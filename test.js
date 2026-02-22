@@ -8,7 +8,8 @@ import {
   getDueJobs, hasRunningRun, nextRunFromCron,
   getTriggeredChildren, getChildJobs, fireTriggeredChildren,
   pruneExpiredJobs, detectCycle, getChainDepth,
-  shouldRetry, scheduleRetry, cancelJob
+  shouldRetry, scheduleRetry, cancelJob,
+  enqueueJob, dequeueJob
 } from './jobs.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
@@ -26,8 +27,9 @@ import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from '.
 let passed = 0;
 let failed = 0;
 
+const verbose = process.argv.includes('-v') || process.argv.includes('--verbose');
 function assert(cond, msg) {
-  if (cond) { passed++; }
+  if (cond) { passed++; if (verbose) console.log(`  ✅ ${msg}`); }
   else { failed++; console.error(`  ✗ ${msg}`); }
 }
 
@@ -346,6 +348,64 @@ const runR = createRun(runP.id, { run_timeout_ms: 300000 });
 assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'running', 'run is running');
 cancelJob(runP.id);
 assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'cancelled', 'running run cancelled');
+
+// ═══════════════════════════════════════════════════════════
+// SECTION 6: Queue overlap policy
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Queue Overlap ──');
+
+// Schema column exists
+const qCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+assert(qCols.includes('queued_count'), 'jobs.queued_count column');
+
+// Create a queue-policy job
+const qJob = createJob({ name: 'QueueJob', schedule_cron: '*/5 * * * *', payload_message: 'q', overlap_policy: 'queue', delivery_mode: 'none' });
+assert(qJob.overlap_policy === 'queue', 'overlap_policy = queue');
+assert(qJob.queued_count === 0, 'initial queued_count = 0');
+
+// Enqueue increments counter
+enqueueJob(qJob.id);
+assert(getJob(qJob.id).queued_count === 1, 'enqueue → queued_count = 1');
+enqueueJob(qJob.id);
+assert(getJob(qJob.id).queued_count === 2, 'enqueue again → queued_count = 2');
+
+// Dequeue consumes one and schedules for next tick
+const dequeued1 = dequeueJob(qJob.id);
+assert(dequeued1 === true, 'dequeue returns true');
+assert(getJob(qJob.id).queued_count === 1, 'after dequeue → queued_count = 1');
+assert(getJob(qJob.id).next_run_at !== null, 'dequeue sets next_run_at');
+
+// Dequeue the second
+const dequeued2 = dequeueJob(qJob.id);
+assert(dequeued2 === true, 'second dequeue returns true');
+assert(getJob(qJob.id).queued_count === 0, 'after second dequeue → queued_count = 0');
+
+// Dequeue on empty returns false
+const dequeued3 = dequeueJob(qJob.id);
+assert(dequeued3 === false, 'dequeue on empty returns false');
+
+// Queue with running run: simulate the full flow
+const qRun = createRun(qJob.id, { run_timeout_ms: 300000 });
+assert(hasRunningRun(qJob.id), 'qJob has running run');
+
+// While running, enqueue 3 times (simulating 3 cron fires during a long run)
+enqueueJob(qJob.id);
+enqueueJob(qJob.id);
+enqueueJob(qJob.id);
+assert(getJob(qJob.id).queued_count === 3, 'queued 3 during running');
+
+// Finish the run — dequeue should consume one
+finishRun(qRun.id, 'ok', { summary: 'done' });
+const dq = dequeueJob(qJob.id);
+assert(dq === true, 'dequeue after run completion');
+assert(getJob(qJob.id).queued_count === 2, 'one consumed, 2 remaining');
+
+// Drain remaining
+dequeueJob(qJob.id);
+dequeueJob(qJob.id);
+assert(getJob(qJob.id).queued_count === 0, 'fully drained');
+assert(dequeueJob(qJob.id) === false, 'nothing left to dequeue');
 
 // ═══════════════════════════════════════════════════════════
 // DONE

@@ -245,6 +245,26 @@ export function fireTriggeredChildren(parentId, status) {
 }
 
 /**
+ * Increment the queued dispatch counter for a job (overlap_policy=queue).
+ */
+export function enqueueJob(jobId) {
+  getDb().prepare('UPDATE jobs SET queued_count = queued_count + 1 WHERE id = ?').run(jobId);
+}
+
+/**
+ * Consume one queued dispatch. Returns true if there was something queued.
+ */
+export function dequeueJob(jobId) {
+  const job = getJob(jobId);
+  if (!job || job.queued_count <= 0) return false;
+  const db = getDb();
+  db.prepare('UPDATE jobs SET queued_count = queued_count - 1 WHERE id = ?').run(jobId);
+  // Schedule it to fire on the next tick
+  db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(jobId);
+  return true;
+}
+
+/**
  * Detect cycles in the parent chain. Throws if adding childId → parentId would create a loop.
  */
 export function detectCycle(childId, parentId) {

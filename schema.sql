@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Retry logic (v3b)
   max_retries     INTEGER DEFAULT 0,             -- 0 = no retry
+
+  -- Queue overlap (v3c)
+  queued_count    INTEGER DEFAULT 0,             -- pending dispatches waiting for current run
   
   -- Scheduling state (denormalized)
   next_run_at     TEXT,

@@ -13,7 +13,7 @@
 //   6. Prune old runs (hourly)
 
 import { initDb, closeDb, getDb } from './db.js';
-import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry } from './jobs.js';
+import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateHeartbeat, updateRunSession, pruneRuns
@@ -58,11 +58,20 @@ function log(level, msg, meta) {
 
 // ── Dispatch a single job ───────────────────────────────────
 async function dispatchJob(job) {
-  // Skip-overlap check
-  if (job.overlap_policy === 'skip' && hasRunningRun(job.id)) {
-    log('info', `Skipping ${job.name} — previous run still active`, { jobId: job.id });
-    advanceNextRun(job);
-    return;
+  // Overlap control
+  if (hasRunningRun(job.id)) {
+    if (job.overlap_policy === 'skip') {
+      log('info', `Skipping ${job.name} — previous run still active`, { jobId: job.id });
+      advanceNextRun(job);
+      return;
+    }
+    if (job.overlap_policy === 'queue') {
+      log('info', `Queueing ${job.name} — previous run still active`, { jobId: job.id });
+      enqueueJob(job.id);
+      advanceNextRun(job);
+      return;
+    }
+    // 'allow' falls through — dispatch concurrently
   }
 
   log('info', `Dispatching: ${job.name}`, { jobId: job.id, target: job.session_target });
@@ -130,6 +139,11 @@ async function dispatchJob(job) {
         });
       }
 
+      // Drain queued dispatches (overlap_policy=queue)
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name}`);
+      }
+
       log('info', `Completed: ${job.name} (${result.usage?.total_tokens || '?'} tokens)`, {
         runId: run.id,
         durationMs: run.duration_ms,
@@ -169,6 +183,12 @@ async function dispatchJob(job) {
           children: triggered.map(c => c.name),
         });
       }
+
+      // Drain queued dispatches (overlap_policy=queue) even on failure
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name} (after failure)`);
+      }
+
       updateJobAfterRun(job, 'error');
     }
   }
@@ -269,7 +289,12 @@ async function checkRunHealth() {
       error_message: `No activity for ${STALE_THRESHOLD_S}s`,
     });
     const job = getJob(run.job_id);
-    if (job) updateJobAfterRun(job, 'timeout');
+    if (job) {
+      updateJobAfterRun(job, 'timeout');
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout)`);
+      }
+    }
   }
 
   // Absolute timeout
@@ -280,7 +305,12 @@ async function checkRunHealth() {
       error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,
     });
     const job = getJob(run.job_id);
-    if (job) updateJobAfterRun(job, 'timeout');
+    if (job) {
+      updateJobAfterRun(job, 'timeout');
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name} (after absolute timeout)`);
+      }
+    }
   }
 }
 
