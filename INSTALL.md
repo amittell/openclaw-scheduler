@@ -1,41 +1,31 @@
-# Installing OpenClaw Scheduler v2 on Scheduler host (scheduler-host.local)
+# Installing OpenClaw Scheduler on a New Host
 
-Complete step-by-step guide to deploy the scheduler on Scheduler host's OpenClaw instance.
+Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., Scheduler host on scheduler-host.local).
 
 ---
 
 ## Prerequisites
 
-| Requirement | Scheduler host Status |
-|-------------|-------------------|
-| macOS (arm64) | ✅ Mac Mini, arm64 |
-| Node.js | ✅ v25.6.1 at `/opt/homebrew/bin/node` |
-| OpenClaw gateway running | ✅ Port 18789, LaunchAgent |
-| Gateway auth token | ✅ `YOUR_GATEWAY_TOKEN` |
-| SSH access | ✅ `ssh user@example.com` |
-| Git | Required (check: `git --version`) |
+| Requirement | Notes |
+|-------------|-------|
+| macOS or Linux | Tested on macOS arm64 |
+| Node.js ≥ 22 | `node --version` |
+| OpenClaw gateway running | With auth token |
+| Git or SCP access | To clone/copy the repo |
 
 ---
 
 ## Step 1: Clone the Repository
 
 ```bash
-ssh user@example.com
 cd ~/.openclaw
 git clone https://github.com/amittell/openclaw-scheduler.git scheduler
 cd scheduler
 ```
 
-If the repo is private, you'll need GitHub auth configured. If `gh` CLI is available:
+Or copy from an existing host:
 ```bash
-gh auth login
-gh repo clone amittell/openclaw-scheduler scheduler
-```
-
-Alternatively, copy from rh-bot:
-```bash
-# From scheduler-host.local:
-scp -r ~/.openclaw/scheduler user@example.com:~/.openclaw/scheduler
+scp -r user@source-host:~/.openclaw/scheduler ~/.openclaw/scheduler
 ```
 
 ---
@@ -44,73 +34,34 @@ scp -r ~/.openclaw/scheduler user@example.com:~/.openclaw/scheduler
 
 ```bash
 cd ~/.openclaw/scheduler
-source ~/.zprofile   # ensures node is in PATH
 npm install
 ```
 
-This installs:
-- `better-sqlite3` (native SQLite driver — will compile for arm64)
-- `croner` (cron expression parser)
+Installs `better-sqlite3` (native, compiles for your arch) and `croner`.
 
-**If `better-sqlite3` fails to compile:** Install build tools:
-```bash
-xcode-select --install
-```
-
-Verify:
-```bash
-node -e "import Database from 'better-sqlite3'; console.log('SQLite OK')"
-```
+If `better-sqlite3` fails: `xcode-select --install` (macOS).
 
 ---
 
 ## Step 3: Run Tests
 
 ```bash
-cd ~/.openclaw/scheduler
-node test.js
+SCHEDULER_DB=:memory: node test.js            # 91 unit tests
+SCHEDULER_DB=:memory: node test-dispatcher.js  # 78 integration tests
 ```
 
-Expected output: `Results: 47 passed, 0 failed`
-
-If any tests fail, do NOT proceed. Fix the issue first.
+**Both suites must pass before proceeding.** Total: 169 tests.
 
 ---
 
 ## Step 4: Enable Chat Completions on Gateway
 
-The scheduler dispatches isolated jobs via the OpenAI-compatible chat completions endpoint. This must be enabled in Scheduler host's gateway config.
-
-### Option A: Via OpenClaw CLI
 ```bash
-source ~/.zprofile
 openclaw config set gateway.http.endpoints.chatCompletions.enabled true
 openclaw gateway restart
 ```
 
-### Option B: Edit config manually
-Edit `~/.openclaw/openclaw.json` and add under the `gateway` key:
-
-```json
-{
-  "gateway": {
-    "http": {
-      "endpoints": {
-        "chatCompletions": {
-          "enabled": true
-        }
-      }
-    }
-  }
-}
-```
-
-Then restart:
-```bash
-source ~/.zprofile && openclaw gateway restart
-```
-
-### Verify
+Verify:
 ```bash
 curl -s -o /dev/null -w "%{http_code}" \
   -X POST \
@@ -124,44 +75,19 @@ Expected: `200`
 
 ---
 
-## Step 5: Initialize Database and Migrate Jobs
+## Step 5: Migrate Jobs from OC Cron
 
-### Initialize the database
 ```bash
 cd ~/.openclaw/scheduler
 node migrate.js
 ```
 
-This will:
-1. Create `scheduler.db` with the v2 schema (jobs, runs, messages, agents tables)
-2. Import all jobs from `~/.openclaw/cron/jobs.json`
-3. Convert schedule formats:
-   - `cron` → direct cron expression
-   - `every` → approximate cron (e.g., 1800000ms → `*/30 * * * *`)
-   - `at` → one-shot cron with `delete_after_run=true`
+This imports jobs from `~/.openclaw/cron/jobs.json` → SQLite, converting schedule formats:
+- `cron` → direct expression
+- `every` → approximate cron (e.g., 30min → `*/30 * * * *`)
+- `at` → one-shot with `delete_after_run=true`
 
-### Expected output for Scheduler host
-
-```
-Found 27 job(s) in /Users/YOUR_USER/.openclaw/cron/jobs.json
-  OK: Smart Email Monitor → cron="0 7-22/2 * * *"
-  OK: pending-acks-check → cron="*/30 * * * *"
-  OK: Line Capture (4x daily) → cron="0 8,12,16,20 * * *"
-  OK: Morning NCAAB/NBA Edge Scan → cron="0 9 * * *"
-  OK: Weekly Power Ratings Refresh → cron="0 8 * * 1"
-  OK: A2P Campaign Status Check → cron="0 */2 * * *"
-  OK: Hourly Workspace Backup → cron="0 8-23 * * *"
-  OK: Daily Workspace Audit → cron="0 6 * * *"
-  OK: Divorce KB Daily Update → cron="0 6 * * *"
-  OK: Early Lines Detection (6 AM) → cron="0 6 * * *"
-  OK: Clean Gmail Spam → cron="0 8,20 * * *"
-  OK: Memory Compression → cron="0 3 * * *"
-  OK: lurker-purge-daily → cron="0 12 * * *"
-  OK: telegram-inactive-cleaner → cron="0 9 * * *"
-  ... (disabled/one-shot jobs also imported)
-```
-
-### Verify
+Verify:
 ```bash
 node cli.js jobs list
 node cli.js status
@@ -169,102 +95,30 @@ node cli.js status
 
 ---
 
-## Step 6: Disable OpenClaw Built-in Cron Jobs
+## Step 6: Disable OC Built-in Cron
 
-The scheduler now owns all scheduling. Disable OC's copies to prevent double-firing.
-
-### Disable all enabled jobs via CLI
 ```bash
-source ~/.zprofile
-
-# List current OC cron jobs
 openclaw cron list
-
-# Disable each enabled job (get IDs from the list above)
+# For each enabled job:
 openclaw cron edit <job-id> --disable
 ```
 
-### Or disable via API (scriptable)
-```bash
-# Get all job IDs
-JOB_IDS=$(curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_GATEWAY_TOKEN" \
-  -d '{"tool":"cron","args":{"action":"list"},"sessionKey":"main"}' \
-  http://127.0.0.1:18789/tools/invoke | \
-  python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-jobs = d.get('result',{}).get('details',{}).get('jobs',[])
-for j in jobs:
-    if j['enabled']:
-        print(j['id'])
-")
+Or disable all programmatically — see the [README](README.md) for API-based approach.
 
-# Disable each
-for ID in $JOB_IDS; do
-  curl -s -X POST \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer YOUR_GATEWAY_TOKEN" \
-    -d "{\"tool\":\"cron\",\"args\":{\"action\":\"update\",\"jobId\":\"$ID\",\"patch\":{\"enabled\":false}},\"sessionKey\":\"main\"}" \
-    http://127.0.0.1:18789/tools/invoke | python3 -c "import json,sys; print('Disabled:', json.load(sys.stdin).get('ok'))"
-done
-```
-
-### Verify all disabled
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_GATEWAY_TOKEN" \
-  -d '{"tool":"cron","args":{"action":"list","includeDisabled":true},"sessionKey":"main"}' \
-  http://127.0.0.1:18789/tools/invoke | python3 -c "
-import json, sys
-jobs = json.load(sys.stdin).get('result',{}).get('details',{}).get('jobs',[])
-enabled = [j['name'] for j in jobs if j['enabled']]
-print('Still enabled:', enabled if enabled else 'NONE (good)')
-"
-```
+Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
 
 ---
 
-## Step 7: Disable OpenClaw Heartbeat
+## Step 7: Disable OC Heartbeat
 
-The scheduler replaces the heartbeat. Set interval to 0:
-
-### Option A: Via CLI
 ```bash
-source ~/.zprofile
 openclaw config set agents.defaults.heartbeat.every "0m"
 openclaw gateway restart
 ```
 
-### Option B: Edit config
-In `~/.openclaw/openclaw.json`, change:
-```json
-"heartbeat": {
-  "every": "0m",
-  ...
-}
-```
-
-Then restart the gateway.
-
-### Verify
-```bash
-python3 -c "
-import json, os
-c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
-print('Heartbeat every:', c.get('agents',{}).get('defaults',{}).get('heartbeat',{}).get('every','NOT SET'))
-"
-```
-
-Expected: `Heartbeat every: 0m`
-
 ---
 
-## Step 8: Configure the LaunchAgent
-
-### Create the plist
+## Step 8: Install LaunchAgent
 
 Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
 
@@ -310,265 +164,121 @@ Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
 </plist>
 ```
 
-**Important:** The token in this file is Scheduler host's gateway token, NOT source host's.
+**Replace** `YOUR_USER` and `YOUR_GATEWAY_TOKEN` with actual values.
 
-### Load the service
+Load it:
 ```bash
 launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 ```
 
-### Verify
+Verify:
 ```bash
-# Check process
 launchctl list | grep scheduler
-ps aux | grep dispatcher | grep -v grep
-
-# Check logs (should show startup + no errors)
-sleep 5
-cat /tmp/openclaw-scheduler.log
-```
-
-Expected log output:
-```
-2026-XX-XX [scheduler] [info] Starting OpenClaw Scheduler v2 (standalone) {"tickMs":10000,...}
-2026-XX-XX [scheduler] [info] Database initialized
-2026-XX-XX [scheduler] [info] Pruned old runs + messages
+sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ```
 
 ---
 
-## Step 9: Run Smoke Test
+## Step 9: Smoke Tests
 
-### Test isolated dispatch
+### Isolated dispatch
 ```bash
 cd ~/.openclaw/scheduler
 node -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();
-const db = getDb();
 const job = createJob({
   name: 'Smoke Test',
   schedule_cron: '0 0 31 2 *',
-  payload_message: 'Reply with exactly: KEBABLEBOT_SCHEDULER_OK',
-  session_target: 'isolated',
-  payload_timeout_seconds: 60,
+  payload_message: 'Reply with exactly: SCHEDULER_OK',
   delivery_mode: 'none',
   delete_after_run: true,
 });
-db.prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
-console.log('Smoke test job created:', job.id);
+getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
+console.log('Created smoke test:', job.id);
 "
+sleep 20 && tail -10 /tmp/openclaw-scheduler.log
 ```
 
-Wait 20 seconds, then check:
-```bash
-sleep 20
-tail -10 /tmp/openclaw-scheduler.log
-```
+Look for: `Dispatching: Smoke Test` → `Completed: Smoke Test`
 
-Expected: You should see `Dispatching: Smoke Test` followed by `Completed: Smoke Test`.
-
-### Test Telegram delivery
+### Telegram delivery
 ```bash
 node -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();
-const db = getDb();
 const job = createJob({
   name: 'Telegram Test',
   schedule_cron: '0 0 31 2 *',
-  payload_message: 'You are Scheduler host running via the standalone scheduler v2. Send a brief confirmation message.',
-  session_target: 'isolated',
-  payload_timeout_seconds: 60,
+  payload_message: 'Confirm scheduler is working. Send a brief greeting.',
   delivery_mode: 'announce',
   delivery_channel: 'telegram',
-  delivery_to: '1000000001',
+  delivery_to: 'YOUR_TELEGRAM_ID',
   delete_after_run: true,
 });
-db.prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
-console.log('Telegram test job created:', job.id);
+getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
+console.log('Created Telegram test:', job.id);
 "
 ```
 
-Wait 30 seconds — you should receive a Telegram message from Scheduler host.
-
-### Test main session dispatch
-```bash
-node -e "
-import { initDb, getDb } from './db.js';
-import { createJob } from './jobs.js';
-initDb();
-const db = getDb();
-const job = createJob({
-  name: 'Main Session Test',
-  schedule_cron: '0 0 31 2 *',
-  payload_kind: 'systemEvent',
-  payload_message: 'Scheduler main session test — system event received.',
-  session_target: 'main',
-  delivery_mode: 'none',
-  delete_after_run: true,
-});
-db.prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
-console.log('Main session test created');
-"
-```
-
-### Verify overall status
-```bash
-node cli.js status
-```
-
-Expected:
-```
-=== OpenClaw Scheduler Status ===
-Jobs:     N total, N enabled
-Running:  0
-Stale:    0
-Agents:   1
-  main: idle
-
-Next:     <next job name> at <time>
-```
+You should receive a Telegram message within 30 seconds.
 
 ---
 
-## Step 10: Review and Tune Migrated Jobs
+## Step 10: Review Migrated Jobs
 
-After migration, review the imported jobs. Some may need adjustment:
-
-### Check all jobs
 ```bash
 node cli.js jobs list
 ```
 
-### Disable jobs you don't want
-Some of Scheduler host's one-shot (`at`) jobs are already expired. Disable or delete them:
-```bash
-# Disable
-node cli.js jobs disable <job-id>
-
-# Or delete
-node cli.js jobs delete <job-id>
-```
-
-### Adjust timeouts
-Default is 5 minutes (300000ms). For jobs that need longer:
-```bash
-node cli.js jobs update <job-id> '{"run_timeout_ms":600000}'
-```
-
-### Adjust `every` schedule conversions
-The migration converts `everyMs` to approximate cron:
-- `1800000ms` (30min) → `*/30 * * * *`
-- `7200000ms` (2hr) → `0 */2 * * *`
-- `600000ms` (10min) → `*/10 * * * *`
-
-Verify these are correct for each job.
+- Disable expired one-shot jobs: `node cli.js jobs disable <id>`
+- Delete unwanted jobs: `node cli.js jobs delete <id>`
+- Adjust timeouts: `node cli.js jobs update <id> '{"run_timeout_ms":600000}'`
+- Verify cron conversions are correct for `every`-based schedules
 
 ---
 
-## Step 11: Verify First Real Job Fires
+## Step 11: Verify First Real Job
 
-Wait for the next scheduled job to fire naturally. Check:
+Wait for the next scheduled job and confirm:
 ```bash
-# Watch the log
 tail -f /tmp/openclaw-scheduler.log
-
-# Or check runs
-node cli.js runs running    # during execution
-node cli.js runs list <job-id>  # after completion
+# Or after it fires:
+node cli.js runs list <job-id>
 ```
 
 ---
 
-## Rollback Procedure
+## Rollback
 
-If something goes wrong:
+If anything goes wrong:
 
-### 1. Stop the scheduler
 ```bash
+# 1. Stop scheduler
 launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-```
 
-### 2. Re-enable OC cron jobs
-```bash
-source ~/.zprofile
-# For each job:
-openclaw cron edit <job-id> --enable
-```
+# 2. Re-enable OC cron
+openclaw cron edit <job-id> --enable  # for each job
 
-### 3. Re-enable heartbeat
-Edit `~/.openclaw/openclaw.json`:
-```json
-"heartbeat": { "every": "5m", ... }
-```
-```bash
-source ~/.zprofile && openclaw gateway restart
-```
-
-### 4. (Optional) Disable chat completions
-```bash
-openclaw config set gateway.http.endpoints.chatCompletions.enabled false
+# 3. Re-enable heartbeat
+openclaw config set agents.defaults.heartbeat.every "5m"
 openclaw gateway restart
 ```
 
 ---
 
-## Ongoing Maintenance
+## Validation Checklist
 
-### View logs
-```bash
-tail -f /tmp/openclaw-scheduler.log
-```
-
-### Check status
-```bash
-cd ~/.openclaw/scheduler && node cli.js status
-```
-
-### Add a new job
-```bash
-node cli.js jobs add '{"name":"My New Job","schedule_cron":"0 */4 * * *","payload_message":"Do something every 4 hours","delivery_mode":"none"}'
-```
-
-### Update the scheduler code
-```bash
-cd ~/.openclaw/scheduler
-git pull
-npm install  # if dependencies changed
-
-# Restart service
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-```
-
----
-
-## Differences from source host's Instance
-
-| Aspect | source-host (scheduler-host.local) | Scheduler host (scheduler-host.local) |
-|--------|----------------------|--------------------------|
-| Jobs | 3 (status, backup, audit) | 27 (email, betting, backup, audit, purge, etc.) |
-| Gateway token | `YOUR_GATEWAY_TOKEN` | `YOUR_GATEWAY_TOKEN` |
-| Node.js | v22.22.0 | v25.6.1 |
-| Gateway port | 18789 | 18789 |
-| Heartbeat (before) | 5m, mini-beast model | 5m, mini-beast model, active hours 7-23 |
-
----
-
-## Quick Validation Checklist
-
-After completing all steps, verify:
-
-- [ ] `node test.js` → 47/47 passed
-- [ ] `node cli.js status` → shows jobs, 0 running, 0 stale
-- [ ] `launchctl list | grep scheduler` → loaded with PID
-- [ ] `/tmp/openclaw-scheduler.log` → startup lines, no errors
-- [ ] OC cron jobs → all disabled
-- [ ] OC heartbeat → `every: "0m"`
-- [ ] Chat completions → `curl` returns 200
-- [ ] Smoke test → dispatched and completed in log
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 91/91
+- [ ] `SCHEDULER_DB=:memory: node test-dispatcher.js` → 78/78
+- [ ] `node cli.js status` → shows jobs, 0 stale
+- [ ] `launchctl list | grep scheduler` → running
+- [ ] Log file has startup lines, no errors
+- [ ] OC cron → all disabled
+- [ ] OC heartbeat → `0m`
+- [ ] Chat completions → 200
+- [ ] Smoke test → dispatched + completed in log
 - [ ] Telegram test → message received
-- [ ] First real job → fires at scheduled time
+- [ ] First real job → fires on schedule
