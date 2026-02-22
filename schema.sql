@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
   delete_after_run INTEGER NOT NULL DEFAULT 0,
+
+  -- Workflow chaining (v3)
+  parent_id       TEXT,                          -- soft ref to parent job id
+  trigger_on      TEXT,                         -- 'success' | 'failure' | 'complete' | NULL
+  trigger_delay_s INTEGER DEFAULT 0,
+
+  -- Retry logic (v3b)
+  max_retries     INTEGER DEFAULT 0,             -- 0 = no retry
   
   -- Scheduling state (denormalized)
   next_run_at     TEXT,
@@ -49,6 +57,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_next_run ON jobs(next_run_at) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS NOT NULL;
 
 -- ============================================================
 -- RUNS: job execution history with heartbeat tracking
@@ -73,7 +82,11 @@ CREATE TABLE IF NOT EXISTS runs (
   summary         TEXT,
   error_message   TEXT,
   dispatched_at   TEXT,
-  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000
+  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
+
+  -- Retry tracking (v3b)
+  retry_count     INTEGER DEFAULT 0,
+  retry_of        TEXT                              -- original run id if this is a retry
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);

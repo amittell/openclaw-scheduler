@@ -12,8 +12,8 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
-import { initDb, closeDb } from './db.js';
-import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob } from './jobs.js';
+import { initDb, closeDb, getDb } from './db.js';
+import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateHeartbeat, updateRunSession, pruneRuns
@@ -121,6 +121,15 @@ async function dispatchJob(job) {
       // Update job state (may delete one-shot jobs)
       updateJobAfterRun(job, 'ok');
 
+      // Fire triggered children on success
+      const triggered = fireTriggeredChildren(job.id, 'ok');
+      if (triggered.length > 0) {
+        log('info', `Triggered ${triggered.length} child job(s)`, {
+          parentId: job.id,
+          children: triggered.map(c => c.name),
+        });
+      }
+
       log('info', `Completed: ${job.name} (${result.usage?.total_tokens || '?'} tokens)`, {
         runId: run.id,
         durationMs: run.duration_ms,
@@ -143,7 +152,25 @@ async function dispatchJob(job) {
       run_id: job.delete_after_run ? null : run.id,
     });
 
-    updateJobAfterRun(job, 'error');
+    // Retry logic: check if we should retry before declaring failure
+    if (shouldRetry(job, run.id)) {
+      const retry = scheduleRetry(job, run.id);
+      log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
+        jobId: job.id, runId: run.id,
+      });
+      // Store retry count on the run for tracking
+      getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+    } else {
+      // Fire triggered children on failure (only after exhausting retries)
+      const triggered = fireTriggeredChildren(job.id, 'error');
+      if (triggered.length > 0) {
+        log('info', `Triggered ${triggered.length} child job(s) on failure`, {
+          parentId: job.id,
+          children: triggered.map(c => c.name),
+        });
+      }
+      updateJobAfterRun(job, 'error');
+    }
   }
 }
 
@@ -188,10 +215,13 @@ function advanceNextRun(job) {
 
 // ── Update job state after run ──────────────────────────────
 function updateJobAfterRun(job, status) {
+  // Re-read from DB to get current state (avoids stale consecutive_errors during retries)
+  const freshJob = getJob(job.id);
+  const currentErrors = freshJob?.consecutive_errors || 0;
   const patch = { last_run_at: sqliteNow(), last_status: status };
 
   if (status === 'error' || status === 'timeout') {
-    patch.consecutive_errors = (job.consecutive_errors || 0) + 1;
+    patch.consecutive_errors = currentErrors + 1;
   } else if (status === 'ok') {
     patch.consecutive_errors = 0;
   }
@@ -294,9 +324,42 @@ async function tick() {
     }
   }
 
-  // 3. Message delivery (every MESSAGE_DELIVERY_MS)
+  // 3. Message delivery + spawn handling (every MESSAGE_DELIVERY_MS)
   if (now - lastMessageDelivery >= MESSAGE_DELIVERY_MS) {
     lastMessageDelivery = now;
+    // Handle spawn messages — running jobs can request child job creation
+    try {
+      const spawnMsgs = getDb().prepare(`
+        SELECT * FROM messages WHERE kind = 'spawn' AND delivered_at IS NULL
+      `).all();
+      for (const msg of spawnMsgs) {
+        try {
+          const spec = JSON.parse(msg.body);
+          const child = createJob({
+            name: spec.name || `Spawned by ${msg.from_agent}`,
+            parent_id: msg.job_id || null,
+            schedule_cron: spec.schedule_cron,
+            payload_message: spec.payload_message,
+            session_target: spec.session_target || 'isolated',
+            agent_id: spec.agent_id || msg.to_agent || 'main',
+            delivery_mode: spec.delivery_mode || 'none',
+            delivery_channel: spec.delivery_channel,
+            delivery_to: spec.delivery_to,
+            delete_after_run: spec.delete_after_run !== false ? 1 : 0,
+            enabled: true,
+          });
+          // Fire immediately
+          getDb().prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
+          markDelivered(msg.id);
+          log('info', `Spawned child job: ${child.name}`, { childId: child.id, parentJobId: msg.job_id });
+        } catch (e) {
+          log('error', `Spawn message parse error: ${e.message}`);
+          markDelivered(msg.id); // Don't retry bad messages
+        }
+      }
+    } catch (err) {
+      log('error', `Spawn handler error: ${err.message}`);
+    }
     try { await deliverPendingMessages(); } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
     }
@@ -308,6 +371,8 @@ async function tick() {
     try {
       pruneRuns(100);
       pruneMessages(30);
+      const expiredCount = pruneExpiredJobs();
+      if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
       log('info', 'Pruned old runs + messages');
     } catch (err) {
       log('error', `Prune error: ${err.message}`);

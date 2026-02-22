@@ -6,14 +6,25 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const DB_PATH = process.env.SCHEDULER_DB || join(__dirname, 'scheduler.db');
+const DEFAULT_DB_PATH = join(__dirname, 'scheduler.db');
 
 let _db;
+let _dbPath;
+
+/**
+ * Override the DB path at runtime (must be called before getDb/initDb).
+ * Pass ':memory:' for in-memory test databases.
+ */
+export function setDbPath(path) {
+  if (_db) { _db.close(); _db = null; }
+  _dbPath = path;
+}
 
 export function getDb() {
   if (!_db) {
-    _db = new Database(DB_PATH);
-    _db.pragma('journal_mode = WAL');
+    const dbPath = _dbPath || process.env.SCHEDULER_DB || DEFAULT_DB_PATH;
+    _db = new Database(dbPath);
+    if (dbPath !== ':memory:') _db.pragma('journal_mode = WAL');
     _db.pragma('foreign_keys = ON');
   }
   return _db;

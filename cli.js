@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Scheduler CLI — manage jobs, runs, messages, agents
 import { initDb } from './db.js';
-import { createJob, getJob, listJobs, updateJob, deleteJob } from './jobs.js';
+import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
@@ -14,11 +14,13 @@ Usage: node cli.js <command> [subcommand] [options]
 
 Jobs:
   jobs list                          List all jobs
+  jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
   jobs add <json>                    Add a job
   jobs enable <id>                   Enable a job
   jobs disable <id>                  Disable a job
   jobs delete <id>                   Delete a job
+  jobs cancel <id> [--no-cascade]   Cancel a job (+ children by default)
   jobs update <id> <json>            Update job fields
 
 Runs:
@@ -60,11 +62,37 @@ switch (command) {
           name: j.name,
           enabled: !!j.enabled,
           cron: j.schedule_cron,
+          agent: j.agent_id || 'main',
           target: j.session_target,
+          parent: j.parent_id ? j.parent_id.slice(0, 8) + '…' : '-',
+          trigger: j.trigger_on || '-',
           nextRun: j.next_run_at,
           lastStatus: j.last_status,
           errors: j.consecutive_errors,
         })));
+        break;
+      }
+      case 'tree': {
+        const jobs = listJobs();
+        const roots = jobs.filter(j => !j.parent_id);
+        const childMap = {};
+        for (const j of jobs) {
+          if (j.parent_id) {
+            if (!childMap[j.parent_id]) childMap[j.parent_id] = [];
+            childMap[j.parent_id].push(j);
+          }
+        }
+        function printTree(job, indent = '') {
+          const status = job.enabled ? '✅' : '⬚';
+          const trigger = job.trigger_on ? ` [on:${job.trigger_on}]` : '';
+          const delay = job.trigger_delay_s ? ` (+${job.trigger_delay_s}s)` : '';
+          console.log(`${indent}${status} ${job.name} (${job.agent_id || 'main'})${trigger}${delay}`);
+          const children = childMap[job.id] || [];
+          for (const child of children) {
+            printTree(child, indent + '  ├─ ');
+          }
+        }
+        for (const root of roots) printTree(root);
         break;
       }
       case 'get': console.log(fmt(getJob(args[0]))); break;
@@ -76,6 +104,13 @@ switch (command) {
       case 'enable': updateJob(args[0], { enabled: 1 }); console.log('Enabled'); break;
       case 'disable': updateJob(args[0], { enabled: 0 }); console.log('Disabled'); break;
       case 'delete': deleteJob(args[0]); console.log('Deleted'); break;
+      case 'cancel': {
+        const noCascade = args.includes('--no-cascade');
+        const id = args.find(a => !a.startsWith('--'));
+        const cancelled = cancelJob(id, { cascade: !noCascade });
+        console.log(`Cancelled ${cancelled.length} job(s):`, cancelled.map(c => c.slice(0, 8) + '…'));
+        break;
+      }
       case 'update': {
         const job = updateJob(args[0], JSON.parse(args[1]));
         console.log('Updated:', fmt(job));

@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { getDb } from './db.js';
 
+const MAX_CHAIN_DEPTH = 10;
+
 /**
  * Calculate next run time from a cron expression.
  */
@@ -20,7 +22,19 @@ export function nextRunFromCron(cronExpr, tz) {
 export function createJob(opts) {
   const db = getDb();
   const id = opts.id || randomUUID();
-  const nextRun = nextRunFromCron(opts.schedule_cron, opts.schedule_tz || 'America/New_York');
+  const isChild = !!opts.parent_id;
+  const cronExpr = opts.schedule_cron || (isChild ? '0 0 31 2 *' : null);
+  if (!cronExpr && !isChild) throw new Error('schedule_cron is required for root jobs');
+
+  // Cycle detection + depth check for child jobs
+  if (isChild) {
+    const depth = getChainDepth(opts.parent_id) + 1; // +1 for the new child
+    if (depth >= MAX_CHAIN_DEPTH) {
+      throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded. Chain would be ${depth} deep.`);
+    }
+  }
+
+  const nextRun = isChild ? null : nextRunFromCron(cronExpr, opts.schedule_tz || 'America/New_York');
 
   const stmt = db.prepare(`
     INSERT INTO jobs (
@@ -29,14 +43,18 @@ export function createJob(opts) {
       payload_model, payload_thinking, payload_timeout_seconds,
       overlap_policy, run_timeout_ms,
       delivery_mode, delivery_channel, delivery_to,
-      delete_after_run, next_run_at
+      delete_after_run, next_run_at,
+      parent_id, trigger_on, trigger_delay_s,
+      max_retries
     ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
       ?, ?, ?,
-      ?, ?
+      ?, ?,
+      ?, ?, ?,
+      ?
     )
   `);
 
@@ -44,7 +62,7 @@ export function createJob(opts) {
     id,
     opts.name,
     opts.enabled !== false ? 1 : 0,
-    opts.schedule_cron,
+    cronExpr,
     opts.schedule_tz || 'America/New_York',
     opts.session_target || 'isolated',
     opts.agent_id || 'main',
@@ -59,7 +77,11 @@ export function createJob(opts) {
     opts.delivery_channel || null,
     opts.delivery_to || null,
     opts.delete_after_run ? 1 : 0,
-    nextRun
+    nextRun,
+    opts.parent_id || null,
+    opts.trigger_on || null,
+    opts.trigger_delay_s || 0,
+    opts.max_retries || 0
   );
 
   return getJob(id);
@@ -95,8 +117,18 @@ export function updateJob(id, patch) {
     'overlap_policy', 'run_timeout_ms',
     'delivery_mode', 'delivery_channel', 'delivery_to',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
-    'consecutive_errors'
+    'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
+    'max_retries'
   ];
+
+  // Cycle detection if parent_id is being changed
+  if (patch.parent_id) {
+    detectCycle(id, patch.parent_id);
+    const depth = getChainDepth(patch.parent_id) + 1;
+    if (depth >= MAX_CHAIN_DEPTH) {
+      throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded.`);
+    }
+  }
 
   const sets = [];
   const values = [];
@@ -145,6 +177,170 @@ export function getDueJobs() {
       AND next_run_at <= datetime('now')
     ORDER BY next_run_at ASC
   `).all();
+}
+
+/**
+ * Prune expired disabled jobs (one-shots that already ran, or disabled jobs
+ * whose next_run_at is in the past and won't fire again).
+ */
+export function pruneExpiredJobs() {
+  const db = getDb();
+  // Delete disabled one-shot jobs (delete_after_run=1) that already have a last_run_at
+  const oneShots = db.prepare(`
+    DELETE FROM jobs
+    WHERE enabled = 0
+      AND delete_after_run = 1
+      AND last_run_at IS NOT NULL
+  `).run();
+  // Delete disabled jobs whose cron only matches dates in the past (one-time crons like '0 4 18 2 *')
+  // by checking if next_run_at is >30 days from now (means it wrapped to next year = expired)
+  const stale = db.prepare(`
+    DELETE FROM jobs
+    WHERE enabled = 0
+      AND next_run_at > datetime('now', '+300 days')
+  `).run();
+  // Delete orphaned children whose parent no longer exists
+  const orphans = db.prepare(`
+    DELETE FROM jobs
+    WHERE parent_id IS NOT NULL
+      AND parent_id NOT IN (SELECT id FROM jobs)
+  `).run();
+  return oneShots.changes + stale.changes + orphans.changes;
+}
+
+/**
+ * Get child jobs triggered by a parent completing with a given status.
+ */
+export function getTriggeredChildren(parentId, status) {
+  return getDb().prepare(`
+    SELECT * FROM jobs
+    WHERE parent_id = ? AND enabled = 1
+      AND (trigger_on = 'complete' OR trigger_on = ?)
+  `).all(parentId, status === 'ok' ? 'success' : 'failure');
+}
+
+/**
+ * Get all child jobs of a parent.
+ */
+export function getChildJobs(parentId) {
+  return getDb().prepare(`SELECT * FROM jobs WHERE parent_id = ?`).all(parentId);
+}
+
+/**
+ * Fire triggered children by setting their next_run_at.
+ * Returns count of children triggered.
+ */
+export function fireTriggeredChildren(parentId, status) {
+  const children = getTriggeredChildren(parentId, status);
+  const db = getDb();
+  for (const child of children) {
+    const delay = child.trigger_delay_s || 0;
+    if (delay > 0) {
+      db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?`).run(delay, child.id);
+    } else {
+      db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
+    }
+  }
+  return children;
+}
+
+/**
+ * Detect cycles in the parent chain. Throws if adding childId → parentId would create a loop.
+ */
+export function detectCycle(childId, parentId) {
+  const db = getDb();
+  const visited = new Set([childId]);
+  let current = parentId;
+  while (current) {
+    if (visited.has(current)) {
+      throw new Error(`Cycle detected: job ${childId} → ${parentId} would create a loop`);
+    }
+    visited.add(current);
+    const job = db.prepare('SELECT parent_id FROM jobs WHERE id = ?').get(current);
+    current = job?.parent_id || null;
+  }
+}
+
+/**
+ * Get the depth of a job's parent chain (0 = root).
+ */
+export function getChainDepth(jobId) {
+  const db = getDb();
+  let depth = 0;
+  let current = jobId;
+  while (current) {
+    const job = db.prepare('SELECT parent_id FROM jobs WHERE id = ?').get(current);
+    if (!job || !job.parent_id) break;
+    depth++;
+    current = job.parent_id;
+    if (depth > MAX_CHAIN_DEPTH) break; // safety valve
+  }
+  return depth;
+}
+
+/**
+ * Check if a failed run should be retried. Returns true if retry was scheduled.
+ */
+export function shouldRetry(job, runId) {
+  if (!job.max_retries || job.max_retries <= 0) return false;
+  const db = getDb();
+  // Count retries for this job's most recent failure chain
+  const run = db.prepare('SELECT retry_count FROM runs WHERE id = ?').get(runId);
+  const retryCount = run?.retry_count || 0;
+  if (retryCount >= job.max_retries) return false;
+  return true;
+}
+
+/**
+ * Schedule a retry for a failed run. Returns the new retry run's next_run_at or null.
+ */
+export function scheduleRetry(job, failedRunId) {
+  const db = getDb();
+  const failedRun = db.prepare('SELECT retry_count FROM runs WHERE id = ?').get(failedRunId);
+  const retryCount = (failedRun?.retry_count || 0) + 1;
+  // Exponential backoff: 30s, 60s, 120s, etc.
+  const delaySec = 30 * Math.pow(2, retryCount - 1);
+  db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?`)
+    .run(delaySec, job.id);
+  // Store retry metadata for the next run
+  db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
+  return { retryCount, delaySec, retryOf: failedRunId };
+}
+
+/**
+ * Cancel a job and optionally cascade to children.
+ * Sets status to disabled and cancels any running runs.
+ */
+export function cancelJob(jobId, opts = {}) {
+  const db = getDb();
+  const cascade = opts.cascade !== false; // default: cascade
+
+  // Disable the job
+  db.prepare('UPDATE jobs SET enabled = 0 WHERE id = ?').run(jobId);
+
+  // Cancel any running runs
+  const runningRuns = db.prepare(`
+    SELECT id FROM runs WHERE job_id = ? AND status = 'running'
+  `).all(jobId);
+  for (const run of runningRuns) {
+    db.prepare(`
+      UPDATE runs SET status = 'cancelled', finished_at = datetime('now')
+      WHERE id = ?
+    `).run(run.id);
+  }
+
+  const cancelled = [jobId];
+
+  // Cascade to children
+  if (cascade) {
+    const children = getChildJobs(jobId);
+    for (const child of children) {
+      const childCancelled = cancelJob(child.id, { cascade: true });
+      cancelled.push(...childCancelled);
+    }
+  }
+
+  return cancelled;
 }
 
 /**
