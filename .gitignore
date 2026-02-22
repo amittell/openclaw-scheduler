@@ -1,0 +1,5 @@
+node_modules/
+scheduler.db
+scheduler.db-wal
+scheduler.db-shm
+*.log
