@@ -1,29 +1,70 @@
-// Gateway API client — talks to OpenClaw's HTTP endpoints
-import { execSync } from 'child_process';
+// Gateway API client — independent dispatch via chat completions + system events
+import { execSync, spawn } from 'child_process';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
 
-/**
- * Invoke a tool via the Gateway's /tools/invoke HTTP endpoint.
- */
-export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
-  const resp = await fetch(`${GATEWAY_URL}/tools/invoke`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(GATEWAY_TOKEN ? { 'Authorization': `Bearer ${GATEWAY_TOKEN}` } : {}),
-    },
-    body: JSON.stringify({ tool, args, sessionKey }),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Gateway ${tool} failed (${resp.status}): ${text}`);
-  }
-
-  return resp.json();
+function authHeaders() {
+  return GATEWAY_TOKEN ? { 'Authorization': `Bearer ${GATEWAY_TOKEN}` } : {};
 }
+
+// ── Chat Completions (independent dispatch) ─────────────────
+
+/**
+ * Run an agent turn via the OpenAI-compatible chat completions endpoint.
+ * Returns the full response including the assistant message.
+ * 
+ * This is the primary dispatch mechanism for isolated jobs.
+ * Each call gets its own session (or use sessionKey for continuity).
+ */
+export async function runAgentTurn(opts) {
+  const {
+    message,
+    agentId = 'main',
+    sessionKey,
+    model,
+    timeoutMs = 300000,
+  } = opts;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
+        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+      },
+      body: JSON.stringify({
+        model: model || `openclaw:${agentId}`,
+        messages: [{ role: 'user', content: message }],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Chat completions failed (${resp.status}): ${text.slice(0, 500)}`);
+    }
+
+    const data = await resp.json();
+    return {
+      ok: true,
+      content: data.choices?.[0]?.message?.content || '',
+      usage: data.usage,
+      sessionKey: resp.headers.get('x-openclaw-session-key') || sessionKey,
+      raw: data,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── System Events (main session) ────────────────────────────
 
 /**
  * Send a system event to the main session.
@@ -40,37 +81,27 @@ export async function sendSystemEvent(text, mode = 'now') {
   }
 }
 
-/**
- * Add a job to OpenClaw's built-in cron (for dispatch).
- * Returns the created job.
- */
-export async function addCronJob(opts) {
-  const result = await invokeGatewayTool('cron', {
-    action: 'add',
-    job: opts,
-  });
-  return result;
-}
+// ── Tools Invoke (for session listing, messages) ────────────
 
 /**
- * Run an existing OpenClaw cron job immediately.
+ * Invoke a tool via the Gateway's /tools/invoke endpoint.
  */
-export async function runCronJob(jobId) {
-  return invokeGatewayTool('cron', {
-    action: 'run',
-    jobId,
-    runMode: 'force',
+export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
+  const resp = await fetch(`${GATEWAY_URL}/tools/invoke`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
+    body: JSON.stringify({ tool, args, sessionKey }),
   });
-}
 
-/**
- * Get cron run history for a job.
- */
-export async function getCronRuns(jobId) {
-  return invokeGatewayTool('cron', {
-    action: 'runs',
-    jobId,
-  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Gateway ${tool} failed (${resp.status}): ${text.slice(0, 500)}`);
+  }
+
+  return resp.json();
 }
 
 /**
@@ -80,18 +111,32 @@ export async function listSessions(opts = {}) {
   return invokeGatewayTool('sessions_list', {
     ...(opts.activeMinutes ? { activeMinutes: opts.activeMinutes } : {}),
     ...(opts.limit ? { limit: opts.limit } : {}),
-    ...(opts.messageLimit ? { messageLimit: opts.messageLimit } : {}),
   });
 }
 
 /**
- * Send a message to a channel (for delivery).
+ * Send a message to a Telegram/channel target via message tool.
  */
-export async function sendMessage(channel, target, message) {
+export async function deliverMessage(channel, target, message) {
   return invokeGatewayTool('message', {
     action: 'send',
     message,
     ...(channel ? { channel } : {}),
     ...(target ? { target } : {}),
   });
+}
+
+/**
+ * Check gateway health.
+ */
+export async function checkGatewayHealth() {
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/health`, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(5000),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
 }

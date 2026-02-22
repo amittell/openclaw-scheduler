@@ -9,7 +9,9 @@ import { getDb } from './db.js';
 export function nextRunFromCron(cronExpr, tz) {
   const cron = new Cron(cronExpr, { timezone: tz });
   const next = cron.nextRun();
-  return next ? next.toISOString() : null;
+  if (!next) return null;
+  // Use SQLite-compatible format: 'YYYY-MM-DD HH:MM:SS' (UTC)
+  return next.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
 /**

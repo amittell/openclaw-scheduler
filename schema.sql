@@ -1,103 +1,143 @@
--- OpenClaw Scheduler Schema v1
--- Replaces jobs.json + heartbeat with SQLite-backed scheduling
+-- OpenClaw Scheduler Schema v2
+-- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 -- ============================================================
--- JOBS: what to run and when
+-- JOBS: scheduled tasks
 -- ============================================================
 CREATE TABLE IF NOT EXISTS jobs (
-  id              TEXT PRIMARY KEY,                -- UUID
+  id              TEXT PRIMARY KEY,
   name            TEXT NOT NULL,
-  enabled         INTEGER NOT NULL DEFAULT 1,      -- 0/1
+  enabled         INTEGER NOT NULL DEFAULT 1,
   
-  -- Schedule: always a cron expression (no mixed formats)
-  schedule_cron   TEXT NOT NULL,                    -- 5-field cron expr
-  schedule_tz     TEXT NOT NULL DEFAULT 'America/New_York',  -- IANA timezone
+  -- Schedule: always cron (no mixed formats)
+  schedule_cron   TEXT NOT NULL,
+  schedule_tz     TEXT NOT NULL DEFAULT 'America/New_York',
   
-  -- Execution target
-  session_target  TEXT NOT NULL DEFAULT 'isolated', -- 'main' | 'isolated'
+  -- Execution
+  session_target  TEXT NOT NULL DEFAULT 'isolated',  -- 'main' | 'isolated'
   agent_id        TEXT DEFAULT 'main',
   
   -- Payload
-  payload_kind    TEXT NOT NULL,                    -- 'systemEvent' | 'agentTurn'
-  payload_message TEXT NOT NULL,                    -- prompt or event text
-  payload_model   TEXT,                             -- optional model override
-  payload_thinking TEXT,                            -- optional thinking level
-  payload_timeout_seconds INTEGER DEFAULT 120,      -- agent turn timeout
+  payload_kind    TEXT NOT NULL,                      -- 'systemEvent' | 'agentTurn'
+  payload_message TEXT NOT NULL,
+  payload_model   TEXT,
+  payload_thinking TEXT,
+  payload_timeout_seconds INTEGER DEFAULT 120,
   
-  -- Overlap policy
-  overlap_policy  TEXT NOT NULL DEFAULT 'skip',     -- 'skip' | 'allow' | 'queue'
-  
-  -- Stale run detection
-  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,  -- 5 min default; fallback if heartbeat fails
+  -- Overlap & timeout
+  overlap_policy  TEXT NOT NULL DEFAULT 'skip',       -- 'skip' | 'allow' | 'queue'
+  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
   
   -- Delivery
-  delivery_mode   TEXT DEFAULT 'announce',          -- 'announce' | 'none'
-  delivery_channel TEXT,                            -- 'telegram' | 'whatsapp' | etc
-  delivery_to     TEXT,                             -- target chat/recipient
+  delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'none'
+  delivery_channel TEXT,
+  delivery_to     TEXT,
   
   -- Metadata
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  delete_after_run INTEGER NOT NULL DEFAULT 0,
   
-  -- One-shot behavior
-  delete_after_run INTEGER NOT NULL DEFAULT 0,      -- 0/1; for one-shot jobs
-  
-  -- Scheduling state (denormalized for fast dispatcher queries)
-  next_run_at     TEXT,                             -- ISO datetime of next scheduled run
-  last_run_at     TEXT,                             -- ISO datetime of last run start
-  last_status     TEXT,                             -- 'ok' | 'error' | 'timeout' | 'skipped'
+  -- Scheduling state (denormalized)
+  next_run_at     TEXT,
+  last_run_at     TEXT,
+  last_status     TEXT,
   consecutive_errors INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_next_run ON jobs(next_run_at) WHERE enabled = 1;
-CREATE INDEX IF NOT EXISTS idx_jobs_enabled ON jobs(enabled);
 
 -- ============================================================
--- RUNS: execution history with heartbeat tracking
+-- RUNS: job execution history with heartbeat tracking
 -- ============================================================
 CREATE TABLE IF NOT EXISTS runs (
-  id              TEXT PRIMARY KEY,                -- UUID
+  id              TEXT PRIMARY KEY,
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|running|ok|error|timeout|skipped
   
-  -- Status lifecycle: pending -> running -> ok|error|timeout|skipped
-  status          TEXT NOT NULL DEFAULT 'pending',
-  
-  -- Timing
   started_at      TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at     TEXT,
   duration_ms     INTEGER,
   
-  -- Heartbeat: dispatcher updates this by checking session activity
+  -- Implicit heartbeat (updated by dispatcher checking session activity)
   last_heartbeat  TEXT NOT NULL DEFAULT (datetime('now')),
   
-  -- Session tracking (for implicit heartbeat via session activity)
-  session_key     TEXT,                            -- OpenClaw session key for this run
-  session_id      TEXT,                            -- OpenClaw session id
+  -- Session tracking
+  session_key     TEXT,
+  session_id      TEXT,
   
   -- Result
-  summary         TEXT,                            -- output summary
-  error_message   TEXT,                            -- error details if failed
-  
-  -- Dispatcher metadata
-  dispatched_at   TEXT,                            -- when dispatcher actually fired this
-  
-  -- Denormalized for fast stale queries
-  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000  -- copied from job at dispatch time
+  summary         TEXT,
+  error_message   TEXT,
+  dispatched_at   TEXT,
+  run_timeout_ms  INTEGER NOT NULL DEFAULT 300000
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 'running';
-CREATE INDEX IF NOT EXISTS idx_runs_stale ON runs(status, last_heartbeat) WHERE status = 'running';
 
 -- ============================================================
--- MIGRATION LOG: track schema versions
+-- MESSAGES: inter-agent message queue
+-- ============================================================
+CREATE TABLE IF NOT EXISTS messages (
+  id              TEXT PRIMARY KEY,
+  
+  -- Routing
+  from_agent      TEXT NOT NULL,                      -- sender agent id or 'scheduler' or 'user'
+  to_agent        TEXT NOT NULL,                      -- recipient agent id or 'broadcast'
+  reply_to        TEXT REFERENCES messages(id),       -- optional: threading
+  
+  -- Content
+  kind            TEXT NOT NULL DEFAULT 'text',       -- 'text' | 'task' | 'result' | 'status' | 'system'
+  subject         TEXT,                               -- optional subject line
+  body            TEXT NOT NULL,
+  metadata        TEXT,                               -- JSON blob for structured data
+  
+  -- Priority & delivery
+  priority        INTEGER NOT NULL DEFAULT 0,         -- higher = more urgent (0=normal, 1=high, 2=urgent)
+  channel         TEXT,                               -- optional: route via specific channel
+  
+  -- Status
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|delivered|read|expired|failed
+  delivered_at    TEXT,
+  read_at         TEXT,
+  expires_at      TEXT,                               -- optional TTL
+  
+  -- Metadata
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  
+  -- Link to job/run if this message is job-related
+  job_id          TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent, status);
+CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_agent);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_pending ON messages(to_agent, status, priority DESC) WHERE status = 'pending';
+
+-- ============================================================
+-- AGENTS: registered agents and status
+-- ============================================================
+CREATE TABLE IF NOT EXISTS agents (
+  id              TEXT PRIMARY KEY,                   -- agent id (e.g. 'main', 'ops')
+  name            TEXT,
+  status          TEXT NOT NULL DEFAULT 'idle',       -- idle|busy|offline
+  last_seen_at    TEXT,
+  session_key     TEXT,                               -- current active session key
+  capabilities    TEXT,                               -- JSON array of capability tags
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ============================================================
+-- MIGRATION LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version   INTEGER PRIMARY KEY,
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);

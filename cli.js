@@ -1,138 +1,229 @@
 #!/usr/bin/env node
-// Scheduler CLI — manage jobs and runs
+// Scheduler CLI — manage jobs, runs, messages, agents
 import { initDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
+import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount } from './messages.js';
+import { upsertAgent, getAgent, listAgents } from './agents.js';
 
-const [,, command, ...args] = process.argv;
+const [,, command, sub, ...args] = process.argv;
 
 function usage() {
   console.log(`
-Usage: node cli.js <command> [options]
+Usage: node cli.js <command> [subcommand] [options]
 
-Commands:
-  list                       List all jobs
-  get <id>                   Get job details
-  add <json>                 Add a job (JSON string)
-  enable <id>                Enable a job
-  disable <id>               Disable a job
-  delete <id>                Delete a job
-  runs <job-id> [limit]      List runs for a job
-  running                    List currently running runs
-  stale [threshold-s]        List stale runs
-  status                     Overall scheduler status
+Jobs:
+  jobs list                          List all jobs
+  jobs get <id>                      Get job details
+  jobs add <json>                    Add a job
+  jobs enable <id>                   Enable a job
+  jobs disable <id>                  Disable a job
+  jobs delete <id>                   Delete a job
+  jobs update <id> <json>            Update job fields
+
+Runs:
+  runs list <job-id> [limit]         List runs for a job
+  runs running                       Currently running runs
+  runs stale [threshold-s]           Stale runs
+
+Messages:
+  msg send <from> <to> <body>        Send a message
+  msg inbox <agent-id> [limit]       Get inbox (unread)
+  msg outbox <agent-id> [limit]      Get outbox
+  msg thread <message-id>            Get message thread
+  msg read <message-id>              Mark message as read
+  msg readall <agent-id>             Mark all as read
+  msg unread <agent-id>              Unread count
+
+Agents:
+  agents list                        List registered agents
+  agents get <id>                    Get agent details
+  agents register <id> [name]        Register/update agent
+
+Status:
+  status                             Overall scheduler status
 `);
 }
 
 initDb();
 
-function formatJob(j) {
-  return {
-    id: j.id,
-    name: j.name,
-    enabled: !!j.enabled,
-    cron: j.schedule_cron,
-    tz: j.schedule_tz,
-    target: j.session_target,
-    nextRun: j.next_run_at,
-    lastRun: j.last_run_at,
-    lastStatus: j.last_status,
-    errors: j.consecutive_errors,
-    overlap: j.overlap_policy,
-    timeoutMs: j.run_timeout_ms,
-  };
-}
+function fmt(obj) { return JSON.stringify(obj, null, 2); }
 
 switch (command) {
-  case 'list': {
-    const jobs = listJobs();
-    console.table(jobs.map(formatJob));
-    break;
-  }
-
-  case 'get': {
-    const job = getJob(args[0]);
-    if (!job) { console.error('Job not found'); process.exit(1); }
-    console.log(JSON.stringify(job, null, 2));
-    break;
-  }
-
-  case 'add': {
-    const opts = JSON.parse(args[0]);
-    const job = createJob(opts);
-    console.log('Created:', JSON.stringify(formatJob(job), null, 2));
-    break;
-  }
-
-  case 'enable': {
-    updateJob(args[0], { enabled: 1 });
-    console.log('Enabled:', args[0]);
-    break;
-  }
-
-  case 'disable': {
-    updateJob(args[0], { enabled: 0 });
-    console.log('Disabled:', args[0]);
-    break;
-  }
-
-  case 'delete': {
-    deleteJob(args[0]);
-    console.log('Deleted:', args[0]);
-    break;
-  }
-
-  case 'runs': {
-    const runs = getRunsForJob(args[0], parseInt(args[1] || '20', 10));
-    console.table(runs.map(r => ({
-      id: r.id.slice(0, 8),
-      status: r.status,
-      started: r.started_at,
-      finished: r.finished_at,
-      durationMs: r.duration_ms,
-      heartbeat: r.last_heartbeat,
-      error: r.error_message?.slice(0, 60),
-    })));
-    break;
-  }
-
-  case 'running': {
-    const runs = getRunningRuns();
-    console.table(runs.map(r => ({
-      id: r.id.slice(0, 8),
-      job: r.job_name,
-      started: r.started_at,
-      heartbeat: r.last_heartbeat,
-      sessionKey: r.session_key,
-    })));
-    break;
-  }
-
-  case 'stale': {
-    const threshold = parseInt(args[0] || '90', 10);
-    const stale = getStaleRuns(threshold);
-    if (stale.length === 0) {
-      console.log('No stale runs');
-    } else {
-      console.table(stale.map(r => ({
-        id: r.id.slice(0, 8),
-        job: r.job_name,
-        heartbeat: r.last_heartbeat,
-        started: r.started_at,
-      })));
+  // ── Jobs ────────────────────────────────────────────────
+  case 'jobs':
+    switch (sub) {
+      case 'list': {
+        const jobs = listJobs();
+        console.table(jobs.map(j => ({
+          id: j.id.slice(0, 8) + '…',
+          name: j.name,
+          enabled: !!j.enabled,
+          cron: j.schedule_cron,
+          target: j.session_target,
+          nextRun: j.next_run_at,
+          lastStatus: j.last_status,
+          errors: j.consecutive_errors,
+        })));
+        break;
+      }
+      case 'get': console.log(fmt(getJob(args[0]))); break;
+      case 'add': {
+        const job = createJob(JSON.parse(args[0]));
+        console.log('Created:', fmt(job));
+        break;
+      }
+      case 'enable': updateJob(args[0], { enabled: 1 }); console.log('Enabled'); break;
+      case 'disable': updateJob(args[0], { enabled: 0 }); console.log('Disabled'); break;
+      case 'delete': deleteJob(args[0]); console.log('Deleted'); break;
+      case 'update': {
+        const job = updateJob(args[0], JSON.parse(args[1]));
+        console.log('Updated:', fmt(job));
+        break;
+      }
+      default: usage();
     }
     break;
-  }
 
+  // ── Runs ────────────────────────────────────────────────
+  case 'runs':
+    switch (sub) {
+      case 'list': {
+        const runs = getRunsForJob(args[0], parseInt(args[1] || '20', 10));
+        console.table(runs.map(r => ({
+          id: r.id.slice(0, 8),
+          status: r.status,
+          started: r.started_at,
+          finished: r.finished_at,
+          durationMs: r.duration_ms,
+          heartbeat: r.last_heartbeat,
+        })));
+        break;
+      }
+      case 'running': {
+        const runs = getRunningRuns();
+        if (runs.length === 0) { console.log('No running runs'); break; }
+        console.table(runs.map(r => ({
+          id: r.id.slice(0, 8),
+          job: r.job_name,
+          started: r.started_at,
+          heartbeat: r.last_heartbeat,
+          sessionKey: r.session_key,
+        })));
+        break;
+      }
+      case 'stale': {
+        const stale = getStaleRuns(parseInt(args[0] || '90', 10));
+        if (stale.length === 0) { console.log('No stale runs'); break; }
+        console.table(stale.map(r => ({
+          id: r.id.slice(0, 8),
+          job: r.job_name,
+          heartbeat: r.last_heartbeat,
+        })));
+        break;
+      }
+      default: usage();
+    }
+    break;
+
+  // ── Messages ────────────────────────────────────────────
+  case 'msg':
+    switch (sub) {
+      case 'send': {
+        const [from, to, ...bodyParts] = args;
+        const msg = sendMessage({ from_agent: from, to_agent: to, body: bodyParts.join(' ') });
+        console.log('Sent:', fmt(msg));
+        break;
+      }
+      case 'inbox': {
+        const msgs = getInbox(args[0], { limit: parseInt(args[1] || '20', 10) });
+        if (msgs.length === 0) { console.log('Inbox empty'); break; }
+        console.table(msgs.map(m => ({
+          id: m.id.slice(0, 8),
+          from: m.from_agent,
+          kind: m.kind,
+          subject: m.subject?.slice(0, 40),
+          status: m.status,
+          priority: m.priority,
+          created: m.created_at,
+        })));
+        break;
+      }
+      case 'outbox': {
+        const msgs = getOutbox(args[0], parseInt(args[1] || '20', 10));
+        if (msgs.length === 0) { console.log('Outbox empty'); break; }
+        console.table(msgs.map(m => ({
+          id: m.id.slice(0, 8),
+          to: m.to_agent,
+          kind: m.kind,
+          subject: m.subject?.slice(0, 40),
+          status: m.status,
+          created: m.created_at,
+        })));
+        break;
+      }
+      case 'thread': {
+        const msgs = getThread(args[0]);
+        for (const m of msgs) {
+          console.log(`[${m.from_agent} → ${m.to_agent}] (${m.status}) ${m.created_at}`);
+          console.log(`  ${m.body.slice(0, 200)}`);
+          console.log();
+        }
+        break;
+      }
+      case 'read': markRead(args[0]); console.log('Marked read'); break;
+      case 'readall': { const r = markAllRead(args[0]); console.log(`Marked ${r.changes} read`); break; }
+      case 'unread': console.log(`Unread: ${getUnreadCount(args[0])}`); break;
+      default: usage();
+    }
+    break;
+
+  // ── Agents ──────────────────────────────────────────────
+  case 'agents':
+    switch (sub) {
+      case 'list': {
+        const agents = listAgents();
+        console.table(agents.map(a => ({
+          id: a.id,
+          name: a.name,
+          status: a.status,
+          lastSeen: a.last_seen_at,
+          sessionKey: a.session_key,
+        })));
+        break;
+      }
+      case 'get': console.log(fmt(getAgent(args[0]))); break;
+      case 'register': {
+        const a = upsertAgent(args[0], { name: args[1] || args[0] });
+        console.log('Registered:', fmt(a));
+        break;
+      }
+      default: usage();
+    }
+    break;
+
+  // ── Status ──────────────────────────────────────────────
   case 'status': {
     const jobs = listJobs();
-    const running = getRunningRuns();
+    const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
-    console.log(`Jobs: ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
-    console.log(`Running: ${running.length}`);
-    console.log(`Stale: ${stale.length}`);
-    const nextJob = jobs.filter(j => j.enabled && j.next_run_at).sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0];
-    if (nextJob) console.log(`Next: ${nextJob.name} at ${nextJob.next_run_at}`);
+    const agents = listAgents();
+
+    console.log('=== OpenClaw Scheduler Status ===');
+    console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
+    console.log(`Running:  ${runningRuns.length}`);
+    console.log(`Stale:    ${stale.length}`);
+    console.log(`Agents:   ${agents.length}`);
+
+    for (const a of agents) {
+      const unread = getUnreadCount(a.id);
+      console.log(`  ${a.id}: ${a.status}${unread ? ` (${unread} unread)` : ''}`);
+    }
+
+    const nextJob = jobs
+      .filter(j => j.enabled && j.next_run_at)
+      .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0];
+    if (nextJob) console.log(`\nNext:     ${nextJob.name} at ${nextJob.next_run_at}`);
     break;
   }
 

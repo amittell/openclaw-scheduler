@@ -7,6 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/node</string>
+        <string>--no-warnings</string>
         <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -19,6 +20,8 @@
         <string>10000</string>
         <key>SCHEDULER_STALE_THRESHOLD_S</key>
         <string>90</string>
+        <key>SCHEDULER_DEBUG</key>
+        <string>1</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
