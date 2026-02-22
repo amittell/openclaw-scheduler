@@ -26,7 +26,7 @@ export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
 }
 
 /**
- * Send a system event to the main session (replaces heartbeat wake).
+ * Send a system event to the main session.
  */
 export async function sendSystemEvent(text, mode = 'now') {
   try {
@@ -41,25 +41,40 @@ export async function sendSystemEvent(text, mode = 'now') {
 }
 
 /**
- * Spawn an isolated session for an agent turn (for isolated jobs).
- * Uses sessions_spawn via tools/invoke.
+ * Add a job to OpenClaw's built-in cron (for dispatch).
+ * Returns the created job.
  */
-export async function spawnIsolatedRun(job, runId) {
-  const args = {
-    task: job.payload_message,
-    label: `scheduler:${job.id}:${runId}`,
-    ...(job.agent_id ? { agentId: job.agent_id } : {}),
-    ...(job.payload_model ? { model: job.payload_model } : {}),
-    ...(job.payload_thinking ? { thinking: job.payload_thinking } : {}),
-    ...(job.payload_timeout_seconds ? { runTimeoutSeconds: job.payload_timeout_seconds } : {}),
-    cleanup: 'keep', // we manage lifecycle
-  };
-
-  return invokeGatewayTool('sessions_spawn', args);
+export async function addCronJob(opts) {
+  const result = await invokeGatewayTool('cron', {
+    action: 'add',
+    job: opts,
+  });
+  return result;
 }
 
 /**
- * List sessions matching a filter — used for implicit heartbeat.
+ * Run an existing OpenClaw cron job immediately.
+ */
+export async function runCronJob(jobId) {
+  return invokeGatewayTool('cron', {
+    action: 'run',
+    jobId,
+    runMode: 'force',
+  });
+}
+
+/**
+ * Get cron run history for a job.
+ */
+export async function getCronRuns(jobId) {
+  return invokeGatewayTool('cron', {
+    action: 'runs',
+    jobId,
+  });
+}
+
+/**
+ * List active sessions (for implicit heartbeat).
  */
 export async function listSessions(opts = {}) {
   return invokeGatewayTool('sessions_list', {
@@ -70,28 +85,13 @@ export async function listSessions(opts = {}) {
 }
 
 /**
- * Get session history — used to check if a session is still active.
- */
-export async function getSessionHistory(sessionKey, limit = 1) {
-  return invokeGatewayTool('sessions_history', { sessionKey, limit });
-}
-
-/**
- * Send a message into a session.
- */
-export async function sendToSession(sessionKey, message) {
-  return invokeGatewayTool('sessions_send', { sessionKey, message });
-}
-
-/**
  * Send a message to a channel (for delivery).
  */
 export async function sendMessage(channel, target, message) {
-  const args = {
+  return invokeGatewayTool('message', {
     action: 'send',
     message,
     ...(channel ? { channel } : {}),
     ...(target ? { target } : {}),
-  };
-  return invokeGatewayTool('message', args);
+  });
 }
