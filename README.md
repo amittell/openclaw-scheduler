@@ -38,7 +38,7 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 
 ```
 ┌─────────────────────────────────────────────┐
-│  Host Machine (e.g., scheduler-host.local)  │
+│  Host Machine (e.g., scheduler-host.local)            │
 │                                              │
 │  OpenClaw Gateway (:18789)                   │
 │    ├─ Telegram / Discord / etc.              │
@@ -568,7 +568,7 @@ node migrate-v4.js   # v3 → v4 (retry columns)
 ├── test-dispatcher.js     # Dispatcher integration tests (78)
 ├── scheduler.db           # Live SQLite database (gitignored)
 ├── package.json           # Dependencies
-├── INSTALL.md             # Installation guide for additional hosts
+├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
 └── README.md              # This file
 ```
 
