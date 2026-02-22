@@ -116,7 +116,7 @@ export function markRead(id) {
 export function markAllRead(agentId) {
   return getDb().prepare(`
     UPDATE messages SET status = 'read', read_at = datetime('now')
-    WHERE to_agent = ? AND status IN ('pending', 'delivered')
+    WHERE (to_agent = ? OR to_agent = 'broadcast') AND status IN ('pending', 'delivered')
   `).run(agentId);
 }
 

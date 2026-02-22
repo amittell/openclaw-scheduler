@@ -124,9 +124,8 @@ assert(getMessage(msg.id).read_at !== null, 'read_at set');
 // Mark all read
 sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'msg A' });
 sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'msg B' });
-const before = getUnreadCount('main');
 markAllRead('main');
-assert(getUnreadCount('main') === 0, `markAllRead (was ${before}, now 0)`);
+assert(getUnreadCount('main') === 0, 'markAllRead → unread = 0');
 
 // Priority ordering
 sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'normal', priority: 0 });

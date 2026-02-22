@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Routing
   from_agent      TEXT NOT NULL,                      -- sender agent id or 'scheduler' or 'user'
   to_agent        TEXT NOT NULL,                      -- recipient agent id or 'broadcast'
-  reply_to        TEXT REFERENCES messages(id),       -- optional: threading
+  reply_to        TEXT REFERENCES messages(id) ON DELETE SET NULL, -- threading
   
   -- Content
   kind            TEXT NOT NULL DEFAULT 'text',       -- 'text' | 'task' | 'result' | 'status' | 'system'
