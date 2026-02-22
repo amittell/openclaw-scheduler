@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.openclaw.scheduler</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OPENCLAW_GATEWAY_URL</key>
+        <string>http://127.0.0.1:18789</string>
+        <key>OPENCLAW_GATEWAY_TOKEN</key>
+        <string>YOUR_GATEWAY_TOKEN</string>
+        <key>SCHEDULER_TICK_MS</key>
+        <string>10000</string>
+        <key>SCHEDULER_STALE_THRESHOLD_S</key>
+        <string>90</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/openclaw-scheduler.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/openclaw-scheduler.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
+</dict>
+</plist>

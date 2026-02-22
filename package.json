@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-scheduler",
+  "version": "0.1.0",
+  "description": "SQLite-backed job scheduler/dispatcher replacing OpenClaw's built-in cron + heartbeat",
+  "type": "module",
+  "main": "dispatcher.js",
+  "scripts": {
+    "start": "node dispatcher.js",
+    "migrate": "node migrate.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "croner": "^8.0.0"
+  }
+}
