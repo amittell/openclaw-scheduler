@@ -1,33 +1,71 @@
-# OpenClaw Scheduler v2
+# OpenClaw Scheduler v4
 
-A full standalone job scheduler, dispatcher, and inter-agent message router for OpenClaw. Replaces OpenClaw's built-in `cron/jobs.json` and heartbeat system with a SQLite-backed scheduler that dispatches independently via the OpenAI-compatible chat completions API.
+A standalone job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces OpenClaw's built-in cron and heartbeat systems with a SQLite-backed scheduler that dispatches independently via the chat completions API.
 
-**Repo:** `github.com/amittell/openclaw-scheduler` (private)  
-**Location:** `~/.openclaw/scheduler/`  
-**Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)  
+**Repo:** `github.com/amittell/openclaw-scheduler` (private)
+**Location:** `~/.openclaw/scheduler/`
+**Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
+**Tests:** 169 (91 unit + 78 dispatcher integration)
 
 ---
 
 ## Table of Contents
 
-1. [Architecture](#architecture)
-2. [Why This Exists](#why-this-exists)
-3. [Components](#components)
-4. [Database Schema](#database-schema)
-5. [Dispatch Flow](#dispatch-flow)
-6. [Stale Run Detection](#stale-run-detection)
+1. [System Overview](#system-overview)
+2. [Architecture](#architecture)
+3. [How Jobs Execute](#how-jobs-execute)
+4. [Workflow Chains](#workflow-chains)
+5. [Retry Logic](#retry-logic)
+6. [Chain Safety](#chain-safety)
 7. [Inter-Agent Messaging](#inter-agent-messaging)
 8. [Agent Registry](#agent-registry)
-9. [CLI Reference](#cli-reference)
-10. [Configuration](#configuration)
-11. [Service Management](#service-management)
-12. [Migration from OpenClaw Cron](#migration-from-openclaw-cron)
-13. [What Was Deprecated](#what-was-deprecated)
-14. [Error Handling & Backoff](#error-handling--backoff)
+9. [Database Schema](#database-schema)
+10. [CLI Reference](#cli-reference)
+11. [Configuration](#configuration)
+12. [Service Management](#service-management)
+13. [Error Handling & Backoff](#error-handling--backoff)
+14. [Migration & History](#migration--history)
 15. [File Reference](#file-reference)
 16. [Testing](#testing)
 17. [Troubleshooting](#troubleshooting)
+
+---
+
+## System Overview
+
+The scheduler sits alongside the OpenClaw gateway as an independent process. It creates **isolated sessions** for each job — they never touch the user's main conversation.
+
+```
+┌─────────────────────────────────────────────┐
+│  Host Machine (e.g., scheduler-host.local)            │
+│                                              │
+│  OpenClaw Gateway (:18789)                   │
+│    ├─ Telegram / Discord / etc.              │
+│    ├─ Chat completions endpoint (/v1/...)    │
+│    ├─ Tool execution (exec, browser, k8s...) │
+│    └─ Memory search                          │
+│                                              │
+│  Scheduler (LaunchAgent)                     │
+│    ├─ SQLite DB (scheduler.db)               │
+│    ├─ Job dispatch via chat completions      │
+│    ├─ Workflow chain engine                  │
+│    ├─ Retry logic                            │
+│    ├─ Inter-agent message queue              │
+│    └─ Agent registry                         │
+└─────────────────────────────────────────────┘
+```
+
+**What replaced what:**
+
+| Before (OC built-in) | After (scheduler) |
+|----------------------|-------------------|
+| `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with run history |
+| `heartbeat.every: "5m"` | Scheduled jobs (e.g., "Daily Workspace Audit") |
+| No run tracking | Full run lifecycle with status, duration, summary |
+| No chain support | Parent/child jobs with trigger-on-completion |
+| No retry | Auto-retry with configurable attempts and delay |
+| No inter-agent comms | Message queue with priority, threading, broadcast |
 
 ---
 
@@ -40,328 +78,321 @@ A full standalone job scheduler, dispatcher, and inter-agent message router for 
 │  1. Gateway health check                                     │
 │  2. Find due jobs (next_run_at <= now, enabled=1)            │
 │  3. Dispatch:                                                │
-│     • main session → openclaw system event CLI               │
-│     • isolated     → POST /v1/chat/completions               │
-│  4. Check running runs for staleness (implicit heartbeat)    │
-│  5. Deliver pending inter-agent messages                     │
-│  6. Expire old messages / prune old runs (hourly)            │
+│     • isolated → POST /v1/chat/completions (unique session)  │
+│     • main     → openclaw system event CLI                   │
+│  4. On completion: trigger child jobs in chain               │
+│  5. On failure: retry if attempts remain                     │
+│  6. Deliver results to Telegram/channel if configured        │
+│  7. Process spawn messages (runtime job creation)            │
+│  8. Check running runs for staleness (90s threshold)         │
+│  9. Expire old messages / prune old runs (hourly)            │
 └──────────────────────────────────────────────────────────────┘
          │                              │
          ▼                              ▼
   ┌───────────────────┐        ┌──────────────────────┐
   │     SQLite DB      │        │   OpenClaw Gateway    │
-  │                    │        │   (127.0.0.1:18789)   │
-  │  • jobs            │        │                       │
-  │  • runs            │        │  • /v1/chat/completions│
-  │  • messages        │        │  • /tools/invoke      │
-  │  • agents          │        │  • system event CLI   │
+  │                    │        │                       │
+  │  • jobs (29 cols)  │        │  • /v1/chat/completions│
+  │  • runs (16 cols)  │        │  • /tools/invoke      │
+  │  • messages (17)   │        │  • /health            │
+  │  • agents (7)      │        │  • system event CLI   │
   └───────────────────┘        └──────────────────────┘
 ```
 
-### Data Flow
+### Session Types
 
-1. **Scheduler tick** (every 10s): queries `jobs` table for rows where `enabled=1` AND `next_run_at <= datetime('now')`
-2. **Skip-overlap check**: if `overlap_policy='skip'` and a run with `status='running'` exists for this job, skip
-3. **Dispatch**:
-   - **Main session jobs**: fires `openclaw system event --text "..." --mode now` which injects into the main agent session
-   - **Isolated jobs**: sends `POST /v1/chat/completions` with the job prompt, targeting a unique session key (`scheduler:<job_id>:<run_id>`)
-4. **Run tracking**: creates a `runs` row with `status='running'`, updates to `ok`/`error`/`timeout` on completion
-5. **Delivery**: if `delivery_mode='announce'`, sends the agent's response to the configured channel (e.g., Telegram) via `/tools/invoke` → `message` tool
-6. **Message queue**: result is also queued as an inter-agent message for traceability
+| Session | Created By | Lifetime | Used For |
+|---------|-----------|----------|----------|
+| User DM | Telegram message | Persistent per-peer | Your conversations |
+| Group chat | Group message | Persistent per-group | Team discussions |
+| Scheduler job | Dispatcher via API | One-shot, dies after completion | Cron jobs, chain steps |
+| Sub-agent | `sessions_spawn` | Task-scoped | Delegated work |
 
----
-
-## Why This Exists
-
-OpenClaw's built-in cron system stores jobs in a flat JSON file (`~/.openclaw/cron/jobs.json`) with no run history, no stale detection, and no inter-agent communication. The heartbeat system runs periodic agent turns but has no concept of job lifecycle.
-
-This scheduler replaces both with:
-
-- **SQLite storage** — ACID, queryable, survives crashes
-- **Run history** — every execution tracked with status, duration, summary
-- **Stale detection** — implicit heartbeat via session activity monitoring
-- **Inter-agent messaging** — agents can send messages, track read receipts, thread conversations
-- **Independent dispatch** — uses chat completions API, not OC's internal cron dispatcher
+Scheduler jobs get completely isolated sessions. They can't see your chat history and your chats can't see theirs.
 
 ---
 
-## Components
+## How Jobs Execute
 
-### Files
-
-| File | Purpose |
-|------|---------|
-| `dispatcher.js` | Main process — tick loop, dispatch, health checks |
-| `db.js` | Database connection (SQLite via better-sqlite3) |
-| `schema.sql` | Table definitions (v2) |
-| `jobs.js` | Job CRUD, scheduling, due detection |
-| `runs.js` | Run lifecycle, stale/timeout detection, heartbeat |
-| `messages.js` | Inter-agent message queue |
-| `agents.js` | Agent registry |
-| `gateway.js` | OpenClaw Gateway API client |
-| `cli.js` | Command-line management tool |
-| `migrate.js` | Import jobs from OC's `jobs.json` |
-| `test.js` | Test suite (47 tests) |
-| `ai.openclaw.scheduler.plist` | macOS LaunchAgent definition |
-
-### Dependencies
-
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `better-sqlite3` | ^11.0.0 | SQLite database driver (native, synchronous) |
-| `croner` | ^8.0.0 | Cron expression parsing and next-run calculation |
-
----
-
-## Database Schema
-
-Four tables plus a migration tracker. All dates stored in SQLite-compatible format (`YYYY-MM-DD HH:MM:SS`, UTC).
-
-### `jobs` — Scheduled tasks
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID |
-| `name` | TEXT | Human-readable name |
-| `enabled` | INTEGER | 0/1 |
-| `schedule_cron` | TEXT | 5-field cron expression (e.g., `0 9 * * *`) |
-| `schedule_tz` | TEXT | IANA timezone (default: `America/New_York`) |
-| `session_target` | TEXT | `main` or `isolated` |
-| `agent_id` | TEXT | Target agent (default: `main`) |
-| `payload_kind` | TEXT | `systemEvent` or `agentTurn` |
-| `payload_message` | TEXT | Prompt or event text |
-| `payload_model` | TEXT | Optional model override |
-| `payload_thinking` | TEXT | Optional thinking level |
-| `payload_timeout_seconds` | INTEGER | Agent turn timeout (default: 120) |
-| `overlap_policy` | TEXT | `skip` / `allow` / `queue` (default: `skip`) |
-| `run_timeout_ms` | INTEGER | Absolute timeout fallback (default: 300000 = 5min) |
-| `delivery_mode` | TEXT | `announce` or `none` |
-| `delivery_channel` | TEXT | Channel name (e.g., `telegram`) |
-| `delivery_to` | TEXT | Target (e.g., chat ID) |
-| `delete_after_run` | INTEGER | 0/1 — for one-shot jobs |
-| `next_run_at` | TEXT | Next scheduled run (UTC, SQLite format) |
-| `last_run_at` | TEXT | Last run timestamp |
-| `last_status` | TEXT | `ok` / `error` / `timeout` / `skipped` |
-| `consecutive_errors` | INTEGER | Error count (resets on success) |
-| `created_at` | TEXT | Creation timestamp |
-| `updated_at` | TEXT | Last update timestamp |
-
-### `runs` — Execution history
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID |
-| `job_id` | TEXT FK | References `jobs(id)` ON DELETE CASCADE |
-| `status` | TEXT | `pending` → `running` → `ok` / `error` / `timeout` / `skipped` |
-| `started_at` | TEXT | Run start time |
-| `finished_at` | TEXT | Run end time |
-| `duration_ms` | INTEGER | Execution duration |
-| `last_heartbeat` | TEXT | Updated by dispatcher when session is active |
-| `session_key` | TEXT | OpenClaw session key for this run |
-| `session_id` | TEXT | OpenClaw session ID |
-| `summary` | TEXT | Agent response (first 5000 chars) |
-| `error_message` | TEXT | Error details if failed |
-| `dispatched_at` | TEXT | When dispatcher fired this |
-| `run_timeout_ms` | INTEGER | Copied from job at dispatch time |
-
-### `messages` — Inter-agent message queue
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID |
-| `from_agent` | TEXT | Sender (agent ID, `scheduler`, or `user`) |
-| `to_agent` | TEXT | Recipient (agent ID or `broadcast`) |
-| `reply_to` | TEXT FK | References `messages(id)` ON DELETE SET NULL |
-| `kind` | TEXT | `text` / `task` / `result` / `status` / `system` |
-| `subject` | TEXT | Optional subject line |
-| `body` | TEXT | Message content |
-| `metadata` | TEXT | JSON blob for structured data |
-| `priority` | INTEGER | 0=normal, 1=high, 2=urgent |
-| `channel` | TEXT | Optional delivery channel override |
-| `status` | TEXT | `pending` → `delivered` → `read` / `expired` / `failed` |
-| `delivered_at` | TEXT | When marked delivered |
-| `read_at` | TEXT | When marked read |
-| `expires_at` | TEXT | Optional TTL |
-| `created_at` | TEXT | Creation timestamp |
-| `job_id` | TEXT FK | References `jobs(id)` ON DELETE SET NULL |
-| `run_id` | TEXT FK | References `runs(id)` ON DELETE SET NULL |
-
-### `agents` — Registered agents
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | Agent ID (e.g., `main`, `ops`) |
-| `name` | TEXT | Display name |
-| `status` | TEXT | `idle` / `busy` / `offline` |
-| `last_seen_at` | TEXT | Last activity timestamp |
-| `session_key` | TEXT | Current active session |
-| `capabilities` | TEXT | JSON array of capability tags |
-| `created_at` | TEXT | Registration timestamp |
-
-### Indexes
-
-- `idx_jobs_next_run` — Fast due-job queries (WHERE enabled=1)
-- `idx_runs_job_id` — Run lookups by job
-- `idx_runs_status` — Running run detection
-- `idx_messages_to` — Inbox queries
-- `idx_messages_from` — Outbox queries
-- `idx_messages_created` — Chronological ordering
-- `idx_messages_pending` — Priority-ordered pending message delivery
-
----
-
-## Dispatch Flow
-
-### Isolated Jobs (chat completions)
+### Isolated Jobs (default)
 
 ```
-Dispatcher tick
+Scheduler tick (every 10s)
   │
-  ├─ getDueJobs() → finds job where next_run_at <= now
-  ├─ hasRunningRun(job_id)? → skip if overlap_policy='skip'
-  ├─ createRun(job_id) → status='running'
-  ├─ setAgentStatus(agent_id, 'busy')
+  ├─ getDueJobs() → "Hourly Workspace Backup is due"
+  ├─ hasRunningRun()? → skip if overlap_policy='skip'
+  ├─ createRun() → status='running'
+  ├─ setAgentStatus('main', 'busy')
   │
   ├─ POST /v1/chat/completions
-  │   Headers:
-  │     Authorization: Bearer <gateway_token>
-  │     x-openclaw-agent-id: <agent_id>
-  │     x-openclaw-session-key: scheduler:<job_id>:<run_id>
-  │   Body:
-  │     model: openclaw:<agent_id>
-  │     messages: [{ role: user, content: <built prompt> }]
+  │   session: scheduler:<job_id>:<run_id>  (unique, isolated)
+  │   model: openclaw:main
+  │   message: [job prompt + any pending inbox messages]
   │
-  │   ← response.choices[0].message.content
+  │   ← "Committed 3 files, pushed to origin"
   │
-  ├─ finishRun(run_id, 'ok', { summary })
-  ├─ setAgentStatus(agent_id, 'idle')
-  ├─ handleDelivery() → POST /tools/invoke → message tool
-  ├─ queueMessage() → result message for traceability
-  └─ advanceNextRun() → calculate next cron fire time
+  ├─ finishRun('ok', summary)
+  ├─ setAgentStatus('main', 'idle')
+  ├─ Deliver to Telegram? → delivery_mode + channel + target
+  ├─ Queue result message for traceability
+  ├─ Advance next_run_at to next cron fire
+  └─ Trigger child jobs if any (workflow chain)
 ```
 
-### Main Session Jobs (system event)
+### Main Session Jobs
+
+For jobs that need the main session context (rare):
 
 ```
-Dispatcher tick
-  │
-  ├─ getDueJobs() → finds main session job
-  ├─ createRun(job_id)
-  ├─ exec: openclaw system event --text "..." --mode now
-  ├─ finishRun(run_id, 'ok')
-  └─ advanceNextRun()
+Dispatcher → exec: openclaw system event --text "..." --mode now
 ```
+
+This injects directly into the active agent session.
 
 ### Prompt Building
 
-For isolated jobs, the dispatcher builds a prompt that includes:
-
-1. A header: `[scheduler:<job_id> <job_name>]`
-2. Any pending messages for the target agent (up to 5, marked as delivered)
+Each isolated job prompt includes:
+1. Header: `[scheduler:<job_id> <job_name>]`
+2. Pending inbox messages for the agent (up to 5)
 3. The job's `payload_message`
-
-This means agents receive their messages inline with job prompts — no separate delivery mechanism needed.
 
 ---
 
-## Stale Run Detection
+## Workflow Chains
 
-The scheduler uses **implicit session heartbeat** — it monitors whether an agent's session is active without requiring the agent to call back.
+Jobs can be linked into parent → child chains. When a parent completes, its children fire automatically.
 
-### How it works
+### Pattern 1: Chained Jobs
 
-1. Every 30 seconds, the dispatcher calls `sessions_list` via `/tools/invoke` with `activeMinutes: 5`
-2. For each running run, it checks if the run's `session_key` appears in the active sessions list
-3. If active → `last_heartbeat` is updated to `datetime('now')`
-4. If `last_heartbeat` is older than 90 seconds (3 missed checks) → run is marked as `timeout`
+```bash
+# Parent: runs on cron
+node cli.js jobs add '{
+  "name": "Build App",
+  "schedule_cron": "0 10 * * *",
+  "payload_message": "Build the application"
+}'
+# → id: "abc123..."
 
-### Fallback: absolute timeout
+# Child: fires when parent succeeds
+node cli.js jobs add '{
+  "name": "Deploy App",
+  "payload_message": "Deploy to production",
+  "parent_id": "abc123...",
+  "trigger_on": "success"
+}'
 
-If the heartbeat check itself fails (gateway down, API error), runs that have been `running` longer than their `run_timeout_ms` are force-timed-out. This is the backstop.
+# Child: fires when parent fails
+node cli.js jobs add '{
+  "name": "Build Alert",
+  "payload_message": "Build failed — check logs",
+  "parent_id": "abc123...",
+  "trigger_on": "failure",
+  "delivery_mode": "announce",
+  "delivery_to": "1000000001"
+}'
+```
 
-### Why implicit heartbeat beats flat timeout
+**Trigger types:**
+- `success` — parent run status = `ok`
+- `failure` — parent run status = `error` or `timeout`
+- `complete` — any completion (success, failure, or timeout)
 
-| Scenario | Flat timeout (5min) | Implicit heartbeat (90s) |
-|----------|--------------------|-----------------------|
-| Job usually takes 20s, agent crashes at 5s | Wait 5 minutes | Detected in ~90s |
-| Job takes 4 minutes (long research task) | Killed at 5 min! | Stays alive (active session) |
-| Agent stuck in infinite loop (no tool calls) | Wait 5 minutes | Detected in ~90s |
+### Pattern 2: Multi-Agent Workflows
 
-### Configuration
+Chain jobs targeting different agents:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Seconds without activity before a run is stale |
-| Job `run_timeout_ms` | `300000` | Absolute timeout fallback per job (5 min) |
+```
+Build (agent: main, cron: 10am)
+  └─ Deploy (agent: ops, trigger: success)
+      └─ Health Check (agent: main, trigger: success, delay: 60s)
+```
+
+```bash
+node cli.js jobs add '{"name":"Deploy","payload_message":"deploy","agent_id":"ops","parent_id":"<build-id>","trigger_on":"success"}'
+```
+
+### Pattern 3: Delayed Triggers
+
+```bash
+node cli.js jobs add '{
+  "name": "Post-Deploy Check",
+  "payload_message": "Verify services healthy",
+  "parent_id": "<deploy-id>",
+  "trigger_on": "success",
+  "trigger_delay_s": 60
+}'
+```
+
+The child won't fire until 60 seconds after the parent completes.
+
+### Pattern 4: Runtime Spawning
+
+A running agent can create new jobs on the fly by sending a `spawn` message:
+
+```json
+{
+  "from_agent": "main",
+  "to_agent": "scheduler",
+  "kind": "spawn",
+  "body": "{\"name\":\"Dynamic Task\",\"payload_message\":\"analyze results\",\"delete_after_run\":true,\"run_now\":true}"
+}
+```
+
+The dispatcher processes spawn messages every 15 seconds.
+
+### Visualizing Chains
+
+```bash
+node cli.js jobs tree <job-id>
+
+# Output:
+# Build App
+#   └─ Deploy App [→success] (agent:ops)
+#   └─ Build Alert [→failure]
+#   └─ Health Check [→complete +60s]
+```
+
+---
+
+## Retry Logic
+
+Jobs can auto-retry before declaring failure and triggering failure children.
+
+```bash
+node cli.js jobs add '{
+  "name": "Flaky Deploy",
+  "schedule_cron": "0 10 * * *",
+  "payload_message": "deploy to prod",
+  "max_retries": 3,
+  "retry_delay_s": 30
+}'
+```
+
+**How it works:**
+
+1. Job fails → check `max_retries`
+2. Retries remaining → schedule retry after `retry_delay_s` seconds
+3. Retry run tracks lineage: `retry_of` → failed run ID, `retry_count` incremented
+4. All retries exhausted → trigger failure children + apply error backoff
+5. Any retry succeeds → trigger success children, reset `consecutive_errors`
+
+**Key:** failure children don't fire until all retries are exhausted. This prevents false alerts on transient failures.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_retries` | 0 | Max retry attempts (0 = no retry) |
+| `retry_delay_s` | 30 | Seconds between retries |
+| `runs.retry_of` | null | ID of the failed run being retried |
+| `runs.retry_count` | 0 | Which attempt this is (0 = first try) |
+
+---
+
+## Chain Safety
+
+### Max Chain Depth
+
+`MAX_CHAIN_DEPTH = 10` — enforced on:
+- `createJob` — can't add a child deeper than 10 levels
+- `updateJob` — can't move a job to create a chain deeper than 10
+- `triggerChildren` — runtime safeguard stops dispatch at depth 10
+
+### Cycle Detection
+
+`detectCycle()` walks up the parent chain on both create and update. Catches:
+- Self-referential: A → A
+- Deep cycles: A → B → C → A
+- Throws with descriptive error message
+
+### Chain Cancellation
+
+```bash
+node cli.js jobs cancel <job-id>
+# Cancels all running runs for this job + every descendant
+```
+
+Sets `status = 'cancelled'` on all running runs in the chain. No-op on finished runs.
 
 ---
 
 ## Inter-Agent Messaging
 
-Agents can exchange messages through the scheduler's message queue. Messages support:
+Agents exchange messages through the scheduler's queue.
 
 ### Features
+- **Priority:** 0 (normal), 1 (high), 2 (urgent) — inbox sorted by priority then time
+- **Threading:** `reply_to` links messages into conversations
+- **Read receipts:** pending → delivered → read (with timestamps)
+- **Broadcast:** `to_agent = 'broadcast'` reaches all agents
+- **TTL/Expiry:** `expires_at` auto-expires unread messages
+- **Metadata:** JSON blob for structured data
+- **Kinds:** `text`, `task`, `result`, `status`, `system`, `spawn`
+- **Job linking:** messages can reference `job_id` and `run_id`
 
-- **Priority levels**: 0 (normal), 1 (high), 2 (urgent) — inbox sorted by priority then time
-- **Threading**: `reply_to` field links messages into conversation threads
-- **Read receipts**: `pending` → `delivered` → `read` with timestamps
-- **Broadcast**: send to `to_agent='broadcast'` to reach all agents
-- **TTL/Expiry**: set `expires_at` to auto-expire unread messages
-- **Metadata**: attach structured JSON data to any message
-- **Message kinds**: `text`, `task`, `result`, `status`, `system`
-- **Job linking**: messages can reference a `job_id` and `run_id` for traceability
+### Delivery
 
-### How messages are delivered
-
-Currently, pending messages are delivered **inline with job prompts**. When the dispatcher builds a prompt for an isolated job, it includes up to 5 pending messages for the target agent:
-
-```
-[scheduler:<job_id> <job_name>]
-
---- Pending Messages ---
-From: ops-agent | task | Deploy review needed
-Please review the prod deployment before approving.
----
-
-<actual job prompt>
-```
-
-Messages are marked as `delivered` when included in a prompt.
-
-### Message operations
-
-| Operation | Function | Description |
-|-----------|----------|-------------|
-| Send | `sendMessage(opts)` | Queue a new message |
-| Get | `getMessage(id)` | Fetch by ID |
-| Inbox | `getInbox(agentId, opts)` | Unread messages, priority-sorted |
-| Outbox | `getOutbox(agentId, limit)` | Sent messages |
-| Thread | `getThread(messageId)` | Message + all replies |
-| Mark delivered | `markDelivered(id)` | Status → delivered |
-| Mark read | `markRead(id)` | Status → read (with timestamp) |
-| Mark all read | `markAllRead(agentId)` | Batch mark (includes broadcast) |
-| Unread count | `getUnreadCount(agentId)` | Count of pending/delivered |
-| Expire | `expireMessages()` | Mark expired messages past TTL |
-| Prune | `pruneMessages(keepDays)` | Delete old read/expired messages |
+Messages are delivered inline with job prompts. When the dispatcher builds a prompt, it includes up to 5 pending messages for the target agent, marked as `delivered`.
 
 ---
 
 ## Agent Registry
 
-Track agent status and capabilities.
-
 | Operation | Function | Description |
 |-----------|----------|-------------|
-| Register/update | `upsertAgent(id, opts)` | Create or update agent record |
+| Register | `upsertAgent(id, opts)` | Create or update |
 | Get | `getAgent(id)` | Fetch by ID |
-| List | `listAgents()` | All registered agents |
-| Set status | `setAgentStatus(id, status, sessionKey)` | Update status + session |
-| Touch | `touchAgent(id)` | Update `last_seen_at` |
+| List | `listAgents()` | All agents |
+| Set status | `setAgentStatus(id, status, sessionKey)` | idle/busy/offline |
+| Touch | `touchAgent(id)` | Update last_seen_at |
 
-The dispatcher automatically:
-- Registers a `main` agent on startup
-- Sets agent to `busy` when dispatching a job
-- Sets agent to `idle` when the job completes
+The dispatcher automatically manages agent status during dispatch (idle → busy → idle).
+
+---
+
+## Database Schema
+
+**Schema version:** 4 | **Mode:** WAL | **Foreign keys:** ON
+
+### Jobs (29 columns)
+
+```
+id, name, enabled, schedule_cron, schedule_tz,
+session_target, agent_id, payload_kind, payload_message,
+payload_model, payload_thinking, payload_timeout_seconds,
+overlap_policy, run_timeout_ms, max_retries, retry_delay_s,
+delivery_mode, delivery_channel, delivery_to,
+delete_after_run, parent_id, trigger_on, trigger_delay_s,
+next_run_at, last_run_at, last_status, consecutive_errors,
+created_at, updated_at
+```
+
+### Runs (16 columns)
+
+```
+id, job_id, status, started_at, finished_at, duration_ms,
+last_heartbeat, session_key, session_id, summary,
+error_message, dispatched_at, run_timeout_ms,
+triggered_by_run, retry_of, retry_count
+```
+
+**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`
+
+### Messages (17 columns)
+
+```
+id, from_agent, to_agent, reply_to, kind, subject, body,
+metadata, priority, channel, status, delivered_at, read_at,
+expires_at, created_at, job_id, run_id
+```
+
+### Agents (7 columns)
+
+```
+id, name, status, last_seen_at, session_key, capabilities, created_at
+```
+
+### Indexes (8)
+
+`idx_jobs_next_run`, `idx_jobs_parent`, `idx_runs_job_id`, `idx_runs_status`, `idx_messages_to`, `idx_messages_from`, `idx_messages_created`, `idx_messages_pending`
 
 ---
 
@@ -369,246 +400,151 @@ The dispatcher automatically:
 
 ```bash
 cd ~/.openclaw/scheduler
-```
 
-### Jobs
+# ── Jobs ──────────────────────────────────────────
+node cli.js jobs list                     # List all (shows agent, parent, trigger)
+node cli.js jobs get <id>                 # Full details as JSON
+node cli.js jobs add '<json>'             # Create a job
+node cli.js jobs update <id> '<json>'     # Partial update
+node cli.js jobs enable <id>
+node cli.js jobs disable <id>
+node cli.js jobs delete <id>              # Cascades to runs
+node cli.js jobs tree <id>                # Visual chain hierarchy
+node cli.js jobs children <id> [status]   # Triggered children
+node cli.js jobs cancel <id>              # Cancel running chain
 
-```bash
-# List all jobs
-node cli.js jobs list
+# ── Runs ──────────────────────────────────────────
+node cli.js runs list <job-id> [limit]    # Run history
+node cli.js runs running                  # Active runs
+node cli.js runs stale [threshold-s]      # Stale runs (default 90s)
 
-# Get job details (full JSON)
-node cli.js jobs get <job-id>
-
-# Add a job
-node cli.js jobs add '{"name":"My Job","schedule_cron":"0 9 * * *","payload_message":"Do the thing","delivery_mode":"none"}'
-
-# Enable/disable
-node cli.js jobs enable <job-id>
-node cli.js jobs disable <job-id>
-
-# Update fields
-node cli.js jobs update <job-id> '{"payload_message":"Updated prompt","run_timeout_ms":600000}'
-
-# Delete
-node cli.js jobs delete <job-id>
-```
-
-### Runs
-
-```bash
-# Run history for a job
-node cli.js runs list <job-id> [limit]
-
-# Currently running
-node cli.js runs running
-
-# Stale runs (default threshold: 90s)
-node cli.js runs stale [threshold-seconds]
-```
-
-### Messages
-
-```bash
-# Send a message
-node cli.js msg send <from-agent> <to-agent> <message body>
-
-# Inbox (unread, priority-sorted)
+# ── Messages ──────────────────────────────────────
+node cli.js msg send <from> <to> <body>
 node cli.js msg inbox <agent-id> [limit]
-
-# Outbox (sent messages)
 node cli.js msg outbox <agent-id> [limit]
-
-# Thread view
 node cli.js msg thread <message-id>
-
-# Mark as read
 node cli.js msg read <message-id>
 node cli.js msg readall <agent-id>
-
-# Unread count
 node cli.js msg unread <agent-id>
-```
 
-### Agents
-
-```bash
-# List agents
+# ── Agents ────────────────────────────────────────
 node cli.js agents list
+node cli.js agents get <id>
+node cli.js agents register <id> [name]
 
-# Agent details
-node cli.js agents get <agent-id>
-
-# Register/update
-node cli.js agents register <agent-id> [display-name]
-```
-
-### Status
-
-```bash
-# Overall scheduler status
+# ── Status ────────────────────────────────────────
 node cli.js status
-
-# Output:
-# === OpenClaw Scheduler Status ===
-# Jobs:     3 total, 3 enabled
-# Running:  0
-# Stale:    0
-# Agents:   1
-#   main: idle
-#
-# Next:     Daily Workspace Audit at 2026-02-22 11:00:00
 ```
 
 ---
 
 ## Configuration
 
-All configuration is via environment variables.
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCHEDULER_DB` | `./scheduler.db` | SQLite database path |
-| `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway HTTP endpoint |
+| `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
-| `SCHEDULER_TICK_MS` | `10000` | Main loop interval (10s) |
-| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run detection threshold |
-| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Session activity check interval |
-| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message delivery check interval |
-| `SCHEDULER_PRUNE_MS` | `3600000` | Run/message prune interval (1 hour) |
-| `SCHEDULER_DEBUG` | *(unset)* | Set to `1` for debug logging |
+| `SCHEDULER_DB` | `./scheduler.db` | SQLite database path |
+| `SCHEDULER_TICK_MS` | `10000` | Tick interval (10s) |
+| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold |
+| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval |
+| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
+| `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
+| `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
 
 ---
 
 ## Service Management
 
-### macOS LaunchAgent
-
-The scheduler runs as a macOS LaunchAgent (`ai.openclaw.scheduler`):
-
 ```bash
-# Install
-cp ~/.openclaw/scheduler/ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-
-# Check status
-launchctl list | grep scheduler
-
-# View logs
-tail -f /tmp/openclaw-scheduler.log
-
-# Restart
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+# Start
 launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 
 # Stop
 launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+
+# Restart
+launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist && \
+  sleep 1 && \
+  launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+
+# Status
+launchctl list | grep scheduler
+ps aux | grep dispatcher | grep -v grep
+
+# Logs
+tail -f /tmp/openclaw-scheduler.log
+
+# Quick health
+node cli.js status
 ```
 
-The LaunchAgent is configured with:
-- `RunAtLoad: true` — starts on login
-- `KeepAlive: true` — restarts on crash
-- Logs to `/tmp/openclaw-scheduler.log`
-
-### Manual run
-
-```bash
-cd ~/.openclaw/scheduler
-OPENCLAW_GATEWAY_TOKEN=<token> node dispatcher.js
-```
-
----
-
-## Migration from OpenClaw Cron
-
-The `migrate.js` script imports jobs from OpenClaw's `~/.openclaw/cron/jobs.json`:
-
-```bash
-node migrate.js
-```
-
-It handles:
-- `cron` schedule kind → direct cron expression
-- `every` schedule kind → approximate cron (e.g., every 60min → `0 */1 * * *`)
-- `at` schedule kind → one-shot cron with `delete_after_run=true`
-- Delivery settings (mode, channel, target)
-- Agent bindings
-- Skips already-imported jobs (by ID)
-
----
-
-## What Was Deprecated
-
-After deploying the scheduler, the following OpenClaw built-in systems were disabled:
-
-### OpenClaw built-in cron jobs
-
-All 3 jobs in `~/.openclaw/cron/jobs.json` were disabled via the cron tool API:
-- Daily Morning Status Update (`0 9 * * *`)
-- Hourly Workspace Backup (`0 8-23 * * *`)
-- Daily Workspace Audit (`0 6 * * *`)
-
-These same jobs now exist in the scheduler's SQLite database and are dispatched independently.
-
-### OpenClaw heartbeat
-
-The heartbeat interval was set to `0m` (disabled) in `~/.openclaw/openclaw.json`:
-
-```json
-"heartbeat": { "every": "0m" }
-```
-
-### Gateway changes
-
-The OpenAI-compatible chat completions endpoint was enabled for dispatch:
-
-```json
-"gateway": {
-  "http": {
-    "endpoints": {
-      "chatCompletions": { "enabled": true }
-    }
-  }
-}
-```
-
-### To re-enable the old system
-
-If you need to revert:
-
-1. Re-enable OC cron jobs: `openclaw cron edit <id> --enable`
-2. Re-enable heartbeat: set `heartbeat.every` back to `5m` in config
-3. Stop the scheduler: `launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist`
+LaunchAgent config: `RunAtLoad: true`, `KeepAlive: true` (auto-restart on crash).
 
 ---
 
 ## Error Handling & Backoff
 
-### Dispatch failures
+### On dispatch failure
 
-If a job dispatch fails (gateway down, API error, agent crash), the run is marked as `error` and the job's `consecutive_errors` counter increments.
+1. Run marked `error`, `consecutive_errors` increments
+2. If `max_retries > 0` and retries remain → schedule retry (failure children wait)
+3. If retries exhausted → trigger failure children, apply backoff
 
-### Exponential backoff
+### Backoff schedule
 
-After consecutive errors, the next run is delayed:
+| Consecutive errors | Delay |
+|-------------------|-------|
+| 1 | 30s |
+| 2 | 1 min |
+| 3 | 5 min |
+| 4 | 15 min |
+| 5+ | 1 hour |
 
-| Consecutive errors | Backoff |
-|-------------------|---------|
-| 1 | 30 seconds |
-| 2 | 1 minute |
-| 3 | 5 minutes |
-| 4 | 15 minutes |
-| 5+ | 60 minutes |
+Backoff is applied on top of the cron schedule (whichever is later). Resets to 0 on success.
 
-The backoff is applied on top of the normal cron schedule — whichever is later wins. The counter resets to 0 on the next successful run.
+### Stale run detection
 
-### One-shot jobs
-
-Jobs with `delete_after_run=true` are deleted from the database after a successful run. On failure, they remain and retry with backoff.
+- Every 30s, dispatcher checks if running runs still have active sessions
+- No activity for 90s → marked `timeout`
+- Fallback: runs exceeding `run_timeout_ms` are force-timed-out
 
 ### Gateway health
 
-The dispatcher checks gateway health (`GET /health`) before each tick. If the gateway is unreachable, the entire tick is skipped to avoid queuing errors.
+`GET /health` checked before each tick. If unreachable, entire tick is skipped.
+
+---
+
+## Migration & History
+
+### Importing from OC cron
+
+```bash
+node migrate.js   # imports from ~/.openclaw/cron/jobs.json
+```
+
+### Schema migrations
+
+```bash
+node migrate-v3.js   # v2 → v3 (chain columns)
+node migrate-v4.js   # v3 → v4 (retry columns)
+```
+
+### What was disabled in OpenClaw
+
+| System | How disabled | Revert |
+|--------|-------------|--------|
+| Built-in cron | All jobs set `enabled: false` via API | `openclaw cron edit <id> --enable` |
+| Heartbeat | `heartbeat.every: "0m"` | Set back to `"5m"` |
+| Chat completions | Enabled for scheduler | Can leave enabled |
+
+### Version history
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v2 | 2026-02-21 | Initial: jobs, runs, messages, agents, standalone dispatch |
+| v3 | 2026-02-22 | Workflow chains: parent_id, trigger_on, trigger_delay_s, cycle detection, spawn messages, multi-agent |
+| v4 | 2026-02-22 | Retry logic, max chain depth (10), chain cancellation, async chain fix |
 
 ---
 
@@ -616,69 +552,78 @@ The dispatcher checks gateway health (`GET /health`) before each tick. If the ga
 
 ```
 ~/.openclaw/scheduler/
-├── ai.openclaw.scheduler.plist  # LaunchAgent definition
-├── cli.js                       # CLI management tool
-├── db.js                        # Database connection
-├── dispatcher.js                # Main process (tick loop)
-├── gateway.js                   # OpenClaw API client
-├── jobs.js                      # Job CRUD operations
-├── messages.js                  # Message queue operations
-├── agents.js                    # Agent registry operations
-├── migrate.js                   # Import from OC jobs.json
-├── runs.js                      # Run lifecycle operations
-├── schema.sql                   # SQLite schema (v2)
-├── test.js                      # Test suite (47 tests)
-├── package.json                 # Dependencies
-├── scheduler.db                 # SQLite database (gitignored)
-└── README.md                    # This file
+├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry
+├── db.js                  # SQLite connection (WAL, FK ON)
+├── schema.sql             # v4 schema definition
+├── jobs.js                # Job CRUD, cron, chains, cycle detection
+├── runs.js                # Run lifecycle, stale/timeout, cancellation
+├── messages.js            # Inter-agent message queue
+├── agents.js              # Agent registry
+├── gateway.js             # OpenClaw API client (chat completions, events, delivery)
+├── cli.js                 # CLI management tool
+├── migrate.js             # Import from OC jobs.json
+├── migrate-v3.js          # Schema v2 → v3
+├── migrate-v4.js          # Schema v3 → v4
+├── test.js                # Unit tests (91)
+├── test-dispatcher.js     # Dispatcher integration tests (78)
+├── scheduler.db           # Live SQLite database (gitignored)
+├── package.json           # Dependencies
+├── INSTALL.md  # Installation guide for additional hosts
+└── README.md              # This file
 ```
 
 ---
 
 ## Testing
 
-### Unit tests
+### Run all tests
 
 ```bash
-node test.js
+cd ~/.openclaw/scheduler
+SCHEDULER_DB=:memory: node test.js            # 91 unit tests
+SCHEDULER_DB=:memory: node test-dispatcher.js  # 78 integration tests
 ```
 
-Runs 47 tests covering:
-- Schema creation (4 tests)
-- Cron parsing (1 test)
-- Job CRUD (6 tests)
-- Due job detection (1 test)
-- Run lifecycle (6 tests)
-- Stale detection (1 test)
-- Timeout detection (1 test)
-- Agent registry (6 tests)
-- Message queue (18 tests: send, reply, priority, inbox, outbox, thread, unread, delivered, read, readall, broadcast, expiry, metadata, all 5 kinds)
-- Cascade delete (2 tests)
-- Prune (1 test)
+### Unit tests (test.js) — 91 assertions
 
-Tests use an in-memory SQLite database (`SCHEDULER_DB=:memory:`) so they don't affect the live DB.
+- Schema creation & integrity
+- Job CRUD, cron parsing, due detection
+- Run lifecycle (create, heartbeat, finish, stale, timeout)
+- Agent registry (upsert, status, capabilities)
+- Message queue (14 operations, 5 kinds, priority, broadcast, expiry)
+- Cascade deletes, pruning
+- Workflow chains (parent/child, trigger matching, tree traversal)
+- Cycle detection (self, deep)
+- Max chain depth enforcement
+- Retry tracking (retry_of, retry_count)
+- Chain cancellation (cascade, no-op on finished)
 
-### Manual live tests (verified 2026-02-22)
+### Dispatcher integration tests (test-dispatcher.js) — 78 assertions
 
-| Test | Result |
-|------|--------|
-| Service health (process, LaunchAgent, gateway, chat completions) | ✅ 4/4 |
-| Database integrity (tables, schema, indexes, WAL, FK) | ✅ 5/5 |
-| Job CRUD (create, read, list, update, cron format, due detection, delete) | ✅ 7/7 |
-| Run lifecycle (12 checks including stale, timeout, cascade) | ✅ 12/12 |
-| Message queue (18 operations) | ✅ 18/18 |
-| Agent registry (8 operations) | ✅ 8/8 |
-| Live isolated dispatch (chat completions → agent reply → tracked) | ✅ 7/7 |
-| Live main session dispatch (system event) | ✅ 3/3 |
-| Live Telegram delivery (dispatch → agent → Telegram message) | ✅ 3/3 |
-| Skip-overlap policy | ✅ 3/3 |
-| Error handling & backoff | ✅ 4/4 |
-| CLI commands (all 11 commands) | ✅ 11/11 |
-| Deprecation verification (OC cron disabled, heartbeat off) | ✅ 3/3 |
-| Migrated jobs (3 production jobs correct) | ✅ 3/3 |
-| Dispatcher logs | ✅ |
-| Unit test suite | ✅ 47/47 |
-| **Total** | **138/138** |
+Uses a mock gateway to test the full dispatch pipeline:
+
+1. Basic isolated dispatch (prompt, delivery, run tracking)
+2. Main session dispatch (system event)
+3. Failed dispatch (error status, error message queued)
+4. HEARTBEAT_OK suppresses delivery
+5. Skip-overlap policy
+6. One-shot job deletion
+7. Retry logic — full 3-attempt cycle, failure children wait
+8. Retry succeeds on 2nd attempt → success children fire
+9. Chain trigger — 3-deep success path (A→B→C)
+10. Chain trigger — failure path (correct children fire)
+11. Delayed triggers (scheduled, not immediate)
+12. Spawn message processing
+13. Invalid spawn rejection
+14. Chain cancellation
+15. buildJobPrompt includes pending messages
+16. Delivery suppressed without channel/target
+17. delivery_mode=none suppresses delivery
+18. Error backoff calculation
+19. Multi-agent chain dispatch (main→ops)
+20. getRetryInfo edge cases
+21. Consecutive error tracking across retries
+22. Complete trigger fires on both success and failure
 
 ---
 
@@ -686,33 +631,38 @@ Tests use an in-memory SQLite database (`SCHEDULER_DB=:memory:`) so they don't a
 
 ### Dispatcher isn't dispatching
 
-1. Check process: `ps aux | grep dispatcher`
-2. Check logs: `tail -f /tmp/openclaw-scheduler.log`
-3. Check gateway: `curl http://127.0.0.1:18789/health`
-4. Check due jobs: `node cli.js jobs list` — is `nextRun` in the past?
-5. Check running runs: `node cli.js runs running` — is overlap blocking?
-
-### Jobs show wrong next_run_at
-
-All dates must be in SQLite format (`YYYY-MM-DD HH:MM:SS`, UTC). If you see ISO format with `T` and `Z`, the date comparison will fail. The `nextRunFromCron()` function handles this automatically.
-
-### Stale runs accumulating
-
-The stale threshold is 90 seconds. If the gateway's `sessions_list` isn't returning session activity, heartbeats won't update and runs will be marked stale after 90s. Check:
-- Is the gateway responding? `curl http://127.0.0.1:18789/health`
-- Is `sessions_list` working? Check via `/tools/invoke`
-
-### Messages not being delivered
-
-Messages are delivered inline with job prompts. If no job fires for an agent, messages accumulate. Future enhancement: immediate delivery for urgent messages via system event.
-
-### Service won't start after reboot
-
-Ensure the plist is in `~/Library/LaunchAgents/` and loaded:
 ```bash
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+ps aux | grep dispatcher              # Is it running?
+tail -20 /tmp/openclaw-scheduler.log   # Any errors?
+curl http://127.0.0.1:18789/health     # Gateway reachable?
+node cli.js jobs list                  # Is nextRun in the past?
+node cli.js runs running               # Overlap blocking?
 ```
 
-### Log file not updating
+### Wrong next_run_at
 
-Node.js buffers stdout when piped to a file. The dispatcher logs to stderr (unbuffered) to avoid this. If logs appear stale, the process may have crashed — check `launchctl list | grep scheduler`.
+All dates must be SQLite format (`YYYY-MM-DD HH:MM:SS`, UTC). `nextRunFromCron()` handles this. If manually setting dates, don't use ISO format with `T`/`Z`.
+
+### Force a job to run now
+
+```bash
+sqlite3 scheduler.db "UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = '<job-id>'"
+```
+
+### Check schema version
+
+```bash
+sqlite3 scheduler.db "SELECT * FROM schema_migrations"
+```
+
+### Service won't start
+
+```bash
+plutil -lint ~/Library/LaunchAgents/ai.openclaw.scheduler.plist  # Valid plist?
+launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+launchctl list | grep scheduler
+```
+
+### Logs not updating
+
+Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have crashed — check `launchctl list | grep scheduler` (exit code in second column, 0 = running).
