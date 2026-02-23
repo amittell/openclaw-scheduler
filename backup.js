@@ -28,6 +28,7 @@ import { execSync } from 'child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = join(__dirname, 'scheduler.db');
@@ -35,6 +36,11 @@ const STAGING_DIR = join(__dirname, '.backup-staging');
 const MC_ALIAS = 'backupstore';
 const BUCKET = 'scheduler-backups';
 const PREFIX = 'scheduler';
+
+// Find mc binary — may be in ~/bin on some hosts
+const MC_BIN = existsSync(join(homedir(), 'bin', 'mc'))
+  ? join(homedir(), 'bin', 'mc')
+  : 'mc';
 
 // Retention
 const SNAPSHOT_RETENTION_HOURS = 24;
@@ -92,7 +98,7 @@ function snapshot() {
   const timeStr = `${String(d.getHours()).padStart(2, '0')}-${String(d.getMinutes()).padStart(2, '0')}`;
   const remotePath = mcPath(`snapshots/${dateStr}/${timeStr}.db`);
 
-  const uploadResult = run(`mc cp "${stagingFile}" "${remotePath}"`);
+  const uploadResult = run(`${MC_BIN} cp "${stagingFile}" "${remotePath}"`);
   if (uploadResult !== null) {
     log('info', `Snapshot shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
   } else {
@@ -124,7 +130,7 @@ function rollup() {
   const hourStr = String(d.getHours()).padStart(2, '0');
   const remotePath = mcPath(`rollups/${dateStr}/${hourStr}.db`);
 
-  run(`mc cp "${stagingFile}" "${remotePath}"`);
+  run(`${MC_BIN} cp "${stagingFile}" "${remotePath}"`);
   log('info', `Rollup shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
 
   try { unlinkSync(stagingFile); } catch {}
@@ -141,7 +147,7 @@ function pruneSnapshots() {
   const cutoffDate = cutoff.toISOString().slice(0, 10);
 
   // List snapshot date directories
-  const listing = run(`mc ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
+  const listing = run(`${MC_BIN} ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
   if (!listing) return;
 
   let pruned = 0;
@@ -150,7 +156,7 @@ function pruneSnapshots() {
       const obj = JSON.parse(line);
       const dirName = obj.key?.replace(/\/$/, '');
       if (dirName && dirName < cutoffDate) {
-        run(`mc rm --recursive --force "${mcPath(`snapshots/${dirName}/`)}"`, { ignoreError: true });
+        run(`${MC_BIN} rm --recursive --force "${mcPath(`snapshots/${dirName}/`)}"`, { ignoreError: true });
         pruned++;
         log('info', `Pruned snapshot dir: ${dirName}`);
       }
@@ -163,7 +169,7 @@ function pruneRollups() {
   const cutoff = new Date(Date.now() - ROLLUP_RETENTION_DAYS * 86400 * 1000);
   const cutoffDate = cutoff.toISOString().slice(0, 10);
 
-  const listing = run(`mc ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
+  const listing = run(`${MC_BIN} ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
   if (!listing) return;
 
   let pruned = 0;
@@ -172,7 +178,7 @@ function pruneRollups() {
       const obj = JSON.parse(line);
       const dirName = obj.key?.replace(/\/$/, '');
       if (dirName && dirName < cutoffDate) {
-        run(`mc rm --recursive --force "${mcPath(`rollups/${dirName}/`)}"`, { ignoreError: true });
+        run(`${MC_BIN} rm --recursive --force "${mcPath(`rollups/${dirName}/`)}"`, { ignoreError: true });
         pruned++;
         log('info', `Pruned rollup dir: ${dirName}`);
       }
@@ -187,14 +193,14 @@ function restore() {
   let latest = null;
 
   // Try rollups first (more reliable)
-  const rollupDirs = run(`mc ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
+  const rollupDirs = run(`${MC_BIN} ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
   if (rollupDirs) {
     const dirs = rollupDirs.split('\n').filter(Boolean).map(l => {
       try { return JSON.parse(l).key?.replace(/\/$/, ''); } catch { return null; }
     }).filter(Boolean).sort().reverse();
 
     for (const dir of dirs) {
-      const files = run(`mc ls "${mcPath(`rollups/${dir}/`)}" --json`, { ignoreError: true });
+      const files = run(`${MC_BIN} ls "${mcPath(`rollups/${dir}/`)}" --json`, { ignoreError: true });
       if (files) {
         const fList = files.split('\n').filter(Boolean).map(l => {
           try { return JSON.parse(l).key; } catch { return null; }
@@ -209,14 +215,14 @@ function restore() {
 
   // Try snapshots if no rollup found
   if (!latest) {
-    const snapDirs = run(`mc ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
+    const snapDirs = run(`${MC_BIN} ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
     if (snapDirs) {
       const dirs = snapDirs.split('\n').filter(Boolean).map(l => {
         try { return JSON.parse(l).key?.replace(/\/$/, ''); } catch { return null; }
       }).filter(Boolean).sort().reverse();
 
       for (const dir of dirs) {
-        const files = run(`mc ls "${mcPath(`snapshots/${dir}/`)}" --json`, { ignoreError: true });
+        const files = run(`${MC_BIN} ls "${mcPath(`snapshots/${dir}/`)}" --json`, { ignoreError: true });
         if (files) {
           const fList = files.split('\n').filter(Boolean).map(l => {
             try { return JSON.parse(l).key; } catch { return null; }
@@ -247,7 +253,7 @@ function restore() {
   // Download and replace
   mkdirSync(STAGING_DIR, { recursive: true });
   const downloadPath = join(STAGING_DIR, 'restore.db');
-  const dlResult = run(`mc cp "${latest.path}" "${downloadPath}"`);
+  const dlResult = run(`${MC_BIN} cp "${latest.path}" "${downloadPath}"`);
   if (dlResult === null) {
     log('error', 'Download failed');
     process.exit(1);
@@ -286,7 +292,7 @@ function status() {
 
   // Snapshots
   console.log('\nSnapshots (last 24h):');
-  const snapDirs = run(`mc ls "${mcPath('snapshots/')}"`, { ignoreError: true });
+  const snapDirs = run(`${MC_BIN} ls "${mcPath('snapshots/')}"`, { ignoreError: true });
   if (snapDirs) {
     console.log(snapDirs);
   } else {
@@ -295,7 +301,7 @@ function status() {
 
   // Rollups
   console.log('\nRollups (last 7d):');
-  const rollupDirs = run(`mc ls "${mcPath('rollups/')}"`, { ignoreError: true });
+  const rollupDirs = run(`${MC_BIN} ls "${mcPath('rollups/')}"`, { ignoreError: true });
   if (rollupDirs) {
     console.log(rollupDirs);
   } else {
@@ -303,7 +309,7 @@ function status() {
   }
 
   // Total size
-  const du = run(`mc du "${mcPath('')}"`, { ignoreError: true });
+  const du = run(`${MC_BIN} du "${mcPath('')}"`, { ignoreError: true });
   if (du) console.log(`\nTotal backup size: ${du}`);
 }
 
