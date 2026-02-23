@@ -55,6 +55,12 @@ Approvals:
   approvals list                     List pending approvals
   approvals pending                  Alias for list
 
+Idempotency:
+  idem status <job-id>               Show recent idempotency keys for a job
+  idem check <key>                   Check if a key is claimed
+  idem release <key>                 Manually release a claimed key
+  idem prune                         Force prune expired entries
+
 Aliases:
   alias list                         List all delivery aliases
   alias add <name> <ch> <tgt> [desc] Add a delivery alias
@@ -367,6 +373,51 @@ switch (command) {
       default: usage();
     }
     break;
+
+  // ── Idempotency ────────────────────────────────────────
+  case 'idem': {
+    const { listIdempotencyForJob, getIdempotencyEntry, releaseIdempotencyKey, forcePruneIdempotency, checkIdempotencyKey } = await import('./idempotency.js');
+    switch (sub) {
+      case 'status': {
+        if (!args[0]) { console.error('Usage: idem status <job-id>'); process.exit(1); }
+        const entries = listIdempotencyForJob(args[0]);
+        if (entries.length === 0) { console.log('No idempotency entries for this job'); break; }
+        console.table(entries.map(e => ({
+          key: e.key.slice(0, 12) + '…',
+          run: e.run_id.slice(0, 8) + '…',
+          status: e.status,
+          claimed: e.claimed_at,
+          released: e.released_at || '-',
+          expires: e.expires_at,
+          hash: e.result_hash || '-',
+        })));
+        break;
+      }
+      case 'check': {
+        if (!args[0]) { console.error('Usage: idem check <key>'); process.exit(1); }
+        const entry = getIdempotencyEntry(args[0]);
+        if (!entry) { console.log('Key not found in ledger'); break; }
+        console.log(fmt(entry));
+        break;
+      }
+      case 'release': {
+        if (!args[0]) { console.error('Usage: idem release <key>'); process.exit(1); }
+        const before = getIdempotencyEntry(args[0]);
+        if (!before) { console.error('Key not found in ledger'); process.exit(1); }
+        if (before.status === 'released') { console.log('Key already released'); break; }
+        releaseIdempotencyKey(args[0]);
+        console.log(`Released idempotency key: ${args[0].slice(0, 12)}…`);
+        break;
+      }
+      case 'prune': {
+        const result = forcePruneIdempotency();
+        console.log(`Pruned ${result} expired idempotency entries`);
+        break;
+      }
+      default: usage();
+    }
+    break;
+  }
 
   // ── Aliases ─────────────────────────────────────────────
   case 'alias': {

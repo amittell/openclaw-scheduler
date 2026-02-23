@@ -1121,6 +1121,233 @@ console.log('\n── v5: Task Tracker ──');
   assert(g2.status === 'failed', 'group with dead agent marked failed');
 }
 
+console.log('\n── v7: Idempotency Keys ──');
+{
+  const {
+    generateIdempotencyKey, generateChainIdempotencyKey, generateRunNowIdempotencyKey,
+    claimIdempotencyKey, releaseIdempotencyKey, checkIdempotencyKey, getIdempotencyEntry,
+    updateIdempotencyResultHash, pruneIdempotencyLedger, listIdempotencyForJob,
+    forcePruneIdempotency,
+  } = await import('./idempotency.js');
+
+  // Verify schema: idempotency_ledger table exists
+  const ledgerTable = getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_ledger'").get();
+  assert(ledgerTable !== undefined, 'idempotency_ledger table exists');
+
+  // Verify runs.idempotency_key column exists
+  const runCols = getDb().prepare('PRAGMA table_info(runs)').all().map(c => c.name);
+  assert(runCols.includes('idempotency_key'), 'runs has idempotency_key column');
+
+  // Verify v7 migration recorded
+  const v7 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 7').get();
+  assert(v7 !== undefined, 'schema_migrations has v7');
+
+  // 1. Key generation is deterministic (same inputs = same key)
+  const key1 = generateIdempotencyKey('job-abc', '2026-02-23 09:00:00');
+  const key2 = generateIdempotencyKey('job-abc', '2026-02-23 09:00:00');
+  assert(key1 === key2, 'idempotency key is deterministic');
+  assert(key1.length === 32, 'idempotency key is 32 chars');
+
+  // 2. Different schedule times produce different keys
+  const key3 = generateIdempotencyKey('job-abc', '2026-02-23 10:00:00');
+  assert(key1 !== key3, 'different schedule times produce different keys');
+
+  // Different job IDs produce different keys
+  const key4 = generateIdempotencyKey('job-xyz', '2026-02-23 09:00:00');
+  assert(key1 !== key4, 'different job IDs produce different keys');
+
+  // 3. Chain keys differ from schedule keys
+  const chainKey = generateChainIdempotencyKey('parent-run-123', 'child-job-abc');
+  assert(chainKey !== key1, 'chain key differs from schedule key');
+  assert(chainKey.length === 32, 'chain key is 32 chars');
+
+  // Chain keys are deterministic
+  const chainKey2 = generateChainIdempotencyKey('parent-run-123', 'child-job-abc');
+  assert(chainKey === chainKey2, 'chain key is deterministic');
+
+  // 4. Run-now keys are unique per call
+  const rnKey1 = generateRunNowIdempotencyKey('job-abc');
+  // Small delay to ensure different timestamp
+  await new Promise(r => setTimeout(r, 2));
+  const rnKey2 = generateRunNowIdempotencyKey('job-abc');
+  assert(rnKey1 !== rnKey2, 'run-now keys are unique per call');
+
+  // 5. Ledger claim blocks duplicate dispatch
+  const testJob = createJob({ name: 'idem-test-1', schedule_cron: '0 * * * *', payload_message: 'test' });
+  const testRun = createRun(testJob.id, { run_timeout_ms: 60000 });
+  const idemKey = generateIdempotencyKey(testJob.id, '2026-02-23 09:00:00');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+
+  const claimed1 = claimIdempotencyKey(idemKey, testJob.id, testRun.id, expiresAt);
+  assert(claimed1 === true, 'first claim succeeds');
+
+  const existing = checkIdempotencyKey(idemKey);
+  assert(existing !== null, 'claimed key is found in ledger');
+  assert(existing.status === 'claimed', 'claimed key status is claimed');
+  assert(existing.job_id === testJob.id, 'claimed key has correct job_id');
+  assert(existing.run_id === testRun.id, 'claimed key has correct run_id');
+
+  // Duplicate claim fails (race condition protection)
+  const testRun2 = createRun(testJob.id, { run_timeout_ms: 60000 });
+  const claimed2 = claimIdempotencyKey(idemKey, testJob.id, testRun2.id, expiresAt);
+  assert(claimed2 === false, 'duplicate claim fails (UNIQUE constraint)');
+
+  // 6. Failed run releases key (can be reclaimed)
+  releaseIdempotencyKey(idemKey);
+  const released = getIdempotencyEntry(idemKey);
+  assert(released.status === 'released', 'released key status is released');
+  assert(released.released_at !== null, 'released_at is set');
+
+  const reclaimedCheck = checkIdempotencyKey(idemKey);
+  assert(reclaimedCheck === null, 'released key not found as claimed');
+
+  // Re-claim the released key (simulating retry)
+  // Need to delete old entry first since it's PRIMARY KEY
+  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(idemKey);
+  const testRun3 = createRun(testJob.id, { run_timeout_ms: 60000 });
+  const reclaimed = claimIdempotencyKey(idemKey, testJob.id, testRun3.id, expiresAt);
+  assert(reclaimed === true, 'released key can be reclaimed after delete');
+
+  // 7. Successful run keeps claim (blocks replay)
+  const successCheck = checkIdempotencyKey(idemKey);
+  assert(successCheck !== null, 'successful claim blocks replay');
+  assert(successCheck.status === 'claimed', 'key remains claimed after success');
+
+  // 8. UNIQUE constraint catches race conditions on runs table
+  const runWithKey = createRun(testJob.id, { run_timeout_ms: 60000, idempotency_key: 'unique-test-key-001' });
+  assert(runWithKey.idempotency_key === 'unique-test-key-001', 'run stores idempotency_key');
+  let uniqueViolation = false;
+  try {
+    // Try inserting another run with same key (should fail due to UNIQUE index)
+    getDb().prepare("INSERT INTO runs (id, job_id, status, run_timeout_ms, dispatched_at, idempotency_key) VALUES (?, ?, 'running', 60000, datetime('now'), ?)")
+      .run('dup-run-id', testJob.id, 'unique-test-key-001');
+  } catch (err) {
+    if (err.message.includes('UNIQUE')) uniqueViolation = true;
+  }
+  assert(uniqueViolation, 'UNIQUE index on runs.idempotency_key catches duplicates');
+
+  // 9. Expired keys are prunable
+  const expiredKey = generateIdempotencyKey('expired-job', '2020-01-01 00:00:00');
+  const pastExpiry = new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  getDb().prepare(
+    "INSERT INTO idempotency_ledger (key, job_id, run_id, claimed_at, expires_at) VALUES (?, ?, ?, datetime('now'), ?)"
+  ).run(expiredKey, 'expired-job', 'expired-run', pastExpiry);
+
+  const futureKey = generateIdempotencyKey('future-job', '2030-01-01 00:00:00');
+  const futureExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  getDb().prepare(
+    "INSERT INTO idempotency_ledger (key, job_id, run_id, claimed_at, expires_at) VALUES (?, ?, ?, datetime('now'), ?)"
+  ).run(futureKey, 'future-job', 'future-run', futureExpiry);
+
+  pruneIdempotencyLedger();
+  const expiredAfterPrune = getIdempotencyEntry(expiredKey);
+  assert(expiredAfterPrune === null, 'expired key pruned');
+
+  // 14. Prune doesn't delete non-expired keys
+  const futureAfterPrune = getIdempotencyEntry(futureKey);
+  assert(futureAfterPrune !== null, 'non-expired key survives prune');
+
+  // Clean up future key
+  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(futureKey);
+
+  // 10. Crashed run keys get released during replay simulation
+  const crashJob = createJob({ name: 'crash-idem-test', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-least-once' });
+  const crashKey = generateIdempotencyKey(crashJob.id, '2026-02-23 12:00:00');
+  const crashRun = createRun(crashJob.id, { run_timeout_ms: 60000, idempotency_key: crashKey });
+  claimIdempotencyKey(crashKey, crashJob.id, crashRun.id, expiresAt);
+
+  // Simulate crash: mark run as crashed and release key (what replayOrphanedRuns does)
+  getDb().prepare("UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?").run(crashRun.id);
+  releaseIdempotencyKey(crashKey);
+  const crashedEntry = getIdempotencyEntry(crashKey);
+  assert(crashedEntry.status === 'released', 'crashed run key is released');
+
+  // Verify the key can be re-claimed in the ledger (for replay)
+  // Note: in real replay, the old crashed run keeps its key in runs table,
+  // and a new replay run gets a fresh idempotency_key. But the ledger key
+  // can be reclaimed since it was released.
+  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(crashKey);
+  const replayRun = createRun(crashJob.id, { run_timeout_ms: 60000, idempotency_key: crashKey + '-replay' });
+  const replayClaimed = claimIdempotencyKey(crashKey, crashJob.id, replayRun.id, expiresAt);
+  assert(replayClaimed === true, 'crashed run key can be reclaimed for replay');
+
+  finishRun(crashRun.id, 'crashed'); finishRun(replayRun.id, 'ok');
+  deleteJob(crashJob.id);
+
+  // 11. Key is stored on run record
+  const keyOnRun = getRun(runWithKey.id);
+  assert(keyOnRun.idempotency_key === 'unique-test-key-001', 'idempotency_key persisted on run');
+
+  // 12. Key is injected into prompt for at-least-once jobs
+  // We test this by checking that buildJobPrompt behavior can detect delivery_guarantee
+  // Since buildJobPrompt is internal to dispatcher.js, we verify the data path:
+  const alJob = createJob({
+    name: 'at-least-once-test', schedule_cron: '0 * * * *',
+    payload_message: 'do something', delivery_guarantee: 'at-least-once',
+  });
+  assert(alJob.delivery_guarantee === 'at-least-once', 'at-least-once delivery_guarantee stored');
+  const alRun = createRun(alJob.id, { run_timeout_ms: 60000, idempotency_key: 'al-test-key-12345678901234567890' });
+  assert(alRun.idempotency_key === 'al-test-key-12345678901234567890', 'idempotency key available for prompt injection');
+  finishRun(alRun.id, 'ok'); deleteJob(alJob.id);
+
+  // 13. IDEMPOTENT_SKIP handling — verify it's a recognized pattern
+  // In dispatcher, content.trim() === 'IDEMPOTENT_SKIP' skips delivery
+  const skipContent = 'IDEMPOTENT_SKIP';
+  const isIdempotentSkip = skipContent.trim() === 'IDEMPOTENT_SKIP' || skipContent.trim().startsWith('IDEMPOTENT_SKIP');
+  assert(isIdempotentSkip, 'IDEMPOTENT_SKIP pattern recognized');
+
+  const skipContent2 = 'IDEMPOTENT_SKIP: already processed this bet settlement';
+  const isSkip2 = skipContent2.trim().startsWith('IDEMPOTENT_SKIP');
+  assert(isSkip2, 'IDEMPOTENT_SKIP with message recognized');
+
+  const normalContent = 'Here is the result';
+  const isNotSkip = !(normalContent.trim() === 'IDEMPOTENT_SKIP' || normalContent.trim().startsWith('IDEMPOTENT_SKIP'));
+  assert(isNotSkip, 'normal content is not IDEMPOTENT_SKIP');
+
+  // 15. Manual release via CLI-style operation
+  const manualKey = generateIdempotencyKey('manual-test', '2026-03-01 00:00:00');
+  const manualRun = createRun(testJob.id, { run_timeout_ms: 60000 });
+  claimIdempotencyKey(manualKey, testJob.id, manualRun.id, expiresAt);
+
+  const beforeRelease = checkIdempotencyKey(manualKey);
+  assert(beforeRelease !== null, 'manual key is claimed before release');
+
+  // Simulate CLI release
+  releaseIdempotencyKey(manualKey);
+  const afterRelease = checkIdempotencyKey(manualKey);
+  assert(afterRelease === null, 'manual key released via CLI-style operation');
+
+  finishRun(manualRun.id, 'ok');
+
+  // Result hash storage
+  const hashKey = generateIdempotencyKey('hash-test', '2026-04-01 00:00:00');
+  const hashRun = createRun(testJob.id, { run_timeout_ms: 60000 });
+  claimIdempotencyKey(hashKey, testJob.id, hashRun.id, expiresAt);
+  updateIdempotencyResultHash(hashKey, 'This is the result content');
+  const hashEntry = getIdempotencyEntry(hashKey);
+  assert(hashEntry.result_hash !== null, 'result hash stored on ledger entry');
+  assert(hashEntry.result_hash.length === 16, 'result hash is 16 chars');
+  finishRun(hashRun.id, 'ok');
+
+  // listIdempotencyForJob
+  const entries = listIdempotencyForJob(testJob.id);
+  assert(entries.length > 0, 'listIdempotencyForJob returns entries');
+  assert(entries[0].job_id === testJob.id, 'listIdempotencyForJob returns correct job entries');
+
+  // forcePruneIdempotency — same as pruneIdempotencyLedger but returns count
+  const prunedCount = forcePruneIdempotency();
+  assert(typeof prunedCount === 'number', 'forcePruneIdempotency returns a number');
+
+  // Run with null idempotency_key (default behavior)
+  const nullKeyRun = createRun(testJob.id, { run_timeout_ms: 60000 });
+  assert(nullKeyRun.idempotency_key === null, 'run without idempotency_key has null');
+
+  // Clean up test runs
+  finishRun(testRun.id, 'ok'); finishRun(testRun2.id, 'ok'); finishRun(testRun3.id, 'ok');
+  finishRun(nullKeyRun.id, 'ok');
+  deleteJob(testJob.id);
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

@@ -14,7 +14,17 @@
 
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
+import {
+  generateIdempotencyKey as _genIdemKey,
+  generateChainIdempotencyKey as _genChainKey,
+  generateRunNowIdempotencyKey as _genRunNowKey,
+  claimIdempotencyKey as _claimIdemKey,
+  releaseIdempotencyKey as _releaseIdemKey,
+  updateIdempotencyResultHash as _updateIdemHash,
+  pruneIdempotencyLedger as _pruneIdemLedger,
+} from './idempotency.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
@@ -41,9 +51,22 @@ import {
 } from './task-tracker.js';
 
 // ── Helpers ─────────────────────────────────────────────────
-function sqliteNow() {
-  return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+function sqliteNow(offsetMs = 0) {
+  return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
+
+// ── Idempotency Key Wrappers ────────────────────────────────
+// The shared module (idempotency.js) uses jobId strings; dispatcher wraps with job objects.
+function generateIdempotencyKey(job, scheduledTime) {
+  if (job.parent_id && !scheduledTime) return null;
+  return _genIdemKey(job.id, scheduledTime);
+}
+const generateChainIdempotencyKey = _genChainKey;
+const generateRunNowIdempotencyKey = _genRunNowKey;
+const claimIdempotencyKey = _claimIdemKey;
+const releaseIdempotencyKey = _releaseIdemKey;
+const updateIdempotencyResultHash = _updateIdemHash;
+const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Config ──────────────────────────────────────────────────
 const TICK_INTERVAL_MS = parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10);
@@ -56,6 +79,8 @@ const LOG_PREFIX = '[scheduler]';
 
 // ── State ───────────────────────────────────────────────────
 let running = true;
+// Map of childJobId → parentRunId for chain idempotency key threading
+const pendingChainKeys = new Map();
 let lastHeartbeatCheck = 0;
 let lastMessageDelivery = 0;
 let lastPrune = 0;
@@ -89,6 +114,13 @@ async function replayOrphanedRuns() {
 
     // Mark old run as crashed
     db.prepare(`UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?`).run(run.id);
+
+    // Release any idempotency key held by the crashed run so replays can reclaim
+    const crashedRunFull = db.prepare('SELECT idempotency_key FROM runs WHERE id = ?').get(run.id);
+    if (crashedRunFull?.idempotency_key) {
+      releaseIdempotencyKey(crashedRunFull.idempotency_key);
+      log('info', `Released idempotency key for crashed run`, { runId: run.id, key: crashedRunFull.idempotency_key.slice(0, 8) });
+    }
 
     if (run.delivery_guarantee === 'at-least-once') {
       // Create a new run with replay_of pointing to the crashed run
@@ -207,9 +239,45 @@ async function dispatchJob(job) {
     // 'allow' falls through — dispatch concurrently
   }
 
+  // ── Idempotency key generation & dedup ─────────────────────
+  const scheduledTime = job.next_run_at; // capture BEFORE advancing
+  let idemKey = null;
+  if (pendingChainKeys.has(job.id)) {
+    // Chain-triggered child: generate key from parent run context
+    const parentRunId = pendingChainKeys.get(job.id);
+    pendingChainKeys.delete(job.id);
+    idemKey = generateChainIdempotencyKey(parentRunId, job.id);
+  } else {
+    idemKey = generateIdempotencyKey(job, scheduledTime);
+  }
+
+  // Check if already claimed in ledger
+  if (idemKey) {
+    const existing = getDb().prepare("SELECT * FROM idempotency_ledger WHERE key = ? AND status = 'claimed'").get(idemKey);
+    if (existing) {
+      log('info', `Idempotency skip: ${job.name} (key ${idemKey.slice(0,8)}… already claimed by run ${existing.run_id.slice(0,8)}…)`);
+      advanceNextRun(job);
+      return;
+    }
+  }
+
   log('info', `Dispatching: ${job.name}`, { jobId: job.id, target: job.session_target });
 
-  const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms });
+  const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms, idempotency_key: idemKey });
+
+  // Claim the key in the ledger (with expiry)
+  if (idemKey) {
+    const expiresAt = job.delete_after_run
+      ? sqliteNow(24 * 60 * 60 * 1000)      // 24h for one-shots
+      : sqliteNow(7 * 24 * 60 * 60 * 1000); // 7 days for recurring
+    const claimed = claimIdempotencyKey(idemKey, job.id, run.id, expiresAt);
+    if (!claimed) {
+      log('warn', `Idempotency race: ${job.name} key ${idemKey.slice(0,8)}… claimed by concurrent dispatch`);
+      finishRun(run.id, 'skipped', { summary: 'Idempotency key already claimed (race)' });
+      advanceNextRun(job);
+      return;
+    }
+  }
 
   try {
     if (job.session_target === 'main') {
@@ -250,13 +318,22 @@ async function dispatchJob(job) {
         log('info', `Flush: nothing to flush for ${job.name}`);
       }
 
+      // Handle IDEMPOTENT_SKIP response (agent recognized duplicate execution)
+      const isIdempotentSkip = content.trim() === 'IDEMPOTENT_SKIP' || content.trim().startsWith('IDEMPOTENT_SKIP');
+      if (isIdempotentSkip) {
+        log('info', `Idempotent skip (agent): ${job.name}`);
+      }
+
       finishRun(run.id, 'ok', { summary: content.slice(0, 5000) });
+
+      // Store result hash on idempotency ledger for verification
+      updateIdempotencyResultHash(idemKey, content);
 
       // Mark agent as idle
       if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
-      // Handle delivery (skip heartbeat-ok and no-flush responses)
-      if (job.delivery_mode === 'announce' && !isHeartbeatOk && !isNoFlush && content.trim()) {
+      // Handle delivery (skip heartbeat-ok, no-flush, and idempotent-skip responses)
+      if (job.delivery_mode === 'announce' && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim()) {
         await handleDelivery(job, content);
       }
 
@@ -278,6 +355,10 @@ async function dispatchJob(job) {
       // Fire triggered children on success (pass content for trigger_condition evaluation)
       const triggered = fireTriggeredChildren(job.id, 'ok', content);
       if (triggered.length > 0) {
+        // Store parent run ID for chain idempotency key generation
+        for (const child of triggered) {
+          pendingChainKeys.set(child.id, run.id);
+        }
         log('info', `Triggered ${triggered.length} child job(s)`, {
           parentId: job.id,
           children: triggered.map(c => c.name),
@@ -297,6 +378,10 @@ async function dispatchJob(job) {
   } catch (err) {
     log('error', `Failed: ${job.name}: ${err.message}`, { jobId: job.id });
     finishRun(run.id, 'error', { error_message: err.message });
+
+    // Release idempotency key on failure so retries/replays can reclaim
+    releaseIdempotencyKey(idemKey);
+
     if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
     // Queue error message (before potential job deletion)
@@ -324,6 +409,10 @@ async function dispatchJob(job) {
       // No content available on error path — condition checks will use empty string
       const triggered = fireTriggeredChildren(job.id, 'error', err.message);
       if (triggered.length > 0) {
+        // Store parent run ID for chain idempotency key generation
+        for (const child of triggered) {
+          pendingChainKeys.set(child.id, run.id);
+        }
         log('info', `Triggered ${triggered.length} child job(s) on failure`, {
           parentId: job.id,
           children: triggered.map(c => c.name),
@@ -406,6 +495,14 @@ function buildJobPrompt(job, run) {
     } catch (err) {
       log('warn', `Retrieval context error for ${job.name}: ${err.message}`);
     }
+  }
+
+  // Inject idempotency key for at-least-once jobs
+  if (run.idempotency_key && job.delivery_guarantee === 'at-least-once') {
+    parts.push(`\n[IDEMPOTENCY KEY: ${run.idempotency_key}]`);
+    parts.push('This is an at-least-once job. Before performing side effects, verify this key');
+    parts.push('has not already been processed. If you\'ve already handled this exact execution,');
+    parts.push('respond with: IDEMPOTENT_SKIP');
   }
 
   parts.push('\n' + job.payload_message);
@@ -673,6 +770,7 @@ async function tick() {
       pruneRuns(100);
       pruneMessages(30);
       pruneApprovals(30);
+      pruneIdempotencyLedger();
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
       // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL

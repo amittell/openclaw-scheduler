@@ -10,8 +10,8 @@ export function createRun(jobId, opts = {}) {
   const id = randomUUID();
 
   db.prepare(`
-    INSERT INTO runs (id, job_id, status, run_timeout_ms, session_key, session_id, dispatched_at, context_summary, replay_of)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+    INSERT INTO runs (id, job_id, status, run_timeout_ms, session_key, session_id, dispatched_at, context_summary, replay_of, idempotency_key)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -20,7 +20,8 @@ export function createRun(jobId, opts = {}) {
     opts.session_key || null,
     opts.session_id || null,
     opts.context_summary ? JSON.stringify(opts.context_summary) : null,
-    opts.replay_of || null
+    opts.replay_of || null,
+    opts.idempotency_key || null
   );
 
   return getRun(id);

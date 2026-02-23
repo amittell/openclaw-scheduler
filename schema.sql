@@ -115,11 +115,15 @@ CREATE TABLE IF NOT EXISTS runs (
 
   -- Context & replay (v5)
   context_summary TEXT,                             -- JSON: {messages_injected,scope,...}
-  replay_of       TEXT                              -- run id if this is a crash replay
+  replay_of       TEXT,                             -- run id if this is a crash replay
+
+  -- Idempotency (v7)
+  idempotency_key TEXT                              -- deterministic key for dedup
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 'running';
+-- idx_runs_idempotency created by migrate-v7.js (cannot reference column before migration adds it)
 
 -- ============================================================
 -- MESSAGES: inter-agent message queue
@@ -208,6 +212,22 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
+
+-- ============================================================
+-- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS idempotency_ledger (
+  key             TEXT PRIMARY KEY,
+  job_id          TEXT NOT NULL,
+  run_id          TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'claimed',  -- claimed | released
+  claimed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  released_at     TEXT,
+  result_hash     TEXT,          -- optional: hash of the result for verification
+  expires_at      TEXT NOT NULL   -- auto-expire old entries to prevent unbounded growth
+);
+CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_ledger(expires_at);
+CREATE INDEX IF NOT EXISTS idx_idem_job ON idempotency_ledger(job_id);
 
 -- ============================================================
 -- TASK TRACKER: dead-man's-switch monitoring for sub-agent teams (v6)

@@ -70,6 +70,18 @@ export async function initDb() {
     process.stderr.write(`${ts} [db] migrate-v6 error: ${err.message}\n`);
   }
 
+  try {
+    const { default: migrateV7 } = await import('./migrate-v7.js');
+    const applied7 = migrateV7();
+    if (applied7) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] Applied migration v7\n`);
+    }
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] migrate-v7 error: ${err.message}\n`);
+  }
+
   return db;
 }
 
