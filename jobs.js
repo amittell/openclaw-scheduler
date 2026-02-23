@@ -199,12 +199,14 @@ export function pruneExpiredJobs() {
     WHERE enabled = 0
       AND next_run_at > datetime('now', '+300 days')
   `).run();
-  // Delete disabled jobs that haven't been updated in 24+ hours
-  // Catches monitoring/ad-hoc jobs that were disabled after completion
-  const disabledStale = db.prepare(`
+  // Delete any disabled job that's been sitting for >24h since last run (or creation if never ran)
+  const aged = db.prepare(`
     DELETE FROM jobs
     WHERE enabled = 0
-      AND updated_at < datetime('now', '-24 hours')
+      AND (
+        (last_run_at IS NOT NULL AND last_run_at < datetime('now', '-24 hours'))
+        OR (last_run_at IS NULL AND created_at < datetime('now', '-24 hours'))
+      )
   `).run();
   // Delete orphaned children whose parent no longer exists
   const orphans = db.prepare(`
@@ -212,7 +214,7 @@ export function pruneExpiredJobs() {
     WHERE parent_id IS NOT NULL
       AND parent_id NOT IN (SELECT id FROM jobs)
   `).run();
-  return oneShots.changes + stale.changes + disabledStale.changes + orphans.changes;
+  return oneShots.changes + stale.changes + aged.changes + orphans.changes;
 }
 
 /**

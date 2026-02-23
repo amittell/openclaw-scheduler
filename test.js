@@ -240,6 +240,19 @@ const pruned = pruneExpiredJobs();
 assert(pruned > 0, 'orphan pruned');
 assert(!getJob(orphan.id), 'orphan removed');
 
+// Aged disabled job cleanup
+const agedJob = createJob({ name: 'AgedDisabled', schedule_cron: '0 12 * * *', payload_message: 'aged', delivery_mode: 'none' });
+updateJob(agedJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
+const pruned2 = pruneExpiredJobs();
+assert(pruned2 > 0, 'aged disabled job pruned');
+assert(!getJob(agedJob.id), 'aged disabled job removed');
+
+// Disabled job < 24h should NOT be pruned
+const recentDisabled = createJob({ name: 'RecentDisabled', schedule_cron: '0 12 * * *', payload_message: 'recent', delivery_mode: 'none' });
+updateJob(recentDisabled.id, { enabled: 0 });
+pruneExpiredJobs();
+assert(getJob(recentDisabled.id), 'recently disabled job kept');
+
 // ═══════════════════════════════════════════════════════════
 // SECTION 3: Cycle detection + max depth (v3b)
 // ═══════════════════════════════════════════════════════════
