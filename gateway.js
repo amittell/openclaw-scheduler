@@ -76,7 +76,10 @@ export async function sendSystemEvent(text, mode = 'now') {
       `openclaw system event --text ${JSON.stringify(text)} --mode ${mode} --json`,
       { encoding: 'utf8', timeout: 30000 }
     );
-    return JSON.parse(result);
+    // Strip any non-JSON prefix (e.g. openclaw doctor output) before parsing
+    const jsonStart = result.indexOf('{');
+    const clean = jsonStart >= 0 ? result.slice(jsonStart) : result;
+    return JSON.parse(clean);
   } catch (err) {
     throw new Error(`system event failed: ${err.message}`);
   }
