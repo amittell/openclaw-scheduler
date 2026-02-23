@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Scheduler CLI — manage jobs, runs, messages, agents
-import { initDb } from './db.js';
-import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob } from './jobs.js';
+import { initDb, getDb } from './db.js';
+import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
@@ -22,6 +22,7 @@ Jobs:
   jobs delete <id>                   Delete a job
   jobs cancel <id> [--no-cascade]   Cancel a job (+ children by default)
   jobs update <id> <json>            Update job fields
+  jobs run <id>                      Trigger immediate run (sets next_run_at to now)
 
 Runs:
   runs list <job-id> [limit]         List runs for a job
@@ -41,6 +42,11 @@ Agents:
   agents list                        List registered agents
   agents get <id>                    Get agent details
   agents register <id> [name]        Register/update agent
+
+Aliases:
+  alias list                         List all delivery aliases
+  alias add <name> <ch> <tgt> [desc] Add a delivery alias
+  alias remove <name>                Remove a delivery alias
 
 Status:
   status                             Overall scheduler status
@@ -114,6 +120,12 @@ switch (command) {
       case 'update': {
         const job = updateJob(args[0], JSON.parse(args[1]));
         console.log('Updated:', fmt(job));
+        break;
+      }
+      case 'run': {
+        const job = runJobNow(args[0]);
+        if (!job) { console.error('Job not found:', args[0]); process.exit(1); }
+        console.log(`Scheduled for immediate run: ${job.name} (next_run_at: ${job.next_run_at})`);
         break;
       }
       default: usage();
@@ -236,6 +248,45 @@ switch (command) {
       default: usage();
     }
     break;
+
+  // ── Aliases ─────────────────────────────────────────────
+  case 'alias': {
+    const db = getDb();
+    switch (sub) {
+      case 'list': {
+        const aliases = db.prepare('SELECT alias, channel, target, description, created_at FROM delivery_aliases ORDER BY alias').all();
+        if (aliases.length === 0) { console.log('No aliases defined'); break; }
+        console.table(aliases.map(a => ({
+          alias: a.alias,
+          channel: a.channel,
+          target: a.target,
+          description: a.description || '',
+        })));
+        break;
+      }
+      case 'add': {
+        const [name, channel, target, ...descParts] = args;
+        if (!name || !channel || !target) {
+          console.error('Usage: alias add <name> <channel> <target> [description]');
+          process.exit(1);
+        }
+        const description = descParts.length > 0 ? descParts.join(' ') : null;
+        db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
+          .run(name, channel, target, description);
+        console.log(`Added alias: ${name} → ${channel}/${target}`);
+        break;
+      }
+      case 'remove': {
+        if (!args[0]) { console.error('Usage: alias remove <name>'); process.exit(1); }
+        const result = db.prepare('DELETE FROM delivery_aliases WHERE alias = ?').run(args[0]);
+        if (result.changes > 0) console.log(`Removed alias: ${args[0]}`);
+        else console.error(`Alias not found: ${args[0]}`);
+        break;
+      }
+      default: usage();
+    }
+    break;
+  }
 
   // ── Status ──────────────────────────────────────────────
   case 'status': {

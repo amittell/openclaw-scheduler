@@ -17,7 +17,7 @@ import { fileURLToPath } from 'url';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
+import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateHeartbeat, updateRunSession, pruneRuns
@@ -28,7 +28,8 @@ import {
 } from './messages.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
 import {
-  runAgentTurn, sendSystemEvent, listSessions, deliverMessage, checkGatewayHealth
+  runAgentTurn, sendSystemEvent, listSessions, deliverMessage, checkGatewayHealth,
+  resolveDeliveryAlias
 } from './gateway.js';
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -64,6 +65,13 @@ function log(level, msg, meta) {
 
 // ── Dispatch a single job ───────────────────────────────────
 async function dispatchJob(job) {
+  // Resource pool concurrency check — prevents different jobs from competing for the same resource
+  if (job.resource_pool && hasRunningRunForPool(job.resource_pool)) {
+    log('info', `Skipping ${job.name} — resource pool '${job.resource_pool}' busy`, { jobId: job.id, pool: job.resource_pool });
+    advanceNextRun(job);
+    return;
+  }
+
   // Overlap control
   if (hasRunningRun(job.id)) {
     if (job.overlap_policy === 'skip') {
@@ -136,8 +144,8 @@ async function dispatchJob(job) {
       // Update job state (may delete one-shot jobs)
       updateJobAfterRun(job, 'ok');
 
-      // Fire triggered children on success
-      const triggered = fireTriggeredChildren(job.id, 'ok');
+      // Fire triggered children on success (pass content for trigger_condition evaluation)
+      const triggered = fireTriggeredChildren(job.id, 'ok', content);
       if (triggered.length > 0) {
         log('info', `Triggered ${triggered.length} child job(s)`, {
           parentId: job.id,
@@ -182,7 +190,8 @@ async function dispatchJob(job) {
       getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
     } else {
       // Fire triggered children on failure (only after exhausting retries)
-      const triggered = fireTriggeredChildren(job.id, 'error');
+      // No content available on error path — condition checks will use empty string
+      const triggered = fireTriggeredChildren(job.id, 'error', err.message);
       if (triggered.length > 0) {
         log('info', `Triggered ${triggered.length} child job(s) on failure`, {
           parentId: job.id,
@@ -203,7 +212,22 @@ async function dispatchJob(job) {
 // ── Build the prompt sent to the agent ──────────────────────
 function buildJobPrompt(job, run) {
   const parts = [`[scheduler:${job.id} ${job.name}]`];
-  
+
+  // Global sub-agent scope: instruct the agent to query across all sessions
+  if (job.payload_scope === 'global') {
+    parts.push(
+      '\n[SYSTEM NOTE — scope=global]',
+      'This job has cross-session sub-agent visibility enabled.',
+      'When you need to list or inspect sub-agents, do NOT use `subagents list`',
+      '(which only shows sub-agents spawned by the current session).',
+      'Instead, call `sessions_list` with no session filter to enumerate ALL active',
+      'sessions across every requester, then filter by session key prefix or agent id.',
+      'This lets you observe sub-agents spawned from the main Telegram session or any',
+      'other session — not just this isolated scheduler session.',
+      '[END SYSTEM NOTE]',
+    );
+  }
+
   // Include any pending messages for this agent
   const inbox = getInbox(job.agent_id || 'main', { limit: 5 });
   if (inbox.length > 0) {
@@ -220,14 +244,37 @@ function buildJobPrompt(job, run) {
   return parts.join('\n');
 }
 
+// ── Alias resolution ────────────────────────────────────────
+/**
+ * Resolve a delivery alias from the delivery_aliases table.
+ * Accepts '@name' or bare 'name'. Returns { channel, target } or null.
+ */
+function resolveAlias(target) {
+  if (!target) return null;
+  return resolveDeliveryAlias(target);
+}
+
 // ── Deliver run output to channel ───────────────────────────
 async function handleDelivery(job, content) {
   if (job.delivery_mode !== 'announce') return;
   if (!job.delivery_channel && !job.delivery_to) return;
 
+  let channel = job.delivery_channel;
+  let target = job.delivery_to;
+
+  // Resolve alias before delivery (e.g. '@team_room' → telegram/-1000000001)
+  if (target) {
+    const resolved = resolveAlias(target);
+    if (resolved) {
+      channel = resolved.channel;
+      target = resolved.target;
+      log('info', `Resolved alias '${job.delivery_to}' → ${channel}/${target}`);
+    }
+  }
+
   try {
-    await deliverMessage(job.delivery_channel, job.delivery_to, content);
-    log('info', `Delivered: ${job.name}`, { channel: job.delivery_channel, to: job.delivery_to });
+    await deliverMessage(channel, target, content);
+    log('info', `Delivered: ${job.name}`, { channel, to: target });
   } catch (err) {
     log('error', `Delivery failed: ${job.name}: ${err.message}`);
   }

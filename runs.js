@@ -142,3 +142,14 @@ export function pruneRuns(keepPerJob = 100) {
     `).run(job.id, job.id, keepPerJob);
   }
 }
+
+/**
+ * Get all running runs for jobs in a given resource pool.
+ */
+export function getRunningRunsByPool(poolName) {
+  return getDb().prepare(`
+    SELECT r.*, j.name as job_name FROM runs r
+    JOIN jobs j ON r.job_id = j.id
+    WHERE r.status = 'running' AND j.resource_pool = ?
+  `).all(poolName);
+}

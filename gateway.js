@@ -1,5 +1,6 @@
 // Gateway API client — independent dispatch via chat completions + system events
 import { execSync, spawn } from 'child_process';
+import { getDb } from './db.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -115,14 +116,43 @@ export async function listSessions(opts = {}) {
 }
 
 /**
+ * Resolve a delivery alias. Returns { channel, target } or null.
+ * Accepts '@name' or bare 'name'. Falls through to null if not found.
+ */
+export function resolveDeliveryAlias(rawTarget) {
+  if (!rawTarget) return null;
+  try {
+    const db = getDb();
+    const name = rawTarget.startsWith('@') ? rawTarget.slice(1) : rawTarget;
+    const row = db.prepare('SELECT channel, target FROM delivery_aliases WHERE alias = ?').get(name);
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Send a message to a Telegram/channel target via message tool.
+ * Automatically resolves delivery aliases (e.g. '@team_room', 'owner_dm').
  */
 export async function deliverMessage(channel, target, message) {
+  let resolvedChannel = channel;
+  let resolvedTarget = target;
+
+  // Resolve alias: try '@name' strip and bare name lookup
+  if (target) {
+    const alias = resolveDeliveryAlias(target);
+    if (alias) {
+      resolvedChannel = alias.channel;
+      resolvedTarget = alias.target;
+    }
+  }
+
   return invokeGatewayTool('message', {
     action: 'send',
     message,
-    ...(channel ? { channel } : {}),
-    ...(target ? { target } : {}),
+    ...(resolvedChannel ? { channel: resolvedChannel } : {}),
+    ...(resolvedTarget ? { target: resolvedTarget } : {}),
   });
 }
 

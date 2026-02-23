@@ -46,12 +46,21 @@ CREATE TABLE IF NOT EXISTS jobs (
   trigger_on      TEXT,                         -- 'success' | 'failure' | 'complete' | NULL
   trigger_delay_s INTEGER DEFAULT 0,
 
+  -- Output-based trigger condition (v4)
+  trigger_condition TEXT DEFAULT NULL,           -- 'contains:ALERT' | 'regex:pattern' | NULL
+
   -- Retry logic (v3b)
   max_retries     INTEGER DEFAULT 0,             -- 0 = no retry
 
   -- Queue overlap (v3c)
   queued_count    INTEGER DEFAULT 0,             -- pending dispatches waiting for current run
   
+  -- Sub-agent scope (v3c)
+  payload_scope   TEXT NOT NULL DEFAULT 'own',   -- 'own' | 'global'
+
+  -- Resource pool (concurrency across different jobs)
+  resource_pool   TEXT DEFAULT NULL,
+
   -- Scheduling state (denormalized)
   next_run_at     TEXT,
   last_run_at     TEXT,
@@ -147,6 +156,21 @@ CREATE TABLE IF NOT EXISTS agents (
   capabilities    TEXT,                               -- JSON array of capability tags
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ============================================================
+-- DELIVERY ALIASES: named targets for job delivery
+-- ============================================================
+CREATE TABLE IF NOT EXISTS delivery_aliases (
+  alias       TEXT PRIMARY KEY,
+  channel     TEXT NOT NULL,
+  target      TEXT NOT NULL,
+  description TEXT,
+  created_at  TEXT DEFAULT (datetime('now'))
+);
+
+INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VALUES
+  ('team_room', 'telegram', '-1000000001', 'Team room'),
+  ('owner_dm',       'telegram', '1000000001',   'Owner DM');
 
 -- ============================================================
 -- MIGRATION LOG

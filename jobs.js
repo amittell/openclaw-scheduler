@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { getDb } from './db.js';
 
+
 const MAX_CHAIN_DEPTH = 10;
 
 /**
@@ -34,7 +35,12 @@ export function createJob(opts) {
     }
   }
 
-  const nextRun = isChild ? null : nextRunFromCron(cronExpr, opts.schedule_tz || 'America/New_York');
+  let nextRun;
+  if (opts.run_now) {
+    nextRun = new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  } else {
+    nextRun = isChild ? null : nextRunFromCron(cronExpr, opts.schedule_tz || 'America/New_York');
+  }
 
   const stmt = db.prepare(`
     INSERT INTO jobs (
@@ -45,7 +51,8 @@ export function createJob(opts) {
       delivery_mode, delivery_channel, delivery_to,
       delete_after_run, next_run_at,
       parent_id, trigger_on, trigger_delay_s,
-      max_retries
+      max_retries, payload_scope, resource_pool,
+      trigger_condition
     ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -54,7 +61,8 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?,
       ?, ?, ?,
-      ?
+      ?, ?,
+      ?, ?
     )
   `);
 
@@ -81,7 +89,10 @@ export function createJob(opts) {
     opts.parent_id || null,
     opts.trigger_on || null,
     opts.trigger_delay_s || 0,
-    opts.max_retries || 0
+    opts.max_retries || 0,
+    opts.payload_scope || 'own',
+    opts.resource_pool || null,
+    opts.trigger_condition || null
   );
 
   return getJob(id);
@@ -118,7 +129,7 @@ export function updateJob(id, patch) {
     'delivery_mode', 'delivery_channel', 'delivery_to',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
     'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
-    'max_retries'
+    'max_retries', 'payload_scope', 'resource_pool', 'trigger_condition'
   ];
 
   // Cycle detection if parent_id is being changed
@@ -164,6 +175,17 @@ export function updateJob(id, patch) {
  */
 export function deleteJob(id) {
   getDb().prepare('DELETE FROM jobs WHERE id = ?').run(id);
+}
+
+/**
+ * Schedule an existing job for immediate execution by setting next_run_at to 1 second in the past.
+ * The job's cron schedule is unchanged; after it runs, updateJobAfterRun restores normal scheduling.
+ */
+export function runJobNow(id) {
+  const db = getDb();
+  const pastSecond = new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  db.prepare(`UPDATE jobs SET next_run_at = ?, updated_at = datetime('now') WHERE id = ?`).run(pastSecond, id);
+  return getJob(id);
 }
 
 /**
@@ -236,21 +258,55 @@ export function getChildJobs(parentId) {
 }
 
 /**
- * Fire triggered children by setting their next_run_at.
- * Returns count of children triggered.
+ * Evaluate a trigger_condition pattern against parent run output content.
+ * Supports:
+ *   - null / undefined → always matches (no condition)
+ *   - "contains:<substr>" → substring match (case-sensitive)
+ *   - "regex:<pattern>" → regex match
+ * Returns true if the condition matches (or is absent).
  */
-export function fireTriggeredChildren(parentId, status) {
-  const children = getTriggeredChildren(parentId, status);
+export function evalTriggerCondition(condition, content) {
+  if (!condition) return true;
+  const str = content || '';
+  if (condition.startsWith('contains:')) {
+    const substr = condition.slice('contains:'.length);
+    return str.includes(substr);
+  }
+  if (condition.startsWith('regex:')) {
+    const pattern = condition.slice('regex:'.length);
+    try {
+      return new RegExp(pattern).test(str);
+    } catch {
+      return false; // Invalid regex never matches
+    }
+  }
+  // Unknown prefix — treat as literal substring match for safety
+  return str.includes(condition);
+}
+
+/**
+ * Fire triggered children by setting their next_run_at.
+ * @param {string} parentId - parent job id
+ * @param {string} status - 'ok' | 'error'
+ * @param {string} [content] - parent run output (used to evaluate trigger_condition)
+ * Returns array of triggered children.
+ */
+export function fireTriggeredChildren(parentId, status, content) {
+  const candidates = getTriggeredChildren(parentId, status);
   const db = getDb();
-  for (const child of children) {
+  const triggered = [];
+  for (const child of candidates) {
+    // Check output-based trigger condition if set
+    if (!evalTriggerCondition(child.trigger_condition, content)) continue;
     const delay = child.trigger_delay_s || 0;
     if (delay > 0) {
       db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?`).run(delay, child.id);
     } else {
       db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
     }
+    triggered.push(child);
   }
-  return children;
+  return triggered;
 }
 
 /**
@@ -370,6 +426,20 @@ export function cancelJob(jobId, opts = {}) {
   }
 
   return cancelled;
+}
+
+/**
+ * Check if ANY job with the given resource_pool has a running run.
+ * Returns true if the pool is busy (at least one running run for any job in the pool).
+ */
+export function hasRunningRunForPool(poolName) {
+  if (!poolName) return false;
+  const row = getDb().prepare(`
+    SELECT COUNT(*) as cnt FROM runs r
+    JOIN jobs j ON r.job_id = j.id
+    WHERE r.status = 'running' AND j.resource_pool = ?
+  `).get(poolName);
+  return row.cnt > 0;
 }
 
 /**

@@ -34,6 +34,18 @@ export function initDb() {
   const db = getDb();
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
+
+  // Incremental migrations — wrapped in try/catch since ALTER TABLE ADD COLUMN
+  // fails if the column already exists (SQLite has no IF NOT EXISTS for columns).
+  const migrations = [
+    `ALTER TABLE jobs ADD COLUMN payload_scope TEXT NOT NULL DEFAULT 'own'`,
+    `ALTER TABLE jobs ADD COLUMN resource_pool TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN trigger_condition TEXT DEFAULT NULL`,
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch { /* column already exists — safe to ignore */ }
+  }
+
   return db;
 }
 
