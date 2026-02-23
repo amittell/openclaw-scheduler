@@ -37,8 +37,38 @@ export function initDb() {
   return db;
 }
 
+/**
+ * Checkpoint WAL to main DB file. Call periodically to minimize
+ * data loss window on crash/SIGKILL. Returns checkpoint stats.
+ */
+export function checkpointWal() {
+  if (!_db) return null;
+  try {
+    const result = _db.pragma('wal_checkpoint(PASSIVE)');
+    return result?.[0] || null;
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] WAL checkpoint error: ${err.message}\n`);
+    return null;
+  }
+}
+
 export function closeDb() {
   if (_db) {
+    try {
+      // Checkpoint WAL to main DB before closing to prevent data loss
+      const result = _db.pragma('wal_checkpoint(TRUNCATE)');
+      const ts = new Date().toISOString();
+      if (result && result[0]) {
+        const r = result[0];
+        process.stderr.write(`${ts} [db] WAL checkpoint on close: busy=${r.busy}, checkpointed=${r.checkpointed}, log=${r.log}\n`);
+      } else {
+        process.stderr.write(`${ts} [db] WAL checkpoint on close: ok\n`);
+      }
+    } catch (err) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] WAL checkpoint failed on close: ${err.message}\n`);
+    }
     _db.close();
     _db = null;
   }

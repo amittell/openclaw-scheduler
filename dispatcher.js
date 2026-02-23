@@ -12,7 +12,7 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
-import { initDb, closeDb, getDb } from './db.js';
+import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
@@ -403,6 +403,11 @@ async function tick() {
       pruneMessages(30);
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
+      // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL
+      const cpResult = checkpointWal();
+      if (cpResult) {
+        log('debug', `WAL checkpoint: log=${cpResult.log}, checkpointed=${cpResult.checkpointed}, busy=${cpResult.busy}`);
+      }
       log('info', 'Pruned old runs + messages');
     } catch (err) {
       log('error', `Prune error: ${err.message}`);
@@ -414,7 +419,17 @@ async function tick() {
 function shutdown(signal) {
   log('info', `Shutting down (${signal})`);
   running = false;
+  try {
+    // Force WAL checkpoint before close to ensure all data is in main DB
+    const cpResult = checkpointWal();
+    if (cpResult) {
+      log('info', `Shutdown WAL checkpoint: log=${cpResult.log}, checkpointed=${cpResult.checkpointed}, busy=${cpResult.busy}`);
+    }
+  } catch (err) {
+    log('error', `Shutdown checkpoint failed: ${err.message}`);
+  }
   closeDb();
+  log('info', 'Shutdown complete');
   process.exit(0);
 }
 
