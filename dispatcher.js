@@ -12,7 +12,11 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import { getDueJobs, hasRunningRun, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
@@ -38,6 +42,7 @@ const STALE_THRESHOLD_S = parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '9
 const HEARTBEAT_CHECK_MS = parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || '30000', 10);
 const MESSAGE_DELIVERY_MS = parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS || '15000', 10);
 const PRUNE_INTERVAL_MS = parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10);
+const BACKUP_INTERVAL_MS = parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10); // 5 min
 const LOG_PREFIX = '[scheduler]';
 
 // ── State ───────────────────────────────────────────────────
@@ -45,6 +50,7 @@ let running = true;
 let lastHeartbeatCheck = 0;
 let lastMessageDelivery = 0;
 let lastPrune = 0;
+let lastBackup = 0;
 let gatewayHealthy = true;
 
 // ── Logging ─────────────────────────────────────────────────
@@ -411,6 +417,23 @@ async function tick() {
       log('info', 'Pruned old runs + messages');
     } catch (err) {
       log('error', `Prune error: ${err.message}`);
+    }
+  }
+
+  // 5. Backup to MinIO (every BACKUP_INTERVAL_MS, default 5 min)
+  if (now - lastBackup >= BACKUP_INTERVAL_MS) {
+    lastBackup = now;
+    try {
+      const isRollup = new Date().getMinutes() < (BACKUP_INTERVAL_MS / 60000);
+      const mode = isRollup ? 'rollup' : 'snapshot';
+      const { execSync } = await import('child_process');
+      execSync(`node "${join(__dirname, 'backup.js')}" ${mode}`, {
+        timeout: 30000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      log('debug', `Backup ${mode} completed`);
+    } catch (err) {
+      log('error', `Backup failed: ${err.stderr?.toString()?.trim() || err.message}`);
     }
   }
 }
