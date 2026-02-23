@@ -30,20 +30,44 @@ export function getDb() {
   return _db;
 }
 
-export function initDb() {
+export async function initDb() {
   const db = getDb();
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
 
-  // Incremental migrations — wrapped in try/catch since ALTER TABLE ADD COLUMN
-  // fails if the column already exists (SQLite has no IF NOT EXISTS for columns).
-  const migrations = [
+  // Legacy inline migrations (v2→v3 era) — kept for backwards compat
+  const legacyMigrations = [
     `ALTER TABLE jobs ADD COLUMN payload_scope TEXT NOT NULL DEFAULT 'own'`,
     `ALTER TABLE jobs ADD COLUMN resource_pool TEXT DEFAULT NULL`,
     `ALTER TABLE jobs ADD COLUMN trigger_condition TEXT DEFAULT NULL`,
   ];
-  for (const sql of migrations) {
+  for (const sql of legacyMigrations) {
     try { db.exec(sql); } catch { /* column already exists — safe to ignore */ }
+  }
+
+  // Run versioned migrations (v5+) — each checks its own version guard
+  try {
+    const { default: migrateV5 } = await import('./migrate-v5.js');
+    const applied5 = migrateV5();
+    if (applied5) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] Applied migration v5\n`);
+    }
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] migrate-v5 error: ${err.message}\n`);
+  }
+
+  try {
+    const { default: migrateV6 } = await import('./migrate-v6.js');
+    const applied6 = migrateV6();
+    if (applied6) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] Applied migration v6\n`);
+    }
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] migrate-v6 error: ${err.message}\n`);
   }
 
   return db;

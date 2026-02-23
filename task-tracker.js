@@ -1,0 +1,240 @@
+// Task Tracker — dead-man's-switch monitoring for sub-agent teams
+import { getDb } from './db.js';
+import { randomUUID } from 'crypto';
+
+// ── Helpers ─────────────────────────────────────────────────
+function sqliteNow() {
+  return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+// ── Create a new tracked task group ─────────────────────────
+/**
+ * @param {object} opts
+ * @param {string} opts.name - Human label e.g. "v5-agent-team"
+ * @param {string[]} opts.expectedAgents - Array of agent labels
+ * @param {number} [opts.timeoutS=600] - Timeout in seconds
+ * @param {string} [opts.createdBy='main'] - Who spawned the task group
+ * @param {string} [opts.deliveryChannel] - Where to send updates
+ * @param {string} [opts.deliveryTo] - Target for updates
+ * @returns {{ id: string, name: string, status: string, agents: Array<{agent_label: string, status: string}> }}
+ */
+export function createTaskGroup({ name, expectedAgents, timeoutS = 600, createdBy = 'main', deliveryChannel, deliveryTo }) {
+  const db = getDb();
+  const id = randomUUID();
+  const now = sqliteNow();
+
+  db.prepare(`
+    INSERT INTO task_tracker (id, name, created_at, created_by, expected_agents, timeout_s, status, delivery_channel, delivery_to)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(id, name, now, createdBy, JSON.stringify(expectedAgents), timeoutS, deliveryChannel || null, deliveryTo || null);
+
+  const insertAgent = db.prepare(`
+    INSERT INTO task_tracker_agents (id, tracker_id, agent_label, status)
+    VALUES (?, ?, ?, 'pending')
+  `);
+
+  const agents = [];
+  for (const label of expectedAgents) {
+    const agentId = randomUUID();
+    insertAgent.run(agentId, id, label);
+    agents.push({ agent_label: label, status: 'pending' });
+  }
+
+  return { id, name, status: 'active', created_at: now, created_by: createdBy, agents };
+}
+
+// ── Get task group by id ────────────────────────────────────
+/**
+ * @param {string} id
+ * @returns {object|undefined}
+ */
+export function getTaskGroup(id) {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_tracker WHERE id = ?').get(id);
+}
+
+// ── List active task groups ─────────────────────────────────
+/**
+ * @returns {object[]}
+ */
+export function listActiveTaskGroups() {
+  const db = getDb();
+  return db.prepare("SELECT * FROM task_tracker WHERE status = 'active' ORDER BY created_at DESC").all();
+}
+
+// ── Agent reports it started ────────────────────────────────
+/**
+ * @param {string} trackerId
+ * @param {string} agentLabel
+ */
+export function agentStarted(trackerId, agentLabel) {
+  const db = getDb();
+  const now = sqliteNow();
+  db.prepare(`
+    UPDATE task_tracker_agents
+    SET status = 'running', started_at = ?
+    WHERE tracker_id = ? AND agent_label = ?
+  `).run(now, trackerId, agentLabel);
+}
+
+// ── Agent reports completion ────────────────────────────────
+/**
+ * @param {string} trackerId
+ * @param {string} agentLabel
+ * @param {string} [exitMessage]
+ */
+export function agentCompleted(trackerId, agentLabel, exitMessage) {
+  const db = getDb();
+  const now = sqliteNow();
+  db.prepare(`
+    UPDATE task_tracker_agents
+    SET status = 'completed', finished_at = ?, exit_message = ?
+    WHERE tracker_id = ? AND agent_label = ?
+  `).run(now, exitMessage || null, trackerId, agentLabel);
+}
+
+// ── Agent reports failure ───────────────────────────────────
+/**
+ * @param {string} trackerId
+ * @param {string} agentLabel
+ * @param {string} [error]
+ */
+export function agentFailed(trackerId, agentLabel, error) {
+  const db = getDb();
+  const now = sqliteNow();
+  db.prepare(`
+    UPDATE task_tracker_agents
+    SET status = 'failed', finished_at = ?, error = ?
+    WHERE tracker_id = ? AND agent_label = ?
+  `).run(now, error || null, trackerId, agentLabel);
+}
+
+// ── Check for dead agents (timeout exceeded) ────────────────
+/**
+ * Find agents with status IN ('pending','running') whose parent task_tracker
+ * has exceeded its timeout_s. Marks those agents as 'dead'.
+ * @returns {Array<{tracker_id: string, agent_label: string, agent_id: string}>}
+ */
+export function checkDeadAgents() {
+  const db = getDb();
+  const now = sqliteNow();
+
+  // Find agents in active trackers that have exceeded timeout
+  const deadAgents = db.prepare(`
+    SELECT a.id as agent_id, a.tracker_id, a.agent_label, a.status as agent_status,
+           t.timeout_s, t.created_at as tracker_created_at
+    FROM task_tracker_agents a
+    JOIN task_tracker t ON a.tracker_id = t.id
+    WHERE a.status IN ('pending', 'running')
+      AND t.status = 'active'
+      AND (julianday(?) - julianday(t.created_at)) * 86400 >= t.timeout_s
+  `).all(now);
+
+  // Mark them as dead
+  const markDead = db.prepare(`
+    UPDATE task_tracker_agents
+    SET status = 'dead', finished_at = ?, error = 'Timed out (dead-man switch)'
+    WHERE id = ?
+  `);
+
+  for (const agent of deadAgents) {
+    markDead.run(now, agent.agent_id);
+  }
+
+  return deadAgents;
+}
+
+// ── Check if all agents in a group are done ─────────────────
+/**
+ * If all agents are in terminal state (completed/failed/dead), mark the tracker.
+ * Status = 'completed' if all succeeded, 'failed' if any failed/dead.
+ * @param {string} trackerId
+ * @returns {object|null} - The updated tracker, or null if not yet complete
+ */
+export function checkGroupCompletion(trackerId) {
+  const db = getDb();
+  const now = sqliteNow();
+
+  const tracker = db.prepare('SELECT * FROM task_tracker WHERE id = ?').get(trackerId);
+  if (!tracker || tracker.status !== 'active') return null;
+
+  const agents = db.prepare('SELECT * FROM task_tracker_agents WHERE tracker_id = ?').all(trackerId);
+  if (agents.length === 0) return null;
+
+  const terminalStatuses = ['completed', 'failed', 'dead'];
+  const allTerminal = agents.every(a => terminalStatuses.includes(a.status));
+  if (!allTerminal) return null;
+
+  // Determine group status
+  const anyFailed = agents.some(a => a.status === 'failed' || a.status === 'dead');
+  const groupStatus = anyFailed ? 'failed' : 'completed';
+
+  // Build summary
+  const summaryParts = agents.map(a => {
+    const label = a.agent_label;
+    if (a.status === 'completed') return `✅ ${label}: ${a.exit_message || 'done'}`;
+    if (a.status === 'failed') return `❌ ${label}: ${a.error || 'failed'}`;
+    if (a.status === 'dead') return `💀 ${label}: timed out`;
+    return `⬜ ${label}: ${a.status}`;
+  });
+  const summary = summaryParts.join('\n');
+
+  db.prepare(`
+    UPDATE task_tracker
+    SET status = ?, completed_at = ?, summary = ?
+    WHERE id = ?
+  `).run(groupStatus, now, summary, trackerId);
+
+  return { ...tracker, status: groupStatus, completed_at: now, summary };
+}
+
+// ── Get status summary for a task group ─────────────────────
+/**
+ * @param {string} trackerId
+ * @returns {{ name: string, status: string, agents: Array<{label: string, status: string, duration: number|null, exit_message?: string, error?: string}>, elapsed: number, remaining_timeout: number }}
+ */
+export function getTaskGroupStatus(trackerId) {
+  const db = getDb();
+
+  const tracker = db.prepare('SELECT * FROM task_tracker WHERE id = ?').get(trackerId);
+  if (!tracker) return null;
+
+  const agents = db.prepare('SELECT * FROM task_tracker_agents WHERE tracker_id = ? ORDER BY agent_label').all(trackerId);
+
+  const now = new Date();
+  const createdAt = new Date(tracker.created_at + 'Z');
+  const elapsedS = Math.floor((now - createdAt) / 1000);
+  const remainingTimeout = Math.max(0, tracker.timeout_s - elapsedS);
+
+  const agentStatuses = agents.map(a => {
+    let duration = null;
+    if (a.started_at && a.finished_at) {
+      const start = new Date(a.started_at + 'Z');
+      const end = new Date(a.finished_at + 'Z');
+      duration = Math.floor((end - start) / 1000);
+    } else if (a.started_at) {
+      const start = new Date(a.started_at + 'Z');
+      duration = Math.floor((now - start) / 1000);
+    }
+
+    return {
+      label: a.agent_label,
+      status: a.status,
+      duration,
+      exit_message: a.exit_message || undefined,
+      error: a.error || undefined,
+    };
+  });
+
+  return {
+    id: tracker.id,
+    name: tracker.name,
+    status: tracker.status,
+    agents: agentStatuses,
+    elapsed: elapsedS,
+    remaining_timeout: remainingTimeout,
+    summary: tracker.summary || undefined,
+    delivery_channel: tracker.delivery_channel,
+    delivery_to: tracker.delivery_to,
+  };
+}

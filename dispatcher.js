@@ -36,6 +36,9 @@ import {
   runAgentTurn, sendSystemEvent, listSessions, deliverMessage, checkGatewayHealth,
   resolveDeliveryAlias
 } from './gateway.js';
+import {
+  listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus
+} from './task-tracker.js';
 
 // ── Helpers ─────────────────────────────────────────────────
 function sqliteNow() {
@@ -532,6 +535,50 @@ async function checkRunHealth() {
   }
 }
 
+// ── Task tracker dead-man's-switch ──────────────────────────
+async function checkTaskTrackers() {
+  try {
+    // 1. Check for dead agents across all active groups
+    const deadAgents = checkDeadAgents();
+    if (deadAgents.length > 0) {
+      log('warn', `Marked ${deadAgents.length} dead agent(s)`, {
+        agents: deadAgents.map(d => `${d.tracker_id.slice(0, 8)}/${d.agent_label}`),
+      });
+    }
+
+    // 2. Check completion for each active group
+    const activeGroups = listActiveTaskGroups();
+    for (const group of activeGroups) {
+      const result = checkGroupCompletion(group.id);
+      if (result) {
+        const status = getTaskGroupStatus(group.id);
+        const emoji = result.status === 'completed' ? '✅' : '❌';
+        const msg = `${emoji} Task group "${group.name}" ${result.status}\n\n${result.summary || ''}`;
+        log('info', `Task group ${result.status}: ${group.name}`, { trackerId: group.id });
+
+        // Deliver summary if delivery channel is configured
+        if (group.delivery_channel && group.delivery_to) {
+          try {
+            let channel = group.delivery_channel;
+            let target = group.delivery_to;
+            const resolved = resolveDeliveryAlias(target);
+            if (resolved) {
+              channel = resolved.channel;
+              target = resolved.target;
+            }
+            await deliverMessage(channel, target, msg);
+            log('info', `Task tracker summary delivered`, { channel, target, trackerId: group.id });
+          } catch (err) {
+            log('error', `Task tracker delivery failed: ${err.message}`, { trackerId: group.id });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log('error', `Task tracker check error: ${err.message}`);
+  }
+}
+
 // ── Message delivery loop ───────────────────────────────────
 async function deliverPendingMessages() {
   // Expire old messages
@@ -614,6 +661,9 @@ async function tick() {
     try { await deliverPendingMessages(); } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
     }
+    try { await checkTaskTrackers(); } catch (err) {
+      log('error', `Task tracker error: ${err.message}`);
+    }
   }
 
   // 4. Prune (hourly)
@@ -679,7 +729,7 @@ async function main() {
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,
   });
 
-  initDb();
+  await initDb();
 
   // Register default agent
   upsertAgent('main', { name: 'Main Agent', status: 'idle', capabilities: ['*'] });

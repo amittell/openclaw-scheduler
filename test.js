@@ -37,7 +37,7 @@ function assert(cond, msg) {
 
 // ── In-memory DB ────────────────────────────────────────────
 setDbPath(':memory:');
-initDb();
+await initDb();
 const db = getDb();
 
 console.log('🧪 Scheduler v2 test suite\n');
@@ -1044,6 +1044,81 @@ console.log('\n── v5: Migration Idempotency ──');
   // Verify new column on messages
   const msgCols = getDb().prepare('PRAGMA table_info(messages)').all().map(c => c.name);
   assert(msgCols.includes('owner'), 'messages has owner column');
+}
+
+console.log('\n── v5: Task Tracker ──');
+{
+  const tt = await import('./task-tracker.js');
+
+  // Create a task group
+  const group = tt.createTaskGroup({
+    name: 'test-agent-team',
+    expectedAgents: ['agent-a', 'agent-b', 'agent-c'],
+    timeoutS: 300,
+    createdBy: 'test',
+    deliveryChannel: 'telegram',
+    deliveryTo: '-123',
+  });
+  assert(group !== undefined, 'task group created');
+  assert(group.status === 'active', 'task group status is active');
+
+  // Check agents were created
+  const status = tt.getTaskGroupStatus(group.id);
+  assert(status.agents.length === 3, 'task group has 3 agents');
+  assert(status.agents.every(a => a.status === 'pending'), 'all agents pending initially');
+
+  // Agent starts
+  tt.agentStarted(group.id, 'agent-a');
+  const s2 = tt.getTaskGroupStatus(group.id);
+  const agentA = s2.agents.find(a => a.label === 'agent-a');
+  assert(agentA.status === 'running', 'agent-a is running after start');
+
+  // Agent completes
+  tt.agentCompleted(group.id, 'agent-a', 'All good, 50 files processed');
+  const s3 = tt.getTaskGroupStatus(group.id);
+  const agentADone = s3.agents.find(a => a.label === 'agent-a');
+  assert(agentADone.status === 'completed', 'agent-a completed');
+  assert(agentADone.exit_message === 'All good, 50 files processed', 'exit message stored');
+
+  // Agent fails
+  tt.agentFailed(group.id, 'agent-b', 'Syntax error in output');
+  const s4 = tt.getTaskGroupStatus(group.id);
+  const agentB = s4.agents.find(a => a.label === 'agent-b');
+  assert(agentB.status === 'failed', 'agent-b failed');
+  assert(agentB.error === 'Syntax error in output', 'error message stored');
+
+  // Group not complete yet (agent-c still pending)
+  const completion1 = tt.checkGroupCompletion(group.id);
+  assert(completion1 === null || completion1.status === 'active', 'group not complete with pending agent');
+
+  // Complete the last agent
+  tt.agentStarted(group.id, 'agent-c');
+  tt.agentCompleted(group.id, 'agent-c', 'Done');
+  const completion2 = tt.checkGroupCompletion(group.id);
+  assert(completion2 !== null, 'group completion detected');
+  assert(completion2.status === 'failed', 'group failed because agent-b failed');
+
+  // List should not show completed groups
+  const active = tt.listActiveTaskGroups();
+  assert(!active.some(g => g.id === group.id), 'completed group not in active list');
+
+  // Test dead agent detection with a short timeout
+  const group2 = tt.createTaskGroup({
+    name: 'timeout-test',
+    expectedAgents: ['slow-agent'],
+    timeoutS: 0, // immediate timeout for testing
+    createdBy: 'test',
+  });
+  tt.agentStarted(group2.id, 'slow-agent');
+  const dead = tt.checkDeadAgents();
+  assert(dead.length > 0, 'dead agent detected after timeout');
+  const deadAgent = dead.find(d => d.tracker_id === group2.id);
+  assert(deadAgent !== undefined, 'correct dead agent found');
+
+  // After marking dead, group should complete as failed
+  tt.checkGroupCompletion(group2.id);
+  const g2 = tt.getTaskGroup(group2.id);
+  assert(g2.status === 'failed', 'group with dead agent marked failed');
 }
 
 closeDb();

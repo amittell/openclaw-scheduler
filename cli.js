@@ -45,6 +45,12 @@ Agents:
   agents get <id>                    Get agent details
   agents register <id> [name]        Register/update agent
 
+Tasks:
+  tasks list                         List active task groups
+  tasks status <id>                  Detailed status of a task group
+  tasks create <json>                Create a tracked task group
+  tasks history [limit]              Recent completed task groups
+
 Approvals:
   approvals list                     List pending approvals
   approvals pending                  Alias for list
@@ -59,7 +65,7 @@ Status:
 `);
 }
 
-initDb();
+await initDb();
 
 function fmt(obj) { return JSON.stringify(obj, null, 2); }
 
@@ -269,6 +275,71 @@ switch (command) {
       case 'register': {
         const a = upsertAgent(args[0], { name: args[1] || args[0] });
         console.log('Registered:', fmt(a));
+        break;
+      }
+      default: usage();
+    }
+    break;
+
+  // ── Tasks ────────────────────────────────────────────────
+  case 'tasks':
+    switch (sub) {
+      case 'list': {
+        const { listActiveTaskGroups, getTaskGroupStatus } = await import('./task-tracker.js');
+        const groups = listActiveTaskGroups();
+        if (groups.length === 0) { console.log('No active task groups'); break; }
+        console.table(groups.map(g => {
+          const status = getTaskGroupStatus(g.id);
+          const agents = JSON.parse(g.expected_agents);
+          return {
+            id: g.id.slice(0, 8) + '…',
+            name: g.name,
+            agents: `${status.agents.filter(a => a.status === 'completed').length}/${agents.length}`,
+            status: g.status,
+            elapsed: `${status.elapsed}s`,
+            timeout: `${g.timeout_s}s`,
+          };
+        }));
+        break;
+      }
+      case 'status': {
+        const { getTaskGroupStatus } = await import('./task-tracker.js');
+        const status = getTaskGroupStatus(args[0]);
+        if (!status) { console.error('Task group not found:', args[0]); process.exit(1); }
+        console.log(`\nTask Group: ${status.name}`);
+        console.log(`Status:     ${status.status}`);
+        console.log(`Elapsed:    ${status.elapsed}s / ${status.remaining_timeout + status.elapsed}s timeout`);
+        console.log(`\nAgents:`);
+        for (const a of status.agents) {
+          const icon = a.status === 'completed' ? '✅' : a.status === 'failed' ? '❌' : a.status === 'dead' ? '💀' : a.status === 'running' ? '🔄' : '⬜';
+          const dur = a.duration != null ? ` (${a.duration}s)` : '';
+          const detail = a.exit_message || a.error || '';
+          console.log(`  ${icon} ${a.label}: ${a.status}${dur}${detail ? ' — ' + detail : ''}`);
+        }
+        if (status.summary) {
+          console.log(`\nSummary:\n${status.summary}`);
+        }
+        break;
+      }
+      case 'create': {
+        const { createTaskGroup } = await import('./task-tracker.js');
+        const group = createTaskGroup(JSON.parse(args[0]));
+        console.log('Created:', fmt(group));
+        break;
+      }
+      case 'history': {
+        const limit = parseInt(args[0] || '10', 10);
+        const rows = getDb().prepare(
+          "SELECT * FROM task_tracker WHERE status != 'active' ORDER BY completed_at DESC LIMIT ?"
+        ).all(limit);
+        if (rows.length === 0) { console.log('No completed task groups'); break; }
+        console.table(rows.map(g => ({
+          id: g.id.slice(0, 8) + '…',
+          name: g.name,
+          status: g.status,
+          completed: g.completed_at,
+          created_by: g.created_by,
+        })));
         break;
       }
       default: usage();

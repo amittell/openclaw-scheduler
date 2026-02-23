@@ -210,6 +210,37 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE statu
 CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
 
 -- ============================================================
+-- TASK TRACKER: dead-man's-switch monitoring for sub-agent teams (v6)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS task_tracker (
+  id              TEXT PRIMARY KEY,           -- unique task group id
+  name            TEXT NOT NULL,              -- human label e.g. "v5-agent-team"
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by      TEXT NOT NULL DEFAULT 'main', -- who spawned the task group
+  expected_agents TEXT NOT NULL,              -- JSON array: ["schema-and-data","runtime-integration","rfc-docs"]
+  timeout_s       INTEGER NOT NULL DEFAULT 600,
+  status          TEXT NOT NULL DEFAULT 'active', -- active|completed|failed|timed_out
+  completed_at    TEXT,
+  delivery_channel TEXT,                      -- where to send updates
+  delivery_to     TEXT,                       -- target for updates
+  summary         TEXT                        -- final summary on completion
+);
+CREATE INDEX IF NOT EXISTS idx_task_tracker_status ON task_tracker(status) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS task_tracker_agents (
+  id              TEXT PRIMARY KEY,
+  tracker_id      TEXT NOT NULL REFERENCES task_tracker(id) ON DELETE CASCADE,
+  agent_label     TEXT NOT NULL,              -- matches label in expected_agents
+  status          TEXT NOT NULL DEFAULT 'pending', -- pending|running|completed|failed|dead
+  started_at      TEXT,
+  finished_at     TEXT,
+  exit_message    TEXT,                       -- agent's final status message
+  error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tta_tracker ON task_tracker_agents(tracker_id);
+CREATE INDEX IF NOT EXISTS idx_tta_status ON task_tracker_agents(status) WHERE status IN ('pending','running');
+
+-- ============================================================
 -- MIGRATION LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -217,4 +248,4 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-INSERT OR IGNORE INTO schema_migrations (version) VALUES (5);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
