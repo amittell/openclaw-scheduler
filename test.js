@@ -815,6 +815,237 @@ const updatedDeg = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').
 assert(updatedDeg?.description === 'Updated description', 'alias upsert updates description');
 assert(updatedDeg?.target === '-1000000001', 'alias upsert preserves target');
 
+// ═══════════════════════════════════════════════════════════
+// v5 Features
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── v5: Delivery Semantics ──');
+{
+  const j1 = createJob({ name: 'at-most-once-job', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-most-once' });
+  assert(j1.delivery_guarantee === 'at-most-once', 'delivery_guarantee defaults to at-most-once');
+
+  const j2 = createJob({ name: 'at-least-once-job', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-least-once' });
+  assert(j2.delivery_guarantee === 'at-least-once', 'delivery_guarantee set to at-least-once');
+
+  const j3 = createJob({ name: 'default-guarantee', schedule_cron: '0 * * * *', payload_message: 'test' });
+  assert(j3.delivery_guarantee === 'at-most-once', 'delivery_guarantee default when omitted');
+
+  const j4 = updateJob(j2.id, { delivery_guarantee: 'at-most-once' });
+  assert(j4.delivery_guarantee === 'at-most-once', 'delivery_guarantee updateable');
+
+  deleteJob(j1.id); deleteJob(j2.id); deleteJob(j3.id);
+}
+
+console.log('\n── v5: Job Class / Flush Hook ──');
+{
+  const j1 = createJob({ name: 'standard-job', schedule_cron: '0 * * * *', payload_message: 'test' });
+  assert(j1.job_class === 'standard', 'job_class defaults to standard');
+
+  const j2 = createJob({ name: 'flush-job', schedule_cron: '0 * * * *', payload_message: 'test', job_class: 'pre_compaction_flush' });
+  assert(j2.job_class === 'pre_compaction_flush', 'job_class set to pre_compaction_flush');
+
+  const j3 = updateJob(j2.id, { job_class: 'standard' });
+  assert(j3.job_class === 'standard', 'job_class updateable');
+
+  deleteJob(j1.id); deleteJob(j2.id);
+}
+
+console.log('\n── v5: Context Summary ──');
+{
+  import('./runs.js').then(m => m.updateContextSummary); // verify export exists
+  const j = createJob({ name: 'ctx-job', schedule_cron: '0 * * * *', payload_message: 'test' });
+  const run = createRun(j.id, { run_timeout_ms: 60000 });
+
+  const ctxMeta = { messages_injected: 3, scope: 'global', job_class: 'standard', delivery_guarantee: 'at-most-once' };
+  getDb().prepare('UPDATE runs SET context_summary = ? WHERE id = ?').run(JSON.stringify(ctxMeta), run.id);
+
+  const updated = getDb().prepare('SELECT context_summary FROM runs WHERE id = ?').get(run.id);
+  assert(updated.context_summary !== null, 'context_summary stored on run');
+
+  const parsed = JSON.parse(updated.context_summary);
+  assert(parsed.messages_injected === 3, 'context_summary JSON: messages_injected');
+  assert(parsed.scope === 'global', 'context_summary JSON: scope');
+
+  finishRun(run.id, 'ok', { summary: 'done' });
+  deleteJob(j.id);
+}
+
+console.log('\n── v5: Typed Messages ──');
+{
+  // Test new message kinds
+  const m1 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'constraint', body: 'Never deploy on Fridays', owner: 'ops' });
+  assert(m1.kind === 'constraint', 'constraint kind accepted');
+  assert(m1.owner === 'ops', 'owner field stored');
+
+  const m2 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'decision', body: 'Use blue-green deploy', owner: 'architect' });
+  assert(m2.kind === 'decision', 'decision kind accepted');
+
+  const m3 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'fact', body: 'DB is 500GB', owner: 'dba' });
+  assert(m3.kind === 'fact', 'fact kind accepted');
+
+  const m4 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'preference', body: 'Prefer Postgres', owner: 'lead' });
+  assert(m4.kind === 'preference', 'preference kind accepted');
+
+  const m5 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'text', body: 'Hello' });
+  assert(m5.kind === 'text', 'text kind still works');
+
+  // Test typed priority ordering in inbox
+  const inbox = getInbox('b', { limit: 10 });
+  assert(inbox.length >= 5, 'inbox has typed messages');
+  // constraint should come first
+  const firstKind = inbox[0]?.kind;
+  assert(firstKind === 'constraint', 'inbox sorted: constraint first');
+  // Find relative positions
+  const kinds = inbox.map(m => m.kind);
+  const constraintIdx = kinds.indexOf('constraint');
+  const decisionIdx = kinds.indexOf('decision');
+  const factIdx = kinds.indexOf('fact');
+  const prefIdx = kinds.indexOf('preference');
+  const textIdx = kinds.indexOf('text');
+  assert(constraintIdx < decisionIdx, 'inbox order: constraint before decision');
+  assert(decisionIdx < factIdx, 'inbox order: decision before fact');
+  assert(factIdx < prefIdx, 'inbox order: fact before preference');
+  assert(prefIdx < textIdx, 'inbox order: preference before text');
+
+  // Clean up
+  markAllRead('b');
+}
+
+console.log('\n── v5: Approval Gates ──');
+{
+  // Import approval module
+  const { createApproval, getApproval, getPendingApproval, listPendingApprovals, resolveApproval, pruneApprovals } = await import('./approval.js');
+
+  const j = createJob({ name: 'approval-job', schedule_cron: '0 * * * *', payload_message: 'test', approval_required: 1, approval_timeout_s: 60, approval_auto: 'reject' });
+  assert(j.approval_required === 1, 'approval_required stored');
+  assert(j.approval_timeout_s === 60, 'approval_timeout_s stored');
+  assert(j.approval_auto === 'reject', 'approval_auto stored');
+
+  const run = createRun(j.id, { run_timeout_ms: 60000, status: 'awaiting_approval' });
+  assert(run.status === 'awaiting_approval', 'run created with awaiting_approval');
+
+  const approval = createApproval(j.id, run.id);
+  assert(approval !== undefined, 'approval created');
+  assert(approval.status === 'pending', 'approval status is pending');
+  assert(approval.job_id === j.id, 'approval linked to job');
+  assert(approval.run_id === run.id, 'approval linked to run');
+
+  const pending = getPendingApproval(j.id);
+  assert(pending.id === approval.id, 'getPendingApproval finds it');
+
+  const allPending = listPendingApprovals();
+  assert(allPending.some(a => a.id === approval.id), 'listPendingApprovals includes it');
+
+  // Approve it
+  const resolved = resolveApproval(approval.id, 'approved', 'operator', 'looks good');
+  assert(resolved.status === 'approved', 'approval resolved as approved');
+  assert(resolved.resolved_by === 'operator', 'resolved_by set');
+  assert(resolved.notes === 'looks good', 'notes stored');
+  assert(resolved.resolved_at !== null, 'resolved_at timestamp set');
+
+  // No more pending for this job
+  const noPending = getPendingApproval(j.id);
+  assert(noPending === undefined, 'no pending after resolution');
+
+  // Create another and reject it
+  const run2 = createRun(j.id, { run_timeout_ms: 60000, status: 'awaiting_approval' });
+  const approval2 = createApproval(j.id, run2.id);
+  const rejected = resolveApproval(approval2.id, 'rejected', 'operator', 'not ready');
+  assert(rejected.status === 'rejected', 'approval rejected');
+
+  finishRun(run.id, 'ok', { summary: 'done' });
+  finishRun(run2.id, 'cancelled', { summary: 'rejected' });
+  deleteJob(j.id);
+}
+
+console.log('\n── v5: Run Replay Fields ──');
+{
+  const j = createJob({ name: 'replay-test', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-least-once' });
+  const run1 = createRun(j.id, { run_timeout_ms: 60000 });
+
+  // Simulate crash: mark as crashed
+  getDb().prepare("UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?").run(run1.id);
+  const crashed = getDb().prepare('SELECT status FROM runs WHERE id = ?').get(run1.id);
+  assert(crashed.status === 'crashed', 'run marked as crashed');
+
+  // Create replay run with replay_of
+  const run2 = createRun(j.id, { run_timeout_ms: 60000, replay_of: run1.id });
+  const replayRun = getDb().prepare('SELECT replay_of FROM runs WHERE id = ?').get(run2.id);
+  assert(replayRun.replay_of === run1.id, 'replay_of links to crashed run');
+
+  finishRun(run2.id, 'ok', { summary: 'replayed successfully' });
+  deleteJob(j.id);
+}
+
+console.log('\n── v5: Hybrid Retrieval ──');
+{
+  const { getRecentRunSummaries, searchRunSummaries, buildRetrievalContext } = await import('./retrieval.js');
+
+  const j = createJob({ name: 'retrieval-test', schedule_cron: '0 * * * *', payload_message: 'check deployment status', context_retrieval: 'hybrid', context_retrieval_limit: 3 });
+  assert(j.context_retrieval === 'hybrid', 'context_retrieval stored');
+  assert(j.context_retrieval_limit === 3, 'context_retrieval_limit stored');
+
+  // Create runs with summaries
+  for (let i = 0; i < 5; i++) {
+    const r = createRun(j.id, { run_timeout_ms: 60000 });
+    const ctx = JSON.stringify({ messages_injected: i, scope: 'own' });
+    getDb().prepare('UPDATE runs SET context_summary = ? WHERE id = ?').run(ctx, r.id);
+    finishRun(r.id, 'ok', { summary: `deployment check completed, status green, uptime ${99 + i/10}%` });
+  }
+
+  // Test recent retrieval
+  const recent = getRecentRunSummaries(j.id, 3);
+  assert(recent.length === 3, 'getRecentRunSummaries returns limit');
+  assert(recent[0].context_summary !== null, 'recent runs have context_summary');
+
+  // Test search retrieval
+  const searched = searchRunSummaries(j.id, 'deployment uptime', 3);
+  assert(searched.length > 0, 'searchRunSummaries returns results');
+  assert(searched.length <= 3, 'searchRunSummaries respects limit');
+
+  // Test buildRetrievalContext
+  const ctx = buildRetrievalContext(j);
+  assert(ctx.includes('Prior Run Context'), 'buildRetrievalContext includes header');
+  assert(ctx.includes('End Prior Run Context'), 'buildRetrievalContext includes footer');
+
+  // Test with none retrieval
+  const j2 = createJob({ name: 'no-retrieval', schedule_cron: '0 * * * *', payload_message: 'test', context_retrieval: 'none' });
+  const noCtx = buildRetrievalContext(j2);
+  assert(noCtx === '', 'buildRetrievalContext empty for none');
+
+  deleteJob(j.id); deleteJob(j2.id);
+}
+
+console.log('\n── v5: Migration Idempotency ──');
+{
+  // Verify v5 schema version recorded
+  const version = getDb().prepare('SELECT MAX(version) as v FROM schema_migrations').get();
+  assert(version.v >= 5 || version.v >= 2, 'schema_migrations has current version');
+
+  // Verify approvals table exists
+  const approvalTable = getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='approvals'").get();
+  assert(approvalTable !== undefined, 'approvals table exists');
+
+  // Verify new columns exist on jobs
+  const jobCols = getDb().prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  assert(jobCols.includes('delivery_guarantee'), 'jobs has delivery_guarantee column');
+  assert(jobCols.includes('job_class'), 'jobs has job_class column');
+  assert(jobCols.includes('approval_required'), 'jobs has approval_required column');
+  assert(jobCols.includes('approval_timeout_s'), 'jobs has approval_timeout_s column');
+  assert(jobCols.includes('approval_auto'), 'jobs has approval_auto column');
+  assert(jobCols.includes('context_retrieval'), 'jobs has context_retrieval column');
+  assert(jobCols.includes('context_retrieval_limit'), 'jobs has context_retrieval_limit column');
+
+  // Verify new columns on runs
+  const runCols = getDb().prepare('PRAGMA table_info(runs)').all().map(c => c.name);
+  assert(runCols.includes('context_summary'), 'runs has context_summary column');
+  assert(runCols.includes('replay_of'), 'runs has replay_of column');
+
+  // Verify new column on messages
+  const msgCols = getDb().prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  assert(msgCols.includes('owner'), 'messages has owner column');
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

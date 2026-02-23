@@ -20,12 +20,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
-  updateHeartbeat, updateRunSession, pruneRuns
+  updateHeartbeat, updateRunSession, pruneRuns, updateContextSummary
 } from './runs.js';
 import {
   sendMessage as queueMessage, getInbox, markDelivered, markRead,
   expireMessages, pruneMessages, getUnreadCount
 } from './messages.js';
+import {
+  createApproval, getPendingApproval, listPendingApprovals,
+  resolveApproval, getTimedOutApprovals, pruneApprovals
+} from './approval.js';
+import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
 import {
   runAgentTurn, sendSystemEvent, listSessions, deliverMessage, checkGatewayHealth,
@@ -63,8 +68,119 @@ function log(level, msg, meta) {
   process.stderr.write(line);
 }
 
+// ── Replay orphaned runs on startup ─────────────────────────
+async function replayOrphanedRuns() {
+  const db = getDb();
+  const orphaned = db.prepare(`
+    SELECT r.id, r.job_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms
+    FROM runs r
+    JOIN jobs j ON r.job_id = j.id
+    WHERE r.status = 'running'
+  `).all();
+
+  if (orphaned.length === 0) return;
+  log('info', `Found ${orphaned.length} orphaned run(s) to process`);
+
+  for (const run of orphaned) {
+    log('info', `Found orphaned run for ${run.job_name}`, { runId: run.id, jobId: run.job_id });
+
+    // Mark old run as crashed
+    db.prepare(`UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?`).run(run.id);
+
+    if (run.delivery_guarantee === 'at-least-once') {
+      // Create a new run with replay_of pointing to the crashed run
+      const newRun = createRun(run.job_id, { run_timeout_ms: run.run_timeout_ms });
+      // Set replay_of on the new run (column may exist from migration)
+      db.prepare(`UPDATE runs SET replay_of = ? WHERE id = ?`).run(run.id, newRun.id);
+      log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, newRunId: newRun.id });
+    } else {
+      // at-most-once: just advance the schedule
+      const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
+      if (nextRun) {
+        updateJob(run.job_id, { next_run_at: nextRun });
+      }
+      log('info', `Marked crashed: ${run.job_name} (at-most-once)`, { runId: run.id });
+    }
+  }
+}
+
+// ── Check approval gates ────────────────────────────────────
+async function checkApprovals() {
+  // 1. Handle timed-out approvals
+  try {
+    const timedOut = getTimedOutApprovals();
+    for (const approval of timedOut) {
+      const job = getJob(approval.job_id);
+      if (!job) continue;
+
+      if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
+        resolveApproval(approval.id, 'approved', 'timeout');
+        log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
+        // Update run status and dispatch
+        if (approval.run_id) {
+          getDb().prepare("UPDATE runs SET status = 'pending' WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+        }
+        await dispatchJob(job);
+      } else {
+        // Default: reject on timeout
+        resolveApproval(approval.id, 'timed_out', 'timeout');
+        if (approval.run_id) {
+          getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+        }
+        log('info', `Approval timed out (rejected): ${approval.job_name || job.name}`, { approvalId: approval.id });
+      }
+    }
+  } catch (err) {
+    log('error', `Approval timeout check error: ${err.message}`);
+  }
+
+  // 2. Check for newly approved approvals (operator approved via CLI)
+  try {
+    const db = getDb();
+    const approved = db.prepare(`
+      SELECT a.*, j.name as job_name
+      FROM approvals a
+      JOIN jobs j ON a.job_id = j.id
+      JOIN runs r ON a.run_id = r.id
+      WHERE a.status = 'approved'
+        AND r.status IN ('awaiting_approval', 'pending')
+    `).all();
+
+    for (const approval of approved) {
+      const job = getJob(approval.job_id);
+      if (!job) continue;
+      log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
+      await dispatchJob(job);
+    }
+  } catch (err) {
+    log('error', `Approval dispatch error: ${err.message}`);
+  }
+}
+
 // ── Dispatch a single job ───────────────────────────────────
 async function dispatchJob(job) {
+  // HITL approval gate — if approval_required, block until approved
+  if (job.approval_required) {
+    const existing = getPendingApproval(job.id);
+    if (existing) {
+      // Already has a pending approval — skip dispatch, checkApprovals will handle it
+      log('debug', `Skipping ${job.name} — awaiting approval`, { approvalId: existing.id });
+      return;
+    }
+    // Check if this is a chain-triggered dispatch (parent_id means it was triggered)
+    if (job.parent_id) {
+      const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms });
+      // Set run to awaiting_approval
+      getDb().prepare("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?").run(run.id);
+      const approval = createApproval(job.id, run.id);
+      log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
+      // Send notification via delivery channel
+      const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
+      await handleDelivery(job, msg);
+      return;
+    }
+  }
+
   // Resource pool concurrency check — prevents different jobs from competing for the same resource
   if (job.resource_pool && hasRunningRunForPool(job.resource_pool)) {
     log('info', `Skipping ${job.name} — resource pool '${job.resource_pool}' busy`, { jobId: job.id, pool: job.resource_pool });
@@ -107,8 +223,14 @@ async function dispatchJob(job) {
       // Mark agent as busy
       if (job.agent_id) setAgentStatus(job.agent_id, 'busy', sessionKey);
 
+      // Build prompt and collect context metadata
+      const { prompt, contextMeta } = buildJobPrompt(job, run);
+
+      // Store context summary on the run
+      try { updateContextSummary(run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
+
       const result = await runAgentTurn({
-        message: buildJobPrompt(job, run),
+        message: prompt,
         agentId: job.agent_id || 'main',
         sessionKey,
         model: job.payload_model || undefined,
@@ -119,13 +241,19 @@ async function dispatchJob(job) {
       const content = result.content || '';
       const isHeartbeatOk = content.trim() === 'HEARTBEAT_OK' || content.trim().startsWith('HEARTBEAT_OK');
 
+      // Handle NO_FLUSH response for pre_compaction_flush jobs
+      const isNoFlush = content.trim() === 'NO_FLUSH';
+      if (isNoFlush) {
+        log('info', `Flush: nothing to flush for ${job.name}`);
+      }
+
       finishRun(run.id, 'ok', { summary: content.slice(0, 5000) });
 
       // Mark agent as idle
       if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
-      // Handle delivery
-      if (job.delivery_mode === 'announce' && !isHeartbeatOk && content.trim()) {
+      // Handle delivery (skip heartbeat-ok and no-flush responses)
+      if (job.delivery_mode === 'announce' && !isHeartbeatOk && !isNoFlush && content.trim()) {
         await handleDelivery(job, content);
       }
 
@@ -213,6 +341,14 @@ async function dispatchJob(job) {
 function buildJobPrompt(job, run) {
   const parts = [`[scheduler:${job.id} ${job.name}]`];
 
+  // Flush preamble for pre_compaction_flush jobs
+  if (job.job_class === 'pre_compaction_flush') {
+    parts.push('\n[SYSTEM: Pre-compaction flush required]');
+    parts.push('Write a structured summary of: active decisions, constraints, task owners, open questions.');
+    parts.push('Format as labeled sections. If nothing needs flushing, respond with exactly: NO_FLUSH');
+    parts.push('[END SYSTEM]');
+  }
+
   // Global sub-agent scope: instruct the agent to query across all sessions
   if (job.payload_scope === 'global') {
     parts.push(
@@ -233,15 +369,44 @@ function buildJobPrompt(job, run) {
   if (inbox.length > 0) {
     parts.push('\n--- Pending Messages ---');
     for (const msg of inbox) {
+      const kindLabel = msg.kind && !['text', 'result', 'status', 'system', 'spawn'].includes(msg.kind)
+        ? `[${msg.kind}]${msg.owner ? ` (owner: ${msg.owner})` : ''} `
+        : '';
       parts.push(`From: ${msg.from_agent} | ${msg.kind} | ${msg.subject || '(no subject)'}`);
-      parts.push(msg.body.slice(0, 500));
+      if (kindLabel) {
+        parts.push(`${kindLabel}${msg.body.slice(0, 500)}`);
+      } else {
+        parts.push(msg.body.slice(0, 500));
+      }
       parts.push('---');
       markDelivered(msg.id);
     }
   }
 
+  // Collect context metadata
+  const contextMeta = {
+    messages_injected: inbox.length,
+    scope: job.payload_scope || 'own',
+    job_class: job.job_class || 'standard',
+    delivery_guarantee: job.delivery_guarantee || 'at-most-once',
+    context_retrieval: job.context_retrieval || 'none',
+  };
+
+  // Add retrieval context if configured
+  if (job.context_retrieval && job.context_retrieval !== 'none') {
+    try {
+      const retrievalCtx = buildRetrievalContext(job);
+      if (retrievalCtx) {
+        parts.push(retrievalCtx);
+        contextMeta.retrieval_results = (retrievalCtx.match(/\n\[/g) || []).length;
+      }
+    } catch (err) {
+      log('warn', `Retrieval context error for ${job.name}: ${err.message}`);
+    }
+  }
+
   parts.push('\n' + job.payload_message);
-  return parts.join('\n');
+  return { prompt: parts.join('\n'), contextMeta };
 }
 
 // ── Alias resolution ────────────────────────────────────────
@@ -399,11 +564,14 @@ async function tick() {
     log('error', `Dispatch error: ${err.message}`);
   }
 
-  // 2. Health check (every HEARTBEAT_CHECK_MS)
+  // 2. Health check + approval gates (every HEARTBEAT_CHECK_MS)
   if (now - lastHeartbeatCheck >= HEARTBEAT_CHECK_MS) {
     lastHeartbeatCheck = now;
     try { await checkRunHealth(); } catch (err) {
       log('error', `Health check error: ${err.message}`);
+    }
+    try { await checkApprovals(); } catch (err) {
+      log('error', `Approval check error: ${err.message}`);
     }
   }
 
@@ -454,6 +622,7 @@ async function tick() {
     try {
       pruneRuns(100);
       pruneMessages(30);
+      pruneApprovals(30);
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
       // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL
@@ -516,6 +685,9 @@ async function main() {
   upsertAgent('main', { name: 'Main Agent', status: 'idle', capabilities: ['*'] });
 
   log('info', 'Database initialized');
+
+  // Replay orphaned runs from previous crash (delivery guarantee support)
+  await replayOrphanedRuns();
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));

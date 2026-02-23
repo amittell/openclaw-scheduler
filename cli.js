@@ -23,6 +23,8 @@ Jobs:
   jobs cancel <id> [--no-cascade]   Cancel a job (+ children by default)
   jobs update <id> <json>            Update job fields
   jobs run <id>                      Trigger immediate run (sets next_run_at to now)
+  jobs approve <id>                  Approve a pending job
+  jobs reject <id> [reason]          Reject with optional reason
 
 Runs:
   runs list <job-id> [limit]         List runs for a job
@@ -42,6 +44,10 @@ Agents:
   agents list                        List registered agents
   agents get <id>                    Get agent details
   agents register <id> [name]        Register/update agent
+
+Approvals:
+  approvals list                     List pending approvals
+  approvals pending                  Alias for list
 
 Aliases:
   alias list                         List all delivery aliases
@@ -70,6 +76,7 @@ switch (command) {
           cron: j.schedule_cron,
           agent: j.agent_id || 'main',
           target: j.session_target,
+          guarantee: j.delivery_guarantee || 'at-most-once',
           parent: j.parent_id ? j.parent_id.slice(0, 8) + '…' : '-',
           trigger: j.trigger_on || '-',
           nextRun: j.next_run_at,
@@ -126,6 +133,25 @@ switch (command) {
         const job = runJobNow(args[0]);
         if (!job) { console.error('Job not found:', args[0]); process.exit(1); }
         console.log(`Scheduled for immediate run: ${job.name} (next_run_at: ${job.next_run_at})`);
+        break;
+      }
+      case 'approve': {
+        const { getPendingApproval, resolveApproval } = await import('./approval.js');
+        const approval = getPendingApproval(args[0]);
+        if (!approval) { console.error('No pending approval for job:', args[0]); process.exit(1); }
+        resolveApproval(approval.id, 'approved', 'operator');
+        getDb().prepare("UPDATE runs SET status = 'pending' WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+        console.log(`Approved: ${approval.job_id}`);
+        break;
+      }
+      case 'reject': {
+        const { getPendingApproval, resolveApproval } = await import('./approval.js');
+        const approval = getPendingApproval(args[0]);
+        if (!approval) { console.error('No pending approval for job:', args[0]); process.exit(1); }
+        const reason = args.slice(1).join(' ') || null;
+        resolveApproval(approval.id, 'rejected', 'operator', reason);
+        getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+        console.log(`Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`);
         break;
       }
       default: usage();
@@ -243,6 +269,28 @@ switch (command) {
       case 'register': {
         const a = upsertAgent(args[0], { name: args[1] || args[0] });
         console.log('Registered:', fmt(a));
+        break;
+      }
+      default: usage();
+    }
+    break;
+
+  // ── Approvals ──────────────────────────────────────────────
+  case 'approvals':
+    switch (sub) {
+      case 'list':
+      case 'pending': {
+        const { listPendingApprovals } = await import('./approval.js');
+        const approvals = listPendingApprovals();
+        if (approvals.length === 0) { console.log('No pending approvals'); break; }
+        console.table(approvals.map(a => ({
+          id: a.id.slice(0, 8),
+          job: a.job_id.slice(0, 8),
+          job_name: a.job_name || '-',
+          run: a.run_id?.slice(0, 8) || '-',
+          status: a.status,
+          requested: a.requested_at,
+        })));
         break;
       }
       default: usage();

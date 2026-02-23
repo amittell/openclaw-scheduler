@@ -61,6 +61,19 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- Resource pool (concurrency across different jobs)
   resource_pool   TEXT DEFAULT NULL,
 
+  -- Delivery semantics (v5)
+  delivery_guarantee TEXT DEFAULT 'at-most-once',  -- 'at-most-once'|'at-least-once'
+  job_class       TEXT DEFAULT 'standard',          -- 'standard'|'pre_compaction_flush'
+
+  -- HITL approval gates (v5)
+  approval_required  INTEGER DEFAULT 0,
+  approval_timeout_s INTEGER DEFAULT 3600,
+  approval_auto      TEXT DEFAULT 'reject',         -- 'approve'|'reject'
+
+  -- Context retrieval (v5)
+  context_retrieval       TEXT DEFAULT 'none',      -- 'none'|'recent'|'hybrid'
+  context_retrieval_limit INTEGER DEFAULT 5,
+
   -- Scheduling state (denormalized)
   next_run_at     TEXT,
   last_run_at     TEXT,
@@ -98,7 +111,11 @@ CREATE TABLE IF NOT EXISTS runs (
 
   -- Retry tracking (v3b)
   retry_count     INTEGER DEFAULT 0,
-  retry_of        TEXT                              -- original run id if this is a retry
+  retry_of        TEXT,                             -- original run id if this is a retry
+
+  -- Context & replay (v5)
+  context_summary TEXT,                             -- JSON: {messages_injected,scope,...}
+  replay_of       TEXT                              -- run id if this is a crash replay
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
@@ -136,7 +153,10 @@ CREATE TABLE IF NOT EXISTS messages (
   
   -- Link to job/run if this message is job-related
   job_id          TEXT REFERENCES jobs(id) ON DELETE SET NULL,
-  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL
+  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
+
+  -- Typed message owner (v5)
+  owner           TEXT                                -- originator of typed message
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent, status);
@@ -173,6 +193,23 @@ INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VAL
   ('owner_dm',       'telegram', '1000000001',   'Owner DM');
 
 -- ============================================================
+-- APPROVALS: HITL approval gates (v5)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS approvals (
+  id              TEXT PRIMARY KEY,
+  job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|rejected|timed_out
+  requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at     TEXT,
+  resolved_by     TEXT,                               -- 'operator'|'timeout'|'api'
+  notes           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
+
+-- ============================================================
 -- MIGRATION LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -180,4 +217,4 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (5);

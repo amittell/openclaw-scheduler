@@ -10,14 +10,17 @@ export function createRun(jobId, opts = {}) {
   const id = randomUUID();
 
   db.prepare(`
-    INSERT INTO runs (id, job_id, status, run_timeout_ms, session_key, session_id, dispatched_at)
-    VALUES (?, ?, 'running', ?, ?, ?, datetime('now'))
+    INSERT INTO runs (id, job_id, status, run_timeout_ms, session_key, session_id, dispatched_at, context_summary, replay_of)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
   `).run(
     id,
     jobId,
+    opts.status || 'running',
     opts.run_timeout_ms || 300000,
     opts.session_key || null,
-    opts.session_id || null
+    opts.session_id || null,
+    opts.context_summary ? JSON.stringify(opts.context_summary) : null,
+    opts.replay_of || null
   );
 
   return getRun(id);
@@ -56,13 +59,15 @@ export function finishRun(id, status, opts = {}) {
       finished_at = datetime('now'),
       duration_ms = ?,
       summary = ?,
-      error_message = ?
+      error_message = ?,
+      context_summary = COALESCE(?, context_summary)
     WHERE id = ?
   `).run(
     status,
     durationMs,
     opts.summary || null,
     opts.error_message || null,
+    opts.context_summary ? JSON.stringify(opts.context_summary) : null,
     id
   );
 
@@ -152,4 +157,15 @@ export function getRunningRunsByPool(poolName) {
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running' AND j.resource_pool = ?
   `).all(poolName);
+}
+
+/**
+ * Store or update the context_summary JSON for a run.
+ */
+export function updateContextSummary(runId, summaryObj) {
+  const json = typeof summaryObj === 'string' ? summaryObj : JSON.stringify(summaryObj);
+  getDb().prepare(`
+    UPDATE runs SET context_summary = ? WHERE id = ?
+  `).run(json, runId);
+  return getRun(runId);
 }
