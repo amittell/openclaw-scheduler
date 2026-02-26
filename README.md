@@ -957,6 +957,7 @@ These migrations are run automatically when `initDb()` detects the database need
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
 ├── INSTALL.md             # Full installation guide (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
+├── IMPLEMENTATION_SPEC.md # Internal developer reference (v5+ feature specs)
 ├── CHANGELOG.md           # Version history
 └── README.md              # This file
 ```
