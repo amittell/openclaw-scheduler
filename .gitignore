@@ -2,6 +2,9 @@ node_modules/
 scheduler.db
 scheduler.db-wal
 scheduler.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.log
 secrets/
 *.secret
