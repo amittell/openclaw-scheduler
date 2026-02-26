@@ -8,3 +8,5 @@ scheduler.db-shm
 *.log
 secrets/
 *.secret
+backupstore/
+logs/
