@@ -71,14 +71,11 @@ const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Shell Command Runner ────────────────────────────────────
 function runShellCommand(cmd, timeoutMs = 300000) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: '/bin/zsh' }, (err, stdout, stderr) => {
       const output = [stdout, stderr].filter(Boolean).join('\n').trim();
-      if (err) {
-        reject(Object.assign(new Error(err.message), { output }));
-      } else {
-        resolve(output || '(no output)');
-      }
+      const exitCode = err?.code ?? 0;
+      resolve({ output: output || '(no output)', exitCode, error: err || null });
     });
   });
 }
@@ -303,10 +300,15 @@ async function dispatchJob(job) {
 
     } else if (job.session_target === 'shell') {
       // Shell job: run payload_message as a shell command — no gateway dependency
-      const output = await runShellCommand(job.payload_message, job.run_timeout_ms);
-      finishRun(run.id, 'ok', { summary: output.slice(0, 5000) });
+      const { output, exitCode, error: shellError } = await runShellCommand(job.payload_message, job.run_timeout_ms);
+      const shellStatus = exitCode === 0 ? 'ok' : 'error';
+      finishRun(run.id, shellStatus, { summary: output.slice(0, 5000) });
 
-      if (job.delivery_mode === 'announce' && output.trim()) {
+      // announce: post output only on failure (non-zero exit) — success = silent
+      // announce-always: post output regardless of exit code
+      if (job.delivery_mode === 'announce-always' && output.trim()) {
+        await handleDelivery(job, output);
+      } else if (job.delivery_mode === 'announce' && exitCode !== 0 && output.trim()) {
         await handleDelivery(job, output);
       }
 
@@ -314,22 +316,22 @@ async function dispatchJob(job) {
         from_agent: 'scheduler',
         to_agent: job.agent_id || 'main',
         kind: 'result',
-        subject: `Shell job completed: ${job.name}`,
+        subject: `Shell job ${shellStatus === 'ok' ? 'completed' : 'failed'}: ${job.name}`,
         body: output.slice(0, 5000),
         job_id: job.delete_after_run ? null : job.id,
         run_id: job.delete_after_run ? null : run.id,
       });
 
-      updateJobAfterRun(job, 'ok');
+      updateJobAfterRun(job, shellStatus);
 
-      const triggered = fireTriggeredChildren(job.id, 'ok', output);
+      const triggered = fireTriggeredChildren(job.id, shellStatus, output);
       if (triggered.length > 0) {
         log('info', `Triggered ${triggered.length} child job(s)`, {
           parentId: job.id, children: triggered.map(c => c.name),
         });
       }
       if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
-      log('info', `Shell completed: ${job.name}`, { runId: run.id });
+      log('info', `Shell ${shellStatus}: ${job.name} (exit ${exitCode})`, { runId: run.id });
 
     } else {
       // Isolated session: dispatch via chat completions API
