@@ -1348,6 +1348,37 @@ console.log('\n── v7: Idempotency Keys ──');
   deleteJob(testJob.id);
 }
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: Shell job type (session_target = 'shell')
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Shell Jobs ──');
+
+// Can create a shell job
+const shellJob = createJob({
+  name: 'Test Shell Job',
+  schedule_cron: '0 8-23 * * *',
+  session_target: 'shell',
+  payload_kind: 'shellCommand',
+  payload_message: '/bin/echo hello',
+  delivery_mode: 'none',
+});
+assert(shellJob.session_target === 'shell', 'shell job: session_target = shell');
+assert(shellJob.payload_kind === 'shellCommand', 'shell job: payload_kind = shellCommand');
+assert(shellJob.payload_message === '/bin/echo hello', 'shell job: payload_message = command');
+
+// Can update to shell target
+const toShellJob = createJob({ name: 'To-Shell Job', schedule_cron: '0 12 * * *', payload_message: 'test', delivery_mode: 'none' });
+updateJob(toShellJob.id, { session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo updated' });
+const updatedShell = getJob(toShellJob.id);
+assert(updatedShell.session_target === 'shell', 'shell job update: session_target persisted');
+assert(updatedShell.payload_message === '/bin/echo updated', 'shell job update: command persisted');
+
+// Shell jobs are pruned like normal jobs (disabled + >24h → deleted)
+updateJob(shellJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
+pruneExpiredJobs();
+assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

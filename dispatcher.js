@@ -15,6 +15,7 @@
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
+import { exec as execCb } from 'child_process';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 import {
   generateIdempotencyKey as _genIdemKey,
@@ -67,6 +68,20 @@ const claimIdempotencyKey = _claimIdemKey;
 const releaseIdempotencyKey = _releaseIdemKey;
 const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
+
+// ── Shell Command Runner ────────────────────────────────────
+function runShellCommand(cmd, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: '/bin/zsh' }, (err, stdout, stderr) => {
+      const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+      if (err) {
+        reject(Object.assign(new Error(err.message), { output }));
+      } else {
+        resolve(output || '(no output)');
+      }
+    });
+  });
+}
 
 // ── Config ──────────────────────────────────────────────────
 const TICK_INTERVAL_MS = parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10);
@@ -285,6 +300,36 @@ async function dispatchJob(job) {
       await sendSystemEvent(job.payload_message, 'now');
       finishRun(run.id, 'ok', { summary: 'System event dispatched' });
       updateJobAfterRun(job, 'ok');
+
+    } else if (job.session_target === 'shell') {
+      // Shell job: run payload_message as a shell command — no gateway dependency
+      const output = await runShellCommand(job.payload_message, job.run_timeout_ms);
+      finishRun(run.id, 'ok', { summary: output.slice(0, 5000) });
+
+      if (job.delivery_mode === 'announce' && output.trim()) {
+        await handleDelivery(job, output);
+      }
+
+      queueMessage({
+        from_agent: 'scheduler',
+        to_agent: job.agent_id || 'main',
+        kind: 'result',
+        subject: `Shell job completed: ${job.name}`,
+        body: output.slice(0, 5000),
+        job_id: job.delete_after_run ? null : job.id,
+        run_id: job.delete_after_run ? null : run.id,
+      });
+
+      updateJobAfterRun(job, 'ok');
+
+      const triggered = fireTriggeredChildren(job.id, 'ok', output);
+      if (triggered.length > 0) {
+        log('info', `Triggered ${triggered.length} child job(s)`, {
+          parentId: job.id, children: triggered.map(c => c.name),
+        });
+      }
+      if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+      log('info', `Shell completed: ${job.name}`, { runId: run.id });
 
     } else {
       // Isolated session: dispatch via chat completions API
