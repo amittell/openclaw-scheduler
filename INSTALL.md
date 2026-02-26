@@ -1,6 +1,6 @@
 # Installing OpenClaw Scheduler on a New Host
 
-Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., Scheduler host on scheduler-host.local).
+Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., `scheduler-host.local`).
 
 ---
 

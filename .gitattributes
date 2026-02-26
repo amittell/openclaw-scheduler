@@ -1,2 +1,1 @@
-secrets/** filter=git-crypt diff=git-crypt
-*.secret filter=git-crypt diff=git-crypt
+# Keep attributes minimal for public distribution.

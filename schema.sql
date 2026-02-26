@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS delivery_aliases (
 
 INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VALUES
   ('team_room', 'telegram', '-1000000001', 'Team room'),
-  ('owner_dm',       'telegram', '1000000001',   'Owner DM');
+  ('owner_dm',  'telegram', '1000000001',  'Owner DM');
 
 -- ============================================================
 -- APPROVALS: HITL approval gates (v5)

@@ -38,7 +38,7 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 
 ```
 ┌─────────────────────────────────────────────┐
-│  Host Machine (e.g., scheduler-host.local)            │
+│  Host Machine (e.g., scheduler-host.local)  │
 │                                              │
 │  OpenClaw Gateway (:18789)                   │
 │    ├─ Telegram / Discord / etc.              │

@@ -3,3 +3,5 @@ scheduler.db
 scheduler.db-wal
 scheduler.db-shm
 *.log
+secrets/
+*.secret

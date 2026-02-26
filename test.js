@@ -727,15 +727,15 @@ assert(aliasCols.includes('description'), 'delivery_aliases.description column')
 assert(aliasCols.includes('created_at'),  'delivery_aliases.created_at column');
 
 // Seeded aliases must be present
-const degRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
-assert(degRow !== undefined,             'seeded alias: team_room exists');
-assert(degRow?.channel === 'telegram',   'team_room channel = telegram');
-assert(degRow?.target  === '-1000000001','team_room target = -1000000001');
+const teamRoomRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
+assert(teamRoomRow !== undefined,               'seeded alias: team_room exists');
+assert(teamRoomRow?.channel === 'telegram',     'team_room channel = telegram');
+assert(teamRoomRow?.target  === '-1000000001',  'team_room target = -1000000001');
 
-const alexRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('owner_dm');
-assert(alexRow !== undefined,            'seeded alias: owner_dm exists');
-assert(alexRow?.channel === 'telegram',  'owner_dm channel = telegram');
-assert(alexRow?.target  === '1000000001', 'owner_dm target = 1000000001');
+const ownerDmRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('owner_dm');
+assert(ownerDmRow !== undefined,              'seeded alias: owner_dm exists');
+assert(ownerDmRow?.channel === 'telegram',    'owner_dm channel = telegram');
+assert(ownerDmRow?.target  === '1000000001',  'owner_dm target = 1000000001');
 
 // Add a new alias via DB
 db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
@@ -750,7 +750,7 @@ assert(testRow?.description === 'Test channel',  'alias add: description correct
 const allAliases = db.prepare('SELECT * FROM delivery_aliases ORDER BY alias').all();
 assert(allAliases.length >= 3, 'alias list: at least 3 aliases (2 seeded + 1 added)');
 assert(allAliases.some(a => a.alias === 'team_room'), 'alias list: team_room present');
-assert(allAliases.some(a => a.alias === 'owner_dm'),        'alias list: owner_dm present');
+assert(allAliases.some(a => a.alias === 'owner_dm'),  'alias list: owner_dm present');
 assert(allAliases.some(a => a.alias === 'testchan'),    'alias list: testchan present');
 
 // Local resolve helper (mirrors dispatcher/gateway logic)
@@ -776,7 +776,7 @@ assert(r2?.target  === '-1000000001','resolve @name: correct target');
 const r3 = resolveTestAlias('@owner_dm');
 assert(r3 !== null,                  'resolve @owner_dm: found');
 assert(r3?.channel === 'telegram',   'resolve @owner_dm: correct channel');
-assert(r3?.target  === '1000000001',  'resolve @owner_dm: correct target');
+assert(r3?.target  === '1000000001', 'resolve @owner_dm: correct target');
 
 // Unknown alias falls through (returns null → caller uses raw target, backward compat)
 const r4 = resolveTestAlias('@nonexistent');
@@ -805,15 +805,15 @@ const removedRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').
 assert(removedRow === undefined, 'alias remove: testchan deleted');
 
 // Seed aliases still intact after removal of different alias
-const stillDeg = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
-assert(stillDeg !== undefined, 'seed alias team_room still intact after other alias removed');
+const stillTeamRoom = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
+assert(stillTeamRoom !== undefined, 'seed alias team_room still intact after other alias removed');
 
 // Upsert (INSERT OR REPLACE) works for alias updates
 db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
   .run('team_room', 'telegram', '-1000000001', 'Updated description');
-const updatedDeg = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
-assert(updatedDeg?.description === 'Updated description', 'alias upsert updates description');
-assert(updatedDeg?.target === '-1000000001', 'alias upsert preserves target');
+const updatedTeamRoom = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
+assert(updatedTeamRoom?.description === 'Updated description', 'alias upsert updates description');
+assert(updatedTeamRoom?.target === '-1000000001', 'alias upsert preserves target');
 
 // ═══════════════════════════════════════════════════════════
 // v5 Features
