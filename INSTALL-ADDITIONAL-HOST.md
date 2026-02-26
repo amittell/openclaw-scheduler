@@ -1,6 +1,8 @@
-# Installing OpenClaw Scheduler on a New Host
+# Installing OpenClaw Scheduler on an Additional Host
 
-Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., `scheduler-host.local`).
+This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own LaunchAgent — they don't share state. This is not a replication setup; each host schedules and dispatches jobs independently.
+
+> **Starting fresh:** Unlike migrating from OC cron, on an additional host you'll typically create jobs from scratch. Use the job examples in README.md.
 
 ---
 
@@ -46,11 +48,10 @@ If `better-sqlite3` fails: `xcode-select --install` (macOS).
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js            # 91 unit tests
-SCHEDULER_DB=:memory: node test-dispatcher.js  # 78 integration tests
+SCHEDULER_DB=:memory: node test.js  # 346 tests
 ```
 
-**Both suites must pass before proceeding.** Total: 169 tests.
+**All tests must pass before proceeding.** Total: 346 tests.
 
 ---
 
@@ -75,27 +76,9 @@ Expected: `200`
 
 ---
 
-## Step 5: Migrate Jobs from OC Cron
+## Step 5: Disable OC Built-in Cron
 
-```bash
-cd ~/.openclaw/scheduler
-node migrate.js
-```
-
-This imports jobs from `~/.openclaw/cron/jobs.json` → SQLite, converting schedule formats:
-- `cron` → direct expression
-- `every` → approximate cron (e.g., 30min → `*/30 * * * *`)
-- `at` → one-shot with `delete_after_run=true`
-
-Verify:
-```bash
-node cli.js jobs list
-node cli.js status
-```
-
----
-
-## Step 6: Disable OC Built-in Cron
+If this host had OC built-in cron jobs enabled, disable them so they don't conflict with the scheduler.
 
 ```bash
 openclaw cron list
@@ -103,13 +86,13 @@ openclaw cron list
 openclaw cron edit <job-id> --disable
 ```
 
-Or disable all programmatically — see the [README](README.md) for API-based approach.
-
 Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
 
 ---
 
-## Step 7: Disable OC Heartbeat
+## Step 6: Disable OC Heartbeat
+
+If this host had OC heartbeat enabled, disable it:
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "0m"
@@ -118,9 +101,19 @@ openclaw gateway restart
 
 ---
 
-## Step 8: Install LaunchAgent
+## Step 7: Install LaunchAgent
 
-Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
+```bash
+cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
+```
+
+Edit the plist — replace `YOUR_USER` and `YOUR_GATEWAY_TOKEN`:
+
+```bash
+nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+```
+
+The template looks like:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -164,8 +157,6 @@ Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
 </plist>
 ```
 
-**Replace** `YOUR_USER` and `YOUR_GATEWAY_TOKEN` with actual values.
-
 Load it:
 ```bash
 launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
@@ -179,7 +170,7 @@ sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 
 ---
 
-## Step 9: Smoke Tests
+## Step 8: Smoke Tests
 
 ### Isolated dispatch
 ```bash
@@ -227,20 +218,28 @@ You should receive a Telegram message within 30 seconds.
 
 ---
 
-## Step 10: Review Migrated Jobs
+## Step 9: Create Your Jobs
+
+Since this is a fresh host, create jobs from scratch using the CLI:
 
 ```bash
+node cli.js jobs add '{
+  "name": "My First Job",
+  "schedule_cron": "0 * * * *",
+  "payload_message": "Run your task here",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID"
+}'
 node cli.js jobs list
+node cli.js status
 ```
 
-- Disable expired one-shot jobs: `node cli.js jobs disable <id>`
-- Delete unwanted jobs: `node cli.js jobs delete <id>`
-- Adjust timeouts: `node cli.js jobs update <id> '{"run_timeout_ms":600000}'`
-- Verify cron conversions are correct for `every`-based schedules
+See README.md for full job examples including shell jobs, workflow chains, approval gates, and more.
 
 ---
 
-## Step 11: Verify First Real Job
+## Step 10: Verify First Real Job
 
 Wait for the next scheduled job and confirm:
 ```bash
@@ -259,10 +258,10 @@ If anything goes wrong:
 # 1. Stop scheduler
 launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 
-# 2. Re-enable OC cron
+# 2. Re-enable OC cron (if you disabled it)
 openclaw cron edit <job-id> --enable  # for each job
 
-# 3. Re-enable heartbeat
+# 3. Re-enable heartbeat (if you disabled it)
 openclaw config set agents.defaults.heartbeat.every "5m"
 openclaw gateway restart
 ```
@@ -271,13 +270,12 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 91/91
-- [ ] `SCHEDULER_DB=:memory: node test-dispatcher.js` → 78/78
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 346/346
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors
-- [ ] OC cron → all disabled
-- [ ] OC heartbeat → `0m`
+- [ ] OC cron → all disabled (if applicable)
+- [ ] OC heartbeat → `0m` (if applicable)
 - [ ] Chat completions → 200
 - [ ] Smoke test → dispatched + completed in log
 - [ ] Telegram test → message received

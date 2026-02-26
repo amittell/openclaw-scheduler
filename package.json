@@ -1,13 +1,31 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.1.0",
-  "description": "SQLite-backed job scheduler/dispatcher replacing OpenClaw's built-in cron + heartbeat",
+  "version": "1.0.0",
+  "description": "SQLite-backed job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces built-in cron and heartbeat with full run history, workflow chains, retry logic, shell jobs, approval gates, and backup support.",
   "type": "module",
   "main": "dispatcher.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node dispatcher.js",
     "migrate": "node migrate.js",
-    "test": "node test.js"
+    "test": "SCHEDULER_DB=:memory: node test.js"
+  },
+  "keywords": [
+    "openclaw",
+    "scheduler",
+    "cron",
+    "workflow",
+    "sqlite",
+    "agent",
+    "automation"
+  ],
+  "author": "OpenClaw Community",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/amittell/openclaw-scheduler"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",

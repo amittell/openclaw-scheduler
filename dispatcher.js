@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenClaw Scheduler Dispatcher v2
+// OpenClaw Scheduler Dispatcher v1.0.0
 //
 // Full standalone scheduler + message router.
 // Dispatches independently via chat completions API.
@@ -884,7 +884,7 @@ function shutdown(signal) {
 }
 
 async function main() {
-  log('info', 'Starting OpenClaw Scheduler v2 (standalone)', {
+  log('info', 'Starting OpenClaw Scheduler v1.0.0', {
     tickMs: TICK_INTERVAL_MS,
     staleThresholdS: STALE_THRESHOLD_S,
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,

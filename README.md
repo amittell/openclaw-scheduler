@@ -1,38 +1,92 @@
-# OpenClaw Scheduler v4
+# OpenClaw Scheduler
 
-A standalone job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces OpenClaw's built-in cron and heartbeat systems with a SQLite-backed scheduler that dispatches independently via the chat completions API.
+[![Tests](https://img.shields.io/badge/tests-346%20passing-brightgreen)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
-**Repo:** `github.com/amittell/openclaw-scheduler` (private)
+A standalone job scheduler, workflow engine, and inter-agent message router for [OpenClaw](https://openclaw.ai). Replaces OpenClaw's built-in cron and heartbeat with a SQLite-backed system that dispatches jobs independently via the chat completions API — complete run history, workflow chains, retry logic, shell jobs, approval gates, and MinIO backup.
+
+**Repo:** `github.com/amittell/openclaw-scheduler`
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 169 (91 unit + 78 dispatcher integration)
+**Tests:** 346 (full suite, in-memory SQLite)
 
 ---
 
 ## Table of Contents
 
-1. [System Overview](#system-overview)
-2. [Architecture](#architecture)
-3. [How Jobs Execute](#how-jobs-execute)
-4. [Workflow Chains](#workflow-chains)
-5. [Retry Logic](#retry-logic)
-6. [Chain Safety](#chain-safety)
-7. [Inter-Agent Messaging](#inter-agent-messaging)
-8. [Agent Registry](#agent-registry)
-9. [Database Schema](#database-schema)
-10. [CLI Reference](#cli-reference)
-11. [Configuration](#configuration)
-12. [Service Management](#service-management)
-13. [Error Handling & Backoff](#error-handling--backoff)
-14. [Migration & History](#migration--history)
-15. [File Reference](#file-reference)
-16. [Testing](#testing)
-17. [Troubleshooting](#troubleshooting)
+1. [What Replaced What](#what-replaced-what)
+2. [Quick Start](#quick-start)
+3. [Architecture](#architecture)
+4. [How Jobs Execute](#how-jobs-execute)
+5. [Delivery Modes](#delivery-modes)
+6. [Delivery Aliases](#delivery-aliases)
+7. [Shell Jobs](#shell-jobs)
+8. [HITL Approval Gates](#hitl-approval-gates)
+9. [Idempotency](#idempotency)
+10. [Context Retrieval](#context-retrieval)
+11. [Task Tracker](#task-tracker)
+12. [Resource Pools](#resource-pools)
+13. [Workflow Chains](#workflow-chains)
+14. [Retry Logic](#retry-logic)
+15. [Chain Safety](#chain-safety)
+16. [Inter-Agent Messaging](#inter-agent-messaging)
+17. [Backup & Recovery](#backup--recovery)
+18. [Agent Registry](#agent-registry)
+19. [Database Schema](#database-schema)
+20. [CLI Reference](#cli-reference)
+21. [Configuration](#configuration)
+22. [Service Management](#service-management)
+23. [Error Handling & Backoff](#error-handling--backoff)
+24. [Migration & History](#migration--history)
+25. [File Reference](#file-reference)
+26. [Testing](#testing)
+27. [Troubleshooting](#troubleshooting)
 
 ---
 
-## System Overview
+## What Replaced What
+
+| Before (OC built-in) | After (scheduler) |
+|----------------------|-------------------|
+| `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with full run history |
+| `heartbeat.every: "5m"` | Scheduled jobs (e.g., "Daily Workspace Audit") |
+| No run tracking | Full run lifecycle with status, duration, summary |
+| No chain support | Parent/child jobs with trigger-on-completion |
+| No retry | Auto-retry with configurable attempts and delay |
+| No inter-agent comms | Message queue with priority, threading, broadcast |
+| Shell scripts (manual) | Shell job target — cron-scheduled scripts, no gateway needed |
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
+cd ~/.openclaw/scheduler
+npm install
+SCHEDULER_DB=:memory: node test.js   # should print: 346 passed, 0 failed
+
+# Copy and configure LaunchAgent
+cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
+# Edit the plist: replace YOUR_USER and YOUR_GATEWAY_TOKEN
+nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+
+# Start
+launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+
+# Verify
+node cli.js status
+tail -5 /tmp/openclaw-scheduler.log
+```
+
+For full installation details (first host), see [INSTALL.md](INSTALL.md).
+For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
+
+---
+
+## Architecture
 
 The scheduler sits alongside the OpenClaw gateway as an independent process. It creates **isolated sessions** for each job — they never touch the user's main conversation.
 
@@ -51,52 +105,46 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 │    ├─ Job dispatch via chat completions      │
 │    ├─ Workflow chain engine                  │
 │    ├─ Retry logic                            │
+│    ├─ Shell job execution                    │
+│    ├─ HITL approval gates                    │
+│    ├─ Idempotency ledger                     │
 │    ├─ Inter-agent message queue              │
-│    └─ Agent registry                         │
+│    ├─ Task tracker                           │
+│    └─ MinIO backup                           │
 └─────────────────────────────────────────────┘
 ```
 
-**What replaced what:**
-
-| Before (OC built-in) | After (scheduler) |
-|----------------------|-------------------|
-| `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with run history |
-| `heartbeat.every: "5m"` | Scheduled jobs (e.g., "Daily Workspace Audit") |
-| No run tracking | Full run lifecycle with status, duration, summary |
-| No chain support | Parent/child jobs with trigger-on-completion |
-| No retry | Auto-retry with configurable attempts and delay |
-| No inter-agent comms | Message queue with priority, threading, broadcast |
-
----
-
-## Architecture
+### Tick Loop
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                   Dispatcher Loop (10s tick)                  │
 │                                                              │
 │  1. Gateway health check                                     │
-│  2. Find due jobs (next_run_at <= now, enabled=1)            │
-│  3. Dispatch:                                                │
-│     • isolated → POST /v1/chat/completions (unique session)  │
-│     • main     → openclaw system event CLI                   │
-│  4. On completion: trigger child jobs in chain               │
-│  5. On failure: retry if attempts remain                     │
-│  6. Deliver results to Telegram/channel if configured        │
-│  7. Process spawn messages (runtime job creation)            │
-│  8. Check running runs for staleness (90s threshold)         │
-│  9. Expire old messages / prune old runs (hourly)            │
+│  2. Find due jobs → dispatch                                 │
+│  3. Check running runs (stale/timeout detection)             │
+│  4. HITL approval gate check                                 │
+│  5. Message delivery + spawn handling                        │
+│  6. Task tracker dead-man's-switch                           │
+│  7. Expire old messages                                      │
+│  8. Prune old runs + WAL checkpoint (hourly)                 │
+│  9. Backup to MinIO (every 5 min)                            │
 └──────────────────────────────────────────────────────────────┘
          │                              │
          ▼                              ▼
   ┌───────────────────┐        ┌──────────────────────┐
   │     SQLite DB      │        │   OpenClaw Gateway    │
   │                    │        │                       │
-  │  • jobs (29 cols)  │        │  • /v1/chat/completions│
-  │  • runs (16 cols)  │        │  • /tools/invoke      │
-  │  • messages (17)   │        │  • /health            │
-  │  • agents (7)      │        │  • system event CLI   │
-  └───────────────────┘        └──────────────────────┘
+  │  • jobs            │        │  • /v1/chat/completions│
+  │  • runs            │        │  • /tools/invoke      │
+  │  • messages        │        │  • /health            │
+  │  • agents          │        │  • system event CLI   │
+  │  • approvals       │        └──────────────────────┘
+  │  • task_tracker    │
+  │  • idempotency_ledger│
+  │  • delivery_aliases│
+  │  • schema_migrations│
+  └───────────────────┘
 ```
 
 ### Session Types
@@ -105,7 +153,9 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 |---------|-----------|----------|----------|
 | User DM | Telegram message | Persistent per-peer | Your conversations |
 | Group chat | Group message | Persistent per-group | Team discussions |
-| Scheduler job | Dispatcher via API | One-shot, dies after completion | Cron jobs, chain steps |
+| Isolated job | Dispatcher via API | One-shot, dies after completion | Cron jobs, chain steps |
+| Main session | `openclaw system event` | Existing main session | Jobs needing main context |
+| Shell | Dispatcher (direct) | Per-job (no session) | Cron scripts, backups, maintenance |
 | Sub-agent | `sessions_spawn` | Task-scoped | Delegated work |
 
 Scheduler jobs get completely isolated sessions. They can't see your chat history and your chats can't see theirs.
@@ -149,12 +199,223 @@ Dispatcher → exec: openclaw system event --text "..." --mode now
 
 This injects directly into the active agent session.
 
+### Shell Jobs
+
+```
+Shell Job (session_target='shell')
+  │
+  ├─ getDueJobs() → "Hourly Backup is due"
+  ├─ createRun() → status='running'
+  ├─ /bin/zsh -c "<payload_message>"
+  │   (no gateway required)
+  │   ← exit 0: "Backup complete, 3 files"
+  │
+  ├─ finishRun(exit===0 ? 'ok' : 'error')
+  ├─ announce: post output if exit ≠ 0
+  ├─ announce-always: post output regardless
+  └─ Trigger child jobs if any
+```
+
 ### Prompt Building
 
 Each isolated job prompt includes:
 1. Header: `[scheduler:<job_id> <job_name>]`
 2. Pending inbox messages for the agent (up to 5)
-3. The job's `payload_message`
+3. Context from prior runs (if `context_retrieval` is set)
+4. The job's `payload_message`
+
+---
+
+## Delivery Modes
+
+| Mode | When output is delivered |
+|------|-------------------------|
+| `none` | Never (background jobs) |
+| `announce` | LLM jobs: any non-HEARTBEAT_OK response. Shell jobs: non-zero exit only |
+| `announce-always` | Always delivers output (LLM or shell) |
+
+> **Note:** delivery is suppressed if `delivery_channel` or `delivery_to` are absent, regardless of `delivery_mode`.
+
+---
+
+## Delivery Aliases
+
+Delivery aliases let you define named delivery targets (e.g., `@my_team`) instead of hard-coding channel/target pairs in every job.
+
+```bash
+# Create a named alias
+node cli.js aliases add my_team telegram -1001234567890
+
+# Use @alias in job (resolves at dispatch time)
+node cli.js jobs add '{
+  "name": "Alert",
+  "delivery_mode": "announce",
+  "delivery_to": "@my_team",
+  ...
+}'
+
+# List aliases
+node cli.js aliases list
+
+# Remove an alias
+node cli.js aliases remove my_team
+```
+
+Aliases are resolved at dispatch time. If an alias is deleted, jobs fall back to suppressed delivery.
+
+---
+
+## Shell Jobs
+
+Shell jobs run a command directly on the host — no gateway or LLM required. Ideal for backups, scripts, maintenance tasks, and anything that doesn't need AI.
+
+```bash
+node cli.js jobs add '{
+  "name": "Hourly Backup",
+  "schedule_cron": "0 * * * *",
+  "schedule_tz": "America/New_York",
+  "session_target": "shell",
+  "payload_message": "/path/to/backup.sh",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID"
+}'
+```
+
+**Key properties:**
+- **No gateway dependency** — runs even when gateway is down
+- `payload_message` is the command to execute (shell string passed to `/bin/zsh -c`)
+- Output captured up to 1MB, truncated to 5000 chars in run summary
+- `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
+- Workflow chains work the same way — shell jobs can trigger children on success/failure
+
+**With environment variables:**
+```bash
+node cli.js jobs add '{
+  "name": "DB Dump",
+  "schedule_cron": "0 3 * * *",
+  "session_target": "shell",
+  "payload_message": "PGPASSWORD=secret pg_dump mydb > /backups/mydb.sql && echo OK",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID"
+}'
+```
+
+---
+
+## HITL Approval Gates
+
+Jobs with `approval_required: 1` pause before each chain-triggered execution and wait for a human to approve or reject.
+
+```bash
+# Job that requires operator approval before each chain-triggered execution
+node cli.js jobs add '{
+  "name": "Deploy to Prod",
+  "parent_id": "<build-job-id>",
+  "trigger_on": "success",
+  "approval_required": 1,
+  "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "payload_message": "Deploy the application to production"
+}'
+```
+
+When triggered, the job creator receives: `⚠️ Job 'Deploy to Prod' requires approval.`
+
+```bash
+node cli.js jobs approve <job-id>
+node cli.js jobs reject <job-id> "Postponing — too late in the day"
+node cli.js approvals list
+```
+
+**Key notes:**
+- Approval gates only apply to **chain-triggered** jobs (`parent_id` set)
+- Cron-scheduled jobs always dispatch without waiting for approval
+- `approval_timeout_s` — auto-resolve timeout (seconds)
+- `approval_auto` — `"approve"` or `"reject"` — what happens on timeout
+
+---
+
+## Idempotency
+
+Control what happens when the dispatcher crashes mid-run.
+
+```bash
+# Enable at-least-once: crashed runs replay on next startup
+node cli.js jobs update <id> '{"delivery_guarantee":"at-least-once"}'
+
+# Default (at-most-once): no replay
+node cli.js jobs update <id> '{"delivery_guarantee":"at-most-once"}'
+```
+
+**How it works:**
+- **`at-most-once`** (default): if dispatcher crashes mid-run, run is marked `crashed` and the schedule advances normally. The run is not replayed.
+- **`at-least-once`**: on startup, any `running` run from a crashed dispatcher is replayed with a new run. `replay_of` field tracks the original run ID for lineage.
+
+**Idempotent agents** can return `IDEMPOTENT_SKIP` in their response to acknowledge they've already processed this execution (detected via the idempotency ledger).
+
+The ledger also prevents double-dispatch in concurrent tick scenarios — each run acquires a lock before dispatch.
+
+---
+
+## Context Retrieval
+
+Inject prior run summaries into a job's prompt so the agent has awareness of recent outcomes.
+
+```bash
+# Inject last 3 run summaries into job prompt
+node cli.js jobs update <id> '{"context_retrieval":"recent","context_retrieval_limit":3}'
+
+# Hybrid: recent runs + TF-IDF search for semantically relevant summaries
+node cli.js jobs update <id> '{"context_retrieval":"hybrid","context_retrieval_limit":5}'
+```
+
+**Modes:**
+| Mode | Description |
+|------|-------------|
+| `none` | No context injected (default) |
+| `recent` | Last N run summaries, newest first |
+| `hybrid` | Recent runs + TF-IDF similarity search against all prior summaries |
+
+Useful for health check jobs that should know about yesterday's failures, or audit jobs that build incrementally on prior work.
+
+---
+
+## Task Tracker
+
+The task tracker provides a dead-man's-switch for coordinating multi-agent sub-agent teams. Create a tracker, assign expected agents, and receive a summary when all agents complete (or time out).
+
+```bash
+# Create a task group to monitor N sub-agents
+node cli.js tasks create '{
+  "name": "v2-release-team",
+  "expected_agents": ["schema-agent","frontend-agent","docs-agent"],
+  "timeout_s": 1800,
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID"
+}'
+
+# Monitor
+node cli.js tasks list
+node cli.js tasks status <tracker-id>
+```
+
+Each agent in the team must send heartbeat updates. If an agent goes silent past its timeout, it's declared dead. When all agents complete or time out, a summary is delivered to the configured channel.
+
+---
+
+## Resource Pools
+
+Prevent concurrent execution across different jobs that share a resource.
+
+```bash
+# Two jobs that must not run concurrently
+node cli.js jobs add '{"name":"DB Migration","resource_pool":"database",...}'
+node cli.js jobs add '{"name":"DB Backup","resource_pool":"database",...}'
+```
+
+If one job in a pool is currently running, all other pool members skip their tick (same behavior as `overlap_policy: 'skip'`, but cross-job rather than per-job). Pool membership is set via the `resource_pool` string field.
 
 ---
 
@@ -197,7 +458,29 @@ node cli.js jobs add '{
 - `failure` — parent run status = `error` or `timeout`
 - `complete` — any completion (success, failure, or timeout)
 
-### Pattern 2: Multi-Agent Workflows
+### Pattern 2: Output-Based Trigger Conditions
+
+```bash
+# Only fire child if parent output contains "ALERT"
+node cli.js jobs add '{
+  "name": "Alert Handler",
+  "parent_id": "<monitor-job-id>",
+  "trigger_on": "success",
+  "trigger_condition": "contains:ALERT",
+  "payload_message": "Handle the alert"
+}'
+
+# Regex condition
+node cli.js jobs add '{
+  "name": "Critical Error Handler",
+  "parent_id": "<monitor-job-id>",
+  "trigger_on": "success",
+  "trigger_condition": "regex:ERROR.*critical",
+  "payload_message": "Handle critical error"
+}'
+```
+
+### Pattern 3: Multi-Agent Workflows
 
 Chain jobs targeting different agents:
 
@@ -208,10 +491,16 @@ Build (agent: main, cron: 10am)
 ```
 
 ```bash
-node cli.js jobs add '{"name":"Deploy","payload_message":"deploy","agent_id":"ops","parent_id":"<build-id>","trigger_on":"success"}'
+node cli.js jobs add '{
+  "name": "Deploy",
+  "payload_message": "deploy",
+  "agent_id": "ops",
+  "parent_id": "<build-id>",
+  "trigger_on": "success"
+}'
 ```
 
-### Pattern 3: Delayed Triggers
+### Pattern 4: Delayed Triggers
 
 ```bash
 node cli.js jobs add '{
@@ -223,9 +512,7 @@ node cli.js jobs add '{
 }'
 ```
 
-The child won't fire until 60 seconds after the parent completes.
-
-### Pattern 4: Runtime Spawning
+### Pattern 5: Runtime Spawning
 
 A running agent can create new jobs on the fly by sending a `spawn` message:
 
@@ -237,8 +524,6 @@ A running agent can create new jobs on the fly by sending a `spawn` message:
   "body": "{\"name\":\"Dynamic Task\",\"payload_message\":\"analyze results\",\"delete_after_run\":true,\"run_now\":true}"
 }
 ```
-
-The dispatcher processes spawn messages every 15 seconds.
 
 ### Visualizing Chains
 
@@ -325,12 +610,63 @@ Agents exchange messages through the scheduler's queue.
 - **Broadcast:** `to_agent = 'broadcast'` reaches all agents
 - **TTL/Expiry:** `expires_at` auto-expires unread messages
 - **Metadata:** JSON blob for structured data
-- **Kinds:** `text`, `task`, `result`, `status`, `system`, `spawn`
+- **Kinds:** `text`, `task`, `result`, `status`, `system`, `spawn`, `decision`, `constraint`, `fact`, `preference`
+- **Owner field:** `owner` tracks message originator for audit
 - **Job linking:** messages can reference `job_id` and `run_id`
 
 ### Delivery
 
 Messages are delivered inline with job prompts. When the dispatcher builds a prompt, it includes up to 5 pending messages for the target agent, marked as `delivered`.
+
+### Usage
+
+```bash
+# Send a message
+node cli.js msg send <from-agent> <to-agent> "message body"
+
+# Read inbox
+node cli.js msg inbox <agent-id>
+
+# Mark all read
+node cli.js msg readall <agent-id>
+```
+
+---
+
+## Backup & Recovery
+
+The scheduler can back up its SQLite database to MinIO automatically.
+
+```bash
+# Manual snapshot
+node backup.js snapshot
+
+# Manual rollup (hourly aggregate)
+node backup.js rollup
+
+# Check backup status
+node backup.js status
+
+# Restore from snapshot
+node backup.js restore scheduler-backups/scheduler/snapshots/2026-02-26/14-00.db
+
+# Prune old backups
+node backup.js prune
+```
+
+**Configuration via environment:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MC_ALIAS` | `backupstore` | MinIO client alias |
+| `BUCKET` | `scheduler-backups` | MinIO bucket name |
+| `PREFIX` | `scheduler` | Path prefix within bucket |
+
+Requires `mc` (MinIO client) in PATH and a configured `backupstore` alias.
+
+**Built-in (when running via LaunchAgent):**
+- Snapshot every 5 minutes (`SCHEDULER_BACKUP_MS`)
+- Rollup on the first tick of each hour
 
 ---
 
@@ -346,42 +682,65 @@ Messages are delivered inline with job prompts. When the dispatcher builds a pro
 
 The dispatcher automatically manages agent status during dispatch (idle → busy → idle).
 
+```bash
+node cli.js agents list
+node cli.js agents get <id>
+node cli.js agents register <id> [name]
+```
+
 ---
 
 ## Database Schema
 
-**Schema version:** 4 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 6 | **Mode:** WAL | **Foreign keys:** ON
 
-### Jobs (29 columns)
+### Tables
+
+| Table | Description |
+|-------|-------------|
+| `jobs` | Job definitions (schedule, payload, chain config, delivery) |
+| `runs` | Execution history (status, timing, summaries, retry lineage) |
+| `messages` | Inter-agent message queue (priority, TTL, typed) |
+| `agents` | Agent registry (status, capabilities, last seen) |
+| `approvals` | HITL gate records (pending/approved/rejected/expired) |
+| `task_tracker` | Multi-agent task group definitions |
+| `task_tracker_agents` | Per-agent status within a task group |
+| `idempotency_ledger` | Dispatch deduplication and at-least-once tracking |
+| `delivery_aliases` | Named delivery targets (channel + target pairs) |
+| `schema_migrations` | Applied migration version log |
+
+### Jobs (key columns)
 
 ```
 id, name, enabled, schedule_cron, schedule_tz,
 session_target, agent_id, payload_kind, payload_message,
-payload_model, payload_thinking, payload_timeout_seconds,
-overlap_policy, run_timeout_ms, max_retries, retry_delay_s,
-delivery_mode, delivery_channel, delivery_to,
-delete_after_run, parent_id, trigger_on, trigger_delay_s,
+payload_model, overlap_policy, run_timeout_ms,
+max_retries, retry_delay_s, delivery_mode, delivery_channel,
+delivery_to, delete_after_run, parent_id, trigger_on,
+trigger_delay_s, trigger_condition, resource_pool,
+approval_required, approval_timeout_s, approval_auto,
+delivery_guarantee, context_retrieval, context_retrieval_limit,
 next_run_at, last_run_at, last_status, consecutive_errors,
 created_at, updated_at
 ```
 
-### Runs (16 columns)
+### Runs (key columns)
 
 ```
 id, job_id, status, started_at, finished_at, duration_ms,
 last_heartbeat, session_key, session_id, summary,
 error_message, dispatched_at, run_timeout_ms,
-triggered_by_run, retry_of, retry_count
+triggered_by_run, retry_of, retry_count, replay_of
 ```
 
-**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`
+**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`
 
-### Messages (17 columns)
+### Messages (key columns)
 
 ```
 id, from_agent, to_agent, reply_to, kind, subject, body,
-metadata, priority, channel, status, delivered_at, read_at,
-expires_at, created_at, job_id, run_id
+metadata, priority, channel, owner, status, delivered_at,
+read_at, expires_at, created_at, job_id, run_id
 ```
 
 ### Agents (7 columns)
@@ -389,10 +748,6 @@ expires_at, created_at, job_id, run_id
 ```
 id, name, status, last_seen_at, session_key, capabilities, created_at
 ```
-
-### Indexes (8)
-
-`idx_jobs_next_run`, `idx_jobs_parent`, `idx_runs_job_id`, `idx_runs_status`, `idx_messages_to`, `idx_messages_from`, `idx_messages_created`, `idx_messages_pending`
 
 ---
 
@@ -432,6 +787,21 @@ node cli.js agents list
 node cli.js agents get <id>
 node cli.js agents register <id> [name]
 
+# ── Approvals ─────────────────────────────────────
+node cli.js jobs approve <id>            # Approve pending gate
+node cli.js jobs reject <id> [reason]    # Reject pending gate
+node cli.js approvals list               # All pending approvals
+
+# ── Task Tracker ──────────────────────────────────
+node cli.js tasks create '<json>'        # Create task group
+node cli.js tasks list                   # Active task groups
+node cli.js tasks status <id>            # Detailed status
+
+# ── Delivery Aliases ──────────────────────────────
+node cli.js aliases list                 # List all aliases
+node cli.js aliases add <name> <channel> <target> [description]
+node cli.js aliases remove <name>
+
 # ── Status ────────────────────────────────────────
 node cli.js status
 ```
@@ -450,6 +820,7 @@ node cli.js status
 | `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval |
 | `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
+| `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
 
 ---
@@ -517,7 +888,7 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 
 ## Migration & History
 
-### Importing from OC cron
+### Importing from OC cron (first host only)
 
 ```bash
 node migrate.js   # imports from ~/.openclaw/cron/jobs.json
@@ -525,10 +896,17 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema migrations
 
+Applied on top of base schema (schema.sql) in order:
+
 ```bash
-node migrate-v3.js   # v2 → v3 (chain columns)
-node migrate-v4.js   # v3 → v4 (retry columns)
+node migrate-v3.js    # chain columns (parent_id, trigger_on, trigger_delay_s)
+node migrate-v3b.js   # retry columns (max_retries, retry_delay_s)
+node migrate-v5.js    # delivery guarantee, approvals, context retrieval
+node migrate-v6.js    # task tracker tables
+node migrate-v7.js    # idempotency ledger
 ```
+
+These migrations are run automatically when `initDb()` detects the database needs upgrading.
 
 ### What was disabled in OpenClaw
 
@@ -540,11 +918,14 @@ node migrate-v4.js   # v3 → v4 (retry columns)
 
 ### Version history
 
-| Version | Date | Changes |
-|---------|------|---------|
-| v2 | 2026-02-21 | Initial: jobs, runs, messages, agents, standalone dispatch |
-| v3 | 2026-02-22 | Workflow chains: parent_id, trigger_on, trigger_delay_s, cycle detection, spawn messages, multi-agent |
-| v4 | 2026-02-22 | Retry logic, max chain depth (10), chain cancellation, async chain fix |
+| Version | Date | Schema | Key changes |
+|---------|------|--------|-------------|
+| 0.1.0 | 2026-02-21 | v1 | Initial: jobs, runs, messages, agents, standalone dispatch |
+| 0.4.0 | 2026-02-22 | v3 | Workflow chains, cycle detection, spawn messages, multi-agent |
+| 0.5.0 | 2026-02-23 | v3b | Retry logic, max chain depth, chain cancellation, queue overlap |
+| 0.6.0 | 2026-02-24 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
+| 0.7.0 | 2026-02-25 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
+| 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
 
 ---
 
@@ -552,23 +933,31 @@ node migrate-v4.js   # v3 → v4 (retry columns)
 
 ```
 ~/.openclaw/scheduler/
-├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry
-├── db.js                  # SQLite connection (WAL, FK ON)
-├── schema.sql             # v4 schema definition
-├── jobs.js                # Job CRUD, cron, chains, cycle detection
-├── runs.js                # Run lifecycle, stale/timeout, cancellation
-├── messages.js            # Inter-agent message queue
+├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
+├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
+├── schema.sql             # Full schema definition (v6)
+├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
+├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
+├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
 ├── agents.js              # Agent registry
-├── gateway.js             # OpenClaw API client (chat completions, events, delivery)
+├── gateway.js             # OpenClaw API client (chat completions, events, delivery, aliases)
+├── approval.js            # HITL approval gates
+├── idempotency.js         # Idempotency ledger (at-least-once delivery dedup)
+├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
+├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
+├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── migrate-v3.js          # Schema v2 → v3
-├── migrate-v4.js          # Schema v3 → v4
-├── test.js                # Unit tests (91)
-├── test-dispatcher.js     # Dispatcher integration tests (78)
-├── scheduler.db           # Live SQLite database (gitignored)
-├── package.json           # Dependencies
+├── migrate-v3.js          # Schema migration: chain columns
+├── migrate-v3b.js         # Schema migration: retry columns
+├── migrate-v5.js          # Schema migration: delivery guarantee, approvals, context retrieval
+├── migrate-v6.js          # Schema migration: task tracker tables
+├── migrate-v7.js          # Schema migration: idempotency ledger
+├── test.js                # Full test suite (346 assertions, in-memory)
+├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
+├── INSTALL.md             # Full installation guide (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
+├── CHANGELOG.md           # Version history
 └── README.md              # This file
 ```
 
@@ -576,54 +965,32 @@ node migrate-v4.js   # v3 → v4 (retry columns)
 
 ## Testing
 
-### Run all tests
-
 ```bash
-cd ~/.openclaw/scheduler
-SCHEDULER_DB=:memory: node test.js            # 91 unit tests
-SCHEDULER_DB=:memory: node test-dispatcher.js  # 78 integration tests
+# Run all tests (346 assertions, in-memory SQLite)
+SCHEDULER_DB=:memory: node test.js
+
+# Or via npm:
+npm test
 ```
 
-### Unit tests (test.js) — 91 assertions
+### Test categories
 
 - Schema creation & integrity
 - Job CRUD, cron parsing, due detection
 - Run lifecycle (create, heartbeat, finish, stale, timeout)
 - Agent registry (upsert, status, capabilities)
-- Message queue (14 operations, 5 kinds, priority, broadcast, expiry)
+- Message queue (priority, broadcast, TTL, typed messages)
 - Cascade deletes, pruning
-- Workflow chains (parent/child, trigger matching, tree traversal)
+- Workflow chains (parent/child, trigger matching, tree traversal, trigger conditions)
 - Cycle detection (self, deep)
 - Max chain depth enforcement
-- Retry tracking (retry_of, retry_count)
-- Chain cancellation (cascade, no-op on finished)
-
-### Dispatcher integration tests (test-dispatcher.js) — 78 assertions
-
-Uses a mock gateway to test the full dispatch pipeline:
-
-1. Basic isolated dispatch (prompt, delivery, run tracking)
-2. Main session dispatch (system event)
-3. Failed dispatch (error status, error message queued)
-4. HEARTBEAT_OK suppresses delivery
-5. Skip-overlap policy
-6. One-shot job deletion
-7. Retry logic — full 3-attempt cycle, failure children wait
-8. Retry succeeds on 2nd attempt → success children fire
-9. Chain trigger — 3-deep success path (A→B→C)
-10. Chain trigger — failure path (correct children fire)
-11. Delayed triggers (scheduled, not immediate)
-12. Spawn message processing
-13. Invalid spawn rejection
-14. Chain cancellation
-15. buildJobPrompt includes pending messages
-16. Delivery suppressed without channel/target
-17. delivery_mode=none suppresses delivery
-18. Error backoff calculation
-19. Multi-agent chain dispatch (main→ops)
-20. getRetryInfo edge cases
-21. Consecutive error tracking across retries
-22. Complete trigger fires on both success and failure
+- Retry tracking and sequencing
+- Chain cancellation
+- Shell job execution
+- Approval gate lifecycle
+- Idempotency key claiming/releasing
+- Context retrieval (recent/hybrid)
+- Dispatcher integration (full dispatch pipeline with mock gateway)
 
 ---
 
@@ -666,3 +1033,18 @@ launchctl list | grep scheduler
 ### Logs not updating
 
 Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have crashed — check `launchctl list | grep scheduler` (exit code in second column, 0 = running).
+
+### Job shows 'awaiting_approval'
+
+```bash
+node cli.js approvals list
+node cli.js jobs approve <id>   # or reject
+```
+
+### Backup failing
+
+```bash
+mc alias list   # verify backupstore alias configured
+# Check: MC_ALIAS, BUCKET, PREFIX env vars or defaults in backup.js
+# Verify MinIO is reachable: mc ls backupstore/
+```
