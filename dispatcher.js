@@ -297,6 +297,9 @@ async function dispatchJob(job) {
       await sendSystemEvent(job.payload_message, 'now');
       finishRun(run.id, 'ok', { summary: 'System event dispatched' });
       updateJobAfterRun(job, 'ok');
+      if (job.delivery_mode === 'announce-always') {
+        await handleDelivery(job, job.payload_message);
+      }
 
     } else if (job.session_target === 'shell') {
       // Shell job: run payload_message as a shell command — no gateway dependency
@@ -380,7 +383,9 @@ async function dispatchJob(job) {
       if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
       // Handle delivery (skip heartbeat-ok, no-flush, and idempotent-skip responses)
-      if (job.delivery_mode === 'announce' && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim()) {
+      const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
+        && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim();
+      if (shouldAnnounce) {
         await handleDelivery(job, content);
       }
 
@@ -430,6 +435,11 @@ async function dispatchJob(job) {
     releaseIdempotencyKey(idemKey);
 
     if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
+
+    // Deliver failure notification if channel configured
+    if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+      await handleDelivery(job, `⚠️ Job failed: ${job.name}\n\n${err.message}`);
+    }
 
     // Queue error message (before potential job deletion)
     queueMessage({
@@ -568,7 +578,7 @@ function resolveAlias(target) {
 
 // ── Deliver run output to channel ───────────────────────────
 async function handleDelivery(job, content) {
-  if (job.delivery_mode !== 'announce') return;
+  if (!['announce', 'announce-always'].includes(job.delivery_mode)) return;
   if (!job.delivery_channel && !job.delivery_to) return;
 
   let channel = job.delivery_channel;
@@ -656,6 +666,9 @@ async function checkRunHealth() {
     const job = getJob(run.job_id);
     if (job) {
       updateJobAfterRun(job, 'timeout');
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        await handleDelivery(job, `⏱ Job timed out (stale): ${job.name}\n\nNo activity for ${STALE_THRESHOLD_S}s`);
+      }
       if (dequeueJob(job.id)) {
         log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout)`);
       }
@@ -672,6 +685,9 @@ async function checkRunHealth() {
     const job = getJob(run.job_id);
     if (job) {
       updateJobAfterRun(job, 'timeout');
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        await handleDelivery(job, `⏱ Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
+      }
       if (dequeueJob(job.id)) {
         log('info', `Dequeued pending dispatch for ${job.name} (after absolute timeout)`);
       }
