@@ -11,9 +11,11 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 | Requirement | Notes |
 |-------------|-------|
 | macOS or Linux | Tested on macOS arm64 |
-| Node.js ≥ 22 | `node --version` |
+| Node.js ≥ 22 | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
+
+> **macOS PATH note:** If installed via Homebrew, `node` and `npm` live at `/opt/homebrew/bin/`. If your terminal doesn't find them, run `export PATH="/opt/homebrew/bin:$PATH"` or add it to your `~/.zprofile`. The LaunchAgent template already includes the correct PATH.
 
 ---
 
@@ -175,7 +177,7 @@ sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ### Isolated dispatch
 ```bash
 cd ~/.openclaw/scheduler
-node -e "
+node --input-type=module -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();
@@ -196,7 +198,7 @@ Look for: `Dispatching: Smoke Test` → `Completed: Smoke Test`
 
 ### Telegram delivery
 ```bash
-node -e "
+node --input-type=module -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();

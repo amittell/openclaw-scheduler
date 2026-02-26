@@ -183,7 +183,7 @@ sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ### Isolated dispatch
 ```bash
 cd ~/.openclaw/scheduler
-node -e "
+node --input-type=module -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();
@@ -204,7 +204,7 @@ Look for: `Dispatching: Smoke Test` → `Completed: Smoke Test`
 
 ### Telegram delivery
 ```bash
-node -e "
+node --input-type=module -e "
 import { initDb, getDb } from './db.js';
 import { createJob } from './jobs.js';
 initDb();
