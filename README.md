@@ -568,7 +568,7 @@ node migrate-v4.js   # v3 → v4 (retry columns)
 ├── test-dispatcher.js     # Dispatcher integration tests (78)
 ├── scheduler.db           # Live SQLite database (gitignored)
 ├── package.json           # Dependencies
-├── INSTALL.md  # Installation guide for additional hosts
+├── INSTALL.md             # Installation guide for additional hosts
 └── README.md              # This file
 ```
 
