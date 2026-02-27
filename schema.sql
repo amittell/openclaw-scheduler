@@ -255,7 +255,9 @@ CREATE TABLE IF NOT EXISTS task_tracker_agents (
   started_at      TEXT,
   finished_at     TEXT,
   exit_message    TEXT,                       -- agent's final status message
-  error           TEXT
+  error           TEXT,
+  session_key     TEXT,                       -- OpenClaw session key for auto-correlation (v8)
+  last_heartbeat  TEXT                        -- last activity detected (CLI or auto-correlation)
 );
 CREATE INDEX IF NOT EXISTS idx_tta_tracker ON task_tracker_agents(tracker_id);
 CREATE INDEX IF NOT EXISTS idx_tta_status ON task_tracker_agents(status) WHERE status IN ('pending','running');
@@ -269,3 +271,5 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
+-- v7: idempotency ledger (applied by migrate-v7.js)
+-- v8: task_tracker_agents.session_key + last_heartbeat (applied by migrate-v8.js)

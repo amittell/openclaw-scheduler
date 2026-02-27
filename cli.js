@@ -46,10 +46,12 @@ Agents:
   agents register <id> [name]        Register/update agent
 
 Tasks:
-  tasks list                         List active task groups
-  tasks status <id>                  Detailed status of a task group
-  tasks create <json>                Create a tracked task group
-  tasks history [limit]              Recent completed task groups
+  tasks list                                    List active task groups
+  tasks status <id>                             Detailed status of a task group
+  tasks create <json>                           Create a tracked task group
+  tasks history [limit]                         Recent completed task groups
+  tasks heartbeat <id> <label> running|completed|failed [msg]  Sub-agent reports status
+  tasks register-session <id> <label> <key>    Orchestrator links session key to agent
 
 Approvals:
   approvals list                     List pending approvals
@@ -348,6 +350,54 @@ switch (command) {
         })));
         break;
       }
+
+      // ── tasks heartbeat ──────────────────────────────────
+      // Called BY sub-agents during execution to report status.
+      // Usage: tasks heartbeat <trackerId> <agentLabel> running|completed|failed [message]
+      case 'heartbeat': {
+        const { agentStarted, agentCompleted, agentFailed } = await import('./task-tracker.js');
+        const [trackerId, agentLabel, status, ...msgParts] = args;
+        const exitMsg = msgParts.join(' ') || undefined;
+
+        if (!trackerId || !agentLabel || !status) {
+          console.error('Usage: tasks heartbeat <trackerId> <agentLabel> running|completed|failed [message]');
+          process.exit(1);
+        }
+
+        if (status === 'running') {
+          agentStarted(trackerId, agentLabel);
+          console.log(`✅ Heartbeat recorded: ${agentLabel} → running`);
+        } else if (status === 'completed') {
+          agentCompleted(trackerId, agentLabel, exitMsg);
+          console.log(`✅ Heartbeat recorded: ${agentLabel} → completed${exitMsg ? ` (${exitMsg})` : ''}`);
+        } else if (status === 'failed') {
+          agentFailed(trackerId, agentLabel, exitMsg || 'failed');
+          console.log(`✅ Heartbeat recorded: ${agentLabel} → failed${exitMsg ? ` (${exitMsg})` : ''}`);
+        } else {
+          console.error(`Unknown status: "${status}". Valid values: running | completed | failed`);
+          process.exit(1);
+        }
+        break;
+      }
+
+      // ── tasks register-session ────────────────────────────
+      // Called BY the orchestrator after spawning a sub-agent.
+      // Links the sub-agent's OC session key to the tracker agent so
+      // the dispatcher can auto-detect heartbeats without CLI calls.
+      // Usage: tasks register-session <trackerId> <agentLabel> <sessionKey>
+      case 'register-session': {
+        const { registerAgentSession } = await import('./task-tracker.js');
+        const [trackerId, agentLabel, sessionKey] = args;
+        if (!trackerId || !agentLabel || !sessionKey) {
+          console.error('Usage: tasks register-session <trackerId> <agentLabel> <sessionKey>');
+          console.error('Example: tasks register-session abc-123 writer agent:main:subagent:xyz-456');
+          process.exit(1);
+        }
+        registerAgentSession(trackerId, agentLabel, sessionKey);
+        console.log(`✅ Session registered: ${agentLabel} → ${sessionKey}`);
+        break;
+      }
+
       default: usage();
     }
     break;

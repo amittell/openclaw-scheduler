@@ -333,6 +333,67 @@ node cli.js msg send monitor-agent handler-agent "Found 3 critical errors at 14:
 
 ---
 
+### Tracking Spawned Sub-Agents
+
+When you spawn sub-agents to do parallel work, use the task tracker so the scheduler monitors them and delivers a completion summary automatically — without you polling.
+
+**Step 1: Create a tracker before spawning**
+
+```bash
+# In your agent session, before spawning:
+TRACKER_ID=$(node ~/.openclaw/scheduler/cli.js tasks create '{
+  "name": "doc-sprint",
+  "expectedAgents": ["writer", "reviewer"],
+  "timeoutS": 3600,
+  "deliveryChannel": "telegram",
+  "deliveryTo": "YOUR_TELEGRAM_ID"
+}' | grep '"id"' | cut -d'"' -f4)
+```
+
+**Step 2: Spawn sub-agents (via `sessions_spawn` tool), then register their session keys**
+
+```bash
+# After getting the childSessionKey from sessions_spawn:
+node ~/.openclaw/scheduler/cli.js tasks register-session $TRACKER_ID writer "agent:main:subagent:abc-123"
+node ~/.openclaw/scheduler/cli.js tasks register-session $TRACKER_ID reviewer "agent:main:subagent:def-456"
+```
+
+Once session keys are registered, the **dispatcher auto-detects heartbeats** by calling `sessions_list` every 30s. As long as the sub-agent's session is active, it's counted as alive — no CLI calls required from inside the sub-agent.
+
+**Step 3: Sub-agents report completion (optional but recommended)**
+
+Add this to the sub-agent's task preamble:
+
+```
+## Status Reporting
+Tracker ID: <TRACKER_ID>
+Your agent label: writer
+
+When you start working:
+  node ~/.openclaw/scheduler/cli.js tasks heartbeat <TRACKER_ID> writer running
+
+When you finish successfully:
+  node ~/.openclaw/scheduler/cli.js tasks heartbeat <TRACKER_ID> writer completed "Brief summary of what you did"
+
+If something goes wrong:
+  node ~/.openclaw/scheduler/cli.js tasks heartbeat <TRACKER_ID> writer failed "What went wrong"
+```
+
+**What happens automatically:**
+- Dispatcher checks active sessions every 30s — agents with active sessions stay "alive"
+- Agents that go silent for > 5 minutes AND whose tracker has timed out → marked dead
+- When all agents reach terminal state → delivery summary sent to your configured channel
+- Check anytime: `node cli.js tasks status <TRACKER_ID>`
+
+**Detecting sub-agents from other sessions:**
+
+The scheduler's dispatcher calls `sessions_list` with `kinds: ['subagent']` which returns **all sub-agent sessions across all requesters** — not just the current session. This means:
+- Sub-agents spawned from any session are visible to the task tracker
+- Works even if the spawning session has ended
+- Works across session compaction / context resets
+
+---
+
 ### Practical Agent Briefing Example
 
 Here's a complete, self-contained entry to add to your workspace `MEMORY.md` or context file. Copy and adapt it:

@@ -66,15 +66,55 @@ export function listActiveTaskGroups() {
 /**
  * @param {string} trackerId
  * @param {string} agentLabel
+ * @param {string} [sessionKey] - Optional OC session key for auto-correlation
  */
-export function agentStarted(trackerId, agentLabel) {
+export function agentStarted(trackerId, agentLabel, sessionKey) {
   const db = getDb();
   const now = sqliteNow();
   db.prepare(`
     UPDATE task_tracker_agents
-    SET status = 'running', started_at = ?
+    SET status = 'running', started_at = ?, last_heartbeat = ?
+      ${sessionKey ? ', session_key = ?' : ''}
     WHERE tracker_id = ? AND agent_label = ?
-  `).run(now, trackerId, agentLabel);
+  `).run(...(sessionKey ? [now, now, sessionKey, trackerId, agentLabel] : [now, now, trackerId, agentLabel]));
+}
+
+// ── Register session key (orchestrator sets this after spawning) ──
+/**
+ * Link an OpenClaw session key to a tracker agent.
+ * The dispatcher uses this for auto-correlation — sub-agents don't
+ * need to actively heartbeat; the dispatcher detects them via sessions_list.
+ * @param {string} trackerId
+ * @param {string} agentLabel
+ * @param {string} sessionKey  - e.g. "agent:main:subagent:abc-123"
+ */
+export function registerAgentSession(trackerId, agentLabel, sessionKey) {
+  const db = getDb();
+  const now = sqliteNow();
+  db.prepare(`
+    UPDATE task_tracker_agents
+    SET session_key = ?, last_heartbeat = ?,
+        status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
+        started_at = CASE WHEN started_at IS NULL THEN ? ELSE started_at END
+    WHERE tracker_id = ? AND agent_label = ?
+  `).run(sessionKey, now, now, trackerId, agentLabel);
+}
+
+// ── Touch heartbeat (called by auto-correlation) ────────────
+/**
+ * @param {string} trackerId
+ * @param {string} agentLabel
+ */
+export function touchAgentHeartbeat(trackerId, agentLabel) {
+  const db = getDb();
+  const now = sqliteNow();
+  db.prepare(`
+    UPDATE task_tracker_agents
+    SET last_heartbeat = ?,
+        status = CASE WHEN status = 'pending' THEN 'running' ELSE status END,
+        started_at = CASE WHEN started_at IS NULL THEN ? ELSE started_at END
+    WHERE tracker_id = ? AND agent_label = ?
+  `).run(now, now, trackerId, agentLabel);
 }
 
 // ── Agent reports completion ────────────────────────────────
@@ -111,8 +151,9 @@ export function agentFailed(trackerId, agentLabel, error) {
 
 // ── Check for dead agents (timeout exceeded) ────────────────
 /**
- * Find agents with status IN ('pending','running') whose parent task_tracker
- * has exceeded its timeout_s. Marks those agents as 'dead'.
+ * Find agents with status IN ('pending','running') whose tracker has timed out.
+ * An agent is NOT dead if it sent a heartbeat within the last 5 minutes
+ * (session correlation keeps them alive).
  * @returns {Array<{tracker_id: string, agent_label: string, agent_id: string}>}
  */
 export function checkDeadAgents() {
@@ -120,6 +161,7 @@ export function checkDeadAgents() {
   const now = sqliteNow();
 
   // Find agents in active trackers that have exceeded timeout
+  // BUT: spare agents with a recent heartbeat (within 5 min) — they're still alive
   const deadAgents = db.prepare(`
     SELECT a.id as agent_id, a.tracker_id, a.agent_label, a.status as agent_status,
            t.timeout_s, t.created_at as tracker_created_at
@@ -128,7 +170,9 @@ export function checkDeadAgents() {
     WHERE a.status IN ('pending', 'running')
       AND t.status = 'active'
       AND (julianday(?) - julianday(t.created_at)) * 86400 >= t.timeout_s
-  `).all(now);
+      AND (a.last_heartbeat IS NULL
+           OR (julianday(?) - julianday(a.last_heartbeat)) * 86400 > 300)
+  `).all(now, now);
 
   // Mark them as dead
   const markDead = db.prepare(`
@@ -220,6 +264,8 @@ export function getTaskGroupStatus(trackerId) {
     return {
       label: a.agent_label,
       status: a.status,
+      session_key: a.session_key || undefined,
+      last_heartbeat: a.last_heartbeat || undefined,
       duration,
       exit_message: a.exit_message || undefined,
       error: a.error || undefined,

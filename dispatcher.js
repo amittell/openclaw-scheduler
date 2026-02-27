@@ -44,11 +44,12 @@ import {
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
 import {
-  runAgentTurn, sendSystemEvent, listSessions, deliverMessage, checkGatewayHealth,
-  resolveDeliveryAlias
+  runAgentTurn, sendSystemEvent, listSessions, getAllSubAgentSessions,
+  deliverMessage, checkGatewayHealth, resolveDeliveryAlias,
 } from './gateway.js';
 import {
-  listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus
+  listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
+  touchAgentHeartbeat, registerAgentSession,
 } from './task-tracker.js';
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -703,6 +704,35 @@ async function checkRunHealth() {
 // ── Task tracker dead-man's-switch ──────────────────────────
 async function checkTaskTrackers() {
   try {
+    // 0. Auto-correlate: match live OC sub-agent sessions → tracker agents
+    //    This means sub-agents don't have to actively heartbeat —
+    //    as long as their session is alive, they're counted as running.
+    try {
+      const db = getDb();
+      const activeSessions = await getAllSubAgentSessions(10);
+      if (activeSessions.length > 0) {
+        for (const session of activeSessions) {
+          const sessionKey = session.key || session.sessionKey;
+          if (!sessionKey) continue;
+
+          // Find any tracker agent registered with this session key
+          const agent = db.prepare(`
+            SELECT a.tracker_id, a.agent_label
+            FROM task_tracker_agents a
+            JOIN task_tracker t ON a.tracker_id = t.id
+            WHERE a.session_key = ? AND a.status IN ('pending', 'running') AND t.status = 'active'
+          `).get(sessionKey);
+
+          if (agent) {
+            touchAgentHeartbeat(agent.tracker_id, agent.agent_label);
+            log('debug', `Auto-heartbeat: ${agent.agent_label} (session active)`);
+          }
+        }
+      }
+    } catch (corrErr) {
+      log('debug', `Session auto-correlation skipped: ${corrErr.message}`);
+    }
+
     // 1. Check for dead agents across all active groups
     const deadAgents = checkDeadAgents();
     if (deadAgents.length > 0) {

@@ -817,6 +817,9 @@ node cli.js approvals list               # All pending approvals
 node cli.js tasks create '<json>'        # Create task group
 node cli.js tasks list                   # Active task groups
 node cli.js tasks status <id>            # Detailed status
+node cli.js tasks history [limit]        # Recently completed groups
+node cli.js tasks heartbeat <id> <label> running|completed|failed [msg]
+node cli.js tasks register-session <id> <label> <session-key>  # Enable auto-heartbeat
 
 # ── Delivery Aliases ──────────────────────────────
 node cli.js aliases list                 # List all aliases
@@ -1001,6 +1004,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── migrate-v5.js          # Schema migration: delivery guarantee, approvals, context retrieval
 ├── migrate-v6.js          # Schema migration: task tracker tables
 ├── migrate-v7.js          # Schema migration: idempotency ledger
+├── migrate-v8.js          # Schema migration: task tracker session keys + heartbeat
 ├── test.js                # Full test suite (346 assertions, in-memory)
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
 ├── INSTALL.md             # Full installation guide — macOS (first host)

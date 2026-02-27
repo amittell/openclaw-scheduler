@@ -109,13 +109,34 @@ export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
 }
 
 /**
- * List active sessions (for implicit heartbeat).
+ * List active sessions (for task tracker auto-correlation).
+ * opts.kinds: filter by session kind, e.g. ['subagent']
+ * opts.activeMinutes: only sessions active within N minutes
+ * opts.limit: max results
  */
 export async function listSessions(opts = {}) {
   return invokeGatewayTool('sessions_list', {
     ...(opts.activeMinutes ? { activeMinutes: opts.activeMinutes } : {}),
-    ...(opts.limit ? { limit: opts.limit } : {}),
+    ...(opts.limit       ? { limit: opts.limit }       : {}),
+    ...(opts.kinds       ? { kinds: opts.kinds }       : {}),
+    messageLimit: 0,   // don't fetch message history — we only need session metadata
   });
+}
+
+/**
+ * Fetch ALL active sub-agent sessions across every requester.
+ * Uses the gateway token's admin view — not scoped to a single session.
+ * Returns an array of session objects (keys like "agent:*:subagent:*").
+ */
+export async function getAllSubAgentSessions(activeMinutes = 10) {
+  try {
+    const result = await listSessions({ kinds: ['subagent'], activeMinutes, limit: 200 });
+    // Gateway returns { sessions: [...] } or similar — normalise to array
+    const raw = result?.sessions || result?.result?.sessions || result || [];
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
 }
 
 /**

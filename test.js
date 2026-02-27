@@ -1103,15 +1103,18 @@ console.log('\n── v5: Task Tracker ──');
   assert(!active.some(g => g.id === group.id), 'completed group not in active list');
 
   // Test dead agent detection with a short timeout
+  // Note: an agent that reported a heartbeat within 5min is spared.
+  // A truly dead agent has no heartbeat at all and exceeded the tracker timeout.
   const group2 = tt.createTaskGroup({
     name: 'timeout-test',
     expectedAgents: ['slow-agent'],
     timeoutS: 0, // immediate timeout for testing
     createdBy: 'test',
   });
-  tt.agentStarted(group2.id, 'slow-agent');
+  // Don't call agentStarted — leave agent in 'pending' with no heartbeat.
+  // This simulates a sub-agent that was spawned but never reported in.
   const dead = tt.checkDeadAgents();
-  assert(dead.length > 0, 'dead agent detected after timeout');
+  assert(dead.length > 0, 'dead agent detected after timeout (no heartbeat, pending)');
   const deadAgent = dead.find(d => d.tracker_id === group2.id);
   assert(deadAgent !== undefined, 'correct dead agent found');
 
@@ -1119,6 +1122,42 @@ console.log('\n── v5: Task Tracker ──');
   tt.checkGroupCompletion(group2.id);
   const g2 = tt.getTaskGroup(group2.id);
   assert(g2.status === 'failed', 'group with dead agent marked failed');
+
+  // ── v8: session key registration and heartbeat ───────────
+  const group3 = tt.createTaskGroup({
+    name: 'session-tracking-test',
+    expectedAgents: ['writer', 'reviewer'],
+    timeoutS: 600,
+    createdBy: 'test',
+  });
+
+  // Register session keys (orchestrator sets these after spawning)
+  tt.registerAgentSession(group3.id, 'writer', 'agent:main:subagent:writer-uuid');
+  tt.registerAgentSession(group3.id, 'reviewer', 'agent:main:subagent:reviewer-uuid');
+
+  const s5 = tt.getTaskGroupStatus(group3.id);
+  const writer = s5.agents.find(a => a.label === 'writer');
+  assert(writer.session_key === 'agent:main:subagent:writer-uuid', 'session key stored on writer');
+  assert(writer.status === 'running', 'writer auto-promoted to running on session register');
+  assert(writer.last_heartbeat !== undefined, 'last_heartbeat set on session register');
+
+  // Touch heartbeat (simulates auto-correlation)
+  tt.touchAgentHeartbeat(group3.id, 'writer');
+  const s6 = tt.getTaskGroupStatus(group3.id);
+  const writerHb = s6.agents.find(a => a.label === 'writer');
+  assert(writerHb.last_heartbeat !== undefined, 'last_heartbeat updated by touchAgentHeartbeat');
+
+  // Dead agent with recent heartbeat should NOT be killed
+  const group4 = tt.createTaskGroup({
+    name: 'heartbeat-alive-test',
+    expectedAgents: ['active-agent'],
+    timeoutS: 0, // immediately expired timeout
+    createdBy: 'test',
+  });
+  tt.registerAgentSession(group4.id, 'active-agent', 'agent:main:subagent:active-uuid');
+  // last_heartbeat was just set — agent should be spared
+  const notDead = tt.checkDeadAgents().filter(d => d.tracker_id === group4.id);
+  assert(notDead.length === 0, 'agent with recent heartbeat not marked dead despite timeout');
 }
 
 console.log('\n── v7: Idempotency Keys ──');
