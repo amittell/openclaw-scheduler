@@ -34,7 +34,7 @@ import {
   updateHeartbeat, updateRunSession, pruneRuns, updateContextSummary
 } from './runs.js';
 import {
-  sendMessage as queueMessage, getInbox, markDelivered, markRead,
+  getInbox, markDelivered,
   expireMessages, pruneMessages, getUnreadCount
 } from './messages.js';
 import {
@@ -321,16 +321,6 @@ async function dispatchJob(job) {
         await handleDelivery(job, output);
       }
 
-      queueMessage({
-        from_agent: 'scheduler',
-        to_agent: job.agent_id || 'main',
-        kind: 'result',
-        subject: `Shell job ${shellStatus === 'ok' ? 'completed' : 'failed'}: ${job.name}`,
-        body: output.slice(0, 5000),
-        job_id: job.delete_after_run ? null : job.id,
-        run_id: job.delete_after_run ? null : run.id,
-      });
-
       updateJobAfterRun(job, shellStatus);
 
       const triggered = fireTriggeredChildren(job.id, shellStatus, output);
@@ -397,18 +387,6 @@ async function dispatchJob(job) {
         await handleDelivery(job, content);
       }
 
-      // Queue result as message for traceability (before job deletion)
-      queueMessage({
-        from_agent: 'scheduler',
-        to_agent: job.agent_id || 'main',
-        kind: 'result',
-        subject: `Job completed: ${job.name}`,
-        body: content.slice(0, 5000),
-        // Don't reference job_id/run_id for one-shot jobs (they get deleted)
-        job_id: job.delete_after_run ? null : job.id,
-        run_id: job.delete_after_run ? null : run.id,
-      });
-
       // Update job state (may delete one-shot jobs)
       updateJobAfterRun(job, 'ok');
 
@@ -448,18 +426,6 @@ async function dispatchJob(job) {
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
       await handleDelivery(job, `⚠️ Job failed: ${job.name}\n\n${err.message}`);
     }
-
-    // Queue error message (before potential job deletion)
-    queueMessage({
-      from_agent: 'scheduler',
-      to_agent: job.agent_id || 'main',
-      kind: 'system',
-      subject: `Job failed: ${job.name}`,
-      body: `Error: ${err.message}`,
-      priority: 1,
-      job_id: job.delete_after_run ? null : job.id,
-      run_id: job.delete_after_run ? null : run.id,
-    });
 
     // Retry logic: check if we should retry before declaring failure
     if (shouldRetry(job, run.id)) {
