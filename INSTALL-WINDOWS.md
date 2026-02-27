@@ -1,0 +1,266 @@
+# Installing OpenClaw Scheduler on Windows
+
+> **TL;DR:** Use WSL2. It's faster to set up, fully supported, and eliminates every Windows-specific limitation listed in this guide.
+
+---
+
+## Option A: WSL2 (Strongly Recommended)
+
+If you're running OpenClaw in WSL2, follow the Linux guide: **[INSTALL-LINUX.md](INSTALL-LINUX.md)**
+
+WSL2 gives you a full Linux environment with:
+- **systemd support** — Ubuntu 22.04+ in WSL2 ships with systemd enabled by default
+- Full bash/zsh shell job compatibility
+- No path separator issues, no `.bat` script constraints
+- Identical behavior to a native Linux install
+
+To enable systemd in WSL2 (Ubuntu 22.04+), add to `/etc/wsl.conf`:
+```ini
+[boot]
+systemd=true
+```
+
+Then restart WSL: `wsl --shutdown` from PowerShell, reopen your terminal.
+
+---
+
+## Option B: PM2 (Native Windows)
+
+Use this path only if you can't use WSL2 — for example, if OpenClaw itself is running natively on Windows (not in WSL2).
+
+> ⚠️ **Shell job limitations apply.** See [Shell Jobs on Windows](#shell-jobs-on-windows) below.
+
+---
+
+### Prerequisites
+
+| Requirement | Install |
+|-------------|---------|
+| Node.js ≥ 22 | [nodejs.org](https://nodejs.org) — use the LTS installer |
+| pm2 | `npm install -g pm2` |
+| OpenClaw gateway | Must be running with a valid auth token |
+| Git for Windows | [git-scm.com](https://git-scm.com) or use GitHub Desktop |
+
+**Build tools for `better-sqlite3`** (required — it compiles a native addon):
+
+Option 1 — automated:
+```powershell
+npm install -g windows-build-tools
+```
+
+Option 2 — manual (more reliable on Windows 11):
+1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) — select the **"Desktop development with C++"** workload
+2. Install [Python 3.x](https://python.org) — check "Add to PATH" during install
+
+Verify:
+```powershell
+node -e "require('better-sqlite3')" && echo "OK"
+```
+
+---
+
+### Step 1: Clone the Repository
+
+```powershell
+cd $env:USERPROFILE\.openclaw
+git clone https://github.com/amittell/openclaw-scheduler.git scheduler
+cd scheduler
+```
+
+---
+
+### Step 2: Install Dependencies
+
+```powershell
+npm install
+```
+
+If `better-sqlite3` fails with a build error, make sure Visual Studio Build Tools and Python are installed (see Prerequisites above), then:
+```powershell
+npm install --build-from-source
+```
+
+---
+
+### Step 3: Run Tests
+
+```powershell
+$env:SCHEDULER_DB=":memory:"; node test.js
+```
+
+All 346 tests must pass before continuing.
+
+---
+
+### Step 4: Enable Chat Completions on Gateway
+
+```powershell
+openclaw config set gateway.http.endpoints.chatCompletions.enabled true
+openclaw gateway restart
+```
+
+Verify (PowerShell):
+```powershell
+$headers = @{ Authorization = "Bearer YOUR_GATEWAY_TOKEN"; "Content-Type" = "application/json" }
+$body = '{"model":"openclaw:main","messages":[{"role":"user","content":"reply OK"}]}'
+(Invoke-WebRequest -Uri http://127.0.0.1:18789/v1/chat/completions -Method POST -Headers $headers -Body $body).StatusCode
+# Expected: 200
+```
+
+---
+
+### Step 5: Migrate Jobs from OC Cron
+
+```powershell
+node migrate.js
+```
+
+Verify:
+```powershell
+node cli.js jobs list
+node cli.js status
+```
+
+---
+
+### Step 6: Disable OC Built-in Cron and Heartbeat
+
+```powershell
+openclaw cron list
+# For each enabled job:
+openclaw cron edit <job-id> --disable
+
+openclaw config set agents.defaults.heartbeat.every "0m"
+openclaw gateway restart
+```
+
+---
+
+### Step 7: Start with PM2
+
+```powershell
+pm2 start dispatcher.js --name openclaw-scheduler `
+  --env OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789 `
+  --env OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN `
+  --env SCHEDULER_TICK_MS=10000 `
+  --env SCHEDULER_STALE_THRESHOLD_S=90 `
+  --env SCHEDULER_DEBUG=1
+
+# Save PM2 process list (persists across restarts)
+pm2 save
+
+# Generate and apply startup hook (run the printed command as Administrator)
+pm2 startup
+```
+
+Verify:
+```powershell
+pm2 status
+pm2 logs openclaw-scheduler --lines 20
+```
+
+---
+
+### Step 8: Smoke Test
+
+```powershell
+node --input-type=module -e "
+import { initDb, getDb } from './db.js';
+import { createJob } from './jobs.js';
+initDb();
+const job = createJob({
+  name: 'Smoke Test',
+  schedule_cron: '0 0 31 2 *',
+  payload_message: 'Reply with exactly: SCHEDULER_OK',
+  delivery_mode: 'none',
+  delete_after_run: true,
+});
+getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
+console.log('Created smoke test:', job.id);
+"
+Start-Sleep 20; pm2 logs openclaw-scheduler --lines 20
+```
+
+Look for: `Dispatching: Smoke Test` → `Completed: Smoke Test`
+
+---
+
+## PM2 Management
+
+```powershell
+# Status
+pm2 status
+
+# Logs (live)
+pm2 logs openclaw-scheduler
+
+# Restart
+pm2 restart openclaw-scheduler
+
+# Stop
+pm2 stop openclaw-scheduler
+
+# Remove from PM2
+pm2 delete openclaw-scheduler
+```
+
+---
+
+## Shell Jobs on Windows
+
+Shell jobs (`session_target: 'shell'`) use **`cmd.exe`** by default on Windows. Override with:
+
+```
+SCHEDULER_SHELL=powershell.exe
+```
+
+Set this in your PM2 launch command:
+```powershell
+pm2 start dispatcher.js --name openclaw-scheduler `
+  --env SCHEDULER_SHELL=powershell.exe `
+  ...
+```
+
+### Known Limitations (native Windows)
+
+| Limitation | Impact | Fix |
+|------------|--------|-----|
+| Shell is `cmd.exe` by default | Bash scripts won't work | Use `.bat`/`.cmd` or set `SCHEDULER_SHELL=powershell.exe` |
+| No `/bin/bash` or `/bin/zsh` | Can't use Unix shell syntax | Rewrite scripts as PowerShell |
+| Path separators | `\` vs `/` in commands | Use `\\` in `payload_message` strings |
+| Line endings | `.sh` scripts may fail | Save scripts with LF line endings |
+
+**WSL2 eliminates all of these.** If you hit these issues in practice, switching to WSL2 will be faster than working around them.
+
+---
+
+## Rollback
+
+```powershell
+# Stop and remove PM2 process
+pm2 stop openclaw-scheduler
+pm2 delete openclaw-scheduler
+
+# Re-enable OC cron
+openclaw cron edit <job-id> --enable  # for each job
+
+# Re-enable heartbeat
+openclaw config set agents.defaults.heartbeat.every "5m"
+openclaw gateway restart
+```
+
+For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
+
+---
+
+## Validation Checklist
+
+- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 346/346
+- [ ] `node cli.js status` → shows jobs, 0 stale
+- [ ] `pm2 status` → openclaw-scheduler is `online`
+- [ ] PM2 log has startup lines, no errors
+- [ ] OC cron → all disabled
+- [ ] OC heartbeat → `0m`
+- [ ] Chat completions → 200
+- [ ] Smoke test → dispatched + completed in log
+- [ ] First real job → fires on schedule

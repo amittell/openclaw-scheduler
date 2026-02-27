@@ -11,6 +11,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
 **Tests:** 346 (full suite, in-memory SQLite)
+**Platform:** macOS · Linux · Windows (WSL2 or PM2)
 
 ---
 
@@ -18,31 +19,34 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 
 1. [What Replaced What](#what-replaced-what)
 2. [Quick Start](#quick-start)
-3. [Architecture](#architecture)
-4. [How Jobs Execute](#how-jobs-execute)
-5. [Delivery Modes](#delivery-modes)
-6. [Delivery Aliases](#delivery-aliases)
-7. [Shell Jobs](#shell-jobs)
-8. [HITL Approval Gates](#hitl-approval-gates)
-9. [Idempotency](#idempotency)
-10. [Context Retrieval](#context-retrieval)
-11. [Task Tracker](#task-tracker)
-12. [Resource Pools](#resource-pools)
-13. [Workflow Chains](#workflow-chains)
-14. [Retry Logic](#retry-logic)
-15. [Chain Safety](#chain-safety)
-16. [Inter-Agent Messaging](#inter-agent-messaging)
-17. [Backup & Recovery](#backup--recovery)
-18. [Agent Registry](#agent-registry)
-19. [Database Schema](#database-schema)
-20. [CLI Reference](#cli-reference)
-21. [Configuration](#configuration)
-22. [Service Management](#service-management)
-23. [Error Handling & Backoff](#error-handling--backoff)
-24. [Migration & History](#migration--history)
-25. [File Reference](#file-reference)
-26. [Testing](#testing)
-27. [Troubleshooting](#troubleshooting)
+3. [Platform Support](#platform-support)
+4. [Architecture](#architecture)
+5. [How Jobs Execute](#how-jobs-execute)
+6. [Delivery Modes](#delivery-modes)
+7. [Delivery Aliases](#delivery-aliases)
+8. [Shell Jobs](#shell-jobs)
+9. [HITL Approval Gates](#hitl-approval-gates)
+10. [Idempotency](#idempotency)
+11. [Context Retrieval](#context-retrieval)
+12. [Task Tracker](#task-tracker)
+13. [Resource Pools](#resource-pools)
+14. [Workflow Chains](#workflow-chains)
+15. [Retry Logic](#retry-logic)
+16. [Chain Safety](#chain-safety)
+17. [Inter-Agent Messaging](#inter-agent-messaging)
+18. [Backup & Recovery](#backup--recovery)
+19. [Agent Registry](#agent-registry)
+20. [Database Schema](#database-schema)
+21. [CLI Reference](#cli-reference)
+22. [Configuration](#configuration)
+23. [Service Management](#service-management)
+24. [Error Handling & Backoff](#error-handling--backoff)
+25. [Migration & History](#migration--history)
+26. [Removing the Scheduler](#removing-the-scheduler)
+27. [Best Practices](#best-practices)
+28. [File Reference](#file-reference)
+29. [Testing](#testing)
+30. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -68,13 +72,13 @@ cd ~/.openclaw/scheduler
 npm install
 SCHEDULER_DB=:memory: node test.js   # should print: 346 passed, 0 failed
 
-# Copy and configure LaunchAgent
+# macOS: copy and configure LaunchAgent
 cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
-# Edit the plist: replace YOUR_USER and YOUR_GATEWAY_TOKEN
-nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-
-# Start
+nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist  # set YOUR_USER + YOUR_GATEWAY_TOKEN
 launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+
+# Linux: see INSTALL-LINUX.md (uses systemd user service)
+# Windows: see INSTALL-WINDOWS.md (WSL2 recommended, or PM2)
 
 # Verify
 node cli.js status
@@ -83,6 +87,23 @@ tail -5 /tmp/openclaw-scheduler.log
 
 For full installation details (first host), see [INSTALL.md](INSTALL.md).
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
+
+---
+
+## Platform Support
+
+| Platform | Service Manager | Shell Jobs | Status |
+|----------|----------------|------------|--------|
+| macOS | LaunchAgent | `/bin/zsh` | ✅ Tested |
+| Linux | systemd user service | `/bin/bash` | ✅ Supported |
+| Windows (WSL2) | systemd | `/bin/bash` | ✅ Recommended |
+| Windows (native) | PM2 | `cmd.exe` / PowerShell | ⚠️ Limited |
+
+- **macOS:** Full guide in [INSTALL.md](INSTALL.md)
+- **Linux:** Full guide in [INSTALL-LINUX.md](INSTALL-LINUX.md)
+- **Windows:** Full guide in [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md)
+
+Override the shell for shell jobs with the `SCHEDULER_SHELL=/path/to/shell` environment variable.
 
 ---
 
@@ -822,10 +843,13 @@ node cli.js status
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
+| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux) | Shell used for shell jobs |
 
 ---
 
 ## Service Management
+
+> **Platform note:** The commands below are for macOS (launchctl). For Linux, see [INSTALL-LINUX.md](INSTALL-LINUX.md). For Windows, see [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
 
 ```bash
 # Start
@@ -929,6 +953,30 @@ These migrations are run automatically when `initDb()` detects the database need
 
 ---
 
+## Removing the Scheduler
+
+To stop the scheduler and restore OpenClaw's built-in cron/heartbeat, see [UNINSTALL.md](UNINSTALL.md).
+
+Quick summary:
+1. Stop the service (launchctl / systemctl / pm2)
+2. Re-enable OC cron: `openclaw cron edit <id> --enable` for each job
+3. Re-enable heartbeat: `openclaw config set agents.defaults.heartbeat.every "5m"`
+4. Optionally delete `~/.openclaw/scheduler/`
+
+---
+
+## Best Practices
+
+See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
+- Choosing between `shell`, `isolated`, and `main` session targets
+- Writing effective payload prompts for LLM jobs
+- When to use chains vs standalone jobs
+- Delivery mode selection
+- How to integrate the scheduler with your OpenClaw agent
+- Example MEMORY.md entries for agent awareness
+
+---
+
 ## File Reference
 
 ```
@@ -955,8 +1003,13 @@ These migrations are run automatically when `initDb()` detects the database need
 ├── migrate-v7.js          # Schema migration: idempotency ledger
 ├── test.js                # Full test suite (346 assertions, in-memory)
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
-├── INSTALL.md             # Full installation guide (first host)
+├── INSTALL.md             # Full installation guide — macOS (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
+├── INSTALL-LINUX.md       # Installation guide for Linux (systemd user service)
+├── INSTALL-WINDOWS.md     # Installation guide for Windows (WSL2 or PM2)
+├── UNINSTALL.md           # Removal guide (all platforms)
+├── BEST-PRACTICES.md      # Job type selection, prompt writing, agent integration
+├── openclaw-scheduler.service  # Linux systemd user service template
 ├── IMPLEMENTATION_SPEC.md # Internal developer reference (v5+ feature specs)
 ├── CHANGELOG.md           # Version history
 └── README.md              # This file

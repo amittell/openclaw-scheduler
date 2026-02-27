@@ -41,6 +41,12 @@ Installs `better-sqlite3` (native, compiles for your arch) and `croner`.
 
 If `better-sqlite3` fails: `xcode-select --install` (macOS).
 
+On Linux, install build deps first:
+```bash
+sudo apt install build-essential python3   # Ubuntu/Debian
+sudo dnf install gcc gcc-c++ make python3   # Fedora/RHEL
+```
+
 ---
 
 ## Step 3: Run Tests
@@ -265,6 +271,8 @@ openclaw cron edit <job-id> --enable  # for each job
 openclaw config set agents.defaults.heartbeat.every "5m"
 openclaw gateway restart
 ```
+
+For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ---
 

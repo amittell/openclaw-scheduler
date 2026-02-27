@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenClaw Scheduler
+Documentation=https://github.com/amittell/openclaw-scheduler
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/scheduler
+ExecStart=/usr/bin/node --no-warnings %h/.openclaw/scheduler/dispatcher.js
+Environment=OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+Environment=OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN
+Environment=SCHEDULER_TICK_MS=10000
+Environment=SCHEDULER_STALE_THRESHOLD_S=90
+Environment=SCHEDULER_DEBUG=1
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/openclaw-scheduler.log
+StandardError=append:/tmp/openclaw-scheduler.log
+
+[Install]
+WantedBy=default.target
