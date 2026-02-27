@@ -1125,4 +1125,20 @@ The `chilisaus/` directory contains an optional companion CLI for orchestrating 
 - Query run status, results, and stuck detection without raw SQL
 - Emit structured dispatch lifecycle events to Loki or a webhook
 
-→ See [`chilisaus/README.md`](chilisaus/README.md) for full documentation.
+### Signal Queue Pattern
+
+The message queue (`messages` table) combined with `chilisaus send` implements a **signal-only** delivery path that complements `delivery_mode: announce`:
+
+```
+Failure path:  dispatcher → announce → Telegram (immediate, unconditional)
+Signal path:   script → chilisaus send → queue → Inbox Consumer → Telegram
+```
+
+Scripts write to the queue **only when they have found something** — not unconditionally. A companion `inbox-consumer.mjs` shell job (run every 5 min) drains the queue and delivers to Telegram. It exits 0 (silent) when the queue is empty, so there is no noise.
+
+> **Important:** The dispatcher does **not** write to the message queue automatically.
+> Every message in the queue was put there by a script with a specific receiver in mind.
+> Traceability for completed jobs comes from the `runs` table, `delivery_mode: announce`,
+> and `chilisaus result/status` — not from queued messages.
+
+→ See [`chilisaus/README.md`](chilisaus/README.md) for full documentation including the Signal Queue Pattern.

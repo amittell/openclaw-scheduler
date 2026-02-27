@@ -197,3 +197,76 @@ node cli.js msg send worker orchestrator '<json>'
 # or:
 node chilisaus/index.mjs send --label orchestrator --message '<json>' --kind result
 ```
+
+---
+
+## Signal Queue Pattern (Inbox Consumer)
+
+The message queue is for **signal**, not for status. The distinction matters:
+
+| Path | When to use |
+|---|---|
+| `delivery_mode: announce` | Failures — immediate, unconditional, no consumer needed |
+| `chilisaus send` + Inbox Consumer | Signal — script found something worth surfacing, LLM/human decides |
+
+### The rule
+
+**Scripts write to the queue only when they have found something actionable.**
+
+```bash
+# ✅ Correct — enqueue only when there is signal
+edges=$(run_edge_scan)
+if [ -n "$edges" ]; then
+  node chilisaus/index.mjs send \
+    --label main \
+    --message "$edges" \
+    --kind result \
+    --subject "Edge scan: $(date +%Y-%m-%d)"
+fi
+# exit 0 → announce silent (nothing found)
+# exit 1 → announce fires directly to Telegram (error, not queue)
+
+# ❌ Wrong — unconditional queue write, floods inbox
+node chilisaus/index.mjs send --label main --message "Scan complete: nothing found"
+```
+
+### The Inbox Consumer
+
+A companion scheduler job (shell, `*/5 * * * *`) that drains the queue and
+delivers queued messages to Telegram. Because scripts only enqueue signal, the
+consumer never needs to filter — everything in the queue is worth forwarding.
+
+```bash
+# workspace/scripts/inbox-consumer.mjs
+# Reads pending messages → formats → deliverMessage() → marks read
+# exit 0 = nothing queued (announce stays silent)
+# exit 1 = delivery error (announce fires)
+```
+
+**Scheduler job:**
+```json
+{
+  "name": "Inbox Consumer",
+  "session_target": "shell",
+  "payload_message": "node /path/to/workspace/scripts/inbox-consumer.mjs",
+  "schedule_cron": "*/5 * * * *",
+  "delivery_mode": "announce",
+  "delivery_to": "YOUR_TELEGRAM_ID"
+}
+```
+
+### Delivery separation
+
+```
+Failure path:    dispatcher → delivery_mode: announce → Telegram (immediate)
+Signal path:     script → chilisaus send → queue → Inbox Consumer → Telegram
+
+Queue is NEVER written by the dispatcher automatically.
+Each message in the queue was put there by a script that had something to say.
+```
+
+> **Note:** Older versions of the dispatcher unconditionally wrote a `result` message
+> to the queue after every shell/isolated job completion. This was removed in
+> commit `32b8ea6` — it produced noise with no consumer. Traceability is
+> provided by the `runs` table, `delivery_mode: announce`, and
+> `chilisaus result/status` queries instead.
