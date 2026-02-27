@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-346%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-351%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -10,7 +10,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 346 (full suite, in-memory SQLite)
+**Tests:** 351 (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2 or PM2)
 
 ---
@@ -46,6 +46,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 27. [Best Practices](#best-practices)
 28. [File Reference](#file-reference)
 29. [Testing](#testing)
+30. [Companion Tools](#companion-tools)
 30. [Troubleshooting](#troubleshooting)
 
 ---
@@ -70,7 +71,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-SCHEDULER_DB=:memory: node test.js   # should print: 346 passed, 0 failed
+SCHEDULER_DB=:memory: node test.js   # should print: 351 passed, 0 failed
 
 # macOS: copy and configure LaunchAgent
 cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
@@ -984,9 +985,12 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 
 ```
 ~/.openclaw/scheduler/
+│
+│  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Full schema definition (v6)
+├── schema.sql             # Complete schema (v9) — all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v9
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -999,13 +1003,15 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── migrate-v3.js          # Schema migration: chain columns
-├── migrate-v3b.js         # Schema migration: retry columns
-├── migrate-v5.js          # Schema migration: delivery guarantee, approvals, context retrieval
-├── migrate-v6.js          # Schema migration: task tracker tables
-├── migrate-v7.js          # Schema migration: idempotency ledger
-├── migrate-v8.js          # Schema migration: task tracker session keys + heartbeat
-├── test.js                # Full test suite (346 assertions, in-memory)
+├── test.js                # Full test suite (351 assertions, in-memory)
+│
+│  Companion tool — chilisaus (optional, see chilisaus/README.md)
+├── chilisaus/
+│   ├── index.mjs          # Dispatch CLI: enqueue / status / stuck / result / send / heartbeat
+│   ├── hooks.mjs          # Lifecycle event emitter (Loki + optional webhook)
+│   └── README.md          # chilisaus documentation
+│
+│  Service & docs
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
 ├── INSTALL.md             # Full installation guide — macOS (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
@@ -1024,7 +1030,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (346 assertions, in-memory SQLite)
+# Run all tests (351 assertions, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:
@@ -1106,3 +1112,17 @@ mc alias list   # verify backupstore alias configured
 # Check: MC_ALIAS, BUCKET, PREFIX env vars or defaults in backup.js
 # Verify MinIO is reachable: mc ls backupstore/
 ```
+
+---
+
+## Companion Tools
+
+The `chilisaus/` directory contains an optional companion CLI for orchestrating sub-agent dispatch patterns on top of the scheduler. It is intentionally separate from the core scheduler — the scheduler handles job scheduling and execution; chilisaus handles the control-plane pattern of *how you dispatch work* from an orchestrator agent.
+
+**chilisaus is not required** to use the scheduler. It's useful if you're building a multi-agent system where one agent acts as an orchestrator and needs to:
+- Dispatch one-shot tasks to worker agents and track them by human-readable label
+- Resume a prior session context (`--mode reuse`)
+- Query run status, results, and stuck detection without raw SQL
+- Emit structured dispatch lifecycle events to Loki or a webhook
+
+→ See [`chilisaus/README.md`](chilisaus/README.md) for full documentation.

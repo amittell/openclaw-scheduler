@@ -17,7 +17,7 @@
 
 import { hostname } from 'os';
 
-const LOKI_URL     = process.env.LOKI_PUSH_URL     || 'http://loki.kebabrack.lan/loki/api/v1/push';
+const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
 const HOST         = process.env.CHILISAUS_HOST     || hostname() || 'rh-bot.lan';
 const TIMEOUT_MS   = 3000;
@@ -25,6 +25,7 @@ const TIMEOUT_MS   = 3000;
 // ── Loki push ───────────────────────────────────────────────
 
 async function lokiPush(event, payload) {
+  if (!LOKI_URL) return; // not configured — skip silently
   const ts     = String(Date.now() * 1_000_000); // nanoseconds
   const logLine = JSON.stringify({ event, host: HOST, ...payload });
 

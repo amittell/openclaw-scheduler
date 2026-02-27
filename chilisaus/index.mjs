@@ -25,11 +25,11 @@
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import { getDb } from './db.js';
-import { createJob, getJob } from './jobs.js';
-import { getStaleRuns, getRunsForJob, getRunningRuns, updateHeartbeat } from './runs.js';
-import { sendMessage, getInbox } from './messages.js';
-import { onStarted, onFinished, onStuck } from './chilisaus-hooks.mjs';
+import { getDb } from '../db.js';
+import { createJob, getJob } from '../jobs.js';
+import { getStaleRuns, getRunsForJob, getRunningRuns, updateHeartbeat } from '../runs.js';
+import { sendMessage, getInbox } from '../messages.js';
+import { onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
