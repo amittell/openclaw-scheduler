@@ -281,7 +281,7 @@ node ~/.openclaw/scheduler/cli.js jobs add '{
   "name": "PR Review Reminder",
   "schedule_cron": "0 17 * * *",
   "session_target": "isolated",
-  "payload_message": "Send Alex a reminder to review the PR he opened this morning. Be specific about which PR.",
+  "payload_message": "Send Jordan a reminder to review the PR they opened this morning. Be specific about which PR.",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_TELEGRAM_ID",
