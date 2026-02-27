@@ -32,78 +32,20 @@ export function getDb() {
 
 export async function initDb() {
   const db = getDb();
+
+  // Apply base schema (idempotent — all CREATE TABLE/INDEX use IF NOT EXISTS)
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
 
-  // Legacy inline migrations (v2→v3 era) — kept for backwards compat
-  const legacyMigrations = [
-    `ALTER TABLE jobs ADD COLUMN payload_scope TEXT NOT NULL DEFAULT 'own'`,
-    `ALTER TABLE jobs ADD COLUMN resource_pool TEXT DEFAULT NULL`,
-    `ALTER TABLE jobs ADD COLUMN trigger_condition TEXT DEFAULT NULL`,
-  ];
-  for (const sql of legacyMigrations) {
-    try { db.exec(sql); } catch { /* column already exists — safe to ignore */ }
-  }
-
-  // Run versioned migrations (v5+) — each checks its own version guard
+  // Bring existing DBs up to current schema version
   try {
-    const { default: migrateV5 } = await import('./migrate-v5.js');
-    const applied5 = migrateV5();
-    if (applied5) {
-      const ts = new Date().toISOString();
-      process.stderr.write(`${ts} [db] Applied migration v5\n`);
+    const { default: consolidate } = await import('./migrate-consolidate.js');
+    const applied = consolidate();
+    if (applied) {
+      process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
     }
   } catch (err) {
-    const ts = new Date().toISOString();
-    process.stderr.write(`${ts} [db] migrate-v5 error: ${err.message}\n`);
-  }
-
-  try {
-    const { default: migrateV6 } = await import('./migrate-v6.js');
-    const applied6 = migrateV6();
-    if (applied6) {
-      const ts = new Date().toISOString();
-      process.stderr.write(`${ts} [db] Applied migration v6\n`);
-    }
-  } catch (err) {
-    const ts = new Date().toISOString();
-    process.stderr.write(`${ts} [db] migrate-v6 error: ${err.message}\n`);
-  }
-
-  try {
-    const { default: migrateV7 } = await import('./migrate-v7.js');
-    const applied7 = migrateV7();
-    if (applied7) {
-      const ts = new Date().toISOString();
-      process.stderr.write(`${ts} [db] Applied migration v7\n`);
-    }
-  } catch (err) {
-    const ts = new Date().toISOString();
-    process.stderr.write(`${ts} [db] migrate-v7 error: ${err.message}\n`);
-  }
-
-  try {
-    const { default: migrateV8 } = await import('./migrate-v8.js');
-    const applied8 = migrateV8();
-    if (applied8) {
-      const ts = new Date().toISOString();
-      process.stderr.write(`${ts} [db] Applied migration v8\n`);
-    }
-  } catch (err) {
-    const ts = new Date().toISOString();
-    process.stderr.write(`${ts} [db] migrate-v8 error: ${err.message}\n`);
-  }
-
-  try {
-    const { default: migrateV9 } = await import('./migrate-v9.js');
-    const applied9 = migrateV9();
-    if (applied9) {
-      const ts = new Date().toISOString();
-      process.stderr.write(`${ts} [db] Applied migration v9\n`);
-    }
-  } catch (err) {
-    const ts = new Date().toISOString();
-    process.stderr.write(`${ts} [db] migrate-v9 error: ${err.message}\n`);
+    process.stderr.write(`${new Date().toISOString()} [db] migrate-consolidate error: ${err.message}\n`);
   }
 
   return db;

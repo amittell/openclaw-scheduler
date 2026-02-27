@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.0.0, schema version: 6)
+-- OpenClaw Scheduler Schema (current: v1.0.0, schema version: 9)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   context_retrieval       TEXT DEFAULT 'none',      -- 'none'|'recent'|'hybrid'
   context_retrieval_limit INTEGER DEFAULT 5,
 
+  -- Session continuity (v9)
+  preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
+
   -- Scheduling state (denormalized)
   next_run_at     TEXT,
   last_run_at     TEXT,
@@ -123,7 +126,7 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 'running';
--- idx_runs_idempotency created by migrate-v7.js (cannot reference column before migration adds it)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- ============================================================
 -- MESSAGES: inter-agent message queue
@@ -261,6 +264,7 @@ CREATE TABLE IF NOT EXISTS task_tracker_agents (
 );
 CREATE INDEX IF NOT EXISTS idx_tta_tracker ON task_tracker_agents(tracker_id);
 CREATE INDEX IF NOT EXISTS idx_tta_status ON task_tracker_agents(status) WHERE status IN ('pending','running');
+CREATE INDEX IF NOT EXISTS idx_tta_session_key ON task_tracker_agents(session_key) WHERE session_key IS NOT NULL;
 
 -- ============================================================
 -- MIGRATION LOG
@@ -270,6 +274,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Fresh installs start at v9 (all columns already in schema above).
+-- Existing installs are brought up to v9 by migrate-consolidate.js.
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (4);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (5);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
--- v7: idempotency ledger (applied by migrate-v7.js)
--- v8: task_tracker_agents.session_key + last_heartbeat (applied by migrate-v8.js)
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (7);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (8);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
