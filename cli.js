@@ -3,7 +3,7 @@
 import { initDb, getDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
-import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount } from './messages.js';
+import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
 
 const [,, command, sub, ...args] = process.argv;
@@ -30,6 +30,11 @@ Runs:
   runs list <job-id> [limit]         List runs for a job
   runs running                       Currently running runs
   runs stale [threshold-s]           Stale runs
+
+Queue:
+  queue list [agent] [limit]         Show pending + delivered messages (default: main)
+  queue clear [agent]                Mark all messages read
+  queue prune                        Prune old messages now
 
 Messages:
   msg send <from> <to> <body>        Send a message
@@ -261,6 +266,44 @@ switch (command) {
       case 'read': markRead(args[0]); console.log('Marked read'); break;
       case 'readall': { const r = markAllRead(args[0]); console.log(`Marked ${r.changes} read`); break; }
       case 'unread': console.log(`Unread: ${getUnreadCount(args[0])}`); break;
+      default: usage();
+    }
+    break;
+
+  // ── Queue ────────────────────────────────────────────────
+  case 'queue':
+    switch (sub) {
+      case 'list':
+      case undefined: {
+        const agent = args[0] || 'main';
+        const limit = parseInt(args[1] || '50', 10);
+        const msgs = getInbox(agent, { limit });
+        const pending = msgs.filter(m => m.status === 'pending');
+        const delivered = msgs.filter(m => m.status === 'delivered');
+        const unread = getUnreadCount(agent);
+        console.log(`\nQueue for agent: ${agent} | ${unread} pending | ${delivered.length} delivered (showing last ${limit})\n`);
+        if (msgs.length === 0) { console.log('  Queue empty'); break; }
+        console.table(msgs.map(m => ({
+          id: m.id.slice(0, 8),
+          from: m.from_agent,
+          kind: m.kind,
+          subject: m.subject?.slice(0, 45),
+          status: m.status,
+          priority: m.priority,
+          created: m.created_at,
+        })));
+        break;
+      }
+      case 'clear': {
+        const r = markAllRead(args[0] || 'main');
+        console.log(`Cleared ${r.changes} messages`);
+        break;
+      }
+      case 'prune': {
+        pruneMessages();
+        console.log('Pruned old messages (read/delivered >3d, system >3d, expired/failed >30d)');
+        break;
+      }
       default: usage();
     }
     break;

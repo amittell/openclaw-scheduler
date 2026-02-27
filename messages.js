@@ -183,14 +183,32 @@ export function expireMessages() {
 }
 
 /**
- * Prune old read/expired messages (keep last N per agent pair).
+ * Prune old read/expired/delivered messages.
+ * - read/expired/failed: after keepDays (default 30)
+ * - delivered: after deliveredKeepDays (default 3) — delivered means consumed, no longer needed
+ * - system kind pending/delivered: after systemKeepDays (default 3) — failure notifications, not actionable
  */
-export function pruneMessages(keepDays = 30) {
-  return getDb().prepare(`
+export function pruneMessages(keepDays = 30, deliveredKeepDays = 3, systemKeepDays = 3) {
+  const db = getDb();
+  // Prune read/expired/failed after keepDays
+  db.prepare(`
     DELETE FROM messages
     WHERE status IN ('read', 'expired', 'failed')
       AND created_at < datetime('now', '-' || ? || ' days')
   `).run(keepDays);
+  // Prune delivered messages after deliveredKeepDays
+  db.prepare(`
+    DELETE FROM messages
+    WHERE status = 'delivered'
+      AND created_at < datetime('now', '-' || ? || ' days')
+  `).run(deliveredKeepDays);
+  // Prune system/result notifications after systemKeepDays regardless of status
+  // (runs table is the canonical record; these queue messages are just transient notifications)
+  return db.prepare(`
+    DELETE FROM messages
+    WHERE kind IN ('system', 'result')
+      AND created_at < datetime('now', '-' || ? || ' days')
+  `).run(systemKeepDays);
 }
 
 function parseMetadata(msg) {
