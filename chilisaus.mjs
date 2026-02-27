@@ -108,7 +108,11 @@ function lastFinishedRun(label) {
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
  *   --deliver-to <target>    Delivery target for results (Telegram user/group ID)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
- *   --mode <fresh|reuse|auto> Session mode hint (logged to Loki; full reuse is future work)
+ *   --mode <fresh|reuse|auto>
+ *       fresh  — always dispatch a new session (default)
+ *       reuse  — look up last session_key for this label and pass it to the gateway
+ *       auto   — try reuse, fall back to fresh if no prior session found
+ *   --session-key <key>      Explicit session key override (bypasses ledger lookup)
  */
 async function cmdEnqueue(flags) {
   const label = flags.label;
@@ -116,12 +120,38 @@ async function cmdEnqueue(flags) {
   if (!label)   die('--label is required', 2);
   if (!message) die('--message is required', 2);
 
-  const agent       = flags.agent         || 'main';
-  const thinking    = flags.thinking      || null;
+  const agent       = flags.agent          || 'main';
+  const thinking    = flags.thinking       || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
-  const deliverTo   = flags['deliver-to'] || null;
+  const deliverTo   = flags['deliver-to']  || null;
   const deliverMode = flags['delivery-mode'] || 'announce';
-  const mode        = flags.mode || 'fresh';
+  const mode        = flags.mode           || 'fresh';
+
+  // ── Session key resolution ──────────────────────────────────
+  let preferredSessionKey = flags['session-key'] || null;
+
+  if (!preferredSessionKey && (mode === 'reuse' || mode === 'auto')) {
+    // Look up last successful/finished run for this label that has a session_key
+    const db = getDb();
+    const lastRun = db.prepare(`
+      SELECT r.session_key FROM runs r
+      JOIN jobs j ON r.job_id = j.id
+      WHERE j.name = ?
+        AND r.status IN ('ok', 'running')
+        AND r.session_key IS NOT NULL
+      ORDER BY r.started_at DESC
+      LIMIT 1
+    `).get(label);
+
+    if (lastRun?.session_key) {
+      preferredSessionKey = lastRun.session_key;
+      process.stderr.write(`[chilisaus] mode=${mode} → reusing session ${preferredSessionKey}\n`);
+    } else if (mode === 'reuse') {
+      die(`mode=reuse: no prior session found for label "${label}". Use --mode fresh or --mode auto.`);
+    } else {
+      process.stderr.write(`[chilisaus] mode=auto → no prior session for "${label}", dispatching fresh\n`);
+    }
+  }
 
   // Use a never-fires cron (Feb 31) so scheduler doesn't auto-re-schedule
   const NEVER_CRON = '0 0 31 2 *';
@@ -138,13 +168,14 @@ async function cmdEnqueue(flags) {
       payload_message:         message,
       payload_thinking:        thinking,
       payload_timeout_seconds: timeoutS,
-      run_now:                 true,       // sets next_run_at to past → fires on next tick
-      delete_after_run:        true,       // one-shot: auto-deletes after completion
+      run_now:                 true,
+      delete_after_run:        true,
       delivery_mode:           deliverMode,
       delivery_channel:        deliverTo ? 'telegram' : null,
       delivery_to:             deliverTo,
       overlap_policy:          'skip',
       run_timeout_ms:          timeoutS * 1000,
+      preferred_session_key:   preferredSessionKey,   // null = fresh session
     });
   } catch (err) {
     die(`createJob failed: ${err.message}`);
@@ -154,13 +185,14 @@ async function cmdEnqueue(flags) {
   await onStarted({ label, job_id: job.id, agent, mode }).catch(() => {});
 
   out({
-    ok:      true,
+    ok:                  true,
     label,
-    job_id:  job.id,
+    job_id:              job.id,
     mode,
     agent,
-    status:  'queued',
-    message: `Job queued. Scheduler will dispatch on next tick (≤${(parseInt(process.env.SCHEDULER_TICK_MS || '10000') / 1000).toFixed(0)}s).`,
+    preferred_session_key: preferredSessionKey || null,
+    status:              'queued',
+    message:             `Job queued. Scheduler will dispatch on next tick (≤${(parseInt(process.env.SCHEDULER_TICK_MS || '10000') / 1000).toFixed(0)}s).`,
   });
 }
 

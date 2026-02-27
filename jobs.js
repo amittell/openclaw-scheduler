@@ -55,7 +55,8 @@ export function createJob(opts) {
       trigger_condition,
       delivery_guarantee, job_class,
       approval_required, approval_timeout_s, approval_auto,
-      context_retrieval, context_retrieval_limit
+      context_retrieval, context_retrieval_limit,
+      preferred_session_key
     ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -68,7 +69,8 @@ export function createJob(opts) {
       ?, ?,
       ?, ?,
       ?, ?, ?,
-      ?, ?
+      ?, ?,
+      ?
     )
   `);
 
@@ -105,7 +107,8 @@ export function createJob(opts) {
     opts.approval_timeout_s || 3600,
     opts.approval_auto || 'reject',
     opts.context_retrieval || 'none',
-    opts.context_retrieval_limit || 5
+    opts.context_retrieval_limit || 5,
+    opts.preferred_session_key || null
   );
 
   return getJob(id);
@@ -145,7 +148,8 @@ export function updateJob(id, patch) {
     'max_retries', 'payload_scope', 'resource_pool', 'trigger_condition',
     'delivery_guarantee', 'job_class',
     'approval_required', 'approval_timeout_s', 'approval_auto',
-    'context_retrieval', 'context_retrieval_limit'
+    'context_retrieval', 'context_retrieval_limit',
+    'preferred_session_key'
   ];
 
   // Cycle detection if parent_id is being changed

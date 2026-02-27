@@ -82,6 +82,30 @@ export async function initDb() {
     process.stderr.write(`${ts} [db] migrate-v7 error: ${err.message}\n`);
   }
 
+  try {
+    const { default: migrateV8 } = await import('./migrate-v8.js');
+    const applied8 = migrateV8();
+    if (applied8) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] Applied migration v8\n`);
+    }
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] migrate-v8 error: ${err.message}\n`);
+  }
+
+  try {
+    const { default: migrateV9 } = await import('./migrate-v9.js');
+    const applied9 = migrateV9();
+    if (applied9) {
+      const ts = new Date().toISOString();
+      process.stderr.write(`${ts} [db] Applied migration v9\n`);
+    }
+  } catch (err) {
+    const ts = new Date().toISOString();
+    process.stderr.write(`${ts} [db] migrate-v9 error: ${err.message}\n`);
+  }
+
   return db;
 }
 

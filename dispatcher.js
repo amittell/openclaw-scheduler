@@ -344,7 +344,9 @@ async function dispatchJob(job) {
 
     } else {
       // Isolated session: dispatch via chat completions API
-      const sessionKey = `scheduler:${job.id}:${run.id}`;
+      // Use preferred_session_key (set by chilisaus for reuse mode) if provided;
+      // otherwise generate a fresh scheduler-scoped key.
+      const sessionKey = job.preferred_session_key || `scheduler:${job.id}:${run.id}`;
       updateRunSession(run.id, sessionKey, null);
 
       // Mark agent as busy
