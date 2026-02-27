@@ -70,9 +70,14 @@ const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Shell Command Runner ────────────────────────────────────
+// Platform-aware shell: macOS defaults to zsh, Linux to bash.
+// Override with SCHEDULER_SHELL env var (e.g., SCHEDULER_SHELL=/bin/sh).
+const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
+  || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
+
 function runShellCommand(cmd, timeoutMs = 300000) {
   return new Promise((resolve) => {
-    execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: '/bin/zsh' }, (err, stdout, stderr) => {
+    execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: DEFAULT_SHELL }, (err, stdout, stderr) => {
       const output = [stdout, stderr].filter(Boolean).join('\n').trim();
       const exitCode = err?.code ?? 0;
       resolve({ output: output || '(no output)', exitCode, error: err || null });
