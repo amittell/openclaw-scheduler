@@ -200,6 +200,44 @@ node chilisaus/index.mjs send --label orchestrator --message '<json>' --kind res
 
 ---
 
+## Agent Memory Integration
+
+After installing chilisaus, add the following to your agent's memory files so
+it knows these tools exist across context resets.
+
+> **Tip:** Run `node setup.mjs` from the scheduler root — it will do this
+> automatically and interactively.
+
+### Add to `MEMORY.md`
+
+Under your `## Active Projects` or equivalent section:
+
+```markdown
+- **chilisaus 🌶️:** Sub-agent dispatch CLI at `~/.openclaw/scheduler/chilisaus/index.mjs`.
+  Commands: `enqueue` (spawn sub-agent), `status`, `stuck`, `result`, `send` (queue message), `heartbeat`.
+  Backed by scheduler DB (runs/jobs tables). Queue (`send`) is signal-only — scripts enqueue only when
+  actionable. Inbox Consumer (`scripts/inbox-consumer.mjs`) drains queue → Telegram DM every 5 min.
+  Docs: `~/.openclaw/scheduler/chilisaus/README.md`.
+```
+
+### Add to `memory/workspace-index.md`
+
+Add a **Scheduler & Dispatch** section:
+
+```markdown
+### Scheduler & Dispatch
+> Covers: standalone scheduler, sub-agent dispatch, inbox queue
+
+| File | Covers | Load |
+|------|--------|------|
+| `~/.openclaw/scheduler/` | Standalone SQLite scheduler. CLI: `node cli.js`. LaunchAgent: `ai.openclaw.scheduler`. | Any scheduler/cron work |
+| `~/.openclaw/scheduler/chilisaus/index.mjs` | Sub-agent dispatch CLI 🌶️. Commands: `enqueue`, `status`, `stuck`, `result`, `send`, `heartbeat`. | Dispatching sub-agents or sending queue messages |
+| `~/.openclaw/scheduler/chilisaus/hooks.mjs` | Loki lifecycle hooks. Only fires if `LOKI_PUSH_URL` env set. | Sub-agent observability |
+| `scripts/inbox-consumer.mjs` | Drains chilisaus queue → Telegram DM. Runs every 5 min via scheduler. Signal-only. | Queue/inbox debugging |
+```
+
+---
+
 ## Signal Queue Pattern (Inbox Consumer)
 
 The message queue is for **signal**, not for status. The distinction matters:

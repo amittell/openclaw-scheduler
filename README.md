@@ -72,21 +72,30 @@ git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
 SCHEDULER_DB=:memory: node test.js   # should print: 351 passed, 0 failed
-
-# macOS: copy and configure LaunchAgent
-cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
-nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist  # set YOUR_USER + YOUR_GATEWAY_TOKEN
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-
-# Linux: see INSTALL-LINUX.md (uses systemd user service)
-# Windows: see INSTALL-WINDOWS.md (WSL2 recommended, or PM2)
-
-# Verify
-node cli.js status
-tail -5 /tmp/openclaw-scheduler.log
 ```
 
-For full installation details (first host), see [INSTALL.md](INSTALL.md).
+Then run the interactive setup wizard:
+
+```bash
+node setup.mjs
+```
+
+The wizard will:
+- Run DB migrations
+- Append chilisaus entries to your agent's `MEMORY.md` and `workspace-index.md`
+- Create **Inbox Consumer** + **Stuck Run Detector** scheduler jobs
+- Install and load the macOS LaunchAgent (optional)
+
+After setup:
+
+```bash
+node cli.js status                    # verify scheduler is running
+node chilisaus/index.mjs stuck        # should print: 0 stuck runs
+tail -5 /tmp/openclaw-scheduler.log   # live logs
+```
+
+For full manual installation details, see [INSTALL.md](INSTALL.md).
+For Linux (systemd) and Windows (WSL2/PM2), see [INSTALL-LINUX.md](INSTALL-LINUX.md) and [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
 
 ---
