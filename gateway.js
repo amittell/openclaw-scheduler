@@ -194,3 +194,31 @@ export async function checkGatewayHealth() {
     return false;
   }
 }
+
+/**
+ * Wait for the gateway to become reachable, polling at intervals.
+ * Returns true if the gateway responded within the timeout, false otherwise.
+ * Any HTTP response (even non-200) counts as "up" — we just need TCP connectivity.
+ *
+ * @param {number} timeoutMs  - Maximum time to wait (default 30s)
+ * @param {number} intervalMs - Polling interval (default 2s)
+ * @returns {Promise<boolean>}
+ */
+export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`${GATEWAY_URL}/health`, {
+        headers: authHeaders(),
+        signal: AbortSignal.timeout(Math.min(intervalMs, 5000)),
+      });
+      return true; // Any response means gateway is up
+    } catch {
+      // Not up yet — wait and retry
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise(r => setTimeout(r, Math.min(intervalMs, remaining)));
+    }
+  }
+  return false;
+}

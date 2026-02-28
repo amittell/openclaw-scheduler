@@ -45,7 +45,7 @@ import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
 import {
   runAgentTurn, sendSystemEvent, listSessions, getAllSubAgentSessions,
-  deliverMessage, checkGatewayHealth, resolveDeliveryAlias,
+  deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
 import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
@@ -334,6 +334,21 @@ async function dispatchJob(job) {
 
     } else {
       // Isolated session: dispatch via chat completions API
+      // ── Gateway health check for agentTurn jobs ──────────────
+      // If gateway is down (e.g. restarting), wait up to 30s for it.
+      // If it never comes up, defer the job instead of losing it.
+      const gatewayReady = await waitForGateway(30000, 2000);
+      if (!gatewayReady) {
+        log('warn', `Gateway unavailable after 30s — deferring: ${job.name}`, { jobId: job.id });
+        finishRun(run.id, 'error', { error_message: 'Gateway unavailable — deferred' });
+        releaseIdempotencyKey(idemKey);
+        // Reschedule for 60s from now so the scheduler retries
+        const deferredAt = new Date(Date.now() + 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+        updateJob(job.id, { next_run_at: deferredAt });
+        // Do NOT delete one-shot jobs — they never got a chance to run
+        return;
+      }
+
       // Use preferred_session_key (set by chilisaus for reuse mode) if provided;
       // otherwise generate a fresh scheduler-scoped key.
       const sessionKey = job.preferred_session_key || `scheduler:${job.id}:${run.id}`;
