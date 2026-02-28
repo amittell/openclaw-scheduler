@@ -216,14 +216,18 @@ if (!deliverTo) {
 
 print();
 
-// ─── Step 5: LaunchAgent (macOS only) ────────────────────────────────────────
+// ─── Step 5: Service / auto-start ────────────────────────────────────────────
 
-print('── Step 5: LaunchAgent (macOS) ─────────────────────────');
+const platform = process.platform;
+const nodePath  = process.execPath;
+const indexPath = path.join(schedulerPath, 'index.js');
+const logPath   = platform === 'win32'
+  ? path.join(os.tmpdir(), 'openclaw-scheduler.log')
+  : '/tmp/openclaw-scheduler.log';
 
-if (process.platform !== 'darwin') {
-  skip('Not macOS — skipping LaunchAgent');
-  print('  For Linux, use PM2 or systemd. See docs/platform-support.md');
-} else {
+// ── macOS ──────────────────────────────────────────────────────────────────
+if (platform === 'darwin') {
+  print('── Step 5: Service (macOS LaunchAgent) ─────────────────');
   const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.scheduler.plist');
   if (fs.existsSync(plistPath)) {
     skip('LaunchAgent already installed');
@@ -232,7 +236,6 @@ if (process.platform !== 'darwin') {
   } else {
     const install = await confirm('Install LaunchAgent (auto-start on login)?');
     if (install) {
-      const nodePath = process.execPath;
       const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -242,7 +245,7 @@ if (process.platform !== 'darwin') {
   <key>ProgramArguments</key>
   <array>
     <string>${nodePath}</string>
-    <string>${path.join(schedulerPath, 'index.js')}</string>
+    <string>${indexPath}</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${schedulerPath}</string>
@@ -256,26 +259,178 @@ if (process.platform !== 'darwin') {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/openclaw-scheduler.log</string>
+  <string>${logPath}</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/openclaw-scheduler.log</string>
+  <string>${logPath}</string>
 </dict>
 </plist>`;
       fs.writeFileSync(plistPath, plist);
       try {
         execSync(`launchctl load "${plistPath}"`);
         ok('LaunchAgent installed and loaded');
-        print(`  Path: ${plistPath}`);
-        print('  Logs: /tmp/openclaw-scheduler.log');
       } catch (err) {
-        ok(`LaunchAgent plist written to ${plistPath}`);
-        warn(`Auto-load failed (${err.message.trim()})`);
+        ok(`LaunchAgent plist written → ${plistPath}`);
+        warn(`Auto-load failed: ${err.message.trim()}`);
         warn(`Run manually: launchctl load "${plistPath}"`);
       }
+      print(`  Logs: ${logPath}`);
     } else {
       skip('Skipped — run again to install later');
     }
   }
+
+// ── Linux ──────────────────────────────────────────────────────────────────
+} else if (platform === 'linux') {
+  print('── Step 5: Service (Linux) ─────────────────────────────');
+
+  // Detect whether systemd user session is available
+  let hasSystemd = false;
+  try { execSync('systemctl --user status', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+  // Also accept if the user session bus is present
+  if (!hasSystemd) {
+    try { execSync('systemctl --user list-units', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+  }
+
+  // Check for PM2
+  let hasPm2 = false;
+  try { execSync('pm2 --version', { stdio: 'ignore' }); hasPm2 = true; } catch {}
+
+  if (hasSystemd) {
+    const unitDir  = path.join(os.homedir(), '.config', 'systemd', 'user');
+    const unitPath = path.join(unitDir, 'openclaw-scheduler.service');
+
+    if (fs.existsSync(unitPath)) {
+      skip('systemd user service already installed');
+      print(`  Path: ${unitPath}`);
+      print('  To restart: systemctl --user restart openclaw-scheduler');
+    } else {
+      const install = await confirm('Install systemd user service (auto-start on login)?');
+      if (install) {
+        const unit = `[Unit]
+Description=OpenClaw Scheduler
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${schedulerPath}
+ExecStart=${nodePath} ${indexPath}
+Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}
+Restart=always
+RestartSec=5
+StandardOutput=append:${logPath}
+StandardError=append:${logPath}
+
+[Install]
+WantedBy=default.target
+`;
+        fs.mkdirSync(unitDir, { recursive: true });
+        fs.writeFileSync(unitPath, unit);
+        try {
+          execSync('systemctl --user daemon-reload');
+          execSync('systemctl --user enable --now openclaw-scheduler');
+          ok('systemd user service installed and started');
+        } catch (err) {
+          ok(`Unit file written → ${unitPath}`);
+          warn(`Auto-start failed: ${err.message.trim()}`);
+          warn('Run manually:');
+          warn('  systemctl --user daemon-reload');
+          warn('  systemctl --user enable --now openclaw-scheduler');
+        }
+        print(`  Logs: ${logPath}  (or: journalctl --user -u openclaw-scheduler -f)`);
+      } else {
+        skip('Skipped — run again to install later');
+      }
+    }
+  } else if (hasPm2) {
+    print('  systemd user session not available — using PM2');
+    const pm2Name = 'openclaw-scheduler';
+    let pm2Running = false;
+    try {
+      const out = execSync('pm2 list --no-color', { encoding: 'utf8' });
+      pm2Running = out.includes(pm2Name);
+    } catch {}
+
+    if (pm2Running) {
+      skip(`PM2 process "${pm2Name}" already running`);
+      print('  To restart: pm2 restart openclaw-scheduler');
+    } else {
+      const install = await confirm('Register with PM2 (auto-start on login)?');
+      if (install) {
+        try {
+          execSync(
+            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${schedulerPath}" ` +
+            `--log "${logPath}" -- --env OPENCLAW_GATEWAY_URL=${gatewayUrl}`,
+            { stdio: 'inherit' }
+          );
+          execSync('pm2 save');
+          ok('PM2 process started and saved');
+          print('  Run `pm2 startup` and follow the instructions to survive reboots.');
+        } catch (err) {
+          warn(`PM2 start failed: ${err.message.trim()}`);
+        }
+      } else {
+        skip('Skipped — run again to install later');
+      }
+    }
+  } else {
+    warn('Neither systemd user session nor PM2 found');
+    print('  Options:');
+    print('  • Install PM2:  npm install -g pm2');
+    print('  • Or run manually:  node index.js &');
+    print('  • See INSTALL-LINUX.md for systemd setup without a user session');
+  }
+
+// ── Windows ────────────────────────────────────────────────────────────────
+} else if (platform === 'win32') {
+  print('── Step 5: Service (Windows) ───────────────────────────');
+
+  // PM2 is the recommended approach on Windows
+  let hasPm2 = false;
+  try { execSync('pm2 --version', { stdio: 'ignore' }); hasPm2 = true; } catch {}
+
+  if (!hasPm2) {
+    warn('PM2 not found — recommended for Windows auto-start');
+    print('  Install: npm install -g pm2');
+    print('  Then re-run setup.mjs');
+    print('  Alternative: Windows Task Scheduler (see INSTALL-WINDOWS.md)');
+  } else {
+    const pm2Name = 'openclaw-scheduler';
+    let pm2Running = false;
+    try {
+      const out = execSync('pm2 list --no-color', { encoding: 'utf8' });
+      pm2Running = out.includes(pm2Name);
+    } catch {}
+
+    if (pm2Running) {
+      skip(`PM2 process "${pm2Name}" already running`);
+      print('  To restart: pm2 restart openclaw-scheduler');
+    } else {
+      const install = await confirm('Register with PM2 (recommended for Windows)?');
+      if (install) {
+        try {
+          execSync(
+            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${schedulerPath}" --log "${logPath}"`,
+            { stdio: 'inherit' }
+          );
+          execSync('pm2 save');
+          ok('PM2 process started and saved');
+          print('  To survive reboots, run: pm2 startup');
+          print('  Then follow the printed instructions (requires Admin for the service install).');
+        } catch (err) {
+          warn(`PM2 start failed: ${err.message.trim()}`);
+          print('  Try running as Administrator, or see INSTALL-WINDOWS.md');
+        }
+      } else {
+        skip('Skipped — run again to install later');
+        print('  Manual start: node index.js');
+      }
+    }
+  }
+
+// ── Unknown ────────────────────────────────────────────────────────────────
+} else {
+  skip(`Unsupported platform: ${platform}`);
+  print('  Start manually: node index.js');
 }
 
 print();
@@ -285,11 +440,23 @@ print();
 print('── Done! ───────────────────────────────────────────────');
 print();
 print('Next steps:');
-print('  • Start the scheduler:  launchctl kickstart -k gui/$UID/ai.openclaw.scheduler');
-print('  • Check status:         node cli.js status');
-print('  • List jobs:            node cli.js jobs list');
-print('  • Test dispatch:        node chilisaus/index.mjs enqueue --label test --message "Hello"');
-print('  • Docs:                 chilisaus/README.md');
+
+if (platform === 'darwin') {
+  print('  • Check service:  launchctl list | grep openclaw');
+  print('  • Restart:        launchctl kickstart -k gui/$UID/ai.openclaw.scheduler');
+} else if (platform === 'linux') {
+  print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
+  print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+} else if (platform === 'win32') {
+  print('  • Check service:  pm2 status');
+  print('  • Logs:           pm2 logs openclaw-scheduler');
+}
+
+print('  • Scheduler CLI:  node cli.js status');
+print('  • List jobs:      node cli.js jobs list');
+print('  • Test dispatch:  node chilisaus/index.mjs enqueue --label test --message "Hello"');
+print(`  • Logs:           ${logPath}`);
+print('  • Docs:           chilisaus/README.md');
 print();
 
 rl.close();
