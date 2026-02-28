@@ -206,7 +206,12 @@ After installing chilisaus, add the following to your agent's memory files so
 it knows these tools exist across context resets.
 
 > **Tip:** Run `node setup.mjs` from the scheduler root — it will do this
-> automatically and interactively.
+> automatically and interactively, and remind you to activate the changes.
+
+> **⚠️ Active sessions:** Memory file changes only take effect in **new** sessions.
+> If your agent is already running, tell it explicitly:
+> *"Read your MEMORY.md and memory/workspace-index.md — chilisaus was just added. Load it into your context."*
+> Future sessions will pick it up automatically via `memory_search`.
 
 ### Add to `MEMORY.md`
 

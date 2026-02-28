@@ -458,5 +458,24 @@ print('  • Test dispatch:  node chilisaus/index.mjs enqueue --label test --mes
 print(`  • Logs:           ${logPath}`);
 print('  • Docs:           chilisaus/README.md');
 print();
+print('── ⚠️  Important: activate memory changes ───────────────');
+print();
+print('  Memory file changes (MEMORY.md, workspace-index.md) only take');
+print('  effect in NEW sessions. Your agent\'s current session won\'t see');
+print('  them until it explicitly re-reads the files.');
+print();
+print('  Tell your agent now:');
+print();
+if (workspacePath) {
+  print(`    "Read ${path.join(workspacePath, 'MEMORY.md')} and`);
+  print(`     ${path.join(workspacePath, 'memory', 'workspace-index.md')} —`);
+  print('     chilisaus was just added to both. Load it into your context."');
+} else {
+  print('    "Read your MEMORY.md and memory/workspace-index.md —');
+  print('     chilisaus was just added to both. Load it into your context."');
+}
+print();
+print('  Future sessions will pick it up automatically via memory_search.');
+print();
 
 rl.close();
