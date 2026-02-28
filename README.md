@@ -11,7 +11,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
 **Tests:** 351 (full suite, in-memory SQLite)
-**Platform:** macOS · Linux · Windows (WSL2 or PM2)
+**Platform:** macOS · Linux · Windows (WSL2)
 
 ---
 
@@ -95,7 +95,7 @@ tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
 
 For full manual installation details, see [INSTALL.md](INSTALL.md).
-For Linux (systemd) and Windows (WSL2/PM2), see [INSTALL-LINUX.md](INSTALL-LINUX.md) and [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
+For Linux and Windows (WSL2), follow [INSTALL-LINUX.md](INSTALL-LINUX.md). For WSL2 setup on Windows, see [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
 
 ---
@@ -106,12 +106,12 @@ For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.m
 |----------|----------------|------------|--------|
 | macOS | LaunchAgent | `/bin/zsh` | ✅ Tested |
 | Linux | systemd user service | `/bin/bash` | ✅ Supported |
-| Windows (WSL2) | systemd | `/bin/bash` | ✅ Recommended |
-| Windows (native) | PM2 | `cmd.exe` / PowerShell | ⚠️ Limited |
+| Windows (WSL2) | systemd (WSL2) / PM2 (WSL1) | `/bin/bash` | ✅ Supported |
+| Windows (native) | — | — | ❌ Not supported — use WSL2 |
 
 - **macOS:** Full guide in [INSTALL.md](INSTALL.md)
 - **Linux:** Full guide in [INSTALL-LINUX.md](INSTALL-LINUX.md)
-- **Windows:** Full guide in [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md)
+- **Windows:** Install WSL2, then follow [INSTALL-LINUX.md](INSTALL-LINUX.md). See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) for WSL2 setup.
 
 Override the shell for shell jobs with the `SCHEDULER_SHELL=/path/to/shell` environment variable.
 

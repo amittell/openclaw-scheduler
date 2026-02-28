@@ -225,6 +225,17 @@ const logPath   = platform === 'win32'
   ? path.join(os.tmpdir(), 'openclaw-scheduler.log')
   : '/tmp/openclaw-scheduler.log';
 
+// Detect WSL (WSL runs as linux; WSL_DISTRO_NAME is set by Microsoft)
+const isWSL = platform === 'linux' && (
+  process.env.WSL_DISTRO_NAME ||
+  process.env.WSL_INTEROP ||
+  (() => { try { return fs.readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft'); } catch { return false; } })()
+);
+// WSL2 has systemd support; WSL1 does not
+const wslVersion = isWSL && (() => {
+  try { return fs.readFileSync('/proc/version', 'utf8').includes('WSL2') ? 2 : 1; } catch { return null; }
+})();
+
 // ── macOS ──────────────────────────────────────────────────────────────────
 if (platform === 'darwin') {
   print('── Step 5: Service (macOS LaunchAgent) ─────────────────');
@@ -281,14 +292,28 @@ if (platform === 'darwin') {
 
 // ── Linux ──────────────────────────────────────────────────────────────────
 } else if (platform === 'linux') {
-  print('── Step 5: Service (Linux) ─────────────────────────────');
+  if (isWSL) {
+    const wslLabel = wslVersion ? `WSL${wslVersion}` : 'WSL';
+    print(`── Step 5: Service (${wslLabel}) ──────────────────────────────`);
+    if (wslVersion === 1) {
+      print('  WSL1 detected — systemd not supported. Using PM2.');
+    } else {
+      print('  WSL2 detected. Systemd is supported if enabled in /etc/wsl.conf.');
+      print('  If not enabled: add [boot] systemd=true to /etc/wsl.conf, then wsl --shutdown.');
+    }
+  } else {
+    print('── Step 5: Service (Linux) ─────────────────────────────');
+  }
 
   // Detect whether systemd user session is available
   let hasSystemd = false;
-  try { execSync('systemctl --user status', { stdio: 'ignore' }); hasSystemd = true; } catch {}
-  // Also accept if the user session bus is present
-  if (!hasSystemd) {
-    try { execSync('systemctl --user list-units', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+  if (isWSL && wslVersion === 1) {
+    hasSystemd = false; // WSL1 never has systemd
+  } else {
+    try { execSync('systemctl --user status', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+    if (!hasSystemd) {
+      try { execSync('systemctl --user list-units', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+    }
   }
 
   // Check for PM2
@@ -380,52 +405,22 @@ WantedBy=default.target
     print('  • See INSTALL-LINUX.md for systemd setup without a user session');
   }
 
-// ── Windows ────────────────────────────────────────────────────────────────
+// ── Windows (native) ───────────────────────────────────────────────────────
 } else if (platform === 'win32') {
   print('── Step 5: Service (Windows) ───────────────────────────');
-
-  // PM2 is the recommended approach on Windows
-  let hasPm2 = false;
-  try { execSync('pm2 --version', { stdio: 'ignore' }); hasPm2 = true; } catch {}
-
-  if (!hasPm2) {
-    warn('PM2 not found — recommended for Windows auto-start');
-    print('  Install: npm install -g pm2');
-    print('  Then re-run setup.mjs');
-    print('  Alternative: Windows Task Scheduler (see INSTALL-WINDOWS.md)');
-  } else {
-    const pm2Name = 'openclaw-scheduler';
-    let pm2Running = false;
-    try {
-      const out = execSync('pm2 list --no-color', { encoding: 'utf8' });
-      pm2Running = out.includes(pm2Name);
-    } catch {}
-
-    if (pm2Running) {
-      skip(`PM2 process "${pm2Name}" already running`);
-      print('  To restart: pm2 restart openclaw-scheduler');
-    } else {
-      const install = await confirm('Register with PM2 (recommended for Windows)?');
-      if (install) {
-        try {
-          execSync(
-            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${schedulerPath}" --log "${logPath}"`,
-            { stdio: 'inherit' }
-          );
-          execSync('pm2 save');
-          ok('PM2 process started and saved');
-          print('  To survive reboots, run: pm2 startup');
-          print('  Then follow the printed instructions (requires Admin for the service install).');
-        } catch (err) {
-          warn(`PM2 start failed: ${err.message.trim()}`);
-          print('  Try running as Administrator, or see INSTALL-WINDOWS.md');
-        }
-      } else {
-        skip('Skipped — run again to install later');
-        print('  Manual start: node index.js');
-      }
-    }
-  }
+  print();
+  warn('Native Windows detected.');
+  print('  OpenClaw Scheduler is designed to run inside WSL (Windows Subsystem for Linux).');
+  print('  Running natively on Windows is not supported.');
+  print();
+  print('  Setup steps:');
+  print('  1. Install WSL2:  wsl --install  (in PowerShell as Admin)');
+  print('  2. Open your WSL terminal and run this wizard again from there:');
+  print(`     cd ${schedulerPath.replace(/\\/g, '/')}`);
+  print('     node setup.mjs');
+  print();
+  print('  WSL2 with systemd enabled gives the best experience (auto-start on login).');
+  print('  See INSTALL-WINDOWS.md for the full WSL2 + systemd setup guide.');
 
 // ── Unknown ────────────────────────────────────────────────────────────────
 } else {
@@ -445,11 +440,16 @@ if (platform === 'darwin') {
   print('  • Check service:  launchctl list | grep openclaw');
   print('  • Restart:        launchctl kickstart -k gui/$UID/ai.openclaw.scheduler');
 } else if (platform === 'linux') {
-  print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
-  print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+  if (isWSL) {
+    print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
+    print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+    print('  • Note: if WSL session closes, restart with: systemctl --user start openclaw-scheduler');
+  } else {
+    print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
+    print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+  }
 } else if (platform === 'win32') {
-  print('  • Check service:  pm2 status');
-  print('  • Logs:           pm2 logs openclaw-scheduler');
+  print('  • Run setup inside WSL — see instructions above');
 }
 
 print('  • Scheduler CLI:  node cli.js status');
