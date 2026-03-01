@@ -292,12 +292,12 @@ async function cmdEnqueue(flags) {
   if (!message) die('--message is required', 2);
 
   const agent       = flags.agent            || 'main';
-  const thinking    = flags.thinking         || null;
+  const thinking    = flags.thinking         || 'xhigh';
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   const deliverTo   = flags['deliver-to']    || null;
   const deliverMode = flags['delivery-mode'] || 'announce';
   const mode        = flags.mode             || 'fresh';
-  const model       = flags.model            || null;
+  const model       = flags.model            || 'anthropic/claude-opus-4-6';
 
   // ── Session key resolution ──────────────────────────────────
   let sessionKey = flags['session-key'] || null;
