@@ -10,3 +10,4 @@ secrets/
 *.secret
 backupstore/
 logs/
+chilisaus/
