@@ -68,6 +68,59 @@ Use `shell` when:
 
 **Shell jobs work great as chain parents too** — a shell build job can trigger an isolated deploy job on success.
 
+#### Shell Daemon Keepalive Jobs — Critical Rules
+
+When using shell jobs to keep a background daemon (e.g. QMD, a model server, a vector DB) warm and running, three rules prevent silent failures:
+
+**Rule 1: The daemon wrapper script must block.**
+
+If your LaunchAgent/systemd service runs a wrapper script that sets up the daemon and then exits, the service manager restarts the script immediately — potentially spawning multiple daemon instances fighting for the same port, causing hangs or crashes.
+
+```bash
+# ❌ Wrong — script exits after setup, KeepAlive loops it immediately
+./bridge.py daemon start   # starts daemon, initializes session, exits
+./bridge.py warmup         # exits → service restarts → another daemon spawns
+
+# ✅ Correct — start daemon in background, block on its PID
+./mydaemon --port 8181 &
+DAEMON_PID=$!
+./bridge.py daemon init    # session setup (runs once)
+./bridge.py warmup         # pre-warm (runs once)
+wait $DAEMON_PID           # blocks until daemon dies → then service restarts cleanly
+```
+
+On macOS (`KeepAlive: true` LaunchAgent) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
+
+**Rule 2: Keepalive jobs must exercise the actual hot path.**
+
+A keepalive that pings `/health` or runs a lightweight query does NOT keep ML/neural models warm in GPU memory. Only calls that trigger real model inference keep the models loaded.
+
+```bash
+# ❌ Wrong — BM25 text search, no model loading, GPU models go cold
+qmd search "keepalive" --limit 1 --collection memory-root-main
+
+# ✅ Correct — deep_search triggers embedding + reranker model inference
+python3 /path/to/mcporter-qmd.py call qmd.deep_search \
+  --args '{"query":"memory","limit":1,"minScore":0,"collection":"memory-root-main"}' \
+  --timeout 30000
+```
+
+Schedule model-warming keepalives at least every 10 minutes. Every 30 minutes is too infrequent — models unload from GPU between calls, causing cold-start delays (10–20s) on the next real query.
+
+**Rule 3: Daemon session/state files must not live in `/tmp`.**
+
+`/tmp` is cleared on macOS reboot and on Linux boot (or by `systemd-tmpfiles`). If your daemon stores a session ID or token in `/tmp`, any reboot causes the next client call to fail — often silently (e.g. `400 Already Initialized`, empty results, or a crash with no stdout).
+
+```bash
+# ❌ Wrong — lost on reboot, daemon calls fail silently after restart
+SESSION_FILE=/tmp/my-daemon-session.json
+
+# ✅ Correct — persistent across reboots
+SESSION_FILE=${XDG_CACHE_HOME:-$HOME/.cache}/my-daemon/session.json
+```
+
+Always store daemon session files in `XDG_CACHE_HOME` or another directory that persists across reboots.
+
 ---
 
 ### When to use `isolated`
