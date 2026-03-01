@@ -56,7 +56,7 @@ node chilisaus/index.mjs enqueue \
   --agent   main                  \
   --thinking xhigh                \
   --timeout  300                  \
-  --deliver-to 484946046          \
+  --deliver-to YOUR_TELEGRAM_ID          \
   --delivery-mode announce
 ```
 
