@@ -14,6 +14,7 @@
  *   steer      Alias for send — explicitly for mid-session course correction
  *   heartbeat  Check session liveness
  *   list       List all tracked labels
+ *   sync       Reconcile labels.json with gateway state
  *
  * Exit codes:
  *   0  — success / nothing stuck
@@ -131,6 +132,133 @@ function gatewayCall(method, params = {}, opts = {}) {
   }
 }
 
+// ── Subagent Registry ────────────────────────────────────────
+
+/**
+ * Load the gateway's subagent run registry.
+ * This tracks all active/recent subagent runs with their start/end times.
+ * Path: ~/.openclaw/subagents/runs.json
+ *
+ * Each entry has:
+ *   - runId:             string
+ *   - childSessionKey:   string  (matches sessionKey in labels.json)
+ *   - startedAt:         number  (ms timestamp)
+ *   - endedAt:           number | undefined  (ms timestamp; absent = still running)
+ *   - cleanupHandled:    boolean
+ */
+function loadSubagentRegistry() {
+  try {
+    const registryPath = join(process.env.HOME || '~', '.openclaw', 'subagents', 'runs.json');
+    const data = JSON.parse(readFileSync(registryPath, 'utf-8'));
+    return data?.runs || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Check if a session has an active run in the gateway's subagent registry.
+ *
+ * Returns:
+ *   { found: true,  active: true  }  — run exists, still running (no endedAt)
+ *   { found: true,  active: false }  — run exists, completed (has endedAt)
+ *   { found: false, active: false }  — not in registry (pruned or never tracked here)
+ */
+function checkSubagentRunState(sessionKey) {
+  const runs = loadSubagentRegistry();
+  for (const entry of Object.values(runs)) {
+    if (entry.childSessionKey === sessionKey) {
+      return {
+        found:   true,
+        active:  typeof entry.endedAt !== 'number',
+        endedAt: typeof entry.endedAt === 'number' ? entry.endedAt : null,
+        runId:   entry.runId || null,
+      };
+    }
+  }
+  return { found: false, active: false, endedAt: null, runId: null };
+}
+
+// ── Gateway Session State Check ──────────────────────────────
+
+/**
+ * Determine if a session should be auto-resolved as "done" based on gateway state.
+ *
+ * Decision logic (in priority order):
+ *   1. Subagent registry says completed (endedAt set)   → resolve
+ *   2. Subagent registry says active (no endedAt)       → do NOT resolve
+ *   3. Session not found in gateway sessions.list        → resolve (expired/deleted)
+ *   4. Session found but idle past threshold + not in registry (pruned = old) → resolve
+ *   5. Gateway unavailable                               → do NOT resolve (safe default)
+ *
+ * @param {string}     sessionKey   - The session key to check
+ * @param {Array|null} sessionCache - Pre-fetched sessions.list array (null = unavailable)
+ * @param {number}     thresholdMs  - Silence threshold in ms
+ * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null }}
+ */
+function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
+  // 1 & 2. Subagent registry — most authoritative for recent sessions
+  const reg = checkSubagentRunState(sessionKey);
+  if (reg.found) {
+    if (!reg.active) {
+      return {
+        shouldResolve: true,
+        reason:       'run completed in gateway subagent registry',
+        lastActivity:  reg.endedAt,
+      };
+    }
+    // Actively running according to registry — don't touch it
+    return {
+      shouldResolve: false,
+      reason:       'run still active in gateway subagent registry',
+      lastActivity:  null,
+    };
+  }
+
+  // Registry doesn't have this session (pruned after completion or not yet tracked).
+  // Fall back to sessions.list.
+
+  if (!sessionCache) {
+    // Gateway unavailable — safe default is to NOT auto-resolve
+    return {
+      shouldResolve: false,
+      reason:       'gateway unavailable for state check',
+      lastActivity:  null,
+    };
+  }
+
+  // 3. Not in sessions.list → session expired/deleted from store
+  const session = sessionCache.find(s => s.key === sessionKey);
+  if (!session) {
+    return {
+      shouldResolve: true,
+      reason:       'session not found in gateway store',
+      lastActivity:  null,
+    };
+  }
+
+  // 4. Session exists in store, check idle time.
+  //    Since it's NOT in the subagent registry (which means the run is pruned/completed),
+  //    we can infer the session is done if its idle time exceeds the threshold.
+  const lastActivity = session.updatedAt || 0;
+  const silenceMs    = Date.now() - lastActivity;
+
+  if (silenceMs >= thresholdMs) {
+    return {
+      shouldResolve: true,
+      reason:       `session idle ${Math.round(silenceMs / 60000)}min in gateway (subagent run pruned = completed)`,
+      lastActivity,
+    };
+  }
+
+  // Session has recent activity — might still be working
+  return {
+    shouldResolve: false,
+    reason:       'session has recent gateway activity',
+    lastActivity,
+  };
+}
+
 // ── Session Helpers ──────────────────────────────────────────
 
 /** Build a unique session key for a new subagent session. */
@@ -163,13 +291,13 @@ async function cmdEnqueue(flags) {
   if (!label)   die('--label is required', 2);
   if (!message) die('--message is required', 2);
 
-  const agent      = flags.agent           || 'main';
-  const thinking   = flags.thinking        || null;
-  const timeoutS   = parseInt(flags.timeout || '300', 10);
-  const deliverTo  = flags['deliver-to']   || null;
+  const agent       = flags.agent            || 'main';
+  const thinking    = flags.thinking         || null;
+  const timeoutS    = parseInt(flags.timeout || '300', 10);
+  const deliverTo   = flags['deliver-to']    || null;
   const deliverMode = flags['delivery-mode'] || 'announce';
-  const mode       = flags.mode            || 'fresh';
-  const model      = flags.model           || null;
+  const mode        = flags.mode             || 'fresh';
+  const model       = flags.model            || null;
 
   // ── Session key resolution ──────────────────────────────────
   let sessionKey = flags['session-key'] || null;
@@ -276,6 +404,7 @@ async function cmdEnqueue(flags) {
 
 /**
  * status — show session status for a label.
+ * Syncs from gateway state for "running" sessions before returning.
  *
  * Flags:
  *   --label <string>    Required
@@ -290,47 +419,70 @@ function cmdStatus(flags) {
     return;
   }
 
-  // Check session liveness via gateway sessions.list
-  let liveness = null;
-  if (entry.sessionKey) {
-    try {
-      const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
-      const session = result?.sessions?.find(s => s.key === entry.sessionKey);
-      if (session) {
-        liveness = {
-          updatedAt: session.updatedAt,
-          ageMs:     session.updatedAt ? Date.now() - session.updatedAt : null,
-          sessionId: session.sessionId,
-          model:     session.model || null,
-          tokens:    session.totalTokens || null,
-        };
-      } else {
-        liveness = { error: 'session not found in store (may have expired)' };
-      }
-    } catch (err) {
-      liveness = { error: 'failed to query gateway: ' + err.message };
+  let liveness   = null;
+  let syncAction = null;
+
+  // Fetch sessions.list for all gateway checks
+  let sessionCache = null;
+  try {
+    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+    sessionCache = result?.sessions || [];
+  } catch {}
+
+  // For "running" sessions, check gateway and auto-resolve if done
+  if (entry.status === 'running' && entry.sessionKey) {
+    const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
+    if (check.shouldResolve) {
+      setLabel(label, {
+        status:  'done',
+        summary: `Auto-resolved: ${check.reason}`,
+      });
+      syncAction = `auto-resolved: ${check.reason}`;
     }
   }
+
+  // Build liveness from cache
+  if (entry.sessionKey && sessionCache) {
+    const session = sessionCache.find(s => s.key === entry.sessionKey);
+    if (session) {
+      liveness = {
+        updatedAt: session.updatedAt,
+        ageMs:     session.updatedAt ? Date.now() - session.updatedAt : null,
+        sessionId: session.sessionId,
+        model:     session.model || null,
+        tokens:    session.totalTokens || null,
+      };
+    } else {
+      liveness = { error: 'session not found in gateway store' };
+    }
+  } else if (entry.sessionKey && !sessionCache) {
+    liveness = { error: 'failed to query gateway' };
+  }
+
+  // Re-read entry in case we just updated it
+  const current = getLabel(label) || entry;
 
   out({
     ok:         true,
     label,
-    sessionKey: entry.sessionKey,
-    runId:      entry.runId,
-    agent:      entry.agent,
-    mode:       entry.mode,
-    status:     entry.status,
-    spawnedAt:  entry.spawnedAt,
-    updatedAt:  entry.updatedAt,
-    summary:    entry.summary || null,
-    error:      entry.error || null,
+    sessionKey: current.sessionKey,
+    runId:      current.runId,
+    agent:      current.agent,
+    mode:       current.mode,
+    status:     current.status,
+    spawnedAt:  current.spawnedAt,
+    updatedAt:  current.updatedAt,
+    summary:    current.summary || null,
+    error:      current.error || null,
     liveness,
+    ...(syncAction ? { syncAction } : {}),
   });
 }
 
 /**
  * stuck — find sessions running past threshold.
- * Exits 1 if any stuck sessions found.
+ * Auto-resolves sessions the gateway considers done before alerting.
+ * Exits 1 only if genuinely stuck sessions remain after sync.
  *
  * Flags:
  *   --threshold-min <n>   Minutes without activity to consider stuck (default: 15)
@@ -341,8 +493,9 @@ async function cmdStuck(flags) {
 
   const labels = loadLabels();
   const stuckSessions = [];
+  const autoResolved  = [];
 
-  // Pre-fetch all sessions once to avoid N gateway calls
+  // Pre-fetch all gateway sessions once to avoid N RPC calls
   let sessionCache = null;
   try {
     const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 10000 });
@@ -357,14 +510,23 @@ async function cmdStuck(flags) {
 
     if (ageMs < thresholdMs) continue;
 
-    // Double-check with gateway
-    let lastActivity = spawnedAt;
-    if (sessionCache) {
-      const session = sessionCache.find(s => s.key === entry.sessionKey);
-      if (session?.updatedAt) lastActivity = session.updatedAt;
+    // ── Check gateway state before alerting ──────────────────
+    const check = checkSessionDone(entry.sessionKey, sessionCache, thresholdMs);
+
+    if (check.shouldResolve) {
+      // Gateway says this session is done — auto-mark and skip alert
+      setLabel(name, {
+        status:  'done',
+        summary: `Auto-resolved: ${check.reason}`,
+      });
+      autoResolved.push({ label: name, reason: check.reason });
+      continue;
     }
 
-    const silenceMs = Date.now() - lastActivity;
+    // Session is still active (or gateway unavailable) — evaluate as potentially stuck
+    const lastActivity = check.lastActivity || spawnedAt;
+    const silenceMs    = Date.now() - lastActivity;
+
     if (silenceMs >= thresholdMs) {
       stuckSessions.push({
         label:      name,
@@ -377,8 +539,21 @@ async function cmdStuck(flags) {
     }
   }
 
+  // Log auto-resolved sessions to stderr (informational, won't trigger delivery)
+  if (autoResolved.length > 0) {
+    const lines = autoResolved.map(r => `  ✓ ${r.label}: ${r.reason}`).join('\n');
+    process.stderr.write(`[chilisaus] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
+  }
+
   if (!stuckSessions.length) {
-    out({ ok: true, stuck_count: 0, stuck_sessions: [], threshold_min: thresholdMin });
+    out({
+      ok:                  true,
+      stuck_count:         0,
+      stuck_sessions:      [],
+      auto_resolved_count: autoResolved.length,
+      auto_resolved:       autoResolved,
+      threshold_min:       thresholdMin,
+    });
     process.exit(0);
   }
 
@@ -398,6 +573,51 @@ async function cmdStuck(flags) {
   }))).catch(() => {});
 
   process.exit(1);
+}
+
+/**
+ * sync — reconcile labels.json with gateway state.
+ * Auto-resolves any "running" sessions that the gateway considers done.
+ *
+ * Flags:
+ *   --dry-run    Show what would change without modifying labels.json
+ */
+function cmdSync(flags) {
+  const dryRun = flags['dry-run'] === true;
+
+  let sessionCache = null;
+  try {
+    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 10000 });
+    sessionCache = result?.sessions || [];
+  } catch (err) {
+    die(`Failed to query gateway: ${err.message}`);
+  }
+
+  const labels  = loadLabels();
+  const changes = [];
+
+  for (const [name, entry] of Object.entries(labels)) {
+    if (entry.status !== 'running') continue;
+
+    const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
+
+    if (check.shouldResolve) {
+      changes.push({ label: name, from: 'running', to: 'done', reason: check.reason });
+      if (!dryRun) {
+        setLabel(name, {
+          status:  'done',
+          summary: `Synced: ${check.reason}`,
+        });
+      }
+    }
+  }
+
+  out({
+    ok:      true,
+    dryRun,
+    changes: changes.length,
+    details: changes,
+  });
 }
 
 /**
@@ -422,7 +642,7 @@ function cmdResult(flags) {
     try {
       const result = gatewayCall('chat.history', {
         sessionKey: entry.sessionKey,
-              }, { timeout: 10000 });
+      }, { timeout: 10000 });
 
       if (result?.messages?.length) {
         for (let i = result.messages.length - 1; i >= 0; i--) {
@@ -520,7 +740,7 @@ function cmdHeartbeat(flags) {
   }
 
   try {
-    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+    const result  = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
     const session = result?.sessions?.find(s => s.key === sessionKey);
 
     if (!session) {
@@ -603,6 +823,8 @@ Subcommands:
   heartbeat --label <l>  OR  --session-key <k>
 
   list     [--status running|done|error] [--limit <n>]
+
+  sync     [--dry-run]                 (reconcile labels.json with gateway)
 `);
 }
 
@@ -620,5 +842,6 @@ switch (subcommand) {
   case 'steer':     await cmdSend(flags);      break;
   case 'heartbeat': cmdHeartbeat(flags);       break;
   case 'list':      cmdList(flags);            break;
+  case 'sync':      cmdSync(flags);            break;
   default:          usage(); process.exit(2);
 }
