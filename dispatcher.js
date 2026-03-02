@@ -44,7 +44,7 @@ import {
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
 import {
-  runAgentTurn, sendSystemEvent, listSessions, getAllSubAgentSessions,
+  runAgentTurn, runAgentTurnWithActivityTimeout, sendSystemEvent, listSessions, getAllSubAgentSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
 import {
@@ -363,12 +363,14 @@ async function dispatchJob(job) {
       // Store context summary on the run
       try { updateContextSummary(run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
 
-      const result = await runAgentTurn({
+      const result = await runAgentTurnWithActivityTimeout({
         message: prompt,
         agentId: job.agent_id || 'main',
         sessionKey,
         model: job.payload_model || undefined,
-        timeoutMs: (job.payload_timeout_seconds || 120) * 1000,
+        idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
+        pollIntervalMs: 60000,
+        absoluteTimeoutMs: job.run_timeout_ms || 300000,
       });
 
       // Run completed synchronously via chat completions

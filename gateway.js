@@ -65,6 +65,139 @@ export async function runAgentTurn(opts) {
   }
 }
 
+/**
+ * Activity-aware wrapper around runAgentTurn.
+ *
+ * Instead of a hard wall-clock abort, this polls the session's `updatedAt`
+ * timestamp and only aborts when the session has been idle for 2x the idle
+ * threshold (default: 2 x 120s = 240s of no activity).
+ *
+ * The absolute ceiling (`absoluteTimeoutMs`, default 5 min) is always enforced
+ * as a safety net regardless of activity.
+ *
+ * @param {Object} opts
+ * @param {string} opts.message           - Prompt to send
+ * @param {string} opts.agentId           - Agent ID (default: 'main')
+ * @param {string} opts.sessionKey        - Session key for matching activity
+ * @param {string} opts.model             - Model override
+ * @param {number} opts.idleTimeoutMs     - Per-check idle threshold in ms (default: 120000)
+ * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
+ * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
+ */
+export async function runAgentTurnWithActivityTimeout(opts) {
+  const {
+    message,
+    agentId = 'main',
+    sessionKey,
+    model,
+    idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
+    pollIntervalMs = 60000,       // check activity every 60s
+    absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
+  } = opts;
+
+  const controller = new AbortController();
+  let abortReason = null;
+
+  // Hard absolute ceiling — always fires regardless of activity
+  const absoluteTimer = setTimeout(() => {
+    abortReason = 'absolute_timeout';
+    controller.abort();
+  }, absoluteTimeoutMs);
+
+  // Track last known activity time (initialised to now — grace period for startup)
+  let lastSeenActivity = Date.now();
+  let pollTimer = null;
+
+  const checkActivity = async () => {
+    try {
+      const result = await listSessions({ kinds: ['subagent', 'isolated'], activeMinutes: 60 });
+      // Normalise: gateway wraps result in several layers
+      const sessions =
+        result?.result?.details?.sessions ||
+        result?.result?.sessions ||
+        result?.sessions ||
+        result || [];
+      if (!Array.isArray(sessions)) return;
+
+      const matched = sessions.find(
+        s => (s.key || s.sessionKey) === sessionKey
+      );
+
+      if (matched && matched.updatedAt) {
+        const ts = typeof matched.updatedAt === 'number'
+          ? matched.updatedAt
+          : new Date(matched.updatedAt).getTime();
+        if (ts > lastSeenActivity) {
+          lastSeenActivity = ts;           // activity advanced → reset
+        }
+      }
+
+      // Check total continuous idle time
+      const idleDuration = Date.now() - lastSeenActivity;
+      if (idleDuration >= idleTimeoutMs * 2) {
+        // Two full idle windows elapsed — session is truly idle
+        abortReason = 'idle_timeout';
+        controller.abort();
+      }
+    } catch {
+      // Monitoring failure — don't abort on transient errors
+    }
+  };
+
+  // Start polling after the first interval (gives session time to initialise)
+  pollTimer = setInterval(checkActivity, pollIntervalMs);
+
+  try {
+    const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders(),
+        ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
+        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+      },
+      body: JSON.stringify({
+        model: model || `openclaw:${agentId}`,
+        messages: [{ role: 'user', content: message }],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Chat completions failed (${resp.status}): ${text.slice(0, 500)}`);
+    }
+
+    const data = await resp.json();
+    return {
+      ok: true,
+      content: data.choices?.[0]?.message?.content || '',
+      usage: data.usage,
+      sessionKey: resp.headers.get('x-openclaw-session-key') || sessionKey,
+      raw: data,
+    };
+  } catch (err) {
+    // Translate AbortError into descriptive messages
+    if (err.name === 'AbortError') {
+      if (abortReason === 'idle_timeout') {
+        throw new Error(
+          `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s — aborted (activity-based timeout)`
+        );
+      }
+      if (abortReason === 'absolute_timeout') {
+        throw new Error(
+          `Exceeded absolute timeout of ${Math.round(absoluteTimeoutMs / 1000)}s`
+        );
+      }
+    }
+    throw err;
+  } finally {
+    clearTimeout(absoluteTimer);
+    if (pollTimer) clearInterval(pollTimer);
+  }
+}
+
 // ── System Events (main session) ────────────────────────────
 
 /**
