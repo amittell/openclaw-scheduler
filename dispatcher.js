@@ -244,6 +244,37 @@ async function checkApprovals() {
   }
 }
 
+// ── Sentinel Matching ────────────────────────────────────────
+/**
+ * Check if content matches a sentinel token at the start of the string.
+ * Matches "TOKEN" exactly, or "TOKEN" followed by whitespace/colon (e.g. "TOKEN: detail").
+ * Does NOT match "TOKENfoo" — requires word boundary after the token.
+ */
+function matchesSentinel(content, token) {
+  if (!content) return false;
+  const re = new RegExp(`^${token}(?:$|[\\s:])`);
+  return re.test(content.trim());
+}
+
+// ── Triggered Children Helper ───────────────────────────────
+/**
+ * Fire triggered children for a completed run and track chain idempotency keys.
+ * Extracts the duplicated fireTriggeredChildren + pendingChainKeys pattern.
+ */
+function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') {
+  const triggered = fireTriggeredChildren(jobId, status, content);
+  if (triggered.length > 0) {
+    for (const child of triggered) {
+      pendingChainKeys.set(child.id, runId);
+    }
+    log('info', `Triggered ${triggered.length} child job(s)${logSuffix}`, {
+      parentId: jobId,
+      children: triggered.map(c => c.name),
+    });
+  }
+  return triggered;
+}
+
 // ── Transient Error Detection ────────────────────────────────
 // Patterns that indicate the agent received a transient service error
 // rather than producing a meaningful response. These should NOT trigger
@@ -253,7 +284,7 @@ const TRANSIENT_ERROR_PATTERNS = [
   /service\s+(?:is\s+)?unavailable/i,
   /rate\s*limit(?:ed|s?)?/i,
   /too\s+many\s+requests/i,
-  /(?:5[0-9]{2})\s+(?:internal\s+)?server\s+error/i,
+  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
   /gateway\s+timeout/i,
   /bad\s+gateway/i,
   /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
@@ -441,22 +472,24 @@ async function dispatchJob(job, opts = {}) {
 
       // Run completed synchronously via chat completions
       const content = result.content || '';
-      const isHeartbeatOk = content.trim() === 'HEARTBEAT_OK' || content.trim().startsWith('HEARTBEAT_OK');
+      const trimmed = content.trim();
+
+      const isHeartbeatOk = matchesSentinel(trimmed, 'HEARTBEAT_OK');
 
       // Handle NO_FLUSH response for pre_compaction_flush jobs
-      const isNoFlush = content.trim() === 'NO_FLUSH';
+      const isNoFlush = trimmed === 'NO_FLUSH';
       if (isNoFlush) {
         log('info', `Flush: nothing to flush for ${job.name}`);
       }
 
       // Handle IDEMPOTENT_SKIP response (agent recognized duplicate execution)
-      const isIdempotentSkip = content.trim() === 'IDEMPOTENT_SKIP' || content.trim().startsWith('IDEMPOTENT_SKIP');
+      const isIdempotentSkip = matchesSentinel(trimmed, 'IDEMPOTENT_SKIP');
       if (isIdempotentSkip) {
         log('info', `Idempotent skip (agent): ${job.name}`);
       }
 
       // Handle TASK_FAILED sentinel — agent explicitly signals failure
-      const isTaskFailed = content.trim() === 'TASK_FAILED' || content.trim().startsWith('TASK_FAILED');
+      const isTaskFailed = matchesSentinel(trimmed, 'TASK_FAILED');
 
       // Detect transient service errors in agent reply content
       const isTransientError = detectTransientError(content);
@@ -489,11 +522,13 @@ async function dispatchJob(job, opts = {}) {
 
       // Handle delivery (skip heartbeat-ok, no-flush, and idempotent-skip responses)
       const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
-        && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim();
+        && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && trimmed;
       if (shouldAnnounce) {
         // For transient errors, prefix the delivery with a warning
         if (effectiveStatus === 'error') {
-          await handleDelivery(job, `⚠️ Job soft-failed (will retry): ${job.name}\n\n${content}`);
+          const willRetry = job.max_retries > 0 && (run.retry_count || 0) < job.max_retries;
+          const retryLabel = willRetry ? 'will retry' : 'no retries configured';
+          await handleDelivery(job, `⚠️ Job soft-failed (${retryLabel}): ${job.name}\n\n${content}`);
         } else {
           await handleDelivery(job, content);
         }
@@ -511,11 +546,7 @@ async function dispatchJob(job, opts = {}) {
           if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
           log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
           // Fire triggered children on failure
-          const triggered = fireTriggeredChildren(job.id, 'error', content);
-          if (triggered.length > 0) {
-            for (const child of triggered) { pendingChainKeys.set(child.id, run.id); }
-            log('info', `Triggered ${triggered.length} child job(s) on soft failure`, { parentId: job.id });
-          }
+          handleTriggeredChildren(job.id, 'error', content, run.id, ' on soft failure');
           return; // early return — retry path handles everything
         }
       }
@@ -524,17 +555,7 @@ async function dispatchJob(job, opts = {}) {
       updateJobAfterRun(job, effectiveStatus);
 
       // Fire triggered children (pass content for trigger_condition evaluation)
-      const triggered = fireTriggeredChildren(job.id, effectiveStatus === 'ok' ? 'ok' : 'error', content);
-      if (triggered.length > 0) {
-        // Store parent run ID for chain idempotency key generation
-        for (const child of triggered) {
-          pendingChainKeys.set(child.id, run.id);
-        }
-        log('info', `Triggered ${triggered.length} child job(s)`, {
-          parentId: job.id,
-          children: triggered.map(c => c.name),
-        });
-      }
+      handleTriggeredChildren(job.id, effectiveStatus === 'ok' ? 'ok' : 'error', content, run.id);
 
       // Drain queued dispatches (overlap_policy=queue)
       if (dequeueJob(job.id)) {
@@ -571,17 +592,7 @@ async function dispatchJob(job, opts = {}) {
     } else {
       // Fire triggered children on failure (only after exhausting retries)
       // No content available on error path — condition checks will use empty string
-      const triggered = fireTriggeredChildren(job.id, 'error', err.message);
-      if (triggered.length > 0) {
-        // Store parent run ID for chain idempotency key generation
-        for (const child of triggered) {
-          pendingChainKeys.set(child.id, run.id);
-        }
-        log('info', `Triggered ${triggered.length} child job(s) on failure`, {
-          parentId: job.id,
-          children: triggered.map(c => c.name),
-        });
-      }
+      handleTriggeredChildren(job.id, 'error', err.message, run.id, ' on failure');
 
       // Drain queued dispatches (overlap_policy=queue) even on failure
       if (dequeueJob(job.id)) {

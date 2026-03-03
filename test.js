@@ -1442,19 +1442,17 @@ console.log('\n── Idempotency Keys ──');
   assert(alRun.idempotency_key === 'al-test-key-12345678901234567890', 'idempotency key available for prompt injection');
   finishRun(alRun.id, 'ok'); deleteJob(alJob.id);
 
-  // 13. IDEMPOTENT_SKIP handling — verify it's a recognized pattern
-  // In dispatcher, content.trim() === 'IDEMPOTENT_SKIP' skips delivery
-  const skipContent = 'IDEMPOTENT_SKIP';
-  const isIdempotentSkip = skipContent.trim() === 'IDEMPOTENT_SKIP' || skipContent.trim().startsWith('IDEMPOTENT_SKIP');
-  assert(isIdempotentSkip, 'IDEMPOTENT_SKIP pattern recognized');
-
-  const skipContent2 = 'IDEMPOTENT_SKIP: already processed this bet settlement';
-  const isSkip2 = skipContent2.trim().startsWith('IDEMPOTENT_SKIP');
-  assert(isSkip2, 'IDEMPOTENT_SKIP with message recognized');
-
-  const normalContent = 'Here is the result';
-  const isNotSkip = !(normalContent.trim() === 'IDEMPOTENT_SKIP' || normalContent.trim().startsWith('IDEMPOTENT_SKIP'));
-  assert(isNotSkip, 'normal content is not IDEMPOTENT_SKIP');
+  // 13. IDEMPOTENT_SKIP handling — verify matchesSentinel pattern
+  // In dispatcher, matchesSentinel(trimmed, 'IDEMPOTENT_SKIP') skips delivery
+  function matchesSentinelIdem(content, token) {
+    if (!content) return false;
+    const re = new RegExp(`^${token}(?:$|[\\s:])`);
+    return re.test(content.trim());
+  }
+  assert(matchesSentinelIdem('IDEMPOTENT_SKIP', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIP pattern recognized');
+  assert(matchesSentinelIdem('IDEMPOTENT_SKIP: already processed this bet settlement', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIP with message recognized');
+  assert(!matchesSentinelIdem('Here is the result', 'IDEMPOTENT_SKIP'), 'normal content is not IDEMPOTENT_SKIP');
+  assert(!matchesSentinelIdem('IDEMPOTENT_SKIPX', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIPX is not IDEMPOTENT_SKIP');
 
   // 15. Manual release via CLI-style operation
   const manualKey = generateIdempotencyKey('manual-test', '2026-03-01 00:00:00');
@@ -1544,7 +1542,7 @@ console.log('\n── Transient Error Detection ──');
     /service\s+(?:is\s+)?unavailable/i,
     /rate\s*limit(?:ed|s?)?/i,
     /too\s+many\s+requests/i,
-    /(?:5[0-9]{2})\s+(?:internal\s+)?server\s+error/i,
+    /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
     /gateway\s+timeout/i,
     /bad\s+gateway/i,
     /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
@@ -1600,15 +1598,23 @@ console.log('\n── Transient Error Detection ──');
     'Here are my recommendations: '.padEnd(600, 'x');
   assert(!detectTransientError(longResponse), 'ignores: long response with keyword (>500 chars)');
 
-  // TASK_FAILED sentinel tests
-  const taskFailed1 = 'TASK_FAILED';
-  assert(taskFailed1.trim() === 'TASK_FAILED' || taskFailed1.trim().startsWith('TASK_FAILED'), 'TASK_FAILED exact match');
+  // TASK_FAILED sentinel tests (uses matchesSentinel regex: ^TOKEN(?:$|[\s:]))
+  function matchesSentinel(content, token) {
+    if (!content) return false;
+    const re = new RegExp(`^${token}(?:$|[\\s:])`);
+    return re.test(content.trim());
+  }
 
-  const taskFailed2 = 'TASK_FAILED: could not connect to database';
-  assert(taskFailed2.trim().startsWith('TASK_FAILED'), 'TASK_FAILED with message');
+  assert(matchesSentinel('TASK_FAILED', 'TASK_FAILED'), 'TASK_FAILED exact match');
+  assert(matchesSentinel('TASK_FAILED: could not connect to database', 'TASK_FAILED'), 'TASK_FAILED with colon message');
+  assert(matchesSentinel('TASK_FAILED something', 'TASK_FAILED'), 'TASK_FAILED with space message');
+  assert(!matchesSentinel('TASK_FAILEDX', 'TASK_FAILED'), 'does not match TASK_FAILEDX (no word boundary)');
+  assert(!matchesSentinel('The task failed to complete', 'TASK_FAILED'), 'does not match "task failed" in prose');
 
-  const notFailed = 'The task failed to complete';
-  assert(!(notFailed.trim() === 'TASK_FAILED' || notFailed.trim().startsWith('TASK_FAILED')), 'does not match "task failed" in prose');
+  // matchesSentinel works for other sentinels too
+  assert(matchesSentinel('HEARTBEAT_OK', 'HEARTBEAT_OK'), 'HEARTBEAT_OK exact');
+  assert(matchesSentinel('HEARTBEAT_OK extra info', 'HEARTBEAT_OK'), 'HEARTBEAT_OK with space');
+  assert(!matchesSentinel('HEARTBEAT_OKAY', 'HEARTBEAT_OK'), 'does not match HEARTBEAT_OKAY');
 }
 
 console.log('\n── delete_after_run Safety ──');
