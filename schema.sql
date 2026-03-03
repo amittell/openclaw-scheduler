@@ -1,4 +1,5 @@
 -- OpenClaw Scheduler Schema (current: v1.0.0, schema version: 9)
+-- OpenClaw Scheduler Schema (current: v1.0.1, schema version: 9)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;

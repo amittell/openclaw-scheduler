@@ -1016,11 +1016,13 @@ console.log('\n── v5: Hybrid Retrieval ──');
   deleteJob(j.id); deleteJob(j2.id);
 }
 
-console.log('\n── v5: Migration Idempotency ──');
+console.log('\n── Schema Baseline ──');
 {
-  // Verify v5 schema version recorded
+  // Verify consolidated schema baseline is recorded
   const version = getDb().prepare('SELECT MAX(version) as v FROM schema_migrations').get();
-  assert(version.v >= 5 || version.v >= 2, 'schema_migrations has current version');
+  assert(version.v >= 8, 'schema_migrations has baseline v8');
+  const v8 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 8').get();
+  assert(v8 !== undefined, 'schema_migrations has v8');
 
   // Verify approvals table exists
   const approvalTable = getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='approvals'").get();
@@ -1160,7 +1162,7 @@ console.log('\n── v5: Task Tracker ──');
   assert(notDead.length === 0, 'agent with recent heartbeat not marked dead despite timeout');
 }
 
-console.log('\n── v7: Idempotency Keys ──');
+console.log('\n── Idempotency Keys ──');
 {
   const {
     generateIdempotencyKey, generateChainIdempotencyKey, generateRunNowIdempotencyKey,
@@ -1177,9 +1179,9 @@ console.log('\n── v7: Idempotency Keys ──');
   const runCols = getDb().prepare('PRAGMA table_info(runs)').all().map(c => c.name);
   assert(runCols.includes('idempotency_key'), 'runs has idempotency_key column');
 
-  // Verify v7 migration recorded
-  const v7 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 7').get();
-  assert(v7 !== undefined, 'schema_migrations has v7');
+  // Verify idempotency index exists
+  const idemIdx = getDb().prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'").get();
+  assert(idemIdx !== undefined, 'idx_runs_idempotency exists');
 
   // 1. Key generation is deterministic (same inputs = same key)
   const key1 = generateIdempotencyKey('job-abc', '2026-02-23 09:00:00');

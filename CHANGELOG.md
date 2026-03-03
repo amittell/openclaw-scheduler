@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] — 2026-03-02
+
+### Changed
+- Consolidated schema management into `schema.sql` + `initDb()` reconciliation (no standalone `migrate-v*` scripts)
+- Set schema baseline to v8 and ensured idempotency/session indexes are created from baseline
+- Updated shell default on native Windows to `cmd.exe` (`SCHEDULER_SHELL` override still supported)
+
+### Fixed
+- Auto-reconciliation now adds `task_tracker_agents.session_key` and `last_heartbeat` for legacy/pre-release DBs
+
+---
+
 ## [1.0.0] — 2026-02-26
 
 First public release. Combines all prior development into a stable, documented package.

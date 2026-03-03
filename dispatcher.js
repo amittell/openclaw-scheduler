@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenClaw Scheduler Dispatcher v1.0.0
+// OpenClaw Scheduler Dispatcher v1.0.1
 //
 // Full standalone scheduler + message router.
 // Dispatches independently via chat completions API.
@@ -71,10 +71,17 @@ const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Shell Command Runner ────────────────────────────────────
-// Platform-aware shell: macOS defaults to zsh, Linux to bash.
-// Override with SCHEDULER_SHELL env var (e.g., SCHEDULER_SHELL=/bin/sh).
+// Platform-aware shell defaults:
+// - macOS: /bin/zsh
+// - Linux/WSL: /bin/bash
+// - Windows: cmd.exe
+// Override with SCHEDULER_SHELL env var.
 const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
-  || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
+  || (process.platform === 'darwin'
+    ? '/bin/zsh'
+    : process.platform === 'win32'
+      ? 'cmd.exe'
+      : '/bin/bash');
 
 function runShellCommand(cmd, timeoutMs = 300000) {
   return new Promise((resolve) => {
@@ -904,7 +911,7 @@ function shutdown(signal) {
 }
 
 async function main() {
-  log('info', 'Starting OpenClaw Scheduler v1.0.0', {
+  log('info', 'Starting OpenClaw Scheduler v1.0.1', {
     tickMs: TICK_INTERVAL_MS,
     staleThresholdS: STALE_THRESHOLD_S,
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,

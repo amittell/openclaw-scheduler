@@ -32,12 +32,16 @@ export function getDb() {
 
 export async function initDb() {
   const db = getDb();
-
-  // Apply base schema (idempotent — all CREATE TABLE/INDEX use IF NOT EXISTS)
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-  db.exec(schema);
 
-  // Bring existing DBs up to current schema version
+  // Apply schema once first (best effort). This is enough for net-new installs.
+  try {
+    db.exec(schema);
+  } catch (err) {
+    process.stderr.write(`${new Date().toISOString()} [db] Initial schema apply warning: ${err.message}\n`);
+  }
+
+  // Bring existing DBs to the consolidated schema version.
   try {
     const { default: consolidate } = await import('./migrate-consolidate.js');
     const applied = consolidate();
@@ -46,6 +50,13 @@ export async function initDb() {
     }
   } catch (err) {
     process.stderr.write(`${new Date().toISOString()} [db] migrate-consolidate error: ${err.message}\n`);
+  }
+
+  // Re-apply schema so indexes/table defs are fully aligned after consolidation.
+  try {
+    db.exec(schema);
+  } catch (err) {
+    process.stderr.write(`${new Date().toISOString()} [db] Schema re-apply warning: ${err.message}\n`);
   }
 
   return db;

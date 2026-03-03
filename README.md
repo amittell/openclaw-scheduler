@@ -237,7 +237,7 @@ Shell Job (session_target='shell')
   │
   ├─ getDueJobs() → "Hourly Backup is due"
   ├─ createRun() → status='running'
-  ├─ /bin/zsh -c "<payload_message>"
+  ├─ run "<payload_message>" via shell (platform default or SCHEDULER_SHELL)
   │   (no gateway required)
   │   ← exit 0: "Backup complete, 3 files"
   │
@@ -315,7 +315,7 @@ node cli.js jobs add '{
 
 **Key properties:**
 - **No gateway dependency** — runs even when gateway is down
-- `payload_message` is the command to execute (shell string passed to `/bin/zsh -c`)
+- `payload_message` is the command to execute (shell string passed to the configured shell)
 - Output captured up to 1MB, truncated to 5000 chars in run summary
 - `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
@@ -579,15 +579,14 @@ node cli.js jobs add '{
   "name": "Flaky Deploy",
   "schedule_cron": "0 10 * * *",
   "payload_message": "deploy to prod",
-  "max_retries": 3,
-  "retry_delay_s": 30
+  "max_retries": 3
 }'
 ```
 
 **How it works:**
 
 1. Job fails → check `max_retries`
-2. Retries remaining → schedule retry after `retry_delay_s` seconds
+2. Retries remaining → schedule retry with exponential backoff (30s, 60s, 120s, ...)
 3. Retry run tracks lineage: `retry_of` → failed run ID, `retry_count` incremented
 4. All retries exhausted → trigger failure children + apply error backoff
 5. Any retry succeeds → trigger success children, reset `consecutive_errors`
@@ -597,7 +596,6 @@ node cli.js jobs add '{
 | Field | Default | Description |
 |-------|---------|-------------|
 | `max_retries` | 0 | Max retry attempts (0 = no retry) |
-| `retry_delay_s` | 30 | Seconds between retries |
 | `runs.retry_of` | null | ID of the failed run being retried |
 | `runs.retry_count` | 0 | Which attempt this is (0 = first try) |
 
@@ -723,7 +721,7 @@ node cli.js agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 6 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 8 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -738,7 +736,7 @@ node cli.js agents register <id> [name]
 | `task_tracker_agents` | Per-agent status within a task group |
 | `idempotency_ledger` | Dispatch deduplication and at-least-once tracking |
 | `delivery_aliases` | Named delivery targets (channel + target pairs) |
-| `schema_migrations` | Applied migration version log |
+| `schema_migrations` | Baseline schema version log |
 
 ### Jobs (key columns)
 
@@ -746,7 +744,7 @@ node cli.js agents register <id> [name]
 id, name, enabled, schedule_cron, schedule_tz,
 session_target, agent_id, payload_kind, payload_message,
 payload_model, overlap_policy, run_timeout_ms,
-max_retries, retry_delay_s, delivery_mode, delivery_channel,
+max_retries, delivery_mode, delivery_channel,
 delivery_to, delete_after_run, parent_id, trigger_on,
 trigger_delay_s, trigger_condition, resource_pool,
 approval_required, approval_timeout_s, approval_auto,
@@ -856,7 +854,7 @@ node cli.js status
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
-| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux) | Shell used for shell jobs |
+| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
 
 ---
 
@@ -931,19 +929,12 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 ```
 
-### Schema migrations
+### Schema baseline
 
-Applied on top of base schema (schema.sql) in order:
+As of `v1.0.1`, the schema is consolidated in `schema.sql` (baseline `v9`).
 
-```bash
-node migrate-v3.js    # chain columns (parent_id, trigger_on, trigger_delay_s)
-node migrate-v3b.js   # retry columns (max_retries, retry_delay_s)
-node migrate-v5.js    # delivery guarantee, approvals, context retrieval
-node migrate-v6.js    # task tracker tables
-node migrate-v7.js    # idempotency ledger
-```
-
-These migrations are run automatically when `initDb()` detects the database needs upgrading.
+- Net-new installs: `initDb()` applies `schema.sql` directly.
+- Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
 
 ### What was disabled in OpenClaw
 
@@ -963,6 +954,7 @@ These migrations are run automatically when `initDb()` detects the database need
 | 0.6.0 | 2026-02-24 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
 | 0.7.0 | 2026-02-25 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
 | 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
+| 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
 
 ---
 
@@ -1012,7 +1004,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── test.js                # Full test suite (351 assertions, in-memory)
+├── test.js                # Full test suite (352 assertions, in-memory)
 │
 │  Companion tool — chilisaus (optional, see chilisaus/README.md)
 ├── chilisaus/
@@ -1039,7 +1031,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (351 assertions, in-memory SQLite)
+# Run all tests (352 assertions, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:
