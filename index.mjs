@@ -277,7 +277,8 @@ function makeSessionKey(agentId) {
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
- *   --deliver-to <target>    Delivery target (kept for compat)
+ *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call
+ *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
  *   --mode <fresh|reuse>
  *       fresh  — always spawn new session (default)
@@ -294,8 +295,9 @@ async function cmdEnqueue(flags) {
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || 'xhigh';
   const timeoutS    = parseInt(flags.timeout || '300', 10);
-  const deliverTo   = flags['deliver-to']    || null;
-  const deliverMode = flags['delivery-mode'] || 'announce';
+  const deliverTo      = flags['deliver-to']       || null;
+  const deliverChannel = flags['deliver-channel']   || 'telegram';
+  const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
   const model       = flags.model            || 'anthropic/claude-opus-4-6';
 
@@ -360,11 +362,16 @@ async function cmdEnqueue(flags) {
       message:        taskMessage,
       sessionKey,
       idempotencyKey: idem,
-      deliver:        false,
+      deliver:        !!deliverTo,
       lane:           'subagent',
       timeout:        timeoutS,
       label:          label,
       thinking:       thinking || undefined,
+      ...(deliverTo ? {
+        channel:      deliverChannel,
+        replyTo:      deliverTo,
+        replyChannel: deliverChannel,
+      } : {}),
     }, { timeout: 15000 });
 
     // Update ledger
@@ -808,7 +815,7 @@ Usage: node index.mjs <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> --message <m> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
-           [--deliver-to <id>] [--delivery-mode <m>]
+           [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
 
   status   --label <l>
 
