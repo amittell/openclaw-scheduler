@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-351%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-352%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -10,7 +10,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 351 (full suite, in-memory SQLite)
+**Tests:** 352 (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -46,8 +46,8 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 27. [Best Practices](#best-practices)
 28. [File Reference](#file-reference)
 29. [Testing](#testing)
-30. [Companion Tools](#companion-tools)
-30. [Troubleshooting](#troubleshooting)
+30. [Companion Scripts](#companion-scripts)
+31. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -71,7 +71,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-SCHEDULER_DB=:memory: node test.js   # should print: 351 passed, 0 failed
+SCHEDULER_DB=:memory: node test.js   # should print: 352 passed, 0 failed
 ```
 
 Then run the interactive setup wizard:
@@ -82,7 +82,7 @@ node setup.mjs
 
 The wizard will:
 - Run DB migrations
-- Append chilisaus entries to your agent's `MEMORY.md` and `workspace-index.md`
+- Append scheduler queue/inbox-consumer entries to your agent's `MEMORY.md` and `workspace-index.md`
 - Create **Inbox Consumer** + **Stuck Run Detector** scheduler jobs
 - Install and load the macOS LaunchAgent (optional)
 
@@ -90,7 +90,7 @@ After setup:
 
 ```bash
 node cli.js status                    # verify scheduler is running
-node chilisaus/index.mjs stuck        # should print: 0 stuck runs
+node scripts/stuck-run-detector.mjs   # should print: No stale runs older than 15 minute(s).
 tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
 
@@ -660,6 +660,27 @@ node cli.js msg inbox <agent-id>
 node cli.js msg readall <agent-id>
 ```
 
+### Signal Queue Consumer Example
+
+Use this when you want scripts to enqueue only actionable signals, then a single consumer job pushes those signals to Telegram.
+
+```bash
+# 1) Enqueue a signal
+node cli.js msg send monitor-agent main "Found 3 critical errors in prod logs"
+
+# 2) Add a consumer shell job (every 5 minutes)
+node cli.js jobs add '{
+  "name": "Inbox Consumer",
+  "schedule_cron": "*/5 * * * *",
+  "session_target": "shell",
+  "payload_message": "node ~/.openclaw/scheduler/scripts/inbox-consumer.mjs --to YOUR_TELEGRAM_ID",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "run_timeout_ms": 60000
+}'
+```
+
 ---
 
 ## Backup & Recovery
@@ -1005,12 +1026,9 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
 ├── test.js                # Full test suite (352 assertions, in-memory)
-│
-│  Companion tool — chilisaus (optional, see chilisaus/README.md)
-├── chilisaus/
-│   ├── index.mjs          # Dispatch CLI: enqueue / status / stuck / result / send / heartbeat
-│   ├── hooks.mjs          # Lifecycle event emitter (Loki + optional webhook)
-│   └── README.md          # chilisaus documentation
+├── scripts/
+│   ├── inbox-consumer.mjs      # Drains queue messages and delivers to Telegram
+│   └── stuck-run-detector.mjs  # Detects stale running runs (alert-only via non-zero exit)
 │
 │  Service & docs
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
@@ -1116,30 +1134,26 @@ mc alias list   # verify backupstore alias configured
 
 ---
 
-## Companion Tools
+## Companion Scripts
 
-The `chilisaus/` directory contains an optional companion CLI for orchestrating sub-agent dispatch patterns on top of the scheduler. It is intentionally separate from the core scheduler — the scheduler handles job scheduling and execution; chilisaus handles the control-plane pattern of *how you dispatch work* from an orchestrator agent.
+The `scripts/` directory contains optional operational helpers built on top of core scheduler primitives.
 
-**chilisaus is not required** to use the scheduler. It's useful if you're building a multi-agent system where one agent acts as an orchestrator and needs to:
-- Dispatch one-shot tasks to worker agents and track them by human-readable label
-- Resume a prior session context (`--mode reuse`)
-- Query run status, results, and stuck detection without raw SQL
-- Emit structured dispatch lifecycle events to Loki or a webhook
+These scripts are not required for scheduling itself, but they are useful for production operations:
+- `scripts/inbox-consumer.mjs` drains queued messages and delivers them to Telegram.
+- `scripts/stuck-run-detector.mjs` detects stale `running` runs and exits non-zero for alerting.
 
 ### Signal Queue Pattern
 
-The message queue (`messages` table) combined with `chilisaus send` implements a **signal-only** delivery path that complements `delivery_mode: announce`:
+The message queue (`messages` table) plus `cli.js msg send` implements a **signal-only** delivery path that complements `delivery_mode: announce`:
 
 ```
 Failure path:  dispatcher → announce → Telegram (immediate, unconditional)
-Signal path:   script → chilisaus send → queue → Inbox Consumer → Telegram
+Signal path:   script → cli.js msg send → queue → Inbox Consumer → Telegram
 ```
 
-Scripts write to the queue **only when they have found something** — not unconditionally. A companion `inbox-consumer.mjs` shell job (run every 5 min) drains the queue and delivers to Telegram. It exits 0 (silent) when the queue is empty, so there is no noise.
+Scripts write to the queue **only when they have found something** — not unconditionally. A companion `scripts/inbox-consumer.mjs` shell job (run every 5 min) drains the queue and delivers to Telegram. It exits 0 when the queue is empty, so there is no noise.
 
 > **Important:** The dispatcher does **not** write to the message queue automatically.
 > Every message in the queue was put there by a script with a specific receiver in mind.
 > Traceability for completed jobs comes from the `runs` table, `delivery_mode: announce`,
-> and `chilisaus result/status` — not from queued messages.
-
-→ See [`chilisaus/README.md`](chilisaus/README.md) for full documentation including the Signal Queue Pattern.
+> and run history/CLI views — not from queued messages.

@@ -159,7 +159,6 @@ switch (command) {
         const approval = getPendingApproval(args[0]);
         if (!approval) { console.error('No pending approval for job:', args[0]); process.exit(1); }
         resolveApproval(approval.id, 'approved', 'operator');
-        getDb().prepare("UPDATE runs SET status = 'pending' WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
         console.log(`Approved: ${approval.job_id}`);
         break;
       }

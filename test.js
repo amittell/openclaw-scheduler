@@ -1243,11 +1243,9 @@ console.log('\n── Idempotency Keys ──');
   assert(reclaimedCheck === null, 'released key not found as claimed');
 
   // Re-claim the released key (simulating retry)
-  // Need to delete old entry first since it's PRIMARY KEY
-  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(idemKey);
   const testRun3 = createRun(testJob.id, { run_timeout_ms: 60000 });
   const reclaimed = claimIdempotencyKey(idemKey, testJob.id, testRun3.id, expiresAt);
-  assert(reclaimed === true, 'released key can be reclaimed after delete');
+  assert(reclaimed === true, 'released key can be reclaimed without deleting ledger row');
 
   // 7. Successful run keeps claim (blocks replay)
   const successCheck = checkIdempotencyKey(idemKey);
@@ -1307,7 +1305,6 @@ console.log('\n── Idempotency Keys ──');
   // Note: in real replay, the old crashed run keeps its key in runs table,
   // and a new replay run gets a fresh idempotency_key. But the ledger key
   // can be reclaimed since it was released.
-  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(crashKey);
   const replayRun = createRun(crashJob.id, { run_timeout_ms: 60000, idempotency_key: crashKey + '-replay' });
   const replayClaimed = claimIdempotencyKey(crashKey, crashJob.id, replayRun.id, expiresAt);
   assert(replayClaimed === true, 'crashed run key can be reclaimed for replay');

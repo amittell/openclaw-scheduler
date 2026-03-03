@@ -176,11 +176,22 @@ async function checkApprovals() {
       if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
         resolveApproval(approval.id, 'approved', 'timeout');
         log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
-        // Update run status and dispatch
         if (approval.run_id) {
-          getDb().prepare("UPDATE runs SET status = 'pending' WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+          getDb().prepare(`
+            UPDATE runs
+            SET status = 'approved',
+                finished_at = datetime('now'),
+                summary = COALESCE(summary, 'Approval granted (timeout auto-approve)')
+            WHERE id = ? AND status IN ('awaiting_approval', 'pending')
+          `).run(approval.run_id);
         }
-        await dispatchJob(job);
+        await dispatchJob(job, { approvalBypass: true });
+        getDb().prepare(`
+          UPDATE approvals
+          SET status = 'dispatched',
+              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
+          WHERE id = ? AND status = 'approved'
+        `).run(approval.id);
       } else {
         // Default: reject on timeout
         resolveApproval(approval.id, 'timed_out', 'timeout');
@@ -201,16 +212,31 @@ async function checkApprovals() {
       SELECT a.*, j.name as job_name
       FROM approvals a
       JOIN jobs j ON a.job_id = j.id
-      JOIN runs r ON a.run_id = r.id
+      LEFT JOIN runs r ON a.run_id = r.id
       WHERE a.status = 'approved'
-        AND r.status IN ('awaiting_approval', 'pending')
+        AND (a.run_id IS NULL OR r.status IN ('awaiting_approval', 'pending'))
     `).all();
 
     for (const approval of approved) {
       const job = getJob(approval.job_id);
       if (!job) continue;
+      if (approval.run_id) {
+        db.prepare(`
+          UPDATE runs
+          SET status = 'approved',
+              finished_at = datetime('now'),
+              summary = COALESCE(summary, 'Approved by operator')
+          WHERE id = ? AND status IN ('awaiting_approval', 'pending')
+        `).run(approval.run_id);
+      }
       log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
-      await dispatchJob(job);
+      await dispatchJob(job, { approvalBypass: true });
+      db.prepare(`
+        UPDATE approvals
+        SET status = 'dispatched',
+            notes = COALESCE(notes, 'Approved and dispatched by scheduler')
+        WHERE id = ? AND status = 'approved'
+      `).run(approval.id);
     }
   } catch (err) {
     log('error', `Approval dispatch error: ${err.message}`);
@@ -218,27 +244,24 @@ async function checkApprovals() {
 }
 
 // ── Dispatch a single job ───────────────────────────────────
-async function dispatchJob(job) {
+async function dispatchJob(job, opts = {}) {
+  const approvalBypass = opts.approvalBypass === true;
+
   // HITL approval gate — if approval_required, block until approved
-  if (job.approval_required) {
+  if (job.approval_required && !approvalBypass) {
     const existing = getPendingApproval(job.id);
     if (existing) {
       // Already has a pending approval — skip dispatch, checkApprovals will handle it
       log('debug', `Skipping ${job.name} — awaiting approval`, { approvalId: existing.id });
       return;
     }
-    // Check if this is a chain-triggered dispatch (parent_id means it was triggered)
-    if (job.parent_id) {
-      const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms });
-      // Set run to awaiting_approval
-      getDb().prepare("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?").run(run.id);
-      const approval = createApproval(job.id, run.id);
-      log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
-      // Send notification via delivery channel
-      const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
-      await handleDelivery(job, msg);
-      return;
-    }
+    const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms, status: 'awaiting_approval' });
+    const approval = createApproval(job.id, run.id);
+    log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
+    // Send notification via delivery channel
+    const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
+    await handleDelivery(job, msg);
+    return;
   }
 
   // Resource pool concurrency check — prevents different jobs from competing for the same resource
@@ -356,7 +379,7 @@ async function dispatchJob(job) {
         return;
       }
 
-      // Use preferred_session_key (set by chilisaus for reuse mode) if provided;
+      // Use preferred_session_key (set by external orchestrators for reuse mode) if provided;
       // otherwise generate a fresh scheduler-scoped key.
       const sessionKey = job.preferred_session_key || `scheduler:${job.id}:${run.id}`;
       updateRunSession(run.id, sessionKey, null);
@@ -783,8 +806,7 @@ async function tick() {
   if (!gatewayHealthy || now % 60000 < TICK_INTERVAL_MS) {
     gatewayHealthy = await checkGatewayHealth();
     if (!gatewayHealthy) {
-      log('warn', 'Gateway unreachable — skipping tick');
-      return;
+      log('warn', 'Gateway unreachable — isolated jobs will be deferred; shell/main jobs continue');
     }
   }
 
@@ -792,6 +814,12 @@ async function tick() {
   try {
     const dueJobs = getDueJobs();
     for (const job of dueJobs) {
+      if (!gatewayHealthy && job.session_target === 'isolated') {
+        const deferredAt = new Date(Date.now() + 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+        updateJob(job.id, { next_run_at: deferredAt });
+        log('info', `Deferred isolated job while gateway is down: ${job.name}`, { jobId: job.id, nextRunAt: deferredAt });
+        continue;
+      }
       await dispatchJob(job);
     }
   } catch (err) {
