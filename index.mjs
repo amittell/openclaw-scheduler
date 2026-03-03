@@ -350,11 +350,25 @@ async function cmdEnqueue(flags) {
   }
 
   // ── Build the task message ──────────────────────────────────
-  const taskMessage = [
+  const parts = [
     `[Subagent Context] You are running as a subagent (depth 1/3). Results auto-announce to your requester; do not busy-poll for status.`,
     ``,
-    `[Subagent Task]: ${message}`,
-  ].join('\n');
+  ];
+
+  // Prepend CHECK_IN template when delivery target is set
+  if (deliverTo) {
+    const configPath = join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    parts.push(`---`);
+    parts.push(`CHECK_IN: To report progress, use curl:`);
+    parts.push(`GW_TOKEN=$(python3 -c "import json; print(json.load(open('` + configPath + `'))['gateway']['auth']['token'])")`);
+    parts.push(`curl -s -X POST http://127.0.0.1:18789/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
+    parts.push(`Call this every ~5 minutes with a brief progress update.`);
+    parts.push(`---`);
+    parts.push(``);
+  }
+
+  parts.push(`[Subagent Task]: ${message}`);
+  const taskMessage = parts.join('\n');
 
   // ── Call gateway agent method ───────────────────────────────
   // Gateway deliver is used as a fast-path secondary. The scheduler watcher
@@ -396,6 +410,32 @@ async function cmdEnqueue(flags) {
       label, job_id: idem, run_id: response?.runId || idem,
       agent, mode, session_key: sessionKey,
     }).catch(() => {});
+
+    // ── Send "Starting" notification via gateway HTTP API ─────
+    if (deliverTo && GATEWAY_TOKEN) {
+      try {
+        await fetch('http://127.0.0.1:18789/tools/invoke', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${GATEWAY_TOKEN}`,
+          },
+          body: JSON.stringify({
+            tool: 'message',
+            args: {
+              action: 'send',
+              channel: deliverChannel,
+              target: deliverTo,
+              message: `🌶️ *chilisaus* [${label}] starting...`,
+            },
+            sessionKey: 'main',
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
+      } catch (err) {
+        process.stderr.write(`[chilisaus] starting notification failed: ${err.message}\n`);
+      }
+    }
 
     // ── Register scheduler watcher for delivery ───────────────
     // Creates a one-shot shell job that runs watcher.mjs (blocks until session
