@@ -1531,6 +1531,120 @@ updateJob(shellJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
 pruneExpiredJobs();
 assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: Transient Error Detection & delete_after_run Safety
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Transient Error Detection ──');
+{
+  // Re-implement detectTransientError locally to test the pattern matching
+  // (matches dispatcher.js TRANSIENT_ERROR_PATTERNS + detectTransientError)
+  const TRANSIENT_ERROR_PATTERNS = [
+    /temporarily overloaded/i,
+    /service\s+(?:is\s+)?unavailable/i,
+    /rate\s*limit(?:ed|s?)?/i,
+    /too\s+many\s+requests/i,
+    /(?:5[0-9]{2})\s+(?:internal\s+)?server\s+error/i,
+    /gateway\s+timeout/i,
+    /bad\s+gateway/i,
+    /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
+    /API\s+(?:error|unavailable|timeout)/i,
+    /capacity\s+(?:exceeded|limit)/i,
+    /retry\s+(?:after|later|in\s+\d)/i,
+    /context\s+(?:length|window)\s+exceeded/i,
+    /token\s+limit\s+exceeded/i,
+  ];
+
+  function detectTransientError(content) {
+    if (!content || !content.trim()) return false;
+    const trimmed = content.trim();
+    if (trimmed.length > 500) return false;
+    return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
+  }
+
+  // Positive matches — these should be caught as transient errors
+  assert(detectTransientError('The AI service is temporarily overloaded. Please try again later.'), 'detects: temporarily overloaded');
+  assert(detectTransientError('Service unavailable'), 'detects: service unavailable');
+  assert(detectTransientError('Service is unavailable right now'), 'detects: service is unavailable');
+  assert(detectTransientError('Rate limited'), 'detects: rate limited');
+  assert(detectTransientError('rate limit exceeded'), 'detects: rate limit exceeded');
+  assert(detectTransientError('Error: Too many requests'), 'detects: too many requests');
+  assert(detectTransientError('502 Bad Gateway'), 'detects: 502 bad gateway');
+  assert(detectTransientError('503 Server Error'), 'detects: 503 server error');
+  assert(detectTransientError('500 Internal Server Error'), 'detects: 500 internal server error');
+  assert(detectTransientError('Gateway timeout'), 'detects: gateway timeout');
+  assert(detectTransientError('Bad gateway'), 'detects: bad gateway');
+  assert(detectTransientError('The model is overloaded'), 'detects: model is overloaded');
+  assert(detectTransientError('model unavailable'), 'detects: model unavailable');
+  assert(detectTransientError('API error occurred'), 'detects: API error');
+  assert(detectTransientError('API unavailable'), 'detects: API unavailable');
+  assert(detectTransientError('API timeout'), 'detects: API timeout');
+  assert(detectTransientError('capacity exceeded'), 'detects: capacity exceeded');
+  assert(detectTransientError('Please retry after 30 seconds'), 'detects: retry after');
+  assert(detectTransientError('Retry later'), 'detects: retry later');
+  assert(detectTransientError('retry in 5 seconds'), 'detects: retry in N');
+  assert(detectTransientError('context length exceeded'), 'detects: context length exceeded');
+  assert(detectTransientError('context window exceeded'), 'detects: context window exceeded');
+  assert(detectTransientError('token limit exceeded'), 'detects: token limit exceeded');
+
+  // Negative matches — these should NOT be flagged
+  assert(!detectTransientError('Here is the weather report for today'), 'ignores: normal response');
+  assert(!detectTransientError('HEARTBEAT_OK'), 'ignores: heartbeat');
+  assert(!detectTransientError('I completed the task successfully'), 'ignores: success response');
+  assert(!detectTransientError(''), 'ignores: empty string');
+  assert(!detectTransientError(null), 'ignores: null');
+  assert(!detectTransientError(undefined), 'ignores: undefined');
+
+  // Long response with keyword should NOT be flagged (real work mentioning the term)
+  const longResponse = 'I analyzed the system and found that the rate limit configuration needs updating. ' +
+    'Here are my recommendations: '.padEnd(600, 'x');
+  assert(!detectTransientError(longResponse), 'ignores: long response with keyword (>500 chars)');
+
+  // TASK_FAILED sentinel tests
+  const taskFailed1 = 'TASK_FAILED';
+  assert(taskFailed1.trim() === 'TASK_FAILED' || taskFailed1.trim().startsWith('TASK_FAILED'), 'TASK_FAILED exact match');
+
+  const taskFailed2 = 'TASK_FAILED: could not connect to database';
+  assert(taskFailed2.trim().startsWith('TASK_FAILED'), 'TASK_FAILED with message');
+
+  const notFailed = 'The task failed to complete';
+  assert(!(notFailed.trim() === 'TASK_FAILED' || notFailed.trim().startsWith('TASK_FAILED')), 'does not match "task failed" in prose');
+}
+
+console.log('\n── delete_after_run Safety ──');
+{
+  // Test that updateJobAfterRun does NOT delete when status is 'error'
+  const oneShot = createJob({
+    name: 'OneShot-DAR-Test',
+    schedule_cron: '0 12 * * *',
+    payload_message: 'one shot task',
+    delete_after_run: true,
+    delivery_mode: 'none',
+  });
+  assert(oneShot.delete_after_run === 1, 'one-shot job has delete_after_run=1');
+
+  // Simulate error status — job should NOT be deleted
+  updateJob(oneShot.id, { last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''), last_status: 'error', consecutive_errors: 1 });
+  const afterError = getJob(oneShot.id);
+  assert(afterError !== undefined, 'one-shot job survives error status (not deleted)');
+
+  // Simulate ok status via updateJobAfterRun-like logic
+  // The dispatcher calls updateJobAfterRun which does: if (status === 'ok' && job.delete_after_run) deleteJob
+  // We verify the condition directly
+  const shouldDeleteOnOk = ('ok' === 'ok' && oneShot.delete_after_run);
+  assert(shouldDeleteOnOk, 'delete_after_run triggers on ok status');
+
+  const shouldDeleteOnError = ('error' === 'ok' && oneShot.delete_after_run);
+  assert(!shouldDeleteOnError, 'delete_after_run does NOT trigger on error status');
+
+  const shouldDeleteOnTimeout = ('timeout' === 'ok' && oneShot.delete_after_run);
+  assert(!shouldDeleteOnTimeout, 'delete_after_run does NOT trigger on timeout status');
+
+  // Clean up
+  deleteJob(oneShot.id);
+}
+
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

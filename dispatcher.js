@@ -244,6 +244,41 @@ async function checkApprovals() {
   }
 }
 
+// ── Transient Error Detection ────────────────────────────────
+// Patterns that indicate the agent received a transient service error
+// rather than producing a meaningful response. These should NOT trigger
+// delete_after_run or count as successful completions.
+const TRANSIENT_ERROR_PATTERNS = [
+  /temporarily overloaded/i,
+  /service\s+(?:is\s+)?unavailable/i,
+  /rate\s*limit(?:ed|s?)?/i,
+  /too\s+many\s+requests/i,
+  /(?:5[0-9]{2})\s+(?:internal\s+)?server\s+error/i,
+  /gateway\s+timeout/i,
+  /bad\s+gateway/i,
+  /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
+  /API\s+(?:error|unavailable|timeout)/i,
+  /capacity\s+(?:exceeded|limit)/i,
+  /retry\s+(?:after|later|in\s+\d)/i,
+  /context\s+(?:length|window)\s+exceeded/i,
+  /token\s+limit\s+exceeded/i,
+];
+
+/**
+ * Detect if agent reply content contains known transient/service error patterns.
+ * Returns true if the content looks like a transient error rather than a real response.
+ * 
+ * Heuristic: only flag short responses (< 500 chars) that match patterns.
+ * Long responses that happen to mention "rate limit" in passing are likely real work.
+ */
+function detectTransientError(content) {
+  if (!content || !content.trim()) return false;
+  const trimmed = content.trim();
+  // Only flag short responses — a 2000-char response mentioning "rate limit" is probably real
+  if (trimmed.length > 500) return false;
+  return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
 // ── Dispatch a single job ───────────────────────────────────
 async function dispatchJob(job, opts = {}) {
   const approvalBypass = opts.approvalBypass === true;
@@ -420,10 +455,34 @@ async function dispatchJob(job, opts = {}) {
         log('info', `Idempotent skip (agent): ${job.name}`);
       }
 
-      finishRun(run.id, 'ok', { summary: content.slice(0, 5000) });
+      // Handle TASK_FAILED sentinel — agent explicitly signals failure
+      const isTaskFailed = content.trim() === 'TASK_FAILED' || content.trim().startsWith('TASK_FAILED');
 
-      // Store result hash on idempotency ledger for verification
-      updateIdempotencyResultHash(idemKey, content);
+      // Detect transient service errors in agent reply content
+      const isTransientError = detectTransientError(content);
+
+      // Determine effective run status — transient errors and TASK_FAILED are not "ok"
+      const effectiveStatus = (isTaskFailed || isTransientError) ? 'error' : 'ok';
+
+      if (isTaskFailed) {
+        log('warn', `Agent signalled TASK_FAILED: ${job.name}`, { runId: run.id });
+      }
+      if (isTransientError) {
+        log('warn', `Transient error detected in agent reply: ${job.name}`, { runId: run.id, snippet: content.slice(0, 200) });
+      }
+
+      finishRun(run.id, effectiveStatus, {
+        summary: content.slice(0, 5000),
+        ...(effectiveStatus === 'error' ? { error_message: isTaskFailed ? 'Agent signalled TASK_FAILED' : 'Transient error in agent reply' } : {}),
+      });
+
+      // Store result hash on idempotency ledger for verification (only for successful runs)
+      if (effectiveStatus === 'ok') {
+        updateIdempotencyResultHash(idemKey, content);
+      } else {
+        // Release idempotency key on soft failure so retries can reclaim
+        releaseIdempotencyKey(idemKey);
+      }
 
       // Mark agent as idle
       if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
@@ -432,14 +491,40 @@ async function dispatchJob(job, opts = {}) {
       const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
         && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim();
       if (shouldAnnounce) {
-        await handleDelivery(job, content);
+        // For transient errors, prefix the delivery with a warning
+        if (effectiveStatus === 'error') {
+          await handleDelivery(job, `⚠️ Job soft-failed (will retry): ${job.name}\n\n${content}`);
+        } else {
+          await handleDelivery(job, content);
+        }
       }
 
-      // Update job state (may delete one-shot jobs)
-      updateJobAfterRun(job, 'ok');
+      // For soft failures, attempt retry before falling through to updateJobAfterRun
+      if (effectiveStatus === 'error') {
+        if (shouldRetry(job, run.id)) {
+          const retry = scheduleRetry(job, run.id);
+          log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (soft failure)`, {
+            jobId: job.id, runId: run.id,
+          });
+          getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+          // Skip updateJobAfterRun — retry handles scheduling
+          if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+          log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
+          // Fire triggered children on failure
+          const triggered = fireTriggeredChildren(job.id, 'error', content);
+          if (triggered.length > 0) {
+            for (const child of triggered) { pendingChainKeys.set(child.id, run.id); }
+            log('info', `Triggered ${triggered.length} child job(s) on soft failure`, { parentId: job.id });
+          }
+          return; // early return — retry path handles everything
+        }
+      }
 
-      // Fire triggered children on success (pass content for trigger_condition evaluation)
-      const triggered = fireTriggeredChildren(job.id, 'ok', content);
+      // Update job state (may delete one-shot jobs — but only when effectiveStatus is 'ok')
+      updateJobAfterRun(job, effectiveStatus);
+
+      // Fire triggered children (pass content for trigger_condition evaluation)
+      const triggered = fireTriggeredChildren(job.id, effectiveStatus === 'ok' ? 'ok' : 'error', content);
       if (triggered.length > 0) {
         // Store parent run ID for chain idempotency key generation
         for (const child of triggered) {
