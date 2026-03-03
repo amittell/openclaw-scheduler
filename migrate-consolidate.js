@@ -1,12 +1,12 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v9).
+ * Brings any DB from any prior version up to the current schema (v10).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js
  *
  * Safe to run multiple times — all operations are idempotent.
  */
@@ -20,7 +20,7 @@ export default function migrateConsolidate() {
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  if (current >= 9) return false;
+  if (current >= 10) return false;
 
   // ── Column additions (all idempotent — column already exists = silent ignore) ─
 
@@ -56,6 +56,15 @@ export default function migrateConsolidate() {
     `ALTER TABLE task_tracker_agents ADD COLUMN last_heartbeat TEXT`,
     // v9: session reuse
     `ALTER TABLE jobs ADD COLUMN preferred_session_key TEXT DEFAULT NULL`,
+    // v10: team routing + receipts on messages
+    `ALTER TABLE messages ADD COLUMN team_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN member_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN task_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN ack_required INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE messages ADD COLUMN ack_at TEXT`,
+    `ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE messages ADD COLUMN last_error TEXT`,
+    `ALTER TABLE messages ADD COLUMN team_mapped_at TEXT`,
   ];
 
   for (const sql of alters) {
@@ -120,6 +129,43 @@ export default function migrateConsolidate() {
     );
     CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_ledger(expires_at);
     CREATE INDEX IF NOT EXISTS idx_idem_job ON idempotency_ledger(job_id);
+
+    CREATE TABLE IF NOT EXISTS message_receipts (
+      id              TEXT PRIMARY KEY,
+      message_id      TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      event_type      TEXT NOT NULL,
+      attempt         INTEGER,
+      actor           TEXT,
+      detail          TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS team_tasks (
+      team_id         TEXT NOT NULL,
+      id              TEXT NOT NULL,
+      member_id       TEXT,
+      source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+      title           TEXT,
+      status          TEXT NOT NULL DEFAULT 'open',
+      gate_tracker_id TEXT REFERENCES task_tracker(id) ON DELETE SET NULL,
+      gate_status     TEXT,
+      last_error      TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at    TEXT,
+      PRIMARY KEY (team_id, id)
+    );
+
+    CREATE TABLE IF NOT EXISTS team_mailbox_events (
+      id              TEXT PRIMARY KEY,
+      team_id         TEXT NOT NULL,
+      member_id       TEXT,
+      task_id         TEXT,
+      message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+      event_type      TEXT NOT NULL,
+      payload         TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // ── Indexes that may be absent ────────────────────────────────────────
@@ -138,10 +184,69 @@ export default function migrateConsolidate() {
     `);
   } catch { /* index may already exist */ }
 
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_team
+      ON messages(team_id, member_id, status) WHERE team_id IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_task
+      ON messages(team_id, task_id, created_at)
+      WHERE team_id IS NOT NULL AND task_id IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_ack_pending
+      ON messages(ack_required, ack_at, status)
+      WHERE ack_required = 1 AND ack_at IS NULL
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_receipts_message
+      ON message_receipts(message_id, created_at DESC)
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_team_tasks_status
+      ON team_tasks(team_id, status, updated_at DESC)
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_team_tasks_gate
+      ON team_tasks(gate_tracker_id) WHERE gate_tracker_id IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_team_events_team
+      ON team_mailbox_events(team_id, created_at DESC)
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_team_events_task
+      ON team_mailbox_events(team_id, task_id, created_at DESC)
+      WHERE task_id IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
+
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
     stmt.run(v);
   }
 
@@ -152,7 +257,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v9'
-    : 'DB already at v9 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v10'
+    : 'DB already at v10 — nothing to do'
   );
 }

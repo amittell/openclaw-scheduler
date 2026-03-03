@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-352%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-388%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -10,7 +10,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 352 (full suite, in-memory SQLite)
+**Tests:** 388 (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -71,7 +71,9 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-SCHEDULER_DB=:memory: node test.js   # should print: 352 passed, 0 failed
+npm test                             # should print: 388 passed, 0 failed
+npm run lint                         # static checks
+npm run coverage                     # coverage summary + lcov report
 ```
 
 Then run the interactive setup wizard:
@@ -938,7 +940,7 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 
 ### Gateway health
 
-`GET /health` checked before each tick. If unreachable, entire tick is skipped.
+`GET /health` checked before each tick. If unreachable, isolated jobs are deferred; shell and main-session jobs continue.
 
 ---
 
@@ -952,7 +954,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of `v1.0.1`, the schema is consolidated in `schema.sql` (baseline `v9`).
+As of `v1.0.2`, the schema is consolidated in `schema.sql` (baseline `v10`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -976,6 +978,7 @@ As of `v1.0.1`, the schema is consolidated in `schema.sql` (baseline `v9`).
 | 0.7.0 | 2026-02-25 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
 | 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
 | 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
+| 1.0.2 | 2026-03-03 | v10 | Team-aware routing fields on messages, explicit message receipt events (attempt/error/ack), team adapter projection + task completion gates |
 
 ---
 
@@ -1011,8 +1014,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v9) — all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v9
+├── schema.sql             # Complete schema (v10) — all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v10
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -1022,6 +1025,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── idempotency.js         # Idempotency ledger (at-least-once delivery dedup)
 ├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
 ├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
+├── team-adapter.js        # Team mailbox/task projection and task completion gates
 ├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json

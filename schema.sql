@@ -1,5 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.0.0, schema version: 9)
--- OpenClaw Scheduler Schema (current: v1.0.1, schema version: 9)
+-- OpenClaw Scheduler Schema (current: v1.0.2, schema version: 10)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -138,6 +137,9 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Routing
   from_agent      TEXT NOT NULL,                      -- sender agent id or 'scheduler' or 'user'
   to_agent        TEXT NOT NULL,                      -- recipient agent id or 'broadcast'
+  team_id         TEXT,                               -- optional team routing namespace
+  member_id       TEXT,                               -- optional team member routing key
+  task_id         TEXT,                               -- optional team task correlation key
   reply_to        TEXT REFERENCES messages(id) ON DELETE SET NULL, -- threading
   
   -- Content
@@ -154,6 +156,11 @@ CREATE TABLE IF NOT EXISTS messages (
   status          TEXT NOT NULL DEFAULT 'pending',    -- pending|delivered|read|expired|failed
   delivered_at    TEXT,
   read_at         TEXT,
+  ack_required    INTEGER NOT NULL DEFAULT 0,         -- message requires explicit ACK
+  ack_at          TEXT,                               -- explicit acknowledgement timestamp
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,       -- outbound delivery attempts
+  last_error      TEXT,                               -- last delivery/adapter error
+  team_mapped_at  TEXT,                               -- when team adapter projected this message
   expires_at      TEXT,                               -- optional TTL
   
   -- Metadata
@@ -171,6 +178,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent, status);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_agent);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_pending ON messages(to_agent, status, priority DESC) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_messages_team ON messages(team_id, member_id, status) WHERE team_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(team_id, task_id, created_at) WHERE team_id IS NOT NULL AND task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_ack_pending ON messages(ack_required, ack_at, status) WHERE ack_required = 1 AND ack_at IS NULL;
 
 -- ============================================================
 -- AGENTS: registered agents and status
@@ -268,6 +278,54 @@ CREATE INDEX IF NOT EXISTS idx_tta_status ON task_tracker_agents(status) WHERE s
 CREATE INDEX IF NOT EXISTS idx_tta_session_key ON task_tracker_agents(session_key) WHERE session_key IS NOT NULL;
 
 -- ============================================================
+-- MESSAGE RECEIPTS: explicit delivery/ack audit trail (v10)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS message_receipts (
+  id              TEXT PRIMARY KEY,
+  message_id      TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  event_type      TEXT NOT NULL,                      -- attempt|error|ack|read|adapter
+  attempt         INTEGER,
+  actor           TEXT,                               -- dispatcher|consumer|agent|team-adapter|operator
+  detail          TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_message ON message_receipts(message_id, created_at DESC);
+
+-- ============================================================
+-- TEAM ADAPTER TABLES: mailbox/task projection + gates (v10)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS team_tasks (
+  team_id         TEXT NOT NULL,
+  id              TEXT NOT NULL,                      -- task id within a team namespace
+  member_id       TEXT,                               -- owner/assignee
+  source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  title           TEXT,
+  status          TEXT NOT NULL DEFAULT 'open',       -- open|blocked|completed|failed
+  gate_tracker_id TEXT REFERENCES task_tracker(id) ON DELETE SET NULL,
+  gate_status     TEXT,                               -- waiting|passed|failed|NULL
+  last_error      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at    TEXT,
+  PRIMARY KEY (team_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_team_tasks_status ON team_tasks(team_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_team_tasks_gate ON team_tasks(gate_tracker_id) WHERE gate_tracker_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS team_mailbox_events (
+  id              TEXT PRIMARY KEY,
+  team_id         TEXT NOT NULL,
+  member_id       TEXT,
+  task_id         TEXT,
+  message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  event_type      TEXT NOT NULL,                      -- mailbox|task_created|task_message|gate_open|gate_passed|gate_failed|ack
+  payload         TEXT,                               -- JSON details
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_team_events_team ON team_mailbox_events(team_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_team_events_task ON team_mailbox_events(team_id, task_id, created_at DESC) WHERE task_id IS NOT NULL;
+
+-- ============================================================
 -- MIGRATION LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -275,8 +333,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs start at v9 (all columns already in schema above).
--- Existing installs are brought up to v9 by migrate-consolidate.js.
+-- Fresh installs start at v10 (all columns already in schema above).
+-- Existing installs are brought up to v10 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -286,3 +344,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (7);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (8);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (10);

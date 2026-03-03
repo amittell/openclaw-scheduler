@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] — 2026-03-03
+
+### Added
+- Team-aware message routing fields on `messages`: `team_id`, `member_id`, optional `task_id`
+- Explicit message receipt audit trail via `message_receipts` (delivery attempts/errors/acks)
+- Team adapter module (`team-adapter.js`) with:
+  - Message projection to `team_mailbox_events`
+  - Team task projection to `team_tasks`
+  - Task completion gates backed by `task_tracker` groups
+- CLI team operations:
+  - `team map`, `team tasks`, `team events`, `team gate`, `team check-gates`, `team ack`
+  - `msg receipts`, `msg ack`, `msg team-inbox`
+
+### Changed
+- Bumped schema baseline to `v10` in `schema.sql` and `migrate-consolidate.js`
+- Dispatcher now runs team adapter mapping + gate checks in message-delivery loop
+- Inbox consumer now records delivery attempts and explicit ACKs for consumed messages
+- Added release quality scripts: `npm run lint` (ESLint v9) and `npm run coverage` (V8 coverage + lcov)
+
+---
+
 ## [1.0.1] — 2026-03-02
 
 ### Changed

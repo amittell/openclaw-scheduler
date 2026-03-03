@@ -90,7 +90,7 @@ try {
   if (ran) {
     ok(`Migrations applied → ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date (schema v9) → ${schedulerDbPath}`);
+    ok(`DB already up to date (schema v10) → ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);

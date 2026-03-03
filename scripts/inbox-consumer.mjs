@@ -21,6 +21,7 @@ import { fileURLToPath } from 'url';
 import { watch } from 'fs';
 import { getDb } from '../db.js';
 import { deliverMessage } from '../gateway.js';
+import { ackMessage, recordMessageAttempt } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -95,24 +96,28 @@ function selectPendingMessages(db, agentId, limit) {
   `).all(agentId, limit);
 }
 
-function markReadBatch(db, ids) {
-  if (!ids.length) return;
-  const placeholders = ids.map(() => '?').join(', ');
-  db.prepare(`
-    UPDATE messages
-    SET status = 'read', read_at = datetime('now')
-    WHERE id IN (${placeholders})
-  `).run(...ids);
-}
-
 async function drainOnce(db, { to, channel, agentId, limit }) {
   const msgs = selectPendingMessages(db, agentId, limit);
   if (msgs.length === 0) {
     return 0;
   }
   const text = formatMessages(msgs, agentId);
-  await deliverMessage(channel, to, text);
-  markReadBatch(db, msgs.map((m) => m.id));
+  try {
+    await deliverMessage(channel, to, text);
+  } catch (err) {
+    for (const msg of msgs) {
+      recordMessageAttempt(msg.id, {
+        ok: false,
+        actor: 'inbox-consumer',
+        error: err.message || 'delivery failed',
+      });
+    }
+    throw err;
+  }
+  for (const msg of msgs) {
+    recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
+    ackMessage(msg.id, 'inbox-consumer', `Delivered to ${channel}:${to}`);
+  }
   process.stdout.write(`[inbox-consumer] delivered ${msgs.length} message(s) to ${channel}:${to}\n`);
   return msgs.length;
 }

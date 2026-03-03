@@ -21,7 +21,8 @@ import {
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
   markDelivered, markRead, markAllRead, getUnreadCount,
-  expireMessages, pruneMessages
+  expireMessages, pruneMessages,
+  ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
 
@@ -52,6 +53,9 @@ assert(tables.includes('jobs'), 'jobs table');
 assert(tables.includes('runs'), 'runs table');
 assert(tables.includes('messages'), 'messages table');
 assert(tables.includes('agents'), 'agents table');
+assert(tables.includes('message_receipts'), 'message_receipts table');
+assert(tables.includes('team_tasks'), 'team_tasks table');
+assert(tables.includes('team_mailbox_events'), 'team_mailbox_events table');
 
 // Verify v3 columns exist
 const jobCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -170,6 +174,42 @@ assert(getMessage(expMsg.id).status === 'expired', 'expiry');
 
 const metaMsg = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'meta', metadata: { key: 'value' } });
 assert(getMessage(metaMsg.id).metadata?.key === 'value', 'metadata');
+
+// Team-aware routing + explicit receipts
+const teamMsg = sendMessage({
+  from_agent: 'orchestrator',
+  to_agent: 'main',
+  team_id: 'core-team',
+  member_id: 'writer',
+  task_id: 'task-001',
+  kind: 'task',
+  subject: 'Write draft',
+  body: 'Draft the release notes for v1.0',
+  ack_required: true,
+});
+assert(teamMsg.team_id === 'core-team', 'team_id stored');
+assert(teamMsg.member_id === 'writer', 'member_id stored');
+assert(teamMsg.task_id === 'task-001', 'task_id stored');
+assert(teamMsg.ack_required === 1, 'ack_required stored');
+
+markDelivered(teamMsg.id);
+const teamDelivered = getMessage(teamMsg.id);
+assert(teamDelivered.delivery_attempts >= 1, 'delivery attempt incremented');
+const receipts1 = listMessageReceipts(teamMsg.id, 10);
+assert(receipts1.some(r => r.event_type === 'attempt'), 'attempt receipt written');
+
+ackMessage(teamMsg.id, 'writer', 'received');
+const teamAcked = getMessage(teamMsg.id);
+assert(teamAcked.ack_at !== null, 'ack_at set on ack');
+const receipts2 = listMessageReceipts(teamMsg.id, 20);
+assert(receipts2.some(r => r.event_type === 'ack'), 'ack receipt written');
+
+recordMessageAttempt(teamMsg.id, { ok: false, actor: 'test', error: 'simulated error' });
+const teamErr = getMessage(teamMsg.id);
+assert(teamErr.last_error === 'simulated error', 'last_error updated on failed attempt');
+
+const teamInbox = getTeamMessages('core-team', { includeRead: true, limit: 10 });
+assert(teamInbox.some(m => m.id === teamMsg.id), 'getTeamMessages finds team message');
 
 // ── Cascade delete ──────────────────────────────────────────
 console.log('\nCascade:');
@@ -1022,9 +1062,11 @@ console.log('\n── Schema Baseline ──');
 {
   // Verify consolidated schema baseline is recorded
   const version = getDb().prepare('SELECT MAX(version) as v FROM schema_migrations').get();
-  assert(version.v >= 8, 'schema_migrations has baseline v8');
+  assert(version.v >= 10, 'schema_migrations has baseline v10');
   const v8 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 8').get();
   assert(v8 !== undefined, 'schema_migrations has v8');
+  const v10 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 10').get();
+  assert(v10 !== undefined, 'schema_migrations has v10');
 
   // Verify approvals table exists
   const approvalTable = getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='approvals'").get();
@@ -1048,6 +1090,14 @@ console.log('\n── Schema Baseline ──');
   // Verify new column on messages
   const msgCols = getDb().prepare('PRAGMA table_info(messages)').all().map(c => c.name);
   assert(msgCols.includes('owner'), 'messages has owner column');
+  assert(msgCols.includes('team_id'), 'messages has team_id column');
+  assert(msgCols.includes('member_id'), 'messages has member_id column');
+  assert(msgCols.includes('task_id'), 'messages has task_id column');
+  assert(msgCols.includes('ack_required'), 'messages has ack_required column');
+  assert(msgCols.includes('ack_at'), 'messages has ack_at column');
+  assert(msgCols.includes('delivery_attempts'), 'messages has delivery_attempts column');
+  assert(msgCols.includes('last_error'), 'messages has last_error column');
+  assert(msgCols.includes('team_mapped_at'), 'messages has team_mapped_at column');
 }
 
 console.log('\n── v5: Task Tracker ──');
@@ -1162,6 +1212,68 @@ console.log('\n── v5: Task Tracker ──');
   // last_heartbeat was just set — agent should be spared
   const notDead = tt.checkDeadAgents().filter(d => d.tracker_id === group4.id);
   assert(notDead.length === 0, 'agent with recent heartbeat not marked dead despite timeout');
+}
+
+console.log('\n── v10: Team Adapter ──');
+{
+  const ta = await import('./team-adapter.js');
+  const tt = await import('./task-tracker.js');
+
+  const teamTaskMsg = sendMessage({
+    from_agent: 'scheduler',
+    to_agent: 'main',
+    team_id: 'team-alpha',
+    member_id: 'writer',
+    task_id: 'deliverable-42',
+    kind: 'task',
+    subject: 'Create draft',
+    body: 'Prepare deliverable 42 draft',
+    ack_required: true,
+  });
+
+  const mapped = ta.mapTeamMessages(50);
+  assert(mapped >= 1, 'team adapter mapped at least one message');
+
+  const teamTasks1 = ta.listTeamTasks('team-alpha', 20);
+  const tracked = teamTasks1.find(t => t.id === 'deliverable-42');
+  assert(tracked !== undefined, 'team task projected from message');
+  assert(tracked.status === 'open', 'projected team task starts open');
+
+  const events1 = ta.listTeamMailboxEvents('team-alpha', { taskId: 'deliverable-42', limit: 20 });
+  assert(events1.some(e => e.event_type === 'task_created' || e.event_type === 'task_message'), 'team mailbox event created');
+
+  const gate = ta.createTeamTaskGate({
+    teamId: 'team-alpha',
+    taskId: 'deliverable-42',
+    expectedMembers: ['writer', 'reviewer'],
+    timeoutS: 300,
+    createdBy: 'test',
+  });
+  assert(gate.tracker_id !== undefined, 'team gate created with tracker');
+
+  const teamTasks2 = ta.listTeamTasks('team-alpha', 20);
+  const gated = teamTasks2.find(t => t.id === 'deliverable-42');
+  assert(gated.status === 'blocked', 'task becomes blocked while gate is waiting');
+  assert(gated.gate_status === 'waiting', 'gate_status waiting');
+
+  tt.agentStarted(gate.tracker_id, 'writer');
+  tt.agentCompleted(gate.tracker_id, 'writer', 'draft complete');
+  tt.agentStarted(gate.tracker_id, 'reviewer');
+  tt.agentCompleted(gate.tracker_id, 'reviewer', 'review complete');
+  tt.checkGroupCompletion(gate.tracker_id);
+
+  const gateCheck = ta.checkTeamTaskGates(20);
+  assert(gateCheck.passed >= 1, 'gate marked passed after all team members complete');
+
+  const teamTasks3 = ta.listTeamTasks('team-alpha', 20);
+  const passedTask = teamTasks3.find(t => t.id === 'deliverable-42');
+  assert(passedTask.gate_status === 'passed', 'task gate_status passed');
+  assert(passedTask.status === 'open', 'task unblocked after gate pass');
+
+  const acked = ta.ackTeamMessage(teamTaskMsg.id, 'writer', 'acknowledged');
+  assert(acked !== null && acked.ack_at !== null, 'team-aware ack sets ack_at');
+  const events2 = ta.listTeamMailboxEvents('team-alpha', { taskId: 'deliverable-42', limit: 50 });
+  assert(events2.some(e => e.event_type === 'ack'), 'team-aware ack emits mailbox event');
 }
 
 console.log('\n── Idempotency Keys ──');

@@ -3,7 +3,10 @@
 import { initDb, getDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
-import { sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages } from './messages.js';
+import {
+  sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
+  ackMessage, listMessageReceipts, getTeamMessages,
+} from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
 
 const [,, command, sub, ...args] = process.argv;
@@ -39,11 +42,22 @@ Queue:
 Messages:
   msg send <from> <to> <body>        Send a message
   msg inbox <agent-id> [limit]       Get inbox (unread)
+  msg team-inbox <team-id> [limit] [member-id] [task-id]  Get team mailbox
   msg outbox <agent-id> [limit]      Get outbox
   msg thread <message-id>            Get message thread
+  msg ack <message-id> [actor] [note] Mark message as acknowledged/read
+  msg receipts <message-id> [limit]  Show delivery/ack receipt events
   msg read <message-id>              Mark message as read
   msg readall <agent-id>             Mark all as read
   msg unread <agent-id>              Unread count
+
+Team Adapter:
+  team map [limit]                           Project unmapped team messages into mailbox/task events
+  team tasks <team-id> [limit]               List projected team tasks
+  team events <team-id> [limit] [task-id]    List team mailbox events
+  team gate <team-id> <task-id> <members-json> [timeout-s]  Open task completion gate
+  team check-gates [limit]                   Evaluate/advance team task gates
+  team ack <message-id> [actor] [note]       Team-aware ACK (creates team mailbox event)
 
 Agents:
   agents list                        List registered agents
@@ -240,6 +254,30 @@ switch (command) {
         })));
         break;
       }
+      case 'team-inbox': {
+        const teamId = args[0];
+        if (!teamId) { console.error('Usage: msg team-inbox <team-id> [limit] [member-id] [task-id]'); process.exit(1); }
+        const limit = parseInt(args[1] || '20', 10);
+        const memberId = args[2] || null;
+        const taskId = args[3] || null;
+        const msgs = getTeamMessages(teamId, { limit, memberId, taskId, includeRead: true });
+        if (msgs.length === 0) { console.log('Team inbox empty'); break; }
+        console.table(msgs.map(m => ({
+          id: m.id.slice(0, 8),
+          from: m.from_agent,
+          to: m.to_agent,
+          member: m.member_id || '-',
+          task: m.task_id || '-',
+          kind: m.kind,
+          status: m.status,
+          ackRequired: !!m.ack_required,
+          ackAt: m.ack_at || '-',
+          attempts: m.delivery_attempts || 0,
+          lastError: m.last_error || '-',
+          created: m.created_at,
+        })));
+        break;
+      }
       case 'outbox': {
         const msgs = getOutbox(args[0], parseInt(args[1] || '20', 10));
         if (msgs.length === 0) { console.log('Outbox empty'); break; }
@@ -260,6 +298,34 @@ switch (command) {
           console.log(`  ${m.body.slice(0, 200)}`);
           console.log();
         }
+        break;
+      }
+      case 'ack': {
+        if (!args[0]) { console.error('Usage: msg ack <message-id> [actor] [note]'); process.exit(1); }
+        const actor = args[1] || 'operator';
+        const detail = args.slice(2).join(' ') || null;
+        const msg = ackMessage(args[0], actor, detail);
+        if (!msg) { console.error('Message not found:', args[0]); process.exit(1); }
+        console.log('Acknowledged:', fmt({
+          id: msg.id,
+          status: msg.status,
+          ack_at: msg.ack_at,
+          read_at: msg.read_at,
+        }));
+        break;
+      }
+      case 'receipts': {
+        if (!args[0]) { console.error('Usage: msg receipts <message-id> [limit]'); process.exit(1); }
+        const rows = listMessageReceipts(args[0], parseInt(args[1] || '20', 10));
+        if (rows.length === 0) { console.log('No receipts for message'); break; }
+        console.table(rows.map(r => ({
+          id: r.id.slice(0, 8),
+          type: r.event_type,
+          attempt: r.attempt ?? '-',
+          actor: r.actor || '-',
+          detail: (r.detail || '').slice(0, 80),
+          at: r.created_at,
+        })));
         break;
       }
       case 'read': markRead(args[0]); console.log('Marked read'); break;
@@ -504,6 +570,86 @@ switch (command) {
       case 'prune': {
         const result = forcePruneIdempotency();
         console.log(`Pruned ${result} expired idempotency entries`);
+        break;
+      }
+      default: usage();
+    }
+    break;
+  }
+
+  // ── Team Adapter ───────────────────────────────────────
+  case 'team': {
+    const {
+      mapTeamMessages, listTeamTasks, listTeamMailboxEvents,
+      createTeamTaskGate, checkTeamTaskGates, ackTeamMessage,
+    } = await import('./team-adapter.js');
+
+    switch (sub) {
+      case 'map': {
+        const mapped = mapTeamMessages(parseInt(args[0] || '200', 10));
+        console.log(`Mapped ${mapped} team message(s)`);
+        break;
+      }
+      case 'tasks': {
+        if (!args[0]) { console.error('Usage: team tasks <team-id> [limit]'); process.exit(1); }
+        const rows = listTeamTasks(args[0], parseInt(args[1] || '50', 10));
+        if (rows.length === 0) { console.log('No team tasks'); break; }
+        console.table(rows.map(t => ({
+          team: t.team_id,
+          task: t.id,
+          member: t.member_id || '-',
+          status: t.status,
+          gateTracker: t.gate_tracker_id ? t.gate_tracker_id.slice(0, 8) + '…' : '-',
+          gateStatus: t.gate_status || '-',
+          updated: t.updated_at,
+          completed: t.completed_at || '-',
+        })));
+        break;
+      }
+      case 'events': {
+        if (!args[0]) { console.error('Usage: team events <team-id> [limit] [task-id]'); process.exit(1); }
+        const teamId = args[0];
+        const limit = parseInt(args[1] || '50', 10);
+        const taskId = args[2] || null;
+        const rows = listTeamMailboxEvents(teamId, { limit, taskId });
+        if (rows.length === 0) { console.log('No team events'); break; }
+        console.table(rows.map(e => ({
+          id: e.id.slice(0, 8),
+          team: e.team_id,
+          member: e.member_id || '-',
+          task: e.task_id || '-',
+          message: e.message_id ? e.message_id.slice(0, 8) : '-',
+          type: e.event_type,
+          at: e.created_at,
+        })));
+        break;
+      }
+      case 'gate': {
+        if (!args[0] || !args[1] || !args[2]) {
+          console.error('Usage: team gate <team-id> <task-id> <members-json> [timeout-s]');
+          console.error('Example: team gate core-team deploy-001 "[\\"writer\\",\\"reviewer\\"]" 900');
+          process.exit(1);
+        }
+        const teamId = args[0];
+        const taskId = args[1];
+        const members = JSON.parse(args[2]);
+        const timeoutS = parseInt(args[3] || '600', 10);
+        const gate = createTeamTaskGate({ teamId, taskId, expectedMembers: members, timeoutS });
+        console.log('Gate opened:', fmt(gate));
+        break;
+      }
+      case 'check-gates': {
+        const result = checkTeamTaskGates(parseInt(args[0] || '100', 10));
+        console.log(fmt(result));
+        break;
+      }
+      case 'ack': {
+        if (!args[0]) { console.error('Usage: team ack <message-id> [actor] [note]'); process.exit(1); }
+        const actor = args[1] || 'team-member';
+        const detail = args.slice(2).join(' ') || null;
+        const msg = ackTeamMessage(args[0], actor, detail);
+        if (!msg) { console.error('Team message not found:', args[0]); process.exit(1); }
+        console.log('Team ACK:', fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at }));
         break;
       }
       default: usage();

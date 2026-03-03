@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenClaw Scheduler Dispatcher v1.0.1
+// OpenClaw Scheduler Dispatcher v1.0.2
 //
 // Full standalone scheduler + message router.
 // Dispatches independently via chat completions API.
@@ -51,6 +51,7 @@ import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
   touchAgentHeartbeat, registerAgentSession,
 } from './task-tracker.js';
+import { mapTeamMessages, checkTeamTaskGates } from './team-adapter.js';
 
 // ── Helpers ─────────────────────────────────────────────────
 function sqliteNow(offsetMs = 0) {
@@ -873,6 +874,24 @@ async function tick() {
     } catch (err) {
       log('error', `Spawn handler error: ${err.message}`);
     }
+    try {
+      const mapped = mapTeamMessages(200);
+      if (mapped > 0) {
+        log('debug', `Team adapter mapped ${mapped} message(s)`);
+      }
+    } catch (err) {
+      log('error', `Team adapter map error: ${err.message}`);
+    }
+    try {
+      const gates = checkTeamTaskGates(100);
+      if (gates.passed > 0 || gates.failed > 0) {
+        log('info', `Team task gates updated`, gates);
+      } else if (gates.pending > 0) {
+        log('debug', `Team task gates pending`, gates);
+      }
+    } catch (err) {
+      log('error', `Team gate check error: ${err.message}`);
+    }
     try { await deliverPendingMessages(); } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
     }
@@ -939,7 +958,7 @@ function shutdown(signal) {
 }
 
 async function main() {
-  log('info', 'Starting OpenClaw Scheduler v1.0.1', {
+  log('info', 'Starting OpenClaw Scheduler v1.0.2', {
     tickMs: TICK_INTERVAL_MS,
     staleThresholdS: STALE_THRESHOLD_S,
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,
