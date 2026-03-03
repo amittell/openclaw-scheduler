@@ -221,65 +221,31 @@ No manual token configuration needed on a standard OpenClaw install.
 
 ---
 
-## Check-ins from Subagent Sessions
+## Delivery & Check-ins
 
-Subagent sessions run in isolated environments **without PATH access to the
-`openclaw` CLI**. Commands like `openclaw system event --text X --mode now`
-silently fail — the binary isn't found, no error is surfaced, and check-ins
-never land.
+### Completion delivery (automatic)
 
-**Use the gateway HTTP API directly via curl instead.** This works from any
-session (main, subagent, or chilisaus-spawned):
+When `--deliver-to` is set, chilisaus passes `deliver: true` with `replyTo`
+and `replyChannel` to the gateway's `agent` RPC method. The gateway
+automatically delivers the agent's final response to the specified channel
+when the run completes. No manual completion check-in needed.
 
-### Gateway token
+### Progress check-ins from subagent sessions
 
-The token lives at `/Users/alexm/.openclaw/openclaw.json` → `gateway.auth.token`:
-
-```bash
-GW_TOKEN=$(python3 -c "import json; print(json.load(open('/Users/alexm/.openclaw/openclaw.json'))['gateway']['auth']['token'])")
-```
-
-### Progress check-in (every ~2 minutes)
+Subagent sessions run without PATH access to the `openclaw` CLI, so
+`openclaw system event` silently fails. For mid-task progress updates,
+use the gateway HTTP API via curl:
 
 ```bash
-curl -s -X POST http://127.0.0.1:18789/tools/invoke \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"<label>: <what you just did>"},"sessionKey":"main"}'
-```
-
-### Completion check-in
-
-```bash
-curl -s -X POST http://127.0.0.1:18789/tools/invoke \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"✅ <label>: Done — <one-line summary>"},"sessionKey":"main"}'
-```
-
-### Prompt template
-
-Include this block at the end of every dispatched prompt:
-
-```
-Check in every 2 minutes with progress:
 GW_TOKEN=$(python3 -c "import json; print(json.load(open('/Users/alexm/.openclaw/openclaw.json'))['gateway']['auth']['token'])")
 curl -s -X POST http://127.0.0.1:18789/tools/invoke \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"<label>: <what you just did>"},"sessionKey":"main"}'
-
-When completely finished, send a final check-in:
-curl -s -X POST http://127.0.0.1:18789/tools/invoke \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"✅ <label>: Done — <one-line summary>"},"sessionKey":"main"}'
+  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"<label>: <progress update>"},"sessionKey":"main"}'
 ```
 
-> **Why not `openclaw system event`?** The `openclaw` binary is in
-> `/opt/homebrew/bin/` which isn't on the PATH in subagent sessions. The
-> command exits silently with a non-zero code. The gateway HTTP API at
-> `127.0.0.1:18789` is always reachable from any local process.
+Include this block in the dispatched prompt for tasks that benefit from
+periodic progress reports (long-running builds, multi-step research, etc.).
 ---
 
 ## Architecture: Before & After
