@@ -221,14 +221,36 @@ No manual token configuration needed on a standard OpenClaw install.
 
 ---
 
-## Delivery & Check-ins
+## Delivery
 
-### Completion delivery (automatic)
+### How it works
 
-When `--deliver-to` is set, chilisaus passes `deliver: true` with `replyTo`
-and `replyChannel` to the gateway's `agent` RPC method. The gateway
-automatically delivers the agent's final response to the specified channel
-when the run completes. No manual completion check-in needed.
+When `--deliver-to` is set, chilisaus registers a **scheduler watcher job**
+after dispatching the session. The watcher polls the session result every
+minute until the agent produces a reply, then delivers via the scheduler's
+`handleDelivery` pipeline.
+
+```
+chilisaus enqueue --deliver-to 484946046
+  → gateway agent call (deliver: false, fire-and-forget)
+  → scheduler job: chilisaus-deliver:<label> (*/1 * * * *, shell, one-shot)
+  → watcher polls: node chilisaus/index.mjs result --label <label>
+  → on success (exit 0): scheduler delivers output to telegram/484946046
+  → job self-deletes (delete_after_run: true)
+```
+
+**Why scheduler instead of gateway `deliver:true`?**
+- Retry / at-least-once delivery guarantee
+- Delivery aliases (scheduler resolves `@team_room` → channel/target)
+- Audit trail (runs table records every attempt)
+- Chain triggers (completion can fire child jobs)
+- Resilient to gateway restarts mid-run
+
+### Watcher script
+
+`deliver-watcher.sh` checks the session result. Exit 0 with output = deliver.
+Exit 1 with no output = retry on next cron tick (no spam — `announce-always`
+only delivers when `output.trim()` is truthy).
 
 ### Progress check-ins from subagent sessions
 
@@ -243,9 +265,6 @@ curl -s -X POST http://127.0.0.1:18789/tools/invoke \
   -H "Authorization: Bearer $GW_TOKEN" \
   -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"<label>: <progress update>"},"sessionKey":"main"}'
 ```
-
-Include this block in the dispatched prompt for tasks that benefit from
-periodic progress reports (long-running builds, multi-step research, etc.).
 ---
 
 ## Architecture: Before & After

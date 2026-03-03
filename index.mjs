@@ -357,6 +357,9 @@ async function cmdEnqueue(flags) {
   ].join('\n');
 
   // ── Call gateway agent method ───────────────────────────────
+  // Gateway deliver is used as a fast-path secondary. The scheduler watcher
+  // (created below) is the primary delivery path with retry + audit trail.
+  // Both may fire — at-least-once semantics, duplicates acceptable.
   try {
     const response = gatewayCall('agent', {
       message:        taskMessage,
@@ -394,6 +397,48 @@ async function cmdEnqueue(flags) {
       agent, mode, session_key: sessionKey,
     }).catch(() => {});
 
+    // ── Register scheduler watcher for delivery ───────────────
+    // Creates a one-shot shell job that runs watcher.mjs (blocks until session
+    // completes, outputs result). The scheduler's handleDelivery delivers with
+    // retry, alias resolution, and audit trail in scheduler.db.
+    // Gateway deliver:true is kept as a fast-path secondary (see deliver flag above).
+    let schedulerWatcherOk = false;
+    if (deliverTo && deliverMode !== 'none') {
+      try {
+        const watcherPath = join(__dirname, 'watcher.mjs');
+        const escapedLabel = label.replace(/'/g, "'\\''");
+        // Watcher timeout = session timeout + 120s buffer for startup/polling
+        const watcherTimeoutS = timeoutS + 120;
+        const watcherCmd = `node '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
+
+        const jobSpec = JSON.stringify({
+          name:                     `chilisaus-deliver:${label}`,
+          schedule_cron:            '0 0 31 2 *',  // never-cron; run_now triggers it once
+          session_target:           'shell',
+          payload_kind:             'shellCommand',
+          payload_message:          watcherCmd,
+          delivery_mode:            'announce-always',
+          delivery_channel:         deliverChannel,
+          delivery_to:              deliverTo,
+          delivery_guarantee:       'at-least-once',
+          delete_after_run:         true,
+          overlap_policy:           'skip',
+          run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
+          run_now:                  true,
+        });
+        const schedulerCli = join(process.env.HOME || '~', '.openclaw', 'scheduler', 'cli.js');
+        execFileSync('node', [schedulerCli, 'jobs', 'add', jobSpec], {
+          encoding: 'utf-8',
+          timeout:  10000,
+          stdio:    ['pipe', 'pipe', 'pipe'],
+        });
+        schedulerWatcherOk = true;
+        process.stderr.write(`[chilisaus] scheduler watcher registered: chilisaus-deliver:${label}\n`);
+      } catch (err) {
+        process.stderr.write(`[chilisaus] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
+      }
+    }
+
     out({
       ok:         true,
       label,
@@ -402,7 +447,17 @@ async function cmdEnqueue(flags) {
       mode:       isFresh ? 'fresh' : 'reuse',
       agent,
       status:     'accepted',
-      message:    'Session spawned via gateway. Agent is running.',
+      delivery:   deliverTo ? {
+        scheduler: schedulerWatcherOk,
+        gateway:   !!deliverTo,
+        target:    deliverTo,
+        channel:   deliverChannel,
+      } : null,
+      message:    schedulerWatcherOk
+        ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
+        : deliverTo
+          ? 'Session spawned. Delivery via gateway only (scheduler watcher failed).'
+          : 'Session spawned via gateway. Agent is running.',
     });
   } catch (err) {
     die(`gateway agent call failed: ${err.message}`);
