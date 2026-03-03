@@ -227,7 +227,7 @@ switch (command) {
         break;
       }
       case 'inbox': {
-        const msgs = getInbox(args[0], { limit: parseInt(args[1] || '20', 10) });
+        const msgs = getInbox(args[0], { limit: parseInt(args[1] || '20', 10), includeDelivered: true });
         if (msgs.length === 0) { console.log('Inbox empty'); break; }
         console.table(msgs.map(m => ({
           id: m.id.slice(0, 8),
@@ -276,7 +276,7 @@ switch (command) {
       case undefined: {
         const agent = args[0] || 'main';
         const limit = parseInt(args[1] || '50', 10);
-        const msgs = getInbox(agent, { limit });
+        const msgs = getInbox(agent, { limit, includeDelivered: true });
         const pending = msgs.filter(m => m.status === 'pending');
         const delivered = msgs.filter(m => m.status === 'delivered');
         const unread = getUnreadCount(agent);

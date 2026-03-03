@@ -75,6 +75,7 @@ function kindPriority(kind) {
 export function getInbox(agentId, opts = {}) {
   const limit = opts.limit || 50;
   const includeRead = opts.includeRead || false;
+  const includeDelivered = opts.includeDelivered || false;
 
   // SQLite CASE expression mirrors KIND_PRIORITY map
   const kindOrder = `
@@ -96,10 +97,20 @@ export function getInbox(agentId, opts = {}) {
     `).all(agentId, limit).map(parseMetadata);
   }
 
+  if (includeDelivered) {
+    return getDb().prepare(`
+      SELECT * FROM messages
+      WHERE (to_agent = ? OR to_agent = 'broadcast')
+        AND status IN ('pending', 'delivered')
+      ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
+      LIMIT ?
+    `).all(agentId, limit).map(parseMetadata);
+  }
+
   return getDb().prepare(`
     SELECT * FROM messages
     WHERE (to_agent = ? OR to_agent = 'broadcast')
-      AND status IN ('pending', 'delivered')
+      AND status = 'pending'
     ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
     LIMIT ?
   `).all(agentId, limit).map(parseMetadata);

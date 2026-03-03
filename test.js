@@ -144,6 +144,8 @@ assert(getUnreadCount('main') >= 1, 'unread > 0');
 
 markDelivered(msg.id);
 assert(getMessage(msg.id).status === 'delivered', 'markDelivered');
+assert(!getInbox('main').some(m => m.id === msg.id), 'default inbox excludes delivered');
+assert(getInbox('main', { includeDelivered: true }).some(m => m.id === msg.id), 'includeDelivered returns delivered');
 
 markRead(msg.id);
 assert(getMessage(msg.id).status === 'read', 'markRead');

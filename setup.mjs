@@ -176,8 +176,8 @@ if (!deliverTo) {
     } else {
       db.prepare(`
         INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 60, 'announce', 'telegram', ?)
+          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
+        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 60, 'announce', 'telegram', ?, datetime('now', '-1 second'))
       `).run(randomUUID(), icName, '*/5 * * * *', `node ${icScript} --to ${deliverTo}`, deliverTo);
       ok(`Created "${icName}" job (*/5 * * * *)`);
     }
@@ -194,8 +194,8 @@ if (!deliverTo) {
     } else {
       db.prepare(`
         INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 30, 'announce', 'telegram', ?)
+          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
+        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 30, 'announce', 'telegram', ?, datetime('now', '-1 second'))
       `).run(randomUUID(), srdName, '*/10 * * * *', srdCmd, deliverTo);
       ok(`Created "${srdName}" job (*/10 * * * *)`);
     }
@@ -212,7 +212,7 @@ print();
 
 const platform = process.platform;
 const nodePath  = process.execPath;
-const indexPath = path.join(schedulerPath, 'index.js');
+const indexPath = path.join(schedulerPath, 'dispatcher.js');
 const logPath   = platform === 'win32'
   ? path.join(os.tmpdir(), 'openclaw-scheduler.log')
   : '/tmp/openclaw-scheduler.log';
@@ -393,7 +393,7 @@ WantedBy=default.target
     warn('Neither systemd user session nor PM2 found');
     print('  Options:');
     print('  • Install PM2:  npm install -g pm2');
-    print('  • Or run manually:  node index.js &');
+    print('  • Or run manually:  node dispatcher.js &');
     print('  • See INSTALL-LINUX.md for systemd setup without a user session');
   }
 
@@ -417,7 +417,7 @@ WantedBy=default.target
 // ── Unknown ────────────────────────────────────────────────────────────────
 } else {
   skip(`Unsupported platform: ${platform}`);
-  print('  Start manually: node index.js');
+  print('  Start manually: node dispatcher.js');
 }
 
 print();
