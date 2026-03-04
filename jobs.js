@@ -7,6 +7,39 @@ import { getDb } from './db.js';
 const MAX_CHAIN_DEPTH = 10;
 
 /**
+ * Valid payload_kind values for each session_target.
+ *   - main:     systemEvent only  (inject into the main session)
+ *   - shell:    shellCommand only (run a shell command)
+ *   - isolated: systemEvent or agentTurn (standalone agent session)
+ */
+const VALID_PAYLOADS_BY_TARGET = {
+  main:     ['systemEvent'],
+  shell:    ['shellCommand'],
+  isolated: ['systemEvent', 'agentTurn'],
+};
+
+/**
+ * Validate that a session_target + payload_kind combination is allowed.
+ * Throws a descriptive Error on invalid combos.
+ * @param {string} sessionTarget
+ * @param {string} payloadKind
+ */
+export function validateJobPayload(sessionTarget, payloadKind) {
+  const allowed = VALID_PAYLOADS_BY_TARGET[sessionTarget];
+  if (!allowed) {
+    throw new Error(
+      `Unknown session_target "${sessionTarget}". Valid targets: ${Object.keys(VALID_PAYLOADS_BY_TARGET).join(', ')}`
+    );
+  }
+  if (!allowed.includes(payloadKind)) {
+    throw new Error(
+      `Invalid payload_kind "${payloadKind}" for session_target "${sessionTarget}". ` +
+      `Allowed: ${allowed.join(', ')}`
+    );
+  }
+}
+
+/**
  * Calculate next run time from a cron expression.
  */
 export function nextRunFromCron(cronExpr, tz) {
@@ -34,6 +67,11 @@ export function createJob(opts) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded. Chain would be ${depth} deep.`);
     }
   }
+
+  // Resolve final payload_kind (after defaults) and validate combo
+  const finalTarget = opts.session_target || 'isolated';
+  const finalKind = opts.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
+  validateJobPayload(finalTarget, finalKind);
 
   let nextRun;
   if (opts.run_now) {
@@ -151,6 +189,16 @@ export function updateJob(id, patch) {
     'context_retrieval', 'context_retrieval_limit',
     'preferred_session_key'
   ];
+
+  // Validate session_target + payload_kind combo if either is changing
+  if ('session_target' in patch || 'payload_kind' in patch) {
+    const current = getJob(id);
+    if (current) {
+      const newTarget = patch.session_target ?? current.session_target;
+      const newKind   = patch.payload_kind   ?? current.payload_kind;
+      validateJobPayload(newTarget, newKind);
+    }
+  }
 
   // Cycle detection if parent_id is being changed
   if (patch.parent_id) {

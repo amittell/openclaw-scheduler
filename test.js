@@ -10,7 +10,8 @@ import {
   pruneExpiredJobs, detectCycle, getChainDepth,
   shouldRetry, scheduleRetry, cancelJob,
   enqueueJob, dequeueJob, runJobNow,
-  hasRunningRunForPool, evalTriggerCondition
+  hasRunningRunForPool, evalTriggerCondition,
+  validateJobPayload
 } from './jobs.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
@@ -1648,6 +1649,78 @@ console.log('\n── delete_after_run Safety ──');
 
   // Clean up
   deleteJob(oneShot.id);
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: session_target + payload_kind Validation
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Payload Validation ──');
+
+// 1. Valid: main + systemEvent
+{
+  const j = createJob({ name: 'Valid-main-sysEvent', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'systemEvent', payload_message: 'test', delivery_mode: 'none' });
+  assert(j.session_target === 'main' && j.payload_kind === 'systemEvent', 'valid: main + systemEvent accepted');
+  deleteJob(j.id);
+}
+
+// 2. Invalid: main + agentTurn → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-main-agentTurn', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: main + agentTurn rejected');
+}
+
+// 3. Valid: shell + shellCommand
+{
+  const j = createJob({ name: 'Valid-shell-cmd', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo hi', delivery_mode: 'none' });
+  assert(j.session_target === 'shell' && j.payload_kind === 'shellCommand', 'valid: shell + shellCommand accepted');
+  deleteJob(j.id);
+}
+
+// 4. Invalid: shell + agentTurn → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-shell-agentTurn', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: shell + agentTurn rejected');
+}
+
+// 5. Valid: isolated + agentTurn (default combo)
+{
+  const j = createJob({ name: 'Valid-isolated-agentTurn', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  assert(j.session_target === 'isolated' && j.payload_kind === 'agentTurn', 'valid: isolated + agentTurn accepted');
+  deleteJob(j.id);
+}
+
+// 6. Invalid: isolated + shellCommand → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-isolated-shell', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'shellCommand', payload_message: '/bin/echo nope', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: isolated + shellCommand rejected');
+}
+
+// 7. updateJob: changing to invalid combo → should throw
+{
+  const j = createJob({ name: 'Update-validation', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  let threw = false;
+  try { updateJob(j.id, { session_target: 'main', payload_kind: 'agentTurn' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'updateJob rejects invalid target+kind combo');
+  deleteJob(j.id);
+}
+
+// 8. updateJob: changing session_target alone checks against existing payload_kind
+{
+  const j = createJob({ name: 'Update-target-only', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  let threw = false;
+  try { updateJob(j.id, { session_target: 'shell' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'updateJob: changing target alone validates against existing kind');
+  deleteJob(j.id);
 }
 
 
