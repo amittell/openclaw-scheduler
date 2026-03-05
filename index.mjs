@@ -24,7 +24,7 @@
  * Usage: node index.mjs <subcommand> [options]
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
@@ -179,6 +179,69 @@ function checkSubagentRunState(sessionKey) {
   return { found: false, active: false, endedAt: null, runId: null };
 }
 
+// ── Gateway Error Log Check ──────────────────────────────────
+
+/**
+ * Check the gateway error log for 529/FailoverError/overload errors
+ * matching a specific session key.
+ *
+ * Scans the last N bytes of gateway.err.log for diagnostic lane task errors
+ * that reference the session key and match overload patterns.
+ *
+ * @param {string} sessionKey - The session key to check
+ * @returns {{ found: boolean, error: string|null, timestamp: string|null }}
+ */
+function check529InGatewayLog(sessionKey) {
+  const OVERLOAD_PATTERNS = [
+    /529/i,
+    /failover\s*error/i,
+    /overload/i,
+    /temporarily\s+overloaded/i,
+  ];
+
+  try {
+    const logPath = join(process.env.HOME || '~', '.openclaw', 'logs', 'gateway.err.log');
+    if (!existsSync(logPath)) return { found: false, error: null, timestamp: null };
+
+    // Read last 512KB of the log (sufficient for recent errors)
+    const fileStat = statSync(logPath);
+    const readSize = Math.min(fileStat.size, 512 * 1024);
+    const fd = openSync(logPath, 'r');
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, Math.max(0, fileStat.size - readSize));
+    closeSync(fd);
+
+    const tail = buf.toString('utf-8');
+    const lines = tail.split('\n');
+
+    // Search backwards for the most recent match
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line.includes(sessionKey)) continue;
+      if (!line.includes('lane task error')) continue;
+
+      // Extract the error message
+      const errorMatch = line.match(/error="([^"]+)"/);
+      if (!errorMatch) continue;
+
+      const errorMsg = errorMatch[1];
+      if (OVERLOAD_PATTERNS.some(p => p.test(errorMsg))) {
+        // Extract timestamp
+        const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/);
+        return {
+          found: true,
+          error: `FailoverError (529): ${errorMsg}`,
+          timestamp: tsMatch ? tsMatch[1] : null,
+        };
+      }
+    }
+
+    return { found: false, error: null, timestamp: null };
+  } catch {
+    return { found: false, error: null, timestamp: null };
+  }
+}
+
 // ── Gateway Session State Check ──────────────────────────────
 
 /**
@@ -194,17 +257,25 @@ function checkSubagentRunState(sessionKey) {
  * @param {string}     sessionKey   - The session key to check
  * @param {Array|null} sessionCache - Pre-fetched sessions.list array (null = unavailable)
  * @param {number}     thresholdMs  - Silence threshold in ms
- * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null }}
+ * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null, is529?: boolean, errorMsg?: string }}
  */
 function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
+  // 0. Check gateway error log for 529/overload errors FIRST.
+  //    If we find a 529, we should resolve as error, not done.
+  const logCheck = check529InGatewayLog(sessionKey);
+
   // 1 & 2. Subagent registry — most authoritative for recent sessions
   const reg = checkSubagentRunState(sessionKey);
   if (reg.found) {
     if (!reg.active) {
       return {
         shouldResolve: true,
-        reason:       'run completed in gateway subagent registry',
+        reason:       logCheck.found
+          ? `529/overload error detected: ${logCheck.error}`
+          : 'run completed in gateway subagent registry',
         lastActivity:  reg.endedAt,
+        is529:         logCheck.found,
+        errorMsg:      logCheck.error || null,
       };
     }
     // Actively running according to registry — don't touch it
@@ -232,8 +303,12 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
   if (!session) {
     return {
       shouldResolve: true,
-      reason:       'session not found in gateway store',
+      reason:       logCheck.found
+        ? `529/overload error detected: ${logCheck.error}`
+        : 'session not found in gateway store',
       lastActivity:  null,
+      is529:         logCheck.found,
+      errorMsg:      logCheck.error || null,
     };
   }
 
@@ -246,8 +321,12 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
   if (silenceMs >= thresholdMs) {
     return {
       shouldResolve: true,
-      reason:       `session idle ${Math.round(silenceMs / 60000)}min in gateway (subagent run pruned = completed)`,
+      reason:       logCheck.found
+        ? `529/overload error detected: ${logCheck.error}`
+        : `session idle ${Math.round(silenceMs / 60000)}min in gateway (subagent run pruned = completed)`,
       lastActivity,
+      is529:         logCheck.found,
+      errorMsg:      logCheck.error || null,
     };
   }
 
@@ -535,11 +614,20 @@ function cmdStatus(flags) {
   if (entry.status === 'running' && entry.sessionKey) {
     const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
     if (check.shouldResolve) {
-      setLabel(label, {
-        status:  'done',
-        summary: `Auto-resolved: ${check.reason}`,
-      });
-      syncAction = `auto-resolved: ${check.reason}`;
+      if (check.is529) {
+        setLabel(label, {
+          status:  'error',
+          error:   check.errorMsg || `529/overload: ${check.reason}`,
+          summary: `Auto-resolved as error: ${check.reason}`,
+        });
+        syncAction = `auto-resolved as 529 error: ${check.reason}`;
+      } else {
+        setLabel(label, {
+          status:  'done',
+          summary: `Auto-resolved: ${check.reason}`,
+        });
+        syncAction = `auto-resolved: ${check.reason}`;
+      }
     }
   }
 
@@ -617,11 +705,20 @@ async function cmdStuck(flags) {
 
     if (check.shouldResolve) {
       // Gateway says this session is done — auto-mark and skip alert
-      setLabel(name, {
-        status:  'done',
-        summary: `Auto-resolved: ${check.reason}`,
-      });
-      autoResolved.push({ label: name, reason: check.reason });
+      if (check.is529) {
+        setLabel(name, {
+          status:  'error',
+          error:   check.errorMsg || `529/overload: ${check.reason}`,
+          summary: `Auto-resolved as error: ${check.reason}`,
+        });
+        autoResolved.push({ label: name, reason: `529 error: ${check.reason}` });
+      } else {
+        setLabel(name, {
+          status:  'done',
+          summary: `Auto-resolved: ${check.reason}`,
+        });
+        autoResolved.push({ label: name, reason: check.reason });
+      }
       continue;
     }
 
@@ -704,12 +801,21 @@ function cmdSync(flags) {
     const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
 
     if (check.shouldResolve) {
-      changes.push({ label: name, from: 'running', to: 'done', reason: check.reason });
+      const newStatus = check.is529 ? 'error' : 'done';
+      changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
       if (!dryRun) {
-        setLabel(name, {
-          status:  'done',
-          summary: `Synced: ${check.reason}`,
-        });
+        if (check.is529) {
+          setLabel(name, {
+            status:  'error',
+            error:   check.errorMsg || `529/overload: ${check.reason}`,
+            summary: `Synced as error: ${check.reason}`,
+          });
+        } else {
+          setLabel(name, {
+            status:  'done',
+            summary: `Synced: ${check.reason}`,
+          });
+        }
       }
     }
   }
