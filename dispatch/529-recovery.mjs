@@ -22,11 +22,13 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LABELS_PATH = join(__dirname, 'labels.json');
 const INDEX_PATH = join(__dirname, 'index.mjs');
+const HOME_DIR = process.env.HOME || homedir();
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000;
@@ -64,7 +66,7 @@ function saveLabels(labels) {
 
 function notify(message) {
   try {
-    const checkinPath = join(process.env.HOME || '~', '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
+    const checkinPath = join(HOME_DIR, '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
     execFileSync('node', [checkinPath, message], {
       encoding: 'utf-8',
       timeout: 10000,

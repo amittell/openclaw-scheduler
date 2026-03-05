@@ -30,9 +30,11 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
+import Database from 'better-sqlite3';
 import { emitEvent, onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const HOME_DIR = process.env.HOME || homedir();
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -42,7 +44,7 @@ const LABELS_PATH = join(__dirname, 'labels.json');
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
-    const configPath = join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
     const cfg = JSON.parse(readFileSync(configPath, 'utf-8'));
     return cfg?.gateway?.auth?.token || null;
   } catch { return null; }
@@ -149,7 +151,7 @@ function gatewayCall(method, params = {}, opts = {}) {
  */
 function loadSubagentRegistry() {
   try {
-    const registryPath = join(process.env.HOME || '~', '.openclaw', 'subagents', 'runs.json');
+    const registryPath = join(HOME_DIR, '.openclaw', 'subagents', 'runs.json');
     const data = JSON.parse(readFileSync(registryPath, 'utf-8'));
     return data?.runs || {};
   } catch {
@@ -201,7 +203,7 @@ function check529InGatewayLog(sessionKey) {
   ];
 
   try {
-    const logPath = join(process.env.HOME || '~', '.openclaw', 'logs', 'gateway.err.log');
+    const logPath = join(HOME_DIR, '.openclaw', 'logs', 'gateway.err.log');
     if (!existsSync(logPath)) return { found: false, error: null, timestamp: null };
 
     // Read last 512KB of the log (sufficient for recent errors)
@@ -437,7 +439,7 @@ async function cmdEnqueue(flags) {
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
-    const configPath = join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
     parts.push(`---`);
     parts.push(`CHECK_IN: To report progress, use curl:`);
     parts.push(`GW_TOKEN=$(python3 -c "import json; print(json.load(open('` + configPath + `'))['gateway']['auth']['token'])")`);
@@ -547,7 +549,7 @@ async function cmdEnqueue(flags) {
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
           run_now:                  true,
         });
-        const schedulerCli = join(process.env.HOME || '~', '.openclaw', 'scheduler', 'cli.js');
+        const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
         execFileSync('node', [schedulerCli, 'jobs', 'add', jobSpec], {
           encoding: 'utf-8',
           timeout:  10000,
@@ -685,15 +687,26 @@ function cmdStatus(flags) {
  * Fails open (returns false) on any DB error.
  */
 function hasActiveWatcher(label) {
+  let db = null;
   try {
-    const dbPath = join(homedir(), '.openclaw', 'scheduler', 'scheduler.db');
-    const safeLabel = label.replace(/'/g, "''");
-    const result = execFileSync('sqlite3', [
-      dbPath,
-      `SELECT COUNT(*) FROM jobs j JOIN runs r ON r.job_id=j.id WHERE j.name='chilisaus-deliver:${safeLabel}' AND (r.status='running' OR (r.status='pending' AND r.started_at > datetime('now','-5 minutes')))`,
-    ], { encoding: 'utf-8', timeout: 5000 }).trim();
-    return parseInt(result, 10) > 0;
-  } catch { return false; }
+    const dbPath = process.env.SCHEDULER_DB || join(HOME_DIR, '.openclaw', 'scheduler', 'scheduler.db');
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const row = db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM jobs j
+      JOIN runs r ON r.job_id = j.id
+      WHERE j.name = ?
+        AND (
+          r.status = 'running'
+          OR (r.status = 'pending' AND r.started_at > datetime('now','-5 minutes'))
+        )
+    `).get(`chilisaus-deliver:${label}`);
+    return (row?.c || 0) > 0;
+  } catch {
+    return false;
+  } finally {
+    try { db?.close(); } catch {}
+  }
 }
 
 async function cmdStuck(flags) {

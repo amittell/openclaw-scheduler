@@ -29,11 +29,13 @@
 import { execFileSync } from 'child_process';
 import { readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = join(__dirname, 'index.mjs');
 const LABELS_PATH = join(__dirname, 'labels.json');
+const HOME_DIR = process.env.HOME || homedir();
 
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
@@ -41,7 +43,7 @@ const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
-    const configPath = join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
     const cfg = JSON.parse(readFileSync(configPath, 'utf-8'));
     return cfg?.gateway?.auth?.token || null;
   } catch {
@@ -185,7 +187,7 @@ function setRetryCount(label, count) {
  */
 function notify(message) {
   try {
-    const checkinPath = join(process.env.HOME || '~', '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
+    const checkinPath = join(HOME_DIR, '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
     execFileSync('node', [checkinPath, message], {
       encoding: 'utf-8',
       timeout: 10000,
