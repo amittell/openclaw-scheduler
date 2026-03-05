@@ -367,7 +367,7 @@ INSERT OR IGNORE INTO jobs (
   'isolated',
   'main',
   'shellCommand',
-  'node ~/.openclaw/chilisaus/529-recovery.mjs',
+  'node dispatch/529-recovery.mjs',
   120,
   datetime('now'),
   datetime('now')

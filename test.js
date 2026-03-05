@@ -1635,17 +1635,13 @@ console.log('\n── delete_after_run Safety ──');
   const afterError = getJob(oneShot.id);
   assert(afterError !== undefined, 'one-shot job survives error status (not deleted)');
 
-  // Simulate ok status via updateJobAfterRun-like logic
-  // The dispatcher calls updateJobAfterRun which does: if (status === 'ok' && job.delete_after_run) deleteJob
-  // We verify the condition directly
-  const shouldDeleteOnOk = ('ok' === 'ok' && oneShot.delete_after_run);
-  assert(shouldDeleteOnOk, 'delete_after_run triggers on ok status');
+  // Simulate updateJobAfterRun deletion condition directly.
+  // updateJobAfterRun deletes only when status === 'ok' and delete_after_run is truthy.
+  const shouldDelete = (status, job) => status === 'ok' && Boolean(job.delete_after_run);
 
-  const shouldDeleteOnError = ('error' === 'ok' && oneShot.delete_after_run);
-  assert(!shouldDeleteOnError, 'delete_after_run does NOT trigger on error status');
-
-  const shouldDeleteOnTimeout = ('timeout' === 'ok' && oneShot.delete_after_run);
-  assert(!shouldDeleteOnTimeout, 'delete_after_run does NOT trigger on timeout status');
+  assert(shouldDelete('ok', oneShot), 'delete_after_run triggers on ok status');
+  assert(!shouldDelete('error', oneShot), 'delete_after_run does NOT trigger on error status');
+  assert(!shouldDelete('timeout', oneShot), 'delete_after_run does NOT trigger on timeout status');
 
   // Clean up
   deleteJob(oneShot.id);

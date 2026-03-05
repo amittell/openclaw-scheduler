@@ -38,6 +38,19 @@ const LABELS_PATH = join(__dirname, 'labels.json');
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
+function getGatewayToken() {
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    const configPath = join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    const cfg = JSON.parse(readFileSync(configPath, 'utf-8'));
+    return cfg?.gateway?.auth?.token || null;
+  } catch {
+    return null;
+  }
+}
+
+const GW_TOKEN = getGatewayToken();
+
 // ── Gateway RPC (sync, matches index.mjs pattern) ───────────
 
 /**
