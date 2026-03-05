@@ -512,6 +512,8 @@ if (finalResult?.lastReply) {
 // Only steer if tokens have been flat for 3+ minutes post-deadline.
 // If the session is still making model calls (tokens growing), stay silent.
 function getTokenCount(sessionKey) {
+  const gatewayTokens = sessionKey ? getSessionTokens(sessionKey) : null;
+  if (typeof gatewayTokens === 'number') return gatewayTokens;
   try {
     const result = chilisaus('status', ['--label', label]);
     // sessions.list via gateway would be better but chilisaus status has liveness
@@ -539,16 +541,26 @@ function markDoneSync(summary) {
 const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
 const ACTIVITY_POLL_MS = 30_000;
 
-let baselineTokens = getTokenCount(label);
+const statusAtDeadline = chilisaus('status', ['--label', label]);
+let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null;
+let baselineTokens = getTokenCount(tokenSessionKey);
 let flatSince = Date.now();
 
 process.stderr.write(`[watcher] deadline hit for ${label} — watching token activity (baseline: ${baselineTokens})\n`);
+
+if (baselineTokens === null) {
+  process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
+  markDoneSync(`timed out after ${timeoutS}s — token telemetry unavailable`);
+  process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
+  process.exit(1);
+}
 
 while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   await sleep(ACTIVITY_POLL_MS);
 
   // Delivered?
   const st = chilisaus('status', ['--label', label]);
+  if (st?.sessionKey && !tokenSessionKey) tokenSessionKey = st.sessionKey;
   if (st?.status === 'done') {
     const r = chilisaus('result', ['--label', label]);
     markDoneSync('completed during activity window');
@@ -561,8 +573,14 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   }
 
   // Token growth?
-  const cur = getTokenCount(label);
-  if (cur !== null && baselineTokens !== null && cur > baselineTokens) {
+  const cur = getTokenCount(tokenSessionKey);
+  if (cur === null) {
+    process.stderr.write(`[watcher] token telemetry lost for ${label}; skipping steer/kill recovery\n`);
+    markDoneSync(`timed out after ${timeoutS}s — token telemetry lost`);
+    process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
+    process.exit(1);
+  }
+  if (cur > baselineTokens) {
     process.stderr.write(`[watcher] ${label} still active (${baselineTokens}→${cur} tokens), resetting flat timer\n`);
     baselineTokens = cur;
     flatSince = Date.now();

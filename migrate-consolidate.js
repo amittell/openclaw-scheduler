@@ -13,6 +13,56 @@
 
 import { getDb } from './db.js';
 
+function reconcileSeedJobs(db) {
+  try {
+    db.exec(`
+      INSERT OR IGNORE INTO jobs (
+        id, name, enabled,
+        schedule_cron, schedule_tz,
+        session_target, agent_id,
+        payload_kind, payload_message,
+        payload_timeout_seconds,
+        next_run_at,
+        created_at, updated_at
+      ) VALUES (
+        '8f2be5bd-b537-48c7-b277-44e934104ddc',
+        'Chilisaus 529 Recovery',
+        1,
+        '*/10 * * * *',
+        'UTC',
+        'shell',
+        'main',
+        'shellCommand',
+        'node dispatch/529-recovery.mjs',
+        120,
+        datetime('now', '-1 second'),
+        datetime('now'),
+        datetime('now')
+      );
+
+      UPDATE jobs
+      SET
+        session_target = 'shell',
+        payload_kind = 'shellCommand',
+        payload_message = 'node dispatch/529-recovery.mjs',
+        next_run_at = CASE
+          WHEN enabled = 1 AND next_run_at IS NULL THEN datetime('now', '-1 second')
+          ELSE next_run_at
+        END,
+        updated_at = datetime('now')
+      WHERE
+        id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
+        AND (
+          session_target = 'isolated'
+          OR payload_message = 'node ~/.openclaw/chilisaus/529-recovery.mjs'
+          OR (enabled = 1 AND next_run_at IS NULL)
+        );
+    `);
+  } catch {
+    // best effort; old schemas may be missing jobs columns before migration
+  }
+}
+
 export default function migrateConsolidate() {
   const db = getDb();
 
@@ -20,7 +70,10 @@ export default function migrateConsolidate() {
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  if (current >= 10) return false;
+  if (current >= 10) {
+    reconcileSeedJobs(db);
+    return false;
+  }
 
   // ── Column additions (all idempotent — column already exists = silent ignore) ─
 
@@ -249,6 +302,8 @@ export default function migrateConsolidate() {
   for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
     stmt.run(v);
   }
+
+  reconcileSeedJobs(db);
 
   return true;
 }

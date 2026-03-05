@@ -17,11 +17,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   schedule_tz     TEXT NOT NULL DEFAULT 'America/New_York',
   
   -- Execution
-  session_target  TEXT NOT NULL DEFAULT 'isolated',  -- 'main' | 'isolated'
+  session_target  TEXT NOT NULL DEFAULT 'isolated',  -- 'main' | 'isolated' | 'shell'
   agent_id        TEXT DEFAULT 'main',
   
   -- Payload
-  payload_kind    TEXT NOT NULL,                      -- 'systemEvent' | 'agentTurn'
+  payload_kind    TEXT NOT NULL,                      -- 'systemEvent' | 'agentTurn' | 'shellCommand'
   payload_message TEXT NOT NULL,
   payload_model   TEXT,
   payload_thinking TEXT,
@@ -357,18 +357,42 @@ INSERT OR IGNORE INTO jobs (
   session_target, agent_id,
   payload_kind, payload_message,
   payload_timeout_seconds,
+  next_run_at,
   created_at, updated_at
 ) VALUES (
   '8f2be5bd-b537-48c7-b277-44e934104ddc',
   'Chilisaus 529 Recovery',
   1,
   '*/10 * * * *',
-  'America/New_York',
-  'isolated',
+  'UTC',
+  'shell',
   'main',
   'shellCommand',
   'node dispatch/529-recovery.mjs',
   120,
+  datetime('now', '-1 second'),
   datetime('now'),
   datetime('now')
 );
+
+-- Reconcile previously seeded broken recovery rows:
+-- - wrong target ('isolated' + 'shellCommand')
+-- - legacy script path under ~/.openclaw/chilisaus
+-- - missing next_run_at (never becomes due)
+UPDATE jobs
+SET
+  session_target = 'shell',
+  payload_kind = 'shellCommand',
+  payload_message = 'node dispatch/529-recovery.mjs',
+  next_run_at = CASE
+    WHEN enabled = 1 AND next_run_at IS NULL THEN datetime('now', '-1 second')
+    ELSE next_run_at
+  END,
+  updated_at = datetime('now')
+WHERE
+  id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
+  AND (
+    session_target = 'isolated'
+    OR payload_message = 'node ~/.openclaw/chilisaus/529-recovery.mjs'
+    OR (enabled = 1 AND next_run_at IS NULL)
+  );
