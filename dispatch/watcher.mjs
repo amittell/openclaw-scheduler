@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * chilisaus watcher — polls a session until done, outputs the result.
+ * dispatch watcher — polls a session until done, outputs the result.
  *
  * Used by scheduler shell jobs for async delivery with retry + audit trail.
  * The scheduler runs this as a shell job with delivery_mode='announce-always',
@@ -15,7 +15,7 @@
  * 529/Overload auto-retry:
  *   When a session errors with a 529/FailoverError/overload pattern, the watcher
  *   will automatically retry up to MAX_529_RETRIES times with exponential backoff
- *   (30s * retryCount). It respawns via `chilisaus enqueue --mode reuse` to continue
+ *   (30s * retryCount). It respawns via `dispatch enqueue --mode reuse` to continue
  *   the same session, and tracks retryCount in labels.json.
  *
  * Usage: node watcher.mjs --label <label> [--timeout <seconds>] [--poll-interval <seconds>]
@@ -106,9 +106,9 @@ function parseFlags(argv) {
 }
 
 /**
- * Run a chilisaus subcommand and return parsed JSON, or null on failure.
+ * Run a dispatch subcommand and return parsed JSON, or null on failure.
  */
-function chilisaus(subcmd, args) {
+function dispatch(subcmd, args) {
   try {
     const result = execFileSync('node', [INDEX_PATH, subcmd, ...args], {
       encoding: 'utf-8',
@@ -214,7 +214,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
       labels[label].updatedAt = new Date().toISOString();
       saveLabels(labels);
     }
-    notify(`🌶️ Chilisaus: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) — giving up`);
+    notify(`🌶️ Dispatch: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) — giving up`);
     return false;
   }
 
@@ -225,7 +225,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
     `[watcher] 529 detected for [${label}] (attempt ${newRetryCount}/${MAX_529_RETRIES}). ` +
     `Waiting ${delayMs / 1000}s before retry...\n`
   );
-  notify(`🌶️ Chilisaus: [${label}] hit 529 overload — retry ${newRetryCount}/${MAX_529_RETRIES} in ${delayMs / 1000}s`);
+  notify(`🌶️ Dispatch: [${label}] hit 529 overload — retry ${newRetryCount}/${MAX_529_RETRIES} in ${delayMs / 1000}s`);
 
   // Update retryCount in labels.json BEFORE sleeping (persist intent)
   setRetryCount(label, newRetryCount);
@@ -234,7 +234,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
 }
 
 /**
- * Re-enqueue a label via chilisaus enqueue --mode reuse.
+ * Re-enqueue a label via dispatch enqueue --mode reuse.
  * Uses the original label's message from the gateway session.
  */
 function respawnSession(label) {
@@ -373,10 +373,10 @@ function deliverResult(label, lastReply, fallbackSummary) {
     const reply = lastReply.length > maxLen
       ? lastReply.slice(0, maxLen) + '\n\n…[truncated]'
       : lastReply;
-    process.stdout.write(`🌶️ *chilisaus* [${label}] completed:\n\n${reply}\n`);
+    process.stdout.write(`🌶️ *dispatch* [${label}] completed:\n\n${reply}\n`);
   } else {
     process.stdout.write(
-      `🌶️ *chilisaus* [${label}] completed (no reply captured)\n` +
+      `🌶️ *dispatch* [${label}] completed (no reply captured)\n` +
       `Summary: ${fallbackSummary || 'none'}\n`
     );
   }
@@ -420,12 +420,12 @@ const MAX_CONSECUTIVE_FAILURES = 10;
 let recoverySessionKey = null;  // captured during polling for steer/kill
 
 while (Date.now() < deadline) {
-  const status = chilisaus('status', ['--label', label]);
+  const status = dispatch('status', ['--label', label]);
 
   if (!status?.ok) {
     consecutiveFailures++;
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      process.stdout.write(`⚠️ chilisaus [${label}] watcher: gave up after ${MAX_CONSECUTIVE_FAILURES} consecutive status failures\n`);
+      process.stdout.write(`⚠️ dispatch [${label}] watcher: gave up after ${MAX_CONSECUTIVE_FAILURES} consecutive status failures\n`);
       process.exit(1);
     }
     await sleep(pollS * 1000);
@@ -447,7 +447,7 @@ while (Date.now() < deadline) {
       if (retryResult === false) {
         // Max retries exceeded — deliver error
         process.stdout.write(
-          `🌶️ *chilisaus* [${label}] failed after ${MAX_529_RETRIES} retries (529 overload)\n` +
+          `🌶️ *dispatch* [${label}] failed after ${MAX_529_RETRIES} retries (529 overload)\n` +
           `Error: ${errorMsg}\n`
         );
         process.exit(1);
@@ -464,7 +464,7 @@ while (Date.now() < deadline) {
       } else {
         // Respawn failed — deliver error
         process.stdout.write(
-          `🌶️ *chilisaus* [${label}] 529 retry failed — could not respawn session\n` +
+          `🌶️ *dispatch* [${label}] 529 retry failed — could not respawn session\n` +
           `Error: ${errorMsg}\n`
         );
         process.exit(1);
@@ -482,7 +482,7 @@ while (Date.now() < deadline) {
         process.stderr.write(`[watcher] [${label}] completed after ${currentRetryCount} retry(ies), reset retryCount\n`);
       }
     }
-    const result = chilisaus('result', ['--label', label]);
+    const result = dispatch('result', ['--label', label]);
     deliverResult(label, result?.lastReply, status.summary);
   }
 
@@ -492,7 +492,7 @@ while (Date.now() < deadline) {
   // auto-resolved yet (10min threshold in checkSessionDone).
   const ageMs = status.liveness?.ageMs;
   if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
-    const result = chilisaus('result', ['--label', label]);
+    const result = dispatch('result', ['--label', label]);
     if (result?.lastReply) {
       deliverResult(label, result.lastReply, null);
     }
@@ -503,7 +503,7 @@ while (Date.now() < deadline) {
 }
 
 // Timed out — try one last result check
-const finalResult = chilisaus('result', ['--label', label]);
+const finalResult = dispatch('result', ['--label', label]);
 if (finalResult?.lastReply) {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
@@ -517,8 +517,8 @@ function getTokenCount(sessionKey) {
   const gatewayTokens = sessionKey ? getSessionTokens(sessionKey) : null;
   if (typeof gatewayTokens === 'number') return gatewayTokens;
   try {
-    const result = chilisaus('status', ['--label', label]);
-    // sessions.list via gateway would be better but chilisaus status has liveness
+    const result = dispatch('status', ['--label', label]);
+    // sessions.list via gateway would be better but dispatch status has liveness
     const tokens = result?.liveness?.tokens;
     return typeof tokens === 'number' ? tokens : null;
   } catch { return null; }
@@ -543,7 +543,7 @@ function markDoneSync(summary) {
 const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
 const ACTIVITY_POLL_MS = 30_000;
 
-const statusAtDeadline = chilisaus('status', ['--label', label]);
+const statusAtDeadline = dispatch('status', ['--label', label]);
 let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null;
 let baselineTokens = getTokenCount(tokenSessionKey);
 let flatSince = Date.now();
@@ -553,7 +553,7 @@ process.stderr.write(`[watcher] deadline hit for ${label} — watching token act
 if (baselineTokens === null) {
   process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
   markDoneSync(`timed out after ${timeoutS}s — token telemetry unavailable`);
-  process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
+  process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
   process.exit(1);
 }
 
@@ -561,14 +561,14 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   await sleep(ACTIVITY_POLL_MS);
 
   // Delivered?
-  const st = chilisaus('status', ['--label', label]);
+  const st = dispatch('status', ['--label', label]);
   if (st?.sessionKey && !tokenSessionKey) tokenSessionKey = st.sessionKey;
   if (st?.status === 'done') {
-    const r = chilisaus('result', ['--label', label]);
+    const r = dispatch('result', ['--label', label]);
     markDoneSync('completed during activity window');
     deliverResult(label, r?.lastReply, st.summary);
   }
-  const r2 = chilisaus('result', ['--label', label]);
+  const r2 = dispatch('result', ['--label', label]);
   if (r2?.lastReply) {
     markDoneSync('completed during activity window');
     deliverResult(label, r2.lastReply, null);
@@ -579,7 +579,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   if (cur === null) {
     process.stderr.write(`[watcher] token telemetry lost for ${label}; skipping steer/kill recovery\n`);
     markDoneSync(`timed out after ${timeoutS}s — token telemetry lost`);
-    process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
+    process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
     process.exit(1);
   }
   if (cur > baselineTokens) {
@@ -593,7 +593,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
 process.stderr.write(`[watcher] ${label} inactive 3min post-deadline — entering steer\n`);
 
 // Get sessionKey for steer/kill
-const statusForSteer = chilisaus('status', ['--label', label]);
+const statusForSteer = dispatch('status', ['--label', label]);
 const steerSessionKey = statusForSteer?.sessionKey || null;
 
 const steerRounds = [
@@ -609,13 +609,13 @@ for (const round of steerRounds) {
   }
   await sleep(round.waitMs);
 
-  const st2 = chilisaus('status', ['--label', label]);
+  const st2 = dispatch('status', ['--label', label]);
   if (st2?.status === 'done') {
-    const r3 = chilisaus('result', ['--label', label]);
+    const r3 = dispatch('result', ['--label', label]);
     markDoneSync('completed during steer recovery');
     deliverResult(label, r3?.lastReply, st2.summary);
   }
-  const r3 = chilisaus('result', ['--label', label]);
+  const r3 = dispatch('result', ['--label', label]);
   if (r3?.lastReply) {
     markDoneSync('completed during steer recovery');
     deliverResult(label, r3.lastReply, null);
@@ -627,10 +627,10 @@ for (const round of steerRounds) {
     // Wait up to 30s for confirmation
     for (let i = 0; i < 6; i++) {
       await sleep(5000);
-      const st3 = chilisaus('status', ['--label', label]);
+      const st3 = dispatch('status', ['--label', label]);
       if (st3?.status === 'done') {
         markDoneSync('killed after steer+backoff — confirmed done');
-        process.stdout.write(`🌶️ *chilisaus* [${label}] killed after steer attempts\n`);
+        process.stdout.write(`🌶️ *dispatch* [${label}] killed after steer attempts\n`);
         process.exit(0);
       }
     }
@@ -638,5 +638,5 @@ for (const round of steerRounds) {
 }
 
 markDoneSync(`timed out after ${timeoutS}s — killed after steer attempts`);
-process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — session killed after steer attempts\n`);
+process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — session killed after steer attempts\n`);
 process.exit(1);

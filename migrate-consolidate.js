@@ -26,7 +26,7 @@ function reconcileSeedJobs(db) {
         created_at, updated_at
       ) VALUES (
         '8f2be5bd-b537-48c7-b277-44e934104ddc',
-        'Chilisaus 529 Recovery',
+        'Dispatch 529 Recovery',
         1,
         '*/10 * * * *',
         'UTC',
@@ -54,7 +54,7 @@ function reconcileSeedJobs(db) {
         id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
         AND (
           session_target = 'isolated'
-          OR payload_message = 'node ~/.openclaw/chilisaus/529-recovery.mjs'
+          OR payload_message LIKE 'node ~/.openclaw/%/529-recovery.mjs'
           OR (enabled = 1 AND next_run_at IS NULL)
         );
     `);

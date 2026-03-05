@@ -1,5 +1,5 @@
 /**
- * chilisaus-hooks.mjs — Lifecycle event emitter
+ * dispatch-hooks.mjs — Lifecycle event emitter
  *
  * Fires structured dispatch events to:
  *   1. Loki (always — structured log stream for Grafana observability)
@@ -19,7 +19,7 @@ import { hostname } from 'os';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
-const HOST         = process.env.CHILISAUS_HOST     || hostname() || 'rh-bot.lan';
+const HOST         = process.env.DISPATCH_HOST     || hostname() || 'rh-bot.lan';
 const TIMEOUT_MS   = 3000;
 
 // ── Loki push ───────────────────────────────────────────────
@@ -31,7 +31,7 @@ async function lokiPush(event, payload) {
 
   const body = JSON.stringify({
     streams: [{
-      stream: { service_name: 'chilisaus', host: HOST, event },
+      stream: { service_name: 'dispatch', host: HOST, event },
       values: [[ts, logLine]],
     }],
   });
@@ -64,11 +64,11 @@ async function webhookPush(event, payload) {
 export async function emitEvent(event, payload = {}) {
   const tasks = [
     lokiPush(event, payload).catch(e =>
-      process.stderr.write(`[chilisaus-hooks] loki failed (${event}): ${e.message}\n`)
+      process.stderr.write(`[dispatch-hooks] loki failed (${event}): ${e.message}\n`)
     ),
     WEBHOOK_URL
       ? webhookPush(event, payload).catch(e =>
-          process.stderr.write(`[chilisaus-hooks] webhook failed (${event}): ${e.message}\n`)
+          process.stderr.write(`[dispatch-hooks] webhook failed (${event}): ${e.message}\n`)
         )
       : Promise.resolve(),
   ];

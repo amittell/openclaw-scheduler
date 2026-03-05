@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * chilisaus 529 recovery — scheduler safety net for 529/overload errors.
+ * dispatch 529 recovery — scheduler safety net for 529/overload errors.
  *
  * Scans labels.json for sessions in 'error' state with 529/overload patterns.
  * If retryCount < MAX_RETRIES and the watcher hasn't already handled it,
@@ -175,11 +175,11 @@ for (const [name, entry] of Object.entries(labels)) {
       updated[name].updatedAt = new Date().toISOString();
       saveLabels(updated);
     }
-    notify(`🌶️ Chilisaus 529 recovery: [${name}] retried (${newRetryCount}/${MAX_RETRIES}) via ${method}`);
+    notify(`🌶️ Dispatch 529 recovery: [${name}] retried (${newRetryCount}/${MAX_RETRIES}) via ${method}`);
     results.push({ label: name, action: 'retried', method, retryCount: newRetryCount });
     anyRetried = true;
   } else {
-    notify(`🌶️ Chilisaus 529 recovery: [${name}] retry FAILED (${newRetryCount}/${MAX_RETRIES})`);
+    notify(`🌶️ Dispatch 529 recovery: [${name}] retry FAILED (${newRetryCount}/${MAX_RETRIES})`);
     results.push({ label: name, action: 'retry_failed', retryCount: newRetryCount });
   }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * chilisaus — Sub-agent dispatch CLI for OpenClaw
+ * dispatch — Sub-agent dispatch CLI for OpenClaw
  *
  * Spawns and steers isolated agent sessions via the OpenClaw Gateway API.
  * Tracks label→session mappings in a local JSON ledger.
@@ -55,7 +55,7 @@ const GATEWAY_TOKEN = getGatewayToken();
 // ── Helpers ──────────────────────────────────────────────────
 
 function die(msg, code = 1) {
-  process.stderr.write(`[chilisaus] ${msg}\n`);
+  process.stderr.write(`[dispatch] ${msg}\n`);
   process.exit(code);
 }
 
@@ -390,7 +390,7 @@ async function cmdEnqueue(flags) {
     const existing = getLabel(label);
     if (existing?.sessionKey) {
       sessionKey = existing.sessionKey;
-      process.stderr.write(`[chilisaus] mode=reuse → continuing session ${sessionKey}\n`);
+      process.stderr.write(`[dispatch] mode=reuse → continuing session ${sessionKey}\n`);
     } else {
       die(`mode=reuse: no prior session found for label "${label}". Use --mode fresh.`);
     }
@@ -509,14 +509,14 @@ async function cmdEnqueue(flags) {
               action: 'send',
               channel: deliverChannel,
               target: deliverTo,
-              message: `🌶️ *chilisaus* [${label}] starting...`,
+              message: `🌶️ *dispatch* [${label}] starting...`,
             },
             sessionKey: 'main',
           }),
           signal: AbortSignal.timeout(5000),
         });
       } catch (err) {
-        process.stderr.write(`[chilisaus] starting notification failed: ${err.message}\n`);
+        process.stderr.write(`[dispatch] starting notification failed: ${err.message}\n`);
       }
     }
 
@@ -535,7 +535,7 @@ async function cmdEnqueue(flags) {
         const watcherCmd = `node '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
-          name:                     `chilisaus-deliver:${label}`,
+          name:                     `dispatch-deliver:${label}`,
           schedule_cron:            '0 0 31 2 *',  // never-cron; run_now triggers it once
           session_target:           'shell',
           payload_kind:             'shellCommand',
@@ -556,9 +556,9 @@ async function cmdEnqueue(flags) {
           stdio:    ['pipe', 'pipe', 'pipe'],
         });
         schedulerWatcherOk = true;
-        process.stderr.write(`[chilisaus] scheduler watcher registered: chilisaus-deliver:${label}\n`);
+        process.stderr.write(`[dispatch] scheduler watcher registered: dispatch-deliver:${label}\n`);
       } catch (err) {
-        process.stderr.write(`[chilisaus] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
+        process.stderr.write(`[dispatch] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
       }
     }
 
@@ -682,7 +682,7 @@ function cmdStatus(flags) {
  *   --threshold-min <n>   Minutes without activity to consider stuck (default: 15)
  */
 /**
- * Check if a chilisaus-deliver watcher job is actively running for a label.
+ * Check if a dispatch-deliver watcher job is actively running for a label.
  * Uses scheduler DB to check for a running/recent-pending run.
  * Fails open (returns false) on any DB error.
  */
@@ -695,12 +695,12 @@ function hasActiveWatcher(label) {
       SELECT COUNT(*) AS c
       FROM jobs j
       JOIN runs r ON r.job_id = j.id
-      WHERE j.name = ?
+      WHERE j.name LIKE ?
         AND (
           r.status = 'running'
           OR (r.status = 'pending' AND r.started_at > datetime('now','-5 minutes'))
         )
-    `).get(`chilisaus-deliver:${label}`);
+    `).get(`%-deliver:${label}`);
     return (row?.c || 0) > 0;
   } catch {
     return false;
@@ -739,7 +739,7 @@ async function cmdStuck(flags) {
 
     // ── Skip if an active watcher is already monitoring this session ──────
     if (hasActiveWatcher(name)) {
-      watcherSkipped.push({ label: name, reason: 'active chilisaus-deliver watcher' });
+      watcherSkipped.push({ label: name, reason: 'active dispatch-deliver watcher' });
       continue;
     }
 
@@ -785,7 +785,7 @@ async function cmdStuck(flags) {
   // Log auto-resolved sessions to stderr (informational, won't trigger delivery)
   if (autoResolved.length > 0) {
     const lines = autoResolved.map(r => `  ✓ ${r.label}: ${r.reason}`).join('\n');
-    process.stderr.write(`[chilisaus] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
+    process.stderr.write(`[dispatch] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
   }
 
   if (!stuckSessions.length) {
@@ -1054,7 +1054,7 @@ function cmdList(flags) {
 
 function usage() {
   process.stdout.write(`
-chilisaus 🌶️ — sub-agent dispatch CLI (native gateway API)
+dispatch 🌶️ — sub-agent dispatch CLI (native gateway API)
 
 Usage: node index.mjs <subcommand> [flags]
 

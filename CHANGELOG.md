@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [1.0.3] — 2026-03-05
 
 ### Fixed
-- Seeded `Chilisaus 529 Recovery` job now uses valid shell dispatch fields and is immediately schedulable (`next_run_at` set)
+- Seeded `Dispatch 529 Recovery` job now uses valid shell dispatch fields and is immediately schedulable (`next_run_at` set)
 - Added seed reconciliation for existing DBs to auto-repair legacy/invalid recovery job rows
 - Watcher timeout recovery now avoids steer/kill escalation when token telemetry is unavailable
 - Dispatch path handling now uses robust home-directory resolution (no literal `~` fallback paths)

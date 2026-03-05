@@ -1,8 +1,8 @@
-# chilisaus 🌶️
+# dispatch 🌶️
 
 **Sub-agent dispatch CLI for OpenClaw — native gateway API edition.**
 
-chilisaus spawns and steers isolated agent sessions directly via the OpenClaw
+dispatch spawns and steers isolated agent sessions directly via the OpenClaw
 Gateway API. It tracks label→session mappings in a local JSON ledger, giving
 you a simple CLI to dispatch work, check on it, steer it mid-run, and get
 results back.
@@ -24,7 +24,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 
 ## How it works
 
-chilisaus calls the OpenClaw Gateway RPC API directly:
+dispatch calls the OpenClaw Gateway RPC API directly:
 
 1. **`sessions.patch`** — configure the session (model, thinking level, spawn depth)
 2. **`agent`** — send a message into the session (spawning it if new)
@@ -33,7 +33,7 @@ chilisaus calls the OpenClaw Gateway RPC API directly:
 
 ```
 Orchestrator calls:
-  chilisaus enqueue --label ticket-42 --message "Fix the deploy script"
+  dispatch enqueue --label ticket-42 --message "Fix the deploy script"
 
   → Creates session key: agent:main:subagent:<uuid>
   → Patches session with model/thinking/spawnDepth
@@ -51,7 +51,7 @@ Orchestrator calls:
 ### `enqueue` — spawn a new session
 
 ```bash
-node chilisaus/index.mjs enqueue \
+node dispatch/index.mjs enqueue \
   --label   "ticket-42"             \
   --message "Fix the deploy script" \
   --mode    fresh                   \   # fresh | reuse
@@ -81,7 +81,7 @@ node chilisaus/index.mjs enqueue \
 ### `status` — session status for a label
 
 ```bash
-node chilisaus/index.mjs status --label "ticket-42"
+node dispatch/index.mjs status --label "ticket-42"
 ```
 
 Returns ledger info + live session data from gateway (model, age, token usage).
@@ -89,7 +89,7 @@ Returns ledger info + live session data from gateway (model, age, token usage).
 ### `stuck` — find stuck running sessions
 
 ```bash
-node chilisaus/index.mjs stuck --threshold-min 15
+node dispatch/index.mjs stuck --threshold-min 15
 ```
 
 Exit 0 = nothing stuck (silent).
@@ -101,7 +101,7 @@ session store for last activity timestamp.
 ### `result` — last assistant reply from a session
 
 ```bash
-node chilisaus/index.mjs result --label "ticket-42"
+node dispatch/index.mjs result --label "ticket-42"
 ```
 
 Reads the session transcript via `chat.history` and returns the last assistant
@@ -110,7 +110,7 @@ message.
 ### `send` — message a running session
 
 ```bash
-node chilisaus/index.mjs send \
+node dispatch/index.mjs send \
   --label "ticket-42" \
   --message "Tests still failing on line 42, focus on the edge case"
 ```
@@ -121,7 +121,7 @@ user turn and continues working. This is the **mid-session steering superpower**
 ### `steer` — alias for send
 
 ```bash
-node chilisaus/index.mjs steer \
+node dispatch/index.mjs steer \
   --label "ticket-42" \
   --message "Change approach: use the new API instead"
 ```
@@ -131,9 +131,9 @@ Identical to `send`. The name makes intent explicit.
 ### `heartbeat` — check session liveness
 
 ```bash
-node chilisaus/index.mjs heartbeat --label "ticket-42"
+node dispatch/index.mjs heartbeat --label "ticket-42"
 # or:
-node chilisaus/index.mjs heartbeat --session-key "agent:main:subagent:..."
+node dispatch/index.mjs heartbeat --session-key "agent:main:subagent:..."
 ```
 
 Returns whether the session is alive (updated within the last 10 minutes),
@@ -142,7 +142,7 @@ plus session metadata.
 ### `list` — list all tracked labels
 
 ```bash
-node chilisaus/index.mjs list [--status running] [--limit 10]
+node dispatch/index.mjs list [--status running] [--limit 10]
 ```
 
 Shows all labels in the ledger, sorted by most recent. Filter by status.
@@ -157,10 +157,10 @@ it left off with full conversation history.
 
 ```bash
 # First run — fresh session
-node chilisaus/index.mjs enqueue --label "daily-report" --message "Generate today's report"
+node dispatch/index.mjs enqueue --label "daily-report" --message "Generate today's report"
 
 # Later — continue in the same session
-node chilisaus/index.mjs enqueue --label "daily-report" --message "Add the Q4 numbers" --mode reuse
+node dispatch/index.mjs enqueue --label "daily-report" --message "Add the Q4 numbers" --mode reuse
 ```
 
 ---
@@ -206,14 +206,14 @@ Fires structured events to Loki and/or an HTTP webhook:
 ```bash
 export LOKI_PUSH_URL=http://your-loki-host/loki/api/v1/push
 export DISPATCH_WEBHOOK_URL=https://your-endpoint.example.com/hook
-export CHILISAUS_HOST=my-agent-host
+export DISPATCH_HOST=my-agent-host
 ```
 
 ---
 
 ## Gateway Auth
 
-chilisaus reads the gateway token from:
+dispatch reads the gateway token from:
 1. `OPENCLAW_GATEWAY_TOKEN` environment variable
 2. `~/.openclaw/openclaw.json` → `gateway.auth.token`
 
@@ -225,16 +225,16 @@ No manual token configuration needed on a standard OpenClaw install.
 
 ### How it works
 
-When `--deliver-to` is set, chilisaus registers a **scheduler watcher job**
+When `--deliver-to` is set, dispatch registers a **scheduler watcher job**
 after dispatching the session. The watcher polls the session result every
 minute until the agent produces a reply, then delivers via the scheduler's
 `handleDelivery` pipeline.
 
 ```
-chilisaus enqueue --deliver-to 484946046
+dispatch enqueue --deliver-to 484946046
   → gateway agent call (deliver: false, fire-and-forget)
-  → scheduler job: chilisaus-deliver:<label> (*/1 * * * *, shell, one-shot)
-  → watcher polls: node chilisaus/index.mjs result --label <label>
+  → scheduler job: dispatch-deliver:<label> (*/1 * * * *, shell, one-shot)
+  → watcher polls: node dispatch/index.mjs result --label <label>
   → on success (exit 0): scheduler delivers output to telegram/484946046
   → job self-deletes (delete_after_run: true)
 ```
@@ -271,13 +271,13 @@ curl -s -X POST http://127.0.0.1:18789/tools/invoke \
 
 ### Before (scheduler DB dispatch)
 ```
-chilisaus enqueue → creates job in scheduler DB → dispatcher picks up on tick
+dispatch enqueue → creates job in scheduler DB → dispatcher picks up on tick
 → runs as isolated session → announces result → hooks fire
 ```
 
 ### After (native gateway API)
 ```
-chilisaus enqueue → calls gateway API directly → session starts immediately
+dispatch enqueue → calls gateway API directly → session starts immediately
 → tracks in labels.json → announces result → hooks fire
 ```
 
@@ -299,7 +299,7 @@ openclaw cron add '{
   "sessionTarget": "shell",
   "payload": {
     "kind": "shellCommand",
-    "message": "node ~/.openclaw/scheduler/chilisaus/index.mjs stuck --threshold-min 15"
+    "message": "node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15"
   },
   "delivery": {
     "mode": "announce",
@@ -318,10 +318,10 @@ If upgrading from the scheduler-DB version:
 1. Replace `index.mjs` (this file replaces it)
 2. `hooks.mjs` is unchanged (no DB imports)
 3. `labels.json` is created automatically on first `enqueue`
-4. Old scheduler jobs for chilisaus tasks can be removed
+4. Old scheduler jobs for dispatch tasks can be removed
 5. The scheduler DB is no longer needed for dispatch
 
-The CLI flags are identical — existing scripts/agents calling chilisaus
+The CLI flags are identical — existing scripts/agents calling dispatch
 don't need changes (except `--mode auto` is gone; use `fresh` or `reuse`).
 
 New additions: `steer` subcommand (alias for `send`), `list` subcommand,
