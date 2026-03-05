@@ -38,6 +38,43 @@ const LABELS_PATH = join(__dirname, 'labels.json');
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
+// ── Gateway RPC (sync, matches index.mjs pattern) ───────────
+
+/**
+ * Sync gateway RPC call via `openclaw gateway call`.
+ * Returns parsed JSON or null on failure.
+ */
+function gatewayCall(method, params = {}, opts = {}) {
+  const timeout = opts.timeout || 15000;
+  const args = ['gateway', 'call', method, '--json'];
+  args.push('--params', JSON.stringify(params));
+  args.push('--timeout', String(timeout));
+  if (GW_TOKEN) args.push('--token', GW_TOKEN);
+
+  try {
+    const result = execFileSync('openclaw', args, {
+      encoding: 'utf-8',
+      timeout: timeout + 5000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return JSON.parse(result.trim());
+  } catch (err) {
+    const stdout = err.stdout?.trim() || '';
+    if (stdout) try { return JSON.parse(stdout); } catch {}
+    return null;
+  }
+}
+
+/**
+ * Get current totalTokens for a session from gateway sessions.list.
+ * Returns number or null if unavailable.
+ */
+function getSessionTokens(sessionKey) {
+  const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+  const session = result?.sessions?.find(s => s.key === sessionKey);
+  return session?.totalTokens ?? null;
+}
+
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
@@ -248,6 +285,45 @@ function respawnSession(label) {
   }
 }
 
+// ── Gateway Steer & Kill ─────────────────────────────────────
+
+/**
+ * Send a steer message into a running session via gateway API (sync).
+ */
+function steerSession(sessionKey, message) {
+  if (!GW_TOKEN) {
+    process.stderr.write(`[watcher] steer skipped: no gateway token\n`);
+    return false;
+  }
+  try {
+    gatewayCall('agent', {
+      message,
+      sessionKey,
+      deliver: false,
+      lane: 'nested',
+    }, { timeout: 15000 });
+    return true;
+  } catch (err) {
+    process.stderr.write(`[watcher] steer failed: ${err.message}\n`);
+    return false;
+  }
+}
+
+/**
+ * Kill a session via gateway subagents API (sync).
+ */
+function killSession(sessionKey) {
+  if (!GW_TOKEN) {
+    process.stderr.write(`[watcher] kill skipped: no gateway token\n`);
+    return;
+  }
+  try {
+    gatewayCall('subagents.kill', { target: sessionKey }, { timeout: 10000 });
+  } catch (err) {
+    process.stderr.write(`[watcher] kill failed: ${err.message}\n`);
+  }
+}
+
 /**
  * Format and output the delivery message, then exit 0.
  */
@@ -285,6 +361,7 @@ if (!label) {
 const deadline = Date.now() + timeoutS * 1000;
 let consecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 10;
+let recoverySessionKey = null;  // captured during polling for steer/kill
 
 while (Date.now() < deadline) {
   const status = chilisaus('status', ['--label', label]);
@@ -300,6 +377,9 @@ while (Date.now() < deadline) {
   }
 
   consecutiveFailures = 0;
+
+  // Capture sessionKey for recovery steer/kill
+  if (status.sessionKey) recoverySessionKey = status.sessionKey;
 
   // ── Path 0: 529/overload auto-retry ───────────────────────
   if (status.status === 'error') {
@@ -369,11 +449,120 @@ while (Date.now() < deadline) {
 // Timed out — try one last result check
 const finalResult = chilisaus('result', ['--label', label]);
 if (finalResult?.lastReply) {
-  // Reset retryCount on success even if we hit watcher timeout
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
   deliverResult(label, finalResult.lastReply, null);
 }
 
-process.stdout.write(`⏱ chilisaus [${label}] watcher timed out after ${timeoutS}s — session may still be running\n`);
+// ── Token-based activity check before steering ────────────────────────────
+// Only steer if tokens have been flat for 3+ minutes post-deadline.
+// If the session is still making model calls (tokens growing), stay silent.
+function getTokenCount(sessionKey) {
+  try {
+    const result = chilisaus('status', ['--label', label]);
+    // sessions.list via gateway would be better but chilisaus status has liveness
+    const tokens = result?.liveness?.tokens;
+    return typeof tokens === 'number' ? tokens : null;
+  } catch { return null; }
+}
+
+function markDoneSync(summary) {
+  try {
+    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    if (labels[label]) {
+      labels[label].status = 'done';
+      labels[label].summary = summary;
+      labels[label].updatedAt = new Date().toISOString();
+      const tmp = LABELS_PATH + '.tmp.' + process.pid;
+      writeFileSync(tmp, JSON.stringify(labels, null, 2));
+      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+    }
+  } catch (e) {
+    process.stderr.write(`[watcher] markDoneSync failed: ${e.message}\n`);
+  }
+}
+
+const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
+const ACTIVITY_POLL_MS = 30_000;
+
+let baselineTokens = getTokenCount(label);
+let flatSince = Date.now();
+
+process.stderr.write(`[watcher] deadline hit for ${label} — watching token activity (baseline: ${baselineTokens})\n`);
+
+while (Date.now() - flatSince < FLAT_WINDOW_MS) {
+  await sleep(ACTIVITY_POLL_MS);
+
+  // Delivered?
+  const st = chilisaus('status', ['--label', label]);
+  if (st?.status === 'done') {
+    const r = chilisaus('result', ['--label', label]);
+    markDoneSync('completed during activity window');
+    deliverResult(label, r?.lastReply, st.summary);
+  }
+  const r2 = chilisaus('result', ['--label', label]);
+  if (r2?.lastReply) {
+    markDoneSync('completed during activity window');
+    deliverResult(label, r2.lastReply, null);
+  }
+
+  // Token growth?
+  const cur = getTokenCount(label);
+  if (cur !== null && baselineTokens !== null && cur > baselineTokens) {
+    process.stderr.write(`[watcher] ${label} still active (${baselineTokens}→${cur} tokens), resetting flat timer\n`);
+    baselineTokens = cur;
+    flatSince = Date.now();
+  }
+}
+
+// 3 min of genuinely flat tokens — now steer
+process.stderr.write(`[watcher] ${label} inactive 3min post-deadline — entering steer\n`);
+
+// Get sessionKey for steer/kill
+const statusForSteer = chilisaus('status', ['--label', label]);
+const steerSessionKey = statusForSteer?.sessionKey || null;
+
+const steerRounds = [
+  { waitMs: 30_000,  msg: "Watcher check: if you're done, please send your final reply now. If still working, continue and ignore this." },
+  { waitMs: 60_000,  msg: "Watcher final check: please send your final reply now, or the session will be terminated in 2 minutes." },
+  { waitMs: 120_000, msg: null }, // kill round
+];
+
+for (const round of steerRounds) {
+  if (round.msg && steerSessionKey) {
+    process.stderr.write(`[watcher] steering ${label}: "${round.msg.slice(0, 60)}..."\n`);
+    await steerSession(steerSessionKey, round.msg);
+  }
+  await sleep(round.waitMs);
+
+  const st2 = chilisaus('status', ['--label', label]);
+  if (st2?.status === 'done') {
+    const r3 = chilisaus('result', ['--label', label]);
+    markDoneSync('completed during steer recovery');
+    deliverResult(label, r3?.lastReply, st2.summary);
+  }
+  const r3 = chilisaus('result', ['--label', label]);
+  if (r3?.lastReply) {
+    markDoneSync('completed during steer recovery');
+    deliverResult(label, r3.lastReply, null);
+  }
+
+  if (!round.msg && steerSessionKey) {
+    process.stderr.write(`[watcher] killing stuck session ${label}\n`);
+    await killSession(steerSessionKey);
+    // Wait up to 30s for confirmation
+    for (let i = 0; i < 6; i++) {
+      await sleep(5000);
+      const st3 = chilisaus('status', ['--label', label]);
+      if (st3?.status === 'done') {
+        markDoneSync('killed after steer+backoff — confirmed done');
+        process.stdout.write(`🌶️ *chilisaus* [${label}] killed after steer attempts\n`);
+        process.exit(0);
+      }
+    }
+  }
+}
+
+markDoneSync(`timed out after ${timeoutS}s — killed after steer attempts`);
+process.stdout.write(`⏱ chilisaus [${label}] timed out after ${timeoutS}s — session killed after steer attempts\n`);
 process.exit(1);
