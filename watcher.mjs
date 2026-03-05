@@ -325,9 +325,34 @@ function killSession(sessionKey) {
 }
 
 /**
+ * Update labels.json to mark the watched label as done (best-effort, atomic write).
+ * Called before exit to ensure labels.json is reconciled even if sync fails.
+ */
+function markLabelDone(label, summary) {
+  try {
+    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    if (labels[label] && labels[label].status !== 'done') {
+      labels[label].status = 'done';
+      labels[label].summary = summary || labels[label].summary || null;
+      labels[label].updatedAt = new Date().toISOString();
+      const tmp = LABELS_PATH + '.tmp.' + process.pid;
+      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+    }
+  } catch (e) {
+    process.stderr.write(`[watcher] markLabelDone failed: ${e.message}\n`);
+  }
+}
+
+/**
  * Format and output the delivery message, then exit 0.
+ * Also marks the label as done in labels.json before exiting.
  */
 function deliverResult(label, lastReply, fallbackSummary) {
+  // Update labels.json before exiting — prevents stuck detector false positives
+  const summary = fallbackSummary || (lastReply ? lastReply.slice(0, 500) : null);
+  markLabelDone(label, summary);
+
   if (lastReply) {
     const maxLen = 3500;
     const reply = lastReply.length > maxLen
@@ -342,6 +367,22 @@ function deliverResult(label, lastReply, fallbackSummary) {
   }
   process.exit(0);
 }
+
+// ── Sync on Exit ────────────────────────────────────────────
+// Best-effort sync of labels.json with gateway state on every watcher exit.
+// Ensures stale 'running' entries are reconciled promptly, preventing
+// false positives from the stuck detector.
+process.on('exit', () => {
+  try {
+    execFileSync('node', [INDEX_PATH, 'sync'], {
+      encoding: 'utf-8',
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Best-effort — never block exit
+  }
+});
 
 // ── Main ────────────────────────────────────────────────────
 
