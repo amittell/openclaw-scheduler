@@ -285,3 +285,30 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (6);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (7);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (8);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
+
+-- ============================================================
+-- SEED JOBS
+-- ============================================================
+
+-- Chilisaus 529 Recovery: safety net — scans for 529-failed sessions and re-enqueues
+INSERT OR IGNORE INTO jobs (
+  id, name, enabled,
+  schedule_cron, schedule_tz,
+  session_target, agent_id,
+  payload_kind, payload_message,
+  payload_timeout_seconds,
+  created_at, updated_at
+) VALUES (
+  '8f2be5bd-b537-48c7-b277-44e934104ddc',
+  'Chilisaus 529 Recovery',
+  1,
+  '*/10 * * * *',
+  'America/New_York',
+  'isolated',
+  'main',
+  'shellCommand',
+  'node ~/.openclaw/chilisaus/529-recovery.mjs',
+  120,
+  datetime('now'),
+  datetime('now')
+);
