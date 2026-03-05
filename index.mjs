@@ -29,6 +29,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
+import { homedir } from 'os';
 import { emitEvent, onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -478,10 +479,11 @@ async function cmdEnqueue(flags) {
       mode:      isFresh ? 'fresh' : 'reuse',
       model:     model || null,
       thinking,
-      spawnedAt: new Date().toISOString(),
-      status:    'running',
-      summary:   null,
-      error:     null,
+      spawnedAt:      new Date().toISOString(),
+      timeoutSeconds: timeoutS,
+      status:         'running',
+      summary:        null,
+      error:          null,
     });
 
     // Fire dispatch.started hook (best-effort)
@@ -677,13 +679,31 @@ function cmdStatus(flags) {
  * Flags:
  *   --threshold-min <n>   Minutes without activity to consider stuck (default: 15)
  */
+/**
+ * Check if a chilisaus-deliver watcher job is actively running for a label.
+ * Uses scheduler DB to check for a running/recent-pending run.
+ * Fails open (returns false) on any DB error.
+ */
+function hasActiveWatcher(label) {
+  try {
+    const dbPath = join(homedir(), '.openclaw', 'scheduler', 'scheduler.db');
+    const safeLabel = label.replace(/'/g, "''");
+    const result = execFileSync('sqlite3', [
+      dbPath,
+      `SELECT COUNT(*) FROM jobs j JOIN runs r ON r.job_id=j.id WHERE j.name='chilisaus-deliver:${safeLabel}' AND (r.status='running' OR (r.status='pending' AND r.started_at > datetime('now','-5 minutes')))`,
+    ], { encoding: 'utf-8', timeout: 5000 }).trim();
+    return parseInt(result, 10) > 0;
+  } catch { return false; }
+}
+
 async function cmdStuck(flags) {
   const thresholdMin = parseFloat(flags['threshold-min'] || '15');
   const thresholdMs  = thresholdMin * 60 * 1000;
 
   const labels = loadLabels();
-  const stuckSessions = [];
-  const autoResolved  = [];
+  const stuckSessions  = [];
+  const autoResolved   = [];
+  const watcherSkipped = [];
 
   // Pre-fetch all gateway sessions once to avoid N RPC calls
   let sessionCache = null;
@@ -695,13 +715,23 @@ async function cmdStuck(flags) {
   for (const [name, entry] of Object.entries(labels)) {
     if (entry.status !== 'running') continue;
 
+    // ── Per-job timeout: don't flag until the job's own timeout has elapsed ──
+    const jobTimeoutMs      = entry.timeoutSeconds ? entry.timeoutSeconds * 1000 : 0;
+    const effectiveThreshMs = Math.max(jobTimeoutMs, thresholdMs);
+
     const spawnedAt = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const ageMs     = Date.now() - spawnedAt;
 
-    if (ageMs < thresholdMs) continue;
+    if (ageMs < effectiveThreshMs) continue;
+
+    // ── Skip if an active watcher is already monitoring this session ──────
+    if (hasActiveWatcher(name)) {
+      watcherSkipped.push({ label: name, reason: 'active chilisaus-deliver watcher' });
+      continue;
+    }
 
     // ── Check gateway state before alerting ──────────────────
-    const check = checkSessionDone(entry.sessionKey, sessionCache, thresholdMs);
+    const check = checkSessionDone(entry.sessionKey, sessionCache, effectiveThreshMs);
 
     if (check.shouldResolve) {
       // Gateway says this session is done — auto-mark and skip alert
@@ -726,14 +756,15 @@ async function cmdStuck(flags) {
     const lastActivity = check.lastActivity || spawnedAt;
     const silenceMs    = Date.now() - lastActivity;
 
-    if (silenceMs >= thresholdMs) {
+    if (silenceMs >= effectiveThreshMs) {
       stuckSessions.push({
-        label:      name,
-        sessionKey: entry.sessionKey,
-        agent:      entry.agent,
-        spawnedAt:  entry.spawnedAt,
-        ageMin:     Math.round(ageMs / 60000),
-        silenceMin: Math.round(silenceMs / 60000),
+        label:        name,
+        sessionKey:   entry.sessionKey,
+        agent:        entry.agent,
+        spawnedAt:    entry.spawnedAt,
+        ageMin:       Math.round(ageMs / 60000),
+        silenceMin:   Math.round(silenceMs / 60000),
+        thresholdMin: Math.round(effectiveThreshMs / 60000),
       });
     }
   }
@@ -751,6 +782,7 @@ async function cmdStuck(flags) {
       stuck_sessions:      [],
       auto_resolved_count: autoResolved.length,
       auto_resolved:       autoResolved,
+      watcher_skipped:     watcherSkipped,
       threshold_min:       thresholdMin,
     });
     process.exit(0);
