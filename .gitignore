@@ -11,3 +11,5 @@ secrets/
 backupstore/
 logs/
 chilisaus/
+coverage/
+.nyc_output/

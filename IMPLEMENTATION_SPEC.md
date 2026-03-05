@@ -1,6 +1,6 @@
 # Implementation Spec — Scheduler v5 Features
 
-## New Schema (migrate-v5.js must add these)
+## New Schema (consolidated into schema baseline)
 
 ### Jobs table — new columns:
 ```sql
@@ -41,7 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE statu
 CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
 ```
 
-### schema_migrations: INSERT version 5
+### schema_migrations: baseline includes these fields/tables
 
 ---
 

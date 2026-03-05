@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] — 2026-03-03
+
+### Added
+- Team-aware message routing fields on `messages`: `team_id`, `member_id`, optional `task_id`
+- Explicit message receipt audit trail via `message_receipts` (delivery attempts/errors/acks)
+- Team adapter module (`team-adapter.js`) with:
+  - Message projection to `team_mailbox_events`
+  - Team task projection to `team_tasks`
+  - Task completion gates backed by `task_tracker` groups
+- CLI team operations:
+  - `team map`, `team tasks`, `team events`, `team gate`, `team check-gates`, `team ack`
+  - `msg receipts`, `msg ack`, `msg team-inbox`
+
+### Changed
+- Bumped schema baseline to `v10` in `schema.sql` and `migrate-consolidate.js`
+- Dispatcher now runs team adapter mapping + gate checks in message-delivery loop
+- Inbox consumer now records delivery attempts and explicit ACKs for consumed messages
+- Added release quality scripts: `npm run lint` (ESLint v9) and `npm run coverage` (V8 coverage + lcov)
+
+---
+
+## [1.0.1] — 2026-03-02
+
+### Changed
+- Consolidated schema management into `schema.sql` + `initDb()` reconciliation (no standalone `migrate-v*` scripts)
+- Set schema baseline to v8 and ensured idempotency/session indexes are created from baseline
+- Updated shell default on native Windows to `cmd.exe` (`SCHEDULER_SHELL` override still supported)
+
+### Fixed
+- Auto-reconciliation now adds `task_tracker_agents.session_key` and `last_heartbeat` for legacy/pre-release DBs
+
+---
+
 ## [1.0.0] — 2026-02-26
 
 First public release. Combines all prior development into a stable, documented package.

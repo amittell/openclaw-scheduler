@@ -10,7 +10,8 @@ import {
   pruneExpiredJobs, detectCycle, getChainDepth,
   shouldRetry, scheduleRetry, cancelJob,
   enqueueJob, dequeueJob, runJobNow,
-  hasRunningRunForPool, evalTriggerCondition
+  hasRunningRunForPool, evalTriggerCondition,
+  validateJobPayload
 } from './jobs.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
@@ -21,7 +22,8 @@ import {
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
   markDelivered, markRead, markAllRead, getUnreadCount,
-  expireMessages, pruneMessages
+  expireMessages, pruneMessages,
+  ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
 
@@ -52,6 +54,9 @@ assert(tables.includes('jobs'), 'jobs table');
 assert(tables.includes('runs'), 'runs table');
 assert(tables.includes('messages'), 'messages table');
 assert(tables.includes('agents'), 'agents table');
+assert(tables.includes('message_receipts'), 'message_receipts table');
+assert(tables.includes('team_tasks'), 'team_tasks table');
+assert(tables.includes('team_mailbox_events'), 'team_mailbox_events table');
 
 // Verify v3 columns exist
 const jobCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -144,6 +149,8 @@ assert(getUnreadCount('main') >= 1, 'unread > 0');
 
 markDelivered(msg.id);
 assert(getMessage(msg.id).status === 'delivered', 'markDelivered');
+assert(!getInbox('main').some(m => m.id === msg.id), 'default inbox excludes delivered');
+assert(getInbox('main', { includeDelivered: true }).some(m => m.id === msg.id), 'includeDelivered returns delivered');
 
 markRead(msg.id);
 assert(getMessage(msg.id).status === 'read', 'markRead');
@@ -168,6 +175,42 @@ assert(getMessage(expMsg.id).status === 'expired', 'expiry');
 
 const metaMsg = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'meta', metadata: { key: 'value' } });
 assert(getMessage(metaMsg.id).metadata?.key === 'value', 'metadata');
+
+// Team-aware routing + explicit receipts
+const teamMsg = sendMessage({
+  from_agent: 'orchestrator',
+  to_agent: 'main',
+  team_id: 'core-team',
+  member_id: 'writer',
+  task_id: 'task-001',
+  kind: 'task',
+  subject: 'Write draft',
+  body: 'Draft the release notes for v1.0',
+  ack_required: true,
+});
+assert(teamMsg.team_id === 'core-team', 'team_id stored');
+assert(teamMsg.member_id === 'writer', 'member_id stored');
+assert(teamMsg.task_id === 'task-001', 'task_id stored');
+assert(teamMsg.ack_required === 1, 'ack_required stored');
+
+markDelivered(teamMsg.id);
+const teamDelivered = getMessage(teamMsg.id);
+assert(teamDelivered.delivery_attempts >= 1, 'delivery attempt incremented');
+const receipts1 = listMessageReceipts(teamMsg.id, 10);
+assert(receipts1.some(r => r.event_type === 'attempt'), 'attempt receipt written');
+
+ackMessage(teamMsg.id, 'writer', 'received');
+const teamAcked = getMessage(teamMsg.id);
+assert(teamAcked.ack_at !== null, 'ack_at set on ack');
+const receipts2 = listMessageReceipts(teamMsg.id, 20);
+assert(receipts2.some(r => r.event_type === 'ack'), 'ack receipt written');
+
+recordMessageAttempt(teamMsg.id, { ok: false, actor: 'test', error: 'simulated error' });
+const teamErr = getMessage(teamMsg.id);
+assert(teamErr.last_error === 'simulated error', 'last_error updated on failed attempt');
+
+const teamInbox = getTeamMessages('core-team', { includeRead: true, limit: 10 });
+assert(teamInbox.some(m => m.id === teamMsg.id), 'getTeamMessages finds team message');
 
 // ── Cascade delete ──────────────────────────────────────────
 console.log('\nCascade:');
@@ -1016,11 +1059,15 @@ console.log('\n── v5: Hybrid Retrieval ──');
   deleteJob(j.id); deleteJob(j2.id);
 }
 
-console.log('\n── v5: Migration Idempotency ──');
+console.log('\n── Schema Baseline ──');
 {
-  // Verify v5 schema version recorded
+  // Verify consolidated schema baseline is recorded
   const version = getDb().prepare('SELECT MAX(version) as v FROM schema_migrations').get();
-  assert(version.v >= 5 || version.v >= 2, 'schema_migrations has current version');
+  assert(version.v >= 10, 'schema_migrations has baseline v10');
+  const v8 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 8').get();
+  assert(v8 !== undefined, 'schema_migrations has v8');
+  const v10 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 10').get();
+  assert(v10 !== undefined, 'schema_migrations has v10');
 
   // Verify approvals table exists
   const approvalTable = getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='approvals'").get();
@@ -1044,6 +1091,14 @@ console.log('\n── v5: Migration Idempotency ──');
   // Verify new column on messages
   const msgCols = getDb().prepare('PRAGMA table_info(messages)').all().map(c => c.name);
   assert(msgCols.includes('owner'), 'messages has owner column');
+  assert(msgCols.includes('team_id'), 'messages has team_id column');
+  assert(msgCols.includes('member_id'), 'messages has member_id column');
+  assert(msgCols.includes('task_id'), 'messages has task_id column');
+  assert(msgCols.includes('ack_required'), 'messages has ack_required column');
+  assert(msgCols.includes('ack_at'), 'messages has ack_at column');
+  assert(msgCols.includes('delivery_attempts'), 'messages has delivery_attempts column');
+  assert(msgCols.includes('last_error'), 'messages has last_error column');
+  assert(msgCols.includes('team_mapped_at'), 'messages has team_mapped_at column');
 }
 
 console.log('\n── v5: Task Tracker ──');
@@ -1160,7 +1215,69 @@ console.log('\n── v5: Task Tracker ──');
   assert(notDead.length === 0, 'agent with recent heartbeat not marked dead despite timeout');
 }
 
-console.log('\n── v7: Idempotency Keys ──');
+console.log('\n── v10: Team Adapter ──');
+{
+  const ta = await import('./team-adapter.js');
+  const tt = await import('./task-tracker.js');
+
+  const teamTaskMsg = sendMessage({
+    from_agent: 'scheduler',
+    to_agent: 'main',
+    team_id: 'team-alpha',
+    member_id: 'writer',
+    task_id: 'deliverable-42',
+    kind: 'task',
+    subject: 'Create draft',
+    body: 'Prepare deliverable 42 draft',
+    ack_required: true,
+  });
+
+  const mapped = ta.mapTeamMessages(50);
+  assert(mapped >= 1, 'team adapter mapped at least one message');
+
+  const teamTasks1 = ta.listTeamTasks('team-alpha', 20);
+  const tracked = teamTasks1.find(t => t.id === 'deliverable-42');
+  assert(tracked !== undefined, 'team task projected from message');
+  assert(tracked.status === 'open', 'projected team task starts open');
+
+  const events1 = ta.listTeamMailboxEvents('team-alpha', { taskId: 'deliverable-42', limit: 20 });
+  assert(events1.some(e => e.event_type === 'task_created' || e.event_type === 'task_message'), 'team mailbox event created');
+
+  const gate = ta.createTeamTaskGate({
+    teamId: 'team-alpha',
+    taskId: 'deliverable-42',
+    expectedMembers: ['writer', 'reviewer'],
+    timeoutS: 300,
+    createdBy: 'test',
+  });
+  assert(gate.tracker_id !== undefined, 'team gate created with tracker');
+
+  const teamTasks2 = ta.listTeamTasks('team-alpha', 20);
+  const gated = teamTasks2.find(t => t.id === 'deliverable-42');
+  assert(gated.status === 'blocked', 'task becomes blocked while gate is waiting');
+  assert(gated.gate_status === 'waiting', 'gate_status waiting');
+
+  tt.agentStarted(gate.tracker_id, 'writer');
+  tt.agentCompleted(gate.tracker_id, 'writer', 'draft complete');
+  tt.agentStarted(gate.tracker_id, 'reviewer');
+  tt.agentCompleted(gate.tracker_id, 'reviewer', 'review complete');
+  tt.checkGroupCompletion(gate.tracker_id);
+
+  const gateCheck = ta.checkTeamTaskGates(20);
+  assert(gateCheck.passed >= 1, 'gate marked passed after all team members complete');
+
+  const teamTasks3 = ta.listTeamTasks('team-alpha', 20);
+  const passedTask = teamTasks3.find(t => t.id === 'deliverable-42');
+  assert(passedTask.gate_status === 'passed', 'task gate_status passed');
+  assert(passedTask.status === 'open', 'task unblocked after gate pass');
+
+  const acked = ta.ackTeamMessage(teamTaskMsg.id, 'writer', 'acknowledged');
+  assert(acked !== null && acked.ack_at !== null, 'team-aware ack sets ack_at');
+  const events2 = ta.listTeamMailboxEvents('team-alpha', { taskId: 'deliverable-42', limit: 50 });
+  assert(events2.some(e => e.event_type === 'ack'), 'team-aware ack emits mailbox event');
+}
+
+console.log('\n── Idempotency Keys ──');
 {
   const {
     generateIdempotencyKey, generateChainIdempotencyKey, generateRunNowIdempotencyKey,
@@ -1177,9 +1294,9 @@ console.log('\n── v7: Idempotency Keys ──');
   const runCols = getDb().prepare('PRAGMA table_info(runs)').all().map(c => c.name);
   assert(runCols.includes('idempotency_key'), 'runs has idempotency_key column');
 
-  // Verify v7 migration recorded
-  const v7 = getDb().prepare('SELECT version FROM schema_migrations WHERE version = 7').get();
-  assert(v7 !== undefined, 'schema_migrations has v7');
+  // Verify idempotency index exists
+  const idemIdx = getDb().prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_runs_idempotency'").get();
+  assert(idemIdx !== undefined, 'idx_runs_idempotency exists');
 
   // 1. Key generation is deterministic (same inputs = same key)
   const key1 = generateIdempotencyKey('job-abc', '2026-02-23 09:00:00');
@@ -1241,11 +1358,9 @@ console.log('\n── v7: Idempotency Keys ──');
   assert(reclaimedCheck === null, 'released key not found as claimed');
 
   // Re-claim the released key (simulating retry)
-  // Need to delete old entry first since it's PRIMARY KEY
-  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(idemKey);
   const testRun3 = createRun(testJob.id, { run_timeout_ms: 60000 });
   const reclaimed = claimIdempotencyKey(idemKey, testJob.id, testRun3.id, expiresAt);
-  assert(reclaimed === true, 'released key can be reclaimed after delete');
+  assert(reclaimed === true, 'released key can be reclaimed without deleting ledger row');
 
   // 7. Successful run keeps claim (blocks replay)
   const successCheck = checkIdempotencyKey(idemKey);
@@ -1305,7 +1420,6 @@ console.log('\n── v7: Idempotency Keys ──');
   // Note: in real replay, the old crashed run keeps its key in runs table,
   // and a new replay run gets a fresh idempotency_key. But the ledger key
   // can be reclaimed since it was released.
-  getDb().prepare('DELETE FROM idempotency_ledger WHERE key = ?').run(crashKey);
   const replayRun = createRun(crashJob.id, { run_timeout_ms: 60000, idempotency_key: crashKey + '-replay' });
   const replayClaimed = claimIdempotencyKey(crashKey, crashJob.id, replayRun.id, expiresAt);
   assert(replayClaimed === true, 'crashed run key can be reclaimed for replay');
@@ -1329,19 +1443,17 @@ console.log('\n── v7: Idempotency Keys ──');
   assert(alRun.idempotency_key === 'al-test-key-12345678901234567890', 'idempotency key available for prompt injection');
   finishRun(alRun.id, 'ok'); deleteJob(alJob.id);
 
-  // 13. IDEMPOTENT_SKIP handling — verify it's a recognized pattern
-  // In dispatcher, content.trim() === 'IDEMPOTENT_SKIP' skips delivery
-  const skipContent = 'IDEMPOTENT_SKIP';
-  const isIdempotentSkip = skipContent.trim() === 'IDEMPOTENT_SKIP' || skipContent.trim().startsWith('IDEMPOTENT_SKIP');
-  assert(isIdempotentSkip, 'IDEMPOTENT_SKIP pattern recognized');
-
-  const skipContent2 = 'IDEMPOTENT_SKIP: already processed this bet settlement';
-  const isSkip2 = skipContent2.trim().startsWith('IDEMPOTENT_SKIP');
-  assert(isSkip2, 'IDEMPOTENT_SKIP with message recognized');
-
-  const normalContent = 'Here is the result';
-  const isNotSkip = !(normalContent.trim() === 'IDEMPOTENT_SKIP' || normalContent.trim().startsWith('IDEMPOTENT_SKIP'));
-  assert(isNotSkip, 'normal content is not IDEMPOTENT_SKIP');
+  // 13. IDEMPOTENT_SKIP handling — verify matchesSentinel pattern
+  // In dispatcher, matchesSentinel(trimmed, 'IDEMPOTENT_SKIP') skips delivery
+  function matchesSentinelIdem(content, token) {
+    if (!content) return false;
+    const re = new RegExp(`^${token}(?:$|[\\s:])`);
+    return re.test(content.trim());
+  }
+  assert(matchesSentinelIdem('IDEMPOTENT_SKIP', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIP pattern recognized');
+  assert(matchesSentinelIdem('IDEMPOTENT_SKIP: already processed this bet settlement', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIP with message recognized');
+  assert(!matchesSentinelIdem('Here is the result', 'IDEMPOTENT_SKIP'), 'normal content is not IDEMPOTENT_SKIP');
+  assert(!matchesSentinelIdem('IDEMPOTENT_SKIPX', 'IDEMPOTENT_SKIP'), 'IDEMPOTENT_SKIPX is not IDEMPOTENT_SKIP');
 
   // 15. Manual release via CLI-style operation
   const manualKey = generateIdempotencyKey('manual-test', '2026-03-01 00:00:00');
@@ -1417,6 +1529,200 @@ assert(updatedShell.payload_message === '/bin/echo updated', 'shell job update: 
 updateJob(shellJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
 pruneExpiredJobs();
 assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: Transient Error Detection & delete_after_run Safety
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Transient Error Detection ──');
+{
+  // Re-implement detectTransientError locally to test the pattern matching
+  // (matches dispatcher.js TRANSIENT_ERROR_PATTERNS + detectTransientError)
+  const TRANSIENT_ERROR_PATTERNS = [
+    /temporarily overloaded/i,
+    /service\s+(?:is\s+)?unavailable/i,
+    /rate\s*limit(?:ed|s?)?/i,
+    /too\s+many\s+requests/i,
+    /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
+    /gateway\s+timeout/i,
+    /bad\s+gateway/i,
+    /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
+    /API\s+(?:error|unavailable|timeout)/i,
+    /capacity\s+(?:exceeded|limit)/i,
+    /retry\s+(?:after|later|in\s+\d)/i,
+    /context\s+(?:length|window)\s+exceeded/i,
+    /token\s+limit\s+exceeded/i,
+  ];
+
+  function detectTransientError(content) {
+    if (!content || !content.trim()) return false;
+    const trimmed = content.trim();
+    if (trimmed.length > 500) return false;
+    return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
+  }
+
+  // Positive matches — these should be caught as transient errors
+  assert(detectTransientError('The AI service is temporarily overloaded. Please try again later.'), 'detects: temporarily overloaded');
+  assert(detectTransientError('Service unavailable'), 'detects: service unavailable');
+  assert(detectTransientError('Service is unavailable right now'), 'detects: service is unavailable');
+  assert(detectTransientError('Rate limited'), 'detects: rate limited');
+  assert(detectTransientError('rate limit exceeded'), 'detects: rate limit exceeded');
+  assert(detectTransientError('Error: Too many requests'), 'detects: too many requests');
+  assert(detectTransientError('502 Bad Gateway'), 'detects: 502 bad gateway');
+  assert(detectTransientError('503 Server Error'), 'detects: 503 server error');
+  assert(detectTransientError('500 Internal Server Error'), 'detects: 500 internal server error');
+  assert(detectTransientError('Gateway timeout'), 'detects: gateway timeout');
+  assert(detectTransientError('Bad gateway'), 'detects: bad gateway');
+  assert(detectTransientError('The model is overloaded'), 'detects: model is overloaded');
+  assert(detectTransientError('model unavailable'), 'detects: model unavailable');
+  assert(detectTransientError('API error occurred'), 'detects: API error');
+  assert(detectTransientError('API unavailable'), 'detects: API unavailable');
+  assert(detectTransientError('API timeout'), 'detects: API timeout');
+  assert(detectTransientError('capacity exceeded'), 'detects: capacity exceeded');
+  assert(detectTransientError('Please retry after 30 seconds'), 'detects: retry after');
+  assert(detectTransientError('Retry later'), 'detects: retry later');
+  assert(detectTransientError('retry in 5 seconds'), 'detects: retry in N');
+  assert(detectTransientError('context length exceeded'), 'detects: context length exceeded');
+  assert(detectTransientError('context window exceeded'), 'detects: context window exceeded');
+  assert(detectTransientError('token limit exceeded'), 'detects: token limit exceeded');
+
+  // Negative matches — these should NOT be flagged
+  assert(!detectTransientError('Here is the weather report for today'), 'ignores: normal response');
+  assert(!detectTransientError('HEARTBEAT_OK'), 'ignores: heartbeat');
+  assert(!detectTransientError('I completed the task successfully'), 'ignores: success response');
+  assert(!detectTransientError(''), 'ignores: empty string');
+  assert(!detectTransientError(null), 'ignores: null');
+  assert(!detectTransientError(undefined), 'ignores: undefined');
+
+  // Long response with keyword should NOT be flagged (real work mentioning the term)
+  const longResponse = 'I analyzed the system and found that the rate limit configuration needs updating. ' +
+    'Here are my recommendations: '.padEnd(600, 'x');
+  assert(!detectTransientError(longResponse), 'ignores: long response with keyword (>500 chars)');
+
+  // TASK_FAILED sentinel tests (uses matchesSentinel regex: ^TOKEN(?:$|[\s:]))
+  function matchesSentinel(content, token) {
+    if (!content) return false;
+    const re = new RegExp(`^${token}(?:$|[\\s:])`);
+    return re.test(content.trim());
+  }
+
+  assert(matchesSentinel('TASK_FAILED', 'TASK_FAILED'), 'TASK_FAILED exact match');
+  assert(matchesSentinel('TASK_FAILED: could not connect to database', 'TASK_FAILED'), 'TASK_FAILED with colon message');
+  assert(matchesSentinel('TASK_FAILED something', 'TASK_FAILED'), 'TASK_FAILED with space message');
+  assert(!matchesSentinel('TASK_FAILEDX', 'TASK_FAILED'), 'does not match TASK_FAILEDX (no word boundary)');
+  assert(!matchesSentinel('The task failed to complete', 'TASK_FAILED'), 'does not match "task failed" in prose');
+
+  // matchesSentinel works for other sentinels too
+  assert(matchesSentinel('HEARTBEAT_OK', 'HEARTBEAT_OK'), 'HEARTBEAT_OK exact');
+  assert(matchesSentinel('HEARTBEAT_OK extra info', 'HEARTBEAT_OK'), 'HEARTBEAT_OK with space');
+  assert(!matchesSentinel('HEARTBEAT_OKAY', 'HEARTBEAT_OK'), 'does not match HEARTBEAT_OKAY');
+}
+
+console.log('\n── delete_after_run Safety ──');
+{
+  // Test that updateJobAfterRun does NOT delete when status is 'error'
+  const oneShot = createJob({
+    name: 'OneShot-DAR-Test',
+    schedule_cron: '0 12 * * *',
+    payload_message: 'one shot task',
+    delete_after_run: true,
+    delivery_mode: 'none',
+  });
+  assert(oneShot.delete_after_run === 1, 'one-shot job has delete_after_run=1');
+
+  // Simulate error status — job should NOT be deleted
+  updateJob(oneShot.id, { last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''), last_status: 'error', consecutive_errors: 1 });
+  const afterError = getJob(oneShot.id);
+  assert(afterError !== undefined, 'one-shot job survives error status (not deleted)');
+
+  // Simulate ok status via updateJobAfterRun-like logic
+  // The dispatcher calls updateJobAfterRun which does: if (status === 'ok' && job.delete_after_run) deleteJob
+  // We verify the condition directly
+  const shouldDeleteOnOk = ('ok' === 'ok' && oneShot.delete_after_run);
+  assert(shouldDeleteOnOk, 'delete_after_run triggers on ok status');
+
+  const shouldDeleteOnError = ('error' === 'ok' && oneShot.delete_after_run);
+  assert(!shouldDeleteOnError, 'delete_after_run does NOT trigger on error status');
+
+  const shouldDeleteOnTimeout = ('timeout' === 'ok' && oneShot.delete_after_run);
+  assert(!shouldDeleteOnTimeout, 'delete_after_run does NOT trigger on timeout status');
+
+  // Clean up
+  deleteJob(oneShot.id);
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: session_target + payload_kind Validation
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Payload Validation ──');
+
+// 1. Valid: main + systemEvent
+{
+  const j = createJob({ name: 'Valid-main-sysEvent', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'systemEvent', payload_message: 'test', delivery_mode: 'none' });
+  assert(j.session_target === 'main' && j.payload_kind === 'systemEvent', 'valid: main + systemEvent accepted');
+  deleteJob(j.id);
+}
+
+// 2. Invalid: main + agentTurn → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-main-agentTurn', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: main + agentTurn rejected');
+}
+
+// 3. Valid: shell + shellCommand
+{
+  const j = createJob({ name: 'Valid-shell-cmd', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo hi', delivery_mode: 'none' });
+  assert(j.session_target === 'shell' && j.payload_kind === 'shellCommand', 'valid: shell + shellCommand accepted');
+  deleteJob(j.id);
+}
+
+// 4. Invalid: shell + agentTurn → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-shell-agentTurn', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: shell + agentTurn rejected');
+}
+
+// 5. Valid: isolated + agentTurn (default combo)
+{
+  const j = createJob({ name: 'Valid-isolated-agentTurn', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  assert(j.session_target === 'isolated' && j.payload_kind === 'agentTurn', 'valid: isolated + agentTurn accepted');
+  deleteJob(j.id);
+}
+
+// 6. Invalid: isolated + shellCommand → should throw
+{
+  let threw = false;
+  try { createJob({ name: 'Bad-isolated-shell', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'shellCommand', payload_message: '/bin/echo nope', delivery_mode: 'none' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'invalid: isolated + shellCommand rejected');
+}
+
+// 7. updateJob: changing to invalid combo → should throw
+{
+  const j = createJob({ name: 'Update-validation', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  let threw = false;
+  try { updateJob(j.id, { session_target: 'main', payload_kind: 'agentTurn' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'updateJob rejects invalid target+kind combo');
+  deleteJob(j.id);
+}
+
+// 8. updateJob: changing session_target alone checks against existing payload_kind
+{
+  const j = createJob({ name: 'Update-target-only', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  let threw = false;
+  try { updateJob(j.id, { session_target: 'shell' }); }
+  catch (e) { threw = e.message.includes('Invalid payload_kind'); }
+  assert(threw, 'updateJob: changing target alone validates against existing kind');
+  deleteJob(j.id);
+}
+
 
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);

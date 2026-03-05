@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenClaw Scheduler Dispatcher v1.0.0
+// OpenClaw Scheduler Dispatcher v1.0.2
 //
 // Full standalone scheduler + message router.
 // Dispatches independently via chat completions API.
@@ -51,6 +51,7 @@ import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
   touchAgentHeartbeat, registerAgentSession,
 } from './task-tracker.js';
+import { mapTeamMessages, checkTeamTaskGates } from './team-adapter.js';
 
 // ── Helpers ─────────────────────────────────────────────────
 function sqliteNow(offsetMs = 0) {
@@ -71,10 +72,17 @@ const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Shell Command Runner ────────────────────────────────────
-// Platform-aware shell: macOS defaults to zsh, Linux to bash.
-// Override with SCHEDULER_SHELL env var (e.g., SCHEDULER_SHELL=/bin/sh).
+// Platform-aware shell defaults:
+// - macOS: /bin/zsh
+// - Linux/WSL: /bin/bash
+// - Windows: cmd.exe
+// Override with SCHEDULER_SHELL env var.
 const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
-  || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash');
+  || (process.platform === 'darwin'
+    ? '/bin/zsh'
+    : process.platform === 'win32'
+      ? 'cmd.exe'
+      : '/bin/bash');
 
 function runShellCommand(cmd, timeoutMs = 300000) {
   return new Promise((resolve) => {
@@ -169,11 +177,22 @@ async function checkApprovals() {
       if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
         resolveApproval(approval.id, 'approved', 'timeout');
         log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
-        // Update run status and dispatch
         if (approval.run_id) {
-          getDb().prepare("UPDATE runs SET status = 'pending' WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+          getDb().prepare(`
+            UPDATE runs
+            SET status = 'approved',
+                finished_at = datetime('now'),
+                summary = COALESCE(summary, 'Approval granted (timeout auto-approve)')
+            WHERE id = ? AND status IN ('awaiting_approval', 'pending')
+          `).run(approval.run_id);
         }
-        await dispatchJob(job);
+        await dispatchJob(job, { approvalBypass: true });
+        getDb().prepare(`
+          UPDATE approvals
+          SET status = 'dispatched',
+              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
+          WHERE id = ? AND status = 'approved'
+        `).run(approval.id);
       } else {
         // Default: reject on timeout
         resolveApproval(approval.id, 'timed_out', 'timeout');
@@ -194,44 +213,122 @@ async function checkApprovals() {
       SELECT a.*, j.name as job_name
       FROM approvals a
       JOIN jobs j ON a.job_id = j.id
-      JOIN runs r ON a.run_id = r.id
+      LEFT JOIN runs r ON a.run_id = r.id
       WHERE a.status = 'approved'
-        AND r.status IN ('awaiting_approval', 'pending')
+        AND (a.run_id IS NULL OR r.status IN ('awaiting_approval', 'pending'))
     `).all();
 
     for (const approval of approved) {
       const job = getJob(approval.job_id);
       if (!job) continue;
+      if (approval.run_id) {
+        db.prepare(`
+          UPDATE runs
+          SET status = 'approved',
+              finished_at = datetime('now'),
+              summary = COALESCE(summary, 'Approved by operator')
+          WHERE id = ? AND status IN ('awaiting_approval', 'pending')
+        `).run(approval.run_id);
+      }
       log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
-      await dispatchJob(job);
+      await dispatchJob(job, { approvalBypass: true });
+      db.prepare(`
+        UPDATE approvals
+        SET status = 'dispatched',
+            notes = COALESCE(notes, 'Approved and dispatched by scheduler')
+        WHERE id = ? AND status = 'approved'
+      `).run(approval.id);
     }
   } catch (err) {
     log('error', `Approval dispatch error: ${err.message}`);
   }
 }
 
+// ── Sentinel Matching ────────────────────────────────────────
+/**
+ * Check if content matches a sentinel token at the start of the string.
+ * Matches "TOKEN" exactly, or "TOKEN" followed by whitespace/colon (e.g. "TOKEN: detail").
+ * Does NOT match "TOKENfoo" — requires word boundary after the token.
+ */
+function matchesSentinel(content, token) {
+  if (!content) return false;
+  const re = new RegExp(`^${token}(?:$|[\\s:])`);
+  return re.test(content.trim());
+}
+
+// ── Triggered Children Helper ───────────────────────────────
+/**
+ * Fire triggered children for a completed run and track chain idempotency keys.
+ * Extracts the duplicated fireTriggeredChildren + pendingChainKeys pattern.
+ */
+function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') {
+  const triggered = fireTriggeredChildren(jobId, status, content);
+  if (triggered.length > 0) {
+    for (const child of triggered) {
+      pendingChainKeys.set(child.id, runId);
+    }
+    log('info', `Triggered ${triggered.length} child job(s)${logSuffix}`, {
+      parentId: jobId,
+      children: triggered.map(c => c.name),
+    });
+  }
+  return triggered;
+}
+
+// ── Transient Error Detection ────────────────────────────────
+// Patterns that indicate the agent received a transient service error
+// rather than producing a meaningful response. These should NOT trigger
+// delete_after_run or count as successful completions.
+const TRANSIENT_ERROR_PATTERNS = [
+  /temporarily overloaded/i,
+  /service\s+(?:is\s+)?unavailable/i,
+  /rate\s*limit(?:ed|s?)?/i,
+  /too\s+many\s+requests/i,
+  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
+  /gateway\s+timeout/i,
+  /bad\s+gateway/i,
+  /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
+  /API\s+(?:error|unavailable|timeout)/i,
+  /capacity\s+(?:exceeded|limit)/i,
+  /retry\s+(?:after|later|in\s+\d)/i,
+  /context\s+(?:length|window)\s+exceeded/i,
+  /token\s+limit\s+exceeded/i,
+];
+
+/**
+ * Detect if agent reply content contains known transient/service error patterns.
+ * Returns true if the content looks like a transient error rather than a real response.
+ * 
+ * Heuristic: only flag short responses (< 500 chars) that match patterns.
+ * Long responses that happen to mention "rate limit" in passing are likely real work.
+ */
+function detectTransientError(content) {
+  if (!content || !content.trim()) return false;
+  const trimmed = content.trim();
+  // Only flag short responses — a 2000-char response mentioning "rate limit" is probably real
+  if (trimmed.length > 500) return false;
+  return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
 // ── Dispatch a single job ───────────────────────────────────
-async function dispatchJob(job) {
+async function dispatchJob(job, opts = {}) {
+  const approvalBypass = opts.approvalBypass === true;
+
   // HITL approval gate — if approval_required, block until approved
-  if (job.approval_required) {
+  if (job.approval_required && !approvalBypass) {
     const existing = getPendingApproval(job.id);
     if (existing) {
       // Already has a pending approval — skip dispatch, checkApprovals will handle it
       log('debug', `Skipping ${job.name} — awaiting approval`, { approvalId: existing.id });
       return;
     }
-    // Check if this is a chain-triggered dispatch (parent_id means it was triggered)
-    if (job.parent_id) {
-      const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms });
-      // Set run to awaiting_approval
-      getDb().prepare("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?").run(run.id);
-      const approval = createApproval(job.id, run.id);
-      log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
-      // Send notification via delivery channel
-      const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
-      await handleDelivery(job, msg);
-      return;
-    }
+    const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms, status: 'awaiting_approval' });
+    const approval = createApproval(job.id, run.id);
+    log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
+    // Send notification via delivery channel
+    const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
+    await handleDelivery(job, msg);
+    return;
   }
 
   // Resource pool concurrency check — prevents different jobs from competing for the same resource
@@ -349,7 +446,7 @@ async function dispatchJob(job) {
         return;
       }
 
-      // Use preferred_session_key (set by chilisaus for reuse mode) if provided;
+      // Use preferred_session_key (set by external orchestrators for reuse mode) if provided;
       // otherwise generate a fresh scheduler-scoped key.
       const sessionKey = job.preferred_session_key || `scheduler:${job.id}:${run.id}`;
       updateRunSession(run.id, sessionKey, null);
@@ -375,50 +472,90 @@ async function dispatchJob(job) {
 
       // Run completed synchronously via chat completions
       const content = result.content || '';
-      const isHeartbeatOk = content.trim() === 'HEARTBEAT_OK' || content.trim().startsWith('HEARTBEAT_OK');
+      const trimmed = content.trim();
+
+      const isHeartbeatOk = matchesSentinel(trimmed, 'HEARTBEAT_OK');
 
       // Handle NO_FLUSH response for pre_compaction_flush jobs
-      const isNoFlush = content.trim() === 'NO_FLUSH';
+      const isNoFlush = trimmed === 'NO_FLUSH';
       if (isNoFlush) {
         log('info', `Flush: nothing to flush for ${job.name}`);
       }
 
       // Handle IDEMPOTENT_SKIP response (agent recognized duplicate execution)
-      const isIdempotentSkip = content.trim() === 'IDEMPOTENT_SKIP' || content.trim().startsWith('IDEMPOTENT_SKIP');
+      const isIdempotentSkip = matchesSentinel(trimmed, 'IDEMPOTENT_SKIP');
       if (isIdempotentSkip) {
         log('info', `Idempotent skip (agent): ${job.name}`);
       }
 
-      finishRun(run.id, 'ok', { summary: content.slice(0, 5000) });
+      // Handle TASK_FAILED sentinel — agent explicitly signals failure
+      const isTaskFailed = matchesSentinel(trimmed, 'TASK_FAILED');
 
-      // Store result hash on idempotency ledger for verification
-      updateIdempotencyResultHash(idemKey, content);
+      // Detect transient service errors in agent reply content
+      const isTransientError = detectTransientError(content);
+
+      // Determine effective run status — transient errors and TASK_FAILED are not "ok"
+      const effectiveStatus = (isTaskFailed || isTransientError) ? 'error' : 'ok';
+
+      if (isTaskFailed) {
+        log('warn', `Agent signalled TASK_FAILED: ${job.name}`, { runId: run.id });
+      }
+      if (isTransientError) {
+        log('warn', `Transient error detected in agent reply: ${job.name}`, { runId: run.id, snippet: content.slice(0, 200) });
+      }
+
+      finishRun(run.id, effectiveStatus, {
+        summary: content.slice(0, 5000),
+        ...(effectiveStatus === 'error' ? { error_message: isTaskFailed ? 'Agent signalled TASK_FAILED' : 'Transient error in agent reply' } : {}),
+      });
+
+      // Store result hash on idempotency ledger for verification (only for successful runs)
+      if (effectiveStatus === 'ok') {
+        updateIdempotencyResultHash(idemKey, content);
+      } else {
+        // Release idempotency key on soft failure so retries can reclaim
+        releaseIdempotencyKey(idemKey);
+      }
 
       // Mark agent as idle
       if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
       // Handle delivery (skip heartbeat-ok, no-flush, and idempotent-skip responses)
       const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
-        && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && content.trim();
+        && !isHeartbeatOk && !isNoFlush && !isIdempotentSkip && trimmed;
       if (shouldAnnounce) {
-        await handleDelivery(job, content);
-      }
-
-      // Update job state (may delete one-shot jobs)
-      updateJobAfterRun(job, 'ok');
-
-      // Fire triggered children on success (pass content for trigger_condition evaluation)
-      const triggered = fireTriggeredChildren(job.id, 'ok', content);
-      if (triggered.length > 0) {
-        // Store parent run ID for chain idempotency key generation
-        for (const child of triggered) {
-          pendingChainKeys.set(child.id, run.id);
+        // For transient errors, prefix the delivery with a warning
+        if (effectiveStatus === 'error') {
+          const willRetry = job.max_retries > 0 && (run.retry_count || 0) < job.max_retries;
+          const retryLabel = willRetry ? 'will retry' : 'no retries configured';
+          await handleDelivery(job, `⚠️ Job soft-failed (${retryLabel}): ${job.name}\n\n${content}`);
+        } else {
+          await handleDelivery(job, content);
         }
-        log('info', `Triggered ${triggered.length} child job(s)`, {
-          parentId: job.id,
-          children: triggered.map(c => c.name),
-        });
       }
+
+      // For soft failures, attempt retry before falling through to updateJobAfterRun
+      if (effectiveStatus === 'error') {
+        if (shouldRetry(job, run.id)) {
+          const retry = scheduleRetry(job, run.id);
+          log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (soft failure)`, {
+            jobId: job.id, runId: run.id,
+          });
+          getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+          // Skip updateJobAfterRun — retry handles scheduling
+          if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+          log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
+          // Fire triggered children on failure
+          handleTriggeredChildren(job.id, 'error', content, run.id, ' on soft failure');
+          return; // early return — retry path handles everything
+        }
+      }
+
+      // Update job state (may delete one-shot jobs — but only when effectiveStatus is 'ok')
+      updateJobAfterRun(job, effectiveStatus);
+
+      // Fire triggered children (pass content for trigger_condition evaluation)
+      handleTriggeredChildren(job.id, effectiveStatus === 'ok' ? 'ok' : 'error', content, run.id);
 
       // Drain queued dispatches (overlap_policy=queue)
       if (dequeueJob(job.id)) {
@@ -455,17 +592,7 @@ async function dispatchJob(job) {
     } else {
       // Fire triggered children on failure (only after exhausting retries)
       // No content available on error path — condition checks will use empty string
-      const triggered = fireTriggeredChildren(job.id, 'error', err.message);
-      if (triggered.length > 0) {
-        // Store parent run ID for chain idempotency key generation
-        for (const child of triggered) {
-          pendingChainKeys.set(child.id, run.id);
-        }
-        log('info', `Triggered ${triggered.length} child job(s) on failure`, {
-          parentId: job.id,
-          children: triggered.map(c => c.name),
-        });
-      }
+      handleTriggeredChildren(job.id, 'error', err.message, run.id, ' on failure');
 
       // Drain queued dispatches (overlap_policy=queue) even on failure
       if (dequeueJob(job.id)) {
@@ -776,8 +903,7 @@ async function tick() {
   if (!gatewayHealthy || now % 60000 < TICK_INTERVAL_MS) {
     gatewayHealthy = await checkGatewayHealth();
     if (!gatewayHealthy) {
-      log('warn', 'Gateway unreachable — skipping tick');
-      return;
+      log('warn', 'Gateway unreachable — isolated jobs will be deferred; shell/main jobs continue');
     }
   }
 
@@ -785,6 +911,12 @@ async function tick() {
   try {
     const dueJobs = getDueJobs();
     for (const job of dueJobs) {
+      if (!gatewayHealthy && job.session_target === 'isolated') {
+        const deferredAt = new Date(Date.now() + 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+        updateJob(job.id, { next_run_at: deferredAt });
+        log('info', `Deferred isolated job while gateway is down: ${job.name}`, { jobId: job.id, nextRunAt: deferredAt });
+        continue;
+      }
       await dispatchJob(job);
     }
   } catch (err) {
@@ -837,6 +969,24 @@ async function tick() {
       }
     } catch (err) {
       log('error', `Spawn handler error: ${err.message}`);
+    }
+    try {
+      const mapped = mapTeamMessages(200);
+      if (mapped > 0) {
+        log('debug', `Team adapter mapped ${mapped} message(s)`);
+      }
+    } catch (err) {
+      log('error', `Team adapter map error: ${err.message}`);
+    }
+    try {
+      const gates = checkTeamTaskGates(100);
+      if (gates.passed > 0 || gates.failed > 0) {
+        log('info', `Team task gates updated`, gates);
+      } else if (gates.pending > 0) {
+        log('debug', `Team task gates pending`, gates);
+      }
+    } catch (err) {
+      log('error', `Team gate check error: ${err.message}`);
     }
     try { await deliverPendingMessages(); } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
@@ -904,7 +1054,7 @@ function shutdown(signal) {
 }
 
 async function main() {
-  log('info', 'Starting OpenClaw Scheduler v1.0.0', {
+  log('info', 'Starting OpenClaw Scheduler v1.0.2', {
     tickMs: TICK_INTERVAL_MS,
     staleThresholdS: STALE_THRESHOLD_S,
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,

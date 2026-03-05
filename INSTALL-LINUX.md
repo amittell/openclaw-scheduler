@@ -196,7 +196,7 @@ This is the Linux equivalent of macOS LaunchAgent's `RunAtLoad: true` + `KeepAli
 
 ### Isolated dispatch
 
-Shell jobs on Linux use `/bin/bash` by default (or whatever `$SHELL` is set to). Override with `SCHEDULER_SHELL` env var in the service file.
+Shell jobs on Linux use `/bin/bash` by default. Override with `SCHEDULER_SHELL` env var in the service file.
 
 ```bash
 cd ~/.openclaw/scheduler

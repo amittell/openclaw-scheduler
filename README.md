@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-351%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-388%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -10,7 +10,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 351 (full suite, in-memory SQLite)
+**Tests:** 388 (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -46,8 +46,8 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 27. [Best Practices](#best-practices)
 28. [File Reference](#file-reference)
 29. [Testing](#testing)
-30. [Companion Tools](#companion-tools)
-30. [Troubleshooting](#troubleshooting)
+30. [Companion Scripts](#companion-scripts)
+31. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -71,7 +71,9 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-SCHEDULER_DB=:memory: node test.js   # should print: 351 passed, 0 failed
+npm test                             # should print: 388 passed, 0 failed
+npm run lint                         # static checks
+npm run coverage                     # coverage summary + lcov report
 ```
 
 Then run the interactive setup wizard:
@@ -82,7 +84,7 @@ node setup.mjs
 
 The wizard will:
 - Run DB migrations
-- Append chilisaus entries to your agent's `MEMORY.md` and `workspace-index.md`
+- Append scheduler queue/inbox-consumer entries to your agent's `MEMORY.md` and `workspace-index.md`
 - Create **Inbox Consumer** + **Stuck Run Detector** scheduler jobs
 - Install and load the macOS LaunchAgent (optional)
 
@@ -90,7 +92,7 @@ After setup:
 
 ```bash
 node cli.js status                    # verify scheduler is running
-node chilisaus/index.mjs stuck        # should print: 0 stuck runs
+node scripts/stuck-run-detector.mjs   # should print: No stale runs older than 15 minute(s).
 tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
 
@@ -237,7 +239,7 @@ Shell Job (session_target='shell')
   │
   ├─ getDueJobs() → "Hourly Backup is due"
   ├─ createRun() → status='running'
-  ├─ /bin/zsh -c "<payload_message>"
+  ├─ run "<payload_message>" via shell (platform default or SCHEDULER_SHELL)
   │   (no gateway required)
   │   ← exit 0: "Backup complete, 3 files"
   │
@@ -315,7 +317,7 @@ node cli.js jobs add '{
 
 **Key properties:**
 - **No gateway dependency** — runs even when gateway is down
-- `payload_message` is the command to execute (shell string passed to `/bin/zsh -c`)
+- `payload_message` is the command to execute (shell string passed to the configured shell)
 - Output captured up to 1MB, truncated to 5000 chars in run summary
 - `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
@@ -579,15 +581,14 @@ node cli.js jobs add '{
   "name": "Flaky Deploy",
   "schedule_cron": "0 10 * * *",
   "payload_message": "deploy to prod",
-  "max_retries": 3,
-  "retry_delay_s": 30
+  "max_retries": 3
 }'
 ```
 
 **How it works:**
 
 1. Job fails → check `max_retries`
-2. Retries remaining → schedule retry after `retry_delay_s` seconds
+2. Retries remaining → schedule retry with exponential backoff (30s, 60s, 120s, ...)
 3. Retry run tracks lineage: `retry_of` → failed run ID, `retry_count` incremented
 4. All retries exhausted → trigger failure children + apply error backoff
 5. Any retry succeeds → trigger success children, reset `consecutive_errors`
@@ -597,7 +598,6 @@ node cli.js jobs add '{
 | Field | Default | Description |
 |-------|---------|-------------|
 | `max_retries` | 0 | Max retry attempts (0 = no retry) |
-| `retry_delay_s` | 30 | Seconds between retries |
 | `runs.retry_of` | null | ID of the failed run being retried |
 | `runs.retry_count` | 0 | Which attempt this is (0 = first try) |
 
@@ -662,6 +662,27 @@ node cli.js msg inbox <agent-id>
 node cli.js msg readall <agent-id>
 ```
 
+### Signal Queue Consumer Example
+
+Use this when you want scripts to enqueue only actionable signals, then a single consumer job pushes those signals to Telegram.
+
+```bash
+# 1) Enqueue a signal
+node cli.js msg send monitor-agent main "Found 3 critical errors in prod logs"
+
+# 2) Add a consumer shell job (every 5 minutes)
+node cli.js jobs add '{
+  "name": "Inbox Consumer",
+  "schedule_cron": "*/5 * * * *",
+  "session_target": "shell",
+  "payload_message": "node ~/.openclaw/scheduler/scripts/inbox-consumer.mjs --to YOUR_TELEGRAM_ID",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "run_timeout_ms": 60000
+}'
+```
+
 ---
 
 ## Backup & Recovery
@@ -723,7 +744,7 @@ node cli.js agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 6 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 8 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -738,7 +759,7 @@ node cli.js agents register <id> [name]
 | `task_tracker_agents` | Per-agent status within a task group |
 | `idempotency_ledger` | Dispatch deduplication and at-least-once tracking |
 | `delivery_aliases` | Named delivery targets (channel + target pairs) |
-| `schema_migrations` | Applied migration version log |
+| `schema_migrations` | Baseline schema version log |
 
 ### Jobs (key columns)
 
@@ -746,7 +767,7 @@ node cli.js agents register <id> [name]
 id, name, enabled, schedule_cron, schedule_tz,
 session_target, agent_id, payload_kind, payload_message,
 payload_model, overlap_policy, run_timeout_ms,
-max_retries, retry_delay_s, delivery_mode, delivery_channel,
+max_retries, delivery_mode, delivery_channel,
 delivery_to, delete_after_run, parent_id, trigger_on,
 trigger_delay_s, trigger_condition, resource_pool,
 approval_required, approval_timeout_s, approval_auto,
@@ -856,7 +877,7 @@ node cli.js status
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
-| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux) | Shell used for shell jobs |
+| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
 
 ---
 
@@ -919,7 +940,7 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 
 ### Gateway health
 
-`GET /health` checked before each tick. If unreachable, entire tick is skipped.
+`GET /health` checked before each tick. If unreachable, isolated jobs are deferred; shell and main-session jobs continue.
 
 ---
 
@@ -931,19 +952,12 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 ```
 
-### Schema migrations
+### Schema baseline
 
-Applied on top of base schema (schema.sql) in order:
+As of `v1.0.2`, the schema is consolidated in `schema.sql` (baseline `v10`).
 
-```bash
-node migrate-v3.js    # chain columns (parent_id, trigger_on, trigger_delay_s)
-node migrate-v3b.js   # retry columns (max_retries, retry_delay_s)
-node migrate-v5.js    # delivery guarantee, approvals, context retrieval
-node migrate-v6.js    # task tracker tables
-node migrate-v7.js    # idempotency ledger
-```
-
-These migrations are run automatically when `initDb()` detects the database needs upgrading.
+- Net-new installs: `initDb()` applies `schema.sql` directly.
+- Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
 
 ### What was disabled in OpenClaw
 
@@ -963,6 +977,8 @@ These migrations are run automatically when `initDb()` detects the database need
 | 0.6.0 | 2026-02-24 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
 | 0.7.0 | 2026-02-25 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
 | 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
+| 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
+| 1.0.2 | 2026-03-03 | v10 | Team-aware routing fields on messages, explicit message receipt events (attempt/error/ack), team adapter projection + task completion gates |
 
 ---
 
@@ -998,8 +1014,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v9) — all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v9
+├── schema.sql             # Complete schema (v10) — all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v10
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -1009,16 +1025,14 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── idempotency.js         # Idempotency ledger (at-least-once delivery dedup)
 ├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
 ├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
+├── team-adapter.js        # Team mailbox/task projection and task completion gates
 ├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── test.js                # Full test suite (351 assertions, in-memory)
-│
-│  Companion tool — chilisaus (optional, see chilisaus/README.md)
-├── chilisaus/
-│   ├── index.mjs          # Dispatch CLI: enqueue / status / stuck / result / send / heartbeat
-│   ├── hooks.mjs          # Lifecycle event emitter (Loki + optional webhook)
-│   └── README.md          # chilisaus documentation
+├── test.js                # Full test suite (352 assertions, in-memory)
+├── scripts/
+│   ├── inbox-consumer.mjs      # Drains queue messages and delivers to Telegram
+│   └── stuck-run-detector.mjs  # Detects stale running runs (alert-only via non-zero exit)
 │
 │  Service & docs
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
@@ -1039,7 +1053,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (351 assertions, in-memory SQLite)
+# Run all tests (352 assertions, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:
@@ -1124,30 +1138,26 @@ mc alias list   # verify backupstore alias configured
 
 ---
 
-## Companion Tools
+## Companion Scripts
 
-The `chilisaus/` directory contains an optional companion CLI for orchestrating sub-agent dispatch patterns on top of the scheduler. It is intentionally separate from the core scheduler — the scheduler handles job scheduling and execution; chilisaus handles the control-plane pattern of *how you dispatch work* from an orchestrator agent.
+The `scripts/` directory contains optional operational helpers built on top of core scheduler primitives.
 
-**chilisaus is not required** to use the scheduler. It's useful if you're building a multi-agent system where one agent acts as an orchestrator and needs to:
-- Dispatch one-shot tasks to worker agents and track them by human-readable label
-- Resume a prior session context (`--mode reuse`)
-- Query run status, results, and stuck detection without raw SQL
-- Emit structured dispatch lifecycle events to Loki or a webhook
+These scripts are not required for scheduling itself, but they are useful for production operations:
+- `scripts/inbox-consumer.mjs` drains queued messages and delivers them to Telegram.
+- `scripts/stuck-run-detector.mjs` detects stale `running` runs and exits non-zero for alerting.
 
 ### Signal Queue Pattern
 
-The message queue (`messages` table) combined with `chilisaus send` implements a **signal-only** delivery path that complements `delivery_mode: announce`:
+The message queue (`messages` table) plus `cli.js msg send` implements a **signal-only** delivery path that complements `delivery_mode: announce`:
 
 ```
 Failure path:  dispatcher → announce → Telegram (immediate, unconditional)
-Signal path:   script → chilisaus send → queue → Inbox Consumer → Telegram
+Signal path:   script → cli.js msg send → queue → Inbox Consumer → Telegram
 ```
 
-Scripts write to the queue **only when they have found something** — not unconditionally. A companion `inbox-consumer.mjs` shell job (run every 5 min) drains the queue and delivers to Telegram. It exits 0 (silent) when the queue is empty, so there is no noise.
+Scripts write to the queue **only when they have found something** — not unconditionally. A companion `scripts/inbox-consumer.mjs` shell job (run every 5 min) drains the queue and delivers to Telegram. It exits 0 when the queue is empty, so there is no noise.
 
 > **Important:** The dispatcher does **not** write to the message queue automatically.
 > Every message in the queue was put there by a script with a specific receiver in mind.
 > Traceability for completed jobs comes from the `runs` table, `delivery_mode: announce`,
-> and `chilisaus result/status` — not from queued messages.
-
-→ See [`chilisaus/README.md`](chilisaus/README.md) for full documentation including the Signal Queue Pattern.
+> and run history/CLI views — not from queued messages.

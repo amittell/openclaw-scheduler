@@ -7,7 +7,7 @@
  *
  * What it does:
  *  1. Runs DB migrations (creates/upgrades scheduler.db)
- *  2. Appends chilisaus entries to your agent's MEMORY.md + workspace-index.md
+ *  2. Appends scheduler queue/consumer entries to MEMORY.md + workspace-index.md
  *  3. Creates Inbox Consumer + Stuck Run Detector scheduler jobs
  *  4. Installs the macOS LaunchAgent (optional)
  */
@@ -17,6 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,15 +46,6 @@ function appendIfMissing(filePath, anchor, content) {
   return true;
 }
 
-function insertBeforeIfMissing(filePath, anchor, content) {
-  if (!fs.existsSync(filePath)) return false;
-  const existing = fs.readFileSync(filePath, 'utf8');
-  if (existing.includes('chilisaus')) return 'exists';
-  if (!existing.includes(anchor)) return false;
-  fs.writeFileSync(filePath, existing.replace(anchor, content + '\n' + anchor));
-  return true;
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 print();
@@ -63,7 +55,7 @@ print('╚═══════════════════════�
 print();
 print('This wizard will:');
 print('  • Run DB migrations');
-print('  • Add chilisaus to your agent memory files');
+print('  • Add scheduler queue + consumer notes to agent memory files');
 print('  • Create Inbox Consumer + Stuck Run Detector jobs');
 print('  • Install the macOS LaunchAgent (optional)');
 print();
@@ -98,7 +90,7 @@ try {
   if (ran) {
     ok(`Migrations applied → ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date (schema v9) → ${schedulerDbPath}`);
+    ok(`DB already up to date (schema v10) → ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);
@@ -111,34 +103,32 @@ print();
 print('── Step 3: Agent memory files ──────────────────────────');
 
 const memoryMd = path.join(workspacePath, 'MEMORY.md');
-const memoryEntry = `- **chilisaus 🌶️:** Sub-agent dispatch CLI at \`${schedulerPath}/chilisaus/index.mjs\`.
-  Commands: \`enqueue\` (spawn sub-agent), \`status\`, \`stuck\`, \`result\`, \`send\` (queue message), \`heartbeat\`.
-  Backed by scheduler DB (runs/jobs tables). Queue (\`send\`) is signal-only — scripts enqueue only when
-  actionable. Inbox Consumer (\`${workspacePath}/scripts/inbox-consumer.mjs\`) drains queue → Telegram DM
-  every 5 min. Docs: \`${schedulerPath}/chilisaus/README.md\`.`;
+const memoryEntry = `- **Scheduler Queue Pattern:** Use \`node ${schedulerPath}/cli.js msg send <from> <to> "body"\` for signal-only queue entries.
+  Inbox Consumer (\`${schedulerPath}/scripts/inbox-consumer.mjs\`) drains pending queue messages to Telegram.
+  Stuck Run Detector (\`${schedulerPath}/scripts/stuck-run-detector.mjs\`) alerts on stale \`running\` runs.`;
 
-const memResult = appendIfMissing(memoryMd, 'chilisaus', memoryEntry);
-if (memResult === true)       ok(`Appended chilisaus entry → MEMORY.md`);
-else if (memResult === 'exists') skip('chilisaus already in MEMORY.md');
+const memResult = appendIfMissing(memoryMd, 'Scheduler Queue Pattern', memoryEntry);
+if (memResult === true)       ok('Appended scheduler queue entry → MEMORY.md');
+else if (memResult === 'exists') skip('Scheduler queue entry already in MEMORY.md');
 else                          warn(`MEMORY.md not found at ${memoryMd} — skipping`);
 
 const workspaceIndex = path.join(workspacePath, 'memory', 'workspace-index.md');
 const indexSection = `### Scheduler & Dispatch
-> Covers: standalone scheduler, sub-agent dispatch, inbox queue
+> Covers: standalone scheduler, message queue, inbox consumer
 
 | File | Covers | Load |
 |------|--------|------|
 | \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. LaunchAgent: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
-| \`${schedulerPath}/chilisaus/index.mjs\` | Sub-agent dispatch CLI 🌶️. Commands: \`enqueue\`, \`status\`, \`stuck\`, \`result\`, \`send\`, \`heartbeat\`. | Dispatching sub-agents or queue messages |
-| \`${schedulerPath}/chilisaus/hooks.mjs\` | Loki lifecycle hooks. Only fires if \`LOKI_PUSH_URL\` env set. | Sub-agent observability |
-| \`${workspacePath}/scripts/inbox-consumer.mjs\` | Drains chilisaus queue → Telegram DM. Runs every 5 min via scheduler. Signal-only. | Queue/inbox debugging |`;
+| \`${schedulerPath}/cli.js\` | Queue + run operations: \`msg send\`, \`msg inbox\`, \`runs running\`, \`runs stale\`. | Day-to-day scheduler operations |
+| \`${schedulerPath}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
+| \`${schedulerPath}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
 
 // Try inserting before a common section header, fall back to append
 const idxAnchors = ['### Automation', '### Memory', '## 🔗', '---\n\n## 🔗'];
 let idxResult = false;
 if (fs.existsSync(workspaceIndex)) {
   const existing = fs.readFileSync(workspaceIndex, 'utf8');
-  if (existing.includes('chilisaus')) {
+  if (existing.includes('inbox-consumer.mjs') || existing.includes('stuck-run-detector.mjs')) {
     idxResult = 'exists';
   } else {
     for (const anchor of idxAnchors) {
@@ -176,35 +166,37 @@ if (!deliverTo) {
     const existing = db.prepare('SELECT name FROM jobs').all().map(r => r.name);
 
     // Inbox Consumer
-    const icScript = path.join(workspacePath, 'scripts', 'inbox-consumer.mjs');
+    const icScript = path.join(schedulerPath, 'scripts', 'inbox-consumer.mjs');
     const icName = 'Inbox Consumer';
     if (existing.includes(icName)) {
       skip(`"${icName}" job already exists`);
     } else if (!fs.existsSync(icScript)) {
       warn(`inbox-consumer.mjs not found at ${icScript}`);
-      warn(`Copy it from docs/examples/ then re-run setup, or add the job manually`);
+      warn('Install is incomplete. Re-clone scheduler repo or add the job manually.');
     } else {
-      const { v4: uuidv4 } = await import('uuid');
       db.prepare(`
         INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 60, 'announce', 'telegram', ?)
-      `).run(uuidv4(), icName, '*/5 * * * *', `node ${icScript}`, deliverTo);
+          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
+        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 60, 'announce', 'telegram', ?, datetime('now', '-1 second'))
+      `).run(randomUUID(), icName, '*/5 * * * *', `node ${icScript} --to ${deliverTo}`, deliverTo);
       ok(`Created "${icName}" job (*/5 * * * *)`);
     }
 
     // Stuck Run Detector
     const srdName = 'Stuck Run Detector';
-    const srdCmd = `node ${path.join(schedulerPath, 'chilisaus', 'index.mjs')} stuck --threshold-min 15`;
+    const srdScript = path.join(schedulerPath, 'scripts', 'stuck-run-detector.mjs');
+    const srdCmd = `node ${srdScript} --threshold-min 15`;
     if (existing.includes(srdName)) {
       skip(`"${srdName}" job already exists`);
+    } else if (!fs.existsSync(srdScript)) {
+      warn(`stuck-run-detector.mjs not found at ${srdScript}`);
+      warn('Install is incomplete. Re-clone scheduler repo or add the job manually.');
     } else {
-      const { v4: uuidv4 } = await import('uuid');
       db.prepare(`
         INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 30, 'announce', 'telegram', ?)
-      `).run(uuidv4(), srdName, '*/10 * * * *', srdCmd, deliverTo);
+          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
+        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 30, 'announce', 'telegram', ?, datetime('now', '-1 second'))
+      `).run(randomUUID(), srdName, '*/10 * * * *', srdCmd, deliverTo);
       ok(`Created "${srdName}" job (*/10 * * * *)`);
     }
 
@@ -220,7 +212,7 @@ print();
 
 const platform = process.platform;
 const nodePath  = process.execPath;
-const indexPath = path.join(schedulerPath, 'index.js');
+const indexPath = path.join(schedulerPath, 'dispatcher.js');
 const logPath   = platform === 'win32'
   ? path.join(os.tmpdir(), 'openclaw-scheduler.log')
   : '/tmp/openclaw-scheduler.log';
@@ -401,7 +393,7 @@ WantedBy=default.target
     warn('Neither systemd user session nor PM2 found');
     print('  Options:');
     print('  • Install PM2:  npm install -g pm2');
-    print('  • Or run manually:  node index.js &');
+    print('  • Or run manually:  node dispatcher.js &');
     print('  • See INSTALL-LINUX.md for systemd setup without a user session');
   }
 
@@ -425,7 +417,7 @@ WantedBy=default.target
 // ── Unknown ────────────────────────────────────────────────────────────────
 } else {
   skip(`Unsupported platform: ${platform}`);
-  print('  Start manually: node index.js');
+  print('  Start manually: node dispatcher.js');
 }
 
 print();
@@ -454,9 +446,9 @@ if (platform === 'darwin') {
 
 print('  • Scheduler CLI:  node cli.js status');
 print('  • List jobs:      node cli.js jobs list');
-print('  • Test dispatch:  node chilisaus/index.mjs enqueue --label test --message "Hello"');
+print('  • Queue test:     node cli.js msg send system main "setup smoke test"');
 print(`  • Logs:           ${logPath}`);
-print('  • Docs:           chilisaus/README.md');
+print('  • Docs:           README.md');
 print();
 print('── ⚠️  Important: activate memory changes ───────────────');
 print();
@@ -469,10 +461,10 @@ print();
 if (workspacePath) {
   print(`    "Read ${path.join(workspacePath, 'MEMORY.md')} and`);
   print(`     ${path.join(workspacePath, 'memory', 'workspace-index.md')} —`);
-  print('     chilisaus was just added to both. Load it into your context."');
+  print('     scheduler queue pattern notes were added. Load them into your context."');
 } else {
   print('    "Read your MEMORY.md and memory/workspace-index.md —');
-  print('     chilisaus was just added to both. Load it into your context."');
+  print('     scheduler queue pattern notes were added. Load them into your context."');
 }
 print();
 print('  Future sessions will pick it up automatically via memory_search.');

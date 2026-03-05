@@ -50,15 +50,35 @@ export function getIdempotencyEntry(key) {
  */
 export function claimIdempotencyKey(key, jobId, runId, expiresAt) {
   if (!key) return true;
-  try {
-    getDb().prepare(
-      "INSERT INTO idempotency_ledger (key, job_id, run_id, claimed_at, expires_at) VALUES (?, ?, ?, datetime('now'), ?)"
-    ).run(key, jobId, runId, expiresAt);
-    return true;
-  } catch (err) {
-    if (err.message.includes('UNIQUE')) return false;
-    throw err;
-  }
+  const db = getDb();
+  const tx = db.transaction(() => {
+    const existing = db.prepare('SELECT status FROM idempotency_ledger WHERE key = ?').get(key);
+    if (!existing) {
+      db.prepare(
+        "INSERT INTO idempotency_ledger (key, job_id, run_id, claimed_at, expires_at) VALUES (?, ?, ?, datetime('now'), ?)"
+      ).run(key, jobId, runId, expiresAt);
+      return true;
+    }
+
+    if (existing.status === 'released') {
+      db.prepare(`
+        UPDATE idempotency_ledger
+        SET status = 'claimed',
+            job_id = ?,
+            run_id = ?,
+            claimed_at = datetime('now'),
+            released_at = NULL,
+            result_hash = NULL,
+            expires_at = ?
+        WHERE key = ?
+      `).run(jobId, runId, expiresAt, key);
+      return true;
+    }
+
+    return false;
+  });
+
+  return tx();
 }
 
 /**

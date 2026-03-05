@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "SQLite-backed job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces built-in cron and heartbeat with full run history, workflow chains, retry logic, shell jobs, approval gates, and backup support.",
   "type": "module",
   "main": "dispatcher.js",
@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node dispatcher.js",
     "migrate": "node migrate.js",
-    "test": "SCHEDULER_DB=:memory: node test.js"
+    "test": "SCHEDULER_DB=:memory: node test.js",
+    "lint": "eslint . --max-warnings=0",
+    "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs"
   },
   "keywords": [
     "openclaw",
@@ -30,5 +32,11 @@
   "dependencies": {
     "better-sqlite3": "^11.0.0",
     "croner": "^8.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "c8": "^10.1.3",
+    "eslint": "^9.39.1",
+    "globals": "^16.5.0"
   }
 }
