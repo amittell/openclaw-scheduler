@@ -280,19 +280,19 @@ function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') 
 // rather than producing a meaningful response. These should NOT trigger
 // delete_after_run or count as successful completions.
 const TRANSIENT_ERROR_PATTERNS = [
-  /temporarily overloaded/i,
-  /service\s+(?:is\s+)?unavailable/i,
-  /rate\s*limit(?:ed|s?)?/i,
-  /too\s+many\s+requests/i,
-  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
-  /gateway\s+timeout/i,
-  /bad\s+gateway/i,
-  /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
-  /API\s+(?:error|unavailable|timeout)/i,
-  /capacity\s+(?:exceeded|limit)/i,
-  /retry\s+(?:after|later|in\s+\d)/i,
-  /context\s+(?:length|window)\s+exceeded/i,
-  /token\s+limit\s+exceeded/i,
+  /\btemporarily overloaded\b/i,
+  /\bservice\s+(?:is\s+)?unavailable\b/i,
+  /\brate\s*limit(?:ed|s?)?\b/i,
+  /\btoo\s+many\s+requests\b/i,
+  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error\b/i,
+  /\bgateway\s+timeout\b/i,
+  /\bbad\s+gateway\b/i,
+  /\bmodel\s+(?:is\s+)?(?:overloaded|unavailable)\b/i,
+  /\bAPI\s+(?:error|unavailable|timeout)\b/i,
+  /\bcapacity\s+(?:exceeded|limit)\b/i,
+  /\bretry\s+(?:after|later|in\s+\d)\b/i,
+  /\bcontext\s+(?:length|window)\s+exceeded\b/i,
+  /\btoken\s+limit\s+exceeded\b/i,
 ];
 
 /**
@@ -356,15 +356,14 @@ async function dispatchJob(job, opts = {}) {
 
   // ── Idempotency key generation & dedup ─────────────────────
   const scheduledTime = job.next_run_at; // capture BEFORE advancing
-  let idemKey = null;
-  if (pendingChainKeys.has(job.id)) {
+  const idemKey = pendingChainKeys.has(job.id)
     // Chain-triggered child: generate key from parent run context
-    const parentRunId = pendingChainKeys.get(job.id);
-    pendingChainKeys.delete(job.id);
-    idemKey = generateChainIdempotencyKey(parentRunId, job.id);
-  } else {
-    idemKey = generateIdempotencyKey(job, scheduledTime);
-  }
+    ? (() => {
+        const parentRunId = pendingChainKeys.get(job.id);
+        pendingChainKeys.delete(job.id);
+        return generateChainIdempotencyKey(parentRunId, job.id);
+      })()
+    : generateIdempotencyKey(job, scheduledTime);
 
   // Check if already claimed in ledger
   if (idemKey) {

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] — 2026-03-05
+
+### Fixed
+- Seeded `Dispatch 529 Recovery` job now uses valid shell dispatch fields and is immediately schedulable (`next_run_at` set)
+- Added seed reconciliation for existing DBs to auto-repair legacy/invalid recovery job rows
+- Watcher timeout recovery now avoids steer/kill escalation when token telemetry is unavailable
+- Dispatch path handling now uses robust home-directory resolution (no literal `~` fallback paths)
+- Replaced watcher-state probe dependency on external `sqlite3` CLI with direct read-only `better-sqlite3` query
+
+### Changed
+- Updated release/docs metadata to reflect latest test baseline (`445 passed`) and version history
+
+---
+
 ## [1.0.2] — 2026-03-03
 
 ### Added

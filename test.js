@@ -1099,6 +1099,18 @@ console.log('\n── Schema Baseline ──');
   assert(msgCols.includes('delivery_attempts'), 'messages has delivery_attempts column');
   assert(msgCols.includes('last_error'), 'messages has last_error column');
   assert(msgCols.includes('team_mapped_at'), 'messages has team_mapped_at column');
+
+  // Verify seeded 529 recovery job is runnable and valid for shell dispatch
+  const recovery = getDb().prepare(`
+    SELECT id, enabled, session_target, payload_kind, payload_message, next_run_at
+    FROM jobs
+    WHERE id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
+  `).get();
+  assert(recovery !== undefined, 'seeded 529 recovery job exists');
+  assert(recovery.session_target === 'shell', 'seeded 529 recovery target is shell');
+  assert(recovery.payload_kind === 'shellCommand', 'seeded 529 recovery payload_kind is shellCommand');
+  assert(recovery.payload_message === 'node dispatch/529-recovery.mjs', 'seeded 529 recovery command path is repo-local');
+  assert(recovery.next_run_at !== null, 'seeded 529 recovery job is schedulable (next_run_at set)');
 }
 
 console.log('\n── v5: Task Tracker ──');
@@ -1635,17 +1647,13 @@ console.log('\n── delete_after_run Safety ──');
   const afterError = getJob(oneShot.id);
   assert(afterError !== undefined, 'one-shot job survives error status (not deleted)');
 
-  // Simulate ok status via updateJobAfterRun-like logic
-  // The dispatcher calls updateJobAfterRun which does: if (status === 'ok' && job.delete_after_run) deleteJob
-  // We verify the condition directly
-  const shouldDeleteOnOk = ('ok' === 'ok' && oneShot.delete_after_run);
-  assert(shouldDeleteOnOk, 'delete_after_run triggers on ok status');
+  // Simulate updateJobAfterRun deletion condition directly.
+  // updateJobAfterRun deletes only when status === 'ok' and delete_after_run is truthy.
+  const shouldDelete = (status, job) => status === 'ok' && Boolean(job.delete_after_run);
 
-  const shouldDeleteOnError = ('error' === 'ok' && oneShot.delete_after_run);
-  assert(!shouldDeleteOnError, 'delete_after_run does NOT trigger on error status');
-
-  const shouldDeleteOnTimeout = ('timeout' === 'ok' && oneShot.delete_after_run);
-  assert(!shouldDeleteOnTimeout, 'delete_after_run does NOT trigger on timeout status');
+  assert(shouldDelete('ok', oneShot), 'delete_after_run triggers on ok status');
+  assert(!shouldDelete('error', oneShot), 'delete_after_run does NOT trigger on error status');
+  assert(!shouldDelete('timeout', oneShot), 'delete_after_run does NOT trigger on timeout status');
 
   // Clean up
   deleteJob(oneShot.id);

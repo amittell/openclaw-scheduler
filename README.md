@@ -71,7 +71,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 388 passed, 0 failed
+npm test                             # should print: 445 passed, 0 failed
 npm run lint                         # static checks
 npm run coverage                     # coverage summary + lcov report
 ```
@@ -954,7 +954,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of `v1.0.2`, the schema is consolidated in `schema.sql` (baseline `v10`).
+As of `v1.0.3`, the schema is consolidated in `schema.sql` (baseline `v10`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -979,6 +979,7 @@ As of `v1.0.2`, the schema is consolidated in `schema.sql` (baseline `v10`).
 | 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
 | 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
 | 1.0.2 | 2026-03-03 | v10 | Team-aware routing fields on messages, explicit message receipt events (attempt/error/ack), team adapter projection + task completion gates |
+| 1.0.3 | 2026-03-05 | v10 | Dispatch hardening: seeded 529 recovery job reconciliation, watcher token-telemetry safeguards, robust home-path resolution, and watcher DB checks without external `sqlite3` CLI |
 
 ---
 
