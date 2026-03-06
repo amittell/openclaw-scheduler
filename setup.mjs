@@ -46,6 +46,14 @@ function appendIfMissing(filePath, anchor, content) {
   return true;
 }
 
+function getNpmConfigValue(key) {
+  try {
+    return execSync(`npm config get ${key}`, { encoding: 'utf8' }).trim();
+  } catch {
+    return '';
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 print();
@@ -76,6 +84,27 @@ print(`  Scheduler:  ${schedulerPath}`);
 print(`  Workspace:  ${workspacePath}`);
 print(`  Gateway:    ${gatewayUrl}`);
 print(`  Deliver to: ${deliverTo || '(none — skipping job creation)'}`);
+print();
+
+// ─── Preflight: npm install behavior ─────────────────────────────────────────
+
+print('── Preflight: npm install behavior ───────────────────');
+const ignoreScripts = getNpmConfigValue('ignore-scripts').toLowerCase();
+if (ignoreScripts === 'true') {
+  warn('Detected npm config: ignore-scripts=true');
+  warn('better-sqlite3 requires install scripts to build/load native bindings.');
+  warn('Recommended fix:');
+  warn('  npm config set ignore-scripts false');
+  warn('  npm install --ignore-scripts=false');
+  const continueAnyway = await confirm('Continue setup anyway?');
+  if (!continueAnyway) {
+    print('Setup aborted. Fix npm config, then rerun: node setup.mjs');
+    rl.close();
+    process.exit(1);
+  }
+} else {
+  ok('npm install scripts are enabled');
+}
 print();
 
 // ─── Step 2: DB migrations ────────────────────────────────────────────────────

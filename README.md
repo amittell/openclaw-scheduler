@@ -86,7 +86,9 @@ The wizard will:
 - Run DB migrations
 - Append scheduler queue/inbox-consumer entries to your agent's `MEMORY.md` and `workspace-index.md`
 - Create **Inbox Consumer** + **Stuck Run Detector** scheduler jobs
-- Install and load the macOS LaunchAgent (optional)
+- Configure dispatcher auto-start service:
+  - macOS: LaunchAgent (optional)
+  - Linux/WSL2: systemd user service (or PM2 fallback)
 
 After setup:
 
@@ -96,8 +98,10 @@ node scripts/stuck-run-detector.mjs   # should print: No stale runs older than 1
 tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
 
-For full manual installation details, see [INSTALL.md](INSTALL.md).
-For Linux and Windows (WSL2), follow [INSTALL-LINUX.md](INSTALL-LINUX.md). For WSL2 setup on Windows, see [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
+Dispatcher setup is covered in:
+- [INSTALL.md](INSTALL.md) (macOS LaunchAgent)
+- [INSTALL-LINUX.md](INSTALL-LINUX.md) (Linux/WSL2 systemd + PM2 fallback)
+- [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) (WSL2 setup path)
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
 
 ---

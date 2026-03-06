@@ -23,10 +23,11 @@
  */
 
 import { getDb } from '../db.js';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveDispatchCliPath, resolveDispatchLabel } from './dispatch-cli-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -34,21 +35,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const LABELS_PATH  = join(__dirname, '..', 'dispatch', 'labels.json');
 const STATE_PATH   = '/tmp/stuck-detector-state.json';
-const HOME_DIR     = process.env.HOME || '';
-const OPENCLAW_HOME = process.env.OPENCLAW_HOME
-  || (HOME_DIR ? join(HOME_DIR, '.openclaw') : '.openclaw');
-
-function resolveDispatchCli() {
-  const candidates = [
-    process.env.DISPATCH_CLI,
-    process.env.CHILISAUS_CLI, // backward-compat override
-    join(OPENCLAW_HOME, 'dispatch', 'index.mjs'),
-    join(OPENCLAW_HOME, 'chilisaus', 'index.mjs'), // backward-compat path
-  ].filter(Boolean);
-  return candidates.find(p => existsSync(p)) || candidates[0] || 'dispatch/index.mjs';
-}
-
-const DISPATCH_CLI = resolveDispatchCli();
+const DISPATCH_CLI = resolveDispatchCliPath(process.env);
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -101,22 +88,6 @@ function saveState(state) {
 }
 
 // ── Dispatch Integration ────────────────────────────────────
-
-/**
- * Resolve a scheduler job name to a dispatch label in labels.json.
- * Handles direct matches and both watcher prefixes for compatibility.
- * Returns the label string if found, null otherwise.
- */
-function resolveLabel(jobName, labels) {
-  if (labels[jobName]) return jobName;
-  for (const prefix of ['dispatch-deliver:', 'chilisaus-deliver:']) {
-    if (jobName.startsWith(prefix)) {
-      const suffix = jobName.slice(prefix.length);
-      if (labels[suffix]) return suffix;
-    }
-  }
-  return null;
-}
 
 /**
  * Get liveness info from `dispatch status --label <label>`.
@@ -209,7 +180,7 @@ try {
   const staleLabelsThisCycle = new Set();
 
   for (const r of rows) {
-    const label = resolveLabel(r.job_name, labels);
+    const label = resolveDispatchLabel(r.job_name, labels);
 
     // ── Non-dispatch job: alert immediately (old behavior) ──
     if (!label) {

@@ -26,6 +26,7 @@ import {
   ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
+import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 
 // ── Test harness ────────────────────────────────────────────
 let passed = 0;
@@ -1729,6 +1730,45 @@ console.log('\n── Payload Validation ──');
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
   assert(threw, 'updateJob: changing target alone validates against existing kind');
   deleteJob(j.id);
+}
+
+console.log('\n── Dispatch Script Compatibility ──');
+{
+  const envBase = { HOME: '/tmp/alex' };
+  const dispatchPath = '/tmp/alex/.openclaw/dispatch/index.mjs';
+  const legacyPath = '/tmp/alex/.openclaw/chilisaus/index.mjs';
+
+  const dispatchOnly = new Set([dispatchPath]);
+  assert(
+    resolveDispatchCliPath(envBase, p => dispatchOnly.has(p)) === dispatchPath,
+    'resolveDispatchCliPath prefers dispatch path when available'
+  );
+
+  const legacyOnly = new Set([legacyPath]);
+  assert(
+    resolveDispatchCliPath(envBase, p => legacyOnly.has(p)) === legacyPath,
+    'resolveDispatchCliPath falls back to legacy path when dispatch path missing'
+  );
+
+  const explicitDispatch = '/opt/custom/dispatch/index.mjs';
+  const explicitLegacy = '/opt/custom/chilisaus/index.mjs';
+  const explicitSet = new Set([explicitDispatch, explicitLegacy, dispatchPath]);
+  assert(
+    resolveDispatchCliPath(
+      { ...envBase, DISPATCH_CLI: explicitDispatch, CHILISAUS_CLI: explicitLegacy },
+      p => explicitSet.has(p)
+    ) === explicitDispatch,
+    'resolveDispatchCliPath prioritizes DISPATCH_CLI override'
+  );
+
+  const labels = {
+    alpha: { status: 'running' },
+    beta: { status: 'done' },
+  };
+  assert(resolveDispatchLabel('alpha', labels) === 'alpha', 'resolveDispatchLabel handles direct label match');
+  assert(resolveDispatchLabel('dispatch-deliver:alpha', labels) === 'alpha', 'resolveDispatchLabel handles dispatch watcher prefix');
+  assert(resolveDispatchLabel('chilisaus-deliver:beta', labels) === 'beta', 'resolveDispatchLabel handles legacy watcher prefix');
+  assert(resolveDispatchLabel('dispatch-deliver:missing', labels) === null, 'resolveDispatchLabel returns null for missing label');
 }
 
 
