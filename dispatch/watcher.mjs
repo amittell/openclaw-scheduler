@@ -134,6 +134,8 @@ const OVERLOAD_PATTERNS = [
   /overload/i,
   /temporarily\s+overloaded/i,
   /service.*overloaded/i,
+  /rate.limit/i,
+  /too.many.requests/i,
 ];
 
 /**
