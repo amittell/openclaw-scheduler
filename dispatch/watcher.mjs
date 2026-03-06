@@ -552,11 +552,21 @@ let flatSince = Date.now();
 
 process.stderr.write(`[watcher] deadline hit for ${label} — watching token activity (baseline: ${baselineTokens})\n`);
 
-if (baselineTokens === null) {
-  process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
-  markDoneSync(`timed out after ${timeoutS}s — token telemetry unavailable`);
-  process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
-  process.exit(1);
+// If the session already completed (gateway pruned it → null tokens), exit cleanly.
+if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
+  const r = dispatch('result', ['--label', label]);
+  if (r?.lastReply) {
+    markDoneSync('completed before deadline monitoring');
+    deliverResult(label, r.lastReply, statusAtDeadline?.summary || null);
+    process.exit(0);
+  }
+  // Truly no result and no tokens — telemetry unavailable
+  if (baselineTokens === null) {
+    process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
+    markDoneSync(`timed out after ${timeoutS}s — token telemetry unavailable`);
+    process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
+    process.exit(1);
+  }
 }
 
 while (Date.now() - flatSince < FLAT_WINDOW_MS) {
