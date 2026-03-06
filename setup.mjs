@@ -185,7 +185,7 @@ if (!deliverTo) {
     // Stuck Run Detector
     const srdName = 'Stuck Run Detector';
     const srdScript = path.join(schedulerPath, 'scripts', 'stuck-run-detector.mjs');
-    const srdCmd = `node ${srdScript} --threshold-min 15`;
+    const srdCmd = `node ${srdScript} --threshold-min 45`;  // coding tasks regularly take 30m+
     if (existing.includes(srdName)) {
       skip(`"${srdName}" job already exists`);
     } else if (!fs.existsSync(srdScript)) {

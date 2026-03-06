@@ -6,7 +6,7 @@
  * Pair with scheduler shell jobs using delivery_mode="announce" for alert-only behavior.
  *
  * Usage:
- *   node scripts/stuck-run-detector.mjs [--threshold-min 15] [--limit 20]
+ *   node scripts/stuck-run-detector.mjs [--threshold-min 45] [--limit 20]
  *
  * Exit codes:
  *   0: no stale runs found
@@ -38,7 +38,7 @@ function parsePositiveInt(input, fallback) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-const thresholdMin = parsePositiveInt(args['threshold-min'], 15);
+const thresholdMin = parsePositiveInt(args['threshold-min'], 45);  // coding tasks regularly take 30m+
 const thresholdS = thresholdMin * 60;
 const limit = parsePositiveInt(args.limit, 20);
 
