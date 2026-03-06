@@ -15,7 +15,7 @@
  * State persisted in /tmp/stuck-detector-state.json (volatile, OK to lose on reboot).
  *
  * Usage:
- *   node scripts/stuck-run-detector.mjs [--threshold-min 15] [--limit 20]
+ *   node scripts/stuck-run-detector.mjs [--threshold-min 45] [--limit 20]
  *
  * Exit codes:
  *   0: no stuck runs (includes steered-but-not-yet-stuck)
