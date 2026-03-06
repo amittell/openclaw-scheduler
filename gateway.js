@@ -106,7 +106,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 
   // Track last known activity time (initialised to now — grace period for startup)
   let lastSeenActivity = Date.now();
-  let pollTimer = null;
 
   const checkActivity = async () => {
     try {
@@ -145,7 +144,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   };
 
   // Start polling after the first interval (gives session time to initialise)
-  pollTimer = setInterval(checkActivity, pollIntervalMs);
+  const pollTimer = setInterval(checkActivity, pollIntervalMs);
 
   try {
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
@@ -182,19 +181,21 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     if (err.name === 'AbortError') {
       if (abortReason === 'idle_timeout') {
         throw new Error(
-          `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s — aborted (activity-based timeout)`
+          `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s — aborted (activity-based timeout)`,
+          { cause: err }
         );
       }
       if (abortReason === 'absolute_timeout') {
         throw new Error(
-          `Exceeded absolute timeout of ${Math.round(absoluteTimeoutMs / 1000)}s`
+          `Exceeded absolute timeout of ${Math.round(absoluteTimeoutMs / 1000)}s`,
+          { cause: err }
         );
       }
     }
     throw err;
   } finally {
     clearTimeout(absoluteTimer);
-    if (pollTimer) clearInterval(pollTimer);
+    clearInterval(pollTimer);
   }
 }
 
@@ -214,7 +215,7 @@ export async function sendSystemEvent(text, mode = 'now') {
     const clean = jsonStart >= 0 ? result.slice(jsonStart) : result;
     return JSON.parse(clean);
   } catch (err) {
-    throw new Error(`system event failed: ${err.message}`);
+    throw new Error(`system event failed: ${err.message}`, { cause: err });
   }
 }
 

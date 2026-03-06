@@ -4,13 +4,13 @@
  *
  * Three-phase stuck detection: liveness gating → steer → alert.
  *
- * Phase 1 (Liveness gate): For chilisaus-tracked runs, check actual session
- *   activity via `chilisaus status`. Skip if tokens recently active or status=done.
+ * Phase 1 (Liveness gate): For dispatch-tracked runs, check actual session
+ *   activity via `dispatch status`. Skip if tokens recently active or status=done.
  * Phase 2 (Steer): Send a nudge into the session before alerting. Give it
  *   one more cycle to respond.
  * Phase 3 (Alert): If steer was ignored (tokens flat), alert as genuinely stuck.
  *
- * Non-chilisaus scheduler jobs skip phases 1–2 and alert immediately (old behavior).
+ * Non-dispatch scheduler jobs skip phases 1–2 and alert immediately (old behavior).
  *
  * State persisted in /tmp/stuck-detector-state.json (volatile, OK to lose on reboot).
  *
@@ -23,7 +23,7 @@
  */
 
 import { getDb } from '../db.js';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -32,9 +32,23 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Paths ────────────────────────────────────────────────────
 
-const LABELS_PATH   = join(__dirname, '..', 'dispatch', 'labels.json');
-const STATE_PATH    = '/tmp/stuck-detector-state.json';
-const CHILISAUS_CLI = join(process.env.HOME || '~', '.openclaw', 'chilisaus', 'index.mjs');
+const LABELS_PATH  = join(__dirname, '..', 'dispatch', 'labels.json');
+const STATE_PATH   = '/tmp/stuck-detector-state.json';
+const HOME_DIR     = process.env.HOME || '';
+const OPENCLAW_HOME = process.env.OPENCLAW_HOME
+  || (HOME_DIR ? join(HOME_DIR, '.openclaw') : '.openclaw');
+
+function resolveDispatchCli() {
+  const candidates = [
+    process.env.DISPATCH_CLI,
+    process.env.CHILISAUS_CLI, // backward-compat override
+    join(OPENCLAW_HOME, 'dispatch', 'index.mjs'),
+    join(OPENCLAW_HOME, 'chilisaus', 'index.mjs'), // backward-compat path
+  ].filter(Boolean);
+  return candidates.find(p => existsSync(p)) || candidates[0] || 'dispatch/index.mjs';
+}
+
+const DISPATCH_CLI = resolveDispatchCli();
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -86,29 +100,31 @@ function saveState(state) {
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + '\n');
 }
 
-// ── Chilisaus Integration ────────────────────────────────────
+// ── Dispatch Integration ────────────────────────────────────
 
 /**
- * Resolve a scheduler job name to a chilisaus label in labels.json.
- * Handles both direct matches and `chilisaus-deliver:` prefixed names.
+ * Resolve a scheduler job name to a dispatch label in labels.json.
+ * Handles direct matches and both watcher prefixes for compatibility.
  * Returns the label string if found, null otherwise.
  */
 function resolveLabel(jobName, labels) {
   if (labels[jobName]) return jobName;
-  if (jobName.startsWith('chilisaus-deliver:')) {
-    const suffix = jobName.slice('chilisaus-deliver:'.length);
-    if (labels[suffix]) return suffix;
+  for (const prefix of ['dispatch-deliver:', 'chilisaus-deliver:']) {
+    if (jobName.startsWith(prefix)) {
+      const suffix = jobName.slice(prefix.length);
+      if (labels[suffix]) return suffix;
+    }
   }
   return null;
 }
 
 /**
- * Get liveness info from `chilisaus status --label <label>`.
+ * Get liveness info from `dispatch status --label <label>`.
  * Returns { ageMs, tokens, status } or null on failure.
  */
-function getChilisausLiveness(label) {
+function getDispatchLiveness(label) {
   try {
-    const result = execFileSync('node', [CHILISAUS_CLI, 'status', '--label', label], {
+    const result = execFileSync('node', [DISPATCH_CLI, 'status', '--label', label], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -122,14 +138,14 @@ function getChilisausLiveness(label) {
     };
   } catch (err) {
     process.stderr.write(
-      `[stuck-detector] chilisaus status for "${label}" failed: ${err.message}\n`
+      `[stuck-detector] dispatch status for "${label}" failed: ${err.message}\n`
     );
     return null;
   }
 }
 
 /**
- * Send a steering message into a chilisaus session.
+ * Send a steering message into a dispatch session.
  * Returns true on success, false on failure.
  */
 function steerSession(label, staleMins) {
@@ -139,7 +155,7 @@ function steerSession(label, staleMins) {
     `— then continue. If done: node ~/.openclaw/workspace/scripts/agent-checkin.mjs 'Done: <summary>'`,
   ].join(' ');
   try {
-    execFileSync('node', [CHILISAUS_CLI, 'send', '--label', label, '--message', msg], {
+    execFileSync('node', [DISPATCH_CLI, 'send', '--label', label, '--message', msg], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -195,7 +211,7 @@ try {
   for (const r of rows) {
     const label = resolveLabel(r.job_name, labels);
 
-    // ── Non-chilisaus job: alert immediately (old behavior) ──
+    // ── Non-dispatch job: alert immediately (old behavior) ──
     if (!label) {
       alertRuns.push(r);
       continue;
@@ -211,11 +227,11 @@ try {
       continue;
     }
 
-    const liveness = getChilisausLiveness(label);
+    const liveness = getDispatchLiveness(label);
 
-    // chilisaus status returned done → skip
+    // dispatch status returned done → skip
     if (liveness?.status === 'done') {
-      skippedRuns.push({ ...r, reason: 'chilisaus status=done', label });
+      skippedRuns.push({ ...r, reason: 'dispatch status=done', label });
       continue;
     }
 

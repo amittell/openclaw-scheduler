@@ -259,7 +259,7 @@ Subagent sessions run without PATH access to the `openclaw` CLI, so
 use the gateway HTTP API via curl:
 
 ```bash
-GW_TOKEN=$(python3 -c "import json; print(json.load(open('/Users/alexm/.openclaw/openclaw.json'))['gateway']['auth']['token'])")
+GW_TOKEN=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))['gateway']['auth']['token'])")
 curl -s -X POST http://127.0.0.1:18789/tools/invoke \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $GW_TOKEN" \

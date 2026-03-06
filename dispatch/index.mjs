@@ -131,7 +131,9 @@ function gatewayCall(method, params = {}, opts = {}) {
     const stderr = err.stderr?.trim() || '';
     const stdout = err.stdout?.trim() || '';
     if (stdout) try { return JSON.parse(stdout); } catch {}
-    throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`);
+    throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`, {
+      cause: err,
+    });
   }
 }
 

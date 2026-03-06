@@ -356,15 +356,14 @@ async function dispatchJob(job, opts = {}) {
 
   // ── Idempotency key generation & dedup ─────────────────────
   const scheduledTime = job.next_run_at; // capture BEFORE advancing
-  let idemKey = null;
-  if (pendingChainKeys.has(job.id)) {
+  const idemKey = pendingChainKeys.has(job.id)
     // Chain-triggered child: generate key from parent run context
-    const parentRunId = pendingChainKeys.get(job.id);
-    pendingChainKeys.delete(job.id);
-    idemKey = generateChainIdempotencyKey(parentRunId, job.id);
-  } else {
-    idemKey = generateIdempotencyKey(job, scheduledTime);
-  }
+    ? (() => {
+        const parentRunId = pendingChainKeys.get(job.id);
+        pendingChainKeys.delete(job.id);
+        return generateChainIdempotencyKey(parentRunId, job.id);
+      })()
+    : generateIdempotencyKey(job, scheduledTime);
 
   // Check if already claimed in ledger
   if (idemKey) {
