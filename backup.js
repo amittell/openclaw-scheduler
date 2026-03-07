@@ -26,13 +26,12 @@
 
 import { execSync } from 'child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { homedir } from 'os';
+import { resolveBackupStagingDir, resolveSchedulerDbPath } from './paths.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, 'scheduler.db');
-const STAGING_DIR = join(__dirname, '.backup-staging');
+const DB_PATH = resolveSchedulerDbPath({ env: process.env });
+const STAGING_DIR = resolveBackupStagingDir(process.env);
 const MC_ALIAS = 'backupstore';
 const BUCKET = 'scheduler-backups';
 const PREFIX = 'scheduler';

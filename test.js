@@ -2,7 +2,12 @@
 // Scheduler v2 unified test suite — in-memory, self-contained
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
+import { execFileSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { setDbPath, initDb, closeDb, getDb } from './db.js';
+import { resolveSchedulerDbPath, resolveSchedulerHome } from './paths.js';
 import {
   createJob, getJob, listJobs, updateJob, deleteJob,
   getDueJobs, hasRunningRun, nextRunFromCron,
@@ -11,8 +16,11 @@ import {
   shouldRetry, scheduleRetry, cancelJob,
   enqueueJob, dequeueJob, runJobNow,
   hasRunningRunForPool, evalTriggerCondition,
-  validateJobPayload
+  validateJobPayload, validateJobSpec
 } from './jobs.js';
+import {
+  getDispatch, getDueDispatches, listDispatchesForJob,
+} from './dispatch-queue.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
   getStaleRuns, getTimedOutRuns, getRunningRuns,
@@ -26,7 +34,10 @@ import {
   ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
+import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH } from './gateway.js';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
+import { buildTriggeredRunContext } from './prompt-context.js';
+import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 
 // ── Test harness ────────────────────────────────────────────
 let passed = 0;
@@ -58,6 +69,7 @@ assert(tables.includes('agents'), 'agents table');
 assert(tables.includes('message_receipts'), 'message_receipts table');
 assert(tables.includes('team_tasks'), 'team_tasks table');
 assert(tables.includes('team_mailbox_events'), 'team_mailbox_events table');
+assert(tables.includes('job_dispatch_queue'), 'job_dispatch_queue table');
 
 // Verify v3 columns exist
 const jobCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -69,6 +81,93 @@ assert(jobCols.includes('max_retries'), 'jobs.max_retries column');
 const runCols = db.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
 assert(runCols.includes('retry_count'), 'runs.retry_count column');
 assert(runCols.includes('retry_of'), 'runs.retry_of column');
+assert(runCols.includes('triggered_by_run'), 'runs.triggered_by_run column');
+assert(runCols.includes('dispatch_queue_id'), 'runs.dispatch_queue_id column');
+
+// ── Paths ───────────────────────────────────────────────────
+console.log('\nPaths:');
+const fakeEnv = { HOME: '/home/tester' };
+assert(resolveSchedulerHome(fakeEnv) === '/home/tester/.openclaw/scheduler', 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
+assert(
+  resolveSchedulerDbPath({
+    env: fakeEnv,
+    moduleDir: '/home/tester/.openclaw/scheduler/node_modules/openclaw-scheduler'
+  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  'npm installs default DB path to scheduler home, not node_modules'
+);
+const writableSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-src-'));
+assert(
+  resolveSchedulerDbPath({ env: fakeEnv, moduleDir: writableSourceDir }) === join(writableSourceDir, 'scheduler.db'),
+  'writable source checkout defaults DB path to package directory'
+);
+rmSync(writableSourceDir, { recursive: true, force: true });
+
+// ── Prompt context ─────────────────────────────────────────
+console.log('\nPrompt Context:');
+const triggerContext = buildTriggeredRunContext(
+  { triggered_by_run: 'parent-run-1' },
+  {
+    getRunById: () => ({ id: 'parent-run-1', job_id: 'parent-job-1', status: 'ok', summary: 'STATUS: ALERT pending_update_count=12' }),
+    getJobById: () => ({ id: 'parent-job-1', name: 'Kebablebot Webhook Check' }),
+  }
+);
+assert(triggerContext.text.includes('Trigger Context'), 'trigger context header included');
+assert(triggerContext.text.includes('Kebablebot Webhook Check'), 'trigger context includes parent job name');
+assert(triggerContext.text.includes('STATUS: ALERT'), 'trigger context includes parent summary');
+assert(triggerContext.meta.parent_run_status === 'ok', 'trigger context meta includes parent status');
+
+// ── Telegram webhook diagnostics ───────────────────────────
+console.log('\nWebhook Diagnostics:');
+const healthOk = evaluateWebhookHealth({
+  label: 'kebablebot',
+  webhookInfo: {
+    url: 'https://example.com/hook',
+    pending_update_count: 0,
+    max_connections: 40,
+  },
+  pendingThreshold: 1,
+  requireWebhook: true,
+  expectedWebhookUrl: 'https://example.com/hook',
+  gatewayHealth: { ok: true, status: 200 },
+  recentTelegramFailures: 0,
+});
+assert(healthOk.status === 'OK', 'webhook health ok state');
+
+const healthAlert = evaluateWebhookHealth({
+  label: 'kebablebot',
+  webhookInfo: {
+    url: 'https://example.com/hook',
+    pending_update_count: 22,
+    last_error_message: 'Bad webhook response: 500 Internal Server Error',
+  },
+  pendingThreshold: 1,
+  requireWebhook: true,
+  expectedWebhookUrl: 'https://example.com/hook',
+  gatewayHealth: { ok: true, status: 200 },
+  recentTelegramFailures: 3,
+});
+assert(healthAlert.status === 'ALERT', 'webhook health alert state');
+assert(healthAlert.issues.some(issue => issue.startsWith('pending_update_count=')), 'webhook health flags pending updates');
+assert(healthAlert.recommendation.includes('drop_pending_updates=true'), 'webhook health recommends drop pending repair');
+assert(chooseRepairWebhookUrl({ url: 'https://current.example/hook' }, 'https://expected.example/hook') === 'https://current.example/hook', 'repair uses current webhook url first');
+assert(chooseRepairWebhookUrl({ url: '' }, 'https://expected.example/hook') === 'https://expected.example/hook', 'repair falls back to expected webhook url');
+
+let webhookCheckFailed = false;
+try {
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'bin/openclaw-scheduler.js'),
+    'webhook-check'
+  ], {
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: '' },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+} catch (err) {
+  webhookCheckFailed = true;
+  assert(err.status === 2, 'webhook-check wrapper returns exit code 2 without a bot token');
+  assert(String(err.stderr || '').includes('missing bot token'), 'webhook-check wrapper forwards missing token error');
+}
+assert(webhookCheckFailed, 'webhook-check wrapper invokes diagnostic script');
 
 // ── Cron ────────────────────────────────────────────────────
 console.log('\nCron:');
@@ -260,16 +359,20 @@ assert(onFailure.length === 2, 'failure triggers 2 (failure + complete)');
 assert(onFailure.some(c => c.name === 'OnFailure'), 'includes failure child');
 assert(!onFailure.some(c => c.name === 'OnSuccess'), 'excludes success child');
 
-// fireTriggeredChildren sets next_run_at
-fireTriggeredChildren(parent.id, 'ok');
-assert(getJob(childSuccess.id).next_run_at !== null, 'child scheduled after fire');
+// fireTriggeredChildren enqueues durable chain dispatches
+const parentRun = createRun(parent.id, { run_timeout_ms: 300000 });
+const triggeredChildren = fireTriggeredChildren(parent.id, 'ok', 'ALERT: test', parentRun.id);
+assert(triggeredChildren.length >= 1, 'children triggered after fire');
+const childDispatches = listDispatchesForJob(childSuccess.id);
+assert(childDispatches.some(d => d.dispatch_kind === 'chain'), 'child chain dispatch persisted');
+assert(childDispatches.some(d => d.source_run_id === parentRun.id), 'child dispatch stores source_run_id');
 
 // Trigger delay
 const delayedChild = createJob({ name: 'Delayed', parent_id: parent.id, trigger_on: 'success', trigger_delay_s: 60, payload_message: 'delayed', delivery_mode: 'none' });
 assert(delayedChild.trigger_delay_s === 60, 'trigger_delay_s stored');
-db.prepare('UPDATE jobs SET next_run_at = NULL WHERE id = ?').run(delayedChild.id);
-fireTriggeredChildren(parent.id, 'ok');
-const delayedTime = new Date(getJob(delayedChild.id).next_run_at + 'Z').getTime();
+fireTriggeredChildren(parent.id, 'ok', 'delayed output', parentRun.id);
+const delayedDispatch = listDispatchesForJob(delayedChild.id).find(d => d.dispatch_kind === 'chain');
+const delayedTime = new Date(delayedDispatch.scheduled_for + 'Z').getTime();
 assert(delayedTime > Date.now(), 'delayed child scheduled in future');
 
 // Agent routing
@@ -359,6 +462,8 @@ assert(shouldRetry(retryJob, run1.id), 'shouldRetry true on first failure');
 const retry1 = scheduleRetry(retryJob, run1.id);
 assert(retry1.retryCount === 1, 'retryCount = 1');
 assert(retry1.delaySec === 30, 'first retry = 30s');
+assert(retry1.dispatch.dispatch_kind === 'retry', 'retry creates durable dispatch');
+assert(retry1.dispatch.retry_of_run_id === run1.id, 'retry dispatch tracks failed run');
 
 // Backoff math
 assert(30 * Math.pow(2, 0) === 30, 'backoff: retry 1 = 30s');
@@ -492,18 +597,18 @@ const noRunNowJob = createJob({ name: 'NoRunNow', schedule_cron: '0 3 * * *', pa
 const noRunNowTime = new Date(noRunNowJob.next_run_at + 'Z');
 assert(noRunNowTime > new Date(), 'run_now=false: next_run_at is in the future (normal cron)');
 
-// 5. runJobNow(id) sets next_run_at to ~1 second in the past
+// 5. runJobNow(id) creates a durable manual dispatch without mutating cron schedule
 const laterJob = createJob({ name: 'LaterJob', schedule_cron: '0 4 * * *', payload_message: 'trigger later', delivery_mode: 'none' });
 assert(new Date(laterJob.next_run_at + 'Z') > new Date(), 'laterJob starts with future next_run_at');
 const triggered = runJobNow(laterJob.id);
-const triggeredTime = new Date(triggered.next_run_at + 'Z');
-assert(triggeredTime < new Date(), 'runJobNow: next_run_at is now in the past');
-const triggeredDiff = Date.now() - triggeredTime.getTime();
-assert(triggeredDiff >= 0 && triggeredDiff < 5000, 'runJobNow: next_run_at is approximately 1 second ago (within 5s)');
-assert(getDueJobs().some(j => j.id === laterJob.id), 'runJobNow: job appears in getDueJobs()');
+assert(triggered.dispatch_id, 'runJobNow returns dispatch id');
+const manualDispatch = getDispatch(triggered.dispatch_id);
+assert(manualDispatch.dispatch_kind === 'manual', 'runJobNow creates manual dispatch');
+assert(getDueDispatches().some(d => d.id === manualDispatch.id), 'runJobNow dispatch appears in dispatch queue');
 
 // 6. runJobNow does NOT change the schedule_cron (normal schedule is preserved)
 assert(triggered.schedule_cron === '0 4 * * *', 'runJobNow: schedule_cron unchanged');
+assert(getJob(laterJob.id).next_run_at === laterJob.next_run_at, 'runJobNow: next_run_at unchanged');
 
 // 7. runJobNow returns null for unknown id
 const unknownResult = runJobNow('nonexistent-uuid-xxxx');
@@ -1730,6 +1835,120 @@ console.log('\n── Payload Validation ──');
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
   assert(threw, 'updateJob: changing target alone validates against existing kind');
   deleteJob(j.id);
+}
+
+console.log('\n── Job Spec Validation ──');
+{
+  let threw = false;
+  try {
+    validateJobSpec({
+      name: 'Bad Control',
+      schedule_cron: '0 9 * * *',
+      payload_message: 'hello\u0000world',
+      delivery_mode: 'none',
+    });
+  } catch (e) {
+    threw = e.message.includes('control characters');
+  }
+  assert(threw, 'validateJobSpec rejects control characters in payload_message');
+
+  threw = false;
+  try {
+    validateJobSpec({
+      name: 'Bad Regex',
+      schedule_cron: '0 9 * * *',
+      payload_message: 'test',
+      trigger_condition: 'regex:(',
+      delivery_mode: 'none',
+    });
+  } catch (e) {
+    threw = e.message.includes('Invalid trigger_condition regex');
+  }
+  assert(threw, 'validateJobSpec rejects invalid trigger_condition regex');
+
+  const normalized = validateJobSpec({
+    name: 'Normalize Optional',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'ok',
+    delivery_mode: 'none',
+    delivery_channel: '',
+  });
+  assert(normalized.delivery_channel === null, 'validateJobSpec normalizes empty nullable strings to null');
+}
+
+console.log('\n── Delivery Chunking ──');
+{
+  const short = splitMessageForChannel('telegram', 'hello world');
+  assert(short.length === 1, 'short telegram message stays single-part');
+
+  const long = 'a'.repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 250);
+  const parts = splitMessageForChannel('telegram', long);
+  assert(parts.length >= 2, 'long telegram message is split into multiple parts');
+  assert(parts.every(p => p.length <= TELEGRAM_MAX_MESSAGE_LENGTH), 'all telegram parts obey max length');
+  assert(parts[0].startsWith('[1/'), 'chunked telegram parts include part prefix');
+}
+
+console.log('\n── CLI JSON / Dry-Run / Schema ──');
+{
+  const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-cli-'));
+  const dbPath = join(tempRoot, 'scheduler.db');
+  const cliPath = join(process.cwd(), 'cli.js');
+  const baseEnv = { ...process.env, SCHEDULER_DB: dbPath };
+
+  const schemaOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'schema', 'jobs', '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(schemaOut.fields?.session_target?.enum?.includes('isolated'), 'cli schema --json returns job schema');
+
+  const before = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'list', '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+
+  const dryRunSpec = JSON.stringify({
+    name: 'DryRunOnly',
+    schedule_cron: '0 10 * * *',
+    payload_message: 'noop',
+    delivery_mode: 'none',
+  });
+  const dryRun = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', dryRunSpec, '--dry-run', '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(dryRun.dry_run === true && dryRun.valid === true, 'jobs add --dry-run --json validates without writing');
+
+  const afterDryRun = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'list', '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(before.length === afterDryRun.length, 'dry-run does not create a job');
+
+  const realSpec = JSON.stringify({
+    name: 'CLI Real Job',
+    schedule_cron: '0 11 * * *',
+    payload_message: 'real',
+    delivery_mode: 'none',
+  });
+  const created = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', realSpec, '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(created.ok === true && created.job?.id, 'jobs add --json returns created job payload');
+
+  const runOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'run', created.job.id, '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(runOut.dispatch_kind === 'manual' && typeof runOut.dispatch_id === 'string', 'jobs run --json returns durable dispatch');
+
+  rmSync(tempRoot, { recursive: true, force: true });
 }
 
 console.log('\n── Dispatch Script Compatibility ──');

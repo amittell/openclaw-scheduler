@@ -1,25 +1,34 @@
 #!/usr/bin/env node
 // Scheduler CLI — manage jobs, runs, messages, agents
 import { initDb, getDb } from './db.js';
-import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow } from './jobs.js';
+import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow, validateJobSpec } from './jobs.js';
 import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, listMessageReceipts, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
+import { SCHEDULER_SCHEMAS } from './scheduler-schema.js';
 
-const [,, command, sub, ...args] = process.argv;
+const cliArgs = process.argv.slice(2);
+const jsonFlagIndex = cliArgs.indexOf('--json');
+const jsonMode = jsonFlagIndex >= 0;
+if (jsonFlagIndex >= 0) cliArgs.splice(jsonFlagIndex, 1);
+const [command, sub, ...args] = cliArgs;
 
 function usage() {
   console.log(`
 Usage: node cli.js <command> [subcommand] [options]
+
+Global:
+  --json                             Emit machine-readable JSON
 
 Jobs:
   jobs list                          List all jobs
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
   jobs add <json>                    Add a job
+  jobs validate <json>               Validate a job spec without writing it
   jobs enable <id>                   Enable a job
   jobs disable <id>                  Disable a job
   jobs delete <id>                   Delete a job
@@ -89,6 +98,9 @@ Aliases:
 
 Status:
   status                             Overall scheduler status
+
+Schema:
+  schema [jobs|runs|messages|approvals|dispatches|all]
 `);
 }
 
@@ -96,13 +108,38 @@ await initDb();
 
 function fmt(obj) { return JSON.stringify(obj, null, 2); }
 
+function emit(data, human = null) {
+  if (jsonMode) {
+    console.log(fmt(data));
+    return;
+  }
+  if (typeof human === 'function') {
+    human();
+    return;
+  }
+  if (typeof human === 'string') {
+    console.log(human);
+    return;
+  }
+  console.log(typeof data === 'string' ? data : fmt(data));
+}
+
+function fail(message, code = 1) {
+  if (jsonMode) {
+    console.error(fmt({ ok: false, error: message }));
+  } else {
+    console.error(message);
+  }
+  process.exit(code);
+}
+
 switch (command) {
   // ── Jobs ────────────────────────────────────────────────
   case 'jobs':
     switch (sub) {
       case 'list': {
         const jobs = listJobs();
-        console.table(jobs.map(j => ({
+        const rows = jobs.map(j => ({
           id: j.id.slice(0, 8) + '…',
           name: j.name,
           enabled: !!j.enabled,
@@ -115,7 +152,8 @@ switch (command) {
           nextRun: j.next_run_at,
           lastStatus: j.last_status,
           errors: j.consecutive_errors,
-        })));
+        }));
+        emit(jsonMode ? jobs : rows, () => console.table(rows));
         break;
       }
       case 'tree': {
@@ -128,6 +166,17 @@ switch (command) {
             childMap[j.parent_id].push(j);
           }
         }
+        function treeNode(job) {
+          return {
+            id: job.id,
+            name: job.name,
+            enabled: !!job.enabled,
+            agent_id: job.agent_id || 'main',
+            trigger_on: job.trigger_on || null,
+            trigger_delay_s: job.trigger_delay_s || 0,
+            children: (childMap[job.id] || []).map(treeNode),
+          };
+        }
         function printTree(job, indent = '') {
           const status = job.enabled ? '✅' : '⬚';
           const trigger = job.trigger_on ? ` [on:${job.trigger_on}]` : '';
@@ -138,52 +187,86 @@ switch (command) {
             printTree(child, indent + '  ├─ ');
           }
         }
-        for (const root of roots) printTree(root);
+        emit(roots.map(treeNode), () => {
+          for (const root of roots) printTree(root);
+        });
         break;
       }
-      case 'get': console.log(fmt(getJob(args[0]))); break;
+      case 'get': emit(getJob(args[0])); break;
       case 'add': {
-        const job = createJob(JSON.parse(args[0]));
-        console.log('Created:', fmt(job));
+        const dryRun = args.includes('--dry-run');
+        const payload = args.find(a => a !== '--dry-run');
+        if (!payload) fail('Usage: jobs add <json> [--dry-run]');
+        const spec = JSON.parse(payload);
+        const normalized = validateJobSpec(spec, null, 'create');
+        if (dryRun) {
+          emit({ ok: true, dry_run: true, valid: true, normalized });
+          break;
+        }
+        const job = createJob(spec);
+        emit({ ok: true, job }, `Created: ${fmt(job)}`);
         break;
       }
-      case 'enable': updateJob(args[0], { enabled: 1 }); console.log('Enabled'); break;
-      case 'disable': updateJob(args[0], { enabled: 0 }); console.log('Disabled'); break;
-      case 'delete': deleteJob(args[0]); console.log('Deleted'); break;
+      case 'validate': {
+        if (!args[0]) fail('Usage: jobs validate <json>');
+        const spec = JSON.parse(args[0]);
+        const normalized = validateJobSpec(spec, null, 'create');
+        emit({ ok: true, valid: true, normalized });
+        break;
+      }
+      case 'enable': updateJob(args[0], { enabled: 1 }); emit({ ok: true, job_id: args[0], enabled: true }, 'Enabled'); break;
+      case 'disable': updateJob(args[0], { enabled: 0 }); emit({ ok: true, job_id: args[0], enabled: false }, 'Disabled'); break;
+      case 'delete': deleteJob(args[0]); emit({ ok: true, job_id: args[0], deleted: true }, 'Deleted'); break;
       case 'cancel': {
         const noCascade = args.includes('--no-cascade');
         const id = args.find(a => !a.startsWith('--'));
         const cancelled = cancelJob(id, { cascade: !noCascade });
-        console.log(`Cancelled ${cancelled.length} job(s):`, cancelled.map(c => c.slice(0, 8) + '…'));
+        emit({ ok: true, cancelled }, `Cancelled ${cancelled.length} job(s): ${cancelled.map(c => c.slice(0, 8) + '…').join(', ')}`);
         break;
       }
       case 'update': {
-        const job = updateJob(args[0], JSON.parse(args[1]));
-        console.log('Updated:', fmt(job));
+        const dryRun = args.includes('--dry-run');
+        const updateArgs = args.filter(a => a !== '--dry-run');
+        const current = getJob(updateArgs[0]);
+        if (!current) fail(`Job not found: ${updateArgs[0]}`);
+        const patch = JSON.parse(updateArgs[1]);
+        const normalized = validateJobSpec(patch, current, 'update');
+        if (dryRun) {
+          emit({ ok: true, dry_run: true, valid: true, normalized });
+          break;
+        }
+        const job = updateJob(updateArgs[0], patch);
+        emit({ ok: true, job }, `Updated: ${fmt(job)}`);
         break;
       }
       case 'run': {
         const job = runJobNow(args[0]);
-        if (!job) { console.error('Job not found:', args[0]); process.exit(1); }
-        console.log(`Scheduled for immediate run: ${job.name} (next_run_at: ${job.next_run_at})`);
+        if (!job) fail(`Job not found: ${args[0]}`);
+        emit(
+          { ok: true, job_id: job.id, name: job.name, dispatch_id: job.dispatch_id, dispatch_kind: job.dispatch_kind },
+          `Scheduled for immediate run: ${job.name} (dispatch: ${job.dispatch_id})`
+        );
         break;
       }
       case 'approve': {
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
-        if (!approval) { console.error('No pending approval for job:', args[0]); process.exit(1); }
+        if (!approval) fail(`No pending approval for job: ${args[0]}`);
         resolveApproval(approval.id, 'approved', 'operator');
-        console.log(`Approved: ${approval.job_id}`);
+        emit({ ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'approved' }, `Approved: ${approval.job_id}`);
         break;
       }
       case 'reject': {
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
-        if (!approval) { console.error('No pending approval for job:', args[0]); process.exit(1); }
+        if (!approval) fail(`No pending approval for job: ${args[0]}`);
         const reason = args.slice(1).join(' ') || null;
         resolveApproval(approval.id, 'rejected', 'operator', reason);
         getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
-        console.log(`Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`);
+        emit(
+          { ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'rejected', reason },
+          `Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`
+        );
         break;
       }
       default: usage();
@@ -195,36 +278,39 @@ switch (command) {
     switch (sub) {
       case 'list': {
         const runs = getRunsForJob(args[0], parseInt(args[1] || '20', 10));
-        console.table(runs.map(r => ({
+        const rows = runs.map(r => ({
           id: r.id.slice(0, 8),
           status: r.status,
           started: r.started_at,
           finished: r.finished_at,
           durationMs: r.duration_ms,
           heartbeat: r.last_heartbeat,
-        })));
+        }));
+        emit(jsonMode ? runs : rows, () => console.table(rows));
         break;
       }
       case 'running': {
         const runs = getRunningRuns();
-        if (runs.length === 0) { console.log('No running runs'); break; }
-        console.table(runs.map(r => ({
+        if (runs.length === 0) { emit([] , 'No running runs'); break; }
+        const rows = runs.map(r => ({
           id: r.id.slice(0, 8),
           job: r.job_name,
           started: r.started_at,
           heartbeat: r.last_heartbeat,
           sessionKey: r.session_key,
-        })));
+        }));
+        emit(jsonMode ? runs : rows, () => console.table(rows));
         break;
       }
       case 'stale': {
         const stale = getStaleRuns(parseInt(args[0] || '90', 10));
-        if (stale.length === 0) { console.log('No stale runs'); break; }
-        console.table(stale.map(r => ({
+        if (stale.length === 0) { emit([], 'No stale runs'); break; }
+        const rows = stale.map(r => ({
           id: r.id.slice(0, 8),
           job: r.job_name,
           heartbeat: r.last_heartbeat,
-        })));
+        }));
+        emit(jsonMode ? stale : rows, () => console.table(rows));
         break;
       }
       default: usage();
@@ -378,19 +464,20 @@ switch (command) {
     switch (sub) {
       case 'list': {
         const agents = listAgents();
-        console.table(agents.map(a => ({
+        const rows = agents.map(a => ({
           id: a.id,
           name: a.name,
           status: a.status,
           lastSeen: a.last_seen_at,
           sessionKey: a.session_key,
-        })));
+        }));
+        emit(jsonMode ? agents : rows, () => console.table(rows));
         break;
       }
-      case 'get': console.log(fmt(getAgent(args[0]))); break;
+      case 'get': emit(getAgent(args[0])); break;
       case 'register': {
         const a = upsertAgent(args[0], { name: args[1] || args[0] });
-        console.log('Registered:', fmt(a));
+        emit({ ok: true, agent: a }, `Registered: ${fmt(a)}`);
         break;
       }
       default: usage();
@@ -517,15 +604,16 @@ switch (command) {
       case 'pending': {
         const { listPendingApprovals } = await import('./approval.js');
         const approvals = listPendingApprovals();
-        if (approvals.length === 0) { console.log('No pending approvals'); break; }
-        console.table(approvals.map(a => ({
+        if (approvals.length === 0) { emit([], 'No pending approvals'); break; }
+        const rows = approvals.map(a => ({
           id: a.id.slice(0, 8),
           job: a.job_id.slice(0, 8),
           job_name: a.job_name || '-',
           run: a.run_id?.slice(0, 8) || '-',
           status: a.status,
           requested: a.requested_at,
-        })));
+        }));
+        emit(jsonMode ? approvals : rows, () => console.table(rows));
         break;
       }
       default: usage();
@@ -663,13 +751,14 @@ switch (command) {
     switch (sub) {
       case 'list': {
         const aliases = db.prepare('SELECT alias, channel, target, description, created_at FROM delivery_aliases ORDER BY alias').all();
-        if (aliases.length === 0) { console.log('No aliases defined'); break; }
-        console.table(aliases.map(a => ({
+        if (aliases.length === 0) { emit([], 'No aliases defined'); break; }
+        const rows = aliases.map(a => ({
           alias: a.alias,
           channel: a.channel,
           target: a.target,
           description: a.description || '',
-        })));
+        }));
+        emit(jsonMode ? aliases : rows, () => console.table(rows));
         break;
       }
       case 'add': {
@@ -681,14 +770,14 @@ switch (command) {
         const description = descParts.length > 0 ? descParts.join(' ') : null;
         db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
           .run(name, channel, target, description);
-        console.log(`Added alias: ${name} → ${channel}/${target}`);
+        emit({ ok: true, alias: name, channel, target, description }, `Added alias: ${name} → ${channel}/${target}`);
         break;
       }
       case 'remove': {
-        if (!args[0]) { console.error('Usage: alias remove <name>'); process.exit(1); }
+        if (!args[0]) fail('Usage: alias remove <name>');
         const result = db.prepare('DELETE FROM delivery_aliases WHERE alias = ?').run(args[0]);
-        if (result.changes > 0) console.log(`Removed alias: ${args[0]}`);
-        else console.error(`Alias not found: ${args[0]}`);
+        if (result.changes > 0) emit({ ok: true, alias: args[0], removed: true }, `Removed alias: ${args[0]}`);
+        else fail(`Alias not found: ${args[0]}`);
         break;
       }
       default: usage();
@@ -702,22 +791,52 @@ switch (command) {
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
     const agents = listAgents();
-
-    console.log('=== OpenClaw Scheduler Status ===');
-    console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
-    console.log(`Running:  ${runningRuns.length}`);
-    console.log(`Stale:    ${stale.length}`);
-    console.log(`Agents:   ${agents.length}`);
-
-    for (const a of agents) {
-      const unread = getUnreadCount(a.id);
-      console.log(`  ${a.id}: ${a.status}${unread ? ` (${unread} unread)` : ''}`);
-    }
-
     const nextJob = jobs
       .filter(j => j.enabled && j.next_run_at)
-      .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0];
-    if (nextJob) console.log(`\nNext:     ${nextJob.name} at ${nextJob.next_run_at}`);
+      .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0] || null;
+    const payload = {
+      jobs_total: jobs.length,
+      jobs_enabled: jobs.filter(j => j.enabled).length,
+      running_runs: runningRuns.length,
+      stale_runs: stale.length,
+      agents: agents.map(a => ({
+        id: a.id,
+        status: a.status,
+        unread: getUnreadCount(a.id),
+      })),
+      next_job: nextJob ? { id: nextJob.id, name: nextJob.name, next_run_at: nextJob.next_run_at } : null,
+    };
+    emit(payload, () => {
+      console.log('=== OpenClaw Scheduler Status ===');
+      console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
+      console.log(`Running:  ${runningRuns.length}`);
+      console.log(`Stale:    ${stale.length}`);
+      console.log(`Agents:   ${agents.length}`);
+      for (const a of agents) {
+        const unread = getUnreadCount(a.id);
+        console.log(`  ${a.id}: ${a.status}${unread ? ` (${unread} unread)` : ''}`);
+      }
+      if (nextJob) console.log(`\nNext:     ${nextJob.name} at ${nextJob.next_run_at}`);
+    });
+    break;
+  }
+
+  case 'schema': {
+    const key = (sub || 'all').toLowerCase();
+    if (key === 'all') {
+      emit(SCHEDULER_SCHEMAS);
+      break;
+    }
+    const singularMap = {
+      job: 'jobs',
+      run: 'runs',
+      message: 'messages',
+      approval: 'approvals',
+      dispatch: 'dispatches',
+    };
+    const resolved = singularMap[key] || key;
+    if (!SCHEDULER_SCHEMAS[resolved]) fail(`Unknown schema target: ${sub}`);
+    emit(SCHEDULER_SCHEMAS[resolved]);
     break;
   }
 

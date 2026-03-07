@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.0.3, schema version: 10)
+-- OpenClaw Scheduler Schema (current: v1.1.0, schema version: 11)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -93,7 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS
 CREATE TABLE IF NOT EXISTS runs (
   id              TEXT PRIMARY KEY,
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|running|ok|error|timeout|skipped
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|running|ok|error|timeout|skipped|awaiting_approval|approved|cancelled|crashed
   
   started_at      TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at     TEXT,
@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS runs (
   -- Retry tracking (v3b)
   retry_count     INTEGER DEFAULT 0,
   retry_of        TEXT,                             -- original run id if this is a retry
+  triggered_by_run TEXT,                            -- parent run id if this run was chain-triggered
+  dispatch_queue_id TEXT REFERENCES job_dispatch_queue(id) ON DELETE SET NULL,
 
   -- Context & replay (v5)
   context_summary TEXT,                             -- JSON: {messages_injected,scope,...}
@@ -127,6 +129,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 'running';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_runs_dispatch_queue ON runs(dispatch_queue_id) WHERE dispatch_queue_id IS NOT NULL;
 
 -- ============================================================
 -- MESSAGES: inter-agent message queue
@@ -217,7 +220,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   id              TEXT PRIMARY KEY,
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|rejected|timed_out
+  dispatch_queue_id TEXT REFERENCES job_dispatch_queue(id) ON DELETE SET NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|rejected|timed_out|dispatched
   requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at     TEXT,
   resolved_by     TEXT,                               -- 'operator'|'timeout'|'api'
@@ -226,6 +230,26 @@ CREATE TABLE IF NOT EXISTS approvals (
 
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_dispatch_queue ON approvals(dispatch_queue_id) WHERE dispatch_queue_id IS NOT NULL;
+
+-- ============================================================
+-- DISPATCH QUEUE: durable non-cron invocations (v11)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS job_dispatch_queue (
+  id              TEXT PRIMARY KEY,
+  job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  dispatch_kind   TEXT NOT NULL,                   -- manual|chain|retry
+  status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled
+  scheduled_for   TEXT NOT NULL,
+  source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  claimed_at      TEXT,
+  processed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_queue_due ON job_dispatch_queue(status, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job ON job_dispatch_queue(job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dispatch_queue_source_run ON job_dispatch_queue(source_run_id) WHERE source_run_id IS NOT NULL;
 
 -- ============================================================
 -- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
@@ -333,8 +357,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs start at v10 (all columns already in schema above).
--- Existing installs are brought up to v10 by migrate-consolidate.js.
+-- Fresh installs start at v11 (all columns already in schema above).
+-- Existing installs are brought up to v11 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -345,6 +369,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (7);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (8);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (10);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (11);
 
 -- ============================================================
 -- SEED JOBS

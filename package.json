@@ -4,6 +4,9 @@
   "description": "SQLite-backed job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces built-in cron and heartbeat with full run history, workflow chains, retry logic, shell jobs, approval gates, and backup support.",
   "type": "module",
   "main": "dispatcher.js",
+  "bin": {
+    "openclaw-scheduler": "bin/openclaw-scheduler.js"
+  },
   "engines": {
     "node": ">=22"
   },
@@ -14,6 +17,27 @@
     "lint": "eslint . --max-warnings=0",
     "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs"
   },
+  "files": [
+    "bin",
+    "dispatch",
+    "scripts",
+    "*.js",
+    "*.mjs",
+    "*.sql",
+    "*.plist",
+    "*.service",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODE_OF_CONDUCT.md",
+    "INSTALL*.md",
+    "UNINSTALL.md",
+    "BEST-PRACTICES.md",
+    "IMPLEMENTATION_SPEC.md",
+    "test.js"
+  ],
   "keywords": [
     "openclaw",
     "scheduler",
@@ -27,8 +51,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amittell/openclaw-scheduler"
+    "url": "git+https://github.com/amittell/openclaw-scheduler.git"
   },
+  "bugs": {
+    "url": "https://github.com/amittell/openclaw-scheduler/issues"
+  },
+  "homepage": "https://github.com/amittell/openclaw-scheduler#readme",
   "dependencies": {
     "better-sqlite3": "^11.10.0",
     "croner": "^10.0.1"

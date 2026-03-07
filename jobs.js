@@ -2,9 +2,17 @@
 import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { getDb } from './db.js';
-
+import { enqueueDispatch } from './dispatch-queue.js';
 
 const MAX_CHAIN_DEPTH = 10;
+const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
+const VALID_OVERLAP_POLICIES = new Set(['skip', 'allow', 'queue']);
+const VALID_DELIVERY_MODES = new Set(['announce', 'announce-always', 'none']);
+const VALID_PAYLOAD_SCOPES = new Set(['own', 'global']);
+const VALID_DELIVERY_GUARANTEES = new Set(['at-most-once', 'at-least-once']);
+const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
+const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
+const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -17,6 +25,167 @@ const VALID_PAYLOADS_BY_TARGET = {
   shell:    ['shellCommand'],
   isolated: ['systemEvent', 'agentTurn'],
 };
+
+function sqliteNow(offsetMs = 0) {
+  return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+function normalizeNullableString(value) {
+  if (value == null) return null;
+  if (typeof value !== 'string') return value;
+  return value.trim() === '' ? null : value;
+}
+
+function assertSafeString(name, value, opts = {}) {
+  if (value == null) return;
+  if (typeof value !== 'string') {
+    throw new Error(`${name} must be a string`);
+  }
+  if (!opts.allowEmpty && value.trim().length === 0) {
+    throw new Error(`${name} cannot be empty`);
+  }
+  const hasControlChars = [...value].some((char) => {
+    const code = char.charCodeAt(0);
+    return (code >= 0 && code <= 8) || (code >= 11 && code <= 12) || (code >= 14 && code <= 31) || code === 127;
+  });
+  if (hasControlChars) {
+    throw new Error(`${name} contains unsupported control characters`);
+  }
+  if (opts.maxLength && value.length > opts.maxLength) {
+    throw new Error(`${name} exceeds max length of ${opts.maxLength}`);
+  }
+}
+
+function assertInt(name, value, min = 0) {
+  if (value == null) return;
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(`${name} must be an integer >= ${min}`);
+  }
+}
+
+function assertEnum(name, value, allowed, { nullable = false } = {}) {
+  if (value == null && nullable) return;
+  if (!allowed.has(value)) {
+    throw new Error(`${name} must be one of: ${[...allowed].join(', ')}`);
+  }
+}
+
+function validateTriggerConditionSyntax(condition) {
+  if (condition == null) return;
+  assertSafeString('trigger_condition', condition, { maxLength: 1024 });
+  if (condition.startsWith('contains:')) {
+    if (!condition.slice('contains:'.length)) {
+      throw new Error('trigger_condition contains: pattern cannot be empty');
+    }
+    return;
+  }
+  if (condition.startsWith('regex:')) {
+    const pattern = condition.slice('regex:'.length);
+    if (!pattern) {
+      throw new Error('trigger_condition regex pattern cannot be empty');
+    }
+    try {
+      new RegExp(pattern);
+    } catch (err) {
+      throw new Error(`Invalid trigger_condition regex: ${err.message}`, { cause: err });
+    }
+  }
+}
+
+export function validateJobSpec(opts, currentJob = null, mode = 'create') {
+  if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+    throw new Error('Job spec must be an object');
+  }
+
+  const normalized = { ...opts };
+  for (const key of [
+    'delivery_channel',
+    'delivery_to',
+    'resource_pool',
+    'preferred_session_key',
+    'payload_model',
+    'payload_thinking',
+    'trigger_condition',
+  ]) {
+    if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
+  }
+
+  const merged = { ...(currentJob || {}), ...normalized };
+  const isChild = !!merged.parent_id;
+
+  if (mode === 'create' || 'name' in normalized) {
+    assertSafeString('name', merged.name, { maxLength: 200 });
+  }
+  if (mode === 'create' || 'payload_message' in normalized) {
+    assertSafeString('payload_message', merged.payload_message, { maxLength: 100000 });
+  }
+  if (mode === 'create' || 'agent_id' in normalized) {
+    assertSafeString('agent_id', merged.agent_id || 'main', { maxLength: 128 });
+  }
+  if (mode === 'create' || 'session_target' in normalized || 'payload_kind' in normalized) {
+    const finalTarget = merged.session_target || 'isolated';
+    const finalKind = merged.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
+    validateJobPayload(finalTarget, finalKind);
+  }
+  if (!isChild && !merged.schedule_cron) {
+    throw new Error('schedule_cron is required for root jobs');
+  }
+  if (merged.schedule_cron) {
+    assertSafeString('schedule_cron', merged.schedule_cron, { maxLength: 128 });
+    nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'America/New_York');
+  }
+  if (mode === 'create' || 'schedule_tz' in normalized) {
+    assertSafeString('schedule_tz', merged.schedule_tz || 'America/New_York', { maxLength: 128 });
+  }
+
+  assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
+  assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
+  assertEnum('payload_scope', merged.payload_scope || 'own', VALID_PAYLOAD_SCOPES);
+  assertEnum('delivery_guarantee', merged.delivery_guarantee || 'at-most-once', VALID_DELIVERY_GUARANTEES);
+  assertEnum('job_class', merged.job_class || 'standard', VALID_JOB_CLASSES);
+  assertEnum('approval_auto', merged.approval_auto || 'reject', VALID_APPROVAL_AUTO);
+  assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
+
+  if (merged.trigger_on != null) {
+    assertEnum('trigger_on', merged.trigger_on, VALID_TRIGGERS);
+  }
+  validateTriggerConditionSyntax(merged.trigger_condition);
+
+  if (mode === 'create' || 'delivery_channel' in normalized) {
+    assertSafeString('delivery_channel', merged.delivery_channel, { allowEmpty: false, maxLength: 64 });
+  }
+  if (mode === 'create' || 'delivery_to' in normalized) {
+    assertSafeString('delivery_to', merged.delivery_to, { allowEmpty: false, maxLength: 256 });
+  }
+  if (mode === 'create' || 'resource_pool' in normalized) {
+    assertSafeString('resource_pool', merged.resource_pool, { allowEmpty: false, maxLength: 128 });
+  }
+  if (mode === 'create' || 'preferred_session_key' in normalized) {
+    assertSafeString('preferred_session_key', merged.preferred_session_key, { allowEmpty: false, maxLength: 512 });
+  }
+  if (mode === 'create' || 'payload_model' in normalized) {
+    assertSafeString('payload_model', merged.payload_model, { allowEmpty: false, maxLength: 256 });
+  }
+  if (mode === 'create' || 'payload_thinking' in normalized) {
+    assertSafeString('payload_thinking', merged.payload_thinking, { allowEmpty: false, maxLength: 64 });
+  }
+
+  for (const [name, min] of [
+    ['payload_timeout_seconds', 1],
+    ['run_timeout_ms', 1],
+    ['trigger_delay_s', 0],
+    ['max_retries', 0],
+    ['approval_timeout_s', 1],
+    ['context_retrieval_limit', 1],
+    ['consecutive_errors', 0],
+  ]) {
+    if (name in normalized || (mode === 'create' && merged[name] != null)) {
+      assertInt(name, merged[name], min);
+    }
+  }
+
+  return normalized;
+}
 
 /**
  * Validate that a session_target + payload_kind combination is allowed.
@@ -54,30 +223,30 @@ export function nextRunFromCron(cronExpr, tz) {
  * Create a new job.
  */
 export function createJob(opts) {
+  const normalized = validateJobSpec(opts, null, 'create');
   const db = getDb();
-  const id = opts.id || randomUUID();
-  const isChild = !!opts.parent_id;
-  const cronExpr = opts.schedule_cron || (isChild ? '0 0 31 2 *' : null);
-  if (!cronExpr && !isChild) throw new Error('schedule_cron is required for root jobs');
+  const id = normalized.id || randomUUID();
+  const isChild = !!normalized.parent_id;
+  const cronExpr = normalized.schedule_cron || (isChild ? '0 0 31 2 *' : null);
 
   // Cycle detection + depth check for child jobs
   if (isChild) {
-    const depth = getChainDepth(opts.parent_id) + 1; // +1 for the new child
+    const depth = getChainDepth(normalized.parent_id) + 1; // +1 for the new child
     if (depth >= MAX_CHAIN_DEPTH) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded. Chain would be ${depth} deep.`);
     }
   }
 
   // Resolve final payload_kind (after defaults) and validate combo
-  const finalTarget = opts.session_target || 'isolated';
-  const finalKind = opts.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
+  const finalTarget = normalized.session_target || 'isolated';
+  const finalKind = normalized.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
   validateJobPayload(finalTarget, finalKind);
 
   let nextRun;
-  if (opts.run_now) {
-    nextRun = new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  if (normalized.run_now) {
+    nextRun = sqliteNow(-1000);
   } else {
-    nextRun = isChild ? null : nextRunFromCron(cronExpr, opts.schedule_tz || 'America/New_York');
+    nextRun = isChild ? null : nextRunFromCron(cronExpr, normalized.schedule_tz || 'America/New_York');
   }
 
   const stmt = db.prepare(`
@@ -114,39 +283,39 @@ export function createJob(opts) {
 
   stmt.run(
     id,
-    opts.name,
-    opts.enabled !== false ? 1 : 0,
+    normalized.name,
+    normalized.enabled !== false ? 1 : 0,
     cronExpr,
-    opts.schedule_tz || 'America/New_York',
-    opts.session_target || 'isolated',
-    opts.agent_id || 'main',
-    opts.payload_kind || (opts.session_target === 'main' ? 'systemEvent' : 'agentTurn'),
-    opts.payload_message,
-    opts.payload_model || null,
-    opts.payload_thinking || null,
-    opts.payload_timeout_seconds || 120,
-    opts.overlap_policy || 'skip',
-    opts.run_timeout_ms || 300000,
-    opts.delivery_mode || 'announce',
-    opts.delivery_channel || null,
-    opts.delivery_to || null,
-    opts.delete_after_run ? 1 : 0,
+    normalized.schedule_tz || 'America/New_York',
+    normalized.session_target || 'isolated',
+    normalized.agent_id || 'main',
+    normalized.payload_kind || (normalized.session_target === 'main' ? 'systemEvent' : 'agentTurn'),
+    normalized.payload_message,
+    normalized.payload_model || null,
+    normalized.payload_thinking || null,
+    normalized.payload_timeout_seconds || 120,
+    normalized.overlap_policy || 'skip',
+    normalized.run_timeout_ms || 300000,
+    normalized.delivery_mode || 'announce',
+    normalized.delivery_channel || null,
+    normalized.delivery_to || null,
+    normalized.delete_after_run ? 1 : 0,
     nextRun,
-    opts.parent_id || null,
-    opts.trigger_on || null,
-    opts.trigger_delay_s || 0,
-    opts.max_retries || 0,
-    opts.payload_scope || 'own',
-    opts.resource_pool || null,
-    opts.trigger_condition || null,
-    opts.delivery_guarantee || 'at-most-once',
-    opts.job_class || 'standard',
-    opts.approval_required ? 1 : 0,
-    opts.approval_timeout_s || 3600,
-    opts.approval_auto || 'reject',
-    opts.context_retrieval || 'none',
-    opts.context_retrieval_limit || 5,
-    opts.preferred_session_key || null
+    normalized.parent_id || null,
+    normalized.trigger_on || null,
+    normalized.trigger_delay_s || 0,
+    normalized.max_retries || 0,
+    normalized.payload_scope || 'own',
+    normalized.resource_pool || null,
+    normalized.trigger_condition || null,
+    normalized.delivery_guarantee || 'at-most-once',
+    normalized.job_class || 'standard',
+    normalized.approval_required ? 1 : 0,
+    normalized.approval_timeout_s || 3600,
+    normalized.approval_auto || 'reject',
+    normalized.context_retrieval || 'none',
+    normalized.context_retrieval_limit || 5,
+    normalized.preferred_session_key || null
   );
 
   return getJob(id);
@@ -175,6 +344,9 @@ export function listJobs(opts = {}) {
  */
 export function updateJob(id, patch) {
   const db = getDb();
+  const current = getJob(id);
+  if (!current) return null;
+  const normalized = validateJobSpec(patch, current, 'update');
   const allowed = [
     'name', 'enabled', 'schedule_cron', 'schedule_tz',
     'session_target', 'agent_id', 'payload_kind', 'payload_message',
@@ -190,20 +362,10 @@ export function updateJob(id, patch) {
     'preferred_session_key'
   ];
 
-  // Validate session_target + payload_kind combo if either is changing
-  if ('session_target' in patch || 'payload_kind' in patch) {
-    const current = getJob(id);
-    if (current) {
-      const newTarget = patch.session_target ?? current.session_target;
-      const newKind   = patch.payload_kind   ?? current.payload_kind;
-      validateJobPayload(newTarget, newKind);
-    }
-  }
-
   // Cycle detection if parent_id is being changed
-  if (patch.parent_id) {
-    detectCycle(id, patch.parent_id);
-    const depth = getChainDepth(patch.parent_id) + 1;
+  if (normalized.parent_id) {
+    detectCycle(id, normalized.parent_id);
+    const depth = getChainDepth(normalized.parent_id) + 1;
     if (depth >= MAX_CHAIN_DEPTH) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded.`);
     }
@@ -212,7 +374,7 @@ export function updateJob(id, patch) {
   const sets = [];
   const values = [];
 
-  for (const [key, val] of Object.entries(patch)) {
+  for (const [key, val] of Object.entries(normalized)) {
     if (allowed.includes(key)) {
       sets.push(`${key} = ?`);
       values.push(val);
@@ -227,10 +389,10 @@ export function updateJob(id, patch) {
   db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
   // Recalculate next_run_at if schedule changed
-  if (patch.schedule_cron || patch.schedule_tz) {
+  if (normalized.schedule_cron || normalized.schedule_tz) {
     const job = getJob(id);
     if (job) {
-      const nextRun = nextRunFromCron(job.schedule_cron, job.schedule_tz);
+      const nextRun = job.parent_id ? null : nextRunFromCron(job.schedule_cron, job.schedule_tz);
       db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
     }
   }
@@ -250,10 +412,13 @@ export function deleteJob(id) {
  * The job's cron schedule is unchanged; after it runs, updateJobAfterRun restores normal scheduling.
  */
 export function runJobNow(id) {
-  const db = getDb();
-  const pastSecond = new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-  db.prepare(`UPDATE jobs SET next_run_at = ?, updated_at = datetime('now') WHERE id = ?`).run(pastSecond, id);
-  return getJob(id);
+  const job = getJob(id);
+  if (!job) return null;
+  const dispatch = enqueueDispatch(id, {
+    kind: 'manual',
+    scheduled_for: sqliteNow(-1000),
+  });
+  return { ...job, dispatch_id: dispatch.id, dispatch_kind: dispatch.dispatch_kind };
 }
 
 /**
@@ -359,20 +524,19 @@ export function evalTriggerCondition(condition, content) {
  * @param {string} [content] - parent run output (used to evaluate trigger_condition)
  * Returns array of triggered children.
  */
-export function fireTriggeredChildren(parentId, status, content) {
+export function fireTriggeredChildren(parentId, status, content, parentRunId = null) {
   const candidates = getTriggeredChildren(parentId, status);
-  const db = getDb();
   const triggered = [];
   for (const child of candidates) {
     // Check output-based trigger condition if set
     if (!evalTriggerCondition(child.trigger_condition, content)) continue;
     const delay = child.trigger_delay_s || 0;
-    if (delay > 0) {
-      db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?`).run(delay, child.id);
-    } else {
-      db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
-    }
-    triggered.push(child);
+    const dispatch = enqueueDispatch(child.id, {
+      kind: 'chain',
+      scheduled_for: sqliteNow(delay > 0 ? delay * 1000 : -1000),
+      source_run_id: parentRunId || null,
+    });
+    triggered.push({ ...child, dispatch_id: dispatch.id, scheduled_for: dispatch.scheduled_for });
   }
   return triggered;
 }
@@ -453,11 +617,20 @@ export function scheduleRetry(job, failedRunId) {
   const retryCount = (failedRun?.retry_count || 0) + 1;
   // Exponential backoff: 30s, 60s, 120s, etc.
   const delaySec = 30 * Math.pow(2, retryCount - 1);
-  db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?`)
-    .run(delaySec, job.id);
+  const dispatch = enqueueDispatch(job.id, {
+    kind: 'retry',
+    scheduled_for: sqliteNow(delaySec * 1000),
+    source_run_id: failedRunId,
+    retry_of_run_id: failedRunId,
+  });
+  if (!job.parent_id) {
+    db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
+      .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
+  } else {
+    db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
+  }
   // Store retry metadata for the next run
-  db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
-  return { retryCount, delaySec, retryOf: failedRunId };
+  return { retryCount, delaySec, retryOf: failedRunId, dispatch };
 }
 
 /**

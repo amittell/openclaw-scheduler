@@ -19,7 +19,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 
 ---
 
-## Step 1: Clone the Repository
+## Step 1: Install Scheduler Files
 
 ```bash
 cd ~/.openclaw
@@ -32,9 +32,20 @@ Or copy from an existing host:
 scp -r user@source-host:~/.openclaw/scheduler ~/.openclaw/scheduler
 ```
 
+Or npm-first install (no git clone):
+```bash
+mkdir -p ~/.openclaw/scheduler
+npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- help
+```
+
+Runtime state for npm installs defaults to `~/.openclaw/scheduler/`, not the package directory under `node_modules/`.
+
 ---
 
 ## Step 2: Install Dependencies
+
+If you used the npm-first install path in Step 1, dependencies are already installed; skip to Step 3.
 
 ```bash
 cd ~/.openclaw/scheduler
@@ -50,10 +61,10 @@ If `better-sqlite3` fails: `xcode-select --install` (macOS).
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 346 tests
+SCHEDULER_DB=:memory: node test.js  # 488 tests
 ```
 
-**All tests must pass before proceeding.** Total: 346 tests.
+**All tests must pass before proceeding.** Total: 488 tests.
 
 ---
 
@@ -86,7 +97,10 @@ If this host had OC built-in cron jobs enabled, disable them so they don't confl
 openclaw cron list
 # For each enabled job:
 openclaw cron edit <job-id> --disable
+openclaw config set cron.enabled false
 ```
+
+Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway service environment (launchctl/systemd/pm2), then restart the gateway.
 
 Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
 
@@ -98,6 +112,8 @@ If this host had OC heartbeat enabled, disable it:
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "0m"
+# If you have per-agent heartbeat overrides, set/remove those too:
+# agents.list[].heartbeat.every = "0m"
 openclaw gateway restart
 ```
 
@@ -262,6 +278,8 @@ launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 
 # 2. Re-enable OC cron (if you disabled it)
 openclaw cron edit <job-id> --enable  # for each job
+openclaw config set cron.enabled true
+# remove OPENCLAW_SKIP_CRON=1 from gateway service env
 
 # 3. Re-enable heartbeat (if you disabled it)
 openclaw config set agents.defaults.heartbeat.every "5m"
@@ -272,7 +290,7 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 346/346
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 488/488
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors

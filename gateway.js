@@ -1,9 +1,10 @@
 // Gateway API client — independent dispatch via chat completions + system events
-import { execSync, spawn } from 'child_process';
+import { execSync } from 'child_process';
 import { getDb } from './db.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 function authHeaders() {
   return GATEWAY_TOKEN ? { 'Authorization': `Bearer ${GATEWAY_TOKEN}` } : {};
@@ -289,6 +290,39 @@ export function resolveDeliveryAlias(rawTarget) {
   }
 }
 
+function chunkPlainText(message, maxLength) {
+  const text = String(message ?? '');
+  if (text.length <= maxLength) return [text];
+
+  const chunks = [];
+  let rest = text;
+  const hardLimit = Math.max(256, maxLength - 12);
+
+  while (rest.length > 0) {
+    if (rest.length <= hardLimit) {
+      chunks.push(rest);
+      break;
+    }
+
+    let splitAt = rest.lastIndexOf('\n', hardLimit);
+    if (splitAt < hardLimit * 0.5) splitAt = rest.lastIndexOf(' ', hardLimit);
+    if (splitAt < hardLimit * 0.5) splitAt = hardLimit;
+
+    const part = rest.slice(0, splitAt).trimEnd();
+    chunks.push(part);
+    rest = rest.slice(splitAt).trimStart();
+  }
+
+  return chunks.map((chunk, index) => `[${index + 1}/${chunks.length}] ${chunk}`);
+}
+
+export function splitMessageForChannel(channel, message) {
+  if (channel === 'telegram') {
+    return chunkPlainText(message, TELEGRAM_MAX_MESSAGE_LENGTH);
+  }
+  return [String(message ?? '')];
+}
+
 /**
  * Send a message to a Telegram/channel target via message tool.
  * Automatically resolves delivery aliases (e.g. '@team_room', 'owner_dm').
@@ -306,12 +340,21 @@ export async function deliverMessage(channel, target, message) {
     }
   }
 
-  return invokeGatewayTool('message', {
-    action: 'send',
-    message,
-    ...(resolvedChannel ? { channel: resolvedChannel } : {}),
-    ...(resolvedTarget ? { target: resolvedTarget } : {}),
-  });
+  const parts = splitMessageForChannel(resolvedChannel, message);
+  let lastResponse = null;
+  for (const part of parts) {
+    lastResponse = await invokeGatewayTool('message', {
+      action: 'send',
+      message: part,
+      ...(resolvedChannel ? { channel: resolvedChannel } : {}),
+      ...(resolvedTarget ? { target: resolvedTarget } : {}),
+    });
+  }
+  return {
+    ok: true,
+    parts: parts.length,
+    lastResponse,
+  };
 }
 
 /**

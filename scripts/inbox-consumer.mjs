@@ -20,6 +20,7 @@ import { dirname, basename, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { watch } from 'fs';
 import { getDb } from '../db.js';
+import { resolveSchedulerDbPath } from '../paths.js';
 import { deliverMessage } from '../gateway.js';
 import { ackMessage, recordMessageAttempt } from '../messages.js';
 
@@ -134,8 +135,7 @@ if (!deliveryTo) {
   process.exit(1);
 }
 
-const defaultDbPath = resolve(join(__dirname, '..', 'scheduler.db'));
-const dbPath = resolve(process.env.SCHEDULER_DB || defaultDbPath);
+const dbPath = resolve(resolveSchedulerDbPath({ env: process.env }));
 const watchDir = dirname(dbPath);
 const walFile = `${basename(dbPath)}-wal`;
 

@@ -40,14 +40,19 @@ pm2 save   # persist the removal
 ### Re-enable cron (if you had OC cron jobs before)
 
 ```bash
+openclaw config set cron.enabled true
 openclaw cron list
 openclaw cron edit <job-id> --enable   # repeat for each job you want back
 ```
+
+Also remove `OPENCLAW_SKIP_CRON=1` from your OpenClaw gateway service environment, then restart the gateway.
 
 ### Re-enable heartbeat (if you had one)
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "5m"
+# If you had per-agent heartbeat overrides, restore those too:
+# agents.list[].heartbeat.every = "5m"
 openclaw gateway restart
 ```
 

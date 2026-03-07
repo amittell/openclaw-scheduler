@@ -59,7 +59,7 @@ node -e "require('better-sqlite3')" && echo "OK"
 
 ---
 
-### Step 1: Clone the Repository
+### Step 1: Install Scheduler Files
 
 ```powershell
 cd $env:USERPROFILE\.openclaw
@@ -67,9 +67,20 @@ git clone https://github.com/amittell/openclaw-scheduler.git scheduler
 cd scheduler
 ```
 
+Or npm-first install (no git clone):
+```powershell
+mkdir $env:USERPROFILE\.openclaw\scheduler -Force
+npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@latest
+npm exec --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler -- help
+```
+
+Runtime state for npm installs defaults to `$env:USERPROFILE\.openclaw\scheduler`, not the package directory under `node_modules`.
+
 ---
 
 ### Step 2: Install Dependencies
+
+If you used the npm-first install path in Step 1, dependencies are already installed; skip to Step 3.
 
 ```powershell
 npm install
@@ -88,7 +99,7 @@ npm install --build-from-source
 $env:SCHEDULER_DB=":memory:"; node test.js
 ```
 
-All 346 tests must pass before continuing.
+All 488 tests must pass before continuing.
 
 ---
 
@@ -129,10 +140,15 @@ node cli.js status
 openclaw cron list
 # For each enabled job:
 openclaw cron edit <job-id> --disable
+openclaw config set cron.enabled false
 
 openclaw config set agents.defaults.heartbeat.every "0m"
+# If you have per-agent heartbeat overrides, set/remove those too:
+# agents.list[].heartbeat.every = "0m"
 openclaw gateway restart
 ```
+
+Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway process environment (service wrapper/PM2 ecosystem), then restart the gateway.
 
 ---
 
@@ -257,6 +273,8 @@ pm2 delete openclaw-scheduler
 
 # Re-enable OC cron
 openclaw cron edit <job-id> --enable  # for each job
+openclaw config set cron.enabled true
+# remove OPENCLAW_SKIP_CRON=1 from gateway process env
 
 # Re-enable heartbeat
 openclaw config set agents.defaults.heartbeat.every "5m"
@@ -269,7 +287,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 346/346
+- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 488/488
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `pm2 status` → openclaw-scheduler is `online`
 - [ ] PM2 log has startup lines, no errors

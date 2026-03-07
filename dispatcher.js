@@ -48,10 +48,14 @@ import {
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
 import {
+  getDispatch, getDueDispatches, claimDispatch, releaseDispatch, setDispatchStatus,
+} from './dispatch-queue.js';
+import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
   touchAgentHeartbeat, registerAgentSession,
 } from './task-tracker.js';
 import { mapTeamMessages, checkTeamTaskGates } from './team-adapter.js';
+import { buildTriggeredRunContext } from './prompt-context.js';
 
 // ── Helpers ─────────────────────────────────────────────────
 function sqliteNow(offsetMs = 0) {
@@ -105,8 +109,6 @@ const LOG_PREFIX = '[scheduler]';
 
 // ── State ───────────────────────────────────────────────────
 let running = true;
-// Map of childJobId → parentRunId for chain idempotency key threading
-const pendingChainKeys = new Map();
 let lastHeartbeatCheck = 0;
 let lastMessageDelivery = 0;
 let lastPrune = 0;
@@ -126,7 +128,7 @@ function log(level, msg, meta) {
 async function replayOrphanedRuns() {
   const db = getDb();
   const orphaned = db.prepare(`
-    SELECT r.id, r.job_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms
+    SELECT r.id, r.job_id, r.dispatch_queue_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms
     FROM runs r
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
@@ -140,6 +142,9 @@ async function replayOrphanedRuns() {
 
     // Mark old run as crashed
     db.prepare(`UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?`).run(run.id);
+    if (run.dispatch_queue_id) {
+      setDispatchStatus(run.dispatch_queue_id, 'done');
+    }
 
     // Release any idempotency key held by the crashed run so replays can reclaim
     const crashedRunFull = db.prepare('SELECT idempotency_key FROM runs WHERE id = ?').get(run.id);
@@ -186,7 +191,10 @@ async function checkApprovals() {
             WHERE id = ? AND status IN ('awaiting_approval', 'pending')
           `).run(approval.run_id);
         }
-        await dispatchJob(job, { approvalBypass: true });
+        await dispatchJob(job, {
+          approvalBypass: true,
+          dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
+        });
         getDb().prepare(`
           UPDATE approvals
           SET status = 'dispatched',
@@ -196,6 +204,7 @@ async function checkApprovals() {
       } else {
         // Default: reject on timeout
         resolveApproval(approval.id, 'timed_out', 'timeout');
+        if (approval.dispatch_queue_id) setDispatchStatus(approval.dispatch_queue_id, 'cancelled');
         if (approval.run_id) {
           getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
         }
@@ -231,7 +240,10 @@ async function checkApprovals() {
         `).run(approval.run_id);
       }
       log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
-      await dispatchJob(job, { approvalBypass: true });
+      await dispatchJob(job, {
+        approvalBypass: true,
+        dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
+      });
       db.prepare(`
         UPDATE approvals
         SET status = 'dispatched',
@@ -262,11 +274,8 @@ function matchesSentinel(content, token) {
  * Extracts the duplicated fireTriggeredChildren + pendingChainKeys pattern.
  */
 function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') {
-  const triggered = fireTriggeredChildren(jobId, status, content);
+  const triggered = fireTriggeredChildren(jobId, status, content, runId);
   if (triggered.length > 0) {
-    for (const child of triggered) {
-      pendingChainKeys.set(child.id, runId);
-    }
     log('info', `Triggered ${triggered.length} child job(s)${logSuffix}`, {
       parentId: jobId,
       children: triggered.map(c => c.name),
@@ -313,17 +322,44 @@ function detectTransientError(content) {
 // ── Dispatch a single job ───────────────────────────────────
 async function dispatchJob(job, opts = {}) {
   const approvalBypass = opts.approvalBypass === true;
+  let dispatchRecord = opts.dispatchRecord || null;
 
-  // HITL approval gate — if approval_required, block until approved
-  if (job.approval_required && !approvalBypass) {
-    const existing = getPendingApproval(job.id);
-    if (existing) {
-      // Already has a pending approval — skip dispatch, checkApprovals will handle it
-      log('debug', `Skipping ${job.name} — awaiting approval`, { approvalId: existing.id });
+  if (dispatchRecord && dispatchRecord.status === 'pending') {
+    dispatchRecord = claimDispatch(dispatchRecord.id);
+    if (!dispatchRecord) {
+      log('debug', `Skipping claimed dispatch for ${job.name}`, { dispatchId: opts.dispatchRecord.id });
       return;
     }
-    const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms, status: 'awaiting_approval' });
-    const approval = createApproval(job.id, run.id);
+  }
+
+  const completeCurrentDispatch = (status = 'done') => {
+    if (!dispatchRecord) return null;
+    return setDispatchStatus(dispatchRecord.id, status);
+  };
+
+  const dispatchKind = dispatchRecord?.dispatch_kind || null;
+  const isChainDispatch = dispatchKind === 'chain';
+
+  // HITL approval gate — chain-triggered jobs pause until approved.
+  if (job.approval_required && isChainDispatch && !approvalBypass) {
+    const existing = getPendingApproval(job.id);
+    if (existing) {
+      releaseDispatch(dispatchRecord.id, sqliteNow(TICK_INTERVAL_MS));
+      log('debug', `Skipping ${job.name} — approval already pending`, {
+        approvalId: existing.id,
+        dispatchId: dispatchRecord?.id || null,
+      });
+      return;
+    }
+    const run = createRun(job.id, {
+      run_timeout_ms: job.run_timeout_ms,
+      status: 'awaiting_approval',
+      dispatch_queue_id: dispatchRecord?.id || null,
+      triggered_by_run: dispatchRecord?.source_run_id || null,
+      retry_of: dispatchRecord?.retry_of_run_id || null,
+    });
+    const approval = createApproval(job.id, run.id, dispatchRecord?.id || null);
+    if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'awaiting_approval');
     log('info', `Approval required for ${job.name} — awaiting operator`, { approvalId: approval.id, runId: run.id });
     // Send notification via delivery channel
     const msg = `⚠️ Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
@@ -334,7 +370,11 @@ async function dispatchJob(job, opts = {}) {
   // Resource pool concurrency check — prevents different jobs from competing for the same resource
   if (job.resource_pool && hasRunningRunForPool(job.resource_pool)) {
     log('info', `Skipping ${job.name} — resource pool '${job.resource_pool}' busy`, { jobId: job.id, pool: job.resource_pool });
-    advanceNextRun(job);
+    if (dispatchRecord) {
+      releaseDispatch(dispatchRecord.id, sqliteNow(TICK_INTERVAL_MS));
+    } else {
+      advanceNextRun(job);
+    }
     return;
   }
 
@@ -342,13 +382,21 @@ async function dispatchJob(job, opts = {}) {
   if (hasRunningRun(job.id)) {
     if (job.overlap_policy === 'skip') {
       log('info', `Skipping ${job.name} — previous run still active`, { jobId: job.id });
-      advanceNextRun(job);
+      if (dispatchRecord) {
+        completeCurrentDispatch('cancelled');
+      } else {
+        advanceNextRun(job);
+      }
       return;
     }
     if (job.overlap_policy === 'queue') {
       log('info', `Queueing ${job.name} — previous run still active`, { jobId: job.id });
       enqueueJob(job.id);
-      advanceNextRun(job);
+      if (dispatchRecord) {
+        completeCurrentDispatch('done');
+      } else {
+        advanceNextRun(job);
+      }
       return;
     }
     // 'allow' falls through — dispatch concurrently
@@ -356,28 +404,40 @@ async function dispatchJob(job, opts = {}) {
 
   // ── Idempotency key generation & dedup ─────────────────────
   const scheduledTime = job.next_run_at; // capture BEFORE advancing
-  const idemKey = pendingChainKeys.has(job.id)
-    // Chain-triggered child: generate key from parent run context
-    ? (() => {
-        const parentRunId = pendingChainKeys.get(job.id);
-        pendingChainKeys.delete(job.id);
-        return generateChainIdempotencyKey(parentRunId, job.id);
-      })()
-    : generateIdempotencyKey(job, scheduledTime);
+  let idemKey;
+  if (dispatchKind === 'chain') {
+    idemKey = generateChainIdempotencyKey(dispatchRecord.source_run_id || dispatchRecord.id, job.id);
+  } else if (dispatchKind === 'manual') {
+    idemKey = generateRunNowIdempotencyKey(job.id);
+  } else if (dispatchKind === 'retry') {
+    idemKey = generateChainIdempotencyKey(dispatchRecord.retry_of_run_id || dispatchRecord.id, job.id);
+  } else {
+    idemKey = generateIdempotencyKey(job, scheduledTime);
+  }
 
   // Check if already claimed in ledger
   if (idemKey) {
     const existing = getDb().prepare("SELECT * FROM idempotency_ledger WHERE key = ? AND status = 'claimed'").get(idemKey);
     if (existing) {
       log('info', `Idempotency skip: ${job.name} (key ${idemKey.slice(0,8)}… already claimed by run ${existing.run_id.slice(0,8)}…)`);
-      advanceNextRun(job);
+      if (dispatchRecord) {
+        completeCurrentDispatch('done');
+      } else {
+        advanceNextRun(job);
+      }
       return;
     }
   }
 
   log('info', `Dispatching: ${job.name}`, { jobId: job.id, target: job.session_target });
 
-  const run = createRun(job.id, { run_timeout_ms: job.run_timeout_ms, idempotency_key: idemKey });
+  const run = createRun(job.id, {
+    run_timeout_ms: job.run_timeout_ms,
+    idempotency_key: idemKey,
+    dispatch_queue_id: dispatchRecord?.id || null,
+    triggered_by_run: dispatchRecord?.source_run_id || null,
+    retry_of: dispatchRecord?.retry_of_run_id || null,
+  });
 
   // Claim the key in the ledger (with expiry)
   if (idemKey) {
@@ -388,7 +448,11 @@ async function dispatchJob(job, opts = {}) {
     if (!claimed) {
       log('warn', `Idempotency race: ${job.name} key ${idemKey.slice(0,8)}… claimed by concurrent dispatch`);
       finishRun(run.id, 'skipped', { summary: 'Idempotency key already claimed (race)' });
-      advanceNextRun(job);
+      if (dispatchRecord) {
+        completeCurrentDispatch('done');
+      } else {
+        advanceNextRun(job);
+      }
       return;
     }
   }
@@ -399,6 +463,7 @@ async function dispatchJob(job, opts = {}) {
       await sendSystemEvent(job.payload_message, 'now');
       finishRun(run.id, 'ok', { summary: 'System event dispatched' });
       updateJobAfterRun(job, 'ok');
+      completeCurrentDispatch('done');
       if (job.delivery_mode === 'announce-always') {
         await handleDelivery(job, job.payload_message);
       }
@@ -418,13 +483,8 @@ async function dispatchJob(job, opts = {}) {
       }
 
       updateJobAfterRun(job, shellStatus);
-
-      const triggered = fireTriggeredChildren(job.id, shellStatus, output);
-      if (triggered.length > 0) {
-        log('info', `Triggered ${triggered.length} child job(s)`, {
-          parentId: job.id, children: triggered.map(c => c.name),
-        });
-      }
+      completeCurrentDispatch('done');
+      handleTriggeredChildren(job.id, shellStatus, output, run.id);
       if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
       log('info', `Shell ${shellStatus}: ${job.name} (exit ${exitCode})`, { runId: run.id });
 
@@ -438,9 +498,12 @@ async function dispatchJob(job, opts = {}) {
         log('warn', `Gateway unavailable after 30s — deferring: ${job.name}`, { jobId: job.id });
         finishRun(run.id, 'error', { error_message: 'Gateway unavailable — deferred' });
         releaseIdempotencyKey(idemKey);
-        // Reschedule for 60s from now so the scheduler retries
-        const deferredAt = new Date(Date.now() + 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-        updateJob(job.id, { next_run_at: deferredAt });
+        const deferredAt = sqliteNow(60000);
+        if (dispatchRecord) {
+          releaseDispatch(dispatchRecord.id, deferredAt);
+        } else {
+          updateJob(job.id, { next_run_at: deferredAt });
+        }
         // Do NOT delete one-shot jobs — they never got a chance to run
         return;
       }
@@ -541,6 +604,7 @@ async function dispatchJob(job, opts = {}) {
             jobId: job.id, runId: run.id,
           });
           getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+          completeCurrentDispatch('done');
           // Skip updateJobAfterRun — retry handles scheduling
           if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
           log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
@@ -552,6 +616,7 @@ async function dispatchJob(job, opts = {}) {
 
       // Update job state (may delete one-shot jobs — but only when effectiveStatus is 'ok')
       updateJobAfterRun(job, effectiveStatus);
+      completeCurrentDispatch('done');
 
       // Fire triggered children (pass content for trigger_condition evaluation)
       handleTriggeredChildren(job.id, effectiveStatus === 'ok' ? 'ok' : 'error', content, run.id);
@@ -588,6 +653,7 @@ async function dispatchJob(job, opts = {}) {
       });
       // Store retry count on the run for tracking
       getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+      completeCurrentDispatch('done');
     } else {
       // Fire triggered children on failure (only after exhausting retries)
       // No content available on error path — condition checks will use empty string
@@ -599,6 +665,7 @@ async function dispatchJob(job, opts = {}) {
       }
 
       updateJobAfterRun(job, 'error');
+      completeCurrentDispatch('cancelled');
     }
   }
 }
@@ -657,6 +724,12 @@ function buildJobPrompt(job, run) {
     delivery_guarantee: job.delivery_guarantee || 'at-most-once',
     context_retrieval: job.context_retrieval || 'none',
   };
+
+  const triggerContext = buildTriggeredRunContext(run);
+  if (triggerContext.text) {
+    parts.push(triggerContext.text);
+    Object.assign(contextMeta, triggerContext.meta);
+  }
 
   // Add retrieval context if configured
   if (job.context_retrieval && job.context_retrieval !== 'none') {
@@ -917,6 +990,24 @@ async function tick() {
         continue;
       }
       await dispatchJob(job);
+    }
+
+    const dueDispatches = getDueDispatches();
+    for (const dispatchRecord of dueDispatches) {
+      const job = getJob(dispatchRecord.job_id);
+      if (!job || !job.enabled) {
+        setDispatchStatus(dispatchRecord.id, 'cancelled');
+        continue;
+      }
+      if (!gatewayHealthy && job.session_target === 'isolated') {
+        releaseDispatch(dispatchRecord.id, sqliteNow(60000));
+        log('info', `Deferred queued dispatch while gateway is down: ${job.name}`, {
+          jobId: job.id,
+          dispatchId: dispatchRecord.id,
+        });
+        continue;
+      }
+      await dispatchJob(job, { dispatchRecord });
     }
   } catch (err) {
     log('error', `Dispatch error: ${err.message}`);

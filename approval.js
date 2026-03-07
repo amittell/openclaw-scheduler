@@ -5,14 +5,14 @@ import { getDb } from './db.js';
 /**
  * Create a pending approval record for a job (optionally linked to a run).
  */
-export function createApproval(jobId, runId) {
+export function createApproval(jobId, runId, dispatchQueueId = null) {
   const db = getDb();
   const id = randomUUID();
 
   db.prepare(`
-    INSERT INTO approvals (id, job_id, run_id, status, requested_at)
-    VALUES (?, ?, ?, 'pending', datetime('now'))
-  `).run(id, jobId, runId || null);
+    INSERT INTO approvals (id, job_id, run_id, dispatch_queue_id, status, requested_at)
+    VALUES (?, ?, ?, ?, 'pending', datetime('now'))
+  `).run(id, jobId, runId || null, dispatchQueueId || null);
 
   return getApproval(id);
 }

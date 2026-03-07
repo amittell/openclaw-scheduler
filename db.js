@@ -3,10 +3,9 @@ import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { ensureSchedulerDbParent, resolveSchedulerDbPath } from './paths.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const DEFAULT_DB_PATH = join(__dirname, 'scheduler.db');
 
 let _db;
 let _dbPath;
@@ -22,12 +21,17 @@ export function setDbPath(path) {
 
 export function getDb() {
   if (!_db) {
-    const dbPath = _dbPath || process.env.SCHEDULER_DB || DEFAULT_DB_PATH;
+    const dbPath = _dbPath || resolveSchedulerDbPath({ env: process.env });
+    if (dbPath !== ':memory:') ensureSchedulerDbParent(dbPath);
     _db = new Database(dbPath);
     if (dbPath !== ':memory:') _db.pragma('journal_mode = WAL');
     _db.pragma('foreign_keys = ON');
   }
   return _db;
+}
+
+export function getResolvedDbPath() {
+  return _dbPath || resolveSchedulerDbPath({ env: process.env });
 }
 
 export async function initDb() {

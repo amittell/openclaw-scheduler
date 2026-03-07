@@ -19,6 +19,7 @@ import os from 'os';
 import { execSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
+import { ensureSchedulerDbParent, resolveSchedulerDbPath } from './paths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,7 +78,8 @@ const workspacePath = await ask('Workspace path', defaultWorkspace);
 const defaultGateway = 'http://127.0.0.1:18789';
 const gatewayUrl = await ask('Gateway URL', defaultGateway);
 const deliverTo = await ask('Telegram delivery ID for alerts (user or group ID)');
-const schedulerDbPath = path.join(schedulerPath, 'scheduler.db');
+const schedulerDbPath = resolveSchedulerDbPath({ env: process.env });
+if (schedulerDbPath !== ':memory:') ensureSchedulerDbParent(schedulerDbPath);
 
 print();
 print(`  Scheduler:  ${schedulerPath}`);
@@ -119,7 +121,7 @@ try {
   if (ran) {
     ok(`Migrations applied → ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date (schema v10) → ${schedulerDbPath}`);
+    ok(`DB already up to date (schema v11) → ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);
@@ -285,6 +287,8 @@ if (platform === 'darwin') {
   <dict>
     <key>OPENCLAW_GATEWAY_URL</key>
     <string>${gatewayUrl}</string>
+    <key>SCHEDULER_DB</key>
+    <string>${schedulerDbPath}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -361,6 +365,7 @@ Type=simple
 WorkingDirectory=${schedulerPath}
 ExecStart=${nodePath} ${indexPath}
 Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}
+Environment=SCHEDULER_DB=${schedulerDbPath}
 Restart=always
 RestartSec=5
 StandardOutput=append:${logPath}
@@ -405,8 +410,15 @@ WantedBy=default.target
         try {
           execSync(
             `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${schedulerPath}" ` +
-            `--log "${logPath}" -- --env OPENCLAW_GATEWAY_URL=${gatewayUrl}`,
-            { stdio: 'inherit' }
+            `--log "${logPath}"`,
+            {
+              stdio: 'inherit',
+              env: {
+                ...process.env,
+                OPENCLAW_GATEWAY_URL: gatewayUrl,
+                SCHEDULER_DB: schedulerDbPath,
+              },
+            }
           );
           execSync('pm2 save');
           ok('PM2 process started and saved');

@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-388%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-488%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -10,7 +10,7 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 388 (full suite, in-memory SQLite)
+**Tests:** 488 (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -67,11 +67,29 @@ A standalone job scheduler, workflow engine, and inter-agent message router for 
 
 ## Quick Start
 
+### Option A: npm-first (publish/install flow)
+
+```bash
+mkdir -p ~/.openclaw/scheduler
+npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup
+```
+
+This installs the package without cloning the repo. The launcher command maps to:
+- `openclaw-scheduler setup` → `setup.mjs`
+- `openclaw-scheduler start` → `dispatcher.js`
+- `openclaw-scheduler webhook-check` → `scripts/telegram-webhook-check.mjs`
+- `openclaw-scheduler <anything-else>` → `cli.js`
+
+For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather than `node_modules/openclaw-scheduler/`, so upgrades do not trample the database path.
+
+### Option B: source clone (dev/contributor flow)
+
 ```bash
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 445 passed, 0 failed
+npm test                             # should print: 488 passed, 0 failed
 npm run lint                         # static checks
 npm run coverage                     # coverage summary + lcov report
 ```
@@ -79,7 +97,8 @@ npm run coverage                     # coverage summary + lcov report
 Then run the interactive setup wizard:
 
 ```bash
-node setup.mjs
+npm exec openclaw-scheduler -- setup
+# or: node setup.mjs
 ```
 
 The wizard will:
@@ -93,7 +112,7 @@ The wizard will:
 After setup:
 
 ```bash
-node cli.js status                    # verify scheduler is running
+npm exec openclaw-scheduler -- status # verify scheduler is running
 node scripts/stuck-run-detector.mjs   # should print: No stale runs older than 15 minute(s).
 tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
@@ -861,6 +880,9 @@ node cli.js aliases list                 # List all aliases
 node cli.js aliases add <name> <channel> <target> [description]
 node cli.js aliases remove <name>
 
+# ── Companion Utility ─────────────────────────────
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- webhook-check --label kebablebot --bot-token-env KEBABLEBOT_TELEGRAM_BOT_TOKEN
+
 # ── Status ────────────────────────────────────────
 node cli.js status
 ```
@@ -873,7 +895,9 @@ node cli.js status
 |----------|---------|-------------|
 | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
-| `SCHEDULER_DB` | `./scheduler.db` | SQLite database path |
+| `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
+| `SCHEDULER_DB` | auto (`./scheduler.db` in a writable source checkout, else `~/.openclaw/scheduler/scheduler.db`) | SQLite database path |
+| `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
 | `SCHEDULER_TICK_MS` | `10000` | Tick interval (10s) |
 | `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold |
 | `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval |
@@ -967,8 +991,8 @@ As of `v1.0.3`, the schema is consolidated in `schema.sql` (baseline `v10`).
 
 | System | How disabled | Revert |
 |--------|-------------|--------|
-| Built-in cron | All jobs set `enabled: false` via API | `openclaw cron edit <id> --enable` |
-| Heartbeat | `heartbeat.every: "0m"` | Set back to `"5m"` |
+| Built-in cron | Jobs disabled (`openclaw cron edit <id> --disable`) + global cron off (`cron.enabled=false`) + gateway env `OPENCLAW_SKIP_CRON=1` | Re-enable jobs + `cron.enabled=true` + unset `OPENCLAW_SKIP_CRON` |
+| Heartbeat | `agents.defaults.heartbeat.every: "0m"` and disable/remove any per-agent `agents.list[].heartbeat` overrides | Set defaults/per-agent heartbeat cadence back (for example `"5m"`) |
 | Chat completions | Enabled for scheduler | Can leave enabled |
 
 ### Version history
@@ -993,9 +1017,10 @@ To stop the scheduler and restore OpenClaw's built-in cron/heartbeat, see [UNINS
 
 Quick summary:
 1. Stop the service (launchctl / systemctl / pm2)
-2. Re-enable OC cron: `openclaw cron edit <id> --enable` for each job
-3. Re-enable heartbeat: `openclaw config set agents.defaults.heartbeat.every "5m"`
-4. Optionally delete `~/.openclaw/scheduler/`
+2. Re-enable OC cron globally: `openclaw config set cron.enabled true` and remove `OPENCLAW_SKIP_CRON=1` from gateway service env
+3. Re-enable OC cron jobs: `openclaw cron edit <id> --enable` for each job
+4. Re-enable heartbeat: `openclaw config set agents.defaults.heartbeat.every "5m"` and restore any per-agent `agents.list[].heartbeat` overrides you use
+5. Optionally delete `~/.openclaw/scheduler/`
 
 ---
 
