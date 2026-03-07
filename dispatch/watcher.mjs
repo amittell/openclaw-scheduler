@@ -506,10 +506,17 @@ while (Date.now() < deadline) {
 
 // Timed out — try one last result check
 const finalResult = dispatch('result', ['--label', label]);
+const finalStatus = dispatch('status', ['--label', label]);
 if (finalResult?.lastReply) {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
-  deliverResult(label, finalResult.lastReply, null);
+  deliverResult(label, finalResult.lastReply, finalStatus?.summary || null);
+}
+// If status is explicitly done, exit cleanly even without lastReply
+if (finalStatus?.status === 'done') {
+  markDoneSync(finalStatus?.summary || 'completed');
+  process.stdout.write(`✅ dispatch [${label}] completed (status=done, no lastReply captured)\n`);
+  process.exit(0);
 }
 
 // ── Token-based activity check before steering ────────────────────────────
@@ -558,6 +565,12 @@ if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   if (r?.lastReply) {
     markDoneSync('completed before deadline monitoring');
     deliverResult(label, r.lastReply, statusAtDeadline?.summary || null);
+    process.exit(0);
+  }
+  // Status is explicitly done — exit cleanly, no timeout noise
+  if (statusAtDeadline?.status === 'done') {
+    markDoneSync(statusAtDeadline?.summary || 'completed');
+    process.stdout.write(`✅ dispatch [${label}] completed (status=done at deadline)\n`);
     process.exit(0);
   }
   // Truly no result and no tokens — telemetry unavailable
