@@ -34,7 +34,7 @@ const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
 );
 import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
-  createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
+  createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateHeartbeat, updateRunSession, pruneRuns, updateContextSummary
 } from './runs.js';
 import {
@@ -440,9 +440,14 @@ async function dispatchJob(job, opts = {}) {
 
   log('info', `Dispatching: ${job.name}`, { jobId: job.id, target: job.session_target });
 
+  const retryCount = dispatchKind === 'retry' && dispatchRecord?.retry_of_run_id
+    ? (getRun(dispatchRecord.retry_of_run_id)?.retry_count || 0)
+    : 0;
+
   const run = createRun(job.id, {
     run_timeout_ms: job.run_timeout_ms,
     idempotency_key: idemKey,
+    retry_count: retryCount,
     dispatch_queue_id: dispatchRecord?.id || null,
     triggered_by_run: dispatchRecord?.source_run_id || null,
     retry_of: dispatchRecord?.retry_of_run_id || null,

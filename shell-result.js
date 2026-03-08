@@ -52,7 +52,13 @@ export function normalizeShellResult(
 
   const exitCode = Number.isInteger(error?.code) ? error.code : null;
   const signal = error?.signal || null;
-  const timedOut = Boolean(error?.killed && /timed out/i.test(error?.message || ''));
+  const timedOut = Boolean(
+    error && (
+      error.code === 'ETIMEDOUT'
+      || /timed out/i.test(error?.message || '')
+      || (error.killed && exitCode == null && signal === 'SIGTERM')
+    )
+  );
   const status = timedOut ? 'timeout' : error ? 'error' : 'ok';
   const errorMessage = deriveErrorMessage({ status, timedOut, exitCode, signal, rawError: error }, timeoutMs);
   const output = combined || errorMessage || '(no output)';

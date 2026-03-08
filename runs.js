@@ -12,10 +12,10 @@ export function createRun(jobId, opts = {}) {
   db.prepare(`
     INSERT INTO runs (
       id, job_id, status, run_timeout_ms, session_key, session_id,
-      dispatched_at, context_summary, replay_of, idempotency_key,
+      dispatched_at, context_summary, replay_of, idempotency_key, retry_count,
       retry_of, triggered_by_run, dispatch_queue_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -26,6 +26,7 @@ export function createRun(jobId, opts = {}) {
     opts.context_summary ? JSON.stringify(opts.context_summary) : null,
     opts.replay_of || null,
     opts.idempotency_key || null,
+    opts.retry_count ?? 0,
     opts.retry_of || null,
     opts.triggered_by_run || null,
     opts.dispatch_queue_id || null

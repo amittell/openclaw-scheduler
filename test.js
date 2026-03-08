@@ -3,7 +3,7 @@
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
 import Database from 'better-sqlite3';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -49,6 +49,33 @@ const verbose = process.argv.includes('-v') || process.argv.includes('--verbose'
 function assert(cond, msg) {
   if (cond) { passed++; if (verbose) console.log(`  ✅ ${msg}`); }
   else { failed++; console.error(`  ✗ ${msg}`); }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(fn, { timeoutMs = 5000, intervalMs = 50, label = 'condition' } = {}) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const value = fn();
+    if (value) return value;
+    await sleep(intervalMs);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function stopChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve();
+    }, 5000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
 }
 
 // ── In-memory DB ────────────────────────────────────────────
@@ -147,12 +174,19 @@ assert(shellFailure.stderr === 'boom', 'shell result stores stderr separately');
 assert(shellFailure.contextSummary.shell_result.stderr_excerpt === 'boom', 'shell result context summary carries stderr excerpt');
 
 const shellTimeout = normalizeShellResult(
-  { stdout: '', stderr: '', error: Object.assign(new Error('Command failed because it timed out'), { killed: true, signal: 'SIGTERM' }) },
+  { stdout: '', stderr: '', error: Object.assign(new Error('Command failed: sleep 2\n'), { killed: true, signal: 'SIGTERM' }) },
   { timeoutMs: 1500 }
 );
 assert(shellTimeout.status === 'timeout', 'shell result marks timeout separately');
 assert(shellTimeout.timedOut === true, 'shell result captures timedOut flag');
 assert(shellTimeout.errorMessage === 'Shell command timed out after 1500ms', 'shell result timeout error message');
+
+const shellSignaled = normalizeShellResult(
+  { stdout: '', stderr: '', error: Object.assign(new Error('Command failed: sleep 2\n'), { killed: false, signal: 'SIGTERM' }) },
+  { timeoutMs: 1500 }
+);
+assert(shellSignaled.status === 'error', 'shell result keeps non-timeout signals as error');
+assert(shellSignaled.timedOut === false, 'shell result does not misclassify non-timeout signals');
 
 const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none' });
 const shellRun = createRun(shellRunJob.id, { run_timeout_ms: 60000 });
@@ -523,6 +557,14 @@ assert(retry1.delaySec === 30, 'first retry = 30s');
 assert(retry1.dispatch.dispatch_kind === 'retry', 'retry creates durable dispatch');
 assert(retry1.dispatch.retry_of_run_id === run1.id, 'retry dispatch tracks failed run');
 
+const retryRun = createRun(retryJob.id, {
+  run_timeout_ms: 300000,
+  retry_count: retry1.retryCount,
+  retry_of: run1.id,
+  triggered_by_run: run1.id,
+});
+assert(retryRun.retry_count === 1, 'createRun persists retry_count for retry dispatches');
+
 // Backoff math
 assert(30 * Math.pow(2, 0) === 30, 'backoff: retry 1 = 30s');
 assert(30 * Math.pow(2, 1) === 60, 'backoff: retry 2 = 60s');
@@ -537,6 +579,20 @@ const noRetry = createJob({ name: 'NoRetry', schedule_cron: '0 8 * * *', payload
 const run2 = createRun(noRetry.id, { run_timeout_ms: 300000 });
 finishRun(run2.id, 'error', { error_message: 'fail' });
 assert(!shouldRetry(noRetry, run2.id), 'shouldRetry false when max_retries=0');
+
+const singleRetryJob = createJob({ name: 'SingleRetry', schedule_cron: '0 9 * * *', payload_message: 'single retry', max_retries: 1, delivery_mode: 'none' });
+const singleRetryRun1 = createRun(singleRetryJob.id, { run_timeout_ms: 300000 });
+finishRun(singleRetryRun1.id, 'error', { error_message: 'first fail' });
+const singleRetry = scheduleRetry(singleRetryJob, singleRetryRun1.id);
+getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(singleRetry.retryCount, singleRetryRun1.id);
+const singleRetryRun2 = createRun(singleRetryJob.id, {
+  run_timeout_ms: 300000,
+  retry_count: singleRetry.retryCount,
+  retry_of: singleRetryRun1.id,
+  triggered_by_run: singleRetryRun1.id,
+});
+finishRun(singleRetryRun2.id, 'error', { error_message: 'second fail' });
+assert(!shouldRetry(singleRetryJob, singleRetryRun2.id), 'retry attempt inherits retry_count and exhausts max_retries');
 
 // ═══════════════════════════════════════════════════════════
 // SECTION 5: Cancellation (v3b)
@@ -2245,6 +2301,191 @@ console.log('\n── Migration Guard ──');
 
   rmSync(legacyDir, { recursive: true, force: true });
   setDbPath(':memory:');
+}
+
+console.log('\n── Dispatcher Integration ──');
+{
+  async function withTempDispatcher({ prepare, exercise }) {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-dispatcher-'));
+    const tempDbPath = join(tempRoot, 'scheduler.db');
+    const env = {
+      ...process.env,
+      SCHEDULER_DB: tempDbPath,
+      SCHEDULER_TICK_MS: '100',
+      SCHEDULER_MESSAGE_DELIVERY_MS: '600000',
+      SCHEDULER_PRUNE_MS: '600000',
+      SCHEDULER_BACKUP_MS: '600000',
+      SCHEDULER_HEARTBEAT_CHECK_MS: '600000',
+    };
+    const createdJobIds = [];
+    const context = {};
+    let child;
+    let probeDb;
+
+    try {
+      closeDb();
+      setDbPath(tempDbPath);
+      await initDb();
+      const addJob = (spec) => {
+        const job = createJob(spec);
+        createdJobIds.push(job.id);
+        return job;
+      };
+      const triggerJob = (jobId) => runJobNow(jobId);
+      await prepare({ addJob, triggerJob, context });
+      closeDb();
+
+      child = spawn(process.execPath, ['dispatcher.js'], {
+        cwd: process.cwd(),
+        env,
+        stdio: 'ignore',
+      });
+
+      probeDb = new Database(tempDbPath);
+      probeDb.pragma('journal_mode = WAL');
+      await waitFor(
+        () => probeDb.prepare("SELECT COUNT(*) AS c FROM agents WHERE id = 'main'").get().c === 1,
+        { timeoutMs: 5000, intervalMs: 100, label: 'dispatcher startup' }
+      );
+
+      await exercise({ probeDb, context });
+    } finally {
+      if (probeDb) probeDb.close();
+      await stopChild(child);
+
+      closeDb();
+      setDbPath(tempDbPath);
+      await initDb();
+      for (const jobId of createdJobIds.reverse()) {
+        deleteJob(jobId);
+      }
+      closeDb();
+      rmSync(tempRoot, { recursive: true, force: true });
+      setDbPath(':memory:');
+      await initDb();
+    }
+  }
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, triggerJob, context }) => {
+      const timeoutJob = addJob({
+        name: 'dispatcher-timeout',
+        schedule_cron: '0 0 31 2 *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'sleep 2',
+        run_timeout_ms: 100,
+        delivery_mode: 'none',
+      });
+      context.timeoutJobId = timeoutJob.id;
+      triggerJob(timeoutJob.id);
+    },
+    exercise: async ({ probeDb, context }) => {
+      const timeoutRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT status, shell_timed_out, shell_signal
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT 1
+        `).get(context.timeoutJobId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'dispatcher timeout run' }
+      );
+      assert(timeoutRun.status === 'timeout', 'dispatcher integration: shell timeout stored as timeout');
+      assert(timeoutRun.shell_timed_out === 1, 'dispatcher integration: shell timeout sets shell_timed_out');
+      assert(timeoutRun.shell_signal === 'SIGTERM', 'dispatcher integration: shell timeout preserves signal');
+    },
+  });
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, triggerJob, context }) => {
+      const root = addJob({
+        name: 'dispatcher-retry-root',
+        schedule_cron: '0 0 31 2 *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo retry-root && exit 9',
+        max_retries: 1,
+        delivery_mode: 'none',
+      });
+      const child = addJob({
+        name: 'dispatcher-retry-child',
+        parent_id: root.id,
+        trigger_on: 'failure',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo retry-child-fired',
+        delivery_mode: 'none',
+      });
+      context.rootJobId = root.id;
+      context.childJobId = child.id;
+      triggerJob(root.id);
+    },
+    exercise: async ({ probeDb, context }) => {
+      await waitFor(
+        () => probeDb.prepare(`
+          SELECT COUNT(*) AS c
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+        `).get(context.rootJobId).c >= 1,
+        { timeoutMs: 10000, intervalMs: 100, label: 'initial retry root run' }
+      );
+
+      const pendingRetry = await waitFor(
+        () => probeDb.prepare(`
+          SELECT id
+          FROM job_dispatch_queue
+          WHERE job_id = ? AND dispatch_kind = 'retry' AND status = 'pending'
+          ORDER BY created_at ASC, rowid ASC
+          LIMIT 1
+        `).get(context.rootJobId),
+        { timeoutMs: 5000, intervalMs: 100, label: 'pending retry dispatch' }
+      );
+      probeDb.prepare(`
+        UPDATE job_dispatch_queue
+        SET scheduled_for = datetime('now', '-1 second')
+        WHERE id = ?
+      `).run(pendingRetry.id);
+
+      const rootRuns = await waitFor(
+        () => {
+          const runs = probeDb.prepare(`
+            SELECT id, status, retry_count, retry_of
+            FROM runs
+            WHERE job_id = ? AND finished_at IS NOT NULL
+            ORDER BY started_at ASC, rowid ASC
+          `).all(context.rootJobId);
+          return runs.length >= 2 ? runs : null;
+        },
+        { timeoutMs: 10000, intervalMs: 100, label: 'exhausted retry chain' }
+      );
+
+      const childRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT status, triggered_by_run, summary
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+          ORDER BY started_at ASC, rowid ASC
+          LIMIT 1
+        `).get(context.childJobId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'failure child dispatch' }
+      );
+
+      const remainingRetryDispatches = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM job_dispatch_queue
+        WHERE job_id = ? AND dispatch_kind = 'retry' AND status = 'pending'
+      `).get(context.rootJobId).c;
+
+      assert(rootRuns.length === 2, 'dispatcher integration: root runs initial attempt plus one retry');
+      assert(rootRuns[0].retry_count === 1, 'dispatcher integration: first failed run stores scheduled retry_count');
+      assert(rootRuns[1].retry_count === 1, 'dispatcher integration: retry run inherits retry_count');
+      assert(rootRuns[1].status === 'error', 'dispatcher integration: retry run finishes as error');
+      assert(childRun.status === 'ok', 'dispatcher integration: failure child fires after retries exhaust');
+      assert(childRun.triggered_by_run === rootRuns[1].id, 'dispatcher integration: failure child links to final failed run');
+      assert(remainingRetryDispatches === 0, 'dispatcher integration: no extra retry dispatch remains after exhaustion');
+    },
+  });
 }
 
 closeDb();
