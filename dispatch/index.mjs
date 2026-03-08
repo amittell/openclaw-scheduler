@@ -49,6 +49,7 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+const BRAND = config.name ?? 'dispatch';
 
 /** Load gateway auth token from config or env */
 function getGatewayToken() {
@@ -65,7 +66,7 @@ const GATEWAY_TOKEN = getGatewayToken();
 // ── Helpers ──────────────────────────────────────────────────
 
 function die(msg, code = 1) {
-  process.stderr.write(`[dispatch] ${msg}\n`);
+  process.stderr.write(`[${BRAND}] ${msg}\n`);
   process.exit(code);
 }
 
@@ -433,7 +434,7 @@ async function cmdEnqueue(flags) {
     const existing = getLabel(label);
     if (existing?.sessionKey) {
       sessionKey = existing.sessionKey;
-      process.stderr.write(`[dispatch] mode=reuse → continuing session ${sessionKey}\n`);
+      process.stderr.write(`[${BRAND}] mode=reuse → continuing session ${sessionKey}\n`);
     } else {
       die(`mode=reuse: no prior session found for label "${label}". Use --mode fresh.`);
     }
@@ -552,14 +553,14 @@ async function cmdEnqueue(flags) {
               action: 'send',
               channel: deliverChannel,
               target: deliverTo,
-              message: `🌶️ *dispatch* [${label}] starting...`,
+              message: `🌶️ *${BRAND}* [${label}] starting...`,
             },
             sessionKey: 'main',
           }),
           signal: AbortSignal.timeout(5000),
         });
       } catch (err) {
-        process.stderr.write(`[dispatch] starting notification failed: ${err.message}\n`);
+        process.stderr.write(`[${BRAND}] starting notification failed: ${err.message}\n`);
       }
     }
 
@@ -578,7 +579,7 @@ async function cmdEnqueue(flags) {
         const watcherCmd = `node '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
-          name:                     `dispatch-deliver:${label}`,
+          name:                     `${BRAND}-deliver:${label}`,
           schedule_cron:            '0 0 31 2 *',  // never-cron; run_now triggers it once
           session_target:           'shell',
           payload_kind:             'shellCommand',
@@ -599,9 +600,9 @@ async function cmdEnqueue(flags) {
           stdio:    ['pipe', 'pipe', 'pipe'],
         });
         schedulerWatcherOk = true;
-        process.stderr.write(`[dispatch] scheduler watcher registered: dispatch-deliver:${label}\n`);
+        process.stderr.write(`[${BRAND}] scheduler watcher registered: ${BRAND}-deliver:${label}\n`);
       } catch (err) {
-        process.stderr.write(`[dispatch] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
+        process.stderr.write(`[${BRAND}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
       }
     }
 
@@ -837,7 +838,7 @@ async function cmdStuck(flags) {
   // Log auto-resolved sessions to stderr (informational, won't trigger delivery)
   if (autoResolved.length > 0) {
     const lines = autoResolved.map(r => `  ✓ ${r.label}: ${r.reason}`).join('\n');
-    process.stderr.write(`[dispatch] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
+    process.stderr.write(`[${BRAND}] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
   }
 
   if (!stuckSessions.length) {
@@ -858,7 +859,7 @@ async function cmdStuck(flags) {
   ).join('\n');
 
   process.stdout.write(
-    `⚠️ ${stuckSessions.length} stuck session${stuckSessions.length > 1 ? 's' : ''}:\n${lines}\n`
+    `⚠️ ${BRAND}: ${stuckSessions.length} stuck session${stuckSessions.length > 1 ? 's' : ''}:\n${lines}\n`
   );
 
   await onStuck(stuckSessions.map(s => ({
@@ -1106,7 +1107,7 @@ function cmdList(flags) {
 
 function usage() {
   process.stdout.write(`
-dispatch 🌶️ — sub-agent dispatch CLI (native gateway API)
+${BRAND} 🌶️ — sub-agent dispatch CLI (native gateway API)
 
 Usage: node index.mjs <subcommand> [flags]
 
