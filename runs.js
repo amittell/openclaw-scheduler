@@ -68,7 +68,12 @@ export function finishRun(id, status, opts = {}) {
       duration_ms = ?,
       summary = ?,
       error_message = ?,
-      context_summary = COALESCE(?, context_summary)
+      context_summary = COALESCE(?, context_summary),
+      shell_exit_code = COALESCE(?, shell_exit_code),
+      shell_signal = COALESCE(?, shell_signal),
+      shell_timed_out = COALESCE(?, shell_timed_out),
+      shell_stdout = COALESCE(?, shell_stdout),
+      shell_stderr = COALESCE(?, shell_stderr)
     WHERE id = ?
   `).run(
     status,
@@ -76,6 +81,11 @@ export function finishRun(id, status, opts = {}) {
     opts.summary || null,
     opts.error_message || null,
     opts.context_summary ? JSON.stringify(opts.context_summary) : null,
+    opts.shell_exit_code ?? null,
+    opts.shell_signal ?? null,
+    opts.shell_timed_out != null ? Number(Boolean(opts.shell_timed_out)) : null,
+    opts.shell_stdout ?? null,
+    opts.shell_stderr ?? null,
     id
   );
 

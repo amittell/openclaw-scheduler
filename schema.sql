@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.1.0, schema version: 11)
+-- OpenClaw Scheduler Schema (current: v1.2.0, schema version: 12)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS runs (
   -- Result
   summary         TEXT,
   error_message   TEXT,
+  shell_exit_code INTEGER,
+  shell_signal    TEXT,
+  shell_timed_out INTEGER NOT NULL DEFAULT 0,
+  shell_stdout    TEXT,
+  shell_stderr    TEXT,
   dispatched_at   TEXT,
   run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
 
@@ -357,8 +362,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs start at v11 (all columns already in schema above).
--- Existing installs are brought up to v11 by migrate-consolidate.js.
+-- Fresh installs start at v12 (all columns already in schema above).
+-- Existing installs are brought up to v12 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -370,6 +375,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (8);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (10);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (11);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (12);
 
 -- ============================================================
 -- SEED JOBS

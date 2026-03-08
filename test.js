@@ -38,6 +38,7 @@ import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH } from './gateway.j
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
+import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
 
 // ── Test harness ────────────────────────────────────────────
 let passed = 0;
@@ -83,6 +84,11 @@ assert(runCols.includes('retry_count'), 'runs.retry_count column');
 assert(runCols.includes('retry_of'), 'runs.retry_of column');
 assert(runCols.includes('triggered_by_run'), 'runs.triggered_by_run column');
 assert(runCols.includes('dispatch_queue_id'), 'runs.dispatch_queue_id column');
+assert(runCols.includes('shell_exit_code'), 'runs.shell_exit_code column');
+assert(runCols.includes('shell_signal'), 'runs.shell_signal column');
+assert(runCols.includes('shell_timed_out'), 'runs.shell_timed_out column');
+assert(runCols.includes('shell_stdout'), 'runs.shell_stdout column');
+assert(runCols.includes('shell_stderr'), 'runs.shell_stderr column');
 
 // ── Paths ───────────────────────────────────────────────────
 console.log('\nPaths:');
@@ -107,14 +113,65 @@ console.log('\nPrompt Context:');
 const triggerContext = buildTriggeredRunContext(
   { triggered_by_run: 'parent-run-1' },
   {
-    getRunById: () => ({ id: 'parent-run-1', job_id: 'parent-job-1', status: 'ok', summary: 'STATUS: ALERT pending_update_count=12' }),
-    getJobById: () => ({ id: 'parent-job-1', name: 'Kebablebot Webhook Check' }),
+    getRunById: () => ({
+      id: 'parent-run-1',
+      job_id: 'parent-job-1',
+      status: 'error',
+      error_message: 'Shell exited with code 2',
+      shell_exit_code: 2,
+      shell_stdout: 'checking...',
+      shell_stderr: 'database locked'
+    }),
+    getJobById: () => ({ id: 'parent-job-1', name: 'Kebablebot Webhook Check', session_target: 'shell' }),
   }
 );
 assert(triggerContext.text.includes('Trigger Context'), 'trigger context header included');
 assert(triggerContext.text.includes('Kebablebot Webhook Check'), 'trigger context includes parent job name');
-assert(triggerContext.text.includes('STATUS: ALERT'), 'trigger context includes parent summary');
-assert(triggerContext.meta.parent_run_status === 'ok', 'trigger context meta includes parent status');
+assert(triggerContext.text.includes('Exit code: 2'), 'trigger context includes shell exit code');
+assert(triggerContext.text.includes('stdout:'), 'trigger context includes shell stdout label');
+assert(triggerContext.text.includes('stderr:'), 'trigger context includes shell stderr label');
+assert(triggerContext.meta.parent_run_status === 'error', 'trigger context meta includes parent status');
+assert(triggerContext.meta.parent_shell_exit_code === 2, 'trigger context meta includes shell exit code');
+
+// ── Shell result helpers ────────────────────────────────────
+console.log('\nShell Results:');
+const shellFailure = normalizeShellResult(
+  { stdout: 'hello\n', stderr: 'boom\n', error: Object.assign(new Error('failed'), { code: 7 }) },
+  { timeoutMs: 300000 }
+);
+assert(shellFailure.status === 'error', 'shell result marks non-zero exit as error');
+assert(shellFailure.exitCode === 7, 'shell result captures exit code');
+assert(shellFailure.stdout === 'hello', 'shell result stores stdout separately');
+assert(shellFailure.stderr === 'boom', 'shell result stores stderr separately');
+assert(shellFailure.contextSummary.shell_result.stderr_excerpt === 'boom', 'shell result context summary carries stderr excerpt');
+
+const shellTimeout = normalizeShellResult(
+  { stdout: '', stderr: '', error: Object.assign(new Error('Command failed because it timed out'), { killed: true, signal: 'SIGTERM' }) },
+  { timeoutMs: 1500 }
+);
+assert(shellTimeout.status === 'timeout', 'shell result marks timeout separately');
+assert(shellTimeout.timedOut === true, 'shell result captures timedOut flag');
+assert(shellTimeout.errorMessage === 'Shell command timed out after 1500ms', 'shell result timeout error message');
+
+const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none' });
+const shellRun = createRun(shellRunJob.id, { run_timeout_ms: 60000 });
+finishRun(shellRun.id, 'error', {
+  summary: shellFailure.summary,
+  error_message: shellFailure.errorMessage,
+  context_summary: shellFailure.contextSummary,
+  shell_exit_code: shellFailure.exitCode,
+  shell_signal: shellFailure.signal,
+  shell_timed_out: shellFailure.timedOut,
+  shell_stdout: shellFailure.stdout,
+  shell_stderr: shellFailure.stderr,
+});
+const storedShellRun = getRun(shellRun.id);
+assert(storedShellRun.shell_exit_code === 7, 'finishRun stores shell exit code');
+assert(storedShellRun.shell_stdout === 'hello', 'finishRun stores shell stdout');
+assert(storedShellRun.shell_stderr === 'boom', 'finishRun stores shell stderr');
+const extractedShell = extractShellResultFromRun(storedShellRun);
+assert(extractedShell.exitCode === 7, 'extractShellResultFromRun reads direct shell columns');
+assert(extractedShell.stderr === 'boom', 'extractShellResultFromRun reads stderr');
 
 // ── Telegram webhook diagnostics ───────────────────────────
 console.log('\nWebhook Diagnostics:');
