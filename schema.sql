@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   watchdog_check_cmd    TEXT,                         -- shell command to check target status
   watchdog_timeout_min  INTEGER,                      -- alert if target running longer than this
   watchdog_alert_channel TEXT,                        -- e.g. 'telegram'
-  watchdog_alert_target TEXT,                         -- e.g. '484946046'
+  watchdog_alert_target TEXT,                         -- e.g. '<telegram-user-id>'
   watchdog_self_destruct INTEGER NOT NULL DEFAULT 1,  -- delete when target done
   watchdog_started_at   TEXT,                         -- ISO timestamp when target was dispatched
 

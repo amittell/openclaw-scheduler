@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "SQLite-backed job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces built-in cron and heartbeat with full run history, workflow chains, retry logic, shell jobs, approval gates, and backup support.",
   "type": "module",
   "main": "dispatcher.js",

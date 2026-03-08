@@ -335,7 +335,7 @@ node cli.js status
 
 ## Optional: QMD Memory Daemon (if using QMD as memory backend)
 
-If your OpenClaw instance uses QMD for hybrid memory search (`memory.backend = "qmd"`), you need a persistent systemd service for the QMD MCP daemon — equivalent to the macOS LaunchAgent on `com.kebablebot.qmd-daemon`.
+If your OpenClaw instance uses QMD for hybrid memory search (`memory.backend = "qmd"`), you need a persistent systemd service for the QMD MCP daemon — equivalent to the macOS LaunchAgent on `com.openclaw.qmd-daemon`.
 
 ### Key rules (learned the hard way)
 
@@ -356,7 +356,7 @@ After=network.target
 [Service]
 Environment=XDG_CONFIG_HOME=%h/.openclaw/agents/main/qmd/xdg-config
 Environment=XDG_CACHE_HOME=%h/.openclaw/agents/main/qmd/xdg-cache
-ExecStart=%h/vault/start-qmd-daemon.sh
+ExecStart=%h/.openclaw/bin/start-qmd-daemon.sh
 Restart=always
 RestartSec=5
 
@@ -371,7 +371,7 @@ systemctl --user start qmd-daemon
 loginctl enable-linger $USER   # keep running without active login session
 ```
 
-### Daemon wrapper script (`~/vault/start-qmd-daemon.sh`)
+### Daemon wrapper script (`~/.openclaw/bin/start-qmd-daemon.sh`)
 
 ```bash
 #!/bin/bash

@@ -23,7 +23,7 @@ const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
 const HOST         = process.env.DISPATCH_HOST
   || process.env.CHILISAUS_HOST
   || hostname()
-  || 'rh-bot.lan';
+  || 'unknown-host';
 const TIMEOUT_MS   = 3000;
 
 // ── Loki push ───────────────────────────────────────────────
