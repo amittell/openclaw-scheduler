@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.2.0, schema version: 12)
+-- OpenClaw Scheduler Schema (current: v1.3.0, schema version: 13)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -76,6 +76,16 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Session continuity (v9)
   preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
+
+  -- Watchdog monitoring (v13)
+  job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
+  watchdog_target_label TEXT,                         -- label of the task being monitored
+  watchdog_check_cmd    TEXT,                         -- shell command to check target status
+  watchdog_timeout_min  INTEGER,                      -- alert if target running longer than this
+  watchdog_alert_channel TEXT,                        -- e.g. 'telegram'
+  watchdog_alert_target TEXT,                         -- e.g. '484946046'
+  watchdog_self_destruct INTEGER NOT NULL DEFAULT 1,  -- delete when target done
+  watchdog_started_at   TEXT,                         -- ISO timestamp when target was dispatched
 
   -- Scheduling state (denormalized)
   next_run_at     TEXT,
@@ -376,6 +386,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (9);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (10);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (11);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (12);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (13);
 
 -- ============================================================
 -- SEED JOBS

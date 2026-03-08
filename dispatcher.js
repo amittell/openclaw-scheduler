@@ -463,7 +463,109 @@ async function dispatchJob(job, opts = {}) {
   }
 
   try {
-    if (job.session_target === 'main') {
+    if (job.job_type === 'watchdog') {
+      // ── Watchdog job: run check command, evaluate target status ──
+      const checkCmd = job.watchdog_check_cmd;
+      if (!checkCmd) {
+        finishRun(run.id, 'error', { error_message: 'Watchdog job missing watchdog_check_cmd' });
+        updateJobAfterRun(job, 'error');
+        completeCurrentDispatch('done');
+        return;
+      }
+
+      const shellExec = await runShellCommand(checkCmd, Math.min(job.run_timeout_ms || 300000, 60000));
+      const exitCode = shellExec.exitCode;
+      const stdout = (shellExec.stdout || '').trim();
+      const stderr = (shellExec.stderr || '').trim();
+
+      // Check timeout: has the target been running too long?
+      let timedOut = false;
+      let elapsedMin = 0;
+      if (job.watchdog_started_at && job.watchdog_timeout_min) {
+        const startedAt = new Date(job.watchdog_started_at).getTime();
+        elapsedMin = Math.round((Date.now() - startedAt) / 60000);
+        if (elapsedMin >= job.watchdog_timeout_min) {
+          timedOut = true;
+        }
+      }
+
+      if (exitCode === 2) {
+        // Exit 2 = check itself failed (transient) — don't alert, retry next tick
+        finishRun(run.id, 'ok', { summary: `Watchdog check failed (transient): ${stderr || stdout}` });
+        updateJobAfterRun(job, 'ok');
+        completeCurrentDispatch('done');
+        log('debug', `Watchdog check transient failure: ${job.name}`, { exitCode, stderr: stderr.slice(0, 200) });
+
+      } else if (exitCode === 0 && stdout) {
+        // Exit 0 + stdout = target completed successfully
+        const completionMsg = `✅ [watchdog] Task "${job.watchdog_target_label}" completed — watchdog disarmed`;
+        log('info', `Watchdog: target completed: ${job.watchdog_target_label}`, { jobId: job.id });
+
+        // Deliver completion notice
+        if (job.watchdog_alert_channel && job.watchdog_alert_target) {
+          await handleDelivery({
+            ...job,
+            delivery_mode: 'announce-always',
+            delivery_channel: job.watchdog_alert_channel,
+            delivery_to: job.watchdog_alert_target,
+          }, completionMsg);
+        }
+
+        finishRun(run.id, 'ok', { summary: completionMsg });
+        updateJobAfterRun(job, 'ok');
+        completeCurrentDispatch('done');
+
+        // Self-destruct: disable and mark for deletion
+        if (job.watchdog_self_destruct) {
+          updateJob(job.id, { enabled: 0 });
+          deleteJob(job.id);
+          log('info', `Watchdog self-destructed: ${job.name}`, { jobId: job.id });
+        }
+
+      } else if (exitCode === 1 || timedOut) {
+        // Exit 1 = target stuck/errored, OR timeout exceeded
+        const reason = timedOut
+          ? `running for ${elapsedMin}min (threshold: ${job.watchdog_timeout_min}min)`
+          : `check command reported stuck`;
+        const alertMsg = [
+          `🚨 [watchdog] Task "${job.watchdog_target_label}" appears stuck`,
+          `- Dispatched: ${job.watchdog_started_at || 'unknown'}`,
+          `- Running for: ${elapsedMin} minutes (threshold: ${job.watchdog_timeout_min || '?'} min)`,
+          `- Reason: ${reason}`,
+          `- Check: ${checkCmd}`,
+          stderr ? `- Error: ${stderr.slice(0, 500)}` : null,
+          stdout ? `- Output: ${stdout.slice(0, 500)}` : null,
+        ].filter(Boolean).join('\n');
+
+        log('warn', `Watchdog alert: ${job.watchdog_target_label} stuck`, {
+          jobId: job.id, elapsedMin, timedOut, exitCode,
+        });
+
+        // Send alert
+        if (job.watchdog_alert_channel && job.watchdog_alert_target) {
+          await handleDelivery({
+            ...job,
+            delivery_mode: 'announce-always',
+            delivery_channel: job.watchdog_alert_channel,
+            delivery_to: job.watchdog_alert_target,
+          }, alertMsg);
+        }
+
+        finishRun(run.id, 'ok', { summary: `Watchdog alert fired: ${reason}` });
+        updateJobAfterRun(job, 'ok');
+        completeCurrentDispatch('done');
+
+      } else {
+        // Exit 0, no stdout = target still running, no alert needed
+        finishRun(run.id, 'ok', { summary: `Watchdog check: target still running (${elapsedMin}min elapsed)` });
+        updateJobAfterRun(job, 'ok');
+        completeCurrentDispatch('done');
+        log('debug', `Watchdog: target still running: ${job.watchdog_target_label}`, {
+          jobId: job.id, elapsedMin,
+        });
+      }
+
+    } else if (job.session_target === 'main') {
       // Main session: send system event
       await sendSystemEvent(job.payload_message, 'now');
       finishRun(run.id, 'ok', { summary: 'System event dispatched' });

@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy this to config.json and customize. All fields are optional.",
+
+  "name": "dispatch",
+  "_name": "Branding name used in Telegram notifications and log output. e.g. 'chilisaus' or 'dispatch'",
+
+  "startupGraceMs": 90000,
+  "_startupGraceMs": "How long after spawn before stuck-detector and auto-resolve kick in (ms). Default: 90000 (90s)",
+
+  "stuckThresholdMs": 600000,
+  "_stuckThresholdMs": "How long a session must run before being considered stuck (ms). Default: 600000 (10min)",
+
+  "maxWatcherAgeMs": 7200000,
+  "_maxWatcherAgeMs": "Max age of a watcher process before it is considered stale (ms). Default: 7200000 (2h)"
+}

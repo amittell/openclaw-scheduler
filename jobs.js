@@ -13,6 +13,7 @@ const VALID_DELIVERY_GUARANTEES = new Set(['at-most-once', 'at-least-once']);
 const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
 const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
+const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -145,6 +146,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('job_class', merged.job_class || 'standard', VALID_JOB_CLASSES);
   assertEnum('approval_auto', merged.approval_auto || 'reject', VALID_APPROVAL_AUTO);
   assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
+  assertEnum('job_type', merged.job_type || 'standard', VALID_JOB_TYPES);
 
   if (merged.trigger_on != null) {
     assertEnum('trigger_on', merged.trigger_on, VALID_TRIGGERS);
@@ -168,6 +170,20 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (mode === 'create' || 'payload_thinking' in normalized) {
     assertSafeString('payload_thinking', merged.payload_thinking, { allowEmpty: false, maxLength: 64 });
+  }
+
+  // Watchdog-specific validations
+  if (merged.job_type === 'watchdog') {
+    if (!merged.watchdog_check_cmd) {
+      throw new Error('watchdog_check_cmd is required for watchdog jobs');
+    }
+    assertSafeString('watchdog_target_label', merged.watchdog_target_label, { allowEmpty: false, maxLength: 256 });
+    assertSafeString('watchdog_check_cmd', merged.watchdog_check_cmd, { allowEmpty: false, maxLength: 4096 });
+    assertSafeString('watchdog_alert_channel', merged.watchdog_alert_channel, { allowEmpty: false, maxLength: 64 });
+    assertSafeString('watchdog_alert_target', merged.watchdog_alert_target, { allowEmpty: false, maxLength: 256 });
+    if (merged.watchdog_timeout_min != null) {
+      assertInt('watchdog_timeout_min', merged.watchdog_timeout_min, 1);
+    }
   }
 
   for (const [name, min] of [
@@ -263,7 +279,10 @@ export function createJob(opts) {
       delivery_guarantee, job_class,
       approval_required, approval_timeout_s, approval_auto,
       context_retrieval, context_retrieval_limit,
-      preferred_session_key
+      preferred_session_key,
+      job_type, watchdog_target_label, watchdog_check_cmd,
+      watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
+      watchdog_self_destruct, watchdog_started_at
     ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -277,7 +296,10 @@ export function createJob(opts) {
       ?, ?,
       ?, ?, ?,
       ?, ?,
-      ?
+      ?,
+      ?, ?, ?,
+      ?, ?, ?,
+      ?, ?
     )
   `);
 
@@ -315,7 +337,15 @@ export function createJob(opts) {
     normalized.approval_auto || 'reject',
     normalized.context_retrieval || 'none',
     normalized.context_retrieval_limit || 5,
-    normalized.preferred_session_key || null
+    normalized.preferred_session_key || null,
+    normalized.job_type || 'standard',
+    normalized.watchdog_target_label || null,
+    normalized.watchdog_check_cmd || null,
+    normalized.watchdog_timeout_min || null,
+    normalized.watchdog_alert_channel || null,
+    normalized.watchdog_alert_target || null,
+    normalized.watchdog_self_destruct != null ? (normalized.watchdog_self_destruct ? 1 : 0) : 1,
+    normalized.watchdog_started_at || null
   );
 
   return getJob(id);
@@ -359,7 +389,10 @@ export function updateJob(id, patch) {
     'delivery_guarantee', 'job_class',
     'approval_required', 'approval_timeout_s', 'approval_auto',
     'context_retrieval', 'context_retrieval_limit',
-    'preferred_session_key'
+    'preferred_session_key',
+    'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
+    'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
+    'watchdog_self_destruct', 'watchdog_started_at'
   ];
 
   // Cycle detection if parent_id is being changed
