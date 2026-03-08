@@ -39,7 +39,7 @@ export const SCHEDULER_SCHEMAS = {
   },
   runs: {
     statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key'],
   },
   approvals: {
     statuses: ['pending', 'approved', 'rejected', 'timed_out', 'dispatched'],

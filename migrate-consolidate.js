@@ -1,12 +1,12 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v11).
+ * Brings any DB from any prior version up to the current schema (v12).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js
  *
  * Safe to run multiple times — all operations are idempotent.
  */
@@ -70,7 +70,7 @@ export default function migrateConsolidate() {
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  if (current >= 11) {
+  if (current >= 12) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -122,6 +122,12 @@ export default function migrateConsolidate() {
     `ALTER TABLE messages ADD COLUMN team_mapped_at TEXT`,
     // v11: durable non-cron dispatches
     `ALTER TABLE approvals ADD COLUMN dispatch_queue_id TEXT`,
+    // v12: structured shell results
+    `ALTER TABLE runs ADD COLUMN shell_exit_code INTEGER`,
+    `ALTER TABLE runs ADD COLUMN shell_signal TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_timed_out INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE runs ADD COLUMN shell_stdout TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_stderr TEXT`,
   ];
 
   for (const sql of alters) {
@@ -352,7 +358,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) {
     stmt.run(v);
   }
 
@@ -365,7 +371,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v11'
-    : 'DB already at v11 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v12'
+    : 'DB already at v12 — nothing to do'
   );
 }

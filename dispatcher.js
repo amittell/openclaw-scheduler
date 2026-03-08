@@ -47,6 +47,7 @@ import {
   runAgentTurn, runAgentTurnWithActivityTimeout, sendSystemEvent, listSessions, getAllSubAgentSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
+import { normalizeShellResult } from './shell-result.js';
 import {
   getDispatch, getDueDispatches, claimDispatch, releaseDispatch, setDispatchStatus,
 } from './dispatch-queue.js';
@@ -91,9 +92,13 @@ const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
 function runShellCommand(cmd, timeoutMs = 300000) {
   return new Promise((resolve) => {
     execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: DEFAULT_SHELL }, (err, stdout, stderr) => {
-      const output = [stdout, stderr].filter(Boolean).join('\n').trim();
-      const exitCode = err?.code ?? 0;
-      resolve({ output: output || '(no output)', exitCode, error: err || null });
+      resolve({
+        stdout: stdout || '',
+        stderr: stderr || '',
+        exitCode: Number.isInteger(err?.code) ? err.code : 0,
+        signal: err?.signal || null,
+        error: err || null,
+      });
     });
   });
 }
@@ -470,23 +475,49 @@ async function dispatchJob(job, opts = {}) {
 
     } else if (job.session_target === 'shell') {
       // Shell job: run payload_message as a shell command — no gateway dependency
-      const { output, exitCode, error: shellError } = await runShellCommand(job.payload_message, job.run_timeout_ms);
-      const shellStatus = exitCode === 0 ? 'ok' : 'error';
-      finishRun(run.id, shellStatus, { summary: output.slice(0, 5000) });
+      const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms);
+      const shellResult = normalizeShellResult(shellExec, { timeoutMs: job.run_timeout_ms });
+      finishRun(run.id, shellResult.status, {
+        summary: shellResult.summary,
+        error_message: shellResult.errorMessage,
+        context_summary: shellResult.contextSummary,
+        shell_exit_code: shellResult.exitCode,
+        shell_signal: shellResult.signal,
+        shell_timed_out: shellResult.timedOut,
+        shell_stdout: shellResult.stdout,
+        shell_stderr: shellResult.stderr,
+      });
 
-      // announce: post output only on failure (non-zero exit) — success = silent
-      // announce-always: post output regardless of exit code
-      if (job.delivery_mode === 'announce-always' && output.trim()) {
-        await handleDelivery(job, output);
-      } else if (job.delivery_mode === 'announce' && exitCode !== 0 && output.trim()) {
-        await handleDelivery(job, output);
+      const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
+      if (job.delivery_mode === 'announce-always' && announcePayload) {
+        const prefix = shellResult.status === 'ok' ? '' : `⚠️ Shell job failed: ${job.name}\n\n`;
+        await handleDelivery(job, `${prefix}${announcePayload}`);
+      } else if (job.delivery_mode === 'announce' && shellResult.status !== 'ok' && announcePayload) {
+        await handleDelivery(job, announcePayload);
       }
 
-      updateJobAfterRun(job, shellStatus);
+      if (shellResult.status !== 'ok' && shouldRetry(job, run.id)) {
+        const retry = scheduleRetry(job, run.id);
+        log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (shell failure)`, {
+          jobId: job.id, runId: run.id,
+        });
+        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+        completeCurrentDispatch('done');
+        if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+        log('info', `Shell ${shellResult.status}: ${job.name} (retry scheduled)`, { runId: run.id, exitCode: shellResult.exitCode, signal: shellResult.signal });
+        return;
+      }
+
+      updateJobAfterRun(job, shellResult.status);
       completeCurrentDispatch('done');
-      handleTriggeredChildren(job.id, shellStatus, output, run.id);
+      handleTriggeredChildren(job.id, shellResult.status, shellResult.deliveryText, run.id);
       if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
-      log('info', `Shell ${shellStatus}: ${job.name} (exit ${exitCode})`, { runId: run.id });
+      log('info', `Shell ${shellResult.status}: ${job.name}`, {
+        runId: run.id,
+        exitCode: shellResult.exitCode,
+        signal: shellResult.signal,
+        timedOut: shellResult.timedOut,
+      });
 
     } else {
       // Isolated session: dispatch via chat completions API

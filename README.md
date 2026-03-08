@@ -342,8 +342,11 @@ node cli.js jobs add '{
 - **No gateway dependency** — runs even when gateway is down
 - `payload_message` is the command to execute (shell string passed to the configured shell)
 - Output captured up to 1MB, truncated to 5000 chars in run summary
+- Shell runs persist structured failure context on `runs`: `shell_exit_code`, `shell_signal`, `shell_timed_out`, `shell_stdout`, `shell_stderr`
+- Failure-triggered agent children receive shell context with separate exit code, stdout, and stderr blocks
 - `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
+- Shell jobs now honor `max_retries` before failure children fire, the same as isolated agent jobs
 
 **With environment variables:**
 ```bash
@@ -617,6 +620,8 @@ node cli.js jobs add '{
 5. Any retry succeeds → trigger success children, reset `consecutive_errors`
 
 **Key:** failure children don't fire until all retries are exhausted. This prevents false alerts on transient failures.
+
+This retry ladder now applies uniformly to shell jobs, isolated agent jobs, and main-session jobs that surface dispatch failures.
 
 | Field | Default | Description |
 |-------|---------|-------------|
