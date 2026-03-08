@@ -67,10 +67,16 @@ export default function migrateConsolidate() {
   const db = getDb();
 
   // Already fully up to date?
+  // Note: we can't just check schema_migrations version — schema.sql inserts
+  // version markers via INSERT OR IGNORE, but CREATE TABLE IF NOT EXISTS
+  // doesn't add new columns to existing tables. So we also check if the
+  // latest column actually exists before skipping.
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  if (current >= 13) {
+  const hasLatestColumn = db.prepare('PRAGMA table_info(jobs)').all()
+    .some(c => c.name === 'job_type');
+  if (current >= 13 && hasLatestColumn) {
     reconcileSeedJobs(db);
     return false;
   }
