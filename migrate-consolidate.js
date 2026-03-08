@@ -70,7 +70,7 @@ export default function migrateConsolidate() {
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  if (current >= 12) {
+  if (current >= 13) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -128,6 +128,15 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN shell_timed_out INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN shell_stdout TEXT`,
     `ALTER TABLE runs ADD COLUMN shell_stderr TEXT`,
+    // v13: watchdog monitoring
+    `ALTER TABLE jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'standard'`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_target_label TEXT`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_check_cmd TEXT`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_timeout_min INTEGER`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_alert_channel TEXT`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_alert_target TEXT`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_self_destruct INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE jobs ADD COLUMN watchdog_started_at TEXT`,
   ];
 
   for (const sql of alters) {
@@ -358,7 +367,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]) {
     stmt.run(v);
   }
 
@@ -371,7 +380,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v12'
-    : 'DB already at v12 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v13'
+    : 'DB already at v13 — nothing to do'
   );
 }

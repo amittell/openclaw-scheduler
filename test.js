@@ -2048,6 +2048,111 @@ console.log('\n── Dispatch Script Compatibility ──');
 }
 
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: Watchdog Job Type (v13)
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Watchdog Jobs ──');
+{
+  // Schema: job_type column exists with default 'standard'
+  const watchdogCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  assert(watchdogCols.includes('job_type'), 'jobs.job_type column exists');
+  assert(watchdogCols.includes('watchdog_target_label'), 'jobs.watchdog_target_label column exists');
+  assert(watchdogCols.includes('watchdog_check_cmd'), 'jobs.watchdog_check_cmd column exists');
+  assert(watchdogCols.includes('watchdog_timeout_min'), 'jobs.watchdog_timeout_min column exists');
+  assert(watchdogCols.includes('watchdog_alert_channel'), 'jobs.watchdog_alert_channel column exists');
+  assert(watchdogCols.includes('watchdog_alert_target'), 'jobs.watchdog_alert_target column exists');
+  assert(watchdogCols.includes('watchdog_self_destruct'), 'jobs.watchdog_self_destruct column exists');
+  assert(watchdogCols.includes('watchdog_started_at'), 'jobs.watchdog_started_at column exists');
+
+  // Default job_type is 'standard'
+  const stdJob = createJob({ name: 'StdJob', schedule_cron: '0 10 * * *', payload_message: 'test', delivery_mode: 'none' });
+  assert(stdJob.job_type === 'standard', "default job_type = 'standard'");
+  deleteJob(stdJob.id);
+
+  // Create a watchdog job
+  const wdJob = createJob({
+    name: 'Test Watchdog',
+    schedule_cron: '*/10 * * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo check',
+    delivery_mode: 'none',
+    job_type: 'watchdog',
+    watchdog_target_label: 'my-task',
+    watchdog_check_cmd: 'node chilisaus/index.mjs stuck --label my-task --threshold-min 15',
+    watchdog_timeout_min: 60,
+    watchdog_alert_channel: 'telegram',
+    watchdog_alert_target: '484946046',
+    watchdog_self_destruct: 1,
+    watchdog_started_at: new Date().toISOString(),
+  });
+  assert(wdJob.job_type === 'watchdog', "watchdog job_type = 'watchdog'");
+  assert(wdJob.watchdog_target_label === 'my-task', 'watchdog_target_label stored');
+  assert(wdJob.watchdog_check_cmd.includes('stuck'), 'watchdog_check_cmd stored');
+  assert(wdJob.watchdog_timeout_min === 60, 'watchdog_timeout_min stored');
+  assert(wdJob.watchdog_alert_channel === 'telegram', 'watchdog_alert_channel stored');
+  assert(wdJob.watchdog_alert_target === '484946046', 'watchdog_alert_target stored');
+  assert(wdJob.watchdog_self_destruct === 1, 'watchdog_self_destruct stored');
+  assert(wdJob.watchdog_started_at !== null, 'watchdog_started_at stored');
+
+  // Get job preserves all watchdog fields
+  const fetched = getJob(wdJob.id);
+  assert(fetched.job_type === 'watchdog', 'getJob returns job_type');
+  assert(fetched.watchdog_target_label === 'my-task', 'getJob returns watchdog_target_label');
+
+  // Update watchdog fields
+  updateJob(wdJob.id, { watchdog_timeout_min: 120 });
+  assert(getJob(wdJob.id).watchdog_timeout_min === 120, 'updateJob updates watchdog_timeout_min');
+
+  updateJob(wdJob.id, { watchdog_self_destruct: 0 });
+  assert(getJob(wdJob.id).watchdog_self_destruct === 0, 'updateJob can disable watchdog_self_destruct');
+
+  // listJobs returns job_type
+  const allJobsWd = listJobs();
+  const listedWd = allJobsWd.find(j => j.id === wdJob.id);
+  assert(listedWd && listedWd.job_type === 'watchdog', 'listJobs includes job_type for watchdog');
+
+  // Validation: watchdog without check_cmd should throw
+  let threwNoCmd = false;
+  try {
+    createJob({
+      name: 'Bad Watchdog',
+      schedule_cron: '*/10 * * * *',
+      payload_message: 'test',
+      delivery_mode: 'none',
+      job_type: 'watchdog',
+      watchdog_target_label: 'test',
+      // missing watchdog_check_cmd
+    });
+  } catch (e) {
+    threwNoCmd = e.message.includes('watchdog_check_cmd');
+  }
+  assert(threwNoCmd, 'watchdog without check_cmd rejected');
+
+  // Validation: invalid job_type should throw
+  let threwBadType = false;
+  try {
+    createJob({
+      name: 'Bad Type',
+      schedule_cron: '*/10 * * * *',
+      payload_message: 'test',
+      delivery_mode: 'none',
+      job_type: 'invalid',
+    });
+  } catch (e) {
+    threwBadType = e.message.includes('job_type');
+  }
+  assert(threwBadType, 'invalid job_type rejected');
+
+  // Schema version is 13
+  const version = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get();
+  assert(version.v >= 13, 'schema_migrations has v13');
+
+  // Clean up
+  deleteJob(wdJob.id);
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

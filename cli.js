@@ -24,10 +24,10 @@ Global:
   --json                             Emit machine-readable JSON
 
 Jobs:
-  jobs list                          List all jobs
+  jobs list [--type watchdog]        List all jobs (optionally filter by type)
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
-  jobs add <json>                    Add a job
+  jobs add <json> [--watchdog]       Add a job (--watchdog sets defaults for watchdog type)
   jobs validate <json>               Validate a job spec without writing it
   jobs enable <id>                   Enable a job
   jobs disable <id>                  Disable a job
@@ -138,10 +138,17 @@ switch (command) {
   case 'jobs':
     switch (sub) {
       case 'list': {
-        const jobs = listJobs();
+        let jobs = listJobs();
+        // Filter by --type if provided (e.g. --type watchdog)
+        const typeFilterIdx = args.indexOf('--type');
+        if (typeFilterIdx >= 0 && args[typeFilterIdx + 1]) {
+          const typeFilter = args[typeFilterIdx + 1];
+          jobs = jobs.filter(j => (j.job_type || 'standard') === typeFilter);
+        }
         const rows = jobs.map(j => ({
           id: j.id.slice(0, 8) + '…',
           name: j.name,
+          type: j.job_type || 'standard',
           enabled: !!j.enabled,
           cron: j.schedule_cron,
           agent: j.agent_id || 'main',
@@ -149,6 +156,7 @@ switch (command) {
           guarantee: j.delivery_guarantee || 'at-most-once',
           parent: j.parent_id ? j.parent_id.slice(0, 8) + '…' : '-',
           trigger: j.trigger_on || '-',
+          ...(j.job_type === 'watchdog' ? { watchdog: j.watchdog_target_label || '-' } : {}),
           nextRun: j.next_run_at,
           lastStatus: j.last_status,
           errors: j.consecutive_errors,
@@ -195,9 +203,22 @@ switch (command) {
       case 'get': emit(getJob(args[0])); break;
       case 'add': {
         const dryRun = args.includes('--dry-run');
-        const payload = args.find(a => a !== '--dry-run');
-        if (!payload) fail('Usage: jobs add <json> [--dry-run]');
+        const isWatchdog = args.includes('--watchdog');
+        const payload = args.find(a => a !== '--dry-run' && a !== '--watchdog');
+        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog]');
         const spec = JSON.parse(payload);
+
+        // If --watchdog flag is set, apply watchdog defaults
+        if (isWatchdog) {
+          spec.job_type = 'watchdog';
+          // Watchdog jobs default to shell target with shellCommand kind
+          if (!spec.session_target) spec.session_target = 'shell';
+          if (!spec.payload_kind) spec.payload_kind = 'shellCommand';
+          if (!spec.payload_message) spec.payload_message = spec.watchdog_check_cmd || 'true';
+          if (!spec.delivery_mode) spec.delivery_mode = 'none';
+          if (spec.watchdog_self_destruct === undefined) spec.watchdog_self_destruct = 1;
+        }
+
         const normalized = validateJobSpec(spec, null, 'create');
         if (dryRun) {
           emit({ ok: true, dry_run: true, valid: true, normalized });
