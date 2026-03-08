@@ -2,6 +2,7 @@
 // Scheduler v2 unified test suite — in-memory, self-contained
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
+import Database from 'better-sqlite3';
 import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -2151,6 +2152,99 @@ console.log('\n── Watchdog Jobs ──');
 
   // Clean up
   deleteJob(wdJob.id);
+}
+
+console.log('\n── Migration Guard ──');
+{
+  const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-migrate-'));
+  const legacyDbPath = join(legacyDir, 'scheduler.db');
+  const legacyDb = new Database(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      schedule_cron TEXT NOT NULL,
+      schedule_tz TEXT NOT NULL DEFAULT 'America/New_York',
+      session_target TEXT NOT NULL DEFAULT 'isolated',
+      agent_id TEXT DEFAULT 'main',
+      payload_kind TEXT NOT NULL,
+      payload_message TEXT NOT NULL,
+      payload_timeout_seconds INTEGER DEFAULT 120,
+      overlap_policy TEXT NOT NULL DEFAULT 'skip',
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      delivery_mode TEXT DEFAULT 'announce',
+      delivery_channel TEXT,
+      delivery_to TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      delete_after_run INTEGER NOT NULL DEFAULT 0,
+      parent_id TEXT,
+      trigger_on TEXT,
+      trigger_delay_s INTEGER DEFAULT 0,
+      trigger_condition TEXT DEFAULT NULL,
+      max_retries INTEGER DEFAULT 0,
+      queued_count INTEGER DEFAULT 0,
+      payload_scope TEXT NOT NULL DEFAULT 'own',
+      resource_pool TEXT DEFAULT NULL,
+      delivery_guarantee TEXT DEFAULT 'at-most-once',
+      job_class TEXT DEFAULT 'standard',
+      approval_required INTEGER DEFAULT 0,
+      approval_timeout_s INTEGER DEFAULT 3600,
+      approval_auto TEXT DEFAULT 'reject',
+      context_retrieval TEXT DEFAULT 'none',
+      context_retrieval_limit INTEGER DEFAULT 5,
+      preferred_session_key TEXT DEFAULT NULL,
+      job_type TEXT NOT NULL DEFAULT 'standard',
+      next_run_at TEXT,
+      last_run_at TEXT,
+      last_status TEXT,
+      consecutive_errors INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT,
+      duration_ms INTEGER,
+      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now')),
+      session_key TEXT,
+      session_id TEXT,
+      summary TEXT,
+      error_message TEXT,
+      dispatched_at TEXT,
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      retry_count INTEGER DEFAULT 0,
+      retry_of TEXT,
+      idempotency_key TEXT,
+      context_summary TEXT,
+      replay_of TEXT,
+      triggered_by_run TEXT,
+      dispatch_queue_id TEXT
+    );
+    CREATE TABLE messages (id TEXT PRIMARY KEY);
+    CREATE TABLE task_tracker_agents (id TEXT PRIMARY KEY);
+    CREATE TABLE approvals (id TEXT PRIMARY KEY);
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (13);
+  `);
+  legacyDb.close();
+
+  closeDb();
+  setDbPath(legacyDbPath);
+  await initDb();
+  const migratedDb = getDb();
+  const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
+  assert(migratedRunCols.includes('shell_exit_code'), 'migration guard backfills shell_exit_code when version marker is already 13');
+  assert(migratedRunCols.includes('shell_stderr'), 'migration guard backfills shell_stderr when version marker is already 13');
+  closeDb();
+
+  rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
 }
 
 closeDb();

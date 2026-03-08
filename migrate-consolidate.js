@@ -1,12 +1,12 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v12).
+ * Brings any DB from any prior version up to the current schema (v13).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js
  *
  * Safe to run multiple times — all operations are idempotent.
  */
@@ -74,9 +74,17 @@ export default function migrateConsolidate() {
   const current = db.prepare(
     'SELECT MAX(version) as v FROM schema_migrations'
   ).get()?.v ?? 0;
-  const hasLatestColumn = db.prepare('PRAGMA table_info(jobs)').all()
-    .some(c => c.name === 'job_type');
-  if (current >= 13 && hasLatestColumn) {
+  const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
+  const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(c => c.name));
+  const hasLatestColumns =
+    jobColumns.has('job_type')
+    && runColumns.has('dispatch_queue_id')
+    && runColumns.has('shell_exit_code')
+    && runColumns.has('shell_signal')
+    && runColumns.has('shell_timed_out')
+    && runColumns.has('shell_stdout')
+    && runColumns.has('shell_stderr');
+  if (current >= 13 && hasLatestColumns) {
     reconcileSeedJobs(db);
     return false;
   }
