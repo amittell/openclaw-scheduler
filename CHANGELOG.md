@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] — 2026-03-08
+
+### Added
+- Watchdog job type for long-running task monitoring, including dedicated watchdog fields, CLI support, dispatcher handling, and config example scaffolding
+- Structured shell failure persistence on runs: exit code, signal, timeout flag, stdout, and stderr
+- Richer shell-failure context for triggered agent follow-up jobs
+
+### Fixed
+- Shell retries now honor the normal retry ladder before firing failure children
+- Consolidated migration skip logic now checks for actual column presence instead of relying on version markers alone
+- Public-facing docs/examples no longer include private hostnames or deployment-specific Telegram identifiers
+
+### Changed
+- Schema baseline is now `v13`
+- Updated test baseline to `534 passed`
+
 ## [1.0.3] — 2026-03-05
 
 ### Fixed

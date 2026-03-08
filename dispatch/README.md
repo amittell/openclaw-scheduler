@@ -231,11 +231,11 @@ minute until the agent produces a reply, then delivers via the scheduler's
 `handleDelivery` pipeline.
 
 ```
-dispatch enqueue --deliver-to 484946046
+dispatch enqueue --deliver-to <telegram-user-id>
   → gateway agent call (deliver: false, fire-and-forget)
   → scheduler job: dispatch-deliver:<label> (*/1 * * * *, shell, one-shot)
   → watcher polls: node dispatch/index.mjs result --label <label>
-  → on success (exit 0): scheduler delivers output to telegram/484946046
+  → on success (exit 0): scheduler delivers output to telegram/<telegram-user-id>
   → job self-deletes (delete_after_run: true)
 ```
 
@@ -263,7 +263,7 @@ GW_TOKEN=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser(
 curl -s -X POST http://127.0.0.1:18789/tools/invoke \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"484946046","message":"<label>: <progress update>"},"sessionKey":"main"}'
+  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"<telegram-user-id>","message":"<label>: <progress update>"},"sessionKey":"main"}'
 ```
 ---
 

@@ -886,7 +886,7 @@ node cli.js aliases add <name> <channel> <target> [description]
 node cli.js aliases remove <name>
 
 # ── Companion Utility ─────────────────────────────
-npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- webhook-check --label kebablebot --bot-token-env KEBABLEBOT_TELEGRAM_BOT_TOKEN
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- webhook-check --label my-bot --bot-token-env TELEGRAM_BOT_TOKEN
 
 # ── Status ────────────────────────────────────────
 node cli.js status
@@ -987,7 +987,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of `v1.0.3`, the schema is consolidated in `schema.sql` (baseline `v10`).
+As of `v1.1.0`, the schema is consolidated in `schema.sql` (baseline `v13`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1013,6 +1013,7 @@ As of `v1.0.3`, the schema is consolidated in `schema.sql` (baseline `v10`).
 | 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
 | 1.0.2 | 2026-03-03 | v10 | Team-aware routing fields on messages, explicit message receipt events (attempt/error/ack), team adapter projection + task completion gates |
 | 1.0.3 | 2026-03-05 | v10 | Dispatch hardening: seeded 529 recovery job reconciliation, watcher token-telemetry safeguards, robust home-path resolution, and watcher DB checks without external `sqlite3` CLI |
+| 1.1.0 | 2026-03-08 | v13 | Structured shell failure triage, watchdog job type, safer migration skip checks, and public-release cleanup for docs/examples |
 
 ---
 

@@ -176,7 +176,7 @@ assert(extractedShell.stderr === 'boom', 'extractShellResultFromRun reads stderr
 // ── Telegram webhook diagnostics ───────────────────────────
 console.log('\nWebhook Diagnostics:');
 const healthOk = evaluateWebhookHealth({
-  label: 'kebablebot',
+  label: 'test-bot',
   webhookInfo: {
     url: 'https://example.com/hook',
     pending_update_count: 0,
@@ -191,7 +191,7 @@ const healthOk = evaluateWebhookHealth({
 assert(healthOk.status === 'OK', 'webhook health ok state');
 
 const healthAlert = evaluateWebhookHealth({
-  label: 'kebablebot',
+  label: 'test-bot',
   webhookInfo: {
     url: 'https://example.com/hook',
     pending_update_count: 22,
@@ -2083,7 +2083,7 @@ console.log('\n── Watchdog Jobs ──');
     watchdog_check_cmd: 'node chilisaus/index.mjs stuck --label my-task --threshold-min 15',
     watchdog_timeout_min: 60,
     watchdog_alert_channel: 'telegram',
-    watchdog_alert_target: '484946046',
+    watchdog_alert_target: '123456789',
     watchdog_self_destruct: 1,
     watchdog_started_at: new Date().toISOString(),
   });
@@ -2092,7 +2092,7 @@ console.log('\n── Watchdog Jobs ──');
   assert(wdJob.watchdog_check_cmd.includes('stuck'), 'watchdog_check_cmd stored');
   assert(wdJob.watchdog_timeout_min === 60, 'watchdog_timeout_min stored');
   assert(wdJob.watchdog_alert_channel === 'telegram', 'watchdog_alert_channel stored');
-  assert(wdJob.watchdog_alert_target === '484946046', 'watchdog_alert_target stored');
+  assert(wdJob.watchdog_alert_target === '123456789', 'watchdog_alert_target stored');
   assert(wdJob.watchdog_self_destruct === 1, 'watchdog_self_destruct stored');
   assert(wdJob.watchdog_started_at !== null, 'watchdog_started_at stored');
 
