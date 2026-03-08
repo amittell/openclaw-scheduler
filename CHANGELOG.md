@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.1.0] — 2026-03-08
+## [0.1.0] — 2026-03-08
+
+First public release.
 
 ### Added
 - Watchdog job type for long-running task monitoring, including dedicated watchdog fields, CLI support, dispatcher handling, and config example scaffolding
@@ -18,7 +20,11 @@ All notable changes to this project will be documented in this file.
 - Schema baseline is now `v13`
 - Updated test baseline to `534 passed`
 
-## [1.0.3] — 2026-03-05
+## Pre-public development milestones
+
+The sections below describe internal development milestones that were not published as external package releases.
+
+### 2026-03-05 — internal milestone (formerly 1.0.3)
 
 ### Fixed
 - Seeded `Dispatch 529 Recovery` job now uses valid shell dispatch fields and is immediately schedulable (`next_run_at` set)
@@ -32,7 +38,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [1.0.2] — 2026-03-03
+### 2026-03-03 — internal milestone (formerly 1.0.2)
 
 ### Added
 - Team-aware message routing fields on `messages`: `team_id`, `member_id`, optional `task_id`
@@ -53,7 +59,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [1.0.1] — 2026-03-02
+### 2026-03-02 — internal milestone (formerly 1.0.1)
 
 ### Changed
 - Consolidated schema management into `schema.sql` + `initDb()` reconciliation (no standalone `migrate-v*` scripts)
@@ -65,9 +71,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [1.0.0] — 2026-02-26
-
-First public release. Combines all prior development into a stable, documented package.
+### 2026-02-26 — internal milestone (formerly 1.0.0)
 
 ### Added
 - Full documentation (README, INSTALL guides, CHANGELOG)
@@ -76,7 +80,7 @@ First public release. Combines all prior development into a stable, documented p
 
 ---
 
-## [0.7.0] — 2026-02-25
+### 2026-02-25 — internal milestone (formerly 0.7.0)
 
 ### Added
 - **Idempotency ledger** — `idempotency_ledger` table prevents double-dispatch on concurrent ticks
@@ -89,7 +93,7 @@ First public release. Combines all prior development into a stable, documented p
 
 ---
 
-## [0.6.0] — 2026-02-24
+### 2026-02-24 — internal milestone (formerly 0.6.0)
 
 ### Added
 - **Shell job target** — `session_target: 'shell'` runs payload as shell command via `/bin/zsh`; no gateway dependency
@@ -101,7 +105,7 @@ First public release. Combines all prior development into a stable, documented p
 
 ---
 
-## [0.5.0] — 2026-02-23
+### 2026-02-23 — internal milestone (formerly 0.5.0)
 
 ### Added
 - **Retry logic** — `max_retries` + `retry_delay_s`; retries before triggering failure children; `retry_of`/`retry_count` tracking on runs
@@ -112,7 +116,7 @@ First public release. Combines all prior development into a stable, documented p
 
 ---
 
-## [0.4.0] — 2026-02-22
+### 2026-02-22 — internal milestone (formerly 0.4.0)
 
 ### Added
 - **Workflow chains** — `parent_id`, `trigger_on` (`success`/`failure`/`complete`), `trigger_delay_s`
@@ -123,7 +127,7 @@ First public release. Combines all prior development into a stable, documented p
 
 ---
 
-## [0.1.0] — 2026-02-21
+### 2026-02-21 — internal milestone
 
 ### Added
 - Initial release

@@ -987,7 +987,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of `v1.1.0`, the schema is consolidated in `schema.sql` (baseline `v13`).
+As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v13`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1000,20 +1000,26 @@ As of `v1.1.0`, the schema is consolidated in `schema.sql` (baseline `v13`).
 | Heartbeat | `agents.defaults.heartbeat.every: "0m"` and disable/remove any per-agent `agents.list[].heartbeat` overrides | Set defaults/per-agent heartbeat cadence back (for example `"5m"`) |
 | Chat completions | Enabled for scheduler | Can leave enabled |
 
-### Version history
+### Public release
 
 | Version | Date | Schema | Key changes |
 |---------|------|--------|-------------|
-| 0.1.0 | 2026-02-21 | v1 | Initial: jobs, runs, messages, agents, standalone dispatch |
-| 0.4.0 | 2026-02-22 | v3 | Workflow chains, cycle detection, spawn messages, multi-agent |
-| 0.5.0 | 2026-02-23 | v3b | Retry logic, max chain depth, chain cancellation, queue overlap |
-| 0.6.0 | 2026-02-24 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
-| 0.7.0 | 2026-02-25 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
-| 1.0.0 | 2026-02-26 | v6 | Public release: docs, LICENSE, CHANGELOG, package metadata |
-| 1.0.1 | 2026-03-02 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
-| 1.0.2 | 2026-03-03 | v10 | Team-aware routing fields on messages, explicit message receipt events (attempt/error/ack), team adapter projection + task completion gates |
-| 1.0.3 | 2026-03-05 | v10 | Dispatch hardening: seeded 529 recovery job reconciliation, watcher token-telemetry safeguards, robust home-path resolution, and watcher DB checks without external `sqlite3` CLI |
-| 1.1.0 | 2026-03-08 | v13 | Structured shell failure triage, watchdog job type, safer migration skip checks, and public-release cleanup for docs/examples |
+| 0.1.0 | 2026-03-08 | v13 | First public release: workflow engine, structured shell failure triage, watchdog jobs, safer migration checks, and public-release cleanup |
+
+### Pre-public development milestones
+
+| Date | Former internal tag | Schema | Key changes |
+|------|----------------------|--------|-------------|
+| 2026-02-21 | 0.1.0 | v1 | Initial: jobs, runs, messages, agents, standalone dispatch |
+| 2026-02-22 | 0.4.0 | v3 | Workflow chains, cycle detection, spawn messages, multi-agent |
+| 2026-02-23 | 0.5.0 | v3b | Retry logic, max chain depth, chain cancellation, queue overlap |
+| 2026-02-24 | 0.6.0 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
+| 2026-02-25 | 0.7.0 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
+| 2026-02-26 | 1.0.0 | v6 | Docs, LICENSE, CHANGELOG, package metadata |
+| 2026-03-02 | 1.0.1 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
+| 2026-03-03 | 1.0.2 | v10 | Team-aware routing fields on messages, explicit message receipt events, team adapter projection + task completion gates |
+| 2026-03-05 | 1.0.3 | v10 | Dispatch hardening: seeded 529 recovery job reconciliation, watcher token-telemetry safeguards, robust home-path resolution, and watcher DB checks without external `sqlite3` CLI |
+| 2026-03-08 | 1.1.0 | v13 | Structured shell failure triage, watchdog job type, safer migration skip checks, and public-release cleanup for docs/examples |
 
 ---
 
