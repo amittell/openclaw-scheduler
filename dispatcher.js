@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenClaw Scheduler Dispatcher v1.0.2
+// OpenClaw Scheduler Dispatcher
 //
 // Full standalone scheduler + message router.
 // Dispatches independently via chat completions API.
@@ -12,6 +12,7 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
+import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -28,6 +29,9 @@ import {
 } from './idempotency.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
+  readFileSync(join(__dirname, 'package.json'), 'utf8')
+);
 import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
 import {
   createRun, finishRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
@@ -1277,7 +1281,7 @@ function shutdown(signal) {
 }
 
 async function main() {
-  log('info', 'Starting OpenClaw Scheduler v1.0.2', {
+  log('info', `Starting OpenClaw Scheduler v${SCHEDULER_VERSION}`, {
     tickMs: TICK_INTERVAL_MS,
     staleThresholdS: STALE_THRESHOLD_S,
     heartbeatCheckMs: HEARTBEAT_CHECK_MS,
