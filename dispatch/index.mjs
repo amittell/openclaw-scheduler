@@ -40,6 +40,16 @@ const HOME_DIR = process.env.HOME || homedir();
 
 const LABELS_PATH = join(__dirname, 'labels.json');
 
+/** Load dispatch config from config.json (falls back to {} on error) */
+function loadConfig() {
+  try {
+    const cfgPath = join(__dirname, 'config.json');
+    return JSON.parse(readFileSync(cfgPath, 'utf-8'));
+  } catch { return {}; }
+}
+
+const config = loadConfig();
+
 /** Load gateway auth token from config or env */
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -134,6 +144,29 @@ function gatewayCall(method, params = {}, opts = {}) {
     throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`, {
       cause: err,
     });
+  }
+}
+
+/**
+ * Invoke a gateway tool via HTTP API with session context.
+ * Uses /tools/invoke endpoint so gateway evaluates with full session-tree
+ * visibility (sees subagents, unlike raw gatewayCall RPC).
+ */
+function gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opts = {}) {
+  try {
+    const body = JSON.stringify({ tool, args, sessionKey });
+    const raw = execFileSync('curl', [
+      '-s', '-X', 'POST',
+      'http://127.0.0.1:18789/tools/invoke',
+      '-H', 'Content-Type: application/json',
+      '-H', `Authorization: Bearer ${GATEWAY_TOKEN}`,
+      '-d', body,
+    ], { encoding: 'utf-8', timeout: (opts.timeout || 15000) + 5000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const outer = JSON.parse(raw.trim());
+    if (outer?.result?.content?.[0]?.text) return JSON.parse(outer.result.content[0].text);
+    return outer?.result || null;
+  } catch {
+    return null;
   }
 }
 
@@ -372,9 +405,17 @@ function makeSessionKey(agentId) {
  */
 async function cmdEnqueue(flags) {
   const label   = flags.label;
-  const message = flags.message;
-  if (!label)   die('--label is required', 2);
-  if (!message) die('--message is required', 2);
+  let   message = flags.message;
+  if (!label) die('--label is required', 2);
+  // Support --message-file for multiline prompts without shell escaping issues
+  if (!message && flags['message-file']) {
+    try {
+      message = readFileSync(flags['message-file'], 'utf-8').trim();
+    } catch (err) {
+      die(`--message-file: could not read file: ${err.message}`, 2);
+    }
+  }
+  if (!message) die('--message or --message-file is required', 2);
 
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || 'xhigh';
@@ -612,13 +653,18 @@ function cmdStatus(flags) {
   // Fetch sessions.list for all gateway checks
   let sessionCache = null;
   try {
-    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 8000 });
     sessionCache = result?.sessions || [];
   } catch {}
 
   // For "running" sessions, check gateway and auto-resolve if done
   if (entry.status === 'running' && entry.sessionKey) {
-    const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
+    const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
+    const ageMs = Date.now() - spawnedAtMs;
+    const STARTUP_GRACE_MS = config.startupGraceMs ?? 90_000;
+    const check = ageMs < STARTUP_GRACE_MS
+      ? { shouldResolve: false }
+      : checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
     if (check.shouldResolve) {
       if (check.is529) {
         setLabel(label, {
@@ -723,7 +769,7 @@ async function cmdStuck(flags) {
   // Pre-fetch all gateway sessions once to avoid N RPC calls
   let sessionCache = null;
   try {
-    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 10000 });
+    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 10000 });
     sessionCache = result?.sessions || [];
   } catch {}
 
@@ -738,6 +784,10 @@ async function cmdStuck(flags) {
     const ageMs     = Date.now() - spawnedAt;
 
     if (ageMs < effectiveThreshMs) continue;
+
+    // ── Skip if session is within startup grace period ────────────────────
+    const STARTUP_GRACE_MS = config.startupGraceMs ?? 90_000;
+    if (ageMs < STARTUP_GRACE_MS) continue;
 
     // ── Skip if an active watcher is already monitoring this session ──────
     if (hasActiveWatcher(name)) {
@@ -833,7 +883,7 @@ function cmdSync(flags) {
 
   let sessionCache = null;
   try {
-    const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 10000 });
+    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 10000 });
     sessionCache = result?.sessions || [];
   } catch (err) {
     die(`Failed to query gateway: ${err.message}`);
@@ -995,7 +1045,7 @@ function cmdHeartbeat(flags) {
   }
 
   try {
-    const result  = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+    const result  = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 8000 });
     const session = result?.sessions?.find(s => s.key === sessionKey);
 
     if (!session) {
@@ -1061,7 +1111,7 @@ dispatch 🌶️ — sub-agent dispatch CLI (native gateway API)
 Usage: node index.mjs <subcommand> [flags]
 
 Subcommands:
-  enqueue  --label <l> --message <m> [--agent <a>] [--thinking <t>]
+  enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
 
