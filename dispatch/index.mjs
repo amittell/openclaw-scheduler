@@ -588,7 +588,7 @@ async function cmdEnqueue(flags) {
           delivery_channel:         deliverChannel,
           delivery_to:              deliverTo,
           delivery_guarantee:       'at-least-once',
-          delete_after_run:         true,
+          ttl_hours:                72,    // 3-day audit window, then auto-prune
           overlap_policy:           'skip',
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
           run_now:                  true,
