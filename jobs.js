@@ -214,6 +214,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     ['output_excerpt_limit_bytes', 64],
     ['output_summary_limit_bytes', 64],
     ['output_offload_threshold_bytes', 128],
+    ['ttl_hours', 1],
   ]) {
     if (name in normalized || (mode === 'create' && merged[name] != null)) {
       assertInt(name, merged[name], min);
@@ -313,7 +314,8 @@ export function createJob(opts) {
       preferred_session_key,
       job_type, watchdog_target_label, watchdog_check_cmd,
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
-      watchdog_self_destruct, watchdog_started_at
+      watchdog_self_destruct, watchdog_started_at,
+      ttl_hours
 ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -330,7 +332,8 @@ export function createJob(opts) {
       ?,
       ?, ?, ?,
       ?, ?, ?,
-      ?, ?
+      ?, ?,
+      ?
     )
   `);
 
@@ -385,7 +388,8 @@ export function createJob(opts) {
     normalized.watchdog_alert_channel || null,
     normalized.watchdog_alert_target || null,
     normalized.watchdog_self_destruct != null ? (normalized.watchdog_self_destruct ? 1 : 0) : 1,
-    normalized.watchdog_started_at || null
+    normalized.watchdog_started_at || null,
+    normalized.ttl_hours || null
   );
 
   return getJob(id);
@@ -434,7 +438,8 @@ export function updateJob(id, patch) {
     'preferred_session_key',
     'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
-    'watchdog_self_destruct', 'watchdog_started_at'
+    'watchdog_self_destruct', 'watchdog_started_at',
+    'ttl_hours'
   ];
 
   // Cycle detection if parent_id is being changed
@@ -547,7 +552,15 @@ export function pruneExpiredJobs() {
     WHERE parent_id IS NOT NULL
       AND parent_id NOT IN (SELECT id FROM jobs)
   `).run();
-  return oneShots.changes + stale.changes + aged.changes + orphans.changes;
+  // TTL pruning: delete jobs that have completed and are past their ttl_hours window
+  const ttlExpired = db.prepare(`
+    DELETE FROM jobs
+    WHERE ttl_hours IS NOT NULL
+      AND last_status IN ('ok', 'error', 'timeout')
+      AND last_run_at IS NOT NULL
+      AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
+  `).run();
+  return oneShots.changes + stale.changes + aged.changes + orphans.changes + ttlExpired.changes;
 }
 
 /**
