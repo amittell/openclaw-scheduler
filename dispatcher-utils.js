@@ -12,7 +12,21 @@ const TRANSIENT_ERROR_PATTERNS = [
   /\bretry\s+(?:after|later|in\s+\d)\b/i,
   /\bcontext\s+(?:length|window)\s+exceeded\b/i,
   /\btoken\s+limit\s+exceeded\b/i,
+  /gateway\s+is\s+draining/i,
+  /new\s+tasks\s+are\s+not\s+accepted/i,
+  /gateway.*draining.*restart/i,
 ];
+
+const DRAIN_PATTERNS = [
+  /gateway\s+is\s+draining/i,
+  /new\s+tasks\s+are\s+not\s+accepted/i,
+];
+
+export function isDrainError(errorMessage) {
+  const trimmed = String(errorMessage ?? '').trim();
+  if (!trimmed) return false;
+  return DRAIN_PATTERNS.some(p => p.test(trimmed));
+}
 
 export function sqliteNow(offsetMs = 0) {
   return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');

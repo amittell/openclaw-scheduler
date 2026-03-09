@@ -52,6 +52,7 @@ import {
 import { normalizeShellResult } from './shell-result.js';
 import {
   getDispatch, getDueDispatches, claimDispatch, releaseDispatch, setDispatchStatus,
+  enqueueDispatch,
 } from './dispatch-queue.js';
 import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
@@ -67,6 +68,7 @@ import {
   matchesSentinel,
   detectTransientError,
   getBackoffMs,
+  isDrainError,
 } from './dispatcher-utils.js';
 import { createDeliveryHelpers } from './dispatcher-delivery.js';
 import { checkApprovals } from './dispatcher-approvals.js';
@@ -714,6 +716,44 @@ async function dispatchJob(job, opts = {}) {
     }
   } catch (err) {
     log('error', `Failed: ${job.name}: ${err.message}`, { jobId: job.id });
+
+    // ── Drain-error retry for isolated agentTurn jobs ──────────
+    // Gateway drain errors are transient infra noise — the job never ran.
+    // Don't increment consecutive_errors, and schedule a single retry after 90s.
+    const isIsolatedAgent = job.session_target !== 'main' && job.session_target !== 'shell' && job.job_type !== 'watchdog';
+    if (isIsolatedAgent && isDrainError(err.message)) {
+      finishRun(run.id, 'error', { error_message: err.message });
+      releaseIdempotencyKey(idemKey);
+      if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
+
+      // Check: max 1 drain retry per run, job must still be enabled, and respect overlap_policy:skip
+      const freshJob = getJob(job.id);
+      const canDrainRetry = freshJob && freshJob.enabled
+        && (run.retry_count || 0) < 1
+        && !(freshJob.overlap_policy === 'skip' && getDispatchBacklogCount(job.id) > 0);
+
+      if (canDrainRetry) {
+        const drainDispatch = enqueueDispatch(job.id, {
+          kind: 'retry',
+          scheduled_for: sqliteNow(90000),
+          source_run_id: run.id,
+          retry_of_run_id: run.id,
+        });
+        getDb().prepare('UPDATE runs SET retry_count = 1 WHERE id = ?').run(run.id);
+        log('info', `[drain-retry] scheduling retry for ${job.name} in 90s (run ${run.id})`, {
+          jobId: job.id, dispatchId: drainDispatch.id,
+        });
+      } else {
+        log('info', `[drain-retry] skipping retry for ${job.name} (enabled=${freshJob?.enabled}, retry_count=${run.retry_count || 0}, overlap_backlog=${getDispatchBacklogCount(job.id)})`, {
+          jobId: job.id, runId: run.id,
+        });
+      }
+
+      // Do NOT call updateJobAfterRun — avoid incrementing consecutive_errors for drain noise
+      completeCurrentDispatch('done');
+      return;
+    }
+
     finishRun(run.id, 'error', { error_message: err.message });
 
     // Release idempotency key on failure so retries/replays can reclaim

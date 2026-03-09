@@ -1940,6 +1940,28 @@ console.log('\n── Transient Error Detection ──');
   assert(!matchesSentinel('HEARTBEAT_OKAY', 'HEARTBEAT_OK'), 'does not match HEARTBEAT_OKAY');
 }
 
+console.log('\n── Drain Error Detection ──');
+{
+  const { isDrainError, detectTransientError: detectTransientFromUtils } = await import('./dispatcher-utils.js');
+
+  // isDrainError positive matches
+  assert(isDrainError('Gateway is draining for restart; new tasks are not accepted'), 'isDrainError: full drain message');
+  assert(isDrainError('gateway is draining'), 'isDrainError: gateway draining (case insensitive)');
+  assert(isDrainError('new tasks are not accepted'), 'isDrainError: new tasks not accepted');
+
+  // isDrainError negative matches
+  assert(!isDrainError('rate limited'), 'isDrainError: rate limited is not a drain error');
+  assert(!isDrainError('Service unavailable'), 'isDrainError: service unavailable is not a drain error');
+  assert(!isDrainError(''), 'isDrainError: empty string is not a drain error');
+  assert(!isDrainError(null), 'isDrainError: null is not a drain error');
+  assert(!isDrainError(undefined), 'isDrainError: undefined is not a drain error');
+  assert(!isDrainError('The gateway timed out'), 'isDrainError: gateway timeout is not a drain error');
+
+  // detectTransientError from dispatcher-utils catches drain errors (patterns added to TRANSIENT_ERROR_PATTERNS)
+  assert(detectTransientFromUtils('Gateway is draining for restart; new tasks are not accepted'), 'detectTransientError: catches drain message');
+  assert(detectTransientFromUtils('new tasks are not accepted'), 'detectTransientError: catches new tasks not accepted');
+}
+
 console.log('\n── delete_after_run Safety ──');
 {
   // Test that updateJobAfterRun does NOT delete when status is 'error'
