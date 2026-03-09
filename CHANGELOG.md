@@ -8,17 +8,22 @@ First public release.
 
 ### Added
 - Watchdog job type for long-running task monitoring, including dedicated watchdog fields, CLI support, dispatcher handling, and config example scaffolding
-- Structured shell failure persistence on runs: exit code, signal, timeout flag, stdout, and stderr
-- Richer shell-failure context for triggered agent follow-up jobs
+- Durable dispatch queue for manual runs, retries, and chain-triggered executions, with persisted run causality via `dispatch_queue_id` and `triggered_by_run`
+- Structured shell result persistence on runs: exit code, signal, timeout flag, stdout, and stderr
+- Richer shell-failure context for triggered follow-up jobs and agent triage flows
+- CLI improvements for machine use and release readiness, including `--json`, `jobs validate`, schema introspection, and improved npm-install defaults
 
 ### Fixed
-- Shell retries now honor the normal retry ladder before firing failure children
+- Shell timeouts are now classified correctly as `timeout`, with `shell_timed_out` persisted on runs
+- Shell retries now exhaust correctly and fire failure children only after the retry ladder is complete
 - Consolidated migration skip logic now checks for actual column presence instead of relying on version markers alone
+- Runtime startup version logging now reads from `package.json` instead of a stale hardcoded string
 - Public-facing docs/examples no longer include private hostnames or deployment-specific Telegram identifiers
 
 ### Changed
 - Schema baseline is now `v13`
-- Updated test baseline to `534 passed`
+- Versioning reset to `0.1.0` as the first public release
+- Updated verification baseline to `550 passed, 0 failed`
 
 ## Pre-public development milestones
 
