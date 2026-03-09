@@ -311,6 +311,8 @@ const disabledNumericJob = createJob({ name: 'Disabled Numeric Job', enabled: 0,
 assert(disabledNumericJob.enabled === 0, 'numeric enabled=0 creates a disabled job');
 updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
+updateJob(job.id, { enabled: false });
+assert(getJob(job.id).enabled === 0, 'boolean enabled=false updates to disabled');
 assert(listJobs().length >= 1, 'listJobs');
 const budgetedJob = createJob({
   name: 'Budgeted Agent Job',
