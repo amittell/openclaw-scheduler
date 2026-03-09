@@ -307,6 +307,8 @@ assert(job && job.name === 'Test Job', 'createJob');
 assert(job.enabled === 1, 'enabled by default');
 assert(job.next_run_at !== null, 'next_run_at calculated');
 assert(getJob(job.id).id === job.id, 'getJob');
+const disabledNumericJob = createJob({ name: 'Disabled Numeric Job', enabled: 0, schedule_cron: '*/6 * * * *', payload_message: 'Disabled', delivery_mode: 'none' });
+assert(disabledNumericJob.enabled === 0, 'numeric enabled=0 creates a disabled job');
 updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
 assert(listJobs().length >= 1, 'listJobs');
