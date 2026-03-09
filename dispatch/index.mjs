@@ -419,13 +419,16 @@ async function cmdEnqueue(flags) {
   if (!message) die('--message or --message-file is required', 2);
 
   const agent       = flags.agent            || 'main';
-  const thinking    = flags.thinking         || 'xhigh';
+  const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   const deliverTo      = flags['deliver-to']       || null;
   const deliverChannel = flags['deliver-channel']   || 'telegram';
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
-  const model       = flags.model            || 'anthropic/claude-opus-4-6';
+
+  // Dynamic branding: resolve per-agent brand name
+  const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
+  const model       = flags.model            || null;
 
   // ── Session key resolution ──────────────────────────────────
   let sessionKey = flags['session-key'] || null;
@@ -434,7 +437,7 @@ async function cmdEnqueue(flags) {
     const existing = getLabel(label);
     if (existing?.sessionKey) {
       sessionKey = existing.sessionKey;
-      process.stderr.write(`[${BRAND}] mode=reuse → continuing session ${sessionKey}\n`);
+      process.stderr.write(`[${agentBrand}] mode=reuse → continuing session ${sessionKey}\n`);
     } else {
       die(`mode=reuse: no prior session found for label "${label}". Use --mode fresh.`);
     }
@@ -470,7 +473,7 @@ async function cmdEnqueue(flags) {
           thinkingLevel: thinking === 'off' ? null : thinking,
         }, { timeout: 10000 });
       } catch (err) {
-        die(`sessions.patch (thinking) failed: ${err.message}`);
+        process.stderr.write(`[${agentBrand}] sessions.patch (thinking) warning: ${err.message}\n`);
       }
     }
   }
@@ -553,14 +556,14 @@ async function cmdEnqueue(flags) {
               action: 'send',
               channel: deliverChannel,
               target: deliverTo,
-              message: `🌶️ *${BRAND}* [${label}] starting...`,
+              message: `🌶️ *${agentBrand}* [${label}] starting...`,
             },
             sessionKey: 'main',
           }),
           signal: AbortSignal.timeout(5000),
         });
       } catch (err) {
-        process.stderr.write(`[${BRAND}] starting notification failed: ${err.message}\n`);
+        process.stderr.write(`[${agentBrand}] starting notification failed: ${err.message}\n`);
       }
     }
 
@@ -579,7 +582,7 @@ async function cmdEnqueue(flags) {
         const watcherCmd = `node '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
-          name:                     `${BRAND}-deliver:${label}`,
+          name:                     `${agentBrand}-deliver:${label}`,
           schedule_cron:            '0 0 31 2 *',  // never-cron; run_now triggers it once
           session_target:           'shell',
           payload_kind:             'shellCommand',
@@ -600,9 +603,9 @@ async function cmdEnqueue(flags) {
           stdio:    ['pipe', 'pipe', 'pipe'],
         });
         schedulerWatcherOk = true;
-        process.stderr.write(`[${BRAND}] scheduler watcher registered: ${BRAND}-deliver:${label}\n`);
+        process.stderr.write(`[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}\n`);
       } catch (err) {
-        process.stderr.write(`[${BRAND}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
+        process.stderr.write(`[${agentBrand}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
       }
     }
 
