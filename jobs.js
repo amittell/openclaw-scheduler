@@ -119,6 +119,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'payload_model',
     'payload_thinking',
     'trigger_condition',
+    'auth_profile',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -183,6 +184,14 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (mode === 'create' || 'payload_thinking' in normalized) {
     assertSafeString('payload_thinking', merged.payload_thinking, { allowEmpty: false, maxLength: 64 });
+  }
+  if (mode === 'create' || 'auth_profile' in normalized) {
+    if (merged.auth_profile != null) {
+      if (typeof merged.auth_profile !== 'string') {
+        throw new Error('auth_profile must be a string or null');
+      }
+      assertSafeString('auth_profile', merged.auth_profile, { allowEmpty: false, maxLength: 256 });
+    }
   }
 
   // Watchdog-specific validations
@@ -315,7 +324,8 @@ export function createJob(opts) {
       job_type, watchdog_target_label, watchdog_check_cmd,
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
       watchdog_self_destruct, watchdog_started_at,
-      ttl_hours
+      ttl_hours,
+      auth_profile
 ) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -333,6 +343,7 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?, ?,
       ?, ?,
+      ?,
       ?
     )
   `);
@@ -389,7 +400,8 @@ export function createJob(opts) {
     normalized.watchdog_alert_target || null,
     normalized.watchdog_self_destruct != null ? (normalized.watchdog_self_destruct ? 1 : 0) : 1,
     normalized.watchdog_started_at || null,
-    normalized.ttl_hours || null
+    normalized.ttl_hours || null,
+    normalized.auth_profile || null
   );
 
   return getJob(id);
@@ -439,7 +451,8 @@ export function updateJob(id, patch) {
     'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
     'watchdog_self_destruct', 'watchdog_started_at',
-    'ttl_hours'
+    'ttl_hours',
+    'auth_profile'
   ];
 
   // Cycle detection if parent_id is being changed

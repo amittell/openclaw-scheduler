@@ -25,6 +25,7 @@ export async function runAgentTurn(opts) {
     agentId = 'main',
     sessionKey,
     model,
+    authProfile,
     timeoutMs = 300000,
   } = opts;
 
@@ -39,6 +40,7 @@ export async function runAgentTurn(opts) {
         ...authHeaders(),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
@@ -84,6 +86,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.idleTimeoutMs     - Per-check idle threshold in ms (default: 120000)
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
+ * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
   const {
@@ -91,6 +94,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     agentId = 'main',
     sessionKey,
     model,
+    authProfile,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
@@ -155,6 +159,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...authHeaders(),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
