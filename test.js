@@ -6,7 +6,8 @@ import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { setDbPath, initDb, closeDb, getDb } from './db.js';
 import { resolveSchedulerDbPath, resolveSchedulerHome } from './paths.js';
 import {
@@ -2118,7 +2119,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
 {
   const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-cli-'));
   const dbPath = join(tempRoot, 'scheduler.db');
-  const cliPath = join(process.cwd(), 'cli.js');
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
   const baseEnv = { ...process.env, SCHEDULER_DB: dbPath };
 
   const schemaOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'schema', 'jobs', '--json'], {
