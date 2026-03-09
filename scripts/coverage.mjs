@@ -9,6 +9,7 @@ const { Report } = require('c8');
 const rootDir = resolve(process.cwd());
 const reportsDir = resolve(rootDir, 'coverage');
 const tempDir = resolve(reportsDir, 'tmp');
+const summaryPath = resolve(reportsDir, 'coverage-summary.json');
 
 rmSync(reportsDir, { recursive: true, force: true });
 mkdirSync(tempDir, { recursive: true });
@@ -40,7 +41,7 @@ const report = Report({
     'coverage/**',
     '**/test.js',
   ],
-  reporter: ['text-summary', 'lcov'],
+  reporter: ['text-summary', 'lcov', 'json-summary'],
   reportsDirectory: reportsDir,
   resolve: rootDir,
   src: [rootDir],
@@ -50,6 +51,12 @@ const report = Report({
 await report.run();
 
 const lcovPath = resolve(reportsDir, 'lcov.info');
+const GLOBAL_THRESHOLDS = {
+  statements: 42,
+  branches: 65,
+  functions: 78,
+  lines: 42,
+};
 const CRITICAL_THRESHOLDS = {
   'jobs.js': { lines: 90, functions: 95 },
   'messages.js': { lines: 85, functions: 90 },
@@ -96,8 +103,20 @@ function findCoverageRecord(byFile, suffix) {
 
 const lcovContent = readFileSync(lcovPath, 'utf-8');
 const coverageByFile = parseLcovByFile(lcovContent);
+const coverageSummary = JSON.parse(readFileSync(summaryPath, 'utf-8'));
 const failures = [];
 const missing = [];
+
+for (const [metric, minPct] of Object.entries(GLOBAL_THRESHOLDS)) {
+  const actual = coverageSummary.total?.[metric]?.pct;
+  if (typeof actual !== 'number') {
+    failures.push(`missing global coverage metric: ${metric}`);
+    continue;
+  }
+  if (actual < minPct) {
+    failures.push(`global ${metric} ${actual.toFixed(2)}% < ${minPct}%`);
+  }
+}
 
 for (const [suffix, threshold] of Object.entries(CRITICAL_THRESHOLDS)) {
   const rec = findCoverageRecord(coverageByFile, suffix);

@@ -63,19 +63,6 @@ export function getMessage(id) {
 }
 
 // Typed priority for kind-based sorting (lower number = higher priority)
-const KIND_PRIORITY = {
-  constraint: 0,
-  decision: 1,
-  fact: 2,
-  task: 3,
-  preference: 4,
-  // Everything else gets 5 (text, result, status, system, spawn)
-};
-
-function kindPriority(kind) {
-  return KIND_PRIORITY[kind] ?? 5;
-}
-
 /**
  * Get pending messages for an agent (inbox), ordered by typed priority then
  * numeric priority then time.

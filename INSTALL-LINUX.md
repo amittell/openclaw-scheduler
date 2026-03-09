@@ -198,7 +198,7 @@ nano ~/.config/systemd/user/openclaw-scheduler.service
    ```
    If node is not at `/usr/bin/node`, update the `ExecStart` line:
    ```ini
-   ExecStart=/home/youruser/.nvm/versions/node/v22.14.0/bin/node --no-warnings /home/youruser/.openclaw/scheduler/dispatcher.js
+   ExecStart=/home/youruser/.nvm/versions/node/v20.19.5/bin/node --no-warnings /home/youruser/.openclaw/scheduler/dispatcher.js
    ```
    Note: `%h` expands to your home directory in systemd user units.
 

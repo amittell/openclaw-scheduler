@@ -6,18 +6,24 @@
   "bin": {
     "openclaw-scheduler": "bin/openclaw-scheduler.js"
   },
+  "types": "./index.d.ts",
   "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
     "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "scripts": {
     "start": "node dispatcher.js",
     "migrate": "node migrate.js",
     "test": "SCHEDULER_DB=:memory: node test.js",
     "lint": "eslint . --max-warnings=0",
-    "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs"
+    "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs",
+    "typecheck": "tsc --project tsconfig.json"
   },
   "files": [
     "bin",
@@ -32,9 +38,16 @@
     "cli.js",
     "db.js",
     "dispatch-queue.js",
+    "dispatcher-approvals.js",
+    "dispatcher-delivery.js",
+    "dispatcher-maintenance.js",
+    "dispatcher-shell.js",
+    "dispatcher-utils.js",
     "dispatcher.js",
     "gateway.js",
     "idempotency.js",
+    "index.d.ts",
+    "index.js",
     "jobs.js",
     "messages.js",
     "migrate.js",
@@ -85,6 +98,7 @@
     "@eslint/js": "^10.0.1",
     "c8": "^11.0.0",
     "eslint": "^10.0.2",
-    "globals": "^17.4.0"
+    "globals": "^17.4.0",
+    "typescript": "^5.9.2"
   }
 }

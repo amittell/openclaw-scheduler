@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'fs';
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 import { resolveSchedulerDbPath } from '../paths.js';
 
 function parseArgs(argv) {
@@ -65,7 +65,7 @@ async function fetchGatewayHealth(gatewayUrl) {
 
 function readRecentTelegramFailures(dbPath) {
   if (!dbPath || !existsSync(dbPath)) return null;
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     const row = db.prepare(`
       SELECT COUNT(*) AS count
