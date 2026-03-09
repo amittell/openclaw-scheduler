@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.4.0, schema version: 14)
+-- OpenClaw Scheduler Schema (current: v1.5.0, schema version: 16)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Session continuity (v9)
   preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
+
+  -- Auth profile override (v16)
+  auth_profile    TEXT DEFAULT NULL,                  -- null=default, 'inherit'=main session profile, or 'provider:label'
 
   -- Watchdog monitoring (v13)
   job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
@@ -405,6 +408,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (12);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (13);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (14);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (15);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (16);
 
 -- ============================================================
 -- SEED JOBS

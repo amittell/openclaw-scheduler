@@ -28,13 +28,17 @@ Jobs:
   jobs list [--type watchdog]        List all jobs (optionally filter by type)
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
-  jobs add <json> [--watchdog]       Add a job (--watchdog sets defaults for watchdog type)
+  jobs add <json> [--watchdog] [--profile <id>]
+                                     Add a job (--watchdog sets defaults for watchdog type)
+                                     --profile: auth profile override (null, 'inherit', or 'provider:label')
   jobs validate <json>               Validate a job spec without writing it
   jobs enable <id>                   Enable a job
   jobs disable <id>                  Disable a job
   jobs delete <id>                   Delete a job
   jobs cancel <id> [--no-cascade]   Cancel a job (+ children by default)
-  jobs update <id> <json>            Update job fields
+  jobs update <id> <json> [--profile <id>]
+                                     Update job fields
+                                     --profile: auth profile override (null, 'inherit', or 'provider:label')
   jobs run <id>                      Trigger immediate run (sets next_run_at to now)
   jobs approve <id>                  Approve a pending job
   jobs reject <id> [reason]          Reject with optional reason
@@ -207,9 +211,14 @@ switch (command) {
       case 'add': {
         const dryRun = args.includes('--dry-run');
         const isWatchdog = args.includes('--watchdog');
-        const payload = args.find(a => a !== '--dry-run' && a !== '--watchdog');
-        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog]');
+        const profileIdx = args.indexOf('--profile');
+        const profileValue = profileIdx >= 0 ? args[profileIdx + 1] : undefined;
+        const skipArgs = new Set(['--dry-run', '--watchdog']);
+        if (profileIdx >= 0) { skipArgs.add(args[profileIdx]); skipArgs.add(args[profileIdx + 1]); }
+        const payload = args.find(a => !skipArgs.has(a));
+        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--profile <id>]');
         const spec = JSON.parse(payload);
+        if (profileValue !== undefined) spec.auth_profile = profileValue;
 
         // If --watchdog flag is set, apply watchdog defaults
         if (isWatchdog) {
@@ -250,10 +259,15 @@ switch (command) {
       }
       case 'update': {
         const dryRun = args.includes('--dry-run');
-        const updateArgs = args.filter(a => a !== '--dry-run');
+        const updateProfileIdx = args.indexOf('--profile');
+        const updateProfileValue = updateProfileIdx >= 0 ? args[updateProfileIdx + 1] : undefined;
+        const updateFilterArgs = new Set(['--dry-run']);
+        if (updateProfileIdx >= 0) { updateFilterArgs.add(args[updateProfileIdx]); updateFilterArgs.add(args[updateProfileIdx + 1]); }
+        const updateArgs = args.filter(a => !updateFilterArgs.has(a));
         const current = getJob(updateArgs[0]);
         if (!current) fail(`Job not found: ${updateArgs[0]}`);
         const patch = JSON.parse(updateArgs[1]);
+        if (updateProfileValue !== undefined) patch.auth_profile = updateProfileValue;
         const normalized = validateJobSpec(patch, current, 'update');
         if (dryRun) {
           emit({ ok: true, dry_run: true, valid: true, normalized });

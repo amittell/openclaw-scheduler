@@ -46,7 +46,7 @@ import {
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus } from './agents.js';
 import {
-  runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions,
+  runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
 import { normalizeShellResult } from './shell-result.js';
@@ -569,11 +569,37 @@ async function dispatchJob(job, opts = {}) {
       // Store context summary on the run
       try { updateContextSummary(run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
 
+      // Resolve auth_profile: 'inherit' → main session's active profile, specific string → pass directly
+      let resolvedAuthProfile = job.auth_profile || undefined;
+      if (resolvedAuthProfile === 'inherit') {
+        try {
+          const sessions = await listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 });
+          const sessionList = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions || [];
+          const mainSession = Array.isArray(sessionList)
+            ? sessionList.find(s => {
+                const key = s.key || s.sessionKey || '';
+                return key.includes(':main:') || key.endsWith(':main') || key === 'main';
+              })
+            : null;
+          const profileId = mainSession?.authProfileOverride || mainSession?.authProfile || mainSession?.profile;
+          if (profileId) {
+            resolvedAuthProfile = profileId;
+            log('debug', `Resolved auth_profile 'inherit' → '${profileId}'`, { jobId: job.id });
+          } else {
+            log('debug', `auth_profile 'inherit' — no main session profile found, passing 'inherit' as-is`, { jobId: job.id });
+          }
+        } catch (err) {
+          log('warn', `Failed to resolve 'inherit' auth_profile: ${err.message}`, { jobId: job.id });
+          // Fall through with 'inherit' — gateway may handle it
+        }
+      }
+
       const result = await runAgentTurnWithActivityTimeout({
         message: prompt,
         agentId: job.agent_id || 'main',
         sessionKey,
         model: job.payload_model || undefined,
+        authProfile: resolvedAuthProfile,
         idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
         pollIntervalMs: 60000,
         absoluteTimeoutMs: job.run_timeout_ms || 300000,
@@ -800,6 +826,7 @@ function buildJobPrompt(job, run) {
     execution_read_only: Boolean(job.execution_read_only),
     payload_model: job.payload_model || null,
     payload_thinking: job.payload_thinking || null,
+    auth_profile: job.auth_profile || null,
   };
 
   const triggerContext = buildTriggeredRunContext(run);

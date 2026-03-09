@@ -2292,12 +2292,98 @@ console.log('\n── Watchdog Jobs ──');
   }
   assert(threwBadType, 'invalid job_type rejected');
 
-  // Schema version is 14
+  // Schema version is 16
   const version = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get();
-  assert(version.v >= 14, 'schema_migrations has v14');
+  assert(version.v >= 16, 'schema_migrations has v16');
 
   // Clean up
   deleteJob(wdJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// AUTH PROFILE
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Auth Profile ──');
+{
+  // Create job with auth_profile: 'inherit'
+  const inheritJob = createJob({
+    name: 'Test Auth Profile Inherit',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test inherit profile',
+    session_target: 'isolated',
+    auth_profile: 'inherit',
+  });
+  assert(inheritJob.auth_profile === 'inherit', 'auth_profile=inherit stored correctly');
+
+  // Create job with specific auth_profile
+  const specificJob = createJob({
+    name: 'Test Auth Profile Specific',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test specific profile',
+    session_target: 'isolated',
+    auth_profile: 'anthropic:gmail',
+  });
+  assert(specificJob.auth_profile === 'anthropic:gmail', 'auth_profile=anthropic:gmail stored correctly');
+
+  // Create job with null auth_profile (default)
+  const nullJob = createJob({
+    name: 'Test Auth Profile Null',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test null profile',
+    session_target: 'isolated',
+  });
+  assert(nullJob.auth_profile === null, 'auth_profile defaults to null');
+
+  // Create job with explicit null auth_profile
+  const explicitNullJob = createJob({
+    name: 'Test Auth Profile Explicit Null',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test explicit null',
+    session_target: 'isolated',
+    auth_profile: null,
+  });
+  assert(explicitNullJob.auth_profile === null, 'auth_profile explicit null stored as null');
+
+  // Update job to set auth_profile
+  const updated = updateJob(nullJob.id, { auth_profile: 'openai:work' });
+  assert(updated.auth_profile === 'openai:work', 'auth_profile updated to openai:work');
+
+  // Update job to clear auth_profile
+  const cleared = updateJob(updated.id, { auth_profile: null });
+  assert(cleared.auth_profile === null, 'auth_profile cleared back to null');
+
+  // Validation: reject non-string types
+  let caught = false;
+  try {
+    validateJobSpec({ auth_profile: 123, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('auth_profile must be a string');
+  }
+  assert(caught, 'auth_profile rejects non-string types');
+
+  // Whitespace-only auth_profile normalizes to null (via normalizeNullableString)
+  const wsResult = validateJobSpec({ auth_profile: '  ', name: 'ok', schedule_cron: '0 0 * * *', payload_message: 'x' }, null, 'create');
+  assert(wsResult.auth_profile === null, 'auth_profile whitespace normalizes to null');
+
+  // Validation: reject boolean type
+  caught = false;
+  try {
+    validateJobSpec({ auth_profile: true, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('auth_profile must be a string');
+  }
+  assert(caught, 'auth_profile rejects boolean type');
+
+  // getJob retrieves auth_profile
+  const fetched = getJob(specificJob.id);
+  assert(fetched.auth_profile === 'anthropic:gmail', 'getJob returns auth_profile');
+
+  // Clean up
+  deleteJob(inheritJob.id);
+  deleteJob(specificJob.id);
+  deleteJob(nullJob.id);
+  deleteJob(explicitNullJob.id);
 }
 
 console.log('\n── Migration Guard ──');

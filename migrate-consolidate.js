@@ -1,12 +1,12 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v15).
+ * Brings any DB from any prior version up to the current schema (v16).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js
  *
  * Safe to run multiple times — all operations are idempotent.
  */
@@ -89,8 +89,9 @@ export default function migrateConsolidate() {
     && runColumns.has('shell_stderr')
     && runColumns.has('shell_stdout_path')
     && runColumns.has('shell_stderr_path')
-    && jobColumns.has('ttl_hours');
-  if (current >= 15 && hasLatestColumns) {
+    && jobColumns.has('ttl_hours')
+    && jobColumns.has('auth_profile');
+  if (current >= 16 && hasLatestColumns) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -173,6 +174,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN shell_stderr_bytes INTEGER NOT NULL DEFAULT 0`,
     // v15: TTL-based auto-deletion
     `ALTER TABLE jobs ADD COLUMN ttl_hours INTEGER DEFAULT NULL`,
+    // v16: auth profile override
+    `ALTER TABLE jobs ADD COLUMN auth_profile TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -403,7 +406,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]) {
     stmt.run(v);
   }
 
@@ -416,7 +419,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v15'
-    : 'DB already at v15 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v16'
+    : 'DB already at v16 — nothing to do'
   );
 }
