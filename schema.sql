@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.3.0, schema version: 13)
+-- OpenClaw Scheduler Schema (current: v1.4.0, schema version: 14)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -26,11 +26,16 @@ CREATE TABLE IF NOT EXISTS jobs (
   payload_model   TEXT,
   payload_thinking TEXT,
   payload_timeout_seconds INTEGER DEFAULT 120,
-  
+  execution_intent TEXT NOT NULL DEFAULT 'execute',   -- 'execute' | 'plan'
+  execution_read_only INTEGER NOT NULL DEFAULT 0,
+
   -- Overlap & timeout
   overlap_policy  TEXT NOT NULL DEFAULT 'skip',       -- 'skip' | 'allow' | 'queue'
   run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
-  
+  max_queued_dispatches INTEGER NOT NULL DEFAULT 25,
+  max_pending_approvals INTEGER NOT NULL DEFAULT 10,
+  max_trigger_fanout INTEGER NOT NULL DEFAULT 25,
+
   -- Delivery
   delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'none'
   delivery_channel TEXT,
@@ -73,6 +78,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- Context retrieval (v5)
   context_retrieval       TEXT DEFAULT 'none',      -- 'none'|'recent'|'hybrid'
   context_retrieval_limit INTEGER DEFAULT 5,
+
+  -- Output handling (v14)
+  output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536,
+  output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000,
+  output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000,
+  output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
 
   -- Session continuity (v9)
   preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
@@ -124,6 +135,10 @@ CREATE TABLE IF NOT EXISTS runs (
   shell_timed_out INTEGER NOT NULL DEFAULT 0,
   shell_stdout    TEXT,
   shell_stderr    TEXT,
+  shell_stdout_path TEXT,
+  shell_stderr_path TEXT,
+  shell_stdout_bytes INTEGER NOT NULL DEFAULT 0,
+  shell_stderr_bytes INTEGER NOT NULL DEFAULT 0,
   dispatched_at   TEXT,
   run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
 
@@ -387,6 +402,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (10);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (11);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (12);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (13);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (14);
 
 -- ============================================================
 -- SEED JOBS

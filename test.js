@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { setDbPath, initDb, closeDb, getDb } from './db.js';
@@ -117,6 +117,17 @@ assert(runCols.includes('shell_signal'), 'runs.shell_signal column');
 assert(runCols.includes('shell_timed_out'), 'runs.shell_timed_out column');
 assert(runCols.includes('shell_stdout'), 'runs.shell_stdout column');
 assert(runCols.includes('shell_stderr'), 'runs.shell_stderr column');
+assert(runCols.includes('shell_stdout_path'), 'runs.shell_stdout_path column');
+assert(runCols.includes('shell_stderr_path'), 'runs.shell_stderr_path column');
+assert(runCols.includes('shell_stdout_bytes'), 'runs.shell_stdout_bytes column');
+assert(runCols.includes('shell_stderr_bytes'), 'runs.shell_stderr_bytes column');
+assert(jobCols.includes('execution_intent'), 'jobs.execution_intent column');
+assert(jobCols.includes('execution_read_only'), 'jobs.execution_read_only column');
+assert(jobCols.includes('max_queued_dispatches'), 'jobs.max_queued_dispatches column');
+assert(jobCols.includes('max_pending_approvals'), 'jobs.max_pending_approvals column');
+assert(jobCols.includes('max_trigger_fanout'), 'jobs.max_trigger_fanout column');
+assert(jobCols.includes('output_store_limit_bytes'), 'jobs.output_store_limit_bytes column');
+assert(jobCols.includes('output_offload_threshold_bytes'), 'jobs.output_offload_threshold_bytes column');
 
 // ── Paths ───────────────────────────────────────────────────
 console.log('\nPaths:');
@@ -188,6 +199,25 @@ const shellSignaled = normalizeShellResult(
 assert(shellSignaled.status === 'error', 'shell result keeps non-timeout signals as error');
 assert(shellSignaled.timedOut === false, 'shell result does not misclassify non-timeout signals');
 
+const shellArtifactsDir = mkdtempSync(join(tmpdir(), 'scheduler-artifacts-'));
+const largeOutput = 'x'.repeat(5000);
+const shellOffloaded = normalizeShellResult(
+  { stdout: largeOutput, stderr: '', error: null },
+  {
+    runId: 'run-offload-1',
+    timeoutMs: 300000,
+    storeLimit: 512,
+    excerptLimit: 256,
+    summaryLimit: 1024,
+    offloadThreshold: 1024,
+    artifactsDir: shellArtifactsDir,
+  }
+);
+assert(typeof shellOffloaded.stdoutPath === 'string', 'shell result offloads stdout when threshold exceeded');
+assert(shellOffloaded.stdoutBytes === 5000, 'shell result stores stdout byte count');
+assert(readFileSync(shellOffloaded.stdoutPath, 'utf8').length === 5000, 'shell result writes offloaded stdout artifact');
+rmSync(shellArtifactsDir, { recursive: true, force: true });
+
 const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none' });
 const shellRun = createRun(shellRunJob.id, { run_timeout_ms: 60000 });
 finishRun(shellRun.id, 'error', {
@@ -199,14 +229,18 @@ finishRun(shellRun.id, 'error', {
   shell_timed_out: shellFailure.timedOut,
   shell_stdout: shellFailure.stdout,
   shell_stderr: shellFailure.stderr,
+  shell_stdout_path: shellOffloaded.stdoutPath,
+  shell_stdout_bytes: shellOffloaded.stdoutBytes,
 });
 const storedShellRun = getRun(shellRun.id);
 assert(storedShellRun.shell_exit_code === 7, 'finishRun stores shell exit code');
 assert(storedShellRun.shell_stdout === 'hello', 'finishRun stores shell stdout');
 assert(storedShellRun.shell_stderr === 'boom', 'finishRun stores shell stderr');
+assert(storedShellRun.shell_stdout_path === shellOffloaded.stdoutPath, 'finishRun stores shell stdout artifact path');
 const extractedShell = extractShellResultFromRun(storedShellRun);
 assert(extractedShell.exitCode === 7, 'extractShellResultFromRun reads direct shell columns');
 assert(extractedShell.stderr === 'boom', 'extractShellResultFromRun reads stderr');
+assert(extractedShell.stdoutPath === shellOffloaded.stdoutPath, 'extractShellResultFromRun reads artifact path');
 
 // ── Telegram webhook diagnostics ───────────────────────────
 console.log('\nWebhook Diagnostics:');
@@ -276,6 +310,27 @@ assert(getJob(job.id).id === job.id, 'getJob');
 updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
 assert(listJobs().length >= 1, 'listJobs');
+const budgetedJob = createJob({
+  name: 'Budgeted Agent Job',
+  schedule_cron: '*/10 * * * *',
+  payload_message: 'Plan the next action without executing it.',
+  session_target: 'isolated',
+  payload_kind: 'agentTurn',
+  delivery_mode: 'none',
+  execution_intent: 'plan',
+  execution_read_only: 1,
+  max_queued_dispatches: 3,
+  max_pending_approvals: 2,
+  max_trigger_fanout: 4,
+  output_store_limit_bytes: 4096,
+  output_excerpt_limit_bytes: 512,
+  output_summary_limit_bytes: 2048,
+  output_offload_threshold_bytes: 1024,
+});
+assert(budgetedJob.execution_intent === 'plan', 'createJob stores execution_intent');
+assert(budgetedJob.execution_read_only === 1, 'createJob stores execution_read_only');
+assert(budgetedJob.max_queued_dispatches === 3, 'createJob stores max_queued_dispatches');
+assert(budgetedJob.output_offload_threshold_bytes === 1024, 'createJob stores output_offload_threshold_bytes');
 
 // ── Due jobs ────────────────────────────────────────────────
 console.log('\nDue jobs:');
@@ -467,6 +522,18 @@ const delayedDispatch = listDispatchesForJob(delayedChild.id).find(d => d.dispat
 const delayedTime = new Date(delayedDispatch.scheduled_for + 'Z').getTime();
 assert(delayedTime > Date.now(), 'delayed child scheduled in future');
 
+const cappedParent = createJob({
+  name: 'CappedParent',
+  schedule_cron: '0 8 * * *',
+  payload_message: 'cap fanout',
+  delivery_mode: 'none',
+  max_trigger_fanout: 1,
+});
+createJob({ name: 'FanoutChild1', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none' });
+createJob({ name: 'FanoutChild2', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c2', delivery_mode: 'none' });
+const fanoutTriggered = fireTriggeredChildren(cappedParent.id, 'ok', 'fanout', parentRun.id);
+assert(fanoutTriggered.length === 1, 'max_trigger_fanout limits triggered children per parent run');
+
 // Agent routing
 const agentJob = createJob({ name: 'AgentJob', schedule_cron: '0 12 * * *', agent_id: 'worker', payload_message: 'x', delivery_mode: 'none' });
 assert(agentJob.agent_id === 'worker', 'agent_id stored');
@@ -647,6 +714,19 @@ enqueueJob(qJob.id);
 assert(getJob(qJob.id).queued_count === 1, 'enqueue → queued_count = 1');
 enqueueJob(qJob.id);
 assert(getJob(qJob.id).queued_count === 2, 'enqueue again → queued_count = 2');
+
+const limitedQueueJob = createJob({
+  name: 'LimitedQueueJob',
+  schedule_cron: '*/5 * * * *',
+  payload_message: 'limited queue',
+  overlap_policy: 'queue',
+  max_queued_dispatches: 1,
+  delivery_mode: 'none',
+});
+const queueResult1 = enqueueJob(limitedQueueJob.id);
+const queueResult2 = enqueueJob(limitedQueueJob.id);
+assert(queueResult1.queued === true, 'enqueueJob returns queued=true below max_queued_dispatches');
+assert(queueResult2.queued === false && queueResult2.limited === true, 'enqueueJob blocks growth once max_queued_dispatches is reached');
 
 // Dequeue consumes one and schedules for next tick
 const dequeued1 = dequeueJob(qJob.id);
@@ -2202,9 +2282,9 @@ console.log('\n── Watchdog Jobs ──');
   }
   assert(threwBadType, 'invalid job_type rejected');
 
-  // Schema version is 13
+  // Schema version is 14
   const version = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get();
-  assert(version.v >= 13, 'schema_migrations has v13');
+  assert(version.v >= 14, 'schema_migrations has v14');
 
   // Clean up
   deleteJob(wdJob.id);
@@ -2286,7 +2366,7 @@ console.log('\n── Migration Guard ──');
       version INTEGER PRIMARY KEY,
       applied_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    INSERT INTO schema_migrations (version) VALUES (13);
+    INSERT INTO schema_migrations (version) VALUES (14);
   `);
   legacyDb.close();
 
@@ -2295,8 +2375,10 @@ console.log('\n── Migration Guard ──');
   await initDb();
   const migratedDb = getDb();
   const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
-  assert(migratedRunCols.includes('shell_exit_code'), 'migration guard backfills shell_exit_code when version marker is already 13');
-  assert(migratedRunCols.includes('shell_stderr'), 'migration guard backfills shell_stderr when version marker is already 13');
+  const migratedJobCols = migratedDb.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  assert(migratedRunCols.includes('shell_exit_code'), 'migration guard backfills shell_exit_code when version marker is already 14');
+  assert(migratedRunCols.includes('shell_stdout_path'), 'migration guard backfills shell_stdout_path when version marker is already 14');
+  assert(migratedJobCols.includes('execution_intent'), 'migration guard backfills execution_intent when version marker is already 14');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });

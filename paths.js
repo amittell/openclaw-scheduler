@@ -61,3 +61,19 @@ export function resolveBackupStagingDir(env = process.env) {
   if (explicit) return explicit;
   return join(resolveSchedulerHome(env), '.backup-staging');
 }
+
+export function resolveArtifactsDir(params = {}) {
+  const env = params.env || process.env;
+  const explicit = firstNonEmpty(params.explicitPath) || firstNonEmpty(env.SCHEDULER_ARTIFACTS_DIR);
+  if (explicit) return explicit;
+  const dbPath = firstNonEmpty(params.dbPath);
+  if (dbPath && dbPath !== ':memory:') {
+    return join(dirname(dbPath), 'artifacts');
+  }
+  return join(resolveSchedulerHome(env), 'artifacts');
+}
+
+export function ensureArtifactsDir(dirPath) {
+  mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}

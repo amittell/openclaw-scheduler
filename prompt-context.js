@@ -53,9 +53,15 @@ export function buildTriggeredRunContext(run, deps = {}) {
       lines.push('stdout:');
       lines.push(truncate(shellResult.stdout, 3000));
     }
+    if (shellResult.stdoutPath) {
+      lines.push(`stdout file: ${shellResult.stdoutPath} (${shellResult.stdoutBytes || 0} bytes)`);
+    }
     if (shellResult.stderr?.trim()) {
       lines.push('stderr:');
       lines.push(truncate(shellResult.stderr, 3000));
+    }
+    if (shellResult.stderrPath) {
+      lines.push(`stderr file: ${shellResult.stderrPath} (${shellResult.stderrBytes || 0} bytes)`);
     }
   } else if (parentRun.summary?.trim()) {
     lines.push('Parent run output:');
@@ -78,7 +84,9 @@ export function buildTriggeredRunContext(run, deps = {}) {
         ? {
             parent_shell_exit_code: shellResult.exitCode,
             parent_shell_signal: shellResult.signal,
-            parent_shell_timed_out: shellResult.timedOut
+            parent_shell_timed_out: shellResult.timedOut,
+            parent_shell_stdout_path: shellResult.stdoutPath || null,
+            parent_shell_stderr_path: shellResult.stderrPath || null,
           }
         : {})
     }

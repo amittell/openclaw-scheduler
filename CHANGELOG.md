@@ -21,9 +21,10 @@ First public release.
 - Public-facing docs/examples no longer include private hostnames or deployment-specific Telegram identifiers
 
 ### Changed
-- Schema baseline is now `v13`
+- Schema baseline is now `v14`
+- Added execution-intent fields, queue / approval / fan-out caps, shell-output offloading, and runtime budget visibility
 - Versioning reset to `0.1.0` as the first public release
-- Updated verification baseline to `550 passed, 0 failed`
+- Updated verification baseline to `574 passed, 0 failed`
 
 ## Pre-public development milestones
 
