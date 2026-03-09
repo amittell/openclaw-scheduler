@@ -101,6 +101,17 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
 
   const normalized = { ...opts };
   for (const key of [
+    'enabled',
+    'execution_read_only',
+    'delete_after_run',
+    'approval_required',
+    'watchdog_self_destruct'
+  ]) {
+    if (typeof normalized[key] === 'boolean') {
+      normalized[key] = normalized[key] ? 1 : 0;
+    }
+  }
+  for (const key of [
     'delivery_channel',
     'delivery_to',
     'resource_pool',
