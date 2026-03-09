@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
   delete_after_run INTEGER NOT NULL DEFAULT 0,
+  ttl_hours       INTEGER DEFAULT NULL,  -- auto-delete N hours after last_run_at if terminal status
 
   -- Workflow chaining (v3)
   parent_id       TEXT,                          -- soft ref to parent job id
@@ -403,6 +404,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (11);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (12);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (13);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (14);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (15);
 
 -- ============================================================
 -- SEED JOBS
