@@ -326,7 +326,7 @@ export function createJob(opts) {
   stmt.run(
     id,
     normalized.name,
-    normalized.enabled !== false ? 1 : 0,
+    normalized.enabled == null ? 1 : (normalized.enabled ? 1 : 0),
     cronExpr,
     normalized.schedule_tz || 'America/New_York',
     normalized.session_target || 'isolated',
