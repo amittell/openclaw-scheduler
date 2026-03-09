@@ -74,6 +74,7 @@ import {
   checkRunHealth,
   checkTaskTrackers,
   deliverPendingMessages,
+  ensureAgentInboxJobs,
 } from './dispatcher-maintenance.js';
 
 // ── Idempotency Key Wrappers ────────────────────────────────
@@ -1067,6 +1068,8 @@ async function tick() {
       pruneIdempotencyLedger();
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
+      // Ensure inbox consumer jobs exist for agents with delivery config
+      ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir: __dirname });
       // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL
       const cpResult = checkpointWal();
       if (cpResult) {

@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.5.0, schema version: 16)
+-- OpenClaw Scheduler Schema (current: v1.5.0, schema version: 17)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -229,6 +229,9 @@ CREATE TABLE IF NOT EXISTS agents (
   last_seen_at    TEXT,
   session_key     TEXT,                               -- current active session key
   capabilities    TEXT,                               -- JSON array of capability tags
+  delivery_channel TEXT,                              -- e.g. 'telegram'
+  delivery_to      TEXT,                              -- e.g. '484946046'
+  brand_name       TEXT,                              -- display name for notifications
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -409,6 +412,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (13);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (14);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (15);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (16);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (17);
 
 -- ============================================================
 -- SEED JOBS

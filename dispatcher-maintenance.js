@@ -131,3 +131,45 @@ export async function checkTaskTrackers({
 export function deliverPendingMessages({ expireMessages }) {
   expireMessages();
 }
+
+export function ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir }) {
+  try {
+    const db = getDb();
+
+    // Find agents with delivery config
+    const agents = db.prepare(`
+      SELECT id, delivery_channel, delivery_to, brand_name
+      FROM agents
+      WHERE delivery_channel IS NOT NULL AND delivery_to IS NOT NULL
+    `).all();
+
+    if (agents.length === 0) return;
+
+    for (const agent of agents) {
+      const jobName = `inbox-consumer:${agent.id}`;
+
+      // Check if job already exists
+      const existing = db.prepare('SELECT id FROM jobs WHERE name = ?').get(jobName);
+      if (existing) continue;
+
+      // Create the inbox consumer job
+      const consumerCmd = `node ${schedulerDir}/scripts/inbox-consumer.mjs --agent ${agent.id} --to ${agent.delivery_to} --channel ${agent.delivery_channel}`;
+
+      createJob({
+        name:             jobName,
+        schedule_cron:    '*/5 * * * *',
+        session_target:   'shell',
+        payload_kind:     'shellCommand',
+        payload_message:  consumerCmd,
+        delivery_mode:    'none',
+        overlap_policy:   'skip',
+        enabled:          1,
+      });
+
+      log('info', `Created inbox consumer job: ${jobName} → ${agent.delivery_channel}:${agent.delivery_to}`);
+    }
+  } catch (err) {
+    log('error', `ensureAgentInboxJobs error: ${err.message}`);
+  }
+}
+
