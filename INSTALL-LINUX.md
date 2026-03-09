@@ -77,10 +77,10 @@ node -e "require('better-sqlite3')" && echo "OK"
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 488 tests
+SCHEDULER_DB=:memory: node test.js  # 576 tests
 ```
 
-**All tests must pass before proceeding.** Total: 488 tests.
+**All tests must pass before proceeding.** Total: 576 tests.
 
 ---
 
@@ -159,10 +159,33 @@ The scheduler runs as a **systemd user service** — it runs under your user acc
 # Create user service directory
 mkdir -p ~/.config/systemd/user/
 
-# Copy the template
-cp ~/.openclaw/scheduler/openclaw-scheduler.service ~/.config/systemd/user/
+# Create the service file
+cat > ~/.config/systemd/user/openclaw-scheduler.service <<'EOF'
+[Unit]
+Description=OpenClaw Scheduler
+Documentation=https://github.com/amittell/openclaw-scheduler
+After=network.target
 
-# Edit the service file
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/scheduler
+ExecStart=/usr/bin/node --no-warnings %h/.openclaw/scheduler/dispatcher.js
+Environment=OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+Environment=OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN
+Environment=SCHEDULER_DB=%h/.openclaw/scheduler/scheduler.db
+Environment=SCHEDULER_TICK_MS=10000
+Environment=SCHEDULER_STALE_THRESHOLD_S=90
+Environment=SCHEDULER_DEBUG=1
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/openclaw-scheduler.log
+StandardError=append:/tmp/openclaw-scheduler.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Edit the service file if needed
 nano ~/.config/systemd/user/openclaw-scheduler.service
 ```
 
@@ -450,7 +473,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 488/488
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 576/576
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `systemctl --user status openclaw-scheduler` → active (running)
 - [ ] Log file has startup lines, no errors

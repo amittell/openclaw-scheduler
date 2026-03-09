@@ -1125,7 +1125,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── backup.js              # MinIO snapshot/rollup/restore
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── test.js                # Full test suite (352 assertions, in-memory)
+├── test.js                # Full test suite (576 tests, in-memory)
 ├── scripts/
 │   ├── inbox-consumer.mjs      # Drains queue messages and delivers to Telegram
 │   └── stuck-run-detector.mjs  # Detects stale running runs (alert-only via non-zero exit)
@@ -1149,7 +1149,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (352 assertions, in-memory SQLite)
+# Run all tests (576 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:

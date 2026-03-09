@@ -1,11 +1,13 @@
 {
   "name": "openclaw-scheduler",
   "version": "0.1.0",
-  "description": "SQLite-backed job scheduler, workflow engine, and inter-agent message router for OpenClaw. Replaces built-in cron and heartbeat with full run history, workflow chains, retry logic, shell jobs, approval gates, and backup support.",
+  "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
-  "main": "dispatcher.js",
   "bin": {
     "openclaw-scheduler": "bin/openclaw-scheduler.js"
+  },
+  "exports": {
+    "./package.json": "./package.json"
   },
   "engines": {
     "node": ">=22"
@@ -20,12 +22,33 @@
   "files": [
     "bin",
     "dispatch",
-    "scripts",
-    "*.js",
-    "*.mjs",
-    "*.sql",
-    "*.plist",
-    "*.service",
+    "scripts/dispatch-cli-utils.mjs",
+    "scripts/inbox-consumer.mjs",
+    "scripts/stuck-run-detector.mjs",
+    "scripts/telegram-webhook-check.mjs",
+    "agents.js",
+    "approval.js",
+    "backup.js",
+    "cli.js",
+    "db.js",
+    "dispatch-queue.js",
+    "dispatcher.js",
+    "gateway.js",
+    "idempotency.js",
+    "jobs.js",
+    "messages.js",
+    "migrate.js",
+    "migrate-consolidate.js",
+    "paths.js",
+    "prompt-context.js",
+    "retrieval.js",
+    "runs.js",
+    "scheduler-schema.js",
+    "schema.sql",
+    "setup.mjs",
+    "shell-result.js",
+    "task-tracker.js",
+    "team-adapter.js",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -33,10 +56,7 @@
     "SECURITY.md",
     "CODE_OF_CONDUCT.md",
     "INSTALL*.md",
-    "UNINSTALL.md",
-    "BEST-PRACTICES.md",
-    "IMPLEMENTATION_SPEC.md",
-    "test.js"
+    "UNINSTALL.md"
   ],
   "keywords": [
     "openclaw",

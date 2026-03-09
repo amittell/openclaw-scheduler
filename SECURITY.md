@@ -4,6 +4,10 @@
 
 Report security issues privately to the maintainers instead of opening a public issue.
 
+Preferred channel:
+
+- GitHub private vulnerability reporting: https://github.com/amittell/openclaw-scheduler/security/advisories/new
+
 Include:
 
 - affected version
