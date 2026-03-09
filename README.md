@@ -1,55 +1,101 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-488%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-550%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
-A standalone job scheduler, workflow engine, and inter-agent message router for [OpenClaw](https://openclaw.ai). Replaces OpenClaw's built-in cron and heartbeat with a SQLite-backed system that dispatches jobs independently via the chat completions API — complete run history, workflow chains, retry logic, shell jobs, approval gates, and MinIO backup.
+A durable orchestration runtime for [OpenClaw](https://openclaw.ai) agents and shell workflows. Use it when built-in cron and heartbeat stop being enough: jobs fail and disappear into logs, shell scripts depend on gateway uptime, multi-step workflows need retries and approvals, and you want a real audit trail for what ran, what failed, and what triggered what.
+
+It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler that keeps full run history, supports shell and agent steps in the same workflow, and lets you build chains like `shell check -> agent diagnosis -> human approval -> remediation`.
 
 **Repo:** `github.com/amittell/openclaw-scheduler`
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 488 (full suite, in-memory SQLite)
+**Tests:** 550 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
 
 ## Table of Contents
 
-1. [What Replaced What](#what-replaced-what)
-2. [Quick Start](#quick-start)
-3. [Platform Support](#platform-support)
-4. [Architecture](#architecture)
-5. [How Jobs Execute](#how-jobs-execute)
-6. [Delivery Modes](#delivery-modes)
-7. [Delivery Aliases](#delivery-aliases)
-8. [Shell Jobs](#shell-jobs)
-9. [HITL Approval Gates](#hitl-approval-gates)
-10. [Idempotency](#idempotency)
-11. [Context Retrieval](#context-retrieval)
-12. [Task Tracker](#task-tracker)
-13. [Resource Pools](#resource-pools)
-14. [Workflow Chains](#workflow-chains)
-15. [Retry Logic](#retry-logic)
-16. [Chain Safety](#chain-safety)
-17. [Inter-Agent Messaging](#inter-agent-messaging)
-18. [Backup & Recovery](#backup--recovery)
-19. [Agent Registry](#agent-registry)
-20. [Database Schema](#database-schema)
-21. [CLI Reference](#cli-reference)
-22. [Configuration](#configuration)
-23. [Service Management](#service-management)
-24. [Error Handling & Backoff](#error-handling--backoff)
-25. [Migration & History](#migration--history)
-26. [Removing the Scheduler](#removing-the-scheduler)
-27. [Best Practices](#best-practices)
-28. [File Reference](#file-reference)
-29. [Testing](#testing)
-30. [Companion Scripts](#companion-scripts)
-31. [Troubleshooting](#troubleshooting)
+1. [Why This Exists](#why-this-exists)
+2. [Concrete Use Cases](#concrete-use-cases)
+3. [When To Use It](#when-to-use-it)
+4. [What Replaced What](#what-replaced-what)
+5. [Quick Start](#quick-start)
+6. [Platform Support](#platform-support)
+7. [Architecture](#architecture)
+8. [How Jobs Execute](#how-jobs-execute)
+9. [Delivery Modes](#delivery-modes)
+10. [Delivery Aliases](#delivery-aliases)
+11. [Shell Jobs](#shell-jobs)
+12. [HITL Approval Gates](#hitl-approval-gates)
+13. [Idempotency](#idempotency)
+14. [Context Retrieval](#context-retrieval)
+15. [Task Tracker](#task-tracker)
+16. [Resource Pools](#resource-pools)
+17. [Workflow Chains](#workflow-chains)
+18. [Retry Logic](#retry-logic)
+19. [Chain Safety](#chain-safety)
+20. [Inter-Agent Messaging](#inter-agent-messaging)
+21. [Backup & Recovery](#backup--recovery)
+22. [Agent Registry](#agent-registry)
+23. [Database Schema](#database-schema)
+24. [CLI Reference](#cli-reference)
+25. [Configuration](#configuration)
+26. [Service Management](#service-management)
+27. [Error Handling & Backoff](#error-handling--backoff)
+28. [Migration & History](#migration--history)
+29. [Removing the Scheduler](#removing-the-scheduler)
+30. [Best Practices](#best-practices)
+31. [File Reference](#file-reference)
+32. [Testing](#testing)
+33. [Companion Scripts](#companion-scripts)
+34. [Troubleshooting](#troubleshooting)
 
 ---
+
+## Why This Exists
+
+OpenClaw's built-in cron and heartbeat are fine until your workflows stop being simple.
+
+The pain usually looks like this:
+
+- A scheduled agent run fails, but the only record is a log line or a chat reply.
+- A shell script is operationally important, but it should keep running even if the gateway is unhealthy.
+- One step should trigger another, but only on success, only on failure, or only if the output contains a specific signal.
+- A risky action needs a human in the loop instead of firing immediately.
+- An agent needs to hand work to another agent or process, and you want that handoff tracked and auditable.
+
+`openclaw-scheduler` exists to solve those problems without making you build a second application stack. It gives OpenClaw a durable runtime for workflows: jobs, runs, chains, retries, shell execution, approvals, and message routing all backed by SQLite.
+
+## Concrete Use Cases
+
+These are the kinds of workflows this scheduler is meant for:
+
+- `metrics capture -> analysis -> approval -> report publish`
+  You want each step tracked, retried if needed, and gated before the final action.
+- `shell ingest fails -> agent diagnoses failure -> operator approves remediation`
+  The ingest should still run without the gateway, but the failure follow-up can use an agent.
+- `workspace audit -> diagnosis -> memory compression`
+  The audit is a shell step, the diagnosis is an agent step, and the remediation should only run if the diagnosis actually recommends it.
+- `bot health check -> alert -> repair action`
+  A shell check runs on schedule, an agent summarizes the issue, and a repair step waits for approval.
+
+The differentiator is not just "better cron". It is mixed shell + agent workflows with durable state and control over what happens after success, failure, timeout, or explicit signals in output.
+
+## When To Use It
+
+Use it when you want:
+
+- reliable scheduled execution with history and retries
+- shell jobs that do not depend on OpenClaw gateway availability
+- parent/child workflow chains
+- approval gates before risky steps
+- auditable inter-agent or agent-to-shell handoffs
+
+Do not use it if simple cron is enough. If all you need is “run one thing every hour” and you do not care about retries, chains, approvals, or run history, this is probably more system than you need.
 
 ## What Replaced What
 
@@ -89,7 +135,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 488 passed, 0 failed
+npm test                             # should print: 550 passed, 0 failed
 npm run lint                         # static checks
 npm run coverage                     # coverage summary + lcov report
 ```
