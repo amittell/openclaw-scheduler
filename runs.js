@@ -74,7 +74,11 @@ export function finishRun(id, status, opts = {}) {
       shell_signal = COALESCE(?, shell_signal),
       shell_timed_out = COALESCE(?, shell_timed_out),
       shell_stdout = COALESCE(?, shell_stdout),
-      shell_stderr = COALESCE(?, shell_stderr)
+      shell_stderr = COALESCE(?, shell_stderr),
+      shell_stdout_path = COALESCE(?, shell_stdout_path),
+      shell_stderr_path = COALESCE(?, shell_stderr_path),
+      shell_stdout_bytes = COALESCE(?, shell_stdout_bytes),
+      shell_stderr_bytes = COALESCE(?, shell_stderr_bytes)
     WHERE id = ?
   `).run(
     status,
@@ -87,6 +91,10 @@ export function finishRun(id, status, opts = {}) {
     opts.shell_timed_out != null ? Number(Boolean(opts.shell_timed_out)) : null,
     opts.shell_stdout ?? null,
     opts.shell_stderr ?? null,
+    opts.shell_stdout_path ?? null,
+    opts.shell_stderr_path ?? null,
+    opts.shell_stdout_bytes ?? null,
+    opts.shell_stderr_bytes ?? null,
     id
   );
 

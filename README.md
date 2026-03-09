@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-550%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-574%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
 
@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 550 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 574 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -135,7 +135,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 550 passed, 0 failed
+npm test                             # should print: 574 passed, 0 failed
 npm run lint                         # static checks
 npm run coverage                     # coverage summary + lcov report
 ```
@@ -387,12 +387,13 @@ node cli.js jobs add '{
 **Key properties:**
 - **No gateway dependency** — runs even when gateway is down
 - `payload_message` is the command to execute (shell string passed to the configured shell)
-- Output captured up to 1MB, truncated to 5000 chars in run summary
-- Shell runs persist structured failure context on `runs`: `shell_exit_code`, `shell_signal`, `shell_timed_out`, `shell_stdout`, `shell_stderr`
+- Output captured up to 1MB, with preview/offload budgets to keep large output out of the main run row
+- Shell runs persist structured failure context on `runs`: `shell_exit_code`, `shell_signal`, `shell_timed_out`, `shell_stdout`, `shell_stderr`, plus optional `shell_stdout_path` / `shell_stderr_path` when large output is offloaded
 - Failure-triggered agent children receive shell context with separate exit code, stdout, and stderr blocks
 - `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
 - Shell jobs now honor `max_retries` before failure children fire, the same as isolated agent jobs
+- `node cli.js runs output <run-id> stdout|stderr` retrieves stored or offloaded shell output on demand
 
 **With environment variables:**
 ```bash
@@ -840,7 +841,10 @@ node cli.js agents register <id> [name]
 ```
 id, name, enabled, schedule_cron, schedule_tz,
 session_target, agent_id, payload_kind, payload_message,
-payload_model, overlap_policy, run_timeout_ms,
+payload_model, payload_thinking, execution_intent, execution_read_only,
+overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals,
+max_trigger_fanout, output_store_limit_bytes, output_excerpt_limit_bytes,
+output_summary_limit_bytes, output_offload_threshold_bytes,
 max_retries, delivery_mode, delivery_channel,
 delivery_to, delete_after_run, parent_id, trigger_on,
 trigger_delay_s, trigger_condition, resource_pool,
@@ -855,7 +859,9 @@ created_at, updated_at
 ```
 id, job_id, status, started_at, finished_at, duration_ms,
 last_heartbeat, session_key, session_id, summary,
-error_message, dispatched_at, run_timeout_ms,
+error_message, shell_exit_code, shell_signal, shell_timed_out,
+shell_stdout, shell_stderr, shell_stdout_path, shell_stderr_path,
+shell_stdout_bytes, shell_stderr_bytes, dispatched_at, run_timeout_ms,
 triggered_by_run, retry_of, retry_count, replay_of
 ```
 
@@ -896,6 +902,8 @@ node cli.js jobs cancel <id>              # Cancel running chain
 
 # ── Runs ──────────────────────────────────────────
 node cli.js runs list <job-id> [limit]    # Run history
+node cli.js runs get <run-id>             # Full run details
+node cli.js runs output <run-id> stdout   # Stored/offloaded stdout or stderr
 node cli.js runs running                  # Active runs
 node cli.js runs stale [threshold-s]      # Stale runs (default 90s)
 
@@ -1033,7 +1041,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v13`).
+As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1050,7 +1058,7 @@ As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (basel
 
 | Version | Date | Schema | Key changes |
 |---------|------|--------|-------------|
-| 0.1.0 | 2026-03-08 | v13 | First public release: workflow engine, structured shell failure triage, watchdog jobs, safer migration checks, and public-release cleanup |
+| 0.1.0 | 2026-03-08 | v14 | First public release: workflow engine, structured shell failure triage, watchdog jobs, output offloading, execution-intent controls, safer migration checks, and public-release cleanup |
 
 ### Pre-public development milestones
 

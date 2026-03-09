@@ -1,12 +1,12 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v13).
+ * Brings any DB from any prior version up to the current schema (v14).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js
  *
  * Safe to run multiple times — all operations are idempotent.
  */
@@ -78,13 +78,18 @@ export default function migrateConsolidate() {
   const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(c => c.name));
   const hasLatestColumns =
     jobColumns.has('job_type')
+    && jobColumns.has('execution_intent')
+    && jobColumns.has('max_queued_dispatches')
+    && jobColumns.has('output_offload_threshold_bytes')
     && runColumns.has('dispatch_queue_id')
     && runColumns.has('shell_exit_code')
     && runColumns.has('shell_signal')
     && runColumns.has('shell_timed_out')
     && runColumns.has('shell_stdout')
-    && runColumns.has('shell_stderr');
-  if (current >= 13 && hasLatestColumns) {
+    && runColumns.has('shell_stderr')
+    && runColumns.has('shell_stdout_path')
+    && runColumns.has('shell_stderr_path');
+  if (current >= 14 && hasLatestColumns) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -151,6 +156,20 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN watchdog_alert_target TEXT`,
     `ALTER TABLE jobs ADD COLUMN watchdog_self_destruct INTEGER NOT NULL DEFAULT 1`,
     `ALTER TABLE jobs ADD COLUMN watchdog_started_at TEXT`,
+    // v14: execution intent, budgets, and shell-output offloading
+    `ALTER TABLE jobs ADD COLUMN execution_intent TEXT NOT NULL DEFAULT 'execute'`,
+    `ALTER TABLE jobs ADD COLUMN execution_read_only INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE jobs ADD COLUMN max_queued_dispatches INTEGER NOT NULL DEFAULT 25`,
+    `ALTER TABLE jobs ADD COLUMN max_pending_approvals INTEGER NOT NULL DEFAULT 10`,
+    `ALTER TABLE jobs ADD COLUMN max_trigger_fanout INTEGER NOT NULL DEFAULT 25`,
+    `ALTER TABLE jobs ADD COLUMN output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536`,
+    `ALTER TABLE jobs ADD COLUMN output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000`,
+    `ALTER TABLE jobs ADD COLUMN output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000`,
+    `ALTER TABLE jobs ADD COLUMN output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536`,
+    `ALTER TABLE runs ADD COLUMN shell_stdout_path TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_stderr_path TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_stdout_bytes INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE runs ADD COLUMN shell_stderr_bytes INTEGER NOT NULL DEFAULT 0`,
   ];
 
   for (const sql of alters) {
@@ -381,7 +400,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]) {
     stmt.run(v);
   }
 
@@ -394,7 +413,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v13'
-    : 'DB already at v13 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v14'
+    : 'DB already at v14 — nothing to do'
   );
 }

@@ -32,7 +32,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
   readFileSync(join(__dirname, 'package.json'), 'utf8')
 );
-import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob } from './jobs.js';
+import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateHeartbeat, updateRunSession, pruneRuns, updateContextSummary
@@ -43,7 +43,7 @@ import {
 } from './messages.js';
 import {
   createApproval, getPendingApproval, listPendingApprovals,
-  resolveApproval, getTimedOutApprovals, pruneApprovals
+  resolveApproval, getTimedOutApprovals, pruneApprovals, countPendingApprovalsForJob
 } from './approval.js';
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
@@ -115,6 +115,27 @@ const MESSAGE_DELIVERY_MS = parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS |
 const PRUNE_INTERVAL_MS = parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10);
 const BACKUP_INTERVAL_MS = parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10); // 5 min
 const LOG_PREFIX = '[scheduler]';
+
+function adaptiveDeferralMs(backlogDepth, baseMs = TICK_INTERVAL_MS) {
+  const multiplier = Math.max(1, Math.min(12, backlogDepth + 1));
+  return Math.min(300000, baseMs * multiplier);
+}
+
+function buildExecutionIntentNote(job) {
+  if (job.execution_intent !== 'plan' && !job.execution_read_only) return '';
+  const lines = [
+    '[SYSTEM NOTE — execution boundary]',
+    job.execution_intent === 'plan'
+      ? 'This run is planning-only. Analyze, reason, and propose actions, but do not execute external side effects.'
+      : 'This run is read-only. Inspect and summarize state, but do not execute external side effects.',
+  ];
+  if (job.execution_read_only) {
+    lines.push('Treat every write, send, post, mutation, or shelling out for side effects as forbidden.');
+  }
+  lines.push('If a concrete change is needed, describe it as a recommendation instead of performing it.');
+  lines.push('[END SYSTEM NOTE]');
+  return lines.join('\n');
+}
 
 // ── State ───────────────────────────────────────────────────
 let running = true;
@@ -348,15 +369,27 @@ async function dispatchJob(job, opts = {}) {
 
   const dispatchKind = dispatchRecord?.dispatch_kind || null;
   const isChainDispatch = dispatchKind === 'chain';
+  const dispatchBacklogDepth = getDispatchBacklogCount(job.id);
 
   // HITL approval gate — chain-triggered jobs pause until approved.
   if (job.approval_required && isChainDispatch && !approvalBypass) {
+    const pendingApprovalCount = countPendingApprovalsForJob(job.id);
+    if (pendingApprovalCount >= (job.max_pending_approvals || 10)) {
+      completeCurrentDispatch('cancelled');
+      log('warn', `Approval backlog limit reached for ${job.name}`, {
+        jobId: job.id,
+        pendingApprovals: pendingApprovalCount,
+        maxPendingApprovals: job.max_pending_approvals || 10,
+      });
+      return;
+    }
     const existing = getPendingApproval(job.id);
     if (existing) {
-      releaseDispatch(dispatchRecord.id, sqliteNow(TICK_INTERVAL_MS));
+      releaseDispatch(dispatchRecord.id, sqliteNow(adaptiveDeferralMs(dispatchBacklogDepth)));
       log('debug', `Skipping ${job.name} — approval already pending`, {
         approvalId: existing.id,
         dispatchId: dispatchRecord?.id || null,
+        deferredMs: adaptiveDeferralMs(dispatchBacklogDepth),
       });
       return;
     }
@@ -399,8 +432,24 @@ async function dispatchJob(job, opts = {}) {
       return;
     }
     if (job.overlap_policy === 'queue') {
-      log('info', `Queueing ${job.name} — previous run still active`, { jobId: job.id });
-      enqueueJob(job.id);
+      const queueResult = enqueueJob(job.id);
+      if (!queueResult.queued) {
+        log('warn', `Queue limit reached for ${job.name} — dropping overlap dispatch`, {
+          jobId: job.id,
+          queuedCount: queueResult.queued_count,
+          maxQueuedDispatches: job.max_queued_dispatches || 25,
+        });
+        if (dispatchRecord) {
+          completeCurrentDispatch('cancelled');
+        } else {
+          advanceNextRun(job);
+        }
+        return;
+      }
+      log('info', `Queueing ${job.name} — previous run still active`, {
+        jobId: job.id,
+        queuedCount: queueResult.queued_count,
+      });
       if (dispatchRecord) {
         completeCurrentDispatch('done');
       } else {
@@ -576,7 +625,11 @@ async function dispatchJob(job, opts = {}) {
 
     } else if (job.session_target === 'main') {
       // Main session: send system event
-      await sendSystemEvent(job.payload_message, 'now');
+      const executionNote = buildExecutionIntentNote(job);
+      const modelNote = job.payload_thinking
+        ? `[SYSTEM NOTE — model policy]\nPrefer reasoning depth: ${job.payload_thinking}.\n[END SYSTEM NOTE]\n\n`
+        : '';
+      await sendSystemEvent(`${executionNote ? `${executionNote}\n\n` : ''}${modelNote}${job.payload_message}`, 'now');
       finishRun(run.id, 'ok', { summary: 'System event dispatched' });
       updateJobAfterRun(job, 'ok');
       completeCurrentDispatch('done');
@@ -587,7 +640,14 @@ async function dispatchJob(job, opts = {}) {
     } else if (job.session_target === 'shell') {
       // Shell job: run payload_message as a shell command — no gateway dependency
       const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms);
-      const shellResult = normalizeShellResult(shellExec, { timeoutMs: job.run_timeout_ms });
+      const shellResult = normalizeShellResult(shellExec, {
+        runId: run.id,
+        timeoutMs: job.run_timeout_ms,
+        storeLimit: job.output_store_limit_bytes || undefined,
+        excerptLimit: job.output_excerpt_limit_bytes || undefined,
+        summaryLimit: job.output_summary_limit_bytes || undefined,
+        offloadThreshold: job.output_offload_threshold_bytes || undefined,
+      });
       finishRun(run.id, shellResult.status, {
         summary: shellResult.summary,
         error_message: shellResult.errorMessage,
@@ -597,6 +657,10 @@ async function dispatchJob(job, opts = {}) {
         shell_timed_out: shellResult.timedOut,
         shell_stdout: shellResult.stdout,
         shell_stderr: shellResult.stderr,
+        shell_stdout_path: shellResult.stdoutPath,
+        shell_stderr_path: shellResult.stderrPath,
+        shell_stdout_bytes: shellResult.stdoutBytes,
+        shell_stderr_bytes: shellResult.stderrBytes,
       });
 
       const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
@@ -609,14 +673,21 @@ async function dispatchJob(job, opts = {}) {
 
       if (shellResult.status !== 'ok' && shouldRetry(job, run.id)) {
         const retry = scheduleRetry(job, run.id);
-        log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (shell failure)`, {
-          jobId: job.id, runId: run.id,
+        if (retry.dispatch) {
+          log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (shell failure)`, {
+            jobId: job.id, runId: run.id,
+          });
+          getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+          completeCurrentDispatch('done');
+          if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+          log('info', `Shell ${shellResult.status}: ${job.name} (retry scheduled)`, { runId: run.id, exitCode: shellResult.exitCode, signal: shellResult.signal });
+          return;
+        }
+        log('warn', `Retry skipped for ${job.name} — dispatch backlog limit reached`, {
+          jobId: job.id,
+          runId: run.id,
+          maxQueuedDispatches: job.max_queued_dispatches || 25,
         });
-        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
-        completeCurrentDispatch('done');
-        if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
-        log('info', `Shell ${shellResult.status}: ${job.name} (retry scheduled)`, { runId: run.id, exitCode: shellResult.exitCode, signal: shellResult.signal });
-        return;
       }
 
       updateJobAfterRun(job, shellResult.status);
@@ -742,17 +813,24 @@ async function dispatchJob(job, opts = {}) {
       if (effectiveStatus === 'error') {
         if (shouldRetry(job, run.id)) {
           const retry = scheduleRetry(job, run.id);
-          log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (soft failure)`, {
-            jobId: job.id, runId: run.id,
+          if (retry.dispatch) {
+            log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s (soft failure)`, {
+              jobId: job.id, runId: run.id,
+            });
+            getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+            completeCurrentDispatch('done');
+            // Skip updateJobAfterRun — retry handles scheduling
+            if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
+            log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
+            // Fire triggered children on failure
+            handleTriggeredChildren(job.id, 'error', content, run.id, ' on soft failure');
+            return; // early return — retry path handles everything
+          }
+          log('warn', `Retry skipped for ${job.name} — dispatch backlog limit reached`, {
+            jobId: job.id,
+            runId: run.id,
+            maxQueuedDispatches: job.max_queued_dispatches || 25,
           });
-          getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
-          completeCurrentDispatch('done');
-          // Skip updateJobAfterRun — retry handles scheduling
-          if (dequeueJob(job.id)) log('info', `Dequeued pending dispatch for ${job.name}`);
-          log('info', `Soft-failed: ${job.name} (retry scheduled)`, { runId: run.id });
-          // Fire triggered children on failure
-          handleTriggeredChildren(job.id, 'error', content, run.id, ' on soft failure');
-          return; // early return — retry path handles everything
         }
       }
 
@@ -790,12 +868,22 @@ async function dispatchJob(job, opts = {}) {
     // Retry logic: check if we should retry before declaring failure
     if (shouldRetry(job, run.id)) {
       const retry = scheduleRetry(job, run.id);
-      log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
-        jobId: job.id, runId: run.id,
-      });
-      // Store retry count on the run for tracking
-      getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
-      completeCurrentDispatch('done');
+      if (retry.dispatch) {
+        log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
+          jobId: job.id, runId: run.id,
+        });
+        // Store retry count on the run for tracking
+        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+        completeCurrentDispatch('done');
+      } else {
+        log('warn', `Retry skipped for ${job.name} — dispatch backlog limit reached`, {
+          jobId: job.id,
+          runId: run.id,
+          maxQueuedDispatches: job.max_queued_dispatches || 25,
+        });
+        updateJobAfterRun(job, 'error');
+        completeCurrentDispatch('cancelled');
+      }
     } else {
       // Fire triggered children on failure (only after exhausting retries)
       // No content available on error path — condition checks will use empty string
@@ -815,6 +903,15 @@ async function dispatchJob(job, opts = {}) {
 // ── Build the prompt sent to the agent ──────────────────────
 function buildJobPrompt(job, run) {
   const parts = [`[scheduler:${job.id} ${job.name}]`];
+  const executionNote = buildExecutionIntentNote(job);
+  if (executionNote) parts.push(`\n${executionNote}`);
+  if (job.payload_thinking) {
+    parts.push(
+      '\n[SYSTEM NOTE — model policy]',
+      `Prefer reasoning depth: ${job.payload_thinking}.`,
+      '[END SYSTEM NOTE]',
+    );
+  }
 
   // Flush preamble for pre_compaction_flush jobs
   if (job.job_class === 'pre_compaction_flush') {
@@ -865,6 +962,10 @@ function buildJobPrompt(job, run) {
     job_class: job.job_class || 'standard',
     delivery_guarantee: job.delivery_guarantee || 'at-most-once',
     context_retrieval: job.context_retrieval || 'none',
+    execution_intent: job.execution_intent || 'execute',
+    execution_read_only: Boolean(job.execution_read_only),
+    payload_model: job.payload_model || null,
+    payload_thinking: job.payload_thinking || null,
   };
 
   const triggerContext = buildTriggeredRunContext(run);

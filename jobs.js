@@ -14,6 +14,7 @@ const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
 const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
+const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan']);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -147,6 +148,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('approval_auto', merged.approval_auto || 'reject', VALID_APPROVAL_AUTO);
   assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
   assertEnum('job_type', merged.job_type || 'standard', VALID_JOB_TYPES);
+  assertEnum('execution_intent', merged.execution_intent || 'execute', VALID_EXECUTION_INTENTS);
 
   if (merged.trigger_on != null) {
     assertEnum('trigger_on', merged.trigger_on, VALID_TRIGGERS);
@@ -194,10 +196,26 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     ['approval_timeout_s', 1],
     ['context_retrieval_limit', 1],
     ['consecutive_errors', 0],
+    ['max_queued_dispatches', 1],
+    ['max_pending_approvals', 1],
+    ['max_trigger_fanout', 1],
+    ['output_store_limit_bytes', 128],
+    ['output_excerpt_limit_bytes', 64],
+    ['output_summary_limit_bytes', 64],
+    ['output_offload_threshold_bytes', 128],
   ]) {
     if (name in normalized || (mode === 'create' && merged[name] != null)) {
       assertInt(name, merged[name], min);
     }
+  }
+
+  if (merged.output_excerpt_limit_bytes != null && merged.output_store_limit_bytes != null
+      && merged.output_excerpt_limit_bytes > merged.output_store_limit_bytes) {
+    throw new Error('output_excerpt_limit_bytes cannot exceed output_store_limit_bytes');
+  }
+  if (merged.output_summary_limit_bytes != null && merged.output_excerpt_limit_bytes != null
+      && merged.output_summary_limit_bytes < merged.output_excerpt_limit_bytes) {
+    throw new Error('output_summary_limit_bytes cannot be smaller than output_excerpt_limit_bytes');
   }
 
   return normalized;
@@ -270,7 +288,8 @@ export function createJob(opts) {
       id, name, enabled, schedule_cron, schedule_tz,
       session_target, agent_id, payload_kind, payload_message,
       payload_model, payload_thinking, payload_timeout_seconds,
-      overlap_policy, run_timeout_ms,
+      execution_intent, execution_read_only,
+      overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals, max_trigger_fanout,
       delivery_mode, delivery_channel, delivery_to,
       delete_after_run, next_run_at,
       parent_id, trigger_on, trigger_delay_s,
@@ -279,23 +298,24 @@ export function createJob(opts) {
       delivery_guarantee, job_class,
       approval_required, approval_timeout_s, approval_auto,
       context_retrieval, context_retrieval_limit,
+      output_store_limit_bytes, output_excerpt_limit_bytes, output_summary_limit_bytes, output_offload_threshold_bytes,
       preferred_session_key,
       job_type, watchdog_target_label, watchdog_check_cmd,
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
       watchdog_self_destruct, watchdog_started_at
-    ) VALUES (
+) VALUES (
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
+      ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
       ?, ?, ?,
-      ?, ?,
-      ?, ?,
-      ?, ?,
       ?, ?, ?,
-      ?, ?,
+      ?, ?, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?, ?, ?,
       ?,
       ?, ?, ?,
       ?, ?, ?,
@@ -316,8 +336,13 @@ export function createJob(opts) {
     normalized.payload_model || null,
     normalized.payload_thinking || null,
     normalized.payload_timeout_seconds || 120,
+    normalized.execution_intent || 'execute',
+    normalized.execution_read_only ? 1 : 0,
     normalized.overlap_policy || 'skip',
     normalized.run_timeout_ms || 300000,
+    normalized.max_queued_dispatches || 25,
+    normalized.max_pending_approvals || 10,
+    normalized.max_trigger_fanout || 25,
     normalized.delivery_mode || 'announce',
     normalized.delivery_channel || null,
     normalized.delivery_to || null,
@@ -337,6 +362,10 @@ export function createJob(opts) {
     normalized.approval_auto || 'reject',
     normalized.context_retrieval || 'none',
     normalized.context_retrieval_limit || 5,
+    normalized.output_store_limit_bytes || 65536,
+    normalized.output_excerpt_limit_bytes || 2000,
+    normalized.output_summary_limit_bytes || 5000,
+    normalized.output_offload_threshold_bytes || 65536,
     normalized.preferred_session_key || null,
     normalized.job_type || 'standard',
     normalized.watchdog_target_label || null,
@@ -381,7 +410,8 @@ export function updateJob(id, patch) {
     'name', 'enabled', 'schedule_cron', 'schedule_tz',
     'session_target', 'agent_id', 'payload_kind', 'payload_message',
     'payload_model', 'payload_thinking', 'payload_timeout_seconds',
-    'overlap_policy', 'run_timeout_ms',
+    'execution_intent', 'execution_read_only',
+    'overlap_policy', 'run_timeout_ms', 'max_queued_dispatches', 'max_pending_approvals', 'max_trigger_fanout',
     'delivery_mode', 'delivery_channel', 'delivery_to',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
     'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
@@ -389,6 +419,7 @@ export function updateJob(id, patch) {
     'delivery_guarantee', 'job_class',
     'approval_required', 'approval_timeout_s', 'approval_auto',
     'context_retrieval', 'context_retrieval_limit',
+    'output_store_limit_bytes', 'output_excerpt_limit_bytes', 'output_summary_limit_bytes', 'output_offload_threshold_bytes',
     'preferred_session_key',
     'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
@@ -447,6 +478,9 @@ export function deleteJob(id) {
 export function runJobNow(id) {
   const job = getJob(id);
   if (!job) return null;
+  if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
+    throw new Error(`Dispatch backlog limit reached for ${job.name}`);
+  }
   const dispatch = enqueueDispatch(id, {
     kind: 'manual',
     scheduled_for: sqliteNow(-1000),
@@ -558,12 +592,14 @@ export function evalTriggerCondition(condition, content) {
  * Returns array of triggered children.
  */
 export function fireTriggeredChildren(parentId, status, content, parentRunId = null) {
+  const parentJob = getJob(parentId);
   const candidates = getTriggeredChildren(parentId, status);
   const triggered = [];
-  for (const child of candidates) {
+  for (const child of candidates.slice(0, parentJob?.max_trigger_fanout || 25)) {
     // Check output-based trigger condition if set
     if (!evalTriggerCondition(child.trigger_condition, content)) continue;
     const delay = child.trigger_delay_s || 0;
+    if (!canEnqueueDispatch(child.id, child.max_queued_dispatches || 25)) continue;
     const dispatch = enqueueDispatch(child.id, {
       kind: 'chain',
       scheduled_for: sqliteNow(delay > 0 ? delay * 1000 : -1000),
@@ -578,7 +614,13 @@ export function fireTriggeredChildren(parentId, status, content, parentRunId = n
  * Increment the queued dispatch counter for a job (overlap_policy=queue).
  */
 export function enqueueJob(jobId) {
+  const job = getJob(jobId);
+  if (!job) return { queued: false, queued_count: 0, limited: true };
+  if ((job.queued_count || 0) >= (job.max_queued_dispatches || 25)) {
+    return { queued: false, queued_count: job.queued_count || 0, limited: true };
+  }
   getDb().prepare('UPDATE jobs SET queued_count = queued_count + 1 WHERE id = ?').run(jobId);
+  return { queued: true, queued_count: (job.queued_count || 0) + 1, limited: false };
 }
 
 /**
@@ -650,6 +692,15 @@ export function scheduleRetry(job, failedRunId) {
   const retryCount = (failedRun?.retry_count || 0) + 1;
   // Exponential backoff: 30s, 60s, 120s, etc.
   const delaySec = 30 * Math.pow(2, retryCount - 1);
+  if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
+    if (!job.parent_id) {
+      db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
+        .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
+    } else {
+      db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
+    }
+    return { retryCount, delaySec, retryOf: failedRunId, dispatch: null, skipped: true };
+  }
   const dispatch = enqueueDispatch(job.id, {
     kind: 'retry',
     scheduled_for: sqliteNow(delaySec * 1000),
@@ -664,6 +715,20 @@ export function scheduleRetry(job, failedRunId) {
   }
   // Store retry metadata for the next run
   return { retryCount, delaySec, retryOf: failedRunId, dispatch };
+}
+
+export function getDispatchBacklogCount(jobId) {
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS cnt
+    FROM job_dispatch_queue
+    WHERE job_id = ?
+      AND status IN ('pending', 'claimed', 'awaiting_approval')
+  `).get(jobId);
+  return row?.cnt || 0;
+}
+
+export function canEnqueueDispatch(jobId, maxQueuedDispatches = 25) {
+  return getDispatchBacklogCount(jobId) < maxQueuedDispatches;
 }
 
 /**

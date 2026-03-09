@@ -49,6 +49,15 @@ export function listPendingApprovals() {
   `).all();
 }
 
+export function countPendingApprovalsForJob(jobId) {
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS cnt
+    FROM approvals
+    WHERE job_id = ? AND status = 'pending'
+  `).get(jobId);
+  return row?.cnt || 0;
+}
+
 /**
  * Resolve an approval (approve / reject / timed_out).
  */

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Scheduler CLI — manage jobs, runs, messages, agents
+import { readFileSync } from 'fs';
 import { initDb, getDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow, validateJobSpec } from './jobs.js';
-import { getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
+import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, listMessageReceipts, getTeamMessages,
@@ -40,6 +41,8 @@ Jobs:
 
 Runs:
   runs list <job-id> [limit]         List runs for a job
+  runs get <run-id>                  Get a run by id
+  runs output <run-id> [stdout|stderr]  Print offloaded or stored shell output
   runs running                       Currently running runs
   runs stale [threshold-s]           Stale runs
 
@@ -308,6 +311,28 @@ switch (command) {
           heartbeat: r.last_heartbeat,
         }));
         emit(jsonMode ? runs : rows, () => console.table(rows));
+        break;
+      }
+      case 'get': {
+        const run = getRun(args[0]);
+        if (!run) fail(`Run not found: ${args[0]}`);
+        emit(run);
+        break;
+      }
+      case 'output': {
+        const run = getRun(args[0]);
+        if (!run) fail(`Run not found: ${args[0]}`);
+        const kind = (args[1] || 'stdout').toLowerCase();
+        const pathField = kind === 'stderr' ? 'shell_stderr_path' : 'shell_stdout_path';
+        const textField = kind === 'stderr' ? 'shell_stderr' : 'shell_stdout';
+        const filePath = run[pathField];
+        const payload = filePath ? readFileSync(filePath, 'utf8') : (run[textField] || '');
+        if (jsonMode) {
+          emit({ ok: true, run_id: run.id, kind, file_path: filePath || null, content: payload });
+        } else {
+          process.stdout.write(payload);
+          if (!payload.endsWith('\n')) process.stdout.write('\n');
+        }
         break;
       }
       case 'running': {
@@ -808,10 +833,32 @@ switch (command) {
 
   // ── Status ──────────────────────────────────────────────
   case 'status': {
+    const db = getDb();
     const jobs = listJobs();
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
     const agents = listAgents();
+    const budget = db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM job_dispatch_queue WHERE status = 'pending') AS pending_dispatches,
+        (SELECT COUNT(*) FROM job_dispatch_queue WHERE status = 'awaiting_approval') AS approval_blocked_dispatches,
+        (SELECT COALESCE(SUM(queued_count), 0) FROM jobs) AS overlap_queued_dispatches,
+        (SELECT COUNT(*) FROM approvals WHERE status = 'pending') AS pending_approvals,
+        (SELECT COALESCE(SUM(shell_stdout_bytes + shell_stderr_bytes), 0) FROM runs) AS shell_output_bytes,
+        (SELECT COUNT(*) FROM runs WHERE shell_stdout_path IS NOT NULL OR shell_stderr_path IS NOT NULL) AS offloaded_shell_runs
+    `).get();
+    const hotJobs = db.prepare(`
+      SELECT
+        j.id, j.name, j.queued_count, j.max_queued_dispatches, j.max_pending_approvals,
+        (SELECT COUNT(*) FROM approvals a WHERE a.job_id = j.id AND a.status = 'pending') AS pending_approval_count,
+        (SELECT COUNT(*) FROM job_dispatch_queue q WHERE q.job_id = j.id AND q.status IN ('pending', 'claimed', 'awaiting_approval')) AS dispatch_backlog
+      FROM jobs j
+      WHERE
+        j.queued_count >= j.max_queued_dispatches
+        OR (SELECT COUNT(*) FROM approvals a WHERE a.job_id = j.id AND a.status = 'pending') >= j.max_pending_approvals
+      ORDER BY j.name
+      LIMIT 10
+    `).all();
     const nextJob = jobs
       .filter(j => j.enabled && j.next_run_at)
       .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0] || null;
@@ -820,6 +867,8 @@ switch (command) {
       jobs_enabled: jobs.filter(j => j.enabled).length,
       running_runs: runningRuns.length,
       stale_runs: stale.length,
+      budgets: budget,
+      budget_hotspots: hotJobs,
       agents: agents.map(a => ({
         id: a.id,
         status: a.status,
@@ -832,10 +881,24 @@ switch (command) {
       console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
       console.log(`Running:  ${runningRuns.length}`);
       console.log(`Stale:    ${stale.length}`);
+      console.log(`Dispatch: ${budget.pending_dispatches} pending, ${budget.approval_blocked_dispatches} approval-blocked, ${budget.overlap_queued_dispatches} overlap-queued`);
+      console.log(`Approvals:${budget.pending_approvals} pending`);
+      console.log(`Output:   ${budget.shell_output_bytes} bytes stored/offloaded across runs (${budget.offloaded_shell_runs} offloaded runs)`);
       console.log(`Agents:   ${agents.length}`);
       for (const a of agents) {
         const unread = getUnreadCount(a.id);
         console.log(`  ${a.id}: ${a.status}${unread ? ` (${unread} unread)` : ''}`);
+      }
+      if (hotJobs.length > 0) {
+        console.log('\nBudget hotspots:');
+        console.table(hotJobs.map(job => ({
+          name: job.name,
+          dispatchBacklog: job.dispatch_backlog,
+          queuedCount: job.queued_count,
+          maxQueued: job.max_queued_dispatches,
+          pendingApprovals: job.pending_approval_count,
+          maxApprovals: job.max_pending_approvals,
+        })));
       }
       if (nextJob) console.log(`\nNext:     ${nextJob.name} at ${nextJob.next_run_at}`);
     });
