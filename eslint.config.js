@@ -23,9 +23,13 @@ export default [
       },
     },
     rules: {
-      'no-unused-vars': 'off',
-      'no-constant-condition': 'off',
-      'no-empty': 'off',
+      'no-unused-vars': ['error', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+        caughtErrorsIgnorePattern: '^_',
+      }],
+      'no-constant-condition': 'error',
+      'no-empty': ['error', { allowEmptyCatch: true }],
     },
   },
 ];

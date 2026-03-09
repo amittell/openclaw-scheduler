@@ -2,7 +2,7 @@
 // Scheduler CLI — manage jobs, runs, messages, agents
 import { readFileSync } from 'fs';
 import { initDb, getDb } from './db.js';
-import { createJob, getJob, listJobs, updateJob, deleteJob, getChildJobs, cancelJob, runJobNow, validateJobSpec } from './jobs.js';
+import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
@@ -475,7 +475,6 @@ switch (command) {
         const agent = args[0] || 'main';
         const limit = parseInt(args[1] || '50', 10);
         const msgs = getInbox(agent, { limit, includeDelivered: true });
-        const pending = msgs.filter(m => m.status === 'pending');
         const delivered = msgs.filter(m => m.status === 'delivered');
         const unread = getUnreadCount(agent);
         console.log(`\nQueue for agent: ${agent} | ${unread} pending | ${delivered.length} delivered (showing last ${limit})\n`);
@@ -668,7 +667,7 @@ switch (command) {
 
   // ── Idempotency ────────────────────────────────────────
   case 'idem': {
-    const { listIdempotencyForJob, getIdempotencyEntry, releaseIdempotencyKey, forcePruneIdempotency, checkIdempotencyKey } = await import('./idempotency.js');
+    const { listIdempotencyForJob, getIdempotencyEntry, releaseIdempotencyKey, forcePruneIdempotency } = await import('./idempotency.js');
     switch (sub) {
       case 'status': {
         if (!args[0]) { console.error('Usage: idem status <job-id>'); process.exit(1); }

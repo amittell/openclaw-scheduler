@@ -37,15 +37,6 @@ const INDEX_PATH = join(__dirname, 'index.mjs');
 const LABELS_PATH = join(__dirname, 'labels.json');
 const HOME_DIR = process.env.HOME || homedir();
 
-function loadConfig() {
-  try {
-    const cfgPath = join(__dirname, 'config.json');
-    return JSON.parse(readFileSync(cfgPath, 'utf-8'));
-  } catch { return {}; }
-}
-const config = loadConfig();
-const BRAND = config.name ?? 'dispatch';
-
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
@@ -259,7 +250,7 @@ function respawnSession(label) {
     // is preserved and we send a continuation message.
     const continuationMsg = `[Auto-retry after 529 overload] Please continue your previous task. Pick up where you left off.`;
 
-    const result = execFileSync('node', [
+    execFileSync('node', [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,

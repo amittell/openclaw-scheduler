@@ -31,7 +31,7 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
-import { emitEvent, onStarted, onFinished, onStuck } from './hooks.mjs';
+import { onStarted, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();

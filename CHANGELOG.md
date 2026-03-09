@@ -12,6 +12,7 @@ First public release.
 - Structured shell result persistence on runs: exit code, signal, timeout flag, stdout, and stderr
 - Richer shell-failure context for triggered follow-up jobs and agent triage flows
 - CLI improvements for machine use and release readiness, including `--json`, `jobs validate`, schema introspection, and improved npm-install defaults
+- Safe typed root exports for programmatic tooling (`index.js` + `index.d.ts`)
 
 ### Fixed
 - Shell timeouts are now classified correctly as `timeout`, with `shell_timed_out` persisted on runs
@@ -19,12 +20,15 @@ First public release.
 - Consolidated migration skip logic now checks for actual column presence instead of relying on version markers alone
 - Runtime startup version logging now reads from `package.json` instead of a stale hardcoded string
 - Public-facing docs/examples no longer include private hostnames or deployment-specific Telegram identifiers
+- Node 20 compatibility by removing runtime dependence on `node:sqlite` and JSON import attributes
 
 ### Changed
 - Schema baseline is now `v14`
 - Added execution-intent fields, queue / approval / fan-out caps, shell-output offloading, and runtime budget visibility
+- Tightened ESLint rules, added TypeScript declaration smoke tests, and enforced global coverage floors
+- Extracted dispatcher approvals, delivery, maintenance, and shell helpers into dedicated modules
 - Versioning reset to `0.1.0` as the first public release
-- Updated verification baseline to `574 passed, 0 failed`
+- Updated verification baseline to `581 passed, 0 failed`
 
 ## Pre-public development milestones
 

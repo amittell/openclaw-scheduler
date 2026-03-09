@@ -15,8 +15,6 @@
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { createHash } from 'crypto';
-import { exec as execCb } from 'child_process';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 import {
   generateIdempotencyKey as _genIdemKey,
@@ -35,20 +33,20 @@ const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
 import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
-  updateHeartbeat, updateRunSession, pruneRuns, updateContextSummary
+  updateRunSession, pruneRuns, updateContextSummary
 } from './runs.js';
 import {
   getInbox, markDelivered,
-  expireMessages, pruneMessages, getUnreadCount
+  expireMessages, pruneMessages
 } from './messages.js';
 import {
-  createApproval, getPendingApproval, listPendingApprovals,
+  createApproval, getPendingApproval,
   resolveApproval, getTimedOutApprovals, pruneApprovals, countPendingApprovalsForJob
 } from './approval.js';
 import { buildRetrievalContext } from './retrieval.js';
-import { upsertAgent, setAgentStatus, touchAgent, getAgent } from './agents.js';
+import { upsertAgent, setAgentStatus } from './agents.js';
 import {
-  runAgentTurn, runAgentTurnWithActivityTimeout, sendSystemEvent, listSessions, getAllSubAgentSessions,
+  runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
 } from './gateway.js';
 import { normalizeShellResult } from './shell-result.js';
@@ -57,15 +55,26 @@ import {
 } from './dispatch-queue.js';
 import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
-  touchAgentHeartbeat, registerAgentSession,
+  touchAgentHeartbeat,
 } from './task-tracker.js';
 import { mapTeamMessages, checkTeamTaskGates } from './team-adapter.js';
 import { buildTriggeredRunContext } from './prompt-context.js';
-
-// ── Helpers ─────────────────────────────────────────────────
-function sqliteNow(offsetMs = 0) {
-  return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-}
+import { runShellCommand } from './dispatcher-shell.js';
+import {
+  sqliteNow,
+  adaptiveDeferralMs,
+  buildExecutionIntentNote,
+  matchesSentinel,
+  detectTransientError,
+  getBackoffMs,
+} from './dispatcher-utils.js';
+import { createDeliveryHelpers } from './dispatcher-delivery.js';
+import { checkApprovals } from './dispatcher-approvals.js';
+import {
+  checkRunHealth,
+  checkTaskTrackers,
+  deliverPendingMessages,
+} from './dispatcher-maintenance.js';
 
 // ── Idempotency Key Wrappers ────────────────────────────────
 // The shared module (idempotency.js) uses jobId strings; dispatcher wraps with job objects.
@@ -80,33 +89,6 @@ const releaseIdempotencyKey = _releaseIdemKey;
 const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
-// ── Shell Command Runner ────────────────────────────────────
-// Platform-aware shell defaults:
-// - macOS: /bin/zsh
-// - Linux/WSL: /bin/bash
-// - Windows: cmd.exe
-// Override with SCHEDULER_SHELL env var.
-const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
-  || (process.platform === 'darwin'
-    ? '/bin/zsh'
-    : process.platform === 'win32'
-      ? 'cmd.exe'
-      : '/bin/bash');
-
-function runShellCommand(cmd, timeoutMs = 300000) {
-  return new Promise((resolve) => {
-    execCb(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024, shell: DEFAULT_SHELL }, (err, stdout, stderr) => {
-      resolve({
-        stdout: stdout || '',
-        stderr: stderr || '',
-        exitCode: Number.isInteger(err?.code) ? err.code : 0,
-        signal: err?.signal || null,
-        error: err || null,
-      });
-    });
-  });
-}
-
 // ── Config ──────────────────────────────────────────────────
 const TICK_INTERVAL_MS = parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10);
 const STALE_THRESHOLD_S = parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '90', 10);
@@ -115,27 +97,6 @@ const MESSAGE_DELIVERY_MS = parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS |
 const PRUNE_INTERVAL_MS = parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10);
 const BACKUP_INTERVAL_MS = parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10); // 5 min
 const LOG_PREFIX = '[scheduler]';
-
-function adaptiveDeferralMs(backlogDepth, baseMs = TICK_INTERVAL_MS) {
-  const multiplier = Math.max(1, Math.min(12, backlogDepth + 1));
-  return Math.min(300000, baseMs * multiplier);
-}
-
-function buildExecutionIntentNote(job) {
-  if (job.execution_intent !== 'plan' && !job.execution_read_only) return '';
-  const lines = [
-    '[SYSTEM NOTE — execution boundary]',
-    job.execution_intent === 'plan'
-      ? 'This run is planning-only. Analyze, reason, and propose actions, but do not execute external side effects.'
-      : 'This run is read-only. Inspect and summarize state, but do not execute external side effects.',
-  ];
-  if (job.execution_read_only) {
-    lines.push('Treat every write, send, post, mutation, or shelling out for side effects as forbidden.');
-  }
-  lines.push('If a concrete change is needed, describe it as a recommendation instead of performing it.');
-  lines.push('[END SYSTEM NOTE]');
-  return lines.join('\n');
-}
 
 // ── State ───────────────────────────────────────────────────
 let running = true;
@@ -153,6 +114,12 @@ function log(level, msg, meta) {
   const line = `${ts} ${LOG_PREFIX} [${level}] ${msg}${metaStr}\n`;
   process.stderr.write(line);
 }
+
+const { handleDelivery } = createDeliveryHelpers({
+  log,
+  deliverMessage,
+  resolveDeliveryAlias,
+});
 
 // ── Replay orphaned runs on startup ─────────────────────────
 async function replayOrphanedRuns() {
@@ -200,104 +167,6 @@ async function replayOrphanedRuns() {
   }
 }
 
-// ── Check approval gates ────────────────────────────────────
-async function checkApprovals() {
-  // 1. Handle timed-out approvals
-  try {
-    const timedOut = getTimedOutApprovals();
-    for (const approval of timedOut) {
-      const job = getJob(approval.job_id);
-      if (!job) continue;
-
-      if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
-        resolveApproval(approval.id, 'approved', 'timeout');
-        log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
-        if (approval.run_id) {
-          getDb().prepare(`
-            UPDATE runs
-            SET status = 'approved',
-                finished_at = datetime('now'),
-                summary = COALESCE(summary, 'Approval granted (timeout auto-approve)')
-            WHERE id = ? AND status IN ('awaiting_approval', 'pending')
-          `).run(approval.run_id);
-        }
-        await dispatchJob(job, {
-          approvalBypass: true,
-          dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
-        });
-        getDb().prepare(`
-          UPDATE approvals
-          SET status = 'dispatched',
-              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
-          WHERE id = ? AND status = 'approved'
-        `).run(approval.id);
-      } else {
-        // Default: reject on timeout
-        resolveApproval(approval.id, 'timed_out', 'timeout');
-        if (approval.dispatch_queue_id) setDispatchStatus(approval.dispatch_queue_id, 'cancelled');
-        if (approval.run_id) {
-          getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
-        }
-        log('info', `Approval timed out (rejected): ${approval.job_name || job.name}`, { approvalId: approval.id });
-      }
-    }
-  } catch (err) {
-    log('error', `Approval timeout check error: ${err.message}`);
-  }
-
-  // 2. Check for newly approved approvals (operator approved via CLI)
-  try {
-    const db = getDb();
-    const approved = db.prepare(`
-      SELECT a.*, j.name as job_name
-      FROM approvals a
-      JOIN jobs j ON a.job_id = j.id
-      LEFT JOIN runs r ON a.run_id = r.id
-      WHERE a.status = 'approved'
-        AND (a.run_id IS NULL OR r.status IN ('awaiting_approval', 'pending'))
-    `).all();
-
-    for (const approval of approved) {
-      const job = getJob(approval.job_id);
-      if (!job) continue;
-      if (approval.run_id) {
-        db.prepare(`
-          UPDATE runs
-          SET status = 'approved',
-              finished_at = datetime('now'),
-              summary = COALESCE(summary, 'Approved by operator')
-          WHERE id = ? AND status IN ('awaiting_approval', 'pending')
-        `).run(approval.run_id);
-      }
-      log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
-      await dispatchJob(job, {
-        approvalBypass: true,
-        dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
-      });
-      db.prepare(`
-        UPDATE approvals
-        SET status = 'dispatched',
-            notes = COALESCE(notes, 'Approved and dispatched by scheduler')
-        WHERE id = ? AND status = 'approved'
-      `).run(approval.id);
-    }
-  } catch (err) {
-    log('error', `Approval dispatch error: ${err.message}`);
-  }
-}
-
-// ── Sentinel Matching ────────────────────────────────────────
-/**
- * Check if content matches a sentinel token at the start of the string.
- * Matches "TOKEN" exactly, or "TOKEN" followed by whitespace/colon (e.g. "TOKEN: detail").
- * Does NOT match "TOKENfoo" — requires word boundary after the token.
- */
-function matchesSentinel(content, token) {
-  if (!content) return false;
-  const re = new RegExp(`^${token}(?:$|[\\s:])`);
-  return re.test(content.trim());
-}
-
 // ── Triggered Children Helper ───────────────────────────────
 /**
  * Fire triggered children for a completed run and track chain idempotency keys.
@@ -312,41 +181,6 @@ function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') 
     });
   }
   return triggered;
-}
-
-// ── Transient Error Detection ────────────────────────────────
-// Patterns that indicate the agent received a transient service error
-// rather than producing a meaningful response. These should NOT trigger
-// delete_after_run or count as successful completions.
-const TRANSIENT_ERROR_PATTERNS = [
-  /\btemporarily overloaded\b/i,
-  /\bservice\s+(?:is\s+)?unavailable\b/i,
-  /\brate\s*limit(?:ed|s?)?\b/i,
-  /\btoo\s+many\s+requests\b/i,
-  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error\b/i,
-  /\bgateway\s+timeout\b/i,
-  /\bbad\s+gateway\b/i,
-  /\bmodel\s+(?:is\s+)?(?:overloaded|unavailable)\b/i,
-  /\bAPI\s+(?:error|unavailable|timeout)\b/i,
-  /\bcapacity\s+(?:exceeded|limit)\b/i,
-  /\bretry\s+(?:after|later|in\s+\d)\b/i,
-  /\bcontext\s+(?:length|window)\s+exceeded\b/i,
-  /\btoken\s+limit\s+exceeded\b/i,
-];
-
-/**
- * Detect if agent reply content contains known transient/service error patterns.
- * Returns true if the content looks like a transient error rather than a real response.
- * 
- * Heuristic: only flag short responses (< 500 chars) that match patterns.
- * Long responses that happen to mention "rate limit" in passing are likely real work.
- */
-function detectTransientError(content) {
-  if (!content || !content.trim()) return false;
-  const trimmed = content.trim();
-  // Only flag short responses — a 2000-char response mentioning "rate limit" is probably real
-  if (trimmed.length > 500) return false;
-  return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
 }
 
 // ── Dispatch a single job ───────────────────────────────────
@@ -999,42 +833,6 @@ function buildJobPrompt(job, run) {
   return { prompt: parts.join('\n'), contextMeta };
 }
 
-// ── Alias resolution ────────────────────────────────────────
-/**
- * Resolve a delivery alias from the delivery_aliases table.
- * Accepts '@name' or bare 'name'. Returns { channel, target } or null.
- */
-function resolveAlias(target) {
-  if (!target) return null;
-  return resolveDeliveryAlias(target);
-}
-
-// ── Deliver run output to channel ───────────────────────────
-async function handleDelivery(job, content) {
-  if (!['announce', 'announce-always'].includes(job.delivery_mode)) return;
-  if (!job.delivery_channel && !job.delivery_to) return;
-
-  let channel = job.delivery_channel;
-  let target = job.delivery_to;
-
-  // Resolve alias before delivery (e.g. '@team_room' → telegram/-1000000001)
-  if (target) {
-    const resolved = resolveAlias(target);
-    if (resolved) {
-      channel = resolved.channel;
-      target = resolved.target;
-      log('info', `Resolved alias '${job.delivery_to}' → ${channel}/${target}`);
-    }
-  }
-
-  try {
-    await deliverMessage(channel, target, content);
-    log('info', `Delivered: ${job.name}`, { channel, to: target });
-  } catch (err) {
-    log('error', `Delivery failed: ${job.name}: ${err.message}`);
-  }
-}
-
 // ── Advance next_run_at ─────────────────────────────────────
 function advanceNextRun(job) {
   const nextRun = nextRunFromCron(job.schedule_cron, job.schedule_tz);
@@ -1072,142 +870,6 @@ function updateJobAfterRun(job, status) {
     log('info', `Deleting one-shot: ${job.name}`);
     deleteJob(job.id);
   }
-}
-
-function getBackoffMs(n) {
-  const b = [30_000, 60_000, 300_000, 900_000, 3_600_000];
-  return b[Math.min(n - 1, b.length - 1)];
-}
-
-// ── Health check for running runs ───────────────────────────
-async function checkRunHealth() {
-  const runningRuns = getRunningRuns();
-  if (runningRuns.length === 0) return;
-
-  log('debug', `Checking ${runningRuns.length} running run(s)`);
-
-  // With chat completions dispatch, runs complete synchronously.
-  // But if something hangs, the stale/timeout checks still apply.
-
-  // Stale detection
-  const staleRuns = getStaleRuns(STALE_THRESHOLD_S);
-  for (const run of staleRuns) {
-    log('warn', `Stale run: ${run.job_name}`, { runId: run.id });
-    finishRun(run.id, 'timeout', {
-      error_message: `No activity for ${STALE_THRESHOLD_S}s`,
-    });
-    const job = getJob(run.job_id);
-    if (job) {
-      updateJobAfterRun(job, 'timeout');
-      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-        await handleDelivery(job, `⏱ Job timed out (stale): ${job.name}\n\nNo activity for ${STALE_THRESHOLD_S}s`);
-      }
-      if (dequeueJob(job.id)) {
-        log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout)`);
-      }
-    }
-  }
-
-  // Absolute timeout
-  const timedOut = getTimedOutRuns();
-  for (const run of timedOut) {
-    log('warn', `Timed out: ${run.job_name}`, { runId: run.id, timeoutMs: run.run_timeout_ms });
-    finishRun(run.id, 'timeout', {
-      error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,
-    });
-    const job = getJob(run.job_id);
-    if (job) {
-      updateJobAfterRun(job, 'timeout');
-      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-        await handleDelivery(job, `⏱ Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
-      }
-      if (dequeueJob(job.id)) {
-        log('info', `Dequeued pending dispatch for ${job.name} (after absolute timeout)`);
-      }
-    }
-  }
-}
-
-// ── Task tracker dead-man's-switch ──────────────────────────
-async function checkTaskTrackers() {
-  try {
-    // 0. Auto-correlate: match live OC sub-agent sessions → tracker agents
-    //    This means sub-agents don't have to actively heartbeat —
-    //    as long as their session is alive, they're counted as running.
-    try {
-      const db = getDb();
-      const activeSessions = await getAllSubAgentSessions(10);
-      if (activeSessions.length > 0) {
-        for (const session of activeSessions) {
-          const sessionKey = session.key || session.sessionKey;
-          if (!sessionKey) continue;
-
-          // Find any tracker agent registered with this session key
-          const agent = db.prepare(`
-            SELECT a.tracker_id, a.agent_label
-            FROM task_tracker_agents a
-            JOIN task_tracker t ON a.tracker_id = t.id
-            WHERE a.session_key = ? AND a.status IN ('pending', 'running') AND t.status = 'active'
-          `).get(sessionKey);
-
-          if (agent) {
-            touchAgentHeartbeat(agent.tracker_id, agent.agent_label);
-            log('debug', `Auto-heartbeat: ${agent.agent_label} (session active)`);
-          }
-        }
-      }
-    } catch (corrErr) {
-      log('debug', `Session auto-correlation skipped: ${corrErr.message}`);
-    }
-
-    // 1. Check for dead agents across all active groups
-    const deadAgents = checkDeadAgents();
-    if (deadAgents.length > 0) {
-      log('warn', `Marked ${deadAgents.length} dead agent(s)`, {
-        agents: deadAgents.map(d => `${d.tracker_id.slice(0, 8)}/${d.agent_label}`),
-      });
-    }
-
-    // 2. Check completion for each active group
-    const activeGroups = listActiveTaskGroups();
-    for (const group of activeGroups) {
-      const result = checkGroupCompletion(group.id);
-      if (result) {
-        const status = getTaskGroupStatus(group.id);
-        const emoji = result.status === 'completed' ? '✅' : '❌';
-        const msg = `${emoji} Task group "${group.name}" ${result.status}\n\n${result.summary || ''}`;
-        log('info', `Task group ${result.status}: ${group.name}`, { trackerId: group.id });
-
-        // Deliver summary if delivery channel is configured
-        if (group.delivery_channel && group.delivery_to) {
-          try {
-            let channel = group.delivery_channel;
-            let target = group.delivery_to;
-            const resolved = resolveDeliveryAlias(target);
-            if (resolved) {
-              channel = resolved.channel;
-              target = resolved.target;
-            }
-            await deliverMessage(channel, target, msg);
-            log('info', `Task tracker summary delivered`, { channel, target, trackerId: group.id });
-          } catch (err) {
-            log('error', `Task tracker delivery failed: ${err.message}`, { trackerId: group.id });
-          }
-        }
-      }
-    }
-  } catch (err) {
-    log('error', `Task tracker check error: ${err.message}`);
-  }
-}
-
-// ── Message delivery loop ───────────────────────────────────
-async function deliverPendingMessages() {
-  // Expire old messages
-  expireMessages();
-
-  // For now, messages are delivered inline with job prompts (buildJobPrompt).
-  // Future: deliver high-priority messages immediately via system event or chat.
 }
 
 // ── Main tick ───────────────────────────────────────────────
@@ -1259,10 +921,34 @@ async function tick() {
   // 2. Health check + approval gates (every HEARTBEAT_CHECK_MS)
   if (now - lastHeartbeatCheck >= HEARTBEAT_CHECK_MS) {
     lastHeartbeatCheck = now;
-    try { await checkRunHealth(); } catch (err) {
+    try {
+      await checkRunHealth({
+        log,
+        getRunningRuns,
+        getStaleRuns,
+        getTimedOutRuns,
+        finishRun,
+        getJob,
+        updateJobAfterRun,
+        handleDelivery,
+        dequeueJob,
+        staleThresholdSeconds: STALE_THRESHOLD_S,
+      });
+    } catch (err) {
       log('error', `Health check error: ${err.message}`);
     }
-    try { await checkApprovals(); } catch (err) {
+    try {
+      await checkApprovals({
+        log,
+        getDb,
+        getTimedOutApprovals,
+        getJob,
+        resolveApproval,
+        dispatchJob,
+        getDispatch,
+        setDispatchStatus,
+      });
+    } catch (err) {
       log('error', `Approval check error: ${err.message}`);
     }
   }
@@ -1321,10 +1007,25 @@ async function tick() {
     } catch (err) {
       log('error', `Team gate check error: ${err.message}`);
     }
-    try { await deliverPendingMessages(); } catch (err) {
+    try {
+      deliverPendingMessages({ expireMessages });
+    } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
     }
-    try { await checkTaskTrackers(); } catch (err) {
+    try {
+      await checkTaskTrackers({
+        log,
+        getDb,
+        getAllSubAgentSessions,
+        touchAgentHeartbeat,
+        checkDeadAgents,
+        listActiveTaskGroups,
+        checkGroupCompletion,
+        getTaskGroupStatus,
+        resolveDeliveryAlias,
+        deliverMessage,
+      });
+    } catch (err) {
       log('error', `Task tracker error: ${err.message}`);
     }
   }

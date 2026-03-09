@@ -19,7 +19,7 @@
  *   1 — error
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
@@ -31,7 +31,6 @@ const INDEX_PATH = join(__dirname, 'index.mjs');
 const HOME_DIR = process.env.HOME || homedir();
 
 const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 30000;
 // Only recover errors that happened within the last 60 minutes
 // (don't revive ancient failures)
 const MAX_ERROR_AGE_MS = 60 * 60 * 1000;
@@ -123,9 +122,7 @@ function respawnSession(label, entry) {
 const labels = loadLabels();
 const now = Date.now();
 const results = [];
-let anyRetried = false;
-
-for (const [name, entry] of Object.entries(labels)) {
+  for (const [name, entry] of Object.entries(labels)) {
   // Only look at error-state sessions
   if (entry.status !== 'error') continue;
 
@@ -177,7 +174,6 @@ for (const [name, entry] of Object.entries(labels)) {
     }
     notify(`🌶️ Dispatch 529 recovery: [${name}] retried (${newRetryCount}/${MAX_RETRIES}) via ${method}`);
     results.push({ label: name, action: 'retried', method, retryCount: newRetryCount });
-    anyRetried = true;
   } else {
     notify(`🌶️ Dispatch 529 recovery: [${name}] retry FAILED (${newRetryCount}/${MAX_RETRIES})`);
     results.push({ label: name, action: 'retry_failed', retryCount: newRetryCount });

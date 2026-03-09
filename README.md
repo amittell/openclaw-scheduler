@@ -1,8 +1,8 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-574%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-581%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Node](https://img.shields.io/badge/node-%E2%89%A522-green)]()
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-green)]()
 
 A durable orchestration runtime for [OpenClaw](https://openclaw.ai) agents and shell workflows. Use it when built-in cron and heartbeat stop being enough: jobs fail and disappear into logs, shell scripts depend on gateway uptime, multi-step workflows need retries and approvals, and you want a real audit trail for what ran, what failed, and what triggered what.
 
@@ -11,8 +11,8 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Repo:** `github.com/amittell/openclaw-scheduler`
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
-**Runtime:** Node.js (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 574 (full suite, in-memory SQLite + dispatcher integration)
+**Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
+**Tests:** 581 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -135,9 +135,16 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 574 passed, 0 failed
+npm test                             # should print: 581 passed, 0 failed
 npm run lint                         # static checks
+npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
+```
+
+The package also exports a small safe programmatic API surface for tooling:
+
+```js
+import { db, jobs, runs, shellResults } from 'openclaw-scheduler';
 ```
 
 Then run the interactive setup wizard:

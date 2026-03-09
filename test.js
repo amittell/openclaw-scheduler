@@ -17,14 +17,14 @@ import {
   shouldRetry, scheduleRetry, cancelJob,
   enqueueJob, dequeueJob, runJobNow,
   hasRunningRunForPool, evalTriggerCondition,
-  validateJobPayload, validateJobSpec
+  validateJobSpec
 } from './jobs.js';
 import {
   getDispatch, getDueDispatches, listDispatchesForJob,
 } from './dispatch-queue.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
-  getStaleRuns, getTimedOutRuns, getRunningRuns,
+  getStaleRuns, getTimedOutRuns,
   updateHeartbeat, pruneRuns,
   getRunningRunsByPool
 } from './runs.js';
@@ -40,6 +40,7 @@ import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch
 import { buildTriggeredRunContext } from './prompt-context.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
+import * as publicApi from './index.js';
 
 // ── Test harness ────────────────────────────────────────────
 let passed = 0;
@@ -99,6 +100,9 @@ assert(tables.includes('message_receipts'), 'message_receipts table');
 assert(tables.includes('team_tasks'), 'team_tasks table');
 assert(tables.includes('team_mailbox_events'), 'team_mailbox_events table');
 assert(tables.includes('job_dispatch_queue'), 'job_dispatch_queue table');
+assert(typeof publicApi.db.initDb === 'function', 'public API exports db namespace');
+assert(typeof publicApi.jobs.createJob === 'function', 'public API exports jobs namespace');
+assert(typeof publicApi.shellResults.normalizeShellResult === 'function', 'public API exports shell result helpers');
 
 // Verify v3 columns exist
 const jobCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -493,6 +497,8 @@ assert(childSuccess.parent_id === parent.id, 'child parent_id set');
 assert(childSuccess.trigger_on === 'success', 'trigger_on = success');
 assert(childSuccess.schedule_cron === '0 0 31 2 *', 'child gets dummy cron');
 assert(childSuccess.next_run_at === null, 'child starts with null next_run_at');
+assert(childFailure.trigger_on === 'failure', 'trigger_on = failure');
+assert(childComplete.trigger_on === 'complete', 'trigger_on = complete');
 
 // getChildJobs
 assert(getChildJobs(parent.id).length === 3, 'getChildJobs returns 3');
@@ -1261,7 +1267,7 @@ console.log('\n── v5: Typed Messages ──');
 console.log('\n── v5: Approval Gates ──');
 {
   // Import approval module
-  const { createApproval, getApproval, getPendingApproval, listPendingApprovals, resolveApproval, pruneApprovals } = await import('./approval.js');
+  const { createApproval, getPendingApproval, listPendingApprovals, resolveApproval } = await import('./approval.js');
 
   const j = createJob({ name: 'approval-job', schedule_cron: '0 * * * *', payload_message: 'test', approval_required: 1, approval_timeout_s: 60, approval_auto: 'reject' });
   assert(j.approval_required === 1, 'approval_required stored');
