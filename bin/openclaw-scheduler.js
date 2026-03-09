@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'child_process';
+import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -61,8 +62,8 @@ if (cmd === 'webhook-check') {
 }
 
 if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
-  const pkg = await import(join(root, 'package.json'), { with: { type: 'json' } });
-  process.stdout.write(`${pkg.default.name} ${pkg.default.version}\n`);
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  process.stdout.write(`${pkg.name} ${pkg.version}\n`);
   process.exit(0);
 }
 

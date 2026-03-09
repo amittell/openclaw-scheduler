@@ -61,10 +61,10 @@ If `better-sqlite3` fails: `xcode-select --install` (macOS).
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 488 tests
+SCHEDULER_DB=:memory: node test.js  # 576 tests
 ```
 
-**All tests must pass before proceeding.** Total: 488 tests.
+**All tests must pass before proceeding.** Total: 576 tests.
 
 ---
 
@@ -122,14 +122,11 @@ openclaw gateway restart
 ## Step 7: Install LaunchAgent
 
 ```bash
-cp ai.openclaw.scheduler.plist ~/Library/LaunchAgents/
-```
-
-Edit the plist — replace `YOUR_USER` and `YOUR_GATEWAY_TOKEN`:
-
-```bash
+mkdir -p ~/Library/LaunchAgents
 nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 ```
+
+Create or edit the plist — replace `YOUR_USER` and `YOUR_GATEWAY_TOKEN`:
 
 The template looks like:
 
@@ -290,7 +287,7 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 488/488
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 576/576
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors
