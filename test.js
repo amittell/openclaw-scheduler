@@ -2993,8 +2993,7 @@ console.log('\n── Sessions.json Detection ──');
   assert(statusObjAbsent.ok === true, 'sessions.json absent: status ok');
   assert(statusObjAbsent.status === 'done', 'sessions.json absent: auto-resolved to done');
 
-  const { rmSync: rm2 } = await import('fs');
-  rm2(testTmpDir, { recursive: true, force: true });
+  rmSync(testTmpDir, { recursive: true, force: true });
 }
 
 console.log('\n── Done Subcommand ──');
@@ -3073,8 +3072,7 @@ console.log('\n── Done Subcommand ──');
   assert(indexSrc.includes('cmdDone'), 'done subcommand: cmdDone function defined');
   assert(indexSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
 
-  const { rmSync: rm3 } = await import('fs');
-  rm3(tempDone, { recursive: true, force: true });
+  rmSync(tempDone, { recursive: true, force: true });
 }
 
 
