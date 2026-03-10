@@ -3038,19 +3038,23 @@ console.log('\n── Done Subcommand ──');
   assert(updatedLabels['my-task'].status === 'done', 'done subcommand: labels.json updated to done');
   assert(updatedLabels['my-task'].summary === 'all done!', 'done subcommand: labels.json summary updated');
 
-  // done with missing label → exits 1
-  let threwMissingLabel = false;
-  try {
-    execFileSync(process.execPath, [indexPath, 'done', '--label', 'nonexistent-label-xyz'], {
-      encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
-      timeout: 5000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch (err) {
-    threwMissingLabel = (err.status === 1);
+  // done with unregistered label → exits 0 and marks as done (not an error)
+  // NOTE: Changed from exits-1 in 07838b6: unregistered labels are valid for
+  //       direct subagent spawns that weren't tracked via enqueue.
+  {
+    const unregRaw = execFileSync(process.execPath,
+      [indexPath, 'done', '--label', 'nonexistent-label-xyz', '--summary', 'finished'],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 5000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    );
+    const unregResult = JSON.parse(unregRaw.trim());
+    assert(unregResult.ok === true, 'done subcommand: exits 0 for unregistered label (not an error)');
+    assert(unregResult.status === 'done', 'done subcommand: unregistered label marked done');
   }
-  assert(threwMissingLabel, 'done subcommand: exits 1 for nonexistent label');
 
   // done without --label → exits 2
   let threwNoLabel = false;

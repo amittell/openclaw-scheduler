@@ -1136,6 +1136,29 @@ async function cmdDone(flags) {
     // This is not an error — the work completed, the label just wasn't tracked.
     process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" — registering as done\n`);
     setLabel(label, { status: 'done', summary });
+
+    // No watcher is polling for this label, so actively notify via the gateway
+    // post office using delivery config from config.json as fallback target.
+    const deliverTo      = config.deliverTo      ?? null;
+    const deliveryChannel = config.deliveryChannel ?? null;
+
+    if (deliverTo) {
+      await onFinished({
+        label,
+        job_id:      null,
+        run_id:      null,
+        agent:       'main',
+        status:      'ok',
+        duration_ms: 0,
+        session_key: null,
+        summary,
+        deliverTo,
+        deliveryChannel,
+      }).catch(() => {});
+    } else {
+      process.stderr.write(`[${BRAND}] warn: no deliverTo in config — completion not delivered for "${label}"\n`);
+    }
+
     out({ ok: true, label, status: 'done', summary, message: 'Label not previously registered; marked done.' });
     return;
   }
