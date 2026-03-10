@@ -30,7 +30,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
   readFileSync(join(__dirname, 'package.json'), 'utf8')
 );
-import { getDueJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
+import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateRunSession, pruneRuns, updateContextSummary
@@ -911,6 +911,7 @@ function advanceNextRun(job) {
 function updateJobAfterRun(job, status) {
   // Re-read from DB to get current state (avoids stale consecutive_errors during retries)
   const freshJob = getJob(job.id);
+  if (!freshJob) return; // Job was already deleted (e.g. delete_after_run race)
   const currentErrors = freshJob?.consecutive_errors || 0;
   const patch = { last_run_at: sqliteNow(), last_status: status };
 
@@ -920,7 +921,21 @@ function updateJobAfterRun(job, status) {
     patch.consecutive_errors = 0;
   }
 
-  // Advance schedule
+  // At-jobs (one-shot): don't advance cron schedule — delete or disable
+  if (freshJob.schedule_kind === 'at') {
+    if (freshJob.delete_after_run) {
+      updateJob(job.id, patch);
+      log('info', `Deleting one-shot at-job: ${job.name}`, { jobId: job.id });
+      deleteJob(job.id);
+    } else {
+      patch.enabled = 0; // Disable so it won't fire again via getDueAtJobs
+      updateJob(job.id, patch);
+      log('info', `Disabling completed at-job: ${job.name}`, { jobId: job.id });
+    }
+    return;
+  }
+
+  // Cron job: advance schedule
   const nextRun = nextRunFromCron(job.schedule_cron, job.schedule_tz);
   patch.next_run_at = nextRun;
 
@@ -960,6 +975,18 @@ async function tick() {
         const deferredAt = new Date(Date.now() + 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
         updateJob(job.id, { next_run_at: deferredAt });
         log('info', `Deferred isolated job while gateway is down: ${job.name}`, { jobId: job.id, nextRunAt: deferredAt });
+        continue;
+      }
+      await dispatchJob(job);
+    }
+
+    // 1b. Dispatch due at-jobs (one-shot scheduling)
+    const dueAtJobs = getDueAtJobs();
+    for (const job of dueAtJobs) {
+      if (!gatewayHealthy && job.session_target === 'isolated') {
+        // Gateway down: skip this tick, at-job will be retried next tick
+        // (schedule_at condition still holds, enabled=1 unchanged)
+        log('info', `Deferred at-job while gateway is down: ${job.name}`, { jobId: job.id, scheduleAt: job.schedule_at });
         continue;
       }
       await dispatchJob(job);

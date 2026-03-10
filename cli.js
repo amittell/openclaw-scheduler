@@ -2,7 +2,7 @@
 // Scheduler CLI — manage jobs, runs, messages, agents
 import { readFileSync } from 'fs';
 import { initDb, getDb } from './db.js';
-import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec } from './jobs.js';
+import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
@@ -28,8 +28,10 @@ Jobs:
   jobs list [--type watchdog]        List all jobs (optionally filter by type)
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
-  jobs add <json> [--watchdog] [--profile <id>]
+  jobs add <json> [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
                                      Add a job (--watchdog sets defaults for watchdog type)
+                                     --at: one-shot schedule, e.g. '2026-03-10T16:47:00-04:00'
+                                     --in: one-shot sugar, e.g. '15m', '2h', '30s', '1d'
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')
   jobs validate <json>               Validate a job spec without writing it
   jobs enable <id>                   Enable a job
@@ -156,8 +158,9 @@ switch (command) {
           id: j.id.slice(0, 8) + '…',
           name: j.name,
           type: j.job_type || 'standard',
+          kind: j.schedule_kind || 'cron',
           enabled: !!j.enabled,
-          cron: j.schedule_cron,
+          schedule: j.schedule_kind === 'at' ? `at:${(j.schedule_at || '').slice(0, 16)}` : j.schedule_cron,
           agent: j.agent_id || 'main',
           target: j.session_target,
           guarantee: j.delivery_guarantee || 'at-most-once',
@@ -213,12 +216,41 @@ switch (command) {
         const isWatchdog = args.includes('--watchdog');
         const profileIdx = args.indexOf('--profile');
         const profileValue = profileIdx >= 0 ? args[profileIdx + 1] : undefined;
+        const atIdx = args.indexOf('--at');
+        const atValue = atIdx >= 0 ? args[atIdx + 1] : undefined;
+        const inIdx = args.indexOf('--in');
+        const inValue = inIdx >= 0 ? args[inIdx + 1] : undefined;
         const skipArgs = new Set(['--dry-run', '--watchdog']);
         if (profileIdx >= 0) { skipArgs.add(args[profileIdx]); skipArgs.add(args[profileIdx + 1]); }
+        if (atIdx >= 0) { skipArgs.add(args[atIdx]); skipArgs.add(args[atIdx + 1]); }
+        if (inIdx >= 0) { skipArgs.add(args[inIdx]); skipArgs.add(args[inIdx + 1]); }
         const payload = args.find(a => !skipArgs.has(a));
-        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--profile <id>]');
+        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]');
         const spec = JSON.parse(payload);
         if (profileValue !== undefined) spec.auth_profile = profileValue;
+
+        // One-shot scheduling via --at or --in
+        if (atValue || inValue) {
+          let scheduleAt;
+          try {
+            if (inValue) {
+              scheduleAt = parseInDuration(inValue);
+            } else {
+              const d = new Date(atValue);
+              if (isNaN(d.getTime())) throw new Error(`Invalid datetime: "${atValue}"`);
+              scheduleAt = d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+            }
+          } catch (err) {
+            fail(`--at/--in error: ${err.message}`);
+          }
+          spec.schedule_kind = 'at';
+          spec.schedule_at = scheduleAt;
+          // Use sentinel cron to satisfy NOT NULL on existing DBs without nullable schedule_cron
+          if (!spec.schedule_cron) spec.schedule_cron = AT_JOB_CRON_SENTINEL;
+          spec.next_run_at = scheduleAt;
+          // Default delete_after_run for at-jobs (user can override in JSON)
+          if (spec.delete_after_run === undefined) spec.delete_after_run = 1;
+        }
 
         // If --watchdog flag is set, apply watchdog defaults
         if (isWatchdog) {

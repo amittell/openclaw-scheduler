@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.5.0, schema version: 17)
+-- OpenClaw Scheduler Schema (current: v1.6.0, schema version: 18)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -12,8 +12,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   name            TEXT NOT NULL,
   enabled         INTEGER NOT NULL DEFAULT 1,
   
-  -- Schedule: always cron (no mixed formats)
-  schedule_cron   TEXT NOT NULL,
+  -- Schedule: cron or one-shot 'at'
+  schedule_kind   TEXT NOT NULL DEFAULT 'cron',          -- 'cron' | 'at'
+  schedule_at     TEXT DEFAULT NULL,                     -- ISO-8601 UTC timestamp, only for kind='at'
+  schedule_cron   TEXT,                                  -- NULL allowed for at-jobs (use sentinel '0 0 31 2 *' on old DBs)
   schedule_tz     TEXT NOT NULL DEFAULT 'America/New_York',
   
   -- Execution
@@ -413,6 +415,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (14);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (15);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (16);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (17);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (18);
 
 -- ============================================================
 -- SEED JOBS

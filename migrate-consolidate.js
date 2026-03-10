@@ -1,14 +1,16 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v17).
+ * Brings any DB from any prior version up to the current schema (v18).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js, migrate-v17.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js, migrate-v17.js, migrate-v18.js
  *
  * Safe to run multiple times — all operations are idempotent.
+ * Note: schedule_cron NOT NULL constraint cannot be dropped via ALTER TABLE in SQLite.
+ * At-jobs on existing DBs use sentinel '0 0 31 2 *' to satisfy the constraint.
  */
 
 import { getDb } from './db.js';
@@ -90,12 +92,14 @@ export default function migrateConsolidate() {
     && runColumns.has('shell_stdout_path')
     && runColumns.has('shell_stderr_path')
     && jobColumns.has('ttl_hours')
-    && jobColumns.has('auth_profile');
+    && jobColumns.has('auth_profile')
+    && jobColumns.has('schedule_kind')
+    && jobColumns.has('schedule_at');
   const agentColumns = new Set(db.prepare('PRAGMA table_info(agents)').all().map(c => c.name));
   const hasAgentDelivery = agentColumns.has('delivery_channel')
     && agentColumns.has('delivery_to')
     && agentColumns.has('brand_name');
-  if (current >= 17 && hasLatestColumns && hasAgentDelivery) {
+  if (current >= 18 && hasLatestColumns && hasAgentDelivery) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -184,6 +188,11 @@ export default function migrateConsolidate() {
     `ALTER TABLE agents ADD COLUMN delivery_channel TEXT`,
     `ALTER TABLE agents ADD COLUMN delivery_to TEXT`,
     `ALTER TABLE agents ADD COLUMN brand_name TEXT`,
+    // v18: one-shot 'at'-style scheduling
+    // Note: schedule_cron NOT NULL constraint cannot be dropped in SQLite via ALTER TABLE.
+    // At-jobs on existing DBs must use sentinel cron '0 0 31 2 *' to satisfy the constraint.
+    `ALTER TABLE jobs ADD COLUMN schedule_kind TEXT NOT NULL DEFAULT 'cron'`,
+    `ALTER TABLE jobs ADD COLUMN schedule_at TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -414,7 +423,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]) {
     stmt.run(v);
   }
 
@@ -427,7 +436,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v17'
-    : 'DB already at v17 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v18'
+    : 'DB already at v18 — nothing to do'
   );
 }
