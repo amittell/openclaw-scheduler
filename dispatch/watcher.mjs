@@ -123,7 +123,7 @@ function parseFlags(argv) {
  */
 function dispatch(subcmd, args) {
   try {
-    const result = execFileSync('node', [INDEX_PATH, subcmd, ...args], {
+    const result = execFileSync(process.execPath, [INDEX_PATH, subcmd, ...args], {
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -203,7 +203,7 @@ function setRetryCount(label, count) {
 function notify(message) {
   try {
     const checkinPath = join(HOME_DIR, '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
-    execFileSync('node', [checkinPath, message], {
+    execFileSync(process.execPath, [checkinPath, message], {
       encoding: 'utf-8',
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -263,7 +263,7 @@ function respawnSession(label) {
     // is preserved and we send a continuation message.
     const continuationMsg = `[Auto-retry after 529 overload] Please continue your previous task. Pick up where you left off.`;
 
-    execFileSync('node', [
+    execFileSync(process.execPath, [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,
@@ -300,7 +300,7 @@ function respawnSession(label) {
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
 
-      execFileSync('node', enqueueArgs, {
+      execFileSync(process.execPath, enqueueArgs, {
         encoding: 'utf-8',
         timeout: 30000,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -421,7 +421,7 @@ function deliverResult(label, lastReply, fallbackSummary) {
 // false positives from the stuck detector.
 process.on('exit', () => {
   try {
-    execFileSync('node', [INDEX_PATH, 'sync'], {
+    execFileSync(process.execPath, [INDEX_PATH, 'sync'], {
       encoding: 'utf-8',
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],

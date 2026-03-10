@@ -557,7 +557,7 @@ async function cmdEnqueue(flags) {
         const escapedLabel = label.replace(/'/g, "'\\''");
         // Watcher timeout = session timeout + 120s buffer for startup/polling
         const watcherTimeoutS = timeoutS + 120;
-        const watcherCmd = `node '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
+        const watcherCmd = `'${process.execPath}' '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -575,7 +575,7 @@ async function cmdEnqueue(flags) {
           run_now:                  true,
         });
         const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
-        execFileSync('node', [schedulerCli, 'jobs', 'add', jobSpec], {
+        execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', jobSpec], {
           encoding: 'utf-8',
           timeout:  10000,
           stdio:    ['pipe', 'pipe', 'pipe'],
