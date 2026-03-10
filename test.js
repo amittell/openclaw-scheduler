@@ -22,12 +22,13 @@ import {
 } from './jobs.js';
 import {
   getDispatch, getDueDispatches, listDispatchesForJob,
+  enqueueDispatch, claimDispatch, releaseDispatch, setDispatchStatus,
 } from './dispatch-queue.js';
 import {
   createRun, getRun, finishRun, getRunsForJob,
   getStaleRuns, getTimedOutRuns,
   updateHeartbeat, pruneRuns,
-  getRunningRunsByPool
+  getRunningRunsByPool, updateRunSession, updateContextSummary,
 } from './runs.js';
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
@@ -39,6 +40,10 @@ import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from '.
 import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH } from './gateway.js';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
+import {
+  matchesSentinel, detectTransientError, adaptiveDeferralMs,
+  buildExecutionIntentNote, getBackoffMs, sqliteNow,
+} from './dispatcher-utils.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
 import * as publicApi from './index.js';
@@ -1859,31 +1864,6 @@ assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
 
 console.log('\n── Transient Error Detection ──');
 {
-  // Re-implement detectTransientError locally to test the pattern matching
-  // (matches dispatcher.js TRANSIENT_ERROR_PATTERNS + detectTransientError)
-  const TRANSIENT_ERROR_PATTERNS = [
-    /temporarily overloaded/i,
-    /service\s+(?:is\s+)?unavailable/i,
-    /rate\s*limit(?:ed|s?)?/i,
-    /too\s+many\s+requests/i,
-    /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error/i,
-    /gateway\s+timeout/i,
-    /bad\s+gateway/i,
-    /model\s+(?:is\s+)?(?:overloaded|unavailable)/i,
-    /API\s+(?:error|unavailable|timeout)/i,
-    /capacity\s+(?:exceeded|limit)/i,
-    /retry\s+(?:after|later|in\s+\d)/i,
-    /context\s+(?:length|window)\s+exceeded/i,
-    /token\s+limit\s+exceeded/i,
-  ];
-
-  function detectTransientError(content) {
-    if (!content || !content.trim()) return false;
-    const trimmed = content.trim();
-    if (trimmed.length > 500) return false;
-    return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
-  }
-
   // Positive matches — these should be caught as transient errors
   assert(detectTransientError('The AI service is temporarily overloaded. Please try again later.'), 'detects: temporarily overloaded');
   assert(detectTransientError('Service unavailable'), 'detects: service unavailable');
@@ -1922,13 +1902,7 @@ console.log('\n── Transient Error Detection ──');
     'Here are my recommendations: '.padEnd(600, 'x');
   assert(!detectTransientError(longResponse), 'ignores: long response with keyword (>500 chars)');
 
-  // TASK_FAILED sentinel tests (uses matchesSentinel regex: ^TOKEN(?:$|[\s:]))
-  function matchesSentinel(content, token) {
-    if (!content) return false;
-    const re = new RegExp(`^${token}(?:$|[\\s:])`);
-    return re.test(content.trim());
-  }
-
+  // TASK_FAILED sentinel tests (uses matchesSentinel from dispatcher-utils.js)
   assert(matchesSentinel('TASK_FAILED', 'TASK_FAILED'), 'TASK_FAILED exact match');
   assert(matchesSentinel('TASK_FAILED: could not connect to database', 'TASK_FAILED'), 'TASK_FAILED with colon message');
   assert(matchesSentinel('TASK_FAILED something', 'TASK_FAILED'), 'TASK_FAILED with space message');
@@ -2502,6 +2476,225 @@ console.log('\n── Migration Guard ──');
 
   rmSync(legacyDir, { recursive: true, force: true });
   setDbPath(':memory:');
+  await initDb();
+}
+
+console.log('\n── Dispatcher Utils ──');
+{
+  // sqliteNow returns valid datetime string
+  const now = sqliteNow();
+  assert(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(now), 'sqliteNow returns YYYY-MM-DD HH:MM:SS');
+  const future = sqliteNow(60000);
+  assert(future > now, 'sqliteNow with positive offset is in the future');
+
+  // adaptiveDeferralMs
+  assert(adaptiveDeferralMs(0) === 10000, 'adaptiveDeferralMs(0) returns base 10s');
+  assert(adaptiveDeferralMs(0, 5000) === 5000, 'adaptiveDeferralMs(0, 5000) returns custom base');
+  assert(adaptiveDeferralMs(4) === 50000, 'adaptiveDeferralMs(4) returns 5x base');
+  assert(adaptiveDeferralMs(11) === 120000, 'adaptiveDeferralMs(11) caps multiplier at 12');
+  assert(adaptiveDeferralMs(99) === 120000, 'adaptiveDeferralMs(99) also caps multiplier at 12');
+  assert(adaptiveDeferralMs(0, 30000) === 30000, 'adaptiveDeferralMs with high base respects base');
+  assert(adaptiveDeferralMs(99, 30000) === 300000, 'adaptiveDeferralMs with high base caps at 300000');
+
+  // buildExecutionIntentNote
+  assert(buildExecutionIntentNote({ execution_intent: 'execute', execution_read_only: 0 }) === '', 'no note for normal job');
+  const planNote = buildExecutionIntentNote({ execution_intent: 'plan', execution_read_only: 0 });
+  assert(planNote.includes('planning-only'), 'plan intent includes planning-only');
+  assert(planNote.includes('[SYSTEM NOTE'), 'plan intent has system note header');
+  assert(planNote.includes('[END SYSTEM NOTE]'), 'plan intent has system note footer');
+  const readOnlyNote = buildExecutionIntentNote({ execution_intent: 'execute', execution_read_only: 1 });
+  assert(readOnlyNote.includes('read-only'), 'read-only note includes read-only');
+  assert(readOnlyNote.includes('forbidden'), 'read-only note includes forbidden');
+  const bothNote = buildExecutionIntentNote({ execution_intent: 'plan', execution_read_only: 1 });
+  assert(bothNote.includes('planning-only'), 'both: includes planning-only');
+  assert(bothNote.includes('forbidden'), 'both: includes forbidden');
+
+  // getBackoffMs
+  assert(getBackoffMs(1) === 30000, 'getBackoffMs(1) = 30s');
+  assert(getBackoffMs(2) === 60000, 'getBackoffMs(2) = 60s');
+  assert(getBackoffMs(3) === 300000, 'getBackoffMs(3) = 5m');
+  assert(getBackoffMs(4) === 900000, 'getBackoffMs(4) = 15m');
+  assert(getBackoffMs(5) === 3600000, 'getBackoffMs(5) = 1h');
+  assert(getBackoffMs(99) === 3600000, 'getBackoffMs(99) caps at 1h');
+}
+
+console.log('\n── Dispatch Queue Lifecycle ──');
+{
+  const dqJob = createJob({ name: 'dq-lifecycle', schedule_cron: '0 0 31 2 *', payload_message: 'test' });
+
+  // claimDispatch
+  const d1 = enqueueDispatch(dqJob.id, { kind: 'manual' });
+  assert(d1.status === 'pending', 'enqueued dispatch is pending');
+  const claimed = claimDispatch(d1.id);
+  assert(claimed !== null, 'claimDispatch returns the dispatch');
+  assert(claimed.status === 'claimed', 'claimed dispatch has status claimed');
+  assert(claimed.claimed_at !== null, 'claimed dispatch has claimed_at');
+  const claimAgain = claimDispatch(d1.id);
+  assert(claimAgain === null, 'claimDispatch on already-claimed returns null');
+
+  // releaseDispatch
+  const released = releaseDispatch(d1.id);
+  assert(released !== null, 'releaseDispatch returns the dispatch');
+  assert(released.status === 'pending', 'released dispatch is pending again');
+  assert(released.claimed_at === null, 'released dispatch has null claimed_at');
+
+  // releaseDispatch with new scheduledFor
+  claimDispatch(d1.id);
+  const releasedWithTime = releaseDispatch(d1.id, '2099-01-01 00:00:00');
+  assert(releasedWithTime.scheduled_for === '2099-01-01 00:00:00', 'release updates scheduled_for');
+
+  // releaseDispatch on pending returns null
+  const releaseNotClaimed = releaseDispatch(d1.id);
+  assert(releaseNotClaimed === null, 'releaseDispatch on pending returns null');
+
+  // setDispatchStatus to done
+  claimDispatch(d1.id);
+  const done = setDispatchStatus(d1.id, 'done');
+  assert(done.status === 'done', 'setDispatchStatus sets done');
+  assert(done.processed_at !== null, 'done dispatch has processed_at');
+
+  // setDispatchStatus to cancelled
+  const d2 = enqueueDispatch(dqJob.id, { kind: 'manual' });
+  const cancelled2 = setDispatchStatus(d2.id, 'cancelled');
+  assert(cancelled2.status === 'cancelled', 'setDispatchStatus sets cancelled');
+  assert(cancelled2.processed_at !== null, 'cancelled dispatch has processed_at');
+
+  // setDispatchStatus to pending does not set processed_at
+  const d3 = enqueueDispatch(dqJob.id, { kind: 'manual' });
+  const pending = setDispatchStatus(d3.id, 'pending');
+  assert(pending.processed_at === null, 'pending dispatch has no processed_at');
+
+  deleteJob(dqJob.id);
+}
+
+console.log('\n── Approval Timeout / Prune / Count ──');
+{
+  const { createApproval, getApproval, countPendingApprovalsForJob,
+          getTimedOutApprovals, pruneApprovals, resolveApproval } = await import('./approval.js');
+
+  const aJob = createJob({
+    name: 'approval-timeout-test', schedule_cron: '0 * * * *', payload_message: 'test',
+    approval_required: 1, approval_timeout_s: 1, approval_auto: 'reject',
+  });
+  const aRun1 = createRun(aJob.id, { status: 'awaiting_approval' });
+  const aRun2 = createRun(aJob.id, { status: 'awaiting_approval' });
+
+  // countPendingApprovalsForJob
+  const ap1 = createApproval(aJob.id, aRun1.id);
+  const ap2 = createApproval(aJob.id, aRun2.id);
+  assert(countPendingApprovalsForJob(aJob.id) === 2, 'countPendingApprovalsForJob returns 2');
+  resolveApproval(ap1.id, 'approved', 'operator');
+  assert(countPendingApprovalsForJob(aJob.id) === 1, 'countPendingApprovalsForJob returns 1 after resolve');
+
+  // getTimedOutApprovals: backdate ap2 so it exceeds the 1s timeout
+  getDb().prepare("UPDATE approvals SET requested_at = datetime('now', '-10 seconds') WHERE id = ?").run(ap2.id);
+  const timedOut = getTimedOutApprovals();
+  assert(timedOut.some(a => a.id === ap2.id), 'getTimedOutApprovals finds backdated approval');
+  const timedOutRow = timedOut.find(a => a.id === ap2.id);
+  assert(timedOutRow.job_name === 'approval-timeout-test', 'timed out approval has job_name');
+  assert(timedOutRow.approval_timeout_s === 1, 'timed out approval has approval_timeout_s');
+  assert(timedOutRow.approval_auto === 'reject', 'timed out approval has approval_auto');
+
+  // pruneApprovals: resolve ap2 and backdate resolved_at
+  resolveApproval(ap2.id, 'timed_out', 'system');
+  getDb().prepare("UPDATE approvals SET resolved_at = datetime('now', '-60 days') WHERE id = ?").run(ap2.id);
+  const pruneResult = pruneApprovals(30);
+  assert(pruneResult.changes >= 1, 'pruneApprovals deletes old resolved approvals');
+  assert(getApproval(ap2.id) === undefined, 'pruned approval is gone');
+  // ap1 was resolved recently, should still exist
+  assert(getApproval(ap1.id) !== undefined, 'recent resolved approval survives prune');
+
+  finishRun(aRun1.id, 'ok');
+  finishRun(aRun2.id, 'cancelled');
+  deleteJob(aJob.id);
+}
+
+console.log('\n── Run Session & Context Summary ──');
+{
+  const rsJob = createJob({ name: 'run-session-test', schedule_cron: '0 0 31 2 *', payload_message: 'test' });
+
+  // updateRunSession
+  const rs1 = createRun(rsJob.id, { run_timeout_ms: 60000 });
+  updateRunSession(rs1.id, 'my-session-key', 'session-123');
+  const updated = getRun(rs1.id);
+  assert(updated.session_key === 'my-session-key', 'updateRunSession stores session_key');
+  assert(updated.session_id === 'session-123', 'updateRunSession stores session_id');
+
+  // updateRunSession with nulls
+  updateRunSession(rs1.id, null, null);
+  const cleared = getRun(rs1.id);
+  assert(cleared.session_key === null, 'updateRunSession clears session_key');
+  assert(cleared.session_id === null, 'updateRunSession clears session_id');
+
+  // updateContextSummary with object
+  const summaryObj = { messages_injected: 3, scope: 'own' };
+  const afterObj = updateContextSummary(rs1.id, summaryObj);
+  assert(afterObj.context_summary === JSON.stringify(summaryObj), 'updateContextSummary stores object as JSON');
+
+  // updateContextSummary with pre-serialized string
+  const summaryStr = '{"pre":"serialized"}';
+  const afterStr = updateContextSummary(rs1.id, summaryStr);
+  assert(afterStr.context_summary === summaryStr, 'updateContextSummary stores string as-is');
+
+  finishRun(rs1.id, 'ok');
+  deleteJob(rsJob.id);
+}
+
+console.log('\n── Prompt Context Edge Cases ──');
+{
+  // No trigger (no triggered_by_run)
+  const noTrigger = buildTriggeredRunContext({});
+  assert(noTrigger.text === '', 'no trigger: text is empty');
+  assert(Object.keys(noTrigger.meta).length === 0, 'no trigger: meta is empty');
+
+  // Null/undefined run
+  const nullRun = buildTriggeredRunContext(null);
+  assert(nullRun.text === '', 'null run: text is empty');
+
+  // Missing parent run (getRunById returns undefined)
+  const missingParent = buildTriggeredRunContext(
+    { triggered_by_run: 'nonexistent-run' },
+    { getRunById: () => undefined, getJobById: () => undefined }
+  );
+  assert(missingParent.text === '', 'missing parent: text is empty');
+  assert(missingParent.meta.parent_run_missing === true, 'missing parent: meta.parent_run_missing is true');
+  assert(missingParent.meta.triggered_by_run === 'nonexistent-run', 'missing parent: meta.triggered_by_run set');
+
+  // Non-shell parent with summary (no shell fields)
+  const nonShellCtx = buildTriggeredRunContext(
+    { triggered_by_run: 'parent-run-2' },
+    {
+      getRunById: () => ({
+        id: 'parent-run-2',
+        job_id: 'parent-job-2',
+        status: 'ok',
+        summary: 'Agent completed the analysis successfully',
+      }),
+      getJobById: () => ({ id: 'parent-job-2', name: 'Agent Analysis', session_target: 'isolated' }),
+    }
+  );
+  assert(nonShellCtx.text.includes('Trigger Context'), 'non-shell: has trigger context header');
+  assert(nonShellCtx.text.includes('Agent Analysis'), 'non-shell: includes parent job name');
+  assert(nonShellCtx.text.includes('Agent completed the analysis'), 'non-shell: includes parent summary');
+  assert(!nonShellCtx.text.includes('Exit code'), 'non-shell: no shell exit code');
+  assert(nonShellCtx.meta.parent_run_status === 'ok', 'non-shell: meta has parent status');
+  assert(nonShellCtx.meta.parent_shell_exit_code === undefined, 'non-shell: no shell fields in meta');
+
+  // Parent with error_message but no summary and no shell fields
+  const errorOnlyCtx = buildTriggeredRunContext(
+    { triggered_by_run: 'parent-run-3' },
+    {
+      getRunById: () => ({
+        id: 'parent-run-3',
+        job_id: 'parent-job-3',
+        status: 'error',
+        error_message: 'Connection refused',
+      }),
+      getJobById: () => ({ id: 'parent-job-3', name: 'Health Check', session_target: 'isolated' }),
+    }
+  );
+  assert(errorOnlyCtx.text.includes('Connection refused'), 'error-only: includes error message');
+  assert(errorOnlyCtx.text.includes('Parent run error:'), 'error-only: has error label');
 }
 
 console.log('\n── Dispatcher Integration ──');
