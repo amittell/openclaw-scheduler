@@ -33,8 +33,8 @@ import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const INDEX_PATH = join(__dirname, 'index.mjs');
-const LABELS_PATH = join(__dirname, 'labels.json');
+const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
+const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
 const HOME_DIR = process.env.HOME || homedir();
 
 const MAX_529_RETRIES = 3;
@@ -421,6 +421,11 @@ let consecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 10;
 let recoverySessionKey = null;  // captured during polling for steer/kill
 
+// Track whether the session has EVER appeared in the gateway sessions list.
+// Used to distinguish spawn failures (session never appeared) from normal
+// completions (session appeared, ran, then cleaned up).
+let sessionEverFound = false;
+
 while (Date.now() < deadline) {
   const status = dispatch('status', ['--label', label]);
 
@@ -438,6 +443,12 @@ while (Date.now() < deadline) {
 
   // Capture sessionKey for recovery steer/kill
   if (status.sessionKey) recoverySessionKey = status.sessionKey;
+
+  // Track session presence in gateway.
+  // liveness is set without an error field only when the session was found in sessions.list.
+  if (status.liveness && !status.liveness.error) {
+    sessionEverFound = true;
+  }
 
   // ── Path 0: 529/overload auto-retry ───────────────────────
   if (status.status === 'error') {
@@ -476,6 +487,22 @@ while (Date.now() < deadline) {
 
   // ── Path 1: status auto-resolved to done ──────────────────
   if (status.status !== 'running') {
+    // ── Spawn failure detection ─────────────────────────────────────────
+    // If the session was auto-resolved to 'done' (or 'spawn-warning') but was
+    // never seen in the gateway, it never ran — this is a spawn failure.
+    // Causes: auth timeout, quota exhaustion, gateway error at spawn time.
+    if (!sessionEverFound && (status.status === 'done' || status.status === 'spawn-warning')) {
+      const spawnErrMsg =
+        `[dispatch] SPAWN FAILURE: session ${status.sessionKey || '(unknown)'} never appeared ` +
+        `in gateway — spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
+      process.stderr.write(spawnErrMsg + '\n');
+      process.stdout.write(
+        `🌶️ *dispatch* [${label}] SPAWN FAILURE: session never appeared in gateway — ` +
+        `spawn likely failed (auth timeout, quota, or gateway error)\n`
+      );
+      process.exit(1);
+    }
+
     // Reset retryCount on successful completion
     if (status.status === 'done') {
       const currentRetryCount = getRetryCount(label);

@@ -74,6 +74,10 @@ function out(obj) {
   process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 /** Parse --flag value pairs from argv */
 function parseFlags(argv) {
   const flags = {};
@@ -171,53 +175,6 @@ function gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opts
   }
 }
 
-// ── Subagent Registry ────────────────────────────────────────
-
-/**
- * Load the gateway's subagent run registry.
- * This tracks all active/recent subagent runs with their start/end times.
- * Path: ~/.openclaw/subagents/runs.json
- *
- * Each entry has:
- *   - runId:             string
- *   - childSessionKey:   string  (matches sessionKey in labels.json)
- *   - startedAt:         number  (ms timestamp)
- *   - endedAt:           number | undefined  (ms timestamp; absent = still running)
- *   - cleanupHandled:    boolean
- */
-function loadSubagentRegistry() {
-  try {
-    const registryPath = join(HOME_DIR, '.openclaw', 'subagents', 'runs.json');
-    const data = JSON.parse(readFileSync(registryPath, 'utf-8'));
-    return data?.runs || {};
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Check if a session has an active run in the gateway's subagent registry.
- *
- * Returns:
- *   { found: true,  active: true  }  — run exists, still running (no endedAt)
- *   { found: true,  active: false }  — run exists, completed (has endedAt)
- *   { found: false, active: false }  — not in registry (pruned or never tracked here)
- */
-function checkSubagentRunState(sessionKey) {
-  const runs = loadSubagentRegistry();
-  for (const entry of Object.values(runs)) {
-    if (entry.childSessionKey === sessionKey) {
-      return {
-        found:   true,
-        active:  typeof entry.endedAt !== 'number',
-        endedAt: typeof entry.endedAt === 'number' ? entry.endedAt : null,
-        runId:   entry.runId || null,
-      };
-    }
-  }
-  return { found: false, active: false, endedAt: null, runId: null };
-}
-
 // ── Gateway Error Log Check ──────────────────────────────────
 
 /**
@@ -287,46 +244,22 @@ function check529InGatewayLog(sessionKey) {
  * Determine if a session should be auto-resolved as "done" based on gateway state.
  *
  * Decision logic (in priority order):
- *   1. Subagent registry says completed (endedAt set)   → resolve
- *   2. Subagent registry says active (no endedAt)       → do NOT resolve
- *   3. Session not found in gateway sessions.list        → resolve (expired/deleted)
- *   4. Session found but idle past threshold + not in registry (pruned = old) → resolve
- *   5. Gateway unavailable                               → do NOT resolve (safe default)
+ *   1. Session not found in gateway sessions.list → resolve (expired/deleted/never spawned)
+ *   2. Session found but idle past threshold       → resolve (completed)
+ *   3. Gateway unavailable                         → do NOT resolve (safe default)
  *
- * @param {string}     sessionKey   - The session key to check
- * @param {Array|null} sessionCache - Pre-fetched sessions.list array (null = unavailable)
- * @param {number}     thresholdMs  - Silence threshold in ms
+ * @param {string}     sessionKey      - The session key to check
+ * @param {Array|null} sessionCache    - Pre-fetched sessions.list array (null = unavailable)
+ * @param {number}     thresholdMs     - Silence threshold in ms
+ * @param {boolean}    [sessionEverFound=true] - Whether the session was ever seen in gateway.
+ *                                               Pass false to get a distinct "spawn likely failed"
+ *                                               reason instead of "session not found in gateway store".
  * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null, is529?: boolean, errorMsg?: string }}
  */
-function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
+function checkSessionDone(sessionKey, sessionCache, thresholdMs, sessionEverFound = true) {
   // 0. Check gateway error log for 529/overload errors FIRST.
   //    If we find a 529, we should resolve as error, not done.
   const logCheck = check529InGatewayLog(sessionKey);
-
-  // 1 & 2. Subagent registry — most authoritative for recent sessions
-  const reg = checkSubagentRunState(sessionKey);
-  if (reg.found) {
-    if (!reg.active) {
-      return {
-        shouldResolve: true,
-        reason:       logCheck.found
-          ? `529/overload error detected: ${logCheck.error}`
-          : 'run completed in gateway subagent registry',
-        lastActivity:  reg.endedAt,
-        is529:         logCheck.found,
-        errorMsg:      logCheck.error || null,
-      };
-    }
-    // Actively running according to registry — don't touch it
-    return {
-      shouldResolve: false,
-      reason:       'run still active in gateway subagent registry',
-      lastActivity:  null,
-    };
-  }
-
-  // Registry doesn't have this session (pruned after completion or not yet tracked).
-  // Fall back to sessions.list.
 
   if (!sessionCache) {
     // Gateway unavailable — safe default is to NOT auto-resolve
@@ -337,23 +270,23 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
     };
   }
 
-  // 3. Not in sessions.list → session expired/deleted from store
+  // 1. Not in sessions.list → session expired/deleted/never-appeared
   const session = sessionCache.find(s => s.key === sessionKey);
   if (!session) {
     return {
       shouldResolve: true,
       reason:       logCheck.found
         ? `529/overload error detected: ${logCheck.error}`
-        : 'session not found in gateway store',
+        : sessionEverFound
+          ? 'session not found in gateway store'
+          : 'session never found — spawn likely failed',
       lastActivity:  null,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
     };
   }
 
-  // 4. Session exists in store, check idle time.
-  //    Since it's NOT in the subagent registry (which means the run is pruned/completed),
-  //    we can infer the session is done if its idle time exceeds the threshold.
+  // 2. Session exists in store, check idle time.
   const lastActivity = session.updatedAt || 0;
   const silenceMs    = Date.now() - lastActivity;
 
@@ -362,7 +295,7 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs) {
       shouldResolve: true,
       reason:       logCheck.found
         ? `529/overload error detected: ${logCheck.error}`
-        : `session idle ${Math.round(silenceMs / 60000)}min in gateway (subagent run pruned = completed)`,
+        : `session idle ${Math.round(silenceMs / 60000)}min in gateway (completed)`,
       lastActivity,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
@@ -629,6 +562,36 @@ async function cmdEnqueue(flags) {
           ? 'Session spawned. Delivery via gateway only (scheduler watcher failed).'
           : 'Session spawned via gateway. Agent is running.',
     });
+
+    // ── Post-spawn verification (Fix 3) ────────────────────────────────
+    // Canary: poll sessions.list up to 3 times at 10s intervals to confirm the
+    // session appeared. Non-fatal — output is already written above. If the session
+    // never shows up, stderr gets a loud warning and ledger status is set to
+    // 'spawn-warning'. The watcher (Fix 2) provides the definitive error path.
+    const SPAWN_POLL_MAX = 3;
+    const SPAWN_POLL_DELAY_MS = 10_000;
+    let spawnConfirmed = false;
+    for (let spawnPoll = 0; spawnPoll < SPAWN_POLL_MAX; spawnPoll++) {
+      await sleep(SPAWN_POLL_DELAY_MS);
+      try {
+        const sessResult = gatewayToolInvoke('sessions_list', { activeMinutes: 5 }, 'agent:main:main', { timeout: 8000 });
+        const activeSessions = sessResult?.sessions || [];
+        if (activeSessions.some(s => s.key === sessionKey)) {
+          spawnConfirmed = true;
+          break;
+        }
+      } catch {
+        // Gateway unavailable — skip remaining polls, can't confirm
+        break;
+      }
+    }
+    if (!spawnConfirmed) {
+      process.stderr.write(
+        `[${agentBrand}] WARNING: session ${sessionKey} did not appear in gateway after ` +
+        `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s — spawn may have failed\n`
+      );
+      setLabel(label, { status: 'spawn-warning' });
+    }
   } catch (err) {
     die(`gateway agent call failed: ${err.message}`);
   }

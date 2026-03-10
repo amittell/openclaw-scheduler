@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -2688,6 +2688,173 @@ console.log('\n── Dispatcher Integration ──');
     },
   });
 }
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: Dispatch Spawn Failure Detection
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Dispatch Spawn Failure Detection ──');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+
+  // 1. Dead registry: verify checkSubagentRunState and loadSubagentRegistry are gone
+  const indexSrc = readFileSync(join(dispatchDir, 'index.mjs'), 'utf8');
+  assert(!indexSrc.includes('checkSubagentRunState'), 'dead registry: checkSubagentRunState removed from index.mjs');
+  assert(!indexSrc.includes('loadSubagentRegistry'), 'dead registry: loadSubagentRegistry removed from index.mjs');
+  assert(!indexSrc.includes("subagents/runs.json"), 'dead registry: no reference to subagents/runs.json');
+  // checkSessionDone now has sessionEverFound param
+  assert(indexSrc.includes('sessionEverFound'), 'Fix 4: checkSessionDone has sessionEverFound param');
+  assert(indexSrc.includes('session never found'), 'Fix 4: distinct reason for spawn-failure case');
+  // post-spawn poll code exists
+  assert(indexSrc.includes('spawn-warning'), 'Fix 3: cmdEnqueue sets spawn-warning status');
+  assert(indexSrc.includes('SPAWN_POLL_MAX'), 'Fix 3: post-spawn poll loop present');
+
+  // 2. Spawn-failure path: watcher exits non-zero when session never appears in gateway
+  //    We use a mock dispatch that always returns status=done with liveness error,
+  //    simulating auto-resolve after STARTUP_GRACE_MS with session never found.
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-sftest-'));
+  const mockSpawnFailPath = join(tempDir, 'mock-spawn-fail.mjs');
+  const mockLabelsSpawnFail = join(tempDir, 'labels-sf.json');
+  const watcherPath = join(dispatchDir, 'watcher.mjs');
+
+  writeFileSync(mockSpawnFailPath, `
+const [,,sub] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'test-sf',
+    status: 'done',
+    summary: 'Auto-resolved: session not found in gateway store',
+    sessionKey: 'agent:main:subagent:sf-uuid',
+    liveness: { error: 'session not found in gateway store' },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'done' }) + '\\n');
+} else {
+  // sync and other subcommands
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+  writeFileSync(mockLabelsSpawnFail, JSON.stringify({
+    'test-sf': {
+      sessionKey: 'agent:main:subagent:sf-uuid',
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  let sfExitCode = 0;
+  let sfStderr = '';
+  let sfStdout = '';
+  try {
+    execFileSync(process.execPath, [watcherPath, '--label', 'test-sf', '--timeout', '5', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockSpawnFailPath,
+        DISPATCH_LABELS_PATH: mockLabelsSpawnFail,
+      },
+      encoding: 'utf8',
+      timeout: 12000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    sfExitCode = 0;
+  } catch (err) {
+    sfExitCode  = err.status ?? 1;
+    sfStderr    = err.stderr  ?? '';
+    sfStdout    = err.stdout  ?? '';
+  }
+  assert(sfExitCode === 1, 'spawn-failure: watcher exits non-zero (exit code 1)');
+  assert(sfStderr.includes('SPAWN FAILURE'), 'spawn-failure: watcher writes SPAWN FAILURE to stderr');
+  assert(sfStdout.includes('SPAWN FAILURE'), 'spawn-failure: watcher writes SPAWN FAILURE to stdout');
+
+  // 3. Normal completion: session seen once (liveness ok), then gone → watcher resolves ok (exit 0)
+  //    Mock returns running+liveness for calls 1-2, then done on call 3+.
+  const counterFile = join(tempDir, 'nc-counter.txt');
+  writeFileSync(counterFile, '0');
+  const mockNormalPath = join(tempDir, 'mock-normal.mjs');
+  const mockLabelsNormal = join(tempDir, 'labels-nc.json');
+
+  writeFileSync(mockNormalPath, `
+import { readFileSync, writeFileSync } from 'fs';
+const [,,sub] = process.argv;
+const counterFile = ${JSON.stringify(counterFile)};
+let count = 0;
+try { count = parseInt(readFileSync(counterFile, 'utf8').trim()) || 0; } catch {}
+if (sub === 'status') {
+  count++;
+  writeFileSync(counterFile, String(count));
+  if (count <= 2) {
+    // First 2 status polls: running, session found in gateway (no liveness error)
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-nc',
+      status: 'running',
+      sessionKey: 'agent:main:subagent:nc-uuid',
+      liveness: { ageMs: 3000, updatedAt: Date.now() - 3000, sessionId: 'nc-sid' },
+    }) + '\\n');
+  } else {
+    // 3rd+ poll: auto-resolved to done
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-nc',
+      status: 'done',
+      summary: 'Auto-resolved: session not found in gateway store',
+      sessionKey: 'agent:main:subagent:nc-uuid',
+      liveness: { error: 'session not found in gateway store' },
+    }) + '\\n');
+  }
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true, lastReply: 'Task completed successfully!', status: 'done',
+  }) + '\\n');
+} else {
+  // sync etc
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+  writeFileSync(mockLabelsNormal, JSON.stringify({
+    'test-nc': {
+      sessionKey: 'agent:main:subagent:nc-uuid',
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  let ncExitCode = -1;
+  let ncStdout = '';
+  let ncStderr = '';
+  try {
+    ncStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-nc', '--timeout', '30', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockNormalPath,
+        DISPATCH_LABELS_PATH: mockLabelsNormal,
+      },
+      encoding: 'utf8',
+      timeout: 40000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    ncExitCode = 0;
+  } catch (err) {
+    ncExitCode = err.status ?? 1;
+    ncStdout   = err.stdout ?? '';
+    ncStderr   = err.stderr ?? '';
+  }
+  assert(ncExitCode === 0, 'normal completion: watcher exits 0');
+  assert(ncStdout.includes('Task completed successfully!'), 'normal completion: watcher delivers lastReply in output');
+  assert(!ncStdout.includes('SPAWN FAILURE'), 'normal completion: watcher does NOT report spawn failure');
+
+  rmSync(tempDir, { recursive: true, force: true });
+}
+
 
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
