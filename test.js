@@ -2855,6 +2855,227 @@ if (sub === 'status') {
   rmSync(tempDir, { recursive: true, force: true });
 }
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: Sessions.json Detection, Done Subcommand, STARTUP_GRACE_MS
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Sessions.json Detection ──');
+{
+  const dispatchDir  = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath    = join(dispatchDir, 'index.mjs');
+  const watcherPath  = join(dispatchDir, 'watcher.mjs');
+  const indexSrc     = readFileSync(indexPath, 'utf8');
+  const watcherSrc   = readFileSync(watcherPath, 'utf8');
+
+  // ── 1. STARTUP_GRACE_MS constant checks ─────────────────────────────────
+  // index.mjs must default to 300_000 (not the old 90_000)
+  assert(indexSrc.includes('300_000'), 'STARTUP_GRACE_MS: index.mjs uses 300_000');
+  assert(!indexSrc.includes('90_000'), 'STARTUP_GRACE_MS: index.mjs does not use old 90_000');
+  // watcher.mjs must declare STARTUP_GRACE_MS = 300_000
+  assert(watcherSrc.includes('STARTUP_GRACE_MS'), 'STARTUP_GRACE_MS: watcher.mjs declares constant');
+  assert(watcherSrc.includes('300_000'), 'STARTUP_GRACE_MS: watcher.mjs uses 300_000');
+
+  // ── 2. readSessionsStore present in both files ───────────────────────────
+  assert(indexSrc.includes('readSessionsStore'), 'sessions.json: readSessionsStore in index.mjs');
+  assert(watcherSrc.includes('readSessionsStore'), 'sessions.json: readSessionsStore in watcher.mjs');
+
+  // ── 3. No direct sessions_list API calls for state checks in index.mjs ───
+  // The three old patterns replaced: cmdStatus, cmdStuck, cmdSync
+  // We verify sessions_list is not used for session state decisions
+  // (it may still exist in other contexts but should not be the state oracle)
+  assert(!indexSrc.includes("gatewayToolInvoke('sessions_list'"), 'sessions.json: no sessions_list calls in index.mjs');
+
+  // ── 4. sessions.json read behaviour via temp store ───────────────────────
+  const testTmpDir = mkdtempSync(join(tmpdir(), 'sessions-json-test-'));
+  const testLabelsPath = join(testTmpDir, 'labels.json');
+  // Path must match readSessionsStore: join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json')
+  const { mkdirSync } = await import('fs');
+  const sessionsDir = join(testTmpDir, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(sessionsDir, { recursive: true });
+  const sessionsJsonPath = join(sessionsDir, 'sessions.json');
+
+  // Fake session entry — simulates a running dispatcher-spawned session
+  const fakeSessionKey = 'agent:main:subagent:test-sess-uuid-001';
+  const nowMs = Date.now();
+  writeFileSync(sessionsJsonPath, JSON.stringify({
+    [fakeSessionKey]: {
+      sessionId: 'fake-sid-001',
+      updatedAt: nowMs,            // active (just updated)
+      model: 'anthropic/test',
+    },
+  }) + '\n');
+
+  // Fake label pointing at fake session
+  writeFileSync(testLabelsPath, JSON.stringify({
+    'test-sess': {
+      sessionKey: fakeSessionKey,
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(nowMs - 60_000).toISOString(),
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  // 4a. Present + active → dispatch status should see it
+  const statusPresentActive = execFileSync(process.execPath, [indexPath, 'status', '--label', 'test-sess'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DISPATCH_LABELS_PATH: testLabelsPath,
+      HOME: testTmpDir,
+    },
+    timeout: 15000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const statusObjActive = JSON.parse(statusPresentActive.trim());
+  assert(statusObjActive.ok === true, 'sessions.json present+active: status ok');
+  assert(statusObjActive.status === 'running', 'sessions.json present+active: status=running (not auto-resolved)');
+  assert(statusObjActive.liveness && !statusObjActive.liveness.error, 'sessions.json present+active: liveness has no error');
+
+  // 4b. Present + stale (>10min idle) → should auto-resolve to done
+  const staleMs = nowMs - 11 * 60 * 1000;
+  writeFileSync(sessionsJsonPath, JSON.stringify({
+    [fakeSessionKey]: {
+      sessionId: 'fake-sid-001',
+      updatedAt: staleMs,
+      model: 'anthropic/test',
+    },
+  }) + '\n');
+  // Reset label to running so auto-resolve can kick in
+  writeFileSync(testLabelsPath, JSON.stringify({
+    'test-sess': {
+      sessionKey: fakeSessionKey,
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(staleMs - 5 * 60 * 1000).toISOString(), // spawnedAt > STARTUP_GRACE_MS ago
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  const statusPresentStale = execFileSync(process.execPath, [indexPath, 'status', '--label', 'test-sess'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DISPATCH_LABELS_PATH: testLabelsPath,
+      HOME: testTmpDir,
+    },
+    timeout: 15000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const statusObjStale = JSON.parse(statusPresentStale.trim());
+  assert(statusObjStale.ok === true, 'sessions.json present+stale: status ok');
+  assert(statusObjStale.status === 'done', 'sessions.json present+stale: auto-resolved to done');
+  assert(statusObjStale.syncAction && statusObjStale.syncAction.includes('auto-resolved'), 'sessions.json present+stale: syncAction includes auto-resolved');
+
+  // 4c. Absent (session key not in store) → auto-resolve as done (session completed/cleaned)
+  writeFileSync(sessionsJsonPath, JSON.stringify({}) + '\n');
+  writeFileSync(testLabelsPath, JSON.stringify({
+    'test-sess': {
+      sessionKey: fakeSessionKey,
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(nowMs - 20 * 60 * 1000).toISOString(), // spawnedAt 20min ago > grace
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  const statusAbsent = execFileSync(process.execPath, [indexPath, 'status', '--label', 'test-sess'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DISPATCH_LABELS_PATH: testLabelsPath,
+      HOME: testTmpDir,
+    },
+    timeout: 15000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const statusObjAbsent = JSON.parse(statusAbsent.trim());
+  assert(statusObjAbsent.ok === true, 'sessions.json absent: status ok');
+  assert(statusObjAbsent.status === 'done', 'sessions.json absent: auto-resolved to done');
+
+  const { rmSync: rm2 } = await import('fs');
+  rm2(testTmpDir, { recursive: true, force: true });
+}
+
+console.log('\n── Done Subcommand ──');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath   = join(dispatchDir, 'index.mjs');
+  const tempDone    = mkdtempSync(join(tmpdir(), 'done-subcmd-test-'));
+  const doneLabels  = join(tempDone, 'labels.json');
+
+  // Pre-populate labels.json with a running entry
+  writeFileSync(doneLabels, JSON.stringify({
+    'my-task': {
+      sessionKey: 'agent:main:subagent:done-test-uuid',
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date().toISOString(),
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  // Run: node index.mjs done --label my-task --summary "all done!"
+  const doneOut = execFileSync(process.execPath, [
+    indexPath, 'done', '--label', 'my-task', '--summary', 'all done!',
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const doneObj = JSON.parse(doneOut.trim());
+  assert(doneObj.ok === true, 'done subcommand: ok=true');
+  assert(doneObj.status === 'done', 'done subcommand: status=done');
+  assert(doneObj.summary === 'all done!', 'done subcommand: summary stored');
+
+  // Verify labels.json was updated
+  const updatedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+  assert(updatedLabels['my-task'].status === 'done', 'done subcommand: labels.json updated to done');
+  assert(updatedLabels['my-task'].summary === 'all done!', 'done subcommand: labels.json summary updated');
+
+  // done with missing label → exits 1
+  let threwMissingLabel = false;
+  try {
+    execFileSync(process.execPath, [indexPath, 'done', '--label', 'nonexistent-label-xyz'], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 5000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    threwMissingLabel = (err.status === 1);
+  }
+  assert(threwMissingLabel, 'done subcommand: exits 1 for nonexistent label');
+
+  // done without --label → exits 2
+  let threwNoLabel = false;
+  try {
+    execFileSync(process.execPath, [indexPath, 'done'], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 5000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    threwNoLabel = (err.status === 2);
+  }
+  assert(threwNoLabel, 'done subcommand: exits 2 when --label missing');
+
+  // index.mjs source includes done in switch + cmdDone function
+  const indexSrc = readFileSync(indexPath, 'utf8');
+  assert(indexSrc.includes("case 'done'"), 'done subcommand: switch case exists in index.mjs');
+  assert(indexSrc.includes('cmdDone'), 'done subcommand: cmdDone function defined');
+  assert(indexSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
+
+  const { rmSync: rm3 } = await import('fs');
+  rm3(tempDone, { recursive: true, force: true });
+}
+
 
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);

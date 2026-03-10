@@ -14,7 +14,8 @@
  *   steer      Alias for send — explicitly for mid-session course correction
  *   heartbeat  Check session liveness
  *   list       List all tracked labels
- *   sync       Reconcile labels.json with gateway state
+ *   sync       Reconcile labels.json with sessions store state
+ *   done       Agent-side completion signal — set label status=done immediately
  *
  * Exit codes:
  *   0  — success / nothing stuck
@@ -38,7 +39,7 @@ const HOME_DIR = process.env.HOME || homedir();
 
 // ── Config ───────────────────────────────────────────────────
 
-const LABELS_PATH = join(__dirname, 'labels.json');
+const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
 
 /** Load dispatch config from config.json (falls back to {} on error) */
 function loadConfig() {
@@ -238,47 +239,80 @@ function check529InGatewayLog(sessionKey) {
   }
 }
 
+// ── Sessions Store (Direct Read) ─────────────────────────────
+
+/**
+ * Read the sessions.json store for an agent directly from disk.
+ * This is the ground truth for session state — sessions spawned via the
+ * dispatcher HTTP agent endpoint appear here but NOT in sessions_list API.
+ *
+ * Sessions are NOT pruned on completion — completed sessions stay in the file.
+ *
+ * @param {string} agent - Agent ID (default: 'main')
+ * @returns {Object|null} - The sessions store object, or null on error
+ */
+function readSessionsStore(agent = 'main') {
+  try {
+    const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json');
+    return JSON.parse(readFileSync(sessionsPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse the agent ID from a session key.
+ * Session key format: agent:{agentId}:...
+ * Falls back to 'main' for malformed keys.
+ */
+function agentFromSessionKey(sessionKey) {
+  if (!sessionKey) return 'main';
+  const parts = sessionKey.split(':');
+  if (parts.length >= 2 && parts[0] === 'agent') return parts[1];
+  return 'main';
+}
+
 // ── Gateway Session State Check ──────────────────────────────
 
 /**
- * Determine if a session should be auto-resolved as "done" based on gateway state.
+ * Determine if a session should be auto-resolved as "done" based on sessions.json state.
  *
  * Decision logic (in priority order):
- *   1. Session not found in gateway sessions.list → resolve (expired/deleted/never spawned)
- *   2. Session found but idle past threshold       → resolve (completed)
- *   3. Gateway unavailable                         → do NOT resolve (safe default)
+ *   1. Store unavailable (null)                    → do NOT resolve (safe default)
+ *   2. Session key NOT in store                    → resolve (never spawned or spawn failure)
+ *   3. Session found but idle past threshold       → resolve (completed)
+ *   4. Session has recent activity                 → do NOT resolve
  *
- * @param {string}     sessionKey      - The session key to check
- * @param {Array|null} sessionCache    - Pre-fetched sessions.list array (null = unavailable)
- * @param {number}     thresholdMs     - Silence threshold in ms
- * @param {boolean}    [sessionEverFound=true] - Whether the session was ever seen in gateway.
- *                                               Pass false to get a distinct "spawn likely failed"
- *                                               reason instead of "session not found in gateway store".
+ * @param {string}      sessionKey       - The session key to check
+ * @param {Object|null} sessionsStore    - Sessions.json object (null = unavailable)
+ * @param {number}      thresholdMs      - Silence threshold in ms
+ * @param {boolean}     [sessionEverFound=true] - Whether the session was ever seen in the store.
+ *                                                Pass false to get a distinct "spawn likely failed"
+ *                                                reason instead of "session not found in sessions store".
  * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null, is529?: boolean, errorMsg?: string }}
  */
-function checkSessionDone(sessionKey, sessionCache, thresholdMs, sessionEverFound = true) {
+function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFound = true) {
   // 0. Check gateway error log for 529/overload errors FIRST.
   //    If we find a 529, we should resolve as error, not done.
   const logCheck = check529InGatewayLog(sessionKey);
 
-  if (!sessionCache) {
-    // Gateway unavailable — safe default is to NOT auto-resolve
+  if (sessionsStore === null) {
+    // Store unavailable — safe default is to NOT auto-resolve
     return {
       shouldResolve: false,
-      reason:       'gateway unavailable for state check',
+      reason:       'sessions store unavailable for state check',
       lastActivity:  null,
     };
   }
 
-  // 1. Not in sessions.list → session expired/deleted/never-appeared
-  const session = sessionCache.find(s => s.key === sessionKey);
-  if (!session) {
+  // 1. Not in sessions store → session never appeared or already cleaned up
+  if (!sessionsStore[sessionKey]) {
     return {
       shouldResolve: true,
       reason:       logCheck.found
         ? `529/overload error detected: ${logCheck.error}`
         : sessionEverFound
-          ? 'session not found in gateway store'
+          ? 'session not found in sessions store'
           : 'session never found — spawn likely failed',
       lastActivity:  null,
       is529:         logCheck.found,
@@ -287,7 +321,8 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs, sessionEverFoun
   }
 
   // 2. Session exists in store, check idle time.
-  const lastActivity = session.updatedAt || 0;
+  const entry        = sessionsStore[sessionKey];
+  const lastActivity = entry.updatedAt || 0;
   const silenceMs    = Date.now() - lastActivity;
 
   if (silenceMs >= thresholdMs) {
@@ -295,7 +330,7 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs, sessionEverFoun
       shouldResolve: true,
       reason:       logCheck.found
         ? `529/overload error detected: ${logCheck.error}`
-        : `session idle ${Math.round(silenceMs / 60000)}min in gateway (completed)`,
+        : `session idle ${Math.round(silenceMs / 60000)}min in sessions store (completed)`,
       lastActivity,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
@@ -305,7 +340,7 @@ function checkSessionDone(sessionKey, sessionCache, thresholdMs, sessionEverFoun
   // Session has recent activity — might still be working
   return {
     shouldResolve: false,
-    reason:       'session has recent gateway activity',
+    reason:       'session has recent activity in sessions store',
     lastActivity,
   };
 }
@@ -430,6 +465,16 @@ async function cmdEnqueue(flags) {
   }
 
   parts.push(`[Subagent Task]: ${message}`);
+
+  // Append agent-side done signal instructions (Fix 2 — push-based completion)
+  const doneScriptPath = __dirname + '/index.mjs';
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(`COMPLETION SIGNAL: When your task is fully complete, run this as your LAST action:`);
+  parts.push(`node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<one-line summary of what you did>"`);
+  parts.push(`This lets the watcher know you're done without waiting for idle timeout.`);
+  parts.push(`---`);
+
   const taskMessage = parts.join('\n');
 
   // ── Call gateway agent method ───────────────────────────────
@@ -564,24 +609,18 @@ async function cmdEnqueue(flags) {
     });
 
     // ── Post-spawn verification (Fix 3) ────────────────────────────────
-    // Canary: poll sessions.list up to 3 times at 10s intervals to confirm the
-    // session appeared. Non-fatal — output is already written above. If the session
-    // never shows up, stderr gets a loud warning and ledger status is set to
-    // 'spawn-warning'. The watcher (Fix 2) provides the definitive error path.
+    // Canary: poll sessions.json up to 3 times at 10s intervals to confirm the
+    // session appeared in the store. Non-fatal — output is already written above.
+    // If the session never shows up, stderr gets a loud warning and ledger status
+    // is set to 'spawn-warning'. The watcher provides the definitive error path.
     const SPAWN_POLL_MAX = 3;
     const SPAWN_POLL_DELAY_MS = 10_000;
     let spawnConfirmed = false;
     for (let spawnPoll = 0; spawnPoll < SPAWN_POLL_MAX; spawnPoll++) {
       await sleep(SPAWN_POLL_DELAY_MS);
-      try {
-        const sessResult = gatewayToolInvoke('sessions_list', { activeMinutes: 5 }, 'agent:main:main', { timeout: 8000 });
-        const activeSessions = sessResult?.sessions || [];
-        if (activeSessions.some(s => s.key === sessionKey)) {
-          spawnConfirmed = true;
-          break;
-        }
-      } catch {
-        // Gateway unavailable — skip remaining polls, can't confirm
+      const spawnStore = readSessionsStore(agent);
+      if (spawnStore && sessionKey in spawnStore) {
+        spawnConfirmed = true;
         break;
       }
     }
@@ -617,21 +656,18 @@ function cmdStatus(flags) {
   let liveness   = null;
   let syncAction = null;
 
-  // Fetch sessions.list for all gateway checks
-  let sessionCache = null;
-  try {
-    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 8000 });
-    sessionCache = result?.sessions || [];
-  } catch {}
+  // Read sessions.json store for state checks (replaces sessions_list API call)
+  const statusAgent = entry.agent || agentFromSessionKey(entry.sessionKey) || 'main';
+  const sessionsStore = readSessionsStore(statusAgent);
 
-  // For "running" sessions, check gateway and auto-resolve if done
+  // For "running" sessions, check sessions store and auto-resolve if done
   if (entry.status === 'running' && entry.sessionKey) {
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const ageMs = Date.now() - spawnedAtMs;
-    const STARTUP_GRACE_MS = config.startupGraceMs ?? 90_000;
+    const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
     const check = ageMs < STARTUP_GRACE_MS
       ? { shouldResolve: false }
-      : checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
+      : checkSessionDone(entry.sessionKey, sessionsStore, 10 * 60 * 1000);
     if (check.shouldResolve) {
       if (check.is529) {
         setLabel(label, {
@@ -650,22 +686,22 @@ function cmdStatus(flags) {
     }
   }
 
-  // Build liveness from cache
-  if (entry.sessionKey && sessionCache) {
-    const session = sessionCache.find(s => s.key === entry.sessionKey);
-    if (session) {
+  // Build liveness from sessions.json store
+  if (entry.sessionKey && sessionsStore) {
+    const sessionEntry = sessionsStore[entry.sessionKey];
+    if (sessionEntry) {
       liveness = {
-        updatedAt: session.updatedAt,
-        ageMs:     session.updatedAt ? Date.now() - session.updatedAt : null,
-        sessionId: session.sessionId,
-        model:     session.model || null,
-        tokens:    session.totalTokens || null,
+        updatedAt: sessionEntry.updatedAt,
+        ageMs:     sessionEntry.updatedAt ? Date.now() - sessionEntry.updatedAt : null,
+        sessionId: sessionEntry.sessionId,
+        model:     sessionEntry.model || null,
+        tokens:    sessionEntry.totalTokens || null,
       };
     } else {
-      liveness = { error: 'session not found in gateway store' };
+      liveness = { error: 'session not found in sessions store' };
     }
-  } else if (entry.sessionKey && !sessionCache) {
-    liveness = { error: 'failed to query gateway' };
+  } else if (entry.sessionKey && !sessionsStore) {
+    liveness = { error: 'sessions store unavailable' };
   }
 
   // Re-read entry in case we just updated it
@@ -733,12 +769,13 @@ async function cmdStuck(flags) {
   const autoResolved   = [];
   const watcherSkipped = [];
 
-  // Pre-fetch all gateway sessions once to avoid N RPC calls
-  let sessionCache = null;
-  try {
-    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 10000 });
-    sessionCache = result?.sessions || [];
-  } catch {}
+  // Sessions stores are read per-agent (cached within this call)
+  const sessionsStoreByAgent = {};
+  function getSessionsStoreForEntry(e) {
+    const ag = e.agent || agentFromSessionKey(e.sessionKey) || 'main';
+    if (!(ag in sessionsStoreByAgent)) sessionsStoreByAgent[ag] = readSessionsStore(ag);
+    return sessionsStoreByAgent[ag];
+  }
 
   for (const [name, entry] of Object.entries(labels)) {
     if (entry.status !== 'running') continue;
@@ -753,7 +790,7 @@ async function cmdStuck(flags) {
     if (ageMs < effectiveThreshMs) continue;
 
     // ── Skip if session is within startup grace period ────────────────────
-    const STARTUP_GRACE_MS = config.startupGraceMs ?? 90_000;
+    const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
     if (ageMs < STARTUP_GRACE_MS) continue;
 
     // ── Skip if an active watcher is already monitoring this session ──────
@@ -762,8 +799,9 @@ async function cmdStuck(flags) {
       continue;
     }
 
-    // ── Check gateway state before alerting ──────────────────
-    const check = checkSessionDone(entry.sessionKey, sessionCache, effectiveThreshMs);
+    // ── Check sessions store state before alerting ───────────
+    const stuckSessionsStore = getSessionsStoreForEntry(entry);
+    const check = checkSessionDone(entry.sessionKey, stuckSessionsStore, effectiveThreshMs);
 
     if (check.shouldResolve) {
       // Gateway says this session is done — auto-mark and skip alert
@@ -839,8 +877,8 @@ async function cmdStuck(flags) {
 }
 
 /**
- * sync — reconcile labels.json with gateway state.
- * Auto-resolves any "running" sessions that the gateway considers done.
+ * sync — reconcile labels.json with sessions store state.
+ * Auto-resolves any "running" sessions that the sessions store considers done.
  *
  * Flags:
  *   --dry-run    Show what would change without modifying labels.json
@@ -848,21 +886,22 @@ async function cmdStuck(flags) {
 function cmdSync(flags) {
   const dryRun = flags['dry-run'] === true;
 
-  let sessionCache = null;
-  try {
-    const result = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 10000 });
-    sessionCache = result?.sessions || [];
-  } catch (err) {
-    die(`Failed to query gateway: ${err.message}`);
-  }
-
   const labels  = loadLabels();
   const changes = [];
+
+  // Preload sessions stores per agent
+  const syncStoreByAgent = {};
+  function getSyncStore(e) {
+    const ag = e.agent || agentFromSessionKey(e.sessionKey) || 'main';
+    if (!(ag in syncStoreByAgent)) syncStoreByAgent[ag] = readSessionsStore(ag);
+    return syncStoreByAgent[ag];
+  }
 
   for (const [name, entry] of Object.entries(labels)) {
     if (entry.status !== 'running') continue;
 
-    const check = checkSessionDone(entry.sessionKey, sessionCache, 10 * 60 * 1000);
+    const syncStore = getSyncStore(entry);
+    const check = checkSessionDone(entry.sessionKey, syncStore, 10 * 60 * 1000);
 
     if (check.shouldResolve) {
       const newStatus = check.is529 ? 'error' : 'done';
@@ -945,6 +984,31 @@ function cmdResult(flags) {
 }
 
 /**
+ * done — agent-side completion signal (push-based).
+ * Called by the subagent itself as its LAST action when fully complete.
+ * Sets labels.json status=done so the watcher resolves immediately.
+ *
+ * Flags:
+ *   --label <string>    Required. Label to mark as done
+ *   --summary <string>  Optional. One-line completion summary
+ */
+function cmdDone(flags) {
+  const label   = flags.label;
+  const summary = flags.summary || 'completed (agent signal)';
+  if (!label) die('--label is required', 2);
+
+  const existing = getLabel(label);
+  if (!existing) die(`No session found for label "${label}"`, 1);
+
+  setLabel(label, {
+    status:  'done',
+    summary,
+  });
+
+  out({ ok: true, label, status: 'done', summary, message: 'Label marked done via agent signal.' });
+}
+
+/**
  * send / steer — send a message into a running session.
  *
  * Flags:
@@ -1011,30 +1075,32 @@ function cmdHeartbeat(flags) {
     sessionKey = entry.sessionKey;
   }
 
-  try {
-    const result  = gatewayToolInvoke('sessions_list', { activeMinutes: 1440 }, 'agent:main:main', { timeout: 8000 });
-    const session = result?.sessions?.find(s => s.key === sessionKey);
+  const hbAgent = label ? (getLabel(label)?.agent || agentFromSessionKey(sessionKey)) : agentFromSessionKey(sessionKey);
+  const hbStore = readSessionsStore(hbAgent || 'main');
 
-    if (!session) {
-      out({ ok: false, sessionKey, alive: false, message: 'Session not found in store' });
-      return;
-    }
-
-    const ageMs = session.updatedAt ? Date.now() - session.updatedAt : null;
-
-    out({
-      ok:        true,
-      sessionKey,
-      label:     label || null,
-      alive:     ageMs !== null && ageMs < 10 * 60 * 1000,
-      ageMs,
-      updatedAt: session.updatedAt ? new Date(session.updatedAt).toISOString() : null,
-      sessionId: session.sessionId,
-      model:     session.model || null,
-    });
-  } catch (err) {
-    out({ ok: false, sessionKey, alive: false, error: err.message });
+  if (!hbStore) {
+    out({ ok: false, sessionKey, alive: false, message: 'Sessions store unavailable' });
+    return;
   }
+
+  const sessionEntry = hbStore[sessionKey];
+  if (!sessionEntry) {
+    out({ ok: false, sessionKey, alive: false, message: 'Session not found in sessions store' });
+    return;
+  }
+
+  const ageMs = sessionEntry.updatedAt ? Date.now() - sessionEntry.updatedAt : null;
+
+  out({
+    ok:        true,
+    sessionKey,
+    label:     label || null,
+    alive:     ageMs !== null && ageMs < 10 * 60 * 1000,
+    ageMs,
+    updatedAt: sessionEntry.updatedAt ? new Date(sessionEntry.updatedAt).toISOString() : null,
+    sessionId: sessionEntry.sessionId,
+    model:     sessionEntry.model || null,
+  });
 }
 
 /**
@@ -1096,7 +1162,9 @@ Subcommands:
 
   list     [--status running|done|error] [--limit <n>]
 
-  sync     [--dry-run]                 (reconcile labels.json with gateway)
+  sync     [--dry-run]                 (reconcile labels.json with sessions store)
+
+  done     --label <l> [--summary <s>] (agent-side completion signal; marks label as done)
 `);
 }
 
@@ -1115,5 +1183,6 @@ switch (subcommand) {
   case 'heartbeat': cmdHeartbeat(flags);       break;
   case 'list':      cmdList(flags);            break;
   case 'sync':      cmdSync(flags);            break;
+  case 'done':      cmdDone(flags);            break;
   default:          usage(); process.exit(2);
 }

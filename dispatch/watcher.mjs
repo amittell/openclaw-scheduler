@@ -40,6 +40,10 @@ const HOME_DIR = process.env.HOME || homedir();
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
+// Startup grace period before declaring a session as spawn-failure.
+// Sessions take 2-5min to start processing due to LLM API queuing.
+const STARTUP_GRACE_MS = 300_000; // 5 minutes
+
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
@@ -81,10 +85,19 @@ function gatewayCall(method, params = {}, opts = {}) {
 }
 
 /**
- * Get current totalTokens for a session from gateway sessions.list.
+ * Get current totalTokens for a session.
+ * Tries sessions.json first (ground truth), falls back to sessions.list API.
  * Returns number or null if unavailable.
  */
 function getSessionTokens(sessionKey) {
+  // Primary: sessions.json direct read
+  const agent = sessionKey ? (sessionKey.split(':')[1] || 'main') : 'main';
+  const store = readSessionsStore(agent);
+  if (store && sessionKey in store) {
+    const tokens = store[sessionKey]?.totalTokens;
+    if (typeof tokens === 'number') return tokens;
+  }
+  // Fallback: gateway sessions.list API (may not see dispatcher-spawned sessions)
   const result = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
   const session = result?.sessions?.find(s => s.key === sessionKey);
   return session?.totalTokens ?? null;
@@ -342,6 +355,23 @@ function killSession(sessionKey) {
 }
 
 /**
+ * Read the sessions.json store for an agent directly from disk.
+ * Primary ground truth for session state — sessions spawned via dispatcher
+ * HTTP agent endpoint appear here but NOT in sessions_list API results.
+ *
+ * @param {string} agent - Agent ID (default: 'main')
+ * @returns {Object|null} - Sessions store object, or null on read error
+ */
+function readSessionsStore(agent = 'main') {
+  try {
+    const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json');
+    return JSON.parse(readFileSync(sessionsPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Update labels.json to mark the watched label as done (best-effort, atomic write).
  * Called before exit to ensure labels.json is reconciled even if sync fails.
  */
@@ -444,13 +474,29 @@ while (Date.now() < deadline) {
   // Capture sessionKey for recovery steer/kill
   if (status.sessionKey) recoverySessionKey = status.sessionKey;
 
-  // Track session presence in gateway.
-  // liveness is set without an error field only when the session was found in sessions.list.
-  if (status.liveness && !status.liveness.error) {
-    sessionEverFound = true;
+  // Track session presence — two independent signals, either is sufficient.
+  // 1. Sessions.json store (primary ground truth for dispatcher-spawned sessions)
+  // 2. Liveness field from dispatch status (secondary; also built from sessions.json
+  //    in production, but test mocks may provide it directly)
+  if (!sessionEverFound && status.sessionKey) {
+    const sessionAgent = status.agent || 'main';
+    const watcherStore = readSessionsStore(sessionAgent);
+    if (watcherStore !== null && status.sessionKey in watcherStore) {
+      // Found in sessions.json — authoritative
+      sessionEverFound = true;
+    } else if (status.liveness && !status.liveness.error) {
+      // Not in sessions.json (or store unavailable) but liveness signal says alive —
+      // session may still be initializing. Trust liveness as a secondary signal.
+      sessionEverFound = true;
+    }
   }
 
-  // ── Path 0: 529/overload auto-retry ───────────────────────
+  // ── Path 0a: agent-side done signal (push-based) ──────────
+  // If the agent ran `dispatch done --label <label>`, status is 'done' immediately.
+  // This is the fast path — no need to poll for idle timeout.
+  // (Handled by Path 1 below since cmdDone sets status='done' in labels.json)
+
+  // ── Path 0b: 529/overload auto-retry ──────────────────────
   if (status.status === 'error') {
     const errorMsg = status.error || status.summary || '';
     if (is529Error(errorMsg)) {
