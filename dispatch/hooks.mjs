@@ -4,6 +4,7 @@
  * Fires structured dispatch events to:
  *   1. Loki (always — structured log stream for Grafana observability)
  *   2. DISPATCH_WEBHOOK_URL (optional — external systems, dashboards, etc.)
+ *   3. Gateway post office (optional — when opts.deliverTo is set)
  *
  * All calls are best-effort and non-blocking. A hook failure never
  * prevents dispatch from completing.
@@ -15,7 +16,9 @@
  *   dispatch.cancelled — run manually cancelled
  */
 
-import { hostname } from 'os';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { hostname, homedir } from 'os';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
@@ -25,6 +28,10 @@ const HOST         = process.env.DISPATCH_HOST
   || hostname()
   || 'unknown-host';
 const TIMEOUT_MS   = 3000;
+const HOME_DIR     = homedir();
+
+// Configurable gateway URL for testability. Defaults to local gateway.
+const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 
 // ── Loki push ───────────────────────────────────────────────
 
@@ -60,6 +67,65 @@ async function webhookPush(event, payload) {
   });
 }
 
+// ── Gateway notification ─────────────────────────────────────
+
+/**
+ * Read the OpenClaw gateway auth token.
+ * Checks OPENCLAW_GATEWAY_TOKEN env first, then ~/.openclaw/openclaw.json.
+ */
+function getGatewayToken() {
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
+    const cfg = JSON.parse(readFileSync(configPath, 'utf-8'));
+    return cfg?.gateway?.auth?.token || null;
+  } catch { return null; }
+}
+
+/**
+ * Send a completion notification via the gateway post office.
+ * Used for unregistered-label done signals where no watcher is waiting.
+ *
+ * @param {string} label           - Dispatch label
+ * @param {string} summary         - One-line summary of what was done
+ * @param {string} deliverTo       - Target chat/user ID (e.g. Telegram chat ID)
+ * @param {string} [deliveryChannel='telegram'] - Channel to deliver via
+ */
+async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram') {
+  const token = getGatewayToken();
+  if (!token) {
+    process.stderr.write(`[dispatch-hooks] gateway notify skipped — no token available\n`);
+    return;
+  }
+  try {
+    const message = `✅ [${label}] done — ${summary}`;
+    const body = JSON.stringify({
+      tool: 'message',
+      args: {
+        action: 'send',
+        channel: deliveryChannel,
+        target: String(deliverTo),
+        message,
+      },
+      sessionKey: 'main',
+    });
+    const res = await fetch(`${GATEWAY_URL}/tools/invoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      process.stderr.write(`[dispatch-hooks] gateway notify HTTP ${res.status} for ${label}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`[dispatch-hooks] gateway notify failed for ${label}: ${e.message}\n`);
+  }
+}
+
 // ── Public API ───────────────────────────────────────────────
 
 /**
@@ -91,18 +157,39 @@ export function onStarted(opts) {
   });
 }
 
-/** Convenience: dispatch.finished */
-export function onFinished(opts) {
-  return emitEvent('dispatch.finished', {
-    label:       opts.label,
-    job_id:      opts.job_id,
-    run_id:      opts.run_id,
-    agent:       opts.agent,
-    status:      opts.status,        // ok | error | timeout | cancelled
-    duration_ms: opts.duration_ms || null,
-    error:       opts.error || null,
-    session_key: opts.session_key || null,
-  });
+/**
+ * Convenience: dispatch.finished
+ *
+ * Fires to Loki + webhook (always) and optionally to the gateway post office.
+ *
+ * Extended opts:
+ *   deliverTo       {string}  — If set, send a completion notification via gateway
+ *   deliveryChannel {string}  — Channel for delivery (default: 'telegram')
+ *   summary         {string}  — One-line summary to include in the notification
+ */
+export async function onFinished(opts) {
+  const tasks = [
+    emitEvent('dispatch.finished', {
+      label:       opts.label,
+      job_id:      opts.job_id,
+      run_id:      opts.run_id,
+      agent:       opts.agent,
+      status:      opts.status,        // ok | error | timeout | cancelled
+      duration_ms: opts.duration_ms || null,
+      error:       opts.error || null,
+      session_key: opts.session_key || null,
+    }),
+  ];
+
+  // Optional gateway post-office delivery (used for unregistered-label done signals)
+  if (opts.deliverTo) {
+    const summary = opts.summary || opts.status || 'completed';
+    tasks.push(
+      gatewayNotify(opts.label, summary, opts.deliverTo, opts.deliveryChannel || 'telegram')
+    );
+  }
+
+  return Promise.allSettled(tasks);
 }
 
 /** Convenience: dispatch.stuck */
