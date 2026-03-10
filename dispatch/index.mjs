@@ -786,9 +786,43 @@ function cmdStatus(flags) {
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const ageMs = Date.now() - spawnedAtMs;
     const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
-    const check = ageMs < STARTUP_GRACE_MS
-      ? { shouldResolve: false }
-      : checkSessionDone(entry.sessionKey, sessionsStore, 10 * 60 * 1000, true, spawnedAtMs);
+
+    // ── Heartbeat-based liveness guard ──────────────────────────────────
+    // The watcher process writes lastPing every 60s while the session is live.
+    // If the ping is fresh, the watcher is alive and working — defer auto-resolve
+    // to avoid killing sessions during slow tool calls, docker builds, etc.
+    //
+    // PING_STALE_MS:   3× the 60s ping interval — if we haven't heard from the
+    //                  watcher in 3 min, it's probably dead; fall through to check.
+    // hardCeilingMs:   job timeout * 1.5 — absolute max regardless of ping age.
+    //                  Catches zombie watchers (watcher alive but session is stuck).
+    // idleThresholdMs: max(job timeout, 10 min) — replaces the old hardcoded 10-min
+    //                  threshold so longer jobs aren't killed at exactly 10 min.
+    const PING_STALE_MS  = 3 * 60 * 1000;
+    const hardCeilingMs  = (entry.timeoutSeconds || 600) * 1000 * 1.5;
+    const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
+
+    let check;
+    if (ageMs < STARTUP_GRACE_MS) {
+      // Within startup grace — never auto-resolve
+      check = { shouldResolve: false };
+    } else if (entry.lastPing) {
+      const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
+      if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
+        // Watcher alive and within job ceiling — defer auto-resolve
+        check = { shouldResolve: false };
+      } else {
+        // Ping stale OR past hard ceiling: fall through to session store check
+        const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
+        check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
+      }
+    } else {
+      // No lastPing — backward compat (sessions dispatched before heartbeat feature).
+      // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
+      const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
+      check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
+    }
+
     if (check.shouldResolve) {
       if (check.is529) {
         setLabel(label, {
@@ -1027,7 +1061,25 @@ function cmdSync(flags) {
 
     const syncStore = getSyncStore(entry);
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
-    const check = checkSessionDone(entry.sessionKey, syncStore, 10 * 60 * 1000, true, spawnedAtMs);
+    const elapsedMs   = Date.now() - spawnedAtMs;
+
+    // ── Heartbeat-based liveness guard (mirrors cmdStatus logic) ─────────
+    // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
+    // See cmdStatus for full commentary on PING_STALE_MS / hardCeilingMs.
+    const PING_STALE_MS_SYNC  = 3 * 60 * 1000;
+    const hardCeilingMsSync   = (entry.timeoutSeconds || 600) * 1000 * 1.5;
+    const idleThresholdMsSync = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
+
+    if (entry.lastPing) {
+      const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
+      if (pingAgeMs < PING_STALE_MS_SYNC && elapsedMs < hardCeilingMsSync) {
+        // Watcher alive and within ceiling — skip auto-resolve for this cycle
+        continue;
+      }
+    }
+
+    const syncThresh = elapsedMs >= hardCeilingMsSync ? 2 * 60 * 1000 : idleThresholdMsSync;
+    const check = checkSessionDone(entry.sessionKey, syncStore, syncThresh, true, spawnedAtMs);
 
     if (check.shouldResolve) {
       const newStatus = check.is529 ? 'error' : 'done';

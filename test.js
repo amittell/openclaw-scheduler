@@ -3271,6 +3271,199 @@ assert(AT_JOB_CRON_SENTINEL === '0 0 31 2 *', 'AT_JOB_CRON_SENTINEL is the expec
 }
 
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: Watchdog Heartbeat Guard
+// ═══════════════════════════════════════════════════════════
+// Tests the lastPing-based liveness guard added to cmdStatus and cmdSync
+// in dispatch/index.mjs (Part 2 of fix/watchdog-premature-resolve).
+
+console.log('\n── Watchdog Heartbeat Guard ──');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath   = join(dispatchDir, 'index.mjs');
+  const watcherPath = join(dispatchDir, 'watcher.mjs');
+  const { mkdirSync } = await import('fs');
+
+  // ── Source-level presence checks ─────────────────────────────────────
+  const indexSrc  = readFileSync(indexPath, 'utf8');
+  const watcherSrc = readFileSync(watcherPath, 'utf8');
+
+  assert(watcherSrc.includes('PING_INTERVAL_MS'),     'watcher.mjs defines PING_INTERVAL_MS constant');
+  assert(watcherSrc.includes('60_000'),               'watcher.mjs sets PING_INTERVAL_MS to 60_000');
+  assert(watcherSrc.includes('lastPing'),             'watcher.mjs writes lastPing in heartbeat');
+  assert(watcherSrc.includes('setInterval'),          'watcher.mjs uses setInterval for heartbeat');
+  assert(watcherSrc.includes('clearInterval'),        'watcher.mjs clears heartbeat interval on exit');
+  assert(watcherSrc.includes('_pingInterval'),        'watcher.mjs tracks interval ref in _pingInterval');
+
+  assert(indexSrc.includes('PING_STALE_MS'),          'index.mjs defines PING_STALE_MS for watchdog guard');
+  assert(indexSrc.includes('hardCeilingMs'),          'index.mjs defines hardCeilingMs');
+  assert(indexSrc.includes('lastPing'),               'index.mjs checks lastPing in watchdog guard');
+  assert(indexSrc.includes('idleThresholdMs'),        'index.mjs uses idleThresholdMs instead of hardcoded 10 min');
+  assert(indexSrc.includes('PING_STALE_MS_SYNC'),     'index.mjs applies same guard in cmdSync');
+
+  // ── Helper: create temp env with stale sessions.json ─────────────────
+  // Uses a session idle for 15 min — normally triggering auto-resolve.
+  function makeWdgEnv(tmpDir) {
+    const labelsPath  = join(tmpDir, 'labels.json');
+    const sessionsDir = join(tmpDir, '.openclaw', 'agents', 'main', 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    const sessionsJsonPath = join(sessionsDir, 'sessions.json');
+    const fakeSessionKey   = 'agent:main:subagent:wdg-test-uuid';
+    const staleUpdatedAt   = Date.now() - 15 * 60 * 1000; // 15 min ago
+
+    writeFileSync(sessionsJsonPath, JSON.stringify({
+      [fakeSessionKey]: {
+        sessionId: 'fake-sid-wdg',
+        updatedAt: staleUpdatedAt,
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    return { labelsPath, sessionsJsonPath, fakeSessionKey, staleUpdatedAt };
+  }
+
+  function runStatus(labelsPath, tmpDir, label) {
+    return JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', label], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tmpDir },
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }));
+  }
+
+  const tmpBase = mkdtempSync(join(tmpdir(), 'wdg-hb-test-'));
+
+  // ── Test 1: fresh lastPing + within hardCeiling → stays running ───────
+  // Without the guard this session (idle 15 min, timeout 600s) would resolve.
+  // With a fresh ping (30s old) and elapsed < hardCeiling (15 min < 15 min... use 6 min),
+  // cmdStatus should defer auto-resolve.
+  {
+    const tmpDir = join(tmpBase, 't1');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t1': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 6 * 60 * 1000).toISOString(), // 6 min ago
+        timeoutSeconds: 600,    // hardCeiling = 900s = 15 min; elapsed = 6 min < 15 min
+        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago — fresh
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t1');
+    assert(result.status === 'running',   'watchdog guard t1: fresh lastPing + within ceiling → stays running');
+    assert(!result.syncAction,            'watchdog guard t1: no auto-resolve action taken');
+  }
+
+  // ── Test 2: stale lastPing + within hardCeiling → falls through, auto-resolves ─
+  // lastPing = 4 min ago (> PING_STALE_MS = 3 min), elapsed = 8 min < hardCeiling (15 min).
+  // Should fall through to checkSessionDone with idleThresholdMs = 10 min.
+  // Session idle 15 min > 10 min → auto-resolves.
+  {
+    const tmpDir = join(tmpBase, 't2');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t2': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 8 * 60 * 1000).toISOString(),  // 8 min ago
+        timeoutSeconds: 600,    // hardCeiling = 15 min; elapsed = 8 min < 15 min
+        lastPing:       new Date(Date.now() - 4 * 60 * 1000).toISOString(),  // 4 min ago — stale
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t2');
+    assert(result.status === 'done',   'watchdog guard t2: stale lastPing → falls through → auto-resolves');
+  }
+
+  // ── Test 3: elapsedMs >= hardCeilingMs → resolves regardless of fresh ping ─
+  // elapsed = 20 min ≥ hardCeiling (600 * 1.5s = 15 min).
+  // Uses 2-min threshold; session idle 15 min > 2 min → auto-resolves.
+  // (Fresh ping cannot save a zombie session past the hard ceiling.)
+  {
+    const tmpDir = join(tmpBase, 't3');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t3': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(), // 20 min ago
+        timeoutSeconds: 600,   // hardCeiling = 15 min; elapsed = 20 min ≥ 15 min
+        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago — fresh
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t3');
+    assert(result.status === 'done', 'watchdog guard t3: past hard ceiling → resolves regardless of fresh ping');
+  }
+
+  // ── Test 4: no lastPing (backward compat) → uses idleThresholdMs ─────
+  // Sessions dispatched before the heartbeat feature have no lastPing.
+  // Behavior should use idleThresholdMs = max(timeoutSeconds*1000, 10 min).
+
+  // 4a: timeoutSeconds=300 → idleThreshold=10 min. Session idle 15 min > 10 min → resolves.
+  {
+    const tmpDir = join(tmpBase, 't4a');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t4a': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+        timeoutSeconds: 300,   // idleThreshold = max(300000, 600000) = 10 min
+        // no lastPing — backward compat
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t4a');
+    assert(result.status === 'done', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves');
+  }
+
+  // 4b: timeoutSeconds=1800 → idleThreshold=30 min. Session idle 15 min < 30 min → stays running.
+  {
+    const tmpDir = join(tmpBase, 't4b');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    // Override sessions.json so session is 15 min stale (same as makeWdgEnv default)
+    // but hardCeiling = 1800 * 1.5 = 2700s = 45 min, elapsed = 20 min < 45 min,
+    // idleThreshold = max(1800000, 600000) = 30 min > silence(15 min) → stays running.
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t4b': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(), // 20 min ago
+        timeoutSeconds: 1800,  // idleThreshold = 30 min, hardCeiling = 45 min
+        // no lastPing — backward compat
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t4b');
+    assert(result.status === 'running', 'watchdog guard t4b: no lastPing + idle < idleThreshold → stays running');
+  }
+
+  const { rmSync: rmWdg } = await import('fs');
+  rmWdg(tmpBase, { recursive: true, force: true });
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

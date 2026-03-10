@@ -44,6 +44,11 @@ const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 // Sessions take 2-5min to start processing due to LLM API queuing.
 const STARTUP_GRACE_MS = 300_000; // 5 minutes
 
+/** How often the watcher writes lastPing to labels.json (heartbeat signal).
+ *  The watchdog guard in index.mjs treats pings older than 3× this as stale,
+ *  so PING_INTERVAL_MS must stay well below PING_STALE_MS (3 * 60_000). */
+const PING_INTERVAL_MS = 60_000; // 60 seconds
+
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
@@ -415,11 +420,21 @@ function deliverResult(label, lastReply, fallbackSummary) {
   process.exit(0);
 }
 
+// ── Watcher heartbeat interval ref ──────────────────────────────────────
+// Populated after label is validated (in main body). Cleared on exit.
+// The interval writes lastPing to labels.json so the watchdog guard in
+// index.mjs knows this watcher process is alive and actively monitoring.
+let _pingInterval = null;
+
 // ── Sync on Exit ────────────────────────────────────────────
 // Best-effort sync of labels.json with gateway state on every watcher exit.
 // Ensures stale 'running' entries are reconciled promptly, preventing
 // false positives from the stuck detector.
 process.on('exit', () => {
+  if (_pingInterval !== null) {
+    clearInterval(_pingInterval);
+    _pingInterval = null;
+  }
   try {
     execFileSync(process.execPath, [INDEX_PATH, 'sync'], {
       encoding: 'utf-8',
@@ -445,6 +460,25 @@ if (!label) {
   process.stderr.write('[watcher] --label is required\n');
   process.exit(2);
 }
+
+// ── Start heartbeat ─────────────────────────────────────────────────────
+// Write lastPing to labels.json every PING_INTERVAL_MS while the session is
+// still running. The watchdog guard in index.mjs reads lastPing to know this
+// watcher process is alive — preventing premature auto-resolve during slow
+// tool calls, docker builds, long pytest runs, etc.
+// Cleared automatically by the process.on('exit') handler above.
+_pingInterval = setInterval(() => {
+  try {
+    const lbs = loadLabels();
+    if (lbs[label]?.status === 'running') {
+      lbs[label].lastPing = new Date().toISOString();
+      saveLabels(lbs);
+    }
+  } catch {
+    // Best-effort — never crash the watcher over a ping failure
+  }
+}, PING_INTERVAL_MS);
+_pingInterval.unref(); // don't prevent Node.js from exiting naturally
 
 const deadline = Date.now() + timeoutS * 1000;
 let consecutiveFailures = 0;
@@ -564,7 +598,9 @@ while (Date.now() < deadline) {
   // ── Path 2: status says 'running' but session may be idle ─
   // If the session has no recent activity, proactively check for a result.
   // This catches the gap where the session completed but status hasn't
-  // auto-resolved yet (10min threshold in checkSessionDone).
+  // auto-resolved yet. The watchdog guard in index.mjs defers auto-resolve
+  // while this watcher's lastPing heartbeat is fresh (written every 60s);
+  // this path handles normal completion before the ping goes stale.
   const ageMs = status.liveness?.ageMs;
   if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
     const result = dispatch('result', ['--label', label]);
