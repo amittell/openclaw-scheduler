@@ -1131,7 +1131,14 @@ async function cmdDone(flags) {
   if (!label) die('--label is required', 2);
 
   const existing = getLabel(label);
-  if (!existing) die(`No session found for label "${label}"`, 1);
+  if (!existing) {
+    // Label was never registered (e.g. direct subagent spawn, not via enqueue).
+    // This is not an error — the work completed, the label just wasn't tracked.
+    process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" — registering as done\n`);
+    setLabel(label, { status: 'done', summary });
+    out({ ok: true, label, status: 'done', summary, message: 'Label not previously registered; marked done.' });
+    return;
+  }
 
   setLabel(label, {
     status:  'done',
