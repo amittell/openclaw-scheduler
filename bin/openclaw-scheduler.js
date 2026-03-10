@@ -8,6 +8,21 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
 
+// Dispatch subcommands — routed to dispatch/index.mjs
+const DISPATCH_SUBCOMMANDS = new Set([
+  'dispatch',
+  'enqueue',
+  'status',
+  'stuck',
+  'result',
+  'sync',
+  'done',
+  'send',
+  'steer',
+  'heartbeat',
+  'list',
+]);
+
 function printUsage() {
   process.stdout.write(`
 openclaw-scheduler <command> [args]
@@ -19,15 +34,46 @@ Commands:
   webhook-check    Run Telegram webhook health check / repair utility
   help             Show this help
 
+Dispatch subcommands (routed to dispatch/index.mjs):
+  dispatch <sub>   Explicit dispatch namespace
+  enqueue          Spawn a sub-agent session (alias: dispatch enqueue)
+  status           Query session status by label
+  stuck            Find sessions running past threshold
+  result           Get last assistant reply from a session
+  send / steer     Send/steer a running session
+  heartbeat        Check session liveness
+  list             List all tracked labels
+  sync             Reconcile labels.json with sessions store
+  done             Agent-side completion signal
+
 All other commands are forwarded to scheduler CLI (cli.js):
-  openclaw-scheduler status
   openclaw-scheduler jobs list
   openclaw-scheduler msg send system main "hello"
+
+Environment:
+  DISPATCH_CONFIG_DIR   Override dispatch config directory (default: ~/.openclaw/chilisaus)
 `);
 }
 
 function runScript(script, args) {
   const result = spawnSync(process.execPath, [join(root, script), ...args], {
+    stdio: 'inherit',
+    env: process.env,
+  });
+  if (typeof result.status === 'number') {
+    process.exit(result.status);
+  }
+  process.exit(1);
+}
+
+/**
+ * Run dispatch/index.mjs with the given args.
+ * Honors DISPATCH_CONFIG_DIR env var for branding config override.
+ */
+function runDispatch(args) {
+  const dispatchScript = join(root, 'dispatch', 'index.mjs');
+  // Pass through all env vars including DISPATCH_CONFIG_DIR
+  const result = spawnSync(process.execPath, [dispatchScript, ...args], {
     stdio: 'inherit',
     env: process.env,
   });
@@ -65,6 +111,17 @@ if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   process.stdout.write(`${pkg.name} ${pkg.version}\n`);
   process.exit(0);
+}
+
+// Route dispatch subcommands to dispatch/index.mjs
+if (DISPATCH_SUBCOMMANDS.has(cmd)) {
+  // If the command is 'dispatch', strip it and pass the rest
+  // If it's a convenience alias (enqueue, status, etc.), pass everything as-is
+  if (cmd === 'dispatch') {
+    runDispatch(args.slice(1));
+  } else {
+    runDispatch(args);
+  }
 }
 
 runScript('cli.js', args);

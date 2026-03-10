@@ -9,21 +9,43 @@
 set -euo pipefail
 LABEL="${1:?Usage: deliver-watcher.sh <label>}"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
-DISPATCH_CLI_CANDIDATE="${DISPATCH_CLI:-$OPENCLAW_HOME/dispatch/index.mjs}"
-LEGACY_CLI_CANDIDATE="${CHILISAUS_CLI:-$OPENCLAW_HOME/chilisaus/index.mjs}"
 NODE_BIN="${NODE_BIN:-$(command -v node)}"
 
-if [ -f "$DISPATCH_CLI_CANDIDATE" ]; then
-  CLI_PATH="$DISPATCH_CLI_CANDIDATE"
-elif [ -f "$LEGACY_CLI_CANDIDATE" ]; then
-  CLI_PATH="$LEGACY_CLI_CANDIDATE"
+# Resolution order:
+#  1) openclaw-scheduler bin (preferred, if in PATH)
+#  2) dispatch/index.mjs directly
+#  3) DISPATCH_CLI env override
+#  4) CHILISAUS_CLI env override (legacy)
+#  5) chilisaus/index.mjs (legacy fallback)
+
+CLI_PATH=""
+USE_BIN=false
+
+if command -v openclaw-scheduler >/dev/null 2>&1; then
+  USE_BIN=true
+elif [ -n "${DISPATCH_CLI:-}" ] && [ -f "$DISPATCH_CLI" ]; then
+  CLI_PATH="$DISPATCH_CLI"
+elif [ -f "$OPENCLAW_HOME/scheduler/dispatch/index.mjs" ]; then
+  CLI_PATH="$OPENCLAW_HOME/scheduler/dispatch/index.mjs"
+elif [ -n "${CHILISAUS_CLI:-}" ] && [ -f "$CHILISAUS_CLI" ]; then
+  CLI_PATH="$CHILISAUS_CLI"
+elif [ -f "$OPENCLAW_HOME/chilisaus/index.mjs" ]; then
+  CLI_PATH="$OPENCLAW_HOME/chilisaus/index.mjs"
 else
-  echo "[deliver-watcher] dispatch CLI not found (checked: $DISPATCH_CLI_CANDIDATE, $LEGACY_CLI_CANDIDATE)" >&2
+  echo "[deliver-watcher] dispatch CLI not found" >&2
   exit 1
 fi
 
+run_dispatch() {
+  if [ "$USE_BIN" = true ]; then
+    openclaw-scheduler "$@"
+  else
+    "$NODE_BIN" "$CLI_PATH" "$@"
+  fi
+}
+
 # Check if the agent produced a reply (direct check, no idle threshold)
-RESULT_JSON=$("$NODE_BIN" "$CLI_PATH" result --label "$LABEL" 2>/dev/null || echo '{}')
+RESULT_JSON=$(run_dispatch result --label "$LABEL" 2>/dev/null || echo '{}')
 REPLY=$(echo "$RESULT_JSON" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
@@ -33,7 +55,7 @@ print(text.strip()[:3000])
 
 if [ -n "$REPLY" ]; then
   # Mark as done in labels.json (best-effort)
-  "$NODE_BIN" "$CLI_PATH" status --label "$LABEL" >/dev/null 2>&1 || true
+  run_dispatch status --label "$LABEL" >/dev/null 2>&1 || true
   echo "✅ $LABEL: $REPLY"
   exit 0
 fi
