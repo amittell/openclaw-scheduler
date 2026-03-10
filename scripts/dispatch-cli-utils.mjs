@@ -28,22 +28,27 @@ function commandExists(cmd) {
  * directly rather than `node <path>`.
  */
 export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
-  // Candidate 0: openclaw-scheduler bin in PATH (useBin=true — caller should invoke as bin)
-  if (commandExists('openclaw-scheduler')) {
-    return 'openclaw-scheduler';
-  }
-
   const homeDir = env.HOME || '';
   const openclawHome = env.OPENCLAW_HOME
     || (homeDir ? join(homeDir, '.openclaw') : '.openclaw');
+
+  // Explicit env overrides always win
+  if (env.DISPATCH_CLI && exists(env.DISPATCH_CLI)) return env.DISPATCH_CLI;
+  if (env.CHILISAUS_CLI && exists(env.CHILISAUS_CLI)) return env.CHILISAUS_CLI;
+
+  // Well-known paths in priority order
   const candidates = [
-    env.DISPATCH_CLI,
-    env.CHILISAUS_CLI,
     join(openclawHome, 'scheduler', 'dispatch', 'index.mjs'),
     join(openclawHome, 'dispatch', 'index.mjs'),
     join(openclawHome, 'chilisaus', 'index.mjs'),
-  ].filter(Boolean);
-  return candidates.find(p => exists(p)) || candidates[0] || 'dispatch/index.mjs';
+  ];
+  const found = candidates.find(p => exists(p));
+  if (found) return found;
+
+  // Fall back to bin in PATH — only when no explicit env or file candidates match
+  if (commandExists('openclaw-scheduler')) return 'openclaw-scheduler';
+
+  return candidates[0] || 'dispatch/index.mjs';
 }
 
 /**
