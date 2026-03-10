@@ -1,21 +1,45 @@
 import { existsSync } from 'fs';
 import { join } from 'path';
+import { execSync } from 'child_process';
+
+/**
+ * Check if a binary is available in PATH.
+ */
+function commandExists(cmd) {
+  try {
+    execSync(`command -v ${cmd}`, { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Resolve the dispatch CLI path with backward-compatible fallbacks.
  * Priority:
- *  1) DISPATCH_CLI
+ *  0) openclaw-scheduler bin (in PATH) — preferred public interface
+ *  1) DISPATCH_CLI env override
  *  2) CHILISAUS_CLI (legacy override)
- *  3) $OPENCLAW_HOME/dispatch/index.mjs
- *  4) $OPENCLAW_HOME/chilisaus/index.mjs (legacy path)
+ *  3) $OPENCLAW_HOME/scheduler/dispatch/index.mjs
+ *  4) $OPENCLAW_HOME/dispatch/index.mjs
+ *  5) $OPENCLAW_HOME/chilisaus/index.mjs (legacy fallback)
+ *
+ * Returns { path, useBin } where useBin=true means call via `openclaw-scheduler`
+ * directly rather than `node <path>`.
  */
 export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
+  // Candidate 0: openclaw-scheduler bin in PATH (useBin=true — caller should invoke as bin)
+  if (commandExists('openclaw-scheduler')) {
+    return 'openclaw-scheduler';
+  }
+
   const homeDir = env.HOME || '';
   const openclawHome = env.OPENCLAW_HOME
     || (homeDir ? join(homeDir, '.openclaw') : '.openclaw');
   const candidates = [
     env.DISPATCH_CLI,
     env.CHILISAUS_CLI,
+    join(openclawHome, 'scheduler', 'dispatch', 'index.mjs'),
     join(openclawHome, 'dispatch', 'index.mjs'),
     join(openclawHome, 'chilisaus', 'index.mjs'),
   ].filter(Boolean);
