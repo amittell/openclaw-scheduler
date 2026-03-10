@@ -4,25 +4,65 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/*.md'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/*.md'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
-    runs-on: ${{ matrix.os }}
+  validate-linux:
+    name: Validate (Linux)
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            node-version: '20'
-          - os: ubuntu-latest
-            node-version: '22'
-          - os: ubuntu-latest
-            node-version: '24'
-          - os: macos-latest
-            node-version: '20'
-          - os: macos-latest
-            node-version: '22'
+        node-version: ['20', '22', '24']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Coverage
+        run: npm run coverage
+
+      - name: Package integrity
+        run: npm pack --dry-run
+
+  validate-macos:
+    name: Validate (macOS)
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '22']
 
     steps:
       - name: Checkout
