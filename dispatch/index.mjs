@@ -289,9 +289,10 @@ function agentFromSessionKey(sessionKey) {
  * @param {boolean}     [sessionEverFound=true] - Whether the session was ever seen in the store.
  *                                                Pass false to get a distinct "spawn likely failed"
  *                                                reason instead of "session not found in sessions store".
+ * @param {number}      [spawnedAtMs=0]  - Timestamp (ms) when the session was spawned (0 = unknown)
  * @returns {{ shouldResolve: boolean, reason: string, lastActivity: number|null, is529?: boolean, errorMsg?: string }}
  */
-function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFound = true) {
+function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFound = true, spawnedAtMs = 0) {
   // 0. Check gateway error log for 529/overload errors FIRST.
   //    If we find a 529, we should resolve as error, not done.
   const logCheck = check529InGatewayLog(sessionKey);
@@ -306,7 +307,18 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   }
 
   // 1. Not in sessions store → session never appeared or already cleaned up
+  //    BUT: young sessions (<5 min old) may simply not have propagated yet,
+  //    especially right after a gateway restart. Don't auto-resolve those.
+  const YOUNG_SESSION_MS = 5 * 60 * 1000;
   if (!sessionsStore[sessionKey]) {
+    const ageMs = spawnedAtMs ? Date.now() - spawnedAtMs : Infinity;
+    if (ageMs < YOUNG_SESSION_MS) {
+      return {
+        shouldResolve: false,
+        reason:       'session young, not yet in sessions store — deferring',
+        lastActivity:  null,
+      };
+    }
     return {
       shouldResolve: true,
       reason:       logCheck.found
@@ -667,7 +679,7 @@ function cmdStatus(flags) {
     const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
     const check = ageMs < STARTUP_GRACE_MS
       ? { shouldResolve: false }
-      : checkSessionDone(entry.sessionKey, sessionsStore, 10 * 60 * 1000);
+      : checkSessionDone(entry.sessionKey, sessionsStore, 10 * 60 * 1000, true, spawnedAtMs);
     if (check.shouldResolve) {
       if (check.is529) {
         setLabel(label, {
@@ -801,7 +813,7 @@ async function cmdStuck(flags) {
 
     // ── Check sessions store state before alerting ───────────
     const stuckSessionsStore = getSessionsStoreForEntry(entry);
-    const check = checkSessionDone(entry.sessionKey, stuckSessionsStore, effectiveThreshMs);
+    const check = checkSessionDone(entry.sessionKey, stuckSessionsStore, effectiveThreshMs, true, spawnedAt);
 
     if (check.shouldResolve) {
       // Gateway says this session is done — auto-mark and skip alert
@@ -901,7 +913,8 @@ function cmdSync(flags) {
     if (entry.status !== 'running') continue;
 
     const syncStore = getSyncStore(entry);
-    const check = checkSessionDone(entry.sessionKey, syncStore, 10 * 60 * 1000);
+    const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
+    const check = checkSessionDone(entry.sessionKey, syncStore, 10 * 60 * 1000, true, spawnedAtMs);
 
     if (check.shouldResolve) {
       const newStatus = check.is529 ? 'error' : 'done';
