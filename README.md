@@ -52,7 +52,8 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 31. [File Reference](#file-reference)
 32. [Testing](#testing)
 33. [Companion Scripts](#companion-scripts)
-34. [Troubleshooting](#troubleshooting)
+34. [Sub-agent Dispatch](#sub-agent-dispatch)
+35. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1181,6 +1182,152 @@ npm test
 - Idempotency key claiming/releasing
 - Context retrieval (recent/hybrid)
 - Dispatcher integration (full dispatch pipeline with mock gateway)
+
+---
+
+## Sub-agent Dispatch
+
+The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in a local `labels.json` ledger, and auto-announces its result when the agent calls `done` as its final action. The module also supports symlink-based branding: a wrapper directory (such as `chilisaus`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
+
+### Quick Example
+
+```bash
+# Dispatch a sub-agent task and deliver the result to Telegram
+openclaw-scheduler enqueue \
+  --label       "fix-deploy-script"                                          \
+  --message     "Fix the deploy script in ~/app to handle missing .env files" \
+  --mode        fresh                                                         \
+  --thinking    high                                                          \
+  --timeout     3600                                                          \
+  --deliver-to  484946046                                                     \
+  --delivery-mode announce
+
+# Fallback (if openclaw-scheduler is not in PATH):
+node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
+  --label "fix-deploy-script" --message "..." --deliver-to 484946046
+```
+
+### Flag Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--label` | required | Human-readable name for the session. Used for status lookups, reuse, and watchdog tracking. |
+| `--message` | required* | Prompt sent to the agent. |
+| `--message-file` | -- | Path to a file whose contents are used as the prompt. Alternative to `--message`; avoids shell-escaping issues with long prompts. |
+| `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
+| `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
+| `--model` | -- | Model override, e.g. `anthropic/claude-sonnet-4-6`. |
+| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers a scheduler watcher job for reliable at-least-once delivery. |
+| `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
+| `--timeout` | `300` | Session timeout in seconds. |
+| `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
+| `--no-monitor` | -- | Disable watchdog registration for this dispatch. |
+
+*Either `--message` or `--message-file` is required.
+
+### Subcommand Reference
+
+| Subcommand | Description |
+|------------|-------------|
+| `enqueue` | Spawn a new agent session (or resume one with `--mode reuse`) and optionally register a scheduler watcher for delivery. |
+| `status` | Show current status for a label: session key, spawn time, running/done/error, and liveness data from the sessions store. |
+| `stuck` | Check all running sessions against the stuck threshold. Exits 1 if genuinely stuck sessions remain after auto-resolving completed ones. |
+| `result` | Retrieve the last assistant reply from a session transcript via `chat.history`. |
+| `sync` | Reconcile `labels.json` with sessions store state. Auto-marks sessions as done or error based on idle time. Supports `--dry-run`. |
+| `done` | Agent-side completion signal. The agent calls this as its final action to mark itself done immediately (push-based; no idle timeout wait). |
+| `send` | Inject a message into a running session for mid-run steering. The agent sees it as a new user turn. |
+| `steer` | Alias for `send`. The name makes steering intent explicit. |
+| `heartbeat` | Check whether a session has been active within the last 10 minutes. Accepts `--label` or `--session-key`. |
+| `list` | List all tracked labels in `labels.json`, sorted by most recent. Accepts `--status running|done|error` and `--limit`. |
+
+### Multi-agent Orchestration
+
+The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are delivered back to the requesting Telegram chat without the orchestrator polling.
+
+**Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. The dispatcher sets `spawnDepth: 1` on each fresh session automatically.
+
+**Example: 3 parallel workers**
+
+```bash
+# Orchestrator dispatches three workers in parallel.
+# All three run concurrently in isolated sessions.
+
+openclaw-scheduler enqueue \
+  --label   "worker-schema"   \
+  --message "Review the DB schema and write documentation for all tables" \
+  --thinking high --timeout 600 --deliver-to 484946046
+
+openclaw-scheduler enqueue \
+  --label   "worker-frontend" \
+  --message "Audit the React components for accessibility issues" \
+  --thinking high --timeout 600 --deliver-to 484946046
+
+openclaw-scheduler enqueue \
+  --label   "worker-docs"     \
+  --message "Update the API docs to reflect the new /v2 endpoints" \
+  --thinking high --timeout 600 --deliver-to 484946046
+
+# Each worker auto-announces its result to Telegram when done.
+# No polling needed. Watchdog jobs are auto-registered for each.
+```
+
+Check status at any time:
+
+```bash
+openclaw-scheduler list --status running
+openclaw-scheduler status --label worker-schema
+```
+
+### Branding and Configuration
+
+`dispatch/index.mjs` resolves `config.json` relative to the directory of the invoking script, not the module itself. This means a symlink at `~/.openclaw/chilisaus/index.mjs -> ~/.openclaw/scheduler/dispatch/index.mjs` will load `~/.openclaw/chilisaus/config.json`, giving the same CLI a different brand name and defaults. All config fields are optional.
+
+**`config.json` fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | `"dispatch"` | Brand name shown in Telegram notifications and log output. |
+| `startupGraceMs` | `90000` | Grace period (ms) after spawn before stuck detection and auto-resolve activate. |
+| `stuckThresholdMs` | `600000` | Silence duration (ms) before a session is considered stuck. |
+| `maxWatcherAgeMs` | `7200000` | Max watcher process age (ms) before it is treated as stale. |
+| `watchdogIntervalCron` | `"*/15 * * * *"` | Cron schedule for the auto-registered watchdog job. |
+| `watchdogTimeoutMin` | `60` | Sessions running longer than this (minutes) without completing trigger a watchdog alert. |
+
+**Environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `DISPATCH_LABELS_PATH` | Override path for `labels.json`. Default: `<invoke_dir>/labels.json`. |
+| `OPENCLAW_GATEWAY_TOKEN` | Gateway auth token. Falls back to `~/.openclaw/openclaw.json` if unset. |
+
+**Minimal `config.json`:**
+
+```json
+{
+  "name": "chilisaus",
+  "watchdogIntervalCron": "*/15 * * * *",
+  "watchdogTimeoutMin": 60
+}
+```
+
+### Monitoring and the Watchdog
+
+When `--deliver-to` is set and `--no-monitor` is not passed, `enqueue` automatically registers a watchdog job in the scheduler DB alongside the delivery watcher job. The watchdog runs on the configured cron schedule and calls `stuck --threshold-min <watchdogTimeoutMin>` for the dispatched label. If the session has been silent past the threshold, the watchdog posts an alert to the configured Telegram target and then disables itself.
+
+Check active dispatch sessions:
+
+```bash
+# List all running dispatch sessions
+openclaw-scheduler list --status running
+
+# Check whether any session is stuck (exits 1 if found)
+node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15
+
+# Status for a specific label
+openclaw-scheduler status --label fix-deploy-script
+```
+
+The watchdog disarms itself automatically when the agent calls `done`, when `status` or `sync` auto-resolves the session from gateway idle state, or when `result` is fetched after a successful completion.
 
 ---
 
