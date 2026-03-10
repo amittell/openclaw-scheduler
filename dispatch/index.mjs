@@ -55,10 +55,19 @@ const INVOKE_DIR = (() => {
 
 const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(INVOKE_DIR, 'labels.json');
 
-/** Load dispatch config from config.json (checks INVOKE_DIR first, then __dirname) */
+/** Load dispatch config from config.json.
+ *  Resolution order:
+ *    1. DISPATCH_CONFIG_DIR env var (branded wrapper deployments)
+ *    2. INVOKE_DIR (argv[1] dirname — supports symlink-based branding)
+ *    3. __dirname (dispatch module directory — fallback)
+ */
 function loadConfig() {
-  // Try invocation directory first (supports symlink-based branding)
-  for (const dir of [INVOKE_DIR, __dirname]) {
+  const searchDirs = [];
+  if (process.env.DISPATCH_CONFIG_DIR) searchDirs.push(pathResolve(process.env.DISPATCH_CONFIG_DIR));
+  if (!searchDirs.includes(INVOKE_DIR)) searchDirs.push(INVOKE_DIR);
+  if (!searchDirs.includes(__dirname)) searchDirs.push(__dirname);
+
+  for (const dir of searchDirs) {
     try {
       const cfgPath = join(dir, 'config.json');
       return JSON.parse(readFileSync(cfgPath, 'utf-8'));
@@ -525,7 +534,8 @@ async function cmdEnqueue(flags) {
   parts.push(`[Subagent Task]: ${message}`);
 
   // Append agent-side done signal instructions (Fix 2 — push-based completion)
-  const doneScriptPath = INVOKE_DIR + '/index.mjs';
+  // Always point to dispatch/index.mjs (__dirname) — the canonical done handler.
+  const doneScriptPath = join(__dirname, 'index.mjs');
   parts.push(``);
   parts.push(`---`);
   parts.push(`COMPLETION SIGNAL: When your task is fully complete, run this as your LAST action:`);
@@ -650,7 +660,7 @@ async function cmdEnqueue(flags) {
     let watchdogJobId = null;
     if (monitorEnabled) {
       try {
-        const checkCmd = `'${process.execPath}' '${join(INVOKE_DIR, 'index.mjs')}' stuck --label '${label.replace(/'/g, "'\\''")}' --threshold-min ${monitorTimeout}`;
+        const checkCmd = `'${process.execPath}' '${join(__dirname, 'index.mjs')}' stuck --label '${label.replace(/'/g, "'\\''")}' --threshold-min ${monitorTimeout}`;
         const alertChannel = deliverChannel || 'telegram';
         const alertTarget  = deliverTo || '484946046';
         const watchdogSpec = JSON.stringify({

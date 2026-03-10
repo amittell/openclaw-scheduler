@@ -69,13 +69,18 @@ function runScript(script, args) {
 /**
  * Run dispatch/index.mjs with the given args.
  * Honors DISPATCH_CONFIG_DIR env var for branding config override.
+ * Defaults to ~/.openclaw/chilisaus if not set (chilisaus branding).
  */
 function runDispatch(args) {
   const dispatchScript = join(root, 'dispatch', 'index.mjs');
-  // Pass through all env vars including DISPATCH_CONFIG_DIR
+  const env = { ...process.env };
+  // Default to chilisaus branding unless explicitly overridden
+  if (!env.DISPATCH_CONFIG_DIR) {
+    env.DISPATCH_CONFIG_DIR = join(process.env.HOME || '', '.openclaw', 'chilisaus');
+  }
   const result = spawnSync(process.execPath, [dispatchScript, ...args], {
     stdio: 'inherit',
-    env: process.env,
+    env,
   });
   if (typeof result.status === 'number') {
     process.exit(result.status);
