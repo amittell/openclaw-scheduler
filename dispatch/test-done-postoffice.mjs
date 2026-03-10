@@ -13,8 +13,8 @@
  *   node dispatch/test-done-postoffice.mjs -v    (verbose)
  */
 
-import { execFileSync, spawnSync } from 'child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
