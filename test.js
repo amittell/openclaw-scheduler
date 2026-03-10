@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -2761,7 +2761,7 @@ if (sub === 'status') {
       timeout: 12000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    sfExitCode = 0;
+    // execFileSync succeeded — sfExitCode retains its initial value of 0
   } catch (err) {
     sfExitCode  = err.status ?? 1;
     sfStderr    = err.stderr  ?? '';
@@ -2828,9 +2828,8 @@ if (sub === 'status') {
     },
   }) + '\n');
 
-  let ncExitCode = -1;
-  let ncStdout = '';
-  let ncStderr = '';
+  let ncExitCode;
+  let ncStdout;
   try {
     ncStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-nc', '--timeout', '30', '--poll-interval', '1'], {
       env: {
@@ -2846,7 +2845,6 @@ if (sub === 'status') {
   } catch (err) {
     ncExitCode = err.status ?? 1;
     ncStdout   = err.stdout ?? '';
-    ncStderr   = err.stderr ?? '';
   }
   assert(ncExitCode === 0, 'normal completion: watcher exits 0');
   assert(ncStdout.includes('Task completed successfully!'), 'normal completion: watcher delivers lastReply in output');
@@ -2889,7 +2887,6 @@ console.log('\n── Sessions.json Detection ──');
   const testTmpDir = mkdtempSync(join(tmpdir(), 'sessions-json-test-'));
   const testLabelsPath = join(testTmpDir, 'labels.json');
   // Path must match readSessionsStore: join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json')
-  const { mkdirSync } = await import('fs');
   const sessionsDir = join(testTmpDir, '.openclaw', 'agents', 'main', 'sessions');
   mkdirSync(sessionsDir, { recursive: true });
   const sessionsJsonPath = join(sessionsDir, 'sessions.json');
@@ -3282,7 +3279,6 @@ console.log('\n── Watchdog Heartbeat Guard ──');
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexPath   = join(dispatchDir, 'index.mjs');
   const watcherPath = join(dispatchDir, 'watcher.mjs');
-  const { mkdirSync } = await import('fs');
 
   // ── Source-level presence checks ─────────────────────────────────────
   const indexSrc  = readFileSync(indexPath, 'utf8');
@@ -3413,7 +3409,11 @@ console.log('\n── Watchdog Heartbeat Guard ──');
   // Sessions dispatched before the heartbeat feature have no lastPing.
   // Behavior should use idleThresholdMs = max(timeoutSeconds*1000, 10 min).
 
-  // 4a: timeoutSeconds=300 → idleThreshold=10 min. Session idle 15 min > 10 min → resolves.
+  // 4a: timeoutSeconds=600 → idleThreshold=10 min, hardCeiling=15 min.
+  //     spawnedAt 12 min ago → elapsed(12 min) < hardCeiling(15 min) → idleThresholdMs path.
+  //     Session idle 15 min (makeWdgEnv default) > idleThreshold 10 min → resolves.
+  //     (Previously used timeoutSeconds=300 / spawnedAt=20 min which fell into the zombie-guard
+  //     path instead of the intended idleThresholdMs path.)
   {
     const tmpDir = join(tmpBase, 't4a');
     mkdirSync(tmpDir);
@@ -3425,14 +3425,14 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         status:         'running',
         agent:          'main',
         mode:           'fresh',
-        spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(),
-        timeoutSeconds: 300,   // idleThreshold = max(300000, 600000) = 10 min
+        spawnedAt:      new Date(Date.now() - 12 * 60 * 1000).toISOString(), // 12 min ago < hardCeiling(15 min)
+        timeoutSeconds: 600,   // idleThreshold = max(600000, 600000) = 10 min; hardCeiling = 15 min
         // no lastPing — backward compat
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t4a');
-    assert(result.status === 'done', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves');
+    assert(result.status === 'done', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves (idleThresholdMs path)');
   }
 
   // 4b: timeoutSeconds=1800 → idleThreshold=30 min. Session idle 15 min < 30 min → stays running.
@@ -3460,8 +3460,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
     assert(result.status === 'running', 'watchdog guard t4b: no lastPing + idle < idleThreshold → stays running');
   }
 
-  const { rmSync: rmWdg } = await import('fs');
-  rmWdg(tmpBase, { recursive: true, force: true });
+  rmSync(tmpBase, { recursive: true, force: true });
 }
 
 closeDb();

@@ -185,7 +185,7 @@ function gatewayCall(method, params = {}, opts = {}) {
  * Uses /tools/invoke endpoint so gateway evaluates with full session-tree
  * visibility (sees subagents, unlike raw gatewayCall RPC).
  */
-function gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opts = {}) {
+function _gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opts = {}) {
   try {
     const body = JSON.stringify({ tool, args, sessionKey });
     const raw = execFileSync('curl', [
@@ -799,8 +799,11 @@ function cmdStatus(flags) {
     // idleThresholdMs: max(job timeout, 10 min) — replaces the old hardcoded 10-min
     //                  threshold so longer jobs aren't killed at exactly 10 min.
     const PING_STALE_MS  = 3 * 60 * 1000;
-    const hardCeilingMs  = (entry.timeoutSeconds || 600) * 1000 * 1.5;
     const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
+    // hardCeilingMs must be >= idleThresholdMs to avoid the ceiling undercutting the
+    // idle floor (e.g. timeoutSeconds=300 → ceiling=7.5 min < idle=10 min would force
+    // zombie-guard threshold for sessions that should still use idleThresholdMs).
+    const hardCeilingMs  = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMs * 1.5);
 
     let check;
     if (ageMs < STARTUP_GRACE_MS) {
@@ -1067,8 +1070,9 @@ function cmdSync(flags) {
     // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
     // See cmdStatus for full commentary on PING_STALE_MS / hardCeilingMs.
     const PING_STALE_MS_SYNC  = 3 * 60 * 1000;
-    const hardCeilingMsSync   = (entry.timeoutSeconds || 600) * 1000 * 1.5;
     const idleThresholdMsSync = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
+    // hardCeilingMsSync must be >= idleThresholdMsSync (mirrors cmdStatus fix).
+    const hardCeilingMsSync   = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMsSync * 1.5);
 
     if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();

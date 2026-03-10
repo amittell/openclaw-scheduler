@@ -42,7 +42,7 @@ const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
 // Startup grace period before declaring a session as spawn-failure.
 // Sessions take 2-5min to start processing due to LLM API queuing.
-const STARTUP_GRACE_MS = 300_000; // 5 minutes
+const _STARTUP_GRACE_MS = 300_000; // 5 minutes — reserved for future startup-gate logic
 
 /** How often the watcher writes lastPing to labels.json (heartbeat signal).
  *  The watchdog guard in index.mjs treats pings older than 3× this as stale,
@@ -467,6 +467,11 @@ if (!label) {
 // watcher process is alive — preventing premature auto-resolve during slow
 // tool calls, docker builds, long pytest runs, etc.
 // Cleared automatically by the process.on('exit') handler above.
+//
+// Race-condition note: loadLabels() always reads fresh from disk (no in-memory cache),
+// so each heartbeat tick gets the latest state before patching only the lastPing field.
+// The read-modify-write window is tiny (synchronous) and worst-case a concurrent writer
+// wins one tick, which is benign — the next tick will re-establish the ping.
 _pingInterval = setInterval(() => {
   try {
     const lbs = loadLabels();
