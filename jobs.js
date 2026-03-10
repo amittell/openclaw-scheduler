@@ -141,12 +141,22 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     const finalKind = merged.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
     validateJobPayload(finalTarget, finalKind);
   }
-  if (!isChild && !merged.schedule_cron) {
-    throw new Error('schedule_cron is required for root jobs');
+  const isAtJob = merged.schedule_kind === 'at';
+  if (!isChild && !isAtJob && !merged.schedule_cron) {
+    throw new Error('schedule_cron is required for root cron jobs');
+  }
+  if (isAtJob && mode === 'create' && !merged.schedule_at) {
+    throw new Error('schedule_at is required for at-jobs (use --at or --in)');
   }
   if (merged.schedule_cron) {
     assertSafeString('schedule_cron', merged.schedule_cron, { maxLength: 128 });
-    nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'America/New_York');
+    // Skip cron validation for the sentinel (never-fires placeholder for at-jobs)
+    if (merged.schedule_cron !== AT_JOB_CRON_SENTINEL) {
+      nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'America/New_York');
+    }
+  }
+  if (merged.schedule_at != null) {
+    assertSafeString('schedule_at', merged.schedule_at, { maxLength: 64 });
   }
   if (mode === 'create' || 'schedule_tz' in normalized) {
     assertSafeString('schedule_tz', merged.schedule_tz || 'America/New_York', { maxLength: 128 });
@@ -264,6 +274,30 @@ export function validateJobPayload(sessionTarget, payloadKind) {
 }
 
 /**
+ * Parse an --in duration string (e.g. '15m', '2h', '30s', '1d') and return
+ * an ISO datetime string (SQLite UTC format: 'YYYY-MM-DD HH:MM:SS') for now + duration.
+ * Supported units: s (seconds), m (minutes), h (hours), d (days).
+ * @param {string} duration - e.g. '15m', '2h', '30s', '1d'
+ * @returns {string} schedule_at in SQLite UTC format
+ */
+export function parseInDuration(duration) {
+  const match = /^(\d+(?:\.\d+)?)(s|m|h|d)$/i.exec(String(duration).trim());
+  if (!match) {
+    throw new Error(`Invalid --in duration: "${duration}". Use e.g. 15m, 2h, 30s, 1d`);
+  }
+  const [, amount, unit] = match;
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  const ms = parseFloat(amount) * multipliers[unit.toLowerCase()];
+  return new Date(Date.now() + ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+/**
+ * Sentinel cron expression used for at-jobs on existing DBs where
+ * schedule_cron is NOT NULL. Feb 31 never exists, so this never fires.
+ */
+export const AT_JOB_CRON_SENTINEL = '0 0 31 2 *';
+
+/**
  * Calculate next run time from a cron expression.
  */
 export function nextRunFromCron(cronExpr, tz) {
@@ -282,7 +316,9 @@ export function createJob(opts) {
   const db = getDb();
   const id = normalized.id || randomUUID();
   const isChild = !!normalized.parent_id;
-  const cronExpr = normalized.schedule_cron || (isChild ? '0 0 31 2 *' : null);
+  const isAtJob = normalized.schedule_kind === 'at';
+  // For at-jobs: use provided cron or sentinel; for children: use sentinel; for cron: require cron
+  const cronExpr = normalized.schedule_cron || (isAtJob || isChild ? AT_JOB_CRON_SENTINEL : null);
 
   // Cycle detection + depth check for child jobs
   if (isChild) {
@@ -300,13 +336,16 @@ export function createJob(opts) {
   let nextRun;
   if (normalized.run_now) {
     nextRun = sqliteNow(-1000);
+  } else if (isAtJob) {
+    // At-jobs fire at schedule_at; use provided next_run_at or derive from schedule_at
+    nextRun = normalized.next_run_at || normalized.schedule_at || null;
   } else {
     nextRun = isChild ? null : nextRunFromCron(cronExpr, normalized.schedule_tz || 'America/New_York');
   }
 
   const stmt = db.prepare(`
     INSERT INTO jobs (
-      id, name, enabled, schedule_cron, schedule_tz,
+      id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
       session_target, agent_id, payload_kind, payload_message,
       payload_model, payload_thinking, payload_timeout_seconds,
       execution_intent, execution_read_only,
@@ -327,7 +366,7 @@ export function createJob(opts) {
       ttl_hours,
       auth_profile
 ) VALUES (
-      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
@@ -352,6 +391,8 @@ export function createJob(opts) {
     id,
     normalized.name,
     normalized.enabled == null ? 1 : (normalized.enabled ? 1 : 0),
+    normalized.schedule_kind || 'cron',
+    normalized.schedule_at || null,
     cronExpr,
     normalized.schedule_tz || 'America/New_York',
     normalized.session_target || 'isolated',
@@ -434,7 +475,7 @@ export function updateJob(id, patch) {
   if (!current) return null;
   const normalized = validateJobSpec(patch, current, 'update');
   const allowed = [
-    'name', 'enabled', 'schedule_cron', 'schedule_tz',
+    'name', 'enabled', 'schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz',
     'session_target', 'agent_id', 'payload_kind', 'payload_message',
     'payload_model', 'payload_thinking', 'payload_timeout_seconds',
     'execution_intent', 'execution_read_only',
@@ -481,10 +522,10 @@ export function updateJob(id, patch) {
 
   db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
-  // Recalculate next_run_at if schedule changed
+  // Recalculate next_run_at if schedule changed (cron jobs only)
   if (normalized.schedule_cron || normalized.schedule_tz) {
     const job = getJob(id);
-    if (job) {
+    if (job && job.schedule_kind !== 'at') {
       const nextRun = job.parent_id ? null : nextRunFromCron(job.schedule_cron, job.schedule_tz);
       db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
     }
@@ -518,7 +559,8 @@ export function runJobNow(id) {
 }
 
 /**
- * Get jobs that are due to run (next_run_at <= now, enabled).
+ * Get cron jobs that are due to run (next_run_at <= now, enabled).
+ * At-jobs are excluded — use getDueAtJobs() for one-shot scheduling.
  */
 export function getDueJobs() {
   return getDb().prepare(`
@@ -526,7 +568,24 @@ export function getDueJobs() {
     WHERE enabled = 1
       AND next_run_at IS NOT NULL
       AND next_run_at <= datetime('now')
+      AND (schedule_kind IS NULL OR schedule_kind = 'cron')
     ORDER BY next_run_at ASC
+  `).all();
+}
+
+/**
+ * Get at-jobs (one-shot) that are due to fire.
+ * Fires when schedule_at <= now and the job hasn't already run since schedule_at.
+ */
+export function getDueAtJobs() {
+  return getDb().prepare(`
+    SELECT * FROM jobs
+    WHERE schedule_kind = 'at'
+      AND enabled = 1
+      AND schedule_at IS NOT NULL
+      AND schedule_at <= datetime('now')
+      AND (last_run_at IS NULL OR last_run_at < schedule_at)
+    ORDER BY schedule_at ASC
   `).all();
 }
 

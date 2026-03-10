@@ -12,13 +12,13 @@ import { setDbPath, initDb, closeDb, getDb } from './db.js';
 import { resolveSchedulerDbPath, resolveSchedulerHome } from './paths.js';
 import {
   createJob, getJob, listJobs, updateJob, deleteJob,
-  getDueJobs, hasRunningRun, nextRunFromCron,
+  getDueJobs, getDueAtJobs, hasRunningRun, nextRunFromCron,
   getTriggeredChildren, getChildJobs, fireTriggeredChildren,
   pruneExpiredJobs, detectCycle, getChainDepth,
   shouldRetry, scheduleRetry, cancelJob,
   enqueueJob, dequeueJob, runJobNow,
   hasRunningRunForPool, evalTriggerCondition,
-  validateJobSpec
+  validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL,
 } from './jobs.js';
 import {
   getDispatch, getDueDispatches, listDispatchesForJob,
@@ -3074,6 +3074,196 @@ console.log('\n── Done Subcommand ──');
 
   const { rmSync: rm3 } = await import('fs');
   rm3(tempDone, { recursive: true, force: true });
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: At-Jobs (one-shot scheduling, v18)
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── At-Jobs (one-shot scheduling) ──');
+
+// Schema: new columns exist
+// Note: uses getDb() (not the cached 'db' from test startup) since migration guard
+// + dispatcher tests may have closed/reopened the connection.
+{
+  const atJobCols = getDb().prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  assert(atJobCols.includes('schedule_kind'), 'jobs.schedule_kind column exists (v18)');
+  assert(atJobCols.includes('schedule_at'), 'jobs.schedule_at column exists (v18)');
+}
+
+// parseInDuration: resolves to correct schedule_at
+{
+  const nowMs = Date.now();
+
+  const in15m = parseInDuration('15m');
+  const parsed15m = new Date(in15m.replace(' ', 'T') + 'Z').getTime();
+  assert(Math.abs(parsed15m - (nowMs + 15 * 60000)) < 2000, '--in 15m resolves within 2s tolerance');
+
+  const in2h = parseInDuration('2h');
+  const parsed2h = new Date(in2h.replace(' ', 'T') + 'Z').getTime();
+  assert(Math.abs(parsed2h - (nowMs + 2 * 3600000)) < 2000, '--in 2h resolves within 2s tolerance');
+
+  const in30s = parseInDuration('30s');
+  const parsed30s = new Date(in30s.replace(' ', 'T') + 'Z').getTime();
+  assert(Math.abs(parsed30s - (nowMs + 30000)) < 2000, '--in 30s resolves within 2s tolerance');
+
+  const in1d = parseInDuration('1d');
+  const parsed1d = new Date(in1d.replace(' ', 'T') + 'Z').getTime();
+  assert(Math.abs(parsed1d - (nowMs + 86400000)) < 2000, '--in 1d resolves within 2s tolerance');
+
+  let threwBadDuration = false;
+  try { parseInDuration('invalid'); } catch { threwBadDuration = true; }
+  assert(threwBadDuration, 'parseInDuration throws on invalid duration string');
+
+  let threwNoUnit = false;
+  try { parseInDuration('15'); } catch { threwNoUnit = true; }
+  assert(threwNoUnit, 'parseInDuration throws when unit is missing');
+}
+
+// AT_JOB_CRON_SENTINEL is exported
+assert(AT_JOB_CRON_SENTINEL === '0 0 31 2 *', 'AT_JOB_CRON_SENTINEL is the expected sentinel cron');
+
+// at-job creation and getDueAtJobs
+{
+  const past = new Date(Date.now() - 5 * 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  const future = new Date(Date.now() + 60 * 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+
+  // Create a past at-job (should be due immediately)
+  const atPast = createJob({
+    name: 'At-Job Past Test',
+    schedule_kind: 'at',
+    schedule_at: past,
+    schedule_cron: AT_JOB_CRON_SENTINEL,
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'at-job past test payload',
+    delete_after_run: 1,
+    next_run_at: past,
+  });
+  assert(atPast.schedule_kind === 'at', 'at-job created with schedule_kind=at');
+  assert(atPast.schedule_at === past, 'at-job created with correct schedule_at');
+  assert(atPast.schedule_cron === AT_JOB_CRON_SENTINEL, 'at-job stores sentinel cron');
+  assert(atPast.delete_after_run === 1, 'at-job delete_after_run=1');
+
+  // Create a future at-job (should NOT be due yet)
+  const atFuture = createJob({
+    name: 'At-Job Future Test',
+    schedule_kind: 'at',
+    schedule_at: future,
+    schedule_cron: AT_JOB_CRON_SENTINEL,
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'at-job future test payload',
+    delete_after_run: 0,
+    next_run_at: future,
+  });
+  assert(atFuture.schedule_kind === 'at', 'future at-job has schedule_kind=at');
+
+  // getDueAtJobs returns past at-job but NOT future at-job
+  const dueAtJobs = getDueAtJobs();
+  assert(dueAtJobs.some(j => j.id === atPast.id), 'getDueAtJobs returns past at-job');
+  assert(!dueAtJobs.some(j => j.id === atFuture.id), 'getDueAtJobs does NOT return future at-job');
+
+  // getDueJobs (cron) does NOT include at-jobs
+  const dueCronJobs = getDueJobs();
+  assert(!dueCronJobs.some(j => j.id === atPast.id), 'getDueJobs (cron) does NOT include past at-job');
+  assert(!dueCronJobs.some(j => j.id === atFuture.id), 'getDueJobs (cron) does NOT include future at-job');
+
+  // at-job with delete_after_run=1: after firing, delete the row
+  updateJob(atPast.id, { last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '') });
+  deleteJob(atPast.id);
+  assert(!getJob(atPast.id), 'after delete_after_run=1 fire, at-job row is gone');
+
+  // at-job with delete_after_run=0: after firing, disable (not deleted)
+  updateJob(atFuture.id, {
+    enabled: 0,
+    last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''),
+  });
+  const disabledAtJob = getJob(atFuture.id);
+  assert(disabledAtJob !== null, 'at-job with delete_after_run=0 still exists after run');
+  assert(!disabledAtJob.enabled, 'at-job with delete_after_run=0 is disabled after run');
+
+  // Disabled at-job NOT returned by getDueAtJobs
+  const dueAfterDisable = getDueAtJobs();
+  assert(!dueAfterDisable.some(j => j.id === atFuture.id), 'disabled at-job not returned by getDueAtJobs');
+
+  // Clean up
+  deleteJob(atFuture.id);
+}
+
+// getDueAtJobs: last_run_at < schedule_at guard (already-ran job not re-fired)
+{
+  // Use a timestamp clearly in the past for schedule_at
+  const ts = new Date(Date.now() - 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  const atAlreadyRan = createJob({
+    name: 'At-Job Already Ran',
+    schedule_kind: 'at',
+    schedule_at: ts,
+    schedule_cron: AT_JOB_CRON_SENTINEL,
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'already ran',
+    delete_after_run: 0,
+    next_run_at: ts,
+  });
+  // Simulate it already having run (last_run_at > schedule_at)
+  const ranAt = new Date(Date.now() - 30000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  updateJob(atAlreadyRan.id, { last_run_at: ranAt });
+  const dueCheck = getDueAtJobs();
+  assert(!dueCheck.some(j => j.id === atAlreadyRan.id), 'getDueAtJobs skips at-job where last_run_at >= schedule_at');
+  deleteJob(atAlreadyRan.id);
+}
+
+// Existing cron jobs unaffected: schedule_kind defaults to 'cron', schedule_at is null
+{
+  const cronJob = createJob({
+    name: 'Regular Cron Job (migration test)',
+    schedule_cron: '*/30 * * * *',
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'regular cron',
+  });
+  assert(cronJob.schedule_kind === 'cron' || cronJob.schedule_kind == null, 'cron job has schedule_kind=cron (default)');
+  assert(cronJob.schedule_at === null || cronJob.schedule_at === undefined, 'cron job has schedule_at=null');
+  assert(cronJob.schedule_cron === '*/30 * * * *', 'cron job schedule_cron is unchanged');
+  // Cron jobs should NOT appear in getDueAtJobs
+  const dueAt = getDueAtJobs();
+  assert(!dueAt.some(j => j.id === cronJob.id), 'cron job not returned by getDueAtJobs');
+  deleteJob(cronJob.id);
+}
+
+// validateJobSpec: at-job requires schedule_at
+{
+  let threwNoScheduleAt = false;
+  try {
+    validateJobSpec({
+      name: 'Bad At-Job',
+      schedule_kind: 'at',
+      session_target: 'isolated',
+      payload_kind: 'agentTurn',
+      payload_message: 'missing schedule_at',
+    }, null, 'create');
+  } catch (e) {
+    threwNoScheduleAt = e.message.includes('schedule_at');
+  }
+  assert(threwNoScheduleAt, 'validateJobSpec throws when at-job missing schedule_at');
+}
+
+// validateJobSpec: cron job still requires schedule_cron (backward compat)
+{
+  let threwNoCron = false;
+  try {
+    validateJobSpec({
+      name: 'Bad Cron Job',
+      session_target: 'isolated',
+      payload_kind: 'agentTurn',
+      payload_message: 'missing schedule_cron',
+    }, null, 'create');
+  } catch (e) {
+    threwNoCron = e.message.includes('schedule_cron');
+  }
+  assert(threwNoCron, 'validateJobSpec still requires schedule_cron for cron jobs (backward compat)');
 }
 
 
