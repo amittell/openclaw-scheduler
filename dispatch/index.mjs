@@ -26,27 +26,45 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve as pathResolve } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
-import { onStarted, onStuck } from './hooks.mjs';
+import { onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
 
+// ── Invocation Directory ─────────────────────────────────────
+// When invoked via symlink (e.g. chilisaus/index.mjs → dispatch/index.mjs),
+// __dirname resolves to the real path (dispatch/). INVOKE_DIR resolves to the
+// symlink's directory so config.json, labels.json, and self-references use the
+// branded wrapper's directory instead of the shared module's.
+
+const INVOKE_DIR = (() => {
+  try {
+    const argv1 = process.argv[1];
+    if (argv1) return dirname(pathResolve(argv1));
+  } catch {}
+  return __dirname;
+})();
+
 // ── Config ───────────────────────────────────────────────────
 
-const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
+const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(INVOKE_DIR, 'labels.json');
 
-/** Load dispatch config from config.json (falls back to {} on error) */
+/** Load dispatch config from config.json (checks INVOKE_DIR first, then __dirname) */
 function loadConfig() {
-  try {
-    const cfgPath = join(__dirname, 'config.json');
-    return JSON.parse(readFileSync(cfgPath, 'utf-8'));
-  } catch { return {}; }
+  // Try invocation directory first (supports symlink-based branding)
+  for (const dir of [INVOKE_DIR, __dirname]) {
+    try {
+      const cfgPath = join(dir, 'config.json');
+      return JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    } catch { /* try next */ }
+  }
+  return {};
 }
 
 const config = loadConfig();
@@ -357,6 +375,28 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   };
 }
 
+// ── Watchdog Helpers ─────────────────────────────────────────
+
+/**
+ * Disarm (disable) a watchdog job for a label if one is registered.
+ * Best-effort — failures are logged but don't throw.
+ */
+function disarmWatchdog(label) {
+  const entry = getLabel(label);
+  if (!entry?.watchdogJobId) return;
+  try {
+    const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
+    execFileSync(process.execPath, [schedulerCli, 'jobs', 'disable', entry.watchdogJobId], {
+      encoding: 'utf-8',
+      timeout:  5000,
+      stdio:    ['pipe', 'pipe', 'pipe'],
+    });
+    process.stderr.write(`[${BRAND}] watchdog disarmed for ${label}\n`);
+  } catch (err) {
+    process.stderr.write(`[${BRAND}] watchdog disarm failed for ${label}: ${err.message}\n`);
+  }
+}
+
 // ── Session Helpers ──────────────────────────────────────────
 
 /** Build a unique session key for a new subagent session. */
@@ -405,6 +445,12 @@ async function cmdEnqueue(flags) {
   const deliverChannel = flags['deliver-channel']   || 'telegram';
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
+
+  // ── Watchdog monitoring flags ─────────────────────────────
+  const noMonitor       = flags['no-monitor'] === true;
+  const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
+  const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
+  const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
 
   // Dynamic branding: resolve per-agent brand name
   const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
@@ -479,7 +525,7 @@ async function cmdEnqueue(flags) {
   parts.push(`[Subagent Task]: ${message}`);
 
   // Append agent-side done signal instructions (Fix 2 — push-based completion)
-  const doneScriptPath = __dirname + '/index.mjs';
+  const doneScriptPath = INVOKE_DIR + '/index.mjs';
   parts.push(``);
   parts.push(`---`);
   parts.push(`COMPLETION SIGNAL: When your task is fully complete, run this as your LAST action:`);
@@ -569,7 +615,7 @@ async function cmdEnqueue(flags) {
         const escapedLabel = label.replace(/'/g, "'\\''");
         // Watcher timeout = session timeout + 120s buffer for startup/polling
         const watcherTimeoutS = timeoutS + 120;
-        const watcherCmd = `'${process.execPath}' '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
+        const watcherCmd = `DISPATCH_LABELS_PATH='${LABELS_PATH}' '${process.execPath}' '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -599,6 +645,53 @@ async function cmdEnqueue(flags) {
       }
     }
 
+    // ── Register watchdog monitoring job ─────────────────────
+    let watchdogJobOk = false;
+    let watchdogJobId = null;
+    if (monitorEnabled) {
+      try {
+        const checkCmd = `'${process.execPath}' '${join(INVOKE_DIR, 'index.mjs')}' stuck --label '${label.replace(/'/g, "'\\''")}' --threshold-min ${monitorTimeout}`;
+        const alertChannel = deliverChannel || 'telegram';
+        const alertTarget  = deliverTo || '484946046';
+        const watchdogSpec = JSON.stringify({
+          name:                     `watchdog:${label}`,
+          job_type:                 'watchdog',
+          schedule_cron:            monitorInterval,
+          session_target:           'shell',
+          payload_kind:             'shellCommand',
+          payload_message:          checkCmd,
+          delivery_mode:            'none',
+          watchdog_target_label:    label,
+          watchdog_check_cmd:       checkCmd,
+          watchdog_timeout_min:     monitorTimeout,
+          watchdog_alert_channel:   alertChannel,
+          watchdog_alert_target:    alertTarget,
+          watchdog_self_destruct:   1,
+          watchdog_started_at:      new Date().toISOString(),
+        });
+        const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
+        const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
+          encoding: 'utf-8',
+          timeout:  10000,
+          stdio:    ['pipe', 'pipe', 'pipe'],
+        });
+        try {
+          const parsed = JSON.parse(addResult.trim());
+          watchdogJobId = parsed?.job?.id || null;
+        } catch {}
+        watchdogJobOk = true;
+
+        // Store watchdog job ID in labels ledger for later cleanup
+        if (watchdogJobId) {
+          setLabel(label, { watchdogJobId });
+        }
+
+        process.stderr.write(`[${agentBrand}] watchdog registered: ${monitorInterval}, timeout: ${monitorTimeout}min\n`);
+      } catch (err) {
+        process.stderr.write(`[${agentBrand}] watchdog registration FAILED: ${err.message}\n`);
+      }
+    }
+
     out({
       ok:         true,
       label,
@@ -612,6 +705,12 @@ async function cmdEnqueue(flags) {
         gateway:   !!deliverTo,
         target:    deliverTo,
         channel:   deliverChannel,
+      } : null,
+      watchdog:   monitorEnabled ? {
+        enabled:  watchdogJobOk,
+        jobId:    watchdogJobId,
+        interval: monitorInterval,
+        timeout:  monitorTimeout,
       } : null,
       message:    schedulerWatcherOk
         ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
@@ -695,6 +794,8 @@ function cmdStatus(flags) {
         });
         syncAction = `auto-resolved: ${check.reason}`;
       }
+      // Disarm watchdog when session is auto-resolved
+      disarmWatchdog(label);
     }
   }
 
@@ -831,6 +932,8 @@ async function cmdStuck(flags) {
         });
         autoResolved.push({ label: name, reason: check.reason });
       }
+      // Disarm watchdog when session is auto-resolved
+      disarmWatchdog(name);
       continue;
     }
 
@@ -932,6 +1035,8 @@ function cmdSync(flags) {
             summary: `Synced: ${check.reason}`,
           });
         }
+        // Disarm watchdog when session is synced as done
+        disarmWatchdog(name);
       }
     }
   }
@@ -984,6 +1089,11 @@ function cmdResult(flags) {
     } catch {}
   }
 
+  // ── Watchdog cleanup: disable watchdog job when result is available ──
+  if (lastReply && entry.watchdogJobId) {
+    disarmWatchdog(label);
+  }
+
   out({
     ok:         true,
     label,
@@ -1005,7 +1115,7 @@ function cmdResult(flags) {
  *   --label <string>    Required. Label to mark as done
  *   --summary <string>  Optional. One-line completion summary
  */
-function cmdDone(flags) {
+async function cmdDone(flags) {
   const label   = flags.label;
   const summary = flags.summary || 'completed (agent signal)';
   if (!label) die('--label is required', 2);
@@ -1017,6 +1127,21 @@ function cmdDone(flags) {
     status:  'done',
     summary,
   });
+
+  // Disarm watchdog when agent signals done
+  disarmWatchdog(label);
+
+  // Fire dispatch.finished hook (best-effort)
+  const spawnedAtMs = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : Date.now();
+  await onFinished({
+    label,
+    job_id:      existing.runId || null,
+    run_id:      existing.runId || null,
+    agent:       existing.agent || 'main',
+    status:      'ok',
+    duration_ms: Date.now() - spawnedAtMs,
+    session_key: existing.sessionKey || null,
+  }).catch(() => {});
 
   out({ ok: true, label, status: 'done', summary, message: 'Label marked done via agent signal.' });
 }
@@ -1160,6 +1285,7 @@ Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
+           [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
 
   status   --label <l>
 
@@ -1196,6 +1322,6 @@ switch (subcommand) {
   case 'heartbeat': cmdHeartbeat(flags);       break;
   case 'list':      cmdList(flags);            break;
   case 'sync':      cmdSync(flags);            break;
-  case 'done':      cmdDone(flags);            break;
+  case 'done':      await cmdDone(flags);       break;
   default:          usage(); process.exit(2);
 }
