@@ -538,9 +538,23 @@ async function cmdEnqueue(flags) {
   const doneScriptPath = join(__dirname, 'index.mjs');
   parts.push(``);
   parts.push(`---`);
-  parts.push(`COMPLETION SIGNAL: When your task is fully complete, run this as your LAST action:`);
-  parts.push(`node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<one-line summary of what you did>"`);
-  parts.push(`This lets the watcher know you're done without waiting for idle timeout.`);
+  parts.push(`COMPLETION SIGNAL — READ CAREFULLY:`);
+  parts.push(``);
+  parts.push(`Only call this command after ALL of the following are true:`);
+  parts.push(`  1. All file edits are saved`);
+  parts.push(`  2. All commits are pushed (git push completed successfully)`);
+  parts.push(`  3. All API calls (e.g. GitHub comment replies) are done`);
+  parts.push(`  4. You have verified the work is complete`);
+  parts.push(``);
+  parts.push(`Call this as your ABSOLUTE FINAL action — nothing else runs after this:`);
+  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<what you actually did, including commit SHA if applicable>"`);
+  parts.push(``);
+  parts.push(`DO NOT call this while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
+  parts.push(`---`);
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(`DELIVERY RULE: Do NOT use the message tool, sessions_send, or any direct messaging to send updates or results to Telegram or any chat. Do NOT reference chat IDs, user IDs, or delivery targets in your work.`);
+  parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically.`);
   parts.push(`---`);
 
   const taskMessage = parts.join('\n');
