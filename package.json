@@ -42,6 +42,7 @@
     "dispatcher-delivery.js",
     "dispatcher-maintenance.js",
     "dispatcher-shell.js",
+    "dispatcher-strategies.js",
     "dispatcher-utils.js",
     "dispatcher.js",
     "gateway.js",
