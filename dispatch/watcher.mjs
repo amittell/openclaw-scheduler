@@ -40,6 +40,8 @@ const HOME_DIR = process.env.HOME || homedir();
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
+const MAX_GW_RESTART_RETRIES = 2; // Max retries for gateway-restart-kill recovery
+
 // Startup grace period before declaring a session as spawn-failure.
 // Sessions take 2-5min to start processing due to LLM API queuing.
 const _STARTUP_GRACE_MS = 300_000; // 5 minutes — reserved for future startup-gate logic
@@ -165,6 +167,28 @@ function is529Error(errorMsg) {
 }
 
 /**
+ * Regex patterns that indicate the session was not found in the sessions store.
+ * This is the telltale signature of a gateway-restart-kill: the gateway restarted,
+ * wiped in-flight sessions, and the status command auto-resolved the label as 'done'
+ * because the sessionKey disappeared from sessions.json.
+ */
+const GW_KILL_PATTERNS = [
+  /session not found in sessions store/i,
+  /session not found in gateway store/i,
+  /session never found/i,
+  /Auto-resolved.*session not found/i,
+  /Auto-resolved.*never found/i,
+];
+
+/**
+ * Check if a status summary indicates the session was killed by a gateway restart.
+ */
+function isGatewayRestartKill(summary) {
+  if (!summary || typeof summary !== 'string') return false;
+  return GW_KILL_PATTERNS.some(p => p.test(summary));
+}
+
+/**
  * Load labels.json directly (avoids going through CLI for speed).
  */
 function loadLabels() {
@@ -197,6 +221,26 @@ function setRetryCount(label, count) {
   const labels = loadLabels();
   if (labels[label]) {
     labels[label].retryCount = count;
+    labels[label].updatedAt = new Date().toISOString();
+    saveLabels(labels);
+  }
+}
+
+/**
+ * Get the current gateway-restart retry count for a label (default 0).
+ */
+function getGwRestartRetryCount(label) {
+  const labels = loadLabels();
+  return labels[label]?.gwRestartRetryCount || 0;
+}
+
+/**
+ * Update the gateway-restart retry count for a label.
+ */
+function setGwRestartRetryCount(label, count) {
+  const labels = loadLabels();
+  if (labels[label]) {
+    labels[label].gwRestartRetryCount = count;
     labels[label].updatedAt = new Date().toISOString();
     saveLabels(labels);
   }
@@ -320,6 +364,53 @@ function respawnSession(label) {
   }
 }
 
+/**
+ * Re-enqueue a label after a gateway-restart kill.
+ * Always uses fresh mode since the original session is gone (the gateway restart
+ * wiped it). Resets label status to 'running' on success so the watcher can
+ * continue polling the new session.
+ */
+function respawnAfterGwRestart(label) {
+  try {
+    const labels = loadLabels();
+    const entry = labels[label];
+    if (!entry) throw new Error(`label "${label}" not found`);
+
+    const continuationMsg =
+      `[Auto-retry after gateway restart] Previous run was killed by gateway restart. ` +
+      `Resume from the beginning.`;
+
+    const enqueueArgs = [
+      INDEX_PATH, 'enqueue',
+      '--label', label,
+      '--message', continuationMsg,
+      '--mode', 'fresh',
+    ];
+    if (entry?.model) enqueueArgs.push('--model', entry.model);
+    if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
+
+    execFileSync(process.execPath, enqueueArgs, {
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // enqueue sets the label to 'running' with a new sessionKey — also reset error field
+    const refreshed = loadLabels();
+    if (refreshed[label]) {
+      refreshed[label].error = null;
+      refreshed[label].updatedAt = new Date().toISOString();
+      saveLabels(refreshed);
+    }
+
+    process.stderr.write(`[watcher] respawned [${label}] via fresh enqueue after gateway restart\n`);
+    return true;
+  } catch (err) {
+    process.stderr.write(`[watcher] respawn after gw restart failed: ${err.message}\n`);
+    return false;
+  }
+}
+
 // ── Gateway Steer & Kill ─────────────────────────────────────
 
 /**
@@ -393,6 +484,28 @@ function markLabelDone(label, summary) {
     }
   } catch (e) {
     process.stderr.write(`[watcher] markLabelDone failed: ${e.message}\n`);
+  }
+}
+
+/**
+ * Update labels.json to mark the watched label as 'error' (best-effort, atomic write).
+ * Used instead of markDoneSync/markLabelDone for sessions that did NOT complete
+ * successfully: gateway-restart-kill, timeout with no result, spawn failure.
+ * This ensures the scheduler run status reflects the true failure outcome.
+ */
+function markLabelError(label, errorSummary) {
+  try {
+    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    if (labels[label]) {
+      labels[label].status = 'error';
+      labels[label].summary = errorSummary || 'failed without result';
+      labels[label].updatedAt = new Date().toISOString();
+      const tmp = LABELS_PATH + '.tmp.' + process.pid;
+      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+    }
+  } catch (e) {
+    process.stderr.write(`[watcher] markLabelError failed: ${e.message}\n`);
   }
 }
 
@@ -581,6 +694,7 @@ while (Date.now() < deadline) {
         `[dispatch] SPAWN FAILURE: session ${status.sessionKey || '(unknown)'} never appeared ` +
         `in gateway — spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
       process.stderr.write(spawnErrMsg + '\n');
+      markLabelError(label, `spawn-failure: session never appeared in gateway`);
       process.stdout.write(
         `🌶️ *dispatch* [${label}] SPAWN FAILURE: session never appeared in gateway — ` +
         `spawn likely failed (auth timeout, quota, or gateway error)\n`
@@ -588,7 +702,72 @@ while (Date.now() < deadline) {
       process.exit(1);
     }
 
-    // Reset retryCount on successful completion
+    // ── Gateway-restart-kill detection ──────────────────────────────────
+    // When a gateway restart kills an in-flight session, the session disappears
+    // from sessions.json and the status command auto-resolves it as 'done' with
+    // a "session not found in sessions store" summary. This is NOT a real
+    // completion — the task was interrupted mid-run. Detect this pattern and
+    // re-dispatch up to MAX_GW_RESTART_RETRIES times.
+    //
+    // Key distinction vs spawn failure:
+    //   spawn failure:          sessionEverFound=false (session never appeared)
+    //   gateway-restart-kill:   sessionEverFound=true  (session ran, then was killed)
+    //
+    // If the session DID produce a lastReply before being killed, deliver it normally.
+    if (sessionEverFound && isGatewayRestartKill(status.summary)) {
+      const gwCheckResult = dispatch('result', ['--label', label]);
+      if (!gwCheckResult?.lastReply) {
+        // No result captured — session was killed before completing
+        const retryCount = getGwRestartRetryCount(label);
+        if (retryCount >= MAX_GW_RESTART_RETRIES) {
+          markLabelError(label,
+            `gateway-restart-kill: max retries exceeded (${retryCount}x — ${status.summary})`);
+          notify(`🌶️ Dispatch: [${label}] gateway-restart-kill: max retries exceeded (${MAX_GW_RESTART_RETRIES}x)`);
+          process.stdout.write(
+            `🌶️ *dispatch* [${label}] failed: session killed by gateway restart, ` +
+            `max retries (${MAX_GW_RESTART_RETRIES}) exceeded\n` +
+            `Summary: ${status.summary}\n`
+          );
+          process.exit(1);
+        }
+        const newRetryCount = retryCount + 1;
+        process.stderr.write(
+          `[watcher] gateway-restart-kill detected for [${label}] — ` +
+          `attempt ${newRetryCount}/${MAX_GW_RESTART_RETRIES}\n`
+        );
+        notify(
+          `🌶️ Dispatch: [${label}] session killed by gateway restart — ` +
+          `re-dispatching (${newRetryCount}/${MAX_GW_RESTART_RETRIES})`
+        );
+        setGwRestartRetryCount(label, newRetryCount);
+        if (respawnAfterGwRestart(label)) {
+          process.stderr.write(
+            `[watcher] [${label}] gw-restart retry ${newRetryCount} dispatched, continuing poll...\n`
+          );
+          await sleep(pollS * 1000);
+          continue;
+        } else {
+          markLabelError(label,
+            `gateway-restart-kill: respawn failed (attempt ${newRetryCount})`);
+          process.stdout.write(
+            `🌶️ *dispatch* [${label}] failed: session killed by gateway restart, respawn failed\n`
+          );
+          process.exit(1);
+        }
+      }
+      // lastReply present — session completed before/during kill; fall through to normal delivery
+    }
+
+    // Reset gw-restart retry count on successful completion
+    const gwRetryCount = getGwRestartRetryCount(label);
+    if (gwRetryCount > 0) {
+      setGwRestartRetryCount(label, 0);
+      process.stderr.write(
+        `[watcher] [${label}] completed after ${gwRetryCount} gw-restart retry(ies), reset gwRestartRetryCount\n`
+      );
+    }
+
+    // Reset 529 retryCount on successful completion
     if (status.status === 'done') {
       const currentRetryCount = getRetryCount(label);
       if (currentRetryCount > 0) {
@@ -690,7 +869,7 @@ if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   // Truly no result and no tokens — telemetry unavailable
   if (baselineTokens === null) {
     process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
-    markDoneSync(`timed out after ${timeoutS}s — token telemetry unavailable`);
+    markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`);
     process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
     process.exit(1);
   }
@@ -717,7 +896,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   const cur = getTokenCount(tokenSessionKey);
   if (cur === null) {
     process.stderr.write(`[watcher] token telemetry lost for ${label}; skipping steer/kill recovery\n`);
-    markDoneSync(`timed out after ${timeoutS}s — token telemetry lost`);
+    markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`);
     process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
     process.exit(1);
   }
@@ -768,14 +947,14 @@ for (const round of steerRounds) {
       await sleep(5000);
       const st3 = dispatch('status', ['--label', label]);
       if (st3?.status === 'done') {
-        markDoneSync('killed after steer+backoff — confirmed done');
-        process.stdout.write(`🌶️ *dispatch* [${label}] killed after steer attempts\n`);
-        process.exit(0);
+        markLabelError(label, 'timed out — killed after steer attempts (no result captured)');
+        process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts — no result captured\n`);
+        process.exit(1);
       }
     }
   }
 }
 
-markDoneSync(`timed out after ${timeoutS}s — killed after steer attempts`);
+markLabelError(label, `timed out after ${timeoutS}s — killed after steer attempts`);
 process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — session killed after steer attempts\n`);
 process.exit(1);

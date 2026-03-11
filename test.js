@@ -3046,6 +3046,205 @@ if (sub === 'status') {
   rmSync(tempDir, { recursive: true, force: true });
 }
 
+// ── Gateway-Restart-Kill Detection ──
+console.log('\n── Gateway-Restart-Kill Recovery ──');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const watcherPath = join(dispatchDir, 'watcher.mjs');
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-gwkill-'));
+
+  // 4. GW-restart-kill with MAX retries exceeded: exits non-zero, labels marked error
+  //    Mock always returns session-not-found with no lastReply, and each enqueue
+  //    call is a no-op (just outputs ok JSON). gwRestartRetryCount is pre-set to 2
+  //    (MAX_GW_RESTART_RETRIES) so the watcher immediately gives up.
+  const mockGwKillPath = join(tempDir, 'mock-gw-kill.mjs');
+  const mockLabelsGwKill = join(tempDir, 'labels-gk.json');
+
+  writeFileSync(mockGwKillPath, `
+const [,,sub] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'test-gk',
+    status: 'done',
+    summary: 'Auto-resolved: session not found in sessions store',
+    sessionKey: 'agent:main:subagent:gk-uuid',
+    liveness: { error: 'session not found in sessions store' },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'done' }) + '\\n');
+} else if (sub === 'enqueue') {
+  process.stdout.write(JSON.stringify({ ok: true, sessionKey: 'agent:main:subagent:gk-new', status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+  // Pre-set gwRestartRetryCount=2 (already at max) so watcher immediately fails.
+  // Also seed sessions.json so sessionEverFound=true (distinguishes from spawn-failure).
+  writeFileSync(mockLabelsGwKill, JSON.stringify({
+    'test-gk': {
+      sessionKey: 'agent:main:subagent:gk-uuid',
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+      timeoutSeconds: 300,
+      gwRestartRetryCount: 2,
+    },
+  }) + '\n');
+
+  // Seed sessions.json so readSessionsStore finds the session (sessionEverFound=true)
+  const gkSessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(gkSessionsDir, { recursive: true });
+  writeFileSync(join(gkSessionsDir, 'sessions.json'), JSON.stringify({
+    'agent:main:subagent:gk-uuid': { sessionId: 'gk-sid', updatedAt: Date.now() - 5000, model: 'test' },
+  }) + '\n');
+
+  let gkExitCode = 0;
+  let gkStdout = '';
+  try {
+    execFileSync(process.execPath, [watcherPath, '--label', 'test-gk', '--timeout', '5', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockGwKillPath,
+        DISPATCH_LABELS_PATH: mockLabelsGwKill,
+        HOME: tempDir,
+      },
+      encoding: 'utf8',
+      timeout: 12000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    gkExitCode = err.status ?? 1;
+    gkStdout   = err.stdout  ?? '';
+  }
+  assert(gkExitCode === 1, 'gw-restart-kill max retries: watcher exits non-zero');
+  assert(gkStdout.includes('gateway restart'), 'gw-restart-kill max retries: output mentions gateway restart');
+  assert(!gkStdout.includes('SPAWN FAILURE'), 'gw-restart-kill max retries: not misclassified as spawn failure');
+  // Verify labels.json was updated to error status
+  const gkLabels = JSON.parse(readFileSync(mockLabelsGwKill, 'utf8'));
+  assert(gkLabels['test-gk'].status === 'error', 'gw-restart-kill max retries: labels.json marked error (not done)');
+  assert(gkLabels['test-gk'].summary.includes('gateway-restart-kill'), 'gw-restart-kill max retries: labels.json summary contains gateway-restart-kill');
+
+  // 5. GW-restart-kill first attempt: watcher re-dispatches (mock returns running after enqueue)
+  //    gwRestartRetryCount starts at 0 — watcher should retry and continue polling.
+  //    We simulate this by: first status call returns done/not-found (kill detected),
+  //    second call also returns done/not-found (simulating another kill on the new session
+  //    with gwRestartRetryCount now=1), third call returns done/not-found (count=2=max → give up).
+  const mockGwRetryPath = join(tempDir, 'mock-gw-retry.mjs');
+  const mockLabelsGwRetry = join(tempDir, 'labels-gr.json');
+  const grCounterFile = join(tempDir, 'gr-counter.txt');
+  writeFileSync(grCounterFile, '0');
+
+  writeFileSync(mockGwRetryPath, `
+import { readFileSync, writeFileSync } from 'fs';
+const [,,sub,...rest] = process.argv;
+const counterFile = ${JSON.stringify(grCounterFile)};
+
+if (sub === 'status') {
+  // Always return session-not-found — watcher should retry up to MAX then fail
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'test-gr',
+    status: 'done',
+    summary: 'Auto-resolved: session not found in sessions store',
+    sessionKey: 'agent:main:subagent:gr-uuid',
+    liveness: { error: 'session not found in sessions store' },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'done' }) + '\\n');
+} else if (sub === 'enqueue') {
+  // Simulate successful enqueue — update labels to 'running' with new sessionKey
+  let labelsPath = ${JSON.stringify(mockLabelsGwRetry)};
+  // Extract --label from args
+  const labelIdx = rest.indexOf('--label');
+  const lbl = labelIdx >= 0 ? rest[labelIdx + 1] : 'test-gr';
+  try {
+    const lbls = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    if (lbls[lbl]) {
+      lbls[lbl].status = 'running';
+      lbls[lbl].sessionKey = 'agent:main:subagent:gr-new-' + Date.now();
+      lbls[lbl].error = null;
+      writeFileSync(labelsPath, JSON.stringify(lbls, null, 2) + '\\n');
+    }
+  } catch {}
+  process.stdout.write(JSON.stringify({ ok: true, sessionKey: 'agent:main:subagent:gr-new', status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+  // gwRestartRetryCount=0 initially — watcher should retry twice then give up
+  writeFileSync(mockLabelsGwRetry, JSON.stringify({
+    'test-gr': {
+      sessionKey: 'agent:main:subagent:gr-uuid',
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  // Seed liveness so sessionEverFound=true: write a fake sessions.json
+  // (watcher reads HOME/.openclaw/agents/main/sessions/sessions.json)
+  // We set HOME to tempDir for this test.
+  const grSessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(grSessionsDir, { recursive: true });
+  writeFileSync(join(grSessionsDir, 'sessions.json'), JSON.stringify({
+    'agent:main:subagent:gr-uuid': { sessionId: 'gr-sid', updatedAt: Date.now() - 5000, model: 'test' },
+  }) + '\n');
+
+  let grExitCode = 0;
+  let grStdout = '';
+  try {
+    execFileSync(process.execPath, [watcherPath, '--label', 'test-gr', '--timeout', '10', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockGwRetryPath,
+        DISPATCH_LABELS_PATH: mockLabelsGwRetry,
+        HOME: tempDir,
+      },
+      encoding: 'utf8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    grExitCode = err.status ?? 1;
+    grStdout   = err.stdout  ?? '';
+  }
+  assert(grExitCode === 1, 'gw-restart-kill retry exhausted: watcher exits non-zero after 2 retries');
+  assert(grStdout.includes('gateway restart'), 'gw-restart-kill retry exhausted: output mentions gateway restart');
+  const grLabels = JSON.parse(readFileSync(mockLabelsGwRetry, 'utf8'));
+  assert(grLabels['test-gr'].status === 'error', 'gw-restart-kill retry exhausted: labels.json marked error');
+  assert((grLabels['test-gr'].gwRestartRetryCount ?? 0) >= 2, 'gw-restart-kill retry exhausted: gwRestartRetryCount reached max');
+
+  rmSync(tempDir, { recursive: true, force: true });
+}
+
+// ── Watcher exit-code correctness (timeout paths) ──
+console.log('\n── Watcher timeout markLabelError ──');
+{
+  const watcherSrc = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs'),
+    'utf8'
+  );
+  // Timeout paths should call markLabelError, not markDoneSync, before exit(1)
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`)'),
+    'timeout: markLabelError used for token-telemetry-unavailable path');
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`)'),
+    'timeout: markLabelError used for token-telemetry-lost path');
+  assert(watcherSrc.includes("markLabelError(label, 'timed out — killed after steer attempts (no result captured)')"),
+    'timeout: markLabelError used for steer-kill path');
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — killed after steer attempts`)'),
+    'timeout: markLabelError used for final killed-after-steer path');
+  assert(watcherSrc.includes('isGatewayRestartKill'), 'gw-kill: isGatewayRestartKill function present');
+  assert(watcherSrc.includes('MAX_GW_RESTART_RETRIES'), 'gw-kill: MAX_GW_RESTART_RETRIES constant present');
+  assert(watcherSrc.includes('respawnAfterGwRestart'), 'gw-kill: respawnAfterGwRestart function present');
+  assert(watcherSrc.includes('gwRestartRetryCount'), 'gw-kill: gwRestartRetryCount tracked in labels');
+}
+
 // ═══════════════════════════════════════════════════════════
 // SECTION: Sessions.json Detection, Done Subcommand, STARTUP_GRACE_MS
 // ═══════════════════════════════════════════════════════════
