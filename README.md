@@ -1292,6 +1292,7 @@ openclaw-scheduler status --label worker-schema
 | `maxWatcherAgeMs` | `7200000` | Max watcher process age (ms) before it is treated as stale. |
 | `watchdogIntervalCron` | `"*/15 * * * *"` | Cron schedule for the auto-registered watchdog job. |
 | `watchdogTimeoutMin` | `60` | Sessions running longer than this (minutes) without completing trigger a watchdog alert. |
+| `deliver_watcher_ttl_hours` | `48` | TTL (hours) for scheduler-registered deliver-watcher jobs. These jobs are transient; they auto-prune once delivery is confirmed. Lower values prune faster; higher values retain audit history longer. |
 
 **Environment variables:**
 
