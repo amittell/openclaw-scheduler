@@ -3464,6 +3464,106 @@ console.log('\n── Done Subcommand ──');
   assert(indexSrc.includes('cmdDone'), 'done subcommand: cmdDone function defined');
   assert(indexSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
 
+  // ── SHA validation tests ──────────────────────────────────
+
+  // done with valid --sha succeeds (uses actual HEAD commit from the scheduler repo)
+  {
+    // Re-populate labels.json with a running entry for sha-test
+    writeFileSync(doneLabels, JSON.stringify({
+      'sha-test-task': {
+        sessionKey: 'agent:main:subagent:sha-test-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    // Get current HEAD SHA from the scheduler repo (a real, existing commit)
+    const validSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', cwd: dirname(fileURLToPath(import.meta.url)) }).trim();
+
+    const shaValidOut = execFileSync(process.execPath, [
+      indexPath, 'done', '--label', 'sha-test-task', '--summary', 'sha test done', '--sha', validSha,
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 10000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const shaValidObj = JSON.parse(shaValidOut.trim());
+    assert(shaValidObj.ok === true, 'done --sha valid: ok=true');
+    assert(shaValidObj.status === 'done', 'done --sha valid: status=done');
+    const shaValidLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(shaValidLabels['sha-test-task'].sha === validSha, 'done --sha valid: sha stored in labels.json');
+  }
+
+  // done with invalid --sha (non-existent commit) is rejected (exit code 1)
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'sha-reject-task': {
+        sessionKey: 'agent:main:subagent:sha-reject-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    // Use a well-formed hex SHA that does not exist in the repo
+    const fakeSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+    let threwInvalidSha = false;
+    let invalidShaExitCode = null;
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'sha-reject-task', '--summary', 'should be rejected', '--sha', fakeSha,
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwInvalidSha = true;
+      invalidShaExitCode = err.status;
+    }
+    assert(threwInvalidSha, 'done --sha invalid (non-existent): throws (non-zero exit)');
+    assert(invalidShaExitCode === 1, 'done --sha invalid (non-existent): exit code 1');
+
+    // Labels should NOT be updated to done (task was rejected)
+    const rejectedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(rejectedLabels['sha-reject-task'].status === 'running', 'done --sha invalid: labels.json NOT updated to done');
+  }
+
+  // done without --sha still succeeds (backward compat)
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'no-sha-task': {
+        sessionKey: 'agent:main:subagent:no-sha-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const noShaOut = execFileSync(process.execPath, [
+      indexPath, 'done', '--label', 'no-sha-task', '--summary', 'no sha needed',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 10000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const noShaObj = JSON.parse(noShaOut.trim());
+    assert(noShaObj.ok === true, 'done without --sha (backward compat): ok=true');
+    assert(noShaObj.status === 'done', 'done without --sha (backward compat): status=done');
+    const noShaLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(!noShaLabels['no-sha-task'].sha, 'done without --sha (backward compat): no sha in labels.json');
+  }
+
   rmSync(tempDone, { recursive: true, force: true });
 }
 
