@@ -110,6 +110,14 @@ function getSessionTokens(sessionKey) {
   return session?.totalTokens ?? null;
 }
 
+/** Returns the session entry from sessions.json, or null if not found. */
+function getSessionStoreEntry(sessionKey) {
+  if (!sessionKey) return null;
+  const agent = sessionKey.split(':')[1] || 'main';
+  const store = readSessionsStore(agent);
+  return (store && sessionKey in store) ? store[sessionKey] : null;
+}
+
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
@@ -868,10 +876,19 @@ if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   }
   // Truly no result and no tokens — telemetry unavailable
   if (baselineTokens === null) {
-    process.stderr.write(`[watcher] token telemetry unavailable for ${label}; skipping steer/kill recovery\n`);
-    markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`);
-    process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
-    process.exit(1);
+    // Check if session is actually in the store (just mid-tool-call with no tokens yet)
+    const entry = getSessionStoreEntry(tokenSessionKey);
+    if (!entry) {
+      // Session truly not found — telemetry unavailable, exit
+      process.stderr.write(`[watcher] token telemetry unavailable for ${label}; session not in store\n`);
+      markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`);
+      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
+      process.exit(1);
+    }
+    // Session IS in store but no tokens — mid-tool-call, fall through to activity window
+    // Use updatedAt as activity signal instead of tokens
+    process.stderr.write(`[watcher] ${label} in store but no tokens (mid-tool-call?) — using updatedAt as activity signal\n`);
+    baselineTokens = -1; // sentinel: token-free mode
   }
 }
 
@@ -895,13 +912,33 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   // Token growth?
   const cur = getTokenCount(tokenSessionKey);
   if (cur === null) {
-    process.stderr.write(`[watcher] token telemetry lost for ${label}; skipping steer/kill recovery\n`);
-    markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`);
-    process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
-    process.exit(1);
+    // Check updatedAt as fallback — if session is still in store and recently updated, keep waiting
+    const entry = getSessionStoreEntry(tokenSessionKey);
+    if (!entry) {
+      process.stderr.write(`[watcher] token telemetry lost for ${label}; session gone from store\n`);
+      markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`);
+      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
+      process.exit(1);
+    }
+    // Still in store — check if updatedAt advanced (tool call still running)
+    const updatedAt = entry.updatedAt;
+    if (typeof updatedAt === 'number' && updatedAt > flatSince) {
+      process.stderr.write(`[watcher] ${label} no tokens but updatedAt advanced — tool call active, resetting flat timer\n`);
+      flatSince = Date.now();
+    } else {
+      process.stderr.write(`[watcher] ${label} no tokens, updatedAt not advancing — may be stuck\n`);
+    }
+    // Don't exit — let FLAT_WINDOW_MS timeout handle the stuck case normally
+    continue;
   }
-  if (cur > baselineTokens) {
+  // Normal token comparison (skip if in token-free sentinel mode)
+  if (baselineTokens !== -1 && cur > baselineTokens) {
     process.stderr.write(`[watcher] ${label} still active (${baselineTokens}→${cur} tokens), resetting flat timer\n`);
+    baselineTokens = cur;
+    flatSince = Date.now();
+  } else if (baselineTokens === -1 && cur > 0) {
+    // Tokens appeared for the first time — switch from sentinel to real token tracking
+    process.stderr.write(`[watcher] ${label} tokens now available (${cur}), switching to token tracking\n`);
     baselineTokens = cur;
     flatSince = Date.now();
   }
