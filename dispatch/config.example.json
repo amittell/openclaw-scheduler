@@ -11,5 +11,8 @@
   "_stuckThresholdMs": "How long a session must run before being considered stuck (ms). Default: 600000 (10min)",
 
   "maxWatcherAgeMs": 7200000,
-  "_maxWatcherAgeMs": "Max age of a watcher process before it is considered stale (ms). Default: 7200000 (2h)"
+  "_maxWatcherAgeMs": "Max age of a watcher process before it is considered stale (ms). Default: 7200000 (2h)",
+
+  "deliver_watcher_ttl_hours": 48,
+  "_deliver_watcher_ttl_hours": "TTL (in hours) for scheduler-registered deliver-watcher jobs. These jobs are transient — they auto-prune once delivery is confirmed. Default: 48. Lower values (e.g. 4) aggressively prune; higher values (e.g. 72) retain audit history longer."
 }

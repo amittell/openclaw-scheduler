@@ -651,7 +651,7 @@ async function cmdEnqueue(flags) {
           delivery_channel:         deliverChannel,
           delivery_to:              deliverTo,
           delivery_guarantee:       'at-least-once',
-          ttl_hours:                4,     // 4-hour audit window — deliver jobs are transient, auto-prune after delivery confirmed
+          ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
           run_now:                  true,
