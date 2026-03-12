@@ -547,8 +547,9 @@ async function cmdEnqueue(flags) {
   parts.push(`  4. You have verified the work is complete`);
   parts.push(``);
   parts.push(`Call this as your ABSOLUTE FINAL action — nothing else runs after this:`);
-  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<what you actually did, including commit SHA if applicable>"`);
+  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<what you actually did, including commit SHA if applicable>" --sha "<git commit SHA of your last push>"`);
   parts.push(``);
+  parts.push(`If your task involved git commits, --sha is required and must be the actual SHA of your pushed commit. The done script will reject invented or placeholder SHAs.`);
   parts.push(`DO NOT call this while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
   parts.push(`---`);
   parts.push(``);
@@ -1198,14 +1199,29 @@ function cmdResult(flags) {
 async function cmdDone(flags) {
   const label   = flags.label;
   const summary = flags.summary || 'completed (agent signal)';
+  const sha     = flags.sha || null;
   if (!label) die('--label is required', 2);
+
+  // Validate --sha if provided
+  if (sha) {
+    // Sanitize: must be a valid git SHA (7–40 hex chars)
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) {
+      die(`REJECTED: --sha "${sha}" is not a valid git SHA (must be 7–40 hex characters). Pass the actual commit SHA.`, 1);
+    }
+    // Verify the commit exists in the local git environment
+    try {
+      execFileSync('git', ['cat-file', '-e', sha + '^{commit}'], { stdio: 'pipe' });
+    } catch {
+      die(`REJECTED: SHA ${sha} not found in local git. Push your commits before calling done.`, 1);
+    }
+  }
 
   const existing = getLabel(label);
   if (!existing) {
     // Label was never registered (e.g. direct subagent spawn, not via enqueue).
     // This is not an error — the work completed, the label just wasn't tracked.
     process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" — registering as done\n`);
-    setLabel(label, { status: 'done', summary });
+    setLabel(label, { status: 'done', summary, ...(sha ? { sha } : {}) });
 
     // No watcher is polling for this label, so actively notify via the gateway
     // post office using delivery config from config.json as fallback target.
@@ -1236,6 +1252,7 @@ async function cmdDone(flags) {
   setLabel(label, {
     status:  'done',
     summary,
+    ...(sha ? { sha } : {}),
   });
 
   // Disarm watchdog when agent signals done
