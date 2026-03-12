@@ -3953,6 +3953,110 @@ console.log('\n── Watchdog Heartbeat Guard ──');
   rmSync(tmpBase, { recursive: true, force: true });
 }
 
+// ═══════════════════════════════════════════════════════════
+// Post-Office Routing
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Post-Office Routing: gatewayNotify enqueues to messages table ──');
+{
+  // Import onFinished from hooks.mjs (which uses sendMessage internally)
+  const { onFinished } = await import('./dispatch/hooks.mjs');
+
+  // Use getDb() to get the current open DB instance (not the stale top-level `db`)
+  const liveDb = getDb();
+
+  // Count messages before
+  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result'").get();
+
+  // Call onFinished with deliverTo set — triggers gatewayNotify → sendMessage
+  await onFinished({
+    label:          'test-label-post-office',
+    job_id:         'jid-post-office',
+    run_id:         'rid-post-office',
+    agent:          'main',
+    status:         'ok',
+    deliverTo:      '484946046',
+    deliveryChannel: 'telegram',
+    summary:        'post-office test completed',
+  });
+
+  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result'").get();
+  assert(after.cnt === before.cnt + 1, 'gatewayNotify: enqueues one message to messages table');
+
+  const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject='test-label-post-office'").get();
+  assert(msg !== undefined,                              'gatewayNotify: message exists');
+  assert(msg.from_agent === 'dispatch',                  'gatewayNotify: from_agent=dispatch');
+  assert(msg.to_agent === 'main',                        'gatewayNotify: to_agent=main');
+  assert(msg.kind === 'result',                          'gatewayNotify: kind=result');
+  assert(msg.subject === 'test-label-post-office',       'gatewayNotify: subject=label');
+  assert(msg.body.includes('test-label-post-office'),    'gatewayNotify: body includes label');
+  assert(msg.body.includes('post-office test completed'),'gatewayNotify: body includes summary');
+  assert(msg.channel === 'telegram',                     'gatewayNotify: channel stored for reference');
+  assert(msg.status === 'pending',                       'gatewayNotify: message status=pending (not yet delivered)');
+}
+
+console.log('\n── Post-Office Routing: handleDelivery (announce) enqueues to messages table ──');
+{
+  const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
+
+  const liveDb = getDb();
+  const logs = [];
+  const { handleDelivery } = createDeliveryHelpers({
+    log: (level, msg, meta) => logs.push({ level, msg, meta }),
+    deliverMessage: async () => { throw new Error('should not call deliverMessage directly'); },
+    resolveDeliveryAlias: () => null,
+  });
+
+  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
+
+  const announceJob = {
+    name: 'PostOfficeShellJob',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '484946046',
+  };
+  await handleDelivery(announceJob, '✅ shell job done — all tests passed');
+
+  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
+  assert(after.cnt === before.cnt + 1, 'handleDelivery(announce): enqueues one message');
+
+  const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject='PostOfficeShellJob'").get();
+  assert(msg !== undefined,                             'handleDelivery(announce): message exists');
+  assert(msg.from_agent === 'scheduler',                'handleDelivery(announce): from_agent=scheduler');
+  assert(msg.to_agent === 'main',                       'handleDelivery(announce): to_agent=main');
+  assert(msg.kind === 'result',                         'handleDelivery(announce): kind=result');
+  assert(msg.subject === 'PostOfficeShellJob',          'handleDelivery(announce): subject=job name');
+  assert(msg.body.includes('shell job done'),           'handleDelivery(announce): body=content');
+  assert(msg.status === 'pending',                      'handleDelivery(announce): status=pending');
+
+  assert(logs.some(l => l.msg.includes('Enqueued')),   'handleDelivery(announce): logs Enqueued');
+}
+
+console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue ──');
+{
+  const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
+
+  const liveDb = getDb();
+  const { handleDelivery } = createDeliveryHelpers({
+    log: () => {},
+    deliverMessage: async () => {},
+    resolveDeliveryAlias: () => null,
+  });
+
+  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main'").get();
+
+  const noneJob = {
+    name: 'SilentJob',
+    delivery_mode: 'none',
+    delivery_channel: 'telegram',
+    delivery_to: '484946046',
+  };
+  await handleDelivery(noneJob, 'should not be enqueued');
+
+  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main'").get();
+  assert(after.cnt === before.cnt, 'handleDelivery(none): does not enqueue any message');
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

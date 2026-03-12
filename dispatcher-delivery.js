@@ -1,3 +1,5 @@
+import { sendMessage } from './messages.js';
+
 export function createDeliveryHelpers({ log, deliverMessage, resolveDeliveryAlias }) {
   function resolveAlias(target) {
     if (!target) return null;
@@ -21,10 +23,18 @@ export function createDeliveryHelpers({ log, deliverMessage, resolveDeliveryAlia
     }
 
     try {
-      await deliverMessage(channel, target, content);
-      log('info', `Delivered: ${job.name}`, { channel, to: target });
+      const subject = (job.name || '').slice(0, 100);
+      sendMessage({
+        from_agent: 'scheduler',
+        to_agent:   'main',
+        kind:       'result',
+        subject,
+        body:       content,
+        channel,
+      });
+      log('info', `Enqueued: ${job.name}`, { channel, to: target });
     } catch (err) {
-      log('error', `Delivery failed: ${job.name}: ${err.message}`);
+      log('error', `Delivery enqueue failed: ${job.name}: ${err.message}`);
     }
   }
 

@@ -16,9 +16,8 @@
  *   dispatch.cancelled — run manually cancelled
  */
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { hostname, homedir } from 'os';
+import { hostname } from 'os';
+import { sendMessage } from '../messages.js';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
@@ -28,10 +27,6 @@ const HOST         = process.env.DISPATCH_HOST
   || hostname()
   || 'unknown-host';
 const TIMEOUT_MS   = 3000;
-const HOME_DIR     = homedir();
-
-// Configurable gateway URL for testability. Defaults to local gateway.
-const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 
 // ── Loki push ───────────────────────────────────────────────
 
@@ -67,62 +62,31 @@ async function webhookPush(event, payload) {
   });
 }
 
-// ── Gateway notification ─────────────────────────────────────
+// ── Post-office notification ─────────────────────────────────
 
 /**
- * Read the OpenClaw gateway auth token.
- * Checks OPENCLAW_GATEWAY_TOKEN env first, then ~/.openclaw/openclaw.json.
- */
-function getGatewayToken() {
-  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
-  try {
-    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
-    const cfg = JSON.parse(readFileSync(configPath, 'utf-8'));
-    return cfg?.gateway?.auth?.token || null;
-  } catch { return null; }
-}
-
-/**
- * Send a completion notification via the gateway post office.
+ * Enqueue a completion notification into the messages queue (post office).
+ * The Inbox Consumer drains pending messages and delivers to Telegram.
  * Used for unregistered-label done signals where no watcher is waiting.
  *
  * @param {string} label           - Dispatch label
  * @param {string} summary         - One-line summary of what was done
- * @param {string} deliverTo       - Target chat/user ID (e.g. Telegram chat ID)
- * @param {string} [deliveryChannel='telegram'] - Channel to deliver via
+ * @param {string} deliverTo       - Target chat/user ID (stored for reference)
+ * @param {string} [deliveryChannel='telegram'] - Channel to deliver via (stored for reference)
  */
 async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram') {
-  const token = getGatewayToken();
-  if (!token) {
-    process.stderr.write(`[dispatch-hooks] gateway notify skipped — no token available\n`);
-    return;
-  }
   try {
-    const message = `✅ [${label}] done — ${summary}`;
-    const body = JSON.stringify({
-      tool: 'message',
-      args: {
-        action: 'send',
-        channel: deliveryChannel,
-        target: String(deliverTo),
-        message,
-      },
-      sessionKey: 'main',
-    });
-    const res = await fetch(`${GATEWAY_URL}/tools/invoke`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
+    const body = `✅ [${label}] done — ${summary}`;
+    sendMessage({
+      from_agent: 'dispatch',
+      to_agent:   'main',
+      kind:       'result',
+      subject:    label,
       body,
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      channel:    deliveryChannel,
     });
-    if (!res.ok) {
-      process.stderr.write(`[dispatch-hooks] gateway notify HTTP ${res.status} for ${label}\n`);
-    }
   } catch (e) {
-    process.stderr.write(`[dispatch-hooks] gateway notify failed for ${label}: ${e.message}\n`);
+    process.stderr.write(`[dispatch-hooks] post-office enqueue failed for ${label}: ${e.message}\n`);
   }
 }
 
