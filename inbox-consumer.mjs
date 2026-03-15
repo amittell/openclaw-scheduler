@@ -40,6 +40,9 @@ const DELIVERY_CH    = process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
 
 const WATCH_MODE = process.argv.includes('--watch');
 
+// Messages that fail delivery this many times are marked 'failed' to prevent infinite retry loops.
+const MAX_DELIVERY_ATTEMPTS = 5;
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function timeAgo(dateStr) {
@@ -92,7 +95,7 @@ function formatMessages(msgs) {
 
 async function drainMessages(db, deliver) {
   const msgs = db.prepare(`
-    SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority
+    SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority, delivery_attempts
     FROM messages
     WHERE (to_agent = 'main' OR to_agent = 'broadcast')
       AND status IN ('pending', 'delivered')
@@ -104,14 +107,33 @@ async function drainMessages(db, deliver) {
     return 0;
   }
 
-  const text = formatMessages(msgs);
-
-  // Deliver directly — bypasses announce, guarantees delivery on normal path
-  await deliver(DELIVERY_CH, DELIVERY_TO, text);
-
-  // Mark as read
-  const placeholders = msgs.map(() => '?').join(', ');
+  const text         = formatMessages(msgs);
   const ids          = msgs.map(m => m.id);
+  const placeholders = ids.map(() => '?').join(', ');
+
+  try {
+    // Deliver directly — bypasses announce, guarantees delivery on normal path
+    await deliver(DELIVERY_CH, DELIVERY_TO, text);
+  } catch (err) {
+    // Delivery failed — do NOT mark messages as read so they retry on the next drain cycle.
+    // Increment the attempt counter and record the error on every message in this batch.
+    // Once a message exceeds MAX_DELIVERY_ATTEMPTS it is marked 'failed' so it stops looping.
+    const errText = String(err?.message ?? err).slice(0, 500);
+    process.stderr.write(`[inbox-consumer] delivery failed (will retry): ${err?.stack ?? errText}\n`);
+    db.prepare(`
+      UPDATE messages
+      SET delivery_attempts = delivery_attempts + 1,
+          last_error        = ?,
+          status            = CASE
+            WHEN delivery_attempts + 1 >= ${MAX_DELIVERY_ATTEMPTS} THEN 'failed'
+            ELSE status
+          END
+      WHERE id IN (${placeholders})
+    `).run(errText, ...ids);
+    throw err; // re-throw so the caller (watch-mode debouncedDrain) logs it at the right level
+  }
+
+  // Delivery confirmed — mark as read
   db.prepare(`
     UPDATE messages
     SET status = 'read', read_at = datetime('now')
