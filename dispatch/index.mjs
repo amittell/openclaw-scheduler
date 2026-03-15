@@ -456,10 +456,23 @@ async function cmdEnqueue(flags) {
   const mode        = flags.mode             || 'fresh';
 
   // ── Watchdog monitoring flags ─────────────────────────────
-  const noMonitor       = flags['no-monitor'] === true;
+  const noMonitorRaw    = flags['no-monitor'];
+  const noMonitor       = !!noMonitorRaw;
+  const deliveryOptOutReason = typeof noMonitorRaw === 'string' ? noMonitorRaw : null;
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
   const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
   const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
+
+  // ── Delivery enforcement for agentTurn jobs ─────────────────
+  // agentTurn jobs must have a delivery target OR explicitly opt out via --no-monitor "<reason>"
+  const isAgentTurn = !flags['payload-kind'] || flags['payload-kind'] === 'agentTurn';
+  const effectiveDeliveryMode = deliverMode;
+  if (isAgentTurn && !deliverTo && !noMonitor) {
+    die(
+      '--deliver-to is required for agentTurn jobs, or pass --no-monitor "<reason>" to explicitly skip.',
+      2
+    );
+  }
 
   // Dynamic branding: resolve per-agent brand name
   const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';

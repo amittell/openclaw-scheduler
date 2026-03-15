@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- Auth profile override (v16)
   auth_profile    TEXT DEFAULT NULL,                  -- null=default, 'inherit'=main session profile, or 'provider:label'
 
+  -- Delivery opt-out (v19)
+  delivery_opt_out_reason TEXT DEFAULT NULL,          -- set when delivery_mode='none' to explicitly skip delivery
+
   -- Watchdog monitoring (v13)
   job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
   watchdog_target_label TEXT,                         -- label of the task being monitored

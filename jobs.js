@@ -120,6 +120,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'payload_thinking',
     'trigger_condition',
     'auth_profile',
+    'delivery_opt_out_reason',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -164,6 +165,22 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
 
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
+
+  if (mode === 'create') {
+    const isChild = !!merged.parent_id;
+    const isAgentTurn =
+      !isChild &&
+      (merged.payload_kind === 'agentTurn' ||
+       ((!merged.payload_kind) && (merged.session_target || 'isolated') === 'isolated'));
+    const effectiveDeliveryMode = merged.delivery_mode || 'announce';
+    if (isAgentTurn && effectiveDeliveryMode === 'none' && !merged.delivery_opt_out_reason) {
+      throw new Error(
+        'agentTurn jobs with delivery_mode "none" require delivery_opt_out_reason. ' +
+        'Set delivery_to + delivery_channel, or pass delivery_opt_out_reason to explicitly skip delivery.'
+      );
+    }
+  }
+
   assertEnum('payload_scope', merged.payload_scope || 'own', VALID_PAYLOAD_SCOPES);
   assertEnum('delivery_guarantee', merged.delivery_guarantee || 'at-most-once', VALID_DELIVERY_GUARANTEES);
   assertEnum('job_class', merged.job_class || 'standard', VALID_JOB_CLASSES);
@@ -364,7 +381,8 @@ export function createJob(opts) {
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
       watchdog_self_destruct, watchdog_started_at,
       ttl_hours,
-      auth_profile
+      auth_profile,
+      delivery_opt_out_reason
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -382,6 +400,7 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?, ?,
       ?, ?,
+      ?,
       ?,
       ?
     )
@@ -442,7 +461,8 @@ export function createJob(opts) {
     normalized.watchdog_self_destruct != null ? (normalized.watchdog_self_destruct ? 1 : 0) : 1,
     normalized.watchdog_started_at || null,
     normalized.ttl_hours || null,
-    normalized.auth_profile || null
+    normalized.auth_profile || null,
+    normalized.delivery_opt_out_reason || null
   );
 
   return getJob(id);
@@ -493,7 +513,8 @@ export function updateJob(id, patch) {
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
     'watchdog_self_destruct', 'watchdog_started_at',
     'ttl_hours',
-    'auth_profile'
+    'auth_profile',
+    'delivery_opt_out_reason'
   ];
 
   // Cycle detection if parent_id is being changed

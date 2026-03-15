@@ -228,7 +228,7 @@ assert(shellOffloaded.stdoutBytes === 5000, 'shell result stores stdout byte cou
 assert(readFileSync(shellOffloaded.stdoutPath, 'utf8').length === 5000, 'shell result writes offloaded stdout artifact');
 rmSync(shellArtifactsDir, { recursive: true, force: true });
 
-const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none' });
+const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const shellRun = createRun(shellRunJob.id, { run_timeout_ms: 60000 });
 finishRun(shellRun.id, 'error', {
   summary: shellFailure.summary,
@@ -312,12 +312,12 @@ assert(next !== null, 'nextRunFromCron parses');
 
 // ── Job CRUD ────────────────────────────────────────────────
 console.log('\nJobs:');
-const job = createJob({ name: 'Test Job', schedule_cron: '*/5 * * * *', payload_message: 'Hello', delivery_mode: 'none' });
+const job = createJob({ name: 'Test Job', schedule_cron: '*/5 * * * *', payload_message: 'Hello', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(job && job.name === 'Test Job', 'createJob');
 assert(job.enabled === 1, 'enabled by default');
 assert(job.next_run_at !== null, 'next_run_at calculated');
 assert(getJob(job.id).id === job.id, 'getJob');
-const disabledNumericJob = createJob({ name: 'Disabled Numeric Job', enabled: 0, schedule_cron: '*/6 * * * *', payload_message: 'Disabled', delivery_mode: 'none' });
+const disabledNumericJob = createJob({ name: 'Disabled Numeric Job', enabled: 0, schedule_cron: '*/6 * * * *', payload_message: 'Disabled', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(disabledNumericJob.enabled === 0, 'numeric enabled=0 creates a disabled job');
 updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
@@ -330,7 +330,7 @@ const budgetedJob = createJob({
   payload_message: 'Plan the next action without executing it.',
   session_target: 'isolated',
   payload_kind: 'agentTurn',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
   execution_intent: 'plan',
   execution_read_only: 1,
   max_queued_dispatches: 3,
@@ -348,7 +348,7 @@ assert(budgetedJob.output_offload_threshold_bytes === 1024, 'createJob stores ou
 
 // ── Due jobs ────────────────────────────────────────────────
 console.log('\nDue jobs:');
-const dueJob = createJob({ name: 'Due', schedule_cron: '* * * * *', payload_message: 'due', delivery_mode: 'none' });
+const dueJob = createJob({ name: 'Due', schedule_cron: '* * * * *', payload_message: 'due', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 db.prepare("UPDATE jobs SET next_run_at = datetime('now', '-1 minute') WHERE id = ?").run(dueJob.id);
 assert(getDueJobs().some(j => j.id === dueJob.id), 'getDueJobs finds past-due');
 
@@ -475,7 +475,7 @@ assert(teamInbox.some(m => m.id === teamMsg.id), 'getTeamMessages finds team mes
 
 // ── Cascade delete ──────────────────────────────────────────
 console.log('\nCascade:');
-const delJob = createJob({ name: 'Deletable', schedule_cron: '0 * * * *', payload_message: 'bye', delivery_mode: 'none' });
+const delJob = createJob({ name: 'Deletable', schedule_cron: '0 * * * *', payload_message: 'bye', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 createRun(delJob.id);
 deleteJob(delJob.id);
 assert(!getJob(delJob.id), 'job deleted');
@@ -494,10 +494,10 @@ pruneMessages(0);
 
 console.log('\n── Chaining ──');
 
-const parent = createJob({ name: 'Parent', schedule_cron: '0 9 * * *', payload_message: 'parent', delivery_mode: 'none' });
-const childSuccess = createJob({ name: 'OnSuccess', parent_id: parent.id, trigger_on: 'success', payload_message: 'on success', delivery_mode: 'none' });
-const childFailure = createJob({ name: 'OnFailure', parent_id: parent.id, trigger_on: 'failure', payload_message: 'on failure', delivery_mode: 'none' });
-const childComplete = createJob({ name: 'OnComplete', parent_id: parent.id, trigger_on: 'complete', payload_message: 'on complete', delivery_mode: 'none' });
+const parent = createJob({ name: 'Parent', schedule_cron: '0 9 * * *', payload_message: 'parent', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const childSuccess = createJob({ name: 'OnSuccess', parent_id: parent.id, trigger_on: 'success', payload_message: 'on success', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const childFailure = createJob({ name: 'OnFailure', parent_id: parent.id, trigger_on: 'failure', payload_message: 'on failure', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const childComplete = createJob({ name: 'OnComplete', parent_id: parent.id, trigger_on: 'complete', payload_message: 'on complete', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 
 assert(childSuccess.parent_id === parent.id, 'child parent_id set');
 assert(childSuccess.trigger_on === 'success', 'trigger_on = success');
@@ -531,7 +531,7 @@ assert(childDispatches.some(d => d.dispatch_kind === 'chain'), 'child chain disp
 assert(childDispatches.some(d => d.source_run_id === parentRun.id), 'child dispatch stores source_run_id');
 
 // Trigger delay
-const delayedChild = createJob({ name: 'Delayed', parent_id: parent.id, trigger_on: 'success', trigger_delay_s: 60, payload_message: 'delayed', delivery_mode: 'none' });
+const delayedChild = createJob({ name: 'Delayed', parent_id: parent.id, trigger_on: 'success', trigger_delay_s: 60, payload_message: 'delayed', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(delayedChild.trigger_delay_s === 60, 'trigger_delay_s stored');
 fireTriggeredChildren(parent.id, 'ok', 'delayed output', parentRun.id);
 const delayedDispatch = listDispatchesForJob(delayedChild.id).find(d => d.dispatch_kind === 'chain');
@@ -542,21 +542,21 @@ const cappedParent = createJob({
   name: 'CappedParent',
   schedule_cron: '0 8 * * *',
   payload_message: 'cap fanout',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
   max_trigger_fanout: 1,
 });
-createJob({ name: 'FanoutChild1', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none' });
-createJob({ name: 'FanoutChild2', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c2', delivery_mode: 'none' });
+createJob({ name: 'FanoutChild1', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+createJob({ name: 'FanoutChild2', parent_id: cappedParent.id, trigger_on: 'success', payload_message: 'c2', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const fanoutTriggered = fireTriggeredChildren(cappedParent.id, 'ok', 'fanout', parentRun.id);
 assert(fanoutTriggered.length === 1, 'max_trigger_fanout limits triggered children per parent run');
 
 // Agent routing
-const agentJob = createJob({ name: 'AgentJob', schedule_cron: '0 12 * * *', agent_id: 'worker', payload_message: 'x', delivery_mode: 'none' });
+const agentJob = createJob({ name: 'AgentJob', schedule_cron: '0 12 * * *', agent_id: 'worker', payload_message: 'x', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(agentJob.agent_id === 'worker', 'agent_id stored');
 
 // Orphan pruning
-const tempParent = createJob({ name: 'TempParent', schedule_cron: '0 12 * * *', payload_message: 'temp', delivery_mode: 'none' });
-const orphan = createJob({ name: 'Orphan', parent_id: tempParent.id, trigger_on: 'success', payload_message: 'orphan', delivery_mode: 'none' });
+const tempParent = createJob({ name: 'TempParent', schedule_cron: '0 12 * * *', payload_message: 'temp', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const orphan = createJob({ name: 'Orphan', parent_id: tempParent.id, trigger_on: 'success', payload_message: 'orphan', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 db.pragma('foreign_keys = OFF');
 db.prepare('DELETE FROM jobs WHERE id = ?').run(tempParent.id);
 db.pragma('foreign_keys = ON');
@@ -565,14 +565,14 @@ assert(pruned > 0, 'orphan pruned');
 assert(!getJob(orphan.id), 'orphan removed');
 
 // Aged disabled job cleanup
-const agedJob = createJob({ name: 'AgedDisabled', schedule_cron: '0 12 * * *', payload_message: 'aged', delivery_mode: 'none' });
+const agedJob = createJob({ name: 'AgedDisabled', schedule_cron: '0 12 * * *', payload_message: 'aged', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 updateJob(agedJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
 const pruned2 = pruneExpiredJobs();
 assert(pruned2 > 0, 'aged disabled job pruned');
 assert(!getJob(agedJob.id), 'aged disabled job removed');
 
 // Disabled job < 24h should NOT be pruned
-const recentDisabled = createJob({ name: 'RecentDisabled', schedule_cron: '0 12 * * *', payload_message: 'recent', delivery_mode: 'none' });
+const recentDisabled = createJob({ name: 'RecentDisabled', schedule_cron: '0 12 * * *', payload_message: 'recent', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 updateJob(recentDisabled.id, { enabled: 0 });
 pruneExpiredJobs();
 assert(getJob(recentDisabled.id), 'recently disabled job kept');
@@ -583,9 +583,9 @@ assert(getJob(recentDisabled.id), 'recently disabled job kept');
 
 console.log('\n── Cycles & Depth ──');
 
-const cA = createJob({ name: 'cA', schedule_cron: '0 6 * * *', payload_message: 'a', delivery_mode: 'none' });
-const cB = createJob({ name: 'cB', parent_id: cA.id, trigger_on: 'success', payload_message: 'b', delivery_mode: 'none' });
-const cC = createJob({ name: 'cC', parent_id: cB.id, trigger_on: 'success', payload_message: 'c', delivery_mode: 'none' });
+const cA = createJob({ name: 'cA', schedule_cron: '0 6 * * *', payload_message: 'a', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const cB = createJob({ name: 'cB', parent_id: cA.id, trigger_on: 'success', payload_message: 'b', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const cC = createJob({ name: 'cC', parent_id: cB.id, trigger_on: 'success', payload_message: 'c', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 
 // Self-cycle
 let err1 = false;
@@ -613,12 +613,12 @@ assert(getChainDepth(cB.id) === 1, 'child depth = 1');
 assert(getChainDepth(cC.id) === 2, 'grandchild depth = 2');
 
 // Build 10-deep chain, verify 11th blocked
-let deepParent = createJob({ name: 'D0', schedule_cron: '0 12 * * *', payload_message: 'd', delivery_mode: 'none' });
+let deepParent = createJob({ name: 'D0', schedule_cron: '0 12 * * *', payload_message: 'd', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 for (let i = 1; i <= 9; i++) {
-  deepParent = createJob({ name: `D${i}`, parent_id: deepParent.id, trigger_on: 'success', payload_message: `d${i}`, delivery_mode: 'none' });
+  deepParent = createJob({ name: `D${i}`, parent_id: deepParent.id, trigger_on: 'success', payload_message: `d${i}`, delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 }
 let err4 = false;
-try { createJob({ name: 'D10', parent_id: deepParent.id, trigger_on: 'success', payload_message: 'too deep', delivery_mode: 'none' }); } catch { err4 = true; }
+try { createJob({ name: 'D10', parent_id: deepParent.id, trigger_on: 'success', payload_message: 'too deep', delivery_mode: 'none', delivery_opt_out_reason: 'test' }); } catch { err4 = true; }
 assert(err4, 'depth 11 blocked by MAX_CHAIN_DEPTH');
 
 // ═══════════════════════════════════════════════════════════
@@ -627,7 +627,7 @@ assert(err4, 'depth 11 blocked by MAX_CHAIN_DEPTH');
 
 console.log('\n── Retry ──');
 
-const retryJob = createJob({ name: 'Retryable', schedule_cron: '0 8 * * *', payload_message: 'retry me', max_retries: 3, delivery_mode: 'none' });
+const retryJob = createJob({ name: 'Retryable', schedule_cron: '0 8 * * *', payload_message: 'retry me', max_retries: 3, delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(retryJob.max_retries === 3, 'max_retries stored');
 
 const run1 = createRun(retryJob.id, { run_timeout_ms: 300000 });
@@ -658,12 +658,12 @@ db.prepare('UPDATE runs SET retry_count = 3 WHERE id = ?').run(run1.id);
 assert(!shouldRetry(retryJob, run1.id), 'shouldRetry false after max');
 
 // No-retry job
-const noRetry = createJob({ name: 'NoRetry', schedule_cron: '0 8 * * *', payload_message: 'no', delivery_mode: 'none' });
+const noRetry = createJob({ name: 'NoRetry', schedule_cron: '0 8 * * *', payload_message: 'no', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const run2 = createRun(noRetry.id, { run_timeout_ms: 300000 });
 finishRun(run2.id, 'error', { error_message: 'fail' });
 assert(!shouldRetry(noRetry, run2.id), 'shouldRetry false when max_retries=0');
 
-const singleRetryJob = createJob({ name: 'SingleRetry', schedule_cron: '0 9 * * *', payload_message: 'single retry', max_retries: 1, delivery_mode: 'none' });
+const singleRetryJob = createJob({ name: 'SingleRetry', schedule_cron: '0 9 * * *', payload_message: 'single retry', max_retries: 1, delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const singleRetryRun1 = createRun(singleRetryJob.id, { run_timeout_ms: 300000 });
 finishRun(singleRetryRun1.id, 'error', { error_message: 'first fail' });
 const singleRetry = scheduleRetry(singleRetryJob, singleRetryRun1.id);
@@ -683,10 +683,10 @@ assert(!shouldRetry(singleRetryJob, singleRetryRun2.id), 'retry attempt inherits
 
 console.log('\n── Cancellation ──');
 
-const cancelP = createJob({ name: 'CancelP', schedule_cron: '0 7 * * *', payload_message: 'p', delivery_mode: 'none' });
-const cancelC1 = createJob({ name: 'CancelC1', parent_id: cancelP.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none' });
-const cancelC2 = createJob({ name: 'CancelC2', parent_id: cancelP.id, trigger_on: 'complete', payload_message: 'c2', delivery_mode: 'none' });
-const cancelGC = createJob({ name: 'CancelGC', parent_id: cancelC1.id, trigger_on: 'success', payload_message: 'gc', delivery_mode: 'none' });
+const cancelP = createJob({ name: 'CancelP', schedule_cron: '0 7 * * *', payload_message: 'p', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const cancelC1 = createJob({ name: 'CancelC1', parent_id: cancelP.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const cancelC2 = createJob({ name: 'CancelC2', parent_id: cancelP.id, trigger_on: 'complete', payload_message: 'c2', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const cancelGC = createJob({ name: 'CancelGC', parent_id: cancelC1.id, trigger_on: 'success', payload_message: 'gc', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 
 // Cascade cancel
 const cancelled = cancelJob(cancelP.id);
@@ -697,14 +697,14 @@ assert(!getJob(cancelC2.id).enabled, 'child 2 disabled');
 assert(!getJob(cancelGC.id).enabled, 'grandchild disabled');
 
 // No-cascade
-const ncP = createJob({ name: 'NcP', schedule_cron: '0 7 * * *', payload_message: 'p', delivery_mode: 'none' });
-const ncC = createJob({ name: 'NcC', parent_id: ncP.id, trigger_on: 'success', payload_message: 'c', delivery_mode: 'none' });
+const ncP = createJob({ name: 'NcP', schedule_cron: '0 7 * * *', payload_message: 'p', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
+const ncC = createJob({ name: 'NcC', parent_id: ncP.id, trigger_on: 'success', payload_message: 'c', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const ncResult = cancelJob(ncP.id, { cascade: false });
 assert(ncResult.length === 1, 'no-cascade cancels 1');
 assert(!!getJob(ncC.id).enabled, 'child still enabled');
 
 // Cancel running runs
-const runP = createJob({ name: 'RunP', schedule_cron: '0 7 * * *', payload_message: 'r', delivery_mode: 'none' });
+const runP = createJob({ name: 'RunP', schedule_cron: '0 7 * * *', payload_message: 'r', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const runR = createRun(runP.id, { run_timeout_ms: 300000 });
 assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'running', 'run is running');
 cancelJob(runP.id);
@@ -721,7 +721,7 @@ const qCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
 assert(qCols.includes('queued_count'), 'jobs.queued_count column');
 
 // Create a queue-policy job
-const qJob = createJob({ name: 'QueueJob', schedule_cron: '*/5 * * * *', payload_message: 'q', overlap_policy: 'queue', delivery_mode: 'none' });
+const qJob = createJob({ name: 'QueueJob', schedule_cron: '*/5 * * * *', payload_message: 'q', overlap_policy: 'queue', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(qJob.overlap_policy === 'queue', 'overlap_policy = queue');
 assert(qJob.queued_count === 0, 'initial queued_count = 0');
 
@@ -737,7 +737,7 @@ const limitedQueueJob = createJob({
   payload_message: 'limited queue',
   overlap_policy: 'queue',
   max_queued_dispatches: 1,
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 const queueResult1 = enqueueJob(limitedQueueJob.id);
 const queueResult2 = enqueueJob(limitedQueueJob.id);
@@ -788,12 +788,12 @@ assert(dequeueJob(qJob.id) === false, 'nothing left to dequeue');
 console.log('\n── Run-Now Flag ──');
 
 // 1. Regular create (no run_now) → next_run_at computed from cron
-const normalJob = createJob({ name: 'NormalScheduled', schedule_cron: '0 3 * * *', payload_message: 'normal', delivery_mode: 'none' });
+const normalJob = createJob({ name: 'NormalScheduled', schedule_cron: '0 3 * * *', payload_message: 'normal', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 const normalNextRun = new Date(normalJob.next_run_at + 'Z');
 assert(normalNextRun > new Date(), 'regular create: next_run_at is in the future');
 
 // 2. Create with run_now=true → next_run_at is in the past
-const runNowJob = createJob({ name: 'RunNowJob', schedule_cron: '0 3 * * *', payload_message: 'run now!', delivery_mode: 'none', run_now: true });
+const runNowJob = createJob({ name: 'RunNowJob', schedule_cron: '0 3 * * *', payload_message: 'run now!', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_now: true });
 const runNowTime = new Date(runNowJob.next_run_at + 'Z');
 assert(runNowTime < new Date(), 'run_now=true: next_run_at is in the past');
 assert(getDueJobs().some(j => j.id === runNowJob.id), 'run_now job immediately appears in getDueJobs()');
@@ -803,12 +803,12 @@ const diff = Date.now() - runNowTime.getTime();
 assert(diff >= 0 && diff < 5000, 'run_now next_run_at is approximately 1 second in the past (within 5s)');
 
 // 4. run_now=false (explicit) behaves like no run_now
-const noRunNowJob = createJob({ name: 'NoRunNow', schedule_cron: '0 3 * * *', payload_message: 'no run', delivery_mode: 'none', run_now: false });
+const noRunNowJob = createJob({ name: 'NoRunNow', schedule_cron: '0 3 * * *', payload_message: 'no run', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_now: false });
 const noRunNowTime = new Date(noRunNowJob.next_run_at + 'Z');
 assert(noRunNowTime > new Date(), 'run_now=false: next_run_at is in the future (normal cron)');
 
 // 5. runJobNow(id) creates a durable manual dispatch without mutating cron schedule
-const laterJob = createJob({ name: 'LaterJob', schedule_cron: '0 4 * * *', payload_message: 'trigger later', delivery_mode: 'none' });
+const laterJob = createJob({ name: 'LaterJob', schedule_cron: '0 4 * * *', payload_message: 'trigger later', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(new Date(laterJob.next_run_at + 'Z') > new Date(), 'laterJob starts with future next_run_at');
 const triggered = runJobNow(laterJob.id);
 assert(triggered.dispatch_id, 'runJobNow returns dispatch id');
@@ -835,11 +835,11 @@ const scopeCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
 assert(scopeCols.includes('payload_scope'), 'jobs.payload_scope column exists');
 
 // Default scope is 'own' when not specified
-const scopeDefaultJob = createJob({ name: 'ScopeDefault', schedule_cron: '0 10 * * *', payload_message: 'default scope', delivery_mode: 'none' });
+const scopeDefaultJob = createJob({ name: 'ScopeDefault', schedule_cron: '0 10 * * *', payload_message: 'default scope', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(scopeDefaultJob.payload_scope === 'own', "default payload_scope = 'own'");
 
 // Create job with payload_scope='global'
-const scopeGlobalJob = createJob({ name: 'ScopeGlobal', schedule_cron: '0 11 * * *', payload_message: 'check all sub-agents', payload_scope: 'global', delivery_mode: 'none' });
+const scopeGlobalJob = createJob({ name: 'ScopeGlobal', schedule_cron: '0 11 * * *', payload_message: 'check all sub-agents', payload_scope: 'global', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 assert(scopeGlobalJob.payload_scope === 'global', "payload_scope stored as 'global'");
 
 // Verify field persisted via getJob
@@ -881,21 +881,21 @@ const poolJob1 = createJob({
   name: 'Pool Job 1',
   schedule_cron: '*/5 * * * *',
   payload_message: 'pool task 1',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
   resource_pool: 'browser',
 });
 const poolJob2 = createJob({
   name: 'Pool Job 2',
   schedule_cron: '*/5 * * * *',
   payload_message: 'pool task 2',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
   resource_pool: 'browser',
 });
 const noPoolJob = createJob({
   name: 'No Pool Job',
   schedule_cron: '*/5 * * * *',
   payload_message: 'no pool',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 
 assert(getJob(poolJob1.id).resource_pool === 'browser', 'poolJob1 has resource_pool=browser');
@@ -974,7 +974,7 @@ const tcParent = createJob({
   name: 'TC Parent',
   schedule_cron: '0 6 * * *',
   payload_message: 'monitor',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 
 // Child that fires only when output contains "ALERT"
@@ -984,7 +984,7 @@ const tcChildAlert = createJob({
   trigger_on: 'success',
   trigger_condition: 'contains:ALERT',
   payload_message: 'escalate',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 assert(getJob(tcChildAlert.id).trigger_condition === 'contains:ALERT', 'trigger_condition stored');
 
@@ -994,7 +994,7 @@ const tcChildAlways = createJob({
   parent_id: tcParent.id,
   trigger_on: 'success',
   payload_message: 'always run',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 assert(getJob(tcChildAlways.id).trigger_condition === null, 'no trigger_condition → null');
 
@@ -1005,7 +1005,7 @@ const tcChildRegex = createJob({
   trigger_on: 'success',
   trigger_condition: 'regex:CPU|MEM',
   payload_message: 'resource alert',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 
 // Reset next_run_at for all children
@@ -1045,7 +1045,7 @@ const tcChildOnFail = createJob({
   trigger_on: 'failure',
   trigger_condition: 'contains:CRITICAL',
   payload_message: 'fail handler',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 db.prepare('UPDATE jobs SET next_run_at = NULL WHERE parent_id = ?').run(tcParent.id);
 // trigger_on='failure' child should NOT fire when status is 'ok'
@@ -1149,7 +1149,7 @@ const aliasJob = createJob({
   name: 'AliasDeliveryJob',
   schedule_cron: '0 9 * * *',
   payload_message: 'alias test',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
   delivery_to: '@team_room',
 });
 assert(aliasJob.delivery_to === '@team_room', 'job stores @alias as-is in delivery_to');
@@ -1840,14 +1840,14 @@ const shellJob = createJob({
   session_target: 'shell',
   payload_kind: 'shellCommand',
   payload_message: '/bin/echo hello',
-  delivery_mode: 'none',
+  delivery_mode: 'none', delivery_opt_out_reason: 'test',
 });
 assert(shellJob.session_target === 'shell', 'shell job: session_target = shell');
 assert(shellJob.payload_kind === 'shellCommand', 'shell job: payload_kind = shellCommand');
 assert(shellJob.payload_message === '/bin/echo hello', 'shell job: payload_message = command');
 
 // Can update to shell target
-const toShellJob = createJob({ name: 'To-Shell Job', schedule_cron: '0 12 * * *', payload_message: 'test', delivery_mode: 'none' });
+const toShellJob = createJob({ name: 'To-Shell Job', schedule_cron: '0 12 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
 updateJob(toShellJob.id, { session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo updated' });
 const updatedShell = getJob(toShellJob.id);
 assert(updatedShell.session_target === 'shell', 'shell job update: session_target persisted');
@@ -1945,7 +1945,7 @@ console.log('\n── delete_after_run Safety ──');
     schedule_cron: '0 12 * * *',
     payload_message: 'one shot task',
     delete_after_run: true,
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
   });
   assert(oneShot.delete_after_run === 1, 'one-shot job has delete_after_run=1');
 
@@ -1975,7 +1975,7 @@ console.log('\n── Payload Validation ──');
 
 // 1. Valid: main + systemEvent
 {
-  const j = createJob({ name: 'Valid-main-sysEvent', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'systemEvent', payload_message: 'test', delivery_mode: 'none' });
+  const j = createJob({ name: 'Valid-main-sysEvent', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'systemEvent', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   assert(j.session_target === 'main' && j.payload_kind === 'systemEvent', 'valid: main + systemEvent accepted');
   deleteJob(j.id);
 }
@@ -1983,14 +1983,14 @@ console.log('\n── Payload Validation ──');
 // 2. Invalid: main + agentTurn → should throw
 {
   let threw = false;
-  try { createJob({ name: 'Bad-main-agentTurn', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  try { createJob({ name: 'Bad-main-agentTurn', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' }); }
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
   assert(threw, 'invalid: main + agentTurn rejected');
 }
 
 // 3. Valid: shell + shellCommand
 {
-  const j = createJob({ name: 'Valid-shell-cmd', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo hi', delivery_mode: 'none' });
+  const j = createJob({ name: 'Valid-shell-cmd', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'shellCommand', payload_message: '/bin/echo hi', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   assert(j.session_target === 'shell' && j.payload_kind === 'shellCommand', 'valid: shell + shellCommand accepted');
   deleteJob(j.id);
 }
@@ -1998,14 +1998,14 @@ console.log('\n── Payload Validation ──');
 // 4. Invalid: shell + agentTurn → should throw
 {
   let threw = false;
-  try { createJob({ name: 'Bad-shell-agentTurn', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' }); }
+  try { createJob({ name: 'Bad-shell-agentTurn', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' }); }
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
   assert(threw, 'invalid: shell + agentTurn rejected');
 }
 
 // 5. Valid: isolated + agentTurn (default combo)
 {
-  const j = createJob({ name: 'Valid-isolated-agentTurn', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  const j = createJob({ name: 'Valid-isolated-agentTurn', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   assert(j.session_target === 'isolated' && j.payload_kind === 'agentTurn', 'valid: isolated + agentTurn accepted');
   deleteJob(j.id);
 }
@@ -2013,14 +2013,14 @@ console.log('\n── Payload Validation ──');
 // 6. Invalid: isolated + shellCommand → should throw
 {
   let threw = false;
-  try { createJob({ name: 'Bad-isolated-shell', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'shellCommand', payload_message: '/bin/echo nope', delivery_mode: 'none' }); }
+  try { createJob({ name: 'Bad-isolated-shell', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'shellCommand', payload_message: '/bin/echo nope', delivery_mode: 'none', delivery_opt_out_reason: 'test' }); }
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
   assert(threw, 'invalid: isolated + shellCommand rejected');
 }
 
 // 7. updateJob: changing to invalid combo → should throw
 {
-  const j = createJob({ name: 'Update-validation', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  const j = createJob({ name: 'Update-validation', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   let threw = false;
   try { updateJob(j.id, { session_target: 'main', payload_kind: 'agentTurn' }); }
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
@@ -2030,7 +2030,7 @@ console.log('\n── Payload Validation ──');
 
 // 8. updateJob: changing session_target alone checks against existing payload_kind
 {
-  const j = createJob({ name: 'Update-target-only', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none' });
+  const j = createJob({ name: 'Update-target-only', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   let threw = false;
   try { updateJob(j.id, { session_target: 'shell' }); }
   catch (e) { threw = e.message.includes('Invalid payload_kind'); }
@@ -2046,7 +2046,7 @@ console.log('\n── Job Spec Validation ──');
       name: 'Bad Control',
       schedule_cron: '0 9 * * *',
       payload_message: 'hello\u0000world',
-      delivery_mode: 'none',
+      delivery_mode: 'none', delivery_opt_out_reason: 'test',
     });
   } catch (e) {
     threw = e.message.includes('control characters');
@@ -2060,7 +2060,7 @@ console.log('\n── Job Spec Validation ──');
       schedule_cron: '0 9 * * *',
       payload_message: 'test',
       trigger_condition: 'regex:(',
-      delivery_mode: 'none',
+      delivery_mode: 'none', delivery_opt_out_reason: 'test',
     });
   } catch (e) {
     threw = e.message.includes('Invalid trigger_condition regex');
@@ -2071,10 +2071,105 @@ console.log('\n── Job Spec Validation ──');
     name: 'Normalize Optional',
     schedule_cron: '0 9 * * *',
     payload_message: 'ok',
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
     delivery_channel: '',
   });
   assert(normalized.delivery_channel === null, 'validateJobSpec normalizes empty nullable strings to null');
+}
+
+console.log('\n── Delivery Enforcement (v19) ──');
+{
+  // Test 1: agentTurn + delivery_mode "none" + no opt-out reason → throws
+  let threw1 = false;
+  try {
+    createJob({
+      name: 'NoDeliveryNoReason',
+      schedule_cron: '0 9 * * *',
+      payload_message: 'test',
+      delivery_mode: 'none',
+    });
+  } catch (e) {
+    threw1 = e.message.includes('delivery_opt_out_reason');
+  }
+  assert(threw1, 'agentTurn + delivery_mode "none" + no opt-out reason → throws');
+
+  // Test 2: agentTurn + delivery_mode "none" + opt-out reason → passes
+  const j2 = createJob({
+    name: 'OptOutWithReason',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'internal monitoring, no human delivery needed',
+  });
+  assert(j2 && j2.delivery_opt_out_reason === 'internal monitoring, no human delivery needed', 'agentTurn + delivery_mode "none" + opt-out reason → passes');
+  deleteJob(j2.id);
+
+  // Test 3: agentTurn + delivery_mode "announce" + delivery_to → passes
+  const j3 = createJob({
+    name: 'WithDeliveryTarget',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'announce',
+    delivery_to: '484946046',
+    delivery_channel: 'telegram',
+  });
+  assert(j3 && j3.delivery_mode === 'announce', 'agentTurn + delivery_mode "announce" + delivery_to → passes');
+  deleteJob(j3.id);
+
+  // Test 4: systemEvent/main + delivery_mode "none" → passes (exempt)
+  const j4 = createJob({
+    name: 'SystemEventNoDelivery',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    session_target: 'main',
+    payload_kind: 'systemEvent',
+    delivery_mode: 'none',
+  });
+  assert(j4 && j4.delivery_mode === 'none', 'systemEvent/main + delivery_mode "none" → passes (exempt)');
+  deleteJob(j4.id);
+
+  // Test 5: child agentTurn + delivery_mode "none" → passes (exempt)
+  const parentJ = createJob({
+    name: 'EnforcementParent',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'parent for child test',
+  });
+  const j5 = createJob({
+    name: 'ChildNoDelivery',
+    parent_id: parentJ.id,
+    trigger_on: 'success',
+    payload_message: 'child task',
+    delivery_mode: 'none',
+  });
+  assert(j5 && j5.delivery_mode === 'none' && !j5.delivery_opt_out_reason, 'child agentTurn + delivery_mode "none" → passes (exempt)');
+  deleteJob(j5.id);
+  deleteJob(parentJ.id);
+
+  // Test 6: shell job + delivery_mode "none" → passes (exempt, not agentTurn)
+  const j6 = createJob({
+    name: 'ShellNoDelivery',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'echo hi',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    delivery_mode: 'none',
+  });
+  assert(j6 && j6.delivery_mode === 'none', 'shell + delivery_mode "none" → passes (exempt)');
+  deleteJob(j6.id);
+
+  // Test 7: delivery_opt_out_reason persists via updateJob
+  const j7 = createJob({
+    name: 'UpdateOptOut',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'original reason',
+  });
+  const j7u = updateJob(j7.id, { delivery_opt_out_reason: 'updated reason' });
+  assert(j7u.delivery_opt_out_reason === 'updated reason', 'delivery_opt_out_reason updateable');
+  deleteJob(j7.id);
 }
 
 console.log('\n── Delivery Chunking ──');
@@ -2113,7 +2208,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
     name: 'DryRunOnly',
     schedule_cron: '0 10 * * *',
     payload_message: 'noop',
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
   });
   const dryRun = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', dryRunSpec, '--dry-run', '--json'], {
     cwd: process.cwd(),
@@ -2133,7 +2228,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
     name: 'CLI Real Job',
     schedule_cron: '0 11 * * *',
     payload_message: 'real',
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
   });
   const created = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', realSpec, '--json'], {
     cwd: process.cwd(),
@@ -2210,7 +2305,7 @@ console.log('\n── Watchdog Jobs ──');
   assert(watchdogCols.includes('watchdog_started_at'), 'jobs.watchdog_started_at column exists');
 
   // Default job_type is 'standard'
-  const stdJob = createJob({ name: 'StdJob', schedule_cron: '0 10 * * *', payload_message: 'test', delivery_mode: 'none' });
+  const stdJob = createJob({ name: 'StdJob', schedule_cron: '0 10 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' });
   assert(stdJob.job_type === 'standard', "default job_type = 'standard'");
   deleteJob(stdJob.id);
 
@@ -2221,7 +2316,7 @@ console.log('\n── Watchdog Jobs ──');
     session_target: 'shell',
     payload_kind: 'shellCommand',
     payload_message: 'echo check',
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
     job_type: 'watchdog',
     watchdog_target_label: 'my-task',
     watchdog_check_cmd: 'node chilisaus/index.mjs stuck --label my-task --threshold-min 15',
@@ -2264,7 +2359,7 @@ console.log('\n── Watchdog Jobs ──');
       name: 'Bad Watchdog',
       schedule_cron: '*/10 * * * *',
       payload_message: 'test',
-      delivery_mode: 'none',
+      delivery_mode: 'none', delivery_opt_out_reason: 'test',
       job_type: 'watchdog',
       watchdog_target_label: 'test',
       // missing watchdog_check_cmd
@@ -2281,7 +2376,7 @@ console.log('\n── Watchdog Jobs ──');
       name: 'Bad Type',
       schedule_cron: '*/10 * * * *',
       payload_message: 'test',
-      delivery_mode: 'none',
+      delivery_mode: 'none', delivery_opt_out_reason: 'test',
       job_type: 'invalid',
     });
   } catch (e) {
@@ -2769,7 +2864,7 @@ console.log('\n── Dispatcher Integration ──');
         payload_kind: 'shellCommand',
         payload_message: 'sleep 2',
         run_timeout_ms: 100,
-        delivery_mode: 'none',
+        delivery_mode: 'none', delivery_opt_out_reason: 'test',
       });
       context.timeoutJobId = timeoutJob.id;
       triggerJob(timeoutJob.id);
@@ -2800,7 +2895,7 @@ console.log('\n── Dispatcher Integration ──');
         payload_kind: 'shellCommand',
         payload_message: 'echo retry-root && exit 9',
         max_retries: 1,
-        delivery_mode: 'none',
+        delivery_mode: 'none', delivery_opt_out_reason: 'test',
       });
       const child = addJob({
         name: 'dispatcher-retry-child',
@@ -2809,7 +2904,7 @@ console.log('\n── Dispatcher Integration ──');
         session_target: 'shell',
         payload_kind: 'shellCommand',
         payload_message: 'echo retry-child-fired',
-        delivery_mode: 'none',
+        delivery_mode: 'none', delivery_opt_out_reason: 'test',
       });
       context.rootJobId = root.id;
       context.childJobId = child.id;
@@ -4047,7 +4142,7 @@ console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) d
 
   const noneJob = {
     name: 'SilentJob',
-    delivery_mode: 'none',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
     delivery_channel: 'telegram',
     delivery_to: '484946046',
   };
