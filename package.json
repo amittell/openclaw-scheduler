@@ -4,7 +4,8 @@
   "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
   "bin": {
-    "openclaw-scheduler": "bin/openclaw-scheduler.js"
+    "openclaw-scheduler": "bin/openclaw-scheduler.js",
+    "openclaw-inbox-consumer": "inbox-consumer.mjs"
   },
   "types": "./index.d.ts",
   "exports": {
@@ -28,6 +29,7 @@
   "files": [
     "bin",
     "dispatch",
+    "inbox-consumer.mjs",
     "scripts/dispatch-cli-utils.mjs",
     "scripts/inbox-consumer.mjs",
     "scripts/stuck-run-detector.mjs",

@@ -1,9 +1,18 @@
 // Gateway API client — independent dispatch via chat completions + system events
 import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { getDb } from './db.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
+const HOME_DIR = process.env.HOME || '/Users/alexm';
+function loadGatewayToken() {
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    return readFileSync(join(HOME_DIR, '.openclaw/credentials/.gateway-token'), 'utf-8').trim();
+  } catch { return null; }
+}
+const GATEWAY_TOKEN = loadGatewayToken();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 function authHeaders() {
