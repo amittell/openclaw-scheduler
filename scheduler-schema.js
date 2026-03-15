@@ -43,6 +43,7 @@ export const SCHEDULER_SCHEMAS = {
       output_offload_threshold_bytes: { type: 'integer', min: 128, default: 65536 },
       preferred_session_key: { type: 'string', nullable: true },
       auth_profile: { type: 'string', nullable: true, description: 'Auth profile override: null=default, "inherit"=main session profile, or "provider:label"' },
+      delivery_opt_out_reason: { type: 'string', nullable: true, maxLength: 256 },
       delete_after_run: { type: 'boolean', default: false },
       run_now: { type: 'boolean', default: false, note: 'create-time convenience flag' },
     },
