@@ -31,6 +31,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
@@ -255,15 +256,15 @@ function setGwRestartRetryCount(label, count) {
 }
 
 /**
- * Send a notification via agent-checkin (scheduler messages table).
+ * Send a notification via the scheduler messages table.
  */
 function notify(message) {
   try {
-    const checkinPath = join(HOME_DIR, '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
-    execFileSync(process.execPath, [checkinPath, message], {
-      encoding: 'utf-8',
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
+    sendMessage({
+      from_agent: 'dispatch',
+      to_agent: 'main',
+      body: message,
+      kind: 'text',
     });
   } catch (err) {
     process.stderr.write(`[watcher] notify failed: ${err.message}\n`);
