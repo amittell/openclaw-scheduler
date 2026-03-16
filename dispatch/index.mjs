@@ -169,11 +169,19 @@ function gatewayCall(method, params = {}, opts = {}) {
       timeout:  timeout + 5000,
       stdio:    ['pipe', 'pipe', 'pipe'],
     });
-    return JSON.parse(result.trim());
+    // Strip non-JSON prefix lines (e.g. plugin init logs leaking to stdout)
+    const trimmed = result.trim();
+    const jsonStart = trimmed.indexOf('{');
+    const cleaned = jsonStart > 0 ? trimmed.slice(jsonStart) : trimmed;
+    return JSON.parse(cleaned);
   } catch (err) {
     const stderr = err.stderr?.trim() || '';
     const stdout = err.stdout?.trim() || '';
-    if (stdout) try { return JSON.parse(stdout); } catch {}
+    if (stdout) {
+      const idx = stdout.indexOf('{');
+      const cleanStdout = idx > 0 ? stdout.slice(idx) : stdout;
+      try { return JSON.parse(cleanStdout); } catch {}
+    }
     throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`, {
       cause: err,
     });
@@ -336,6 +344,9 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   // 1. Not in sessions store → session never appeared or already cleaned up
   //    BUT: young sessions (<5 min old) may simply not have propagated yet,
   //    especially right after a gateway restart. Don't auto-resolve those.
+  //    Also: in openclaw 2026.3.13+, subagent sessions are tracked via
+  //    SessionBindingService and are NOT written to sessions.json. Fall back
+  //    to the gateway sessions.list API before concluding the session is done.
   const YOUNG_SESSION_MS = 5 * 60 * 1000;
   if (!sessionsStore[sessionKey]) {
     const ageMs = spawnedAtMs ? Date.now() - spawnedAtMs : Infinity;
@@ -346,12 +357,36 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
         lastActivity:  null,
       };
     }
+
+    // Gateway API fallback: check if session is actually still active.
+    // Subagents in 2026.3.13+ are NOT written to sessions.json, so absence
+    // from the store does not mean the session is gone.
+    try {
+      const listResult = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
+      const liveSession = listResult?.sessions?.find(s => s.key === sessionKey);
+      if (liveSession) {
+        // Session is alive in gateway — do NOT auto-resolve
+        return {
+          shouldResolve: false,
+          reason:       'session not in sessions.json but confirmed active via gateway API',
+          lastActivity:  liveSession.updatedAt || null,
+        };
+      }
+    } catch {
+      // Gateway unreachable — safe default: do NOT auto-resolve
+      return {
+        shouldResolve: false,
+        reason:       'sessions store miss + gateway API unreachable — deferring',
+        lastActivity:  null,
+      };
+    }
+
     return {
       shouldResolve: true,
       reason:       logCheck.found
         ? `529/overload error detected: ${logCheck.error}`
         : sessionEverFound
-          ? 'session not found in sessions store'
+          ? 'session not found in sessions store or gateway API'
           : 'session never found — spawn likely failed',
       lastActivity:  null,
       is529:         logCheck.found,

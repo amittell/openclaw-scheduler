@@ -3453,7 +3453,12 @@ console.log('\n── Sessions.json Detection ──');
   assert(statusObjStale.status === 'done', 'sessions.json present+stale: auto-resolved to done');
   assert(statusObjStale.syncAction && statusObjStale.syncAction.includes('auto-resolved'), 'sessions.json present+stale: syncAction includes auto-resolved');
 
-  // 4c. Absent (session key not in store) → auto-resolve as done (session completed/cleaned)
+  // 4c. Absent (session key not in store) → gateway API fallback.
+  //     In 2026.3.13+ subagents are NOT written to sessions.json (SessionBindingService).
+  //     When session is absent from sessions.json, checkSessionDone now calls
+  //     gateway sessions.list API. In test env the gateway is unreachable, so
+  //     the safe default is to NOT auto-resolve (defer), keeping status='running'.
+  //     Only after the gateway API also confirms absence should we resolve as done.
   writeFileSync(sessionsJsonPath, JSON.stringify({}) + '\n');
   writeFileSync(testLabelsPath, JSON.stringify({
     'test-sess': {
@@ -3478,7 +3483,8 @@ console.log('\n── Sessions.json Detection ──');
   });
   const statusObjAbsent = JSON.parse(statusAbsent.trim());
   assert(statusObjAbsent.ok === true, 'sessions.json absent: status ok');
-  assert(statusObjAbsent.status === 'done', 'sessions.json absent: auto-resolved to done');
+  // With gateway API fallback: gateway unreachable in test env → safe default = running (not done)
+  assert(statusObjAbsent.status === 'running', 'sessions.json absent: deferred (gateway API fallback — unreachable in test = safe default running)');
 
   rmSync(testTmpDir, { recursive: true, force: true });
 }
