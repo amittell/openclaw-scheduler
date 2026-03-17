@@ -416,7 +416,7 @@ export function createJob(opts) {
     normalized.schedule_tz || 'UTC',
     normalized.session_target || 'isolated',
     normalized.agent_id || 'main',
-    normalized.payload_kind || (normalized.session_target === 'main' ? 'systemEvent' : 'agentTurn'),
+    normalized.payload_kind || (normalized.session_target === 'main' ? 'systemEvent' : normalized.session_target === 'shell' ? 'shellCommand' : 'agentTurn'),
     normalized.payload_message,
     normalized.payload_model || null,
     normalized.payload_thinking || null,
