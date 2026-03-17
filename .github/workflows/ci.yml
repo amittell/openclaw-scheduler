@@ -1,22 +1,14 @@
 name: CI
 
+# GitHub Actions disabled — billing credits exhausted.
+# All checks run locally via git pre-push hook (.git/hooks/pre-push).
+# Re-enable by restoring the on: push/pull_request triggers.
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/*.md'
-  pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/*.md'
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual run'
+        required: false
 
 jobs:
   validate-linux:
@@ -57,7 +49,6 @@ jobs:
 
   validate-macos:
     name: Validate (macOS)
-    if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
     strategy:
       fail-fast: false

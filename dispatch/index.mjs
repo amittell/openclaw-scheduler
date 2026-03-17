@@ -493,7 +493,7 @@ async function cmdEnqueue(flags) {
   // ── Watchdog monitoring flags ─────────────────────────────
   const noMonitorRaw    = flags['no-monitor'];
   const noMonitor       = !!noMonitorRaw;
-  const deliveryOptOutReason = typeof noMonitorRaw === 'string' ? noMonitorRaw : null;
+  const _deliveryOptOutReason = typeof noMonitorRaw === 'string' ? noMonitorRaw : null;
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
   const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
   const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
@@ -501,7 +501,7 @@ async function cmdEnqueue(flags) {
   // ── Delivery enforcement for agentTurn jobs ─────────────────
   // agentTurn jobs must have a delivery target OR explicitly opt out via --no-monitor "<reason>"
   const isAgentTurn = !flags['payload-kind'] || flags['payload-kind'] === 'agentTurn';
-  const effectiveDeliveryMode = deliverMode;
+  const _effectiveDeliveryMode = deliverMode;
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
       '--deliver-to is required for agentTurn jobs, or pass --no-monitor "<reason>" to explicitly skip.',
