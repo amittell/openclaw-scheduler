@@ -505,24 +505,6 @@ function getSessionJsonlMtime(sessionId, agentDir = 'main') {
   }
 }
 
-/**
- * Get the number of lines in a session's JSONL file.
- * Useful for detecting active writes (line count growth = messages being appended).
- *
- * @param {string} sessionId - Internal session UUID (entry.sessionId from sessions.json)
- * @param {string} agentDir - Agent directory (default: 'main')
- * @returns {number|null} line count if file exists, null otherwise
- */
-function getSessionJsonlLineCount(sessionId, agentDir = 'main') {
-  if (!sessionId) return null;
-  try {
-    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
-    const content = readFileSync(jsonlPath, 'utf-8');
-    return content.split('\n').filter(l => l.trim()).length;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Read the last N non-empty lines from a session's JSONL file and return them
@@ -1150,11 +1132,13 @@ if (sessionInternalId) {
         const rExt = dispatch('result', ['--label', label]);
         markDoneSync('completed during extended mid-turn wait');
         deliverResult(label, rExt?.lastReply, stExt.summary);
+        process.exit(0);
       }
       const rExt2 = dispatch('result', ['--label', label]);
       if (rExt2?.lastReply) {
         markDoneSync('completed during extended mid-turn wait');
         deliverResult(label, rExt2.lastReply, null);
+        process.exit(0);
       }
 
       // JSONL mtime check during extended wait
