@@ -11,7 +11,7 @@ Step-by-step guide to deploy the scheduler on a Linux host running OpenClaw.
 
 | Requirement | Notes |
 |-------------|-------|
-| Node.js ≥ 22 | Install via [nvm](https://github.com/nvm-sh/nvm) or [NodeSource](https://github.com/nodesource/distributions) |
+| Node.js >= 20 | Install via [nvm](https://github.com/nvm-sh/nvm) or [NodeSource](https://github.com/nodesource/distributions) |
 | build-essential | `sudo apt install build-essential python3` — required for `better-sqlite3` native compile |
 | OpenClaw gateway running | With auth token |
 | Git | `sudo apt install git` |
@@ -77,10 +77,10 @@ node -e "require('better-sqlite3')" && echo "OK"
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 576 tests
+SCHEDULER_DB=:memory: node test.js  # 753 tests
 ```
 
-**All tests must pass before proceeding.** Total: 576 tests.
+**All tests must pass before proceeding.** Total: 753 tests.
 
 ---
 
@@ -473,7 +473,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 576/576
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 753/753
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `systemctl --user status openclaw-scheduler` → active (running)
 - [ ] Log file has startup lines, no errors

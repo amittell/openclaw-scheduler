@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-581%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-753%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-green)]()
 
@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 581 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 753 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -136,7 +136,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 581 passed, 0 failed
+npm test                             # should print: 753 passed, 0 failed
 npm run lint                         # static checks
 npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
@@ -354,10 +354,10 @@ Delivery aliases let you define named delivery targets (e.g., `@my_team`) instea
 
 ```bash
 # Create a named alias
-node cli.js aliases add my_team telegram -1001234567890
+openclaw-scheduler alias add my_team telegram -1001234567890
 
 # Use @alias in job (resolves at dispatch time)
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Alert",
   "delivery_mode": "announce",
   "delivery_to": "@my_team",
@@ -365,10 +365,10 @@ node cli.js jobs add '{
 }'
 
 # List aliases
-node cli.js aliases list
+openclaw-scheduler alias list
 
 # Remove an alias
-node cli.js aliases remove my_team
+openclaw-scheduler alias remove my_team
 ```
 
 Aliases are resolved at dispatch time. If an alias is deleted, jobs fall back to suppressed delivery.
@@ -380,7 +380,7 @@ Aliases are resolved at dispatch time. If an alias is deleted, jobs fall back to
 Shell jobs run a command directly on the host — no gateway or LLM required. Ideal for backups, scripts, maintenance tasks, and anything that doesn't need AI.
 
 ```bash
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Hourly Backup",
   "schedule_cron": "0 * * * *",
   "schedule_tz": "America/New_York",
@@ -401,11 +401,11 @@ node cli.js jobs add '{
 - `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
 - Shell jobs now honor `max_retries` before failure children fire, the same as isolated agent jobs
-- `node cli.js runs output <run-id> stdout|stderr` retrieves stored or offloaded shell output on demand
+- `openclaw-scheduler runs output <run-id> stdout|stderr` retrieves stored or offloaded shell output on demand
 
 **With environment variables:**
 ```bash
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "DB Dump",
   "schedule_cron": "0 3 * * *",
   "session_target": "shell",
@@ -424,7 +424,7 @@ Jobs with `approval_required: 1` pause before each chain-triggered execution and
 
 ```bash
 # Job that requires operator approval before each chain-triggered execution
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Deploy to Prod",
   "parent_id": "<build-job-id>",
   "trigger_on": "success",
@@ -438,9 +438,9 @@ node cli.js jobs add '{
 When triggered, the job creator receives: `⚠️ Job 'Deploy to Prod' requires approval.`
 
 ```bash
-node cli.js jobs approve <job-id>
-node cli.js jobs reject <job-id> "Postponing — too late in the day"
-node cli.js approvals list
+openclaw-scheduler jobs approve <job-id>
+openclaw-scheduler jobs reject <job-id> "Postponing — too late in the day"
+openclaw-scheduler approvals list
 ```
 
 **Key notes:**
@@ -457,10 +457,10 @@ Control what happens when the dispatcher crashes mid-run.
 
 ```bash
 # Enable at-least-once: crashed runs replay on next startup
-node cli.js jobs update <id> '{"delivery_guarantee":"at-least-once"}'
+openclaw-scheduler jobs update <id> '{"delivery_guarantee":"at-least-once"}'
 
 # Default (at-most-once): no replay
-node cli.js jobs update <id> '{"delivery_guarantee":"at-most-once"}'
+openclaw-scheduler jobs update <id> '{"delivery_guarantee":"at-most-once"}'
 ```
 
 **How it works:**
@@ -479,10 +479,10 @@ Inject prior run summaries into a job's prompt so the agent has awareness of rec
 
 ```bash
 # Inject last 3 run summaries into job prompt
-node cli.js jobs update <id> '{"context_retrieval":"recent","context_retrieval_limit":3}'
+openclaw-scheduler jobs update <id> '{"context_retrieval":"recent","context_retrieval_limit":3}'
 
 # Hybrid: recent runs + TF-IDF search for semantically relevant summaries
-node cli.js jobs update <id> '{"context_retrieval":"hybrid","context_retrieval_limit":5}'
+openclaw-scheduler jobs update <id> '{"context_retrieval":"hybrid","context_retrieval_limit":5}'
 ```
 
 **Modes:**
@@ -502,7 +502,7 @@ The task tracker provides a dead-man's-switch for coordinating multi-agent sub-a
 
 ```bash
 # Create a task group to monitor N sub-agents
-node cli.js tasks create '{
+openclaw-scheduler tasks create '{
   "name": "v2-release-team",
   "expected_agents": ["schema-agent","frontend-agent","docs-agent"],
   "timeout_s": 1800,
@@ -511,8 +511,8 @@ node cli.js tasks create '{
 }'
 
 # Monitor
-node cli.js tasks list
-node cli.js tasks status <tracker-id>
+openclaw-scheduler tasks list
+openclaw-scheduler tasks status <tracker-id>
 ```
 
 Each agent in the team must send heartbeat updates. If an agent goes silent past its timeout, it's declared dead. When all agents complete or time out, a summary is delivered to the configured channel.
@@ -525,8 +525,8 @@ Prevent concurrent execution across different jobs that share a resource.
 
 ```bash
 # Two jobs that must not run concurrently
-node cli.js jobs add '{"name":"DB Migration","resource_pool":"database",...}'
-node cli.js jobs add '{"name":"DB Backup","resource_pool":"database",...}'
+openclaw-scheduler jobs add '{"name":"DB Migration","resource_pool":"database",...}'
+openclaw-scheduler jobs add '{"name":"DB Backup","resource_pool":"database",...}'
 ```
 
 If one job in a pool is currently running, all other pool members skip their tick (same behavior as `overlap_policy: 'skip'`, but cross-job rather than per-job). Pool membership is set via the `resource_pool` string field.
@@ -541,7 +541,7 @@ Jobs can be linked into parent → child chains. When a parent completes, its ch
 
 ```bash
 # Parent: runs on cron
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Build App",
   "schedule_cron": "0 10 * * *",
   "payload_message": "Build the application"
@@ -549,7 +549,7 @@ node cli.js jobs add '{
 # → id: "abc123..."
 
 # Child: fires when parent succeeds
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Deploy App",
   "payload_message": "Deploy to production",
   "parent_id": "abc123...",
@@ -557,7 +557,7 @@ node cli.js jobs add '{
 }'
 
 # Child: fires when parent fails
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Build Alert",
   "payload_message": "Build failed — check logs",
   "parent_id": "abc123...",
@@ -576,7 +576,7 @@ node cli.js jobs add '{
 
 ```bash
 # Only fire child if parent output contains "ALERT"
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Alert Handler",
   "parent_id": "<monitor-job-id>",
   "trigger_on": "success",
@@ -585,7 +585,7 @@ node cli.js jobs add '{
 }'
 
 # Regex condition
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Critical Error Handler",
   "parent_id": "<monitor-job-id>",
   "trigger_on": "success",
@@ -605,7 +605,7 @@ Build (agent: main, cron: 10am)
 ```
 
 ```bash
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Deploy",
   "payload_message": "deploy",
   "agent_id": "ops",
@@ -617,7 +617,7 @@ node cli.js jobs add '{
 ### Pattern 4: Delayed Triggers
 
 ```bash
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Post-Deploy Check",
   "payload_message": "Verify services healthy",
   "parent_id": "<deploy-id>",
@@ -642,7 +642,7 @@ A running agent can create new jobs on the fly by sending a `spawn` message:
 ### Visualizing Chains
 
 ```bash
-node cli.js jobs tree <job-id>
+openclaw-scheduler jobs tree <job-id>
 
 # Output:
 # Build App
@@ -658,7 +658,7 @@ node cli.js jobs tree <job-id>
 Jobs can auto-retry before declaring failure and triggering failure children.
 
 ```bash
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Flaky Deploy",
   "schedule_cron": "0 10 * * *",
   "payload_message": "deploy to prod",
@@ -705,7 +705,7 @@ This retry ladder now applies uniformly to shell jobs, isolated agent jobs, and 
 ### Chain Cancellation
 
 ```bash
-node cli.js jobs cancel <job-id>
+openclaw-scheduler jobs cancel <job-id>
 # Cancels all running runs for this job + every descendant
 ```
 
@@ -736,13 +736,13 @@ Messages are delivered inline with job prompts. When the dispatcher builds a pro
 
 ```bash
 # Send a message
-node cli.js msg send <from-agent> <to-agent> "message body"
+openclaw-scheduler msg send <from-agent> <to-agent> "message body"
 
 # Read inbox
-node cli.js msg inbox <agent-id>
+openclaw-scheduler msg inbox <agent-id>
 
 # Mark all read
-node cli.js msg readall <agent-id>
+openclaw-scheduler msg readall <agent-id>
 ```
 
 ### Signal Queue Consumer Example
@@ -751,10 +751,10 @@ Use this when you want scripts to enqueue only actionable signals, then a single
 
 ```bash
 # 1) Enqueue a signal
-node cli.js msg send monitor-agent main "Found 3 critical errors in prod logs"
+openclaw-scheduler msg send monitor-agent main "Found 3 critical errors in prod logs"
 
 # 2) Add a consumer shell job (every 5 minutes)
-node cli.js jobs add '{
+openclaw-scheduler jobs add '{
   "name": "Inbox Consumer",
   "schedule_cron": "*/5 * * * *",
   "session_target": "shell",
@@ -818,16 +818,16 @@ Requires `mc` (MinIO client) in PATH and a configured `backupstore` alias.
 The dispatcher automatically manages agent status during dispatch (idle → busy → idle).
 
 ```bash
-node cli.js agents list
-node cli.js agents get <id>
-node cli.js agents register <id> [name]
+openclaw-scheduler agents list
+openclaw-scheduler agents get <id>
+openclaw-scheduler agents register <id> [name]
 ```
 
 ---
 
 ## Database Schema
 
-**Schema version:** 8 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 18 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -847,17 +847,21 @@ node cli.js agents register <id> [name]
 ### Jobs (key columns)
 
 ```
-id, name, enabled, schedule_cron, schedule_tz,
+id, name, enabled, schedule_kind, schedule_cron, schedule_at, schedule_tz,
 session_target, agent_id, payload_kind, payload_message,
 payload_model, payload_thinking, execution_intent, execution_read_only,
 overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals,
 max_trigger_fanout, output_store_limit_bytes, output_excerpt_limit_bytes,
 output_summary_limit_bytes, output_offload_threshold_bytes,
 max_retries, delivery_mode, delivery_channel,
-delivery_to, delete_after_run, parent_id, trigger_on,
-trigger_delay_s, trigger_condition, resource_pool,
+delivery_to, delivery_guarantee, delete_after_run, ttl_hours,
+parent_id, trigger_on, trigger_delay_s, trigger_condition,
+resource_pool, auth_profile,
 approval_required, approval_timeout_s, approval_auto,
-delivery_guarantee, context_retrieval, context_retrieval_limit,
+context_retrieval, context_retrieval_limit,
+preferred_session_key, job_type, watchdog_target_label,
+watchdog_check_cmd, watchdog_timeout_min, watchdog_alert_channel,
+watchdog_alert_target, watchdog_self_destruct, watchdog_started_at,
 next_run_at, last_run_at, last_status, consecutive_errors,
 created_at, updated_at
 ```
@@ -883,10 +887,11 @@ metadata, priority, channel, owner, status, delivered_at,
 read_at, expires_at, created_at, job_id, run_id
 ```
 
-### Agents (7 columns)
+### Agents (10 columns)
 
 ```
-id, name, status, last_seen_at, session_key, capabilities, created_at
+id, name, status, last_seen_at, session_key, capabilities,
+delivery_channel, delivery_to, brand_name, created_at
 ```
 
 ---
@@ -894,65 +899,91 @@ id, name, status, last_seen_at, session_key, capabilities, created_at
 ## CLI Reference
 
 ```bash
-cd ~/.openclaw/scheduler
-
 # ── Jobs ──────────────────────────────────────────
-node cli.js jobs list                     # List all (shows agent, parent, trigger)
-node cli.js jobs get <id>                 # Full details as JSON
-node cli.js jobs add '<json>'             # Create a job
-node cli.js jobs update <id> '<json>'     # Partial update
-node cli.js jobs enable <id>
-node cli.js jobs disable <id>
-node cli.js jobs delete <id>              # Cascades to runs
-node cli.js jobs tree <id>                # Visual chain hierarchy
-node cli.js jobs children <id> [status]   # Triggered children
-node cli.js jobs cancel <id>              # Cancel running chain
+openclaw-scheduler jobs list                     # List all (shows agent, parent, trigger)
+openclaw-scheduler jobs get <id>                 # Full details as JSON
+openclaw-scheduler jobs add '<json>'             # Create a job
+openclaw-scheduler jobs update <id> '<json>'     # Partial update
+openclaw-scheduler jobs enable <id>
+openclaw-scheduler jobs disable <id>              # NOTE: disabled jobs are auto-pruned after 24h
+openclaw-scheduler jobs delete <id>              # Cascades to runs
+openclaw-scheduler jobs tree                     # Visual chain hierarchy
+openclaw-scheduler jobs cancel <id>              # Cancel running chain
 
 # ── Runs ──────────────────────────────────────────
-node cli.js runs list <job-id> [limit]    # Run history
-node cli.js runs get <run-id>             # Full run details
-node cli.js runs output <run-id> stdout   # Stored/offloaded stdout or stderr
-node cli.js runs running                  # Active runs
-node cli.js runs stale [threshold-s]      # Stale runs (default 90s)
+openclaw-scheduler runs list <job-id> [limit]    # Run history
+openclaw-scheduler runs get <run-id>             # Full run details
+openclaw-scheduler runs output <run-id> stdout   # Stored/offloaded stdout or stderr
+openclaw-scheduler runs running                  # Active runs
+openclaw-scheduler runs stale [threshold-s]      # Stale runs (default 90s)
 
 # ── Messages ──────────────────────────────────────
-node cli.js msg send <from> <to> <body>
-node cli.js msg inbox <agent-id> [limit]
-node cli.js msg outbox <agent-id> [limit]
-node cli.js msg thread <message-id>
-node cli.js msg read <message-id>
-node cli.js msg readall <agent-id>
-node cli.js msg unread <agent-id>
+openclaw-scheduler msg send <from> <to> <body>
+openclaw-scheduler msg inbox <agent-id> [limit]
+openclaw-scheduler msg outbox <agent-id> [limit]
+openclaw-scheduler msg thread <message-id>
+openclaw-scheduler msg ack <message-id> [actor] [note]
+openclaw-scheduler msg receipts <message-id> [limit]
+openclaw-scheduler msg team-inbox <team-id> [limit] [member-id] [task-id]
+openclaw-scheduler msg read <message-id>
+openclaw-scheduler msg readall <agent-id>
+openclaw-scheduler msg unread <agent-id>
 
 # ── Agents ────────────────────────────────────────
-node cli.js agents list
-node cli.js agents get <id>
-node cli.js agents register <id> [name]
+openclaw-scheduler agents list
+openclaw-scheduler agents get <id>
+openclaw-scheduler agents register <id> [name]
 
 # ── Approvals ─────────────────────────────────────
-node cli.js jobs approve <id>            # Approve pending gate
-node cli.js jobs reject <id> [reason]    # Reject pending gate
-node cli.js approvals list               # All pending approvals
+openclaw-scheduler jobs approve <id>            # Approve pending gate
+openclaw-scheduler jobs reject <id> [reason]    # Reject pending gate
+openclaw-scheduler approvals list               # All pending approvals
 
 # ── Task Tracker ──────────────────────────────────
-node cli.js tasks create '<json>'        # Create task group
-node cli.js tasks list                   # Active task groups
-node cli.js tasks status <id>            # Detailed status
-node cli.js tasks history [limit]        # Recently completed groups
-node cli.js tasks heartbeat <id> <label> running|completed|failed [msg]
-node cli.js tasks register-session <id> <label> <session-key>  # Enable auto-heartbeat
+openclaw-scheduler tasks create '<json>'        # Create task group
+openclaw-scheduler tasks list                   # Active task groups
+openclaw-scheduler tasks status <id>            # Detailed status
+openclaw-scheduler tasks history [limit]        # Recently completed groups
+openclaw-scheduler tasks heartbeat <id> <label> running|completed|failed [msg]
+openclaw-scheduler tasks register-session <id> <label> <session-key>  # Enable auto-heartbeat
+
+# ── Queue ─────────────────────────────────────────
+openclaw-scheduler queue list [agent] [limit]    # Pending + delivered messages
+openclaw-scheduler queue clear [agent]           # Mark all messages read
+openclaw-scheduler queue prune                   # Prune old messages
+
+# ── Team Adapter ─────────────────────────────────
+openclaw-scheduler team map [limit]                          # Project team messages into events
+openclaw-scheduler team tasks <team-id> [limit]              # List team tasks
+openclaw-scheduler team events <team-id> [limit] [task-id]   # List team events
+openclaw-scheduler team gate <team-id> <task-id> <members-json> [timeout-s]
+openclaw-scheduler team check-gates [limit]                  # Evaluate task gates
+openclaw-scheduler team ack <message-id> [actor] [note]      # Team-aware ACK
+
+# ── Idempotency ──────────────────────────────────
+openclaw-scheduler idem status <job-id>          # Recent idempotency keys
+openclaw-scheduler idem check <key>              # Check if key is claimed
+openclaw-scheduler idem release <key>            # Manually release a key
+openclaw-scheduler idem prune                    # Force prune expired entries
 
 # ── Delivery Aliases ──────────────────────────────
-node cli.js aliases list                 # List all aliases
-node cli.js aliases add <name> <channel> <target> [description]
-node cli.js aliases remove <name>
+openclaw-scheduler alias list                 # List all aliases
+openclaw-scheduler alias add <name> <channel> <target> [description]
+openclaw-scheduler alias remove <name>
 
-# ── Companion Utility ─────────────────────────────
-npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- webhook-check --label my-bot --bot-token-env TELEGRAM_BOT_TOKEN
+# ── Schema Introspection ─────────────────────────
+openclaw-scheduler schema jobs              # JSON schema for job fields (types, defaults, enums)
+openclaw-scheduler schema runs              # Run statuses and key fields
+openclaw-scheduler schema messages          # Message kinds and statuses
+openclaw-scheduler schema approvals         # Approval statuses
+openclaw-scheduler schema dispatches        # Dispatch kinds and statuses
+openclaw-scheduler schema all               # Everything
 
 # ── Status ────────────────────────────────────────
-node cli.js status
+openclaw-scheduler status
 ```
+
+All CLI commands support `--json` for machine-readable output (useful for piping into `jq` or agent toolchains).
 
 ---
 
@@ -971,8 +1002,25 @@ node cli.js status
 | `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
+| `SCHEDULER_BACKUP` | *(unset)* | Set to `1` to enable MinIO backups (requires `mc` CLI) |
+| `SCHEDULER_BACKUP_MC_ALIAS` | `backupstore` | MinIO alias used by `mc` for backup snapshots |
+| `SCHEDULER_BACKUP_BUCKET` | `scheduler-backups` | MinIO bucket for snapshots |
+| `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
+| `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
+| `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
+| `DISPATCH_LABELS_PATH` | *(auto)* | Override path to labels.json for dispatch session tracking |
+| `DISPATCH_INDEX_PATH` | *(auto)* | Override path to dispatch/index.mjs (used by watcher) |
+| `DISPATCH_HOST` | `hostname()` | Host identifier sent with dispatch hook events |
+| `DISPATCH_WEBHOOK_URL` | *(unset)* | Webhook URL for dispatch lifecycle events (hooks.mjs) |
+| `LOKI_PUSH_URL` | *(unset)* | Loki push endpoint for dispatch event logging (hooks.mjs) |
+| `TELEGRAM_BOT_TOKEN` | *(unset)* | Bot token for webhook health check utility |
+| `TELEGRAM_WEBHOOK_URL` | *(unset)* | Expected webhook URL for Telegram webhook check |
+| `INBOX_AGENT` | `main` | Target agent for inbox-consumer.mjs |
+| `INBOX_DELIVERY_CHANNEL` | *(unset)* | Delivery channel for inbox-consumer.mjs forwarding |
+| `INBOX_DELIVERY_TO` | *(unset)* | Delivery target for inbox-consumer.mjs forwarding |
+| `INBOX_LIMIT` | `10` | Batch size for inbox-consumer.mjs |
 
 ---
 
@@ -1000,7 +1048,7 @@ ps aux | grep dispatcher | grep -v grep
 tail -f /tmp/openclaw-scheduler.log
 
 # Quick health
-node cli.js status
+openclaw-scheduler status
 ```
 
 LaunchAgent config: `RunAtLoad: true`, `KeepAlive: true` (auto-restart on crash).
@@ -1049,7 +1097,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`).
+As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v18`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1118,8 +1166,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v10) — all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v10
+├── schema.sql             # Complete schema (v18) — all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v18
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -1130,13 +1178,14 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
 ├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
 ├── team-adapter.js        # Team mailbox/task projection and task completion gates
-├── backup.js              # MinIO snapshot/rollup/restore
+├── backup.js              # MinIO snapshot/rollup/restore (requires `mc` CLI)
 ├── cli.js                 # CLI management tool
 ├── migrate.js             # Import from OC jobs.json
-├── test.js                # Full test suite (576 tests, in-memory)
 ├── scripts/
-│   ├── inbox-consumer.mjs      # Drains queue messages and delivers to Telegram
-│   └── stuck-run-detector.mjs  # Detects stale running runs (alert-only via non-zero exit)
+│   ├── dispatch-cli-utils.mjs       # Dispatch CLI path resolution helpers
+│   ├── inbox-consumer.mjs           # Drains queue messages and delivers to Telegram
+│   ├── stuck-run-detector.mjs       # Detects stale running runs (alert-only via non-zero exit)
+│   └── telegram-webhook-check.mjs   # Telegram webhook health check / repair utility
 │
 │  Service & docs
 ├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
@@ -1147,7 +1196,6 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── UNINSTALL.md           # Removal guide (all platforms)
 ├── BEST-PRACTICES.md      # Job type selection, prompt writing, agent integration
 ├── openclaw-scheduler.service  # Linux systemd user service template
-├── IMPLEMENTATION_SPEC.md # Internal developer reference (v5+ feature specs)
 ├── CHANGELOG.md           # Version history
 └── README.md              # This file
 ```
@@ -1157,7 +1205,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (576 tests, in-memory SQLite)
+# Run all tests (753 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:
@@ -1187,7 +1235,7 @@ npm test
 
 ## Sub-agent Dispatch
 
-The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in a local `labels.json` ledger, and auto-announces its result when the agent calls `done` as its final action. The module also supports symlink-based branding: a wrapper directory (such as `chilisaus`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
+The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in a local `labels.json` ledger, and auto-announces its result when the agent calls `done` as its final action. The module also supports symlink-based branding: a wrapper directory (such as `my-brand`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
 
 ### Quick Example
 
@@ -1199,12 +1247,12 @@ openclaw-scheduler enqueue \
   --mode        fresh                                                         \
   --thinking    high                                                          \
   --timeout     3600                                                          \
-  --deliver-to  484946046                                                     \
+  --deliver-to  YOUR_TELEGRAM_ID                                                     \
   --delivery-mode announce
 
 # Fallback (if openclaw-scheduler is not in PATH):
 node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
-  --label "fix-deploy-script" --message "..." --deliver-to 484946046
+  --label "fix-deploy-script" --message "..." --deliver-to YOUR_TELEGRAM_ID
 ```
 
 ### Flag Reference
@@ -1255,17 +1303,17 @@ The main agent acts as the orchestrator and delegates parallel units of work to 
 openclaw-scheduler enqueue \
   --label   "worker-schema"   \
   --message "Review the DB schema and write documentation for all tables" \
-  --thinking high --timeout 600 --deliver-to 484946046
+  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-frontend" \
   --message "Audit the React components for accessibility issues" \
-  --thinking high --timeout 600 --deliver-to 484946046
+  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-docs"     \
   --message "Update the API docs to reflect the new /v2 endpoints" \
-  --thinking high --timeout 600 --deliver-to 484946046
+  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
 
 # Each worker auto-announces its result to Telegram when done.
 # No polling needed. Watchdog jobs are auto-registered for each.
@@ -1280,7 +1328,7 @@ openclaw-scheduler status --label worker-schema
 
 ### Branding and Configuration
 
-`dispatch/index.mjs` resolves `config.json` relative to the directory of the invoking script, not the module itself. This means a symlink at `~/.openclaw/chilisaus/index.mjs -> ~/.openclaw/scheduler/dispatch/index.mjs` will load `~/.openclaw/chilisaus/config.json`, giving the same CLI a different brand name and defaults. All config fields are optional.
+`dispatch/index.mjs` resolves `config.json` relative to the directory of the invoking script, not the module itself. This means a symlink at `~/.openclaw/my-brand/index.mjs -> ~/.openclaw/scheduler/dispatch/index.mjs` will load `~/.openclaw/my-brand/config.json`, giving the same CLI a different brand name and defaults. All config fields are optional.
 
 **`config.json` fields:**
 
@@ -1305,7 +1353,7 @@ openclaw-scheduler status --label worker-schema
 
 ```json
 {
-  "name": "chilisaus",
+  "name": "my-brand",
   "watchdogIntervalCron": "*/15 * * * *",
   "watchdogTimeoutMin": 60
 }
@@ -1340,8 +1388,8 @@ The watchdog disarms itself automatically when the agent calls `done`, when `sta
 ps aux | grep dispatcher              # Is it running?
 tail -20 /tmp/openclaw-scheduler.log   # Any errors?
 curl http://127.0.0.1:18789/health     # Gateway reachable?
-node cli.js jobs list                  # Is nextRun in the past?
-node cli.js runs running               # Overlap blocking?
+openclaw-scheduler jobs list                  # Is nextRun in the past?
+openclaw-scheduler runs running               # Overlap blocking?
 ```
 
 ### Wrong next_run_at
@@ -1375,8 +1423,8 @@ Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have
 ### Job shows 'awaiting_approval'
 
 ```bash
-node cli.js approvals list
-node cli.js jobs approve <id>   # or reject
+openclaw-scheduler approvals list
+openclaw-scheduler jobs approve <id>   # or reject
 ```
 
 ### Backup failing

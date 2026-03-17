@@ -6,7 +6,7 @@
     <string>ai.openclaw.scheduler</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/node</string>
+        <string>YOUR_NODE_PATH</string>
         <string>--no-warnings</string>
         <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
     </array>

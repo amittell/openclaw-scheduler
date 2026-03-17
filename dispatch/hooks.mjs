@@ -21,9 +21,7 @@ import { sendMessage } from '../messages.js';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
-// Backward-compat: CHILISAUS_HOST from older deployments is still honored.
 const HOST         = process.env.DISPATCH_HOST
-  || process.env.CHILISAUS_HOST
   || hostname()
   || 'unknown-host';
 const TIMEOUT_MS   = 3000;

@@ -22,13 +22,11 @@
 import { readFileSync, writeFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
-import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LABELS_PATH = join(__dirname, 'labels.json');
 const INDEX_PATH = join(__dirname, 'index.mjs');
-const HOME_DIR = process.env.HOME || homedir();
 
 const MAX_RETRIES = 3;
 // Only recover errors that happened within the last 60 minutes
@@ -65,8 +63,8 @@ function saveLabels(labels) {
 
 function notify(message) {
   try {
-    const checkinPath = join(HOME_DIR, '.openclaw', 'workspace', 'scripts', 'agent-checkin.mjs');
-    execFileSync('node', [checkinPath, message], {
+    const cliPath = join(__dirname, '..', 'cli.js');
+    execFileSync(process.execPath, [cliPath, 'msg', 'send', 'scheduler', 'main', message], {
       encoding: 'utf-8',
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -79,7 +77,7 @@ function respawnSession(label, entry) {
 
   // Try send (reuse session) first
   try {
-    execFileSync('node', [
+    execFileSync(process.execPath, [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,
@@ -106,7 +104,7 @@ function respawnSession(label, entry) {
       args.push('--delivery-mode', 'announce');
     }
 
-    execFileSync('node', args, {
+    execFileSync(process.execPath, args, {
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['pipe', 'pipe', 'pipe'],

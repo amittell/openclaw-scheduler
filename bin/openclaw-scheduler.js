@@ -48,44 +48,51 @@ Dispatch subcommands (routed to dispatch/index.mjs):
 
 All other commands are forwarded to scheduler CLI (cli.js):
   openclaw-scheduler jobs list
+  openclaw-scheduler runs running
   openclaw-scheduler msg send system main "hello"
+  openclaw-scheduler status
+
+Flags:
+  --json               Output machine-readable JSON (supported by all CLI subcommands)
 
 Environment:
-  DISPATCH_CONFIG_DIR   Override dispatch config directory (default: ~/.openclaw/chilisaus)
+  DISPATCH_CONFIG_DIR   Override dispatch config directory (default: ~/.openclaw/dispatch)
 `);
 }
 
 function runScript(script, args) {
-  const result = spawnSync(process.execPath, [join(root, script), ...args], {
+  const scriptPath = join(root, script);
+  const result = spawnSync(process.execPath, [scriptPath, ...args], {
     stdio: 'inherit',
     env: process.env,
   });
-  if (typeof result.status === 'number') {
-    process.exit(result.status);
+  if (result.error) {
+    process.stderr.write(`Error: could not run ${script}: ${result.error.message}\n`);
+    process.exit(1);
   }
-  process.exit(1);
+  process.exit(typeof result.status === 'number' ? result.status : 1);
 }
 
 /**
  * Run dispatch/index.mjs with the given args.
- * Honors DISPATCH_CONFIG_DIR env var for branding config override.
- * Defaults to ~/.openclaw/chilisaus if not set (chilisaus branding).
+ * Honors DISPATCH_CONFIG_DIR env var for config override.
+ * Defaults to ~/.openclaw/dispatch if not set.
  */
 function runDispatch(args) {
   const dispatchScript = join(root, 'dispatch', 'index.mjs');
   const env = { ...process.env };
-  // Default to chilisaus branding unless explicitly overridden
   if (!env.DISPATCH_CONFIG_DIR) {
-    env.DISPATCH_CONFIG_DIR = join(process.env.HOME || '', '.openclaw', 'chilisaus');
+    env.DISPATCH_CONFIG_DIR = join(process.env.HOME || '', '.openclaw', 'dispatch');
   }
   const result = spawnSync(process.execPath, [dispatchScript, ...args], {
     stdio: 'inherit',
     env,
   });
-  if (typeof result.status === 'number') {
-    process.exit(result.status);
+  if (result.error) {
+    process.stderr.write(`Error: could not run dispatch: ${result.error.message}\n`);
+    process.exit(1);
   }
-  process.exit(1);
+  process.exit(typeof result.status === 'number' ? result.status : 1);
 }
 
 const args = process.argv.slice(2);

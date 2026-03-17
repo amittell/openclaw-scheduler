@@ -153,14 +153,14 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     assertSafeString('schedule_cron', merged.schedule_cron, { maxLength: 128 });
     // Skip cron validation for the sentinel (never-fires placeholder for at-jobs)
     if (merged.schedule_cron !== AT_JOB_CRON_SENTINEL) {
-      nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'America/New_York');
+      nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'UTC');
     }
   }
   if (merged.schedule_at != null) {
     assertSafeString('schedule_at', merged.schedule_at, { maxLength: 64 });
   }
   if (mode === 'create' || 'schedule_tz' in normalized) {
-    assertSafeString('schedule_tz', merged.schedule_tz || 'America/New_York', { maxLength: 128 });
+    assertSafeString('schedule_tz', merged.schedule_tz || 'UTC', { maxLength: 128 });
   }
 
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
@@ -357,7 +357,7 @@ export function createJob(opts) {
     // At-jobs fire at schedule_at; use provided next_run_at or derive from schedule_at
     nextRun = normalized.next_run_at || normalized.schedule_at || null;
   } else {
-    nextRun = isChild ? null : nextRunFromCron(cronExpr, normalized.schedule_tz || 'America/New_York');
+    nextRun = isChild ? null : nextRunFromCron(cronExpr, normalized.schedule_tz || 'UTC');
   }
 
   const stmt = db.prepare(`
@@ -413,7 +413,7 @@ export function createJob(opts) {
     normalized.schedule_kind || 'cron',
     normalized.schedule_at || null,
     cronExpr,
-    normalized.schedule_tz || 'America/New_York',
+    normalized.schedule_tz || 'UTC',
     normalized.session_target || 'isolated',
     normalized.agent_id || 'main',
     normalized.payload_kind || (normalized.session_target === 'main' ? 'systemEvent' : 'agentTurn'),

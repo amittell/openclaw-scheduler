@@ -17,6 +17,9 @@
  *   snapshots: 24 hours (288 files max at 5-min intervals)
  *   rollups:   7 days (168 files max)
  * 
+ * Requires: MinIO client (`mc`) binary in PATH or ~/bin/mc.
+ * Install: https://min.io/docs/minio/linux/reference/minio-mc.html
+ *
  * Usage:
  *   node backup.js snapshot     # Ship current DB
  *   node backup.js rollup       # Hourly rollup + prune old snapshots
@@ -32,9 +35,9 @@ import { resolveBackupStagingDir, resolveSchedulerDbPath } from './paths.js';
 
 const DB_PATH = resolveSchedulerDbPath({ env: process.env });
 const STAGING_DIR = resolveBackupStagingDir(process.env);
-const MC_ALIAS = 'backupstore';
-const BUCKET = 'scheduler-backups';
-const PREFIX = 'scheduler';
+const MC_ALIAS = process.env.SCHEDULER_BACKUP_MC_ALIAS || 'backupstore';
+const BUCKET = process.env.SCHEDULER_BACKUP_BUCKET || 'scheduler-backups';
+const PREFIX = process.env.SCHEDULER_BACKUP_PREFIX || 'scheduler';
 
 // Find mc binary — may be in ~/bin on some hosts
 const MC_BIN = existsSync(join(homedir(), 'bin', 'mc'))

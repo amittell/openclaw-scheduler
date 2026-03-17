@@ -104,6 +104,7 @@ const HEARTBEAT_CHECK_MS = parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || 
 const MESSAGE_DELIVERY_MS = parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS || '15000', 10);
 const PRUNE_INTERVAL_MS = parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10);
 const BACKUP_INTERVAL_MS = parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10); // 5 min
+let backupEnabled = process.env.SCHEDULER_BACKUP === '1' || process.env.SCHEDULER_BACKUP === 'true';
 const LOG_PREFIX = '[scheduler]';
 
 // ── State ───────────────────────────────────────────────────
@@ -587,8 +588,8 @@ async function tick() {
     }
   }
 
-  // 5. Backup to MinIO (every BACKUP_INTERVAL_MS, default 5 min)
-  if (now - lastBackup >= BACKUP_INTERVAL_MS) {
+  // 5. Backup to MinIO (every BACKUP_INTERVAL_MS, default 5 min; set SCHEDULER_BACKUP=1 to enable)
+  if (backupEnabled && now - lastBackup >= BACKUP_INTERVAL_MS) {
     lastBackup = now;
     try {
       const isRollup = new Date().getMinutes() < (BACKUP_INTERVAL_MS / 60000);
@@ -600,7 +601,13 @@ async function tick() {
       });
       log('debug', `Backup ${mode} completed`);
     } catch (err) {
-      log('error', `Backup failed: ${err.stderr?.toString()?.trim() || err.message}`);
+      const msg = err.stderr?.toString()?.trim() || err.message;
+      if (msg.includes('not found') || msg.includes('ENOENT')) {
+        log('warn', `Backup disabled: mc binary not found. Install mc to use backups.`);
+        backupEnabled = false;
+      } else {
+        log('error', `Backup failed: ${msg}`);
+      }
     }
   }
 }

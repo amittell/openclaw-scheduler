@@ -20,7 +20,9 @@ export interface JobSpec {
   enabled?: number | boolean;
 
   // Schedule
+  schedule_kind?: 'cron' | 'at';
   schedule_cron?: string | null;
+  schedule_at?: string | null;
   schedule_tz?: string | null;
 
   // Execution
@@ -61,6 +63,7 @@ export interface JobSpec {
 
   // Metadata
   delete_after_run?: number | boolean;
+  ttl_hours?: number | null;
   resource_pool?: string | null;
   job_class?: 'standard' | 'pre_compaction_flush';
 
@@ -82,6 +85,9 @@ export interface JobSpec {
   // Session continuity
   preferred_session_key?: string | null;
 
+  // Auth profile override
+  auth_profile?: string | null;
+
   // Watchdog monitoring
   job_type?: 'standard' | 'watchdog';
   watchdog_target_label?: string | null;
@@ -101,10 +107,14 @@ export interface JobSpec {
 export interface JobRecord extends JobSpec {
   id: string;
   enabled: number;
+  schedule_kind: 'cron' | 'at';
   schedule_cron: string;
+  schedule_at: string | null;
   schedule_tz: string;
   payload_kind: 'systemEvent' | 'agentTurn' | 'shellCommand';
   payload_message: string;
+  ttl_hours: number | null;
+  auth_profile: string | null;
 
   // Scheduling state (denormalized)
   next_run_at?: string | null;
@@ -229,6 +239,9 @@ export interface AgentRecord {
   last_seen_at?: string | null;
   session_key?: string | null;
   capabilities?: JsonValue | null;
+  delivery_channel?: string | null;
+  delivery_to?: string | null;
+  brand_name?: string | null;
   created_at?: string;
   [key: string]: unknown;
 }
@@ -374,6 +387,7 @@ export interface AgentTurnOpts {
   agentId?: string;
   sessionKey?: string;
   model?: string;
+  authProfile?: string | null;
   timeoutMs?: number;
 }
 
@@ -382,6 +396,7 @@ export interface AgentTurnWithTimeoutOpts {
   agentId?: string;
   sessionKey?: string;
   model?: string;
+  authProfile?: string | null;
   idleTimeoutMs?: number;
   pollIntervalMs?: number;
   absoluteTimeoutMs?: number;
@@ -405,7 +420,7 @@ export interface DeliveryResult {
 
 export const db: {
   setDbPath(path: string): void;
-  getDb(): unknown;
+  getDb(): import('better-sqlite3').Database;
   getResolvedDbPath(): string;
   initDb(): Promise<unknown>;
   checkpointWal(): { busy: number; checkpointed: number; log: number } | null;
@@ -424,9 +439,14 @@ export const jobs: {
   updateJob(id: string, patch: Partial<JobSpec>): JobRecord | null;
   deleteJob(id: string): void;
 
+  // At-job helpers
+  parseInDuration(duration: string): string;
+  AT_JOB_CRON_SENTINEL: string;
+
   // Scheduling
   nextRunFromCron(cronExpr: string, tz?: string | null): string | null;
   getDueJobs(): JobRecord[];
+  getDueAtJobs(): JobRecord[];
   runJobNow(id: string): (JobRecord & { dispatch_id: string; dispatch_kind: string }) | null;
 
   // Chaining
@@ -597,6 +617,97 @@ export const shellResults: {
   DEFAULT_OFFLOAD_THRESHOLD: number;
   normalizeShellResult(result: { stdout?: string; stderr?: string; error?: unknown }, opts?: NormalizeShellOpts): ShellResult;
   extractShellResultFromRun(run: RunRecord): PartialShellResult | null;
+};
+
+export const idempotency: {
+  generateIdempotencyKey(jobId: string, scheduledTime?: string): string;
+  generateChainIdempotencyKey(parentRunId: string, childJobId: string): string;
+  generateRunNowIdempotencyKey(jobId: string): string;
+  checkIdempotencyKey(key: string): Record<string, unknown> | null;
+  getIdempotencyEntry(key: string): Record<string, unknown> | null;
+  claimIdempotencyKey(key: string, jobId: string, runId: string, expiresAt: string): boolean;
+  releaseIdempotencyKey(key: string): void;
+  updateIdempotencyResultHash(key: string, content: string): void;
+  pruneIdempotencyLedger(): SqliteRunResult;
+  listIdempotencyForJob(jobId: string, limit?: number): Array<Record<string, unknown>>;
+  forcePruneIdempotency(): number;
+};
+
+export interface TaskGroupOpts {
+  name: string;
+  expectedAgents: string[];
+  timeoutS?: number;
+  createdBy?: string;
+  deliveryChannel?: string | null;
+  deliveryTo?: string | null;
+}
+
+export interface TaskGroupResult {
+  id: string;
+  name: string;
+  status: string;
+  created_at: string;
+  created_by: string;
+  agents: Array<{ agent_label: string; status: string }>;
+}
+
+export interface TaskGroupStatus {
+  id: string;
+  name: string;
+  status: string;
+  agents: Array<{
+    label: string;
+    status: string;
+    session_key?: string;
+    last_heartbeat?: string;
+    duration: number | null;
+    exit_message?: string;
+    error?: string;
+  }>;
+  elapsed: number;
+  remaining_timeout: number;
+  summary?: string;
+  delivery_channel: string | null;
+  delivery_to: string | null;
+}
+
+export const taskTracker: {
+  createTaskGroup(opts: TaskGroupOpts): TaskGroupResult;
+  getTaskGroup(id: string): Record<string, unknown> | undefined;
+  listActiveTaskGroups(): Array<Record<string, unknown>>;
+  agentStarted(trackerId: string, agentLabel: string, sessionKey?: string): void;
+  registerAgentSession(trackerId: string, agentLabel: string, sessionKey: string): void;
+  touchAgentHeartbeat(trackerId: string, agentLabel: string): void;
+  agentCompleted(trackerId: string, agentLabel: string, exitMessage?: string): void;
+  agentFailed(trackerId: string, agentLabel: string, error?: string): void;
+  checkDeadAgents(): Array<{ tracker_id: string; agent_label: string; agent_id: string }>;
+  checkGroupCompletion(trackerId: string): Record<string, unknown> | null;
+  getTaskGroupStatus(trackerId: string): TaskGroupStatus | null;
+};
+
+export interface TeamTaskGateOpts {
+  teamId: string;
+  taskId: string;
+  expectedMembers: string[];
+  timeoutS?: number;
+  createdBy?: string;
+  deliveryChannel?: string | null;
+  deliveryTo?: string | null;
+}
+
+export const teamAdapter: {
+  mapTeamMessages(limit?: number): number;
+  listTeamTasks(teamId: string, limit?: number): Array<Record<string, unknown>>;
+  listTeamMailboxEvents(teamId: string, opts?: { limit?: number; taskId?: string | null }): Array<Record<string, unknown>>;
+  createTeamTaskGate(opts: TeamTaskGateOpts): {
+    team_id: string;
+    task_id: string;
+    gate_status: string;
+    tracker_id: string;
+    expected_members: string[];
+  };
+  checkTeamTaskGates(limit?: number): { passed: number; failed: number; pending: number };
+  ackTeamMessage(messageId: string, actor?: string, detail?: string | null): Record<string, unknown> | null;
 };
 
 export const SCHEDULER_SCHEMAS: {

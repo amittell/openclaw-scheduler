@@ -12,4 +12,8 @@ secrets/
 backupstore/
 logs/
 chilisaus/
+dispatch/labels.json
+dispatch/config.json
+dispatch/test-*.mjs
+dispatch/chilisaus.mjs
 .DS_Store

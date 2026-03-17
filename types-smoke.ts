@@ -3,7 +3,8 @@
 
 import {
   db, jobs, runs, messages, approvals, agents, dispatchQueue, gateway,
-  paths, promptContext, retrieval, shellResults, SCHEDULER_SCHEMAS,
+  paths, promptContext, retrieval, shellResults, idempotency, taskTracker, teamAdapter,
+  SCHEDULER_SCHEMAS,
   type JobSpec, type JobRecord, type RunRecord, type MessageRecord,
   type ApprovalRecord, type AgentRecord, type DispatchRecord,
   type ShellResult, type PartialShellResult,
@@ -12,6 +13,8 @@ import {
   type DbPathParams, type ArtifactsDirParams,
   type AgentTurnOpts, type AgentTurnWithTimeoutOpts,
   type AgentTurnResult, type DeliveryResult, type SqliteRunResult,
+  type TaskGroupOpts, type TaskGroupResult, type TaskGroupStatus,
+  type TeamTaskGateOpts,
 } from './index.js';
 
 // ---- db ----
@@ -281,6 +284,47 @@ void SCHEDULER_SCHEMAS.dispatches.statuses;
 void SCHEDULER_SCHEMAS.messages.kinds;
 void SCHEDULER_SCHEMAS.messages.statuses;
 
+// ---- idempotency ----
+const idemKey: string = idempotency.generateIdempotencyKey('job-1', '2026-01-01');
+const chainKey: string = idempotency.generateChainIdempotencyKey('run-1', 'child-1');
+const runNowKey: string = idempotency.generateRunNowIdempotencyKey('job-1');
+const idemCheck: Record<string, unknown> | null = idempotency.checkIdempotencyKey(idemKey);
+const idemEntry: Record<string, unknown> | null = idempotency.getIdempotencyEntry(idemKey);
+const idemClaimed: boolean = idempotency.claimIdempotencyKey(idemKey, 'job-1', 'run-1', '2026-12-31');
+idempotency.releaseIdempotencyKey(idemKey);
+idempotency.updateIdempotencyResultHash(idemKey, 'content');
+const idemPruned: SqliteRunResult = idempotency.pruneIdempotencyLedger();
+const idemList: Array<Record<string, unknown>> = idempotency.listIdempotencyForJob('job-1', 10);
+const idemForce: number = idempotency.forcePruneIdempotency();
+
+// ---- taskTracker ----
+const tgOpts: TaskGroupOpts = { name: 'smoke', expectedAgents: ['a', 'b'] };
+const tgResult: TaskGroupResult = taskTracker.createTaskGroup(tgOpts);
+void tgResult.id; void tgResult.agents;
+const tgGet: Record<string, unknown> | undefined = taskTracker.getTaskGroup('id');
+const tgActive: Array<Record<string, unknown>> = taskTracker.listActiveTaskGroups();
+taskTracker.agentStarted('t-1', 'agent-a', 'key');
+taskTracker.registerAgentSession('t-1', 'agent-a', 'key');
+taskTracker.touchAgentHeartbeat('t-1', 'agent-a');
+taskTracker.agentCompleted('t-1', 'agent-a', 'done');
+taskTracker.agentFailed('t-1', 'agent-a', 'error');
+const deadAgents = taskTracker.checkDeadAgents();
+if (deadAgents.length) { void deadAgents[0].tracker_id; void deadAgents[0].agent_label; }
+const tgCompletion: Record<string, unknown> | null = taskTracker.checkGroupCompletion('t-1');
+const tgStatus: TaskGroupStatus | null = taskTracker.getTaskGroupStatus('t-1');
+if (tgStatus) { void tgStatus.elapsed; void tgStatus.agents; void tgStatus.remaining_timeout; }
+
+// ---- teamAdapter ----
+const mapped: number = teamAdapter.mapTeamMessages(10);
+const teamTasks: Array<Record<string, unknown>> = teamAdapter.listTeamTasks('team-1', 10);
+const teamEvents: Array<Record<string, unknown>> = teamAdapter.listTeamMailboxEvents('team-1', { limit: 10, taskId: 'task-1' });
+const gateOpts: TeamTaskGateOpts = { teamId: 'team-1', taskId: 'task-1', expectedMembers: ['a', 'b'] };
+const gate = teamAdapter.createTeamTaskGate(gateOpts);
+void gate.team_id; void gate.task_id; void gate.gate_status; void gate.tracker_id;
+const gatesResult = teamAdapter.checkTeamTaskGates(10);
+void gatesResult.passed; void gatesResult.failed; void gatesResult.pending;
+const ackResult: Record<string, unknown> | null = teamAdapter.ackTeamMessage('msg-1', 'operator', 'ok');
+
 // Suppress unused variable warnings
 void created; void fetched; void listed; void updated;
 void nextRun; void due; void children; void allChildren; void condMatch; void depth;
@@ -295,3 +339,7 @@ void gotDispatch; void claimed; void released; void statusUpdated; void jobDispa
 void healthy; void waited;
 void home; void dbPath; void parent; void backupDir; void artifactsDir; void ensuredDir;
 void ctx; void normalized; void parts;
+void idemKey; void chainKey; void runNowKey; void idemCheck; void idemEntry;
+void idemClaimed; void idemPruned; void idemList; void idemForce;
+void tgOpts; void tgGet; void tgActive; void tgCompletion;
+void mapped; void teamTasks; void teamEvents; void gateOpts; void ackResult;

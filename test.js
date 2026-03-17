@@ -2250,27 +2250,26 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
 console.log('\n── Dispatch Script Compatibility ──');
 {
   const envBase = { HOME: '/tmp/alex' };
+  const schedulerPath = '/tmp/alex/.openclaw/scheduler/dispatch/index.mjs';
   const dispatchPath = '/tmp/alex/.openclaw/dispatch/index.mjs';
-  const legacyPath = '/tmp/alex/.openclaw/chilisaus/index.mjs';
+
+  const schedulerOnly = new Set([schedulerPath]);
+  assert(
+    resolveDispatchCliPath(envBase, p => schedulerOnly.has(p)) === schedulerPath,
+    'resolveDispatchCliPath prefers scheduler/dispatch path when available'
+  );
 
   const dispatchOnly = new Set([dispatchPath]);
   assert(
     resolveDispatchCliPath(envBase, p => dispatchOnly.has(p)) === dispatchPath,
-    'resolveDispatchCliPath prefers dispatch path when available'
-  );
-
-  const legacyOnly = new Set([legacyPath]);
-  assert(
-    resolveDispatchCliPath(envBase, p => legacyOnly.has(p)) === legacyPath,
-    'resolveDispatchCliPath falls back to legacy path when dispatch path missing'
+    'resolveDispatchCliPath falls back to dispatch path when scheduler path missing'
   );
 
   const explicitDispatch = '/opt/custom/dispatch/index.mjs';
-  const explicitLegacy = '/opt/custom/chilisaus/index.mjs';
-  const explicitSet = new Set([explicitDispatch, explicitLegacy, dispatchPath]);
+  const explicitSet = new Set([explicitDispatch, schedulerPath]);
   assert(
     resolveDispatchCliPath(
-      { ...envBase, DISPATCH_CLI: explicitDispatch, CHILISAUS_CLI: explicitLegacy },
+      { ...envBase, DISPATCH_CLI: explicitDispatch },
       p => explicitSet.has(p)
     ) === explicitDispatch,
     'resolveDispatchCliPath prioritizes DISPATCH_CLI override'
@@ -2282,7 +2281,6 @@ console.log('\n── Dispatch Script Compatibility ──');
   };
   assert(resolveDispatchLabel('alpha', labels) === 'alpha', 'resolveDispatchLabel handles direct label match');
   assert(resolveDispatchLabel('dispatch-deliver:alpha', labels) === 'alpha', 'resolveDispatchLabel handles dispatch watcher prefix');
-  assert(resolveDispatchLabel('chilisaus-deliver:beta', labels) === 'beta', 'resolveDispatchLabel handles legacy watcher prefix');
   assert(resolveDispatchLabel('dispatch-deliver:missing', labels) === null, 'resolveDispatchLabel returns null for missing label');
 }
 
@@ -2319,7 +2317,7 @@ console.log('\n── Watchdog Jobs ──');
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     job_type: 'watchdog',
     watchdog_target_label: 'my-task',
-    watchdog_check_cmd: 'node chilisaus/index.mjs stuck --label my-task --threshold-min 15',
+    watchdog_check_cmd: 'node dispatch/index.mjs stuck --label my-task --threshold-min 15',
     watchdog_timeout_min: 60,
     watchdog_alert_channel: 'telegram',
     watchdog_alert_target: '123456789',

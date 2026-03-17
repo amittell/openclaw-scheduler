@@ -9,7 +9,7 @@ Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., `
 | Requirement | Notes |
 |-------------|-------|
 | macOS or Linux | Tested on macOS arm64 |
-| Node.js ≥ 22 | `node --version` |
+| Node.js >= 20 | `node --version` |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 
@@ -63,10 +63,10 @@ sudo dnf install gcc gcc-c++ make python3   # Fedora/RHEL
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 576 tests
+SCHEDULER_DB=:memory: node test.js  # 753 tests
 ```
 
-**All tests must pass before proceeding.** Total: 576 tests.
+**All tests must pass before proceeding.** Total: 753 tests.
 
 ---
 
@@ -296,7 +296,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 576/576
+- [ ] `SCHEDULER_DB=:memory: node test.js` -- 753/753
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors

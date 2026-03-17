@@ -1,11 +1,12 @@
 // Gateway API client — independent dispatch via chat completions + system events
 import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-const HOME_DIR = process.env.HOME || '/Users/alexm';
+const HOME_DIR = process.env.HOME || homedir();
 function loadGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
@@ -247,6 +248,7 @@ export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
       ...authHeaders(),
     },
     body: JSON.stringify({ tool, args, sessionKey }),
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (!resp.ok) {

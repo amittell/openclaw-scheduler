@@ -24,11 +24,18 @@
     "test": "SCHEDULER_DB=:memory: node test.js",
     "lint": "eslint . --max-warnings=0",
     "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs",
-    "typecheck": "tsc --project tsconfig.json"
+    "typecheck": "tsc --project tsconfig.json",
+    "prepublishOnly": "npm test && npm run typecheck"
   },
   "files": [
     "bin",
-    "dispatch",
+    "dispatch/529-recovery.mjs",
+    "dispatch/config.example.json",
+    "dispatch/deliver-watcher.sh",
+    "dispatch/hooks.mjs",
+    "dispatch/index.mjs",
+    "dispatch/README.md",
+    "dispatch/watcher.mjs",
     "inbox-consumer.mjs",
     "scripts/dispatch-cli-utils.mjs",
     "scripts/inbox-consumer.mjs",
@@ -72,7 +79,10 @@
     "SECURITY.md",
     "CODE_OF_CONDUCT.md",
     "INSTALL*.md",
-    "UNINSTALL.md"
+    "UNINSTALL.md",
+    "BEST-PRACTICES.md",
+    "ai.openclaw.scheduler.plist",
+    "openclaw-scheduler.service"
   ],
   "keywords": [
     "openclaw",
