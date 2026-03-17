@@ -139,7 +139,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (mode === 'create' || 'session_target' in normalized || 'payload_kind' in normalized) {
     const finalTarget = merged.session_target || 'isolated';
-    const finalKind = merged.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
+    const finalKind = merged.payload_kind || (finalTarget === 'main' ? 'systemEvent' : finalTarget === 'shell' ? 'shellCommand' : 'agentTurn');
     validateJobPayload(finalTarget, finalKind);
   }
   const isAtJob = merged.schedule_kind === 'at';
@@ -347,7 +347,7 @@ export function createJob(opts) {
 
   // Resolve final payload_kind (after defaults) and validate combo
   const finalTarget = normalized.session_target || 'isolated';
-  const finalKind = normalized.payload_kind || (finalTarget === 'main' ? 'systemEvent' : 'agentTurn');
+  const finalKind = normalized.payload_kind || (finalTarget === 'main' ? 'systemEvent' : finalTarget === 'shell' ? 'shellCommand' : 'agentTurn');
   validateJobPayload(finalTarget, finalKind);
 
   let nextRun;
