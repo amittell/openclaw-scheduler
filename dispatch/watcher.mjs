@@ -27,7 +27,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -477,6 +477,133 @@ function readSessionsStore(agent = 'main') {
 }
 
 /**
+ * Get the mtime (in milliseconds) of a session's JSONL file.
+ *
+ * Unlike sessions.json (which is NOT flushed during active turns), the JSONL
+ * file at ~/.openclaw/agents/<agentDir>/sessions/<sessionId>.jsonl is written
+ * continuously as the session processes messages. Use this as a reliable
+ * activity signal when totalTokens and updatedAt are flat.
+ *
+ * Fix rationale: for spawned subagent sessions, OpenClaw does NOT flush
+ * totalTokens or updatedAt during active turns — so sessions.json stays stale
+ * while the session is actively working. The JSONL mtime advances on every
+ * tool call, model reply, and streaming chunk, making it a much more reliable
+ * liveness signal. Without this, the watcher hits FLAT_WINDOW_MS mid-turn and
+ * marks the session done prematurely, causing zombie sessions with no delivery.
+ *
+ * @param {string} sessionId - Internal session UUID (entry.sessionId from sessions.json)
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @returns {number|null} mtimeMs if file exists, null otherwise
+ */
+function getSessionJsonlMtime(sessionId, agentDir = 'main') {
+  if (!sessionId) return null;
+  try {
+    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+    return statSync(jsonlPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+
+/**
+ * Read the last N non-empty lines from a session's JSONL file and return them
+ * as parsed objects. Returns null if file doesn't exist or is unreadable.
+ *
+ * @param {string} sessionId - Internal session UUID
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @param {number} n - Number of lines to read from end (default: 3)
+ * @returns {Array|null} parsed JSON objects, or null
+ */
+function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
+  if (!sessionId) return null;
+  try {
+    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+    const content = readFileSync(jsonlPath, 'utf-8');
+    return content
+      .split('\n')
+      .filter(l => l.trim())
+      .slice(-n)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if a session is currently mid-turn by inspecting its JSONL tail.
+ * Returns a reason string if mid-turn is detected, null if safe to proceed.
+ *
+ * Mid-turn signals:
+ *   - Last entry is role=assistant with content containing type=tool_use
+ *     → assistant dispatched a tool call, tool hasn't returned yet
+ *   - Last entry is role=user with content containing type=tool_result
+ *     → tool result just delivered, assistant hasn't replied yet
+ *   - JSONL modified within FLAT_WINDOW_MS (combined with above)
+ *
+ * Safe signals (return null):
+ *   - JSONL doesn't exist or hasn't been modified in >FLAT_WINDOW_MS
+ *   - Last assistant entry has type=text only (complete reply)
+ *
+ * @param {string} sessionId - Internal session UUID
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @returns {string|null} reason string if mid-turn, null if safe to proceed
+ */
+function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
+  if (!sessionId) return null;
+
+  const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+  let mtimeMs = null;
+  try {
+    mtimeMs = statSync(jsonlPath).mtimeMs;
+  } catch {
+    return null; // File doesn't exist — session is genuinely gone, safe to proceed
+  }
+
+  // If JSONL hasn't been modified in >FLAT_WINDOW_MS, session isn't actively running
+  if (Date.now() - mtimeMs > FLAT_WINDOW_MS) {
+    return null;
+  }
+
+  const lastLines = readJsonlLastLines(sessionId, agentDir, 3);
+  if (!lastLines || lastLines.length === 0) return null;
+
+  const last = lastLines[lastLines.length - 1];
+
+  // Check last entry: role=assistant with tool_use in content array
+  // (assistant dispatched a tool call, awaiting tool result)
+  if (last?.role === 'assistant') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    const hasToolUse = content.some(c => c?.type === 'tool_use');
+    if (hasToolUse) {
+      const toolName = content.find(c => c?.type === 'tool_use')?.name || 'unknown';
+      return `last assistant entry has tool_use (${toolName}) — awaiting tool result`;
+    }
+    // Top-level type=tool_use (non-array content format)
+    if (last.type === 'tool_use') {
+      return `last entry is tool_use (${last.name || 'unknown'}) — awaiting tool result`;
+    }
+  }
+
+  // Check last entry: role=user with tool_result in content
+  // (tool result just delivered, assistant hasn't replied yet)
+  if (last?.role === 'user') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    if (content.some(c => c?.type === 'tool_result')) {
+      return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+    }
+  }
+
+  // Top-level type=tool_result (alternative format)
+  if (last?.type === 'tool_result') {
+    return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+  }
+
+  return null; // Last assistant entry appears to be a complete text reply — safe to proceed
+}
+
+/**
  * Update labels.json to mark the watched label as done (best-effort, atomic write).
  * Called before exit to ensure labels.json is reconciled even if sync fails.
  */
@@ -859,7 +986,19 @@ let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null
 let baselineTokens = getTokenCount(tokenSessionKey);
 let flatSince = Date.now();
 
+// Capture the internal sessionId (UUID) from sessions.json — this is the filename
+// of the JSONL file, distinct from the sessionKey (agent:main:subagent:UUID).
+// The JSONL is updated continuously during active turns, making it a reliable
+// activity signal when sessions.json totalTokens/updatedAt are stale.
+const _deadlineEntry = getSessionStoreEntry(tokenSessionKey);
+const sessionInternalId = _deadlineEntry?.sessionId || null;
+const sessionAgent = (tokenSessionKey?.split(':')[1]) || 'main';
+let lastJsonlMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
+
 process.stderr.write(`[watcher] deadline hit for ${label} — watching token activity (baseline: ${baselineTokens})\n`);
+if (sessionInternalId) {
+  process.stderr.write(`[watcher] ${label} JSONL tracking: sessionId=${sessionInternalId} mtime=${lastJsonlMtime}\n`);
+}
 
 // If the session already completed (gateway pruned it → null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
@@ -942,6 +1081,88 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
     process.stderr.write(`[watcher] ${label} tokens now available (${cur}), switching to token tracking\n`);
     baselineTokens = cur;
     flatSince = Date.now();
+  }
+
+  // ── JSONL mtime check ─────────────────────────────────────────────────────
+  // Most reliable activity signal for spawned subagent sessions: OpenClaw does
+  // NOT flush totalTokens or updatedAt in sessions.json during active turns, but
+  // the JSONL file IS written continuously. If the mtime advanced since last
+  // check by >1s, the session is actively processing — reset the flat timer.
+  const curJsonlMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
+  if (curJsonlMtime !== null) {
+    if (lastJsonlMtime !== null && curJsonlMtime > lastJsonlMtime + 1000) {
+      process.stderr.write(
+        `[watcher] ${label} JSONL mtime advanced (${lastJsonlMtime}→${curJsonlMtime}ms), ` +
+        `session active — resetting flat timer\n`
+      );
+      lastJsonlMtime = curJsonlMtime;
+      flatSince = Date.now();
+    } else if (lastJsonlMtime === null) {
+      // First observation — just record, don't reset yet
+      process.stderr.write(`[watcher] ${label} JSONL mtime first observation: ${curJsonlMtime}\n`);
+      lastJsonlMtime = curJsonlMtime;
+    }
+  }
+}
+
+// ── Pre-steer JSONL sanity check ──────────────────────────────────────────
+// Before triggering steer/markDoneSync, verify the session is not currently
+// mid-turn. A mid-turn session has an in-flight tool call (JSONL last entry
+// is tool_use or tool_result) — steeling or declaring it done would interrupt
+// active work and produce a partial/zombie result.
+//
+// If mid-turn is detected AND the JSONL was modified recently, extend the flat
+// window one time to let the turn complete naturally.
+if (sessionInternalId) {
+  const midTurnReason = getJsonlMidTurnReason(sessionInternalId, sessionAgent);
+  if (midTurnReason) {
+    process.stderr.write(
+      `[watcher] ${label} pre-steer sanity check: ${midTurnReason} — ` +
+      `session is mid-turn, extending flat window once\n`
+    );
+    notify(`🌶️ Dispatch: [${label}] pre-steer: mid-turn detected (${midTurnReason}), extending wait`);
+    flatSince = Date.now();
+    // Re-enter the flat window loop for one more FLAT_WINDOW_MS extension
+    while (Date.now() - flatSince < FLAT_WINDOW_MS) {
+      await sleep(ACTIVITY_POLL_MS);
+
+      // Check for completion
+      const stExt = dispatch('status', ['--label', label]);
+      if (stExt?.status === 'done') {
+        const rExt = dispatch('result', ['--label', label]);
+        markDoneSync('completed during extended mid-turn wait');
+        deliverResult(label, rExt?.lastReply, stExt.summary);
+        process.exit(0);
+      }
+      const rExt2 = dispatch('result', ['--label', label]);
+      if (rExt2?.lastReply) {
+        markDoneSync('completed during extended mid-turn wait');
+        deliverResult(label, rExt2.lastReply, null);
+        process.exit(0);
+      }
+
+      // JSONL mtime check during extended wait
+      const extMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
+      if (extMtime !== null && lastJsonlMtime !== null && extMtime > lastJsonlMtime + 1000) {
+        process.stderr.write(
+          `[watcher] ${label} JSONL mtime advanced during extended wait (${lastJsonlMtime}→${extMtime}ms), resetting flat timer\n`
+        );
+        lastJsonlMtime = extMtime;
+        flatSince = Date.now();
+      } else if (extMtime !== null) {
+        lastJsonlMtime = extMtime;
+      }
+
+      // Token growth check during extended wait
+      const extTokens = getTokenCount(tokenSessionKey);
+      if (extTokens !== null && baselineTokens !== -1 && extTokens > baselineTokens) {
+        process.stderr.write(`[watcher] ${label} tokens advanced during extended wait, resetting flat timer\n`);
+        baselineTokens = extTokens;
+        flatSince = Date.now();
+      }
+    }
+    // Extended window expired — proceed to steer regardless
+    process.stderr.write(`[watcher] ${label} extended mid-turn wait expired — proceeding to steer\n`);
   }
 }
 
