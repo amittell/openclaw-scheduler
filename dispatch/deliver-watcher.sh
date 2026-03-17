@@ -13,10 +13,8 @@ NODE_BIN="${NODE_BIN:-$(command -v node)}"
 
 # Resolution order:
 #  1) openclaw-scheduler bin (preferred, if in PATH)
-#  2) dispatch/index.mjs directly
-#  3) DISPATCH_CLI env override
-#  4) CHILISAUS_CLI env override (legacy)
-#  5) chilisaus/index.mjs (legacy fallback)
+#  2) DISPATCH_CLI env override
+#  3) dispatch/index.mjs directly
 
 CLI_PATH=""
 USE_BIN=false
@@ -27,10 +25,6 @@ elif [ -n "${DISPATCH_CLI:-}" ] && [ -f "$DISPATCH_CLI" ]; then
   CLI_PATH="$DISPATCH_CLI"
 elif [ -f "$OPENCLAW_HOME/scheduler/dispatch/index.mjs" ]; then
   CLI_PATH="$OPENCLAW_HOME/scheduler/dispatch/index.mjs"
-elif [ -n "${CHILISAUS_CLI:-}" ] && [ -f "$CHILISAUS_CLI" ]; then
-  CLI_PATH="$CHILISAUS_CLI"
-elif [ -f "$OPENCLAW_HOME/chilisaus/index.mjs" ]; then
-  CLI_PATH="$OPENCLAW_HOME/chilisaus/index.mjs"
 else
   echo "[deliver-watcher] dispatch CLI not found" >&2
   exit 1

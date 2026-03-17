@@ -11,7 +11,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 | Requirement | Notes |
 |-------------|-------|
 | macOS or Linux | Tested on macOS arm64 |
-| Node.js ≥ 22 | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
+| Node.js >= 20 | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 
@@ -61,10 +61,10 @@ If `better-sqlite3` fails: `xcode-select --install` (macOS).
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 576 tests
+SCHEDULER_DB=:memory: node test.js  # 753 tests
 ```
 
-**All tests must pass before proceeding.** Total: 576 tests.
+**All tests must pass before proceeding.** Total: 753 tests.
 
 ---
 
@@ -287,7 +287,7 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 576/576
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 753/753
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors

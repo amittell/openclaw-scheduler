@@ -233,7 +233,7 @@ export async function prepareDispatch(job, opts, deps) {
     const approval = createApproval(job.id, run.id, dispatchRecord?.id || null);
     if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'awaiting_approval');
     log('info', `Approval required for ${job.name} -- awaiting operator`, { approvalId: approval.id, runId: run.id });
-    const msg = `\u26a0\ufe0f Job '${job.name}' requires approval.\nApprove: node cli.js jobs approve ${job.id}\nReject: node cli.js jobs reject ${job.id}`;
+    const msg = `\u26a0\ufe0f Job '${job.name}' requires approval.\nApprove: openclaw-scheduler jobs approve ${job.id}\nReject: openclaw-scheduler jobs reject ${job.id}`;
     await handleDelivery(job, msg);
     return null;
   }

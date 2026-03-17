@@ -36,7 +36,7 @@ Use this path only if you can't use WSL2 — for example, if OpenClaw itself is 
 
 | Requirement | Install |
 |-------------|---------|
-| Node.js ≥ 22 | [nodejs.org](https://nodejs.org) — use the LTS installer |
+| Node.js >= 20 | [nodejs.org](https://nodejs.org) -- use the LTS installer |
 | pm2 | `npm install -g pm2` |
 | OpenClaw gateway | Must be running with a valid auth token |
 | Git for Windows | [git-scm.com](https://git-scm.com) or use GitHub Desktop |
@@ -99,7 +99,7 @@ npm install --build-from-source
 $env:SCHEDULER_DB=":memory:"; node test.js
 ```
 
-All 576 tests must pass before continuing.
+All 753 tests must pass before continuing.
 
 ---
 
@@ -287,7 +287,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 576/576
+- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 753/753
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `pm2 status` → openclaw-scheduler is `online`
 - [ ] PM2 log has startup lines, no errors

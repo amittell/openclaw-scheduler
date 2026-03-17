@@ -121,7 +121,7 @@ try {
   if (ran) {
     ok(`Migrations applied → ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date (schema v14) → ${schedulerDbPath}`);
+    ok(`DB already up to date (schema v18) → ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);

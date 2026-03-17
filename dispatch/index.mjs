@@ -22,7 +22,7 @@
  *   1  — stuck runs found, or hard error
  *   2  — argument error
  *
- * Usage: node index.mjs <subcommand> [options]
+ * Usage: openclaw-scheduler <subcommand> [options]
  */
 
 import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync } from 'fs';
@@ -36,12 +36,13 @@ import { onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
+const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 
 // ── Invocation Directory ─────────────────────────────────────
-// When invoked via symlink (e.g. chilisaus/index.mjs → dispatch/index.mjs),
+// When invoked via symlink (e.g. my-brand/index.mjs -> dispatch/index.mjs),
 // __dirname resolves to the real path (dispatch/). INVOKE_DIR resolves to the
 // symlink's directory so config.json, labels.json, and self-references use the
-// branded wrapper's directory instead of the shared module's.
+// wrapper's directory instead of the shared module's.
 
 const INVOKE_DIR = (() => {
   try {
@@ -198,7 +199,7 @@ function _gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opt
     const body = JSON.stringify({ tool, args, sessionKey });
     const raw = execFileSync('curl', [
       '-s', '-X', 'POST',
-      'http://127.0.0.1:18789/tools/invoke',
+      `${GATEWAY_URL}/tools/invoke`,
       '-H', 'Content-Type: application/json',
       '-H', `Authorization: Bearer ${GATEWAY_TOKEN}`,
       '-d', body,
@@ -429,7 +430,7 @@ function disarmWatchdog(label) {
   const entry = getLabel(label);
   if (!entry?.watchdogJobId) return;
   try {
-    const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
+    const schedulerCli = join(__dirname, '..', 'cli.js');
     execFileSync(process.execPath, [schedulerCli, 'jobs', 'disable', entry.watchdogJobId], {
       encoding: 'utf-8',
       timeout:  5000,
@@ -573,7 +574,7 @@ async function cmdEnqueue(flags) {
     parts.push(`---`);
     parts.push(`CHECK_IN: To report progress, use curl:`);
     parts.push(`GW_TOKEN=$(python3 -c "import json; print(json.load(open('` + configPath + `'))['gateway']['auth']['token'])")`);
-    parts.push(`curl -s -X POST http://127.0.0.1:18789/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
+    parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${deliverChannel || 'telegram'}","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);
     parts.push(``);
@@ -653,7 +654,7 @@ async function cmdEnqueue(flags) {
     // ── Send "Starting" notification via gateway HTTP API ─────
     if (deliverTo && GATEWAY_TOKEN) {
       try {
-        await fetch('http://127.0.0.1:18789/tools/invoke', {
+        await fetch(`${GATEWAY_URL}/tools/invoke`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -705,7 +706,7 @@ async function cmdEnqueue(flags) {
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
           run_now:                  true,
         });
-        const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
+        const schedulerCli = join(__dirname, '..', 'cli.js');
         execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', jobSpec], {
           encoding: 'utf-8',
           timeout:  10000,
@@ -721,11 +722,11 @@ async function cmdEnqueue(flags) {
     // ── Register watchdog monitoring job ─────────────────────
     let watchdogJobOk = false;
     let watchdogJobId = null;
-    if (monitorEnabled) {
+    if (monitorEnabled && deliverTo) {
       try {
         const checkCmd = `'${process.execPath}' '${join(__dirname, 'index.mjs')}' stuck --label '${label.replace(/'/g, "'\\''")}' --threshold-min ${monitorTimeout}`;
         const alertChannel = deliverChannel || 'telegram';
-        const alertTarget  = deliverTo || '484946046';
+        const alertTarget  = deliverTo;
         const watchdogSpec = JSON.stringify({
           name:                     `watchdog:${label}`,
           job_type:                 'watchdog',
@@ -742,7 +743,7 @@ async function cmdEnqueue(flags) {
           watchdog_self_destruct:   1,
           watchdog_started_at:      new Date().toISOString(),
         });
-        const schedulerCli = join(HOME_DIR, '.openclaw', 'scheduler', 'cli.js');
+        const schedulerCli = join(__dirname, '..', 'cli.js');
         const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
           encoding: 'utf-8',
           timeout:  10000,
@@ -784,6 +785,7 @@ async function cmdEnqueue(flags) {
         jobId:    watchdogJobId,
         interval: monitorInterval,
         timeout:  monitorTimeout,
+        ...(monitorEnabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
       } : null,
       message:    schedulerWatcherOk
         ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
@@ -1454,7 +1456,7 @@ function usage() {
   process.stdout.write(`
 ${BRAND} 🌶️ — sub-agent dispatch CLI (native gateway API)
 
-Usage: node index.mjs <subcommand> [flags]
+Usage: openclaw-scheduler <subcommand> [flags]
 
 Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]

@@ -95,7 +95,7 @@ function saveState(state) {
  */
 function getDispatchLiveness(label) {
   try {
-    const result = execFileSync('node', [DISPATCH_CLI, 'status', '--label', label], {
+    const result = execFileSync(process.execPath, [DISPATCH_CLI, 'status', '--label', label], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -122,11 +122,11 @@ function getDispatchLiveness(label) {
 function steerSession(label, staleMins) {
   const msg = [
     `[Auto-steer] You have been silent for ${staleMins} minutes.`,
-    `Please send a check-in: node ~/.openclaw/workspace/scripts/agent-checkin.mjs 'Progress: <what you are doing>'`,
-    `— then continue. If done: node ~/.openclaw/workspace/scripts/agent-checkin.mjs 'Done: <summary>'`,
+    `Please reply with a brief progress update, then continue your task.`,
+    `If you are done, call the done signal as instructed in your prompt.`,
   ].join(' ');
   try {
-    execFileSync('node', [DISPATCH_CLI, 'send', '--label', label, '--message', msg], {
+    execFileSync(process.execPath, [DISPATCH_CLI, 'send', '--label', label, '--message', msg], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],

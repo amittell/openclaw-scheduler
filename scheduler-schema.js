@@ -6,7 +6,7 @@ export const SCHEDULER_SCHEMAS = {
       name: { type: 'string', maxLength: 200 },
       enabled: { type: 'boolean', default: true },
       schedule_cron: { type: 'string', requiredFor: 'root jobs' },
-      schedule_tz: { type: 'string', default: 'America/New_York' },
+      schedule_tz: { type: 'string', default: 'UTC' },
       session_target: { type: 'string', enum: ['main', 'isolated', 'shell'], default: 'isolated' },
       payload_kind: { type: 'string', enum: ['systemEvent', 'agentTurn', 'shellCommand'] },
       payload_message: { type: 'string', maxLength: 100000 },

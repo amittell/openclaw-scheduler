@@ -17,12 +17,10 @@ function commandExists(cmd) {
 /**
  * Resolve the dispatch CLI path with backward-compatible fallbacks.
  * Priority:
- *  0) openclaw-scheduler bin (in PATH) — preferred public interface
+ *  0) openclaw-scheduler bin (in PATH) -- preferred public interface
  *  1) DISPATCH_CLI env override
- *  2) CHILISAUS_CLI (legacy override)
- *  3) $OPENCLAW_HOME/scheduler/dispatch/index.mjs
- *  4) $OPENCLAW_HOME/dispatch/index.mjs
- *  5) $OPENCLAW_HOME/chilisaus/index.mjs (legacy fallback)
+ *  2) $OPENCLAW_HOME/scheduler/dispatch/index.mjs
+ *  3) $OPENCLAW_HOME/dispatch/index.mjs
  *
  * Returns { path, useBin } where useBin=true means call via `openclaw-scheduler`
  * directly rather than `node <path>`.
@@ -32,15 +30,13 @@ export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
   const openclawHome = env.OPENCLAW_HOME
     || (homeDir ? join(homeDir, '.openclaw') : '.openclaw');
 
-  // Explicit env overrides always win
+  // Explicit env override always wins
   if (env.DISPATCH_CLI && exists(env.DISPATCH_CLI)) return env.DISPATCH_CLI;
-  if (env.CHILISAUS_CLI && exists(env.CHILISAUS_CLI)) return env.CHILISAUS_CLI;
 
   // Well-known paths in priority order
   const candidates = [
     join(openclawHome, 'scheduler', 'dispatch', 'index.mjs'),
     join(openclawHome, 'dispatch', 'index.mjs'),
-    join(openclawHome, 'chilisaus', 'index.mjs'),
   ];
   const found = candidates.find(p => exists(p));
   if (found) return found;
@@ -57,7 +53,7 @@ export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
  */
 export function resolveDispatchLabel(jobName, labels = {}) {
   if (labels[jobName]) return jobName;
-  for (const prefix of ['dispatch-deliver:', 'chilisaus-deliver:']) {
+  for (const prefix of ['dispatch-deliver:']) {
     if (jobName.startsWith(prefix)) {
       const suffix = jobName.slice(prefix.length);
       if (labels[suffix]) return suffix;

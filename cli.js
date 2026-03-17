@@ -19,7 +19,7 @@ const [command, sub, ...args] = cliArgs;
 
 function usage() {
   console.log(`
-Usage: node cli.js <command> [subcommand] [options]
+Usage: openclaw-scheduler <command> [subcommand] [options]
 
 Global:
   --json                             Emit machine-readable JSON
@@ -226,7 +226,8 @@ switch (command) {
         if (inIdx >= 0) { skipArgs.add(args[inIdx]); skipArgs.add(args[inIdx + 1]); }
         const payload = args.find(a => !skipArgs.has(a));
         if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]');
-        const spec = JSON.parse(payload);
+        let spec;
+        try { spec = JSON.parse(payload); } catch { fail('Invalid JSON. Usage: jobs add \'{"name":"..."}\''); }
         if (profileValue !== undefined) spec.auth_profile = profileValue;
 
         // One-shot scheduling via --at or --in
@@ -274,7 +275,8 @@ switch (command) {
       }
       case 'validate': {
         if (!args[0]) fail('Usage: jobs validate <json>');
-        const spec = JSON.parse(args[0]);
+        let spec;
+        try { spec = JSON.parse(args[0]); } catch { fail('Invalid JSON. Usage: jobs validate \'{"name":"..."}\''); }
         const normalized = validateJobSpec(spec, null, 'create');
         emit({ ok: true, valid: true, normalized });
         break;
@@ -298,7 +300,8 @@ switch (command) {
         const updateArgs = args.filter(a => !updateFilterArgs.has(a));
         const current = getJob(updateArgs[0]);
         if (!current) fail(`Job not found: ${updateArgs[0]}`);
-        const patch = JSON.parse(updateArgs[1]);
+        let patch;
+        try { patch = JSON.parse(updateArgs[1]); } catch { fail('Invalid JSON. Usage: jobs update <id> \'{"key":"value"}\''); }
         if (updateProfileValue !== undefined) patch.auth_profile = updateProfileValue;
         const normalized = validateJobSpec(patch, current, 'update');
         if (dryRun) {
@@ -415,13 +418,13 @@ switch (command) {
       case 'send': {
         const [from, to, ...bodyParts] = args;
         const msg = sendMessage({ from_agent: from, to_agent: to, body: bodyParts.join(' ') });
-        console.log('Sent:', fmt(msg));
+        emit({ ok: true, message: msg }, `Sent: ${fmt(msg)}`);
         break;
       }
       case 'inbox': {
         const msgs = getInbox(args[0], { limit: parseInt(args[1] || '20', 10), includeDelivered: true });
-        if (msgs.length === 0) { console.log('Inbox empty'); break; }
-        console.table(msgs.map(m => ({
+        if (msgs.length === 0) { emit([], 'Inbox empty'); break; }
+        const rows = msgs.map(m => ({
           id: m.id.slice(0, 8),
           from: m.from_agent,
           kind: m.kind,
@@ -429,18 +432,19 @@ switch (command) {
           status: m.status,
           priority: m.priority,
           created: m.created_at,
-        })));
+        }));
+        emit(jsonMode ? msgs : rows, () => console.table(rows));
         break;
       }
       case 'team-inbox': {
         const teamId = args[0];
-        if (!teamId) { console.error('Usage: msg team-inbox <team-id> [limit] [member-id] [task-id]'); process.exit(1); }
+        if (!teamId) fail('Usage: msg team-inbox <team-id> [limit] [member-id] [task-id]');
         const limit = parseInt(args[1] || '20', 10);
         const memberId = args[2] || null;
         const taskId = args[3] || null;
         const msgs = getTeamMessages(teamId, { limit, memberId, taskId, includeRead: true });
-        if (msgs.length === 0) { console.log('Team inbox empty'); break; }
-        console.table(msgs.map(m => ({
+        if (msgs.length === 0) { emit([], 'Team inbox empty'); break; }
+        const rows = msgs.map(m => ({
           id: m.id.slice(0, 8),
           from: m.from_agent,
           to: m.to_agent,
@@ -453,62 +457,65 @@ switch (command) {
           attempts: m.delivery_attempts || 0,
           lastError: m.last_error || '-',
           created: m.created_at,
-        })));
+        }));
+        emit(jsonMode ? msgs : rows, () => console.table(rows));
         break;
       }
       case 'outbox': {
         const msgs = getOutbox(args[0], parseInt(args[1] || '20', 10));
-        if (msgs.length === 0) { console.log('Outbox empty'); break; }
-        console.table(msgs.map(m => ({
+        if (msgs.length === 0) { emit([], 'Outbox empty'); break; }
+        const rows = msgs.map(m => ({
           id: m.id.slice(0, 8),
           to: m.to_agent,
           kind: m.kind,
           subject: m.subject?.slice(0, 40),
           status: m.status,
           created: m.created_at,
-        })));
+        }));
+        emit(jsonMode ? msgs : rows, () => console.table(rows));
         break;
       }
       case 'thread': {
         const msgs = getThread(args[0]);
-        for (const m of msgs) {
-          console.log(`[${m.from_agent} → ${m.to_agent}] (${m.status}) ${m.created_at}`);
-          console.log(`  ${m.body.slice(0, 200)}`);
-          console.log();
-        }
+        emit(msgs, () => {
+          for (const m of msgs) {
+            console.log(`[${m.from_agent} → ${m.to_agent}] (${m.status}) ${m.created_at}`);
+            console.log(`  ${m.body.slice(0, 200)}`);
+            console.log();
+          }
+        });
         break;
       }
       case 'ack': {
-        if (!args[0]) { console.error('Usage: msg ack <message-id> [actor] [note]'); process.exit(1); }
+        if (!args[0]) fail('Usage: msg ack <message-id> [actor] [note]');
         const actor = args[1] || 'operator';
         const detail = args.slice(2).join(' ') || null;
         const msg = ackMessage(args[0], actor, detail);
-        if (!msg) { console.error('Message not found:', args[0]); process.exit(1); }
-        console.log('Acknowledged:', fmt({
-          id: msg.id,
-          status: msg.status,
-          ack_at: msg.ack_at,
-          read_at: msg.read_at,
-        }));
+        if (!msg) fail('Message not found: ' + args[0]);
+        emit(
+          { ok: true, id: msg.id, status: msg.status, ack_at: msg.ack_at, read_at: msg.read_at },
+          `Acknowledged: ${fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at, read_at: msg.read_at })}`
+        );
         break;
       }
       case 'receipts': {
-        if (!args[0]) { console.error('Usage: msg receipts <message-id> [limit]'); process.exit(1); }
-        const rows = listMessageReceipts(args[0], parseInt(args[1] || '20', 10));
-        if (rows.length === 0) { console.log('No receipts for message'); break; }
-        console.table(rows.map(r => ({
+        if (!args[0]) fail('Usage: msg receipts <message-id> [limit]');
+        const receipts = listMessageReceipts(args[0], parseInt(args[1] || '20', 10));
+        if (receipts.length === 0) { emit([], 'No receipts for message'); break; }
+        const rows = receipts.map(r => ({
           id: r.id.slice(0, 8),
           type: r.event_type,
           attempt: r.attempt ?? '-',
           actor: r.actor || '-',
           detail: (r.detail || '').slice(0, 80),
           at: r.created_at,
-        })));
+        }));
+        emit(jsonMode ? receipts : rows, () => console.table(rows));
         break;
       }
-      case 'read': markRead(args[0]); console.log('Marked read'); break;
-      case 'readall': { const r = markAllRead(args[0]); console.log(`Marked ${r.changes} read`); break; }
-      case 'unread': console.log(`Unread: ${getUnreadCount(args[0])}`); break;
+      case 'read': markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break;
+      case 'readall': { const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
+      case 'unread': { const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
       default: usage();
     }
     break;
@@ -523,9 +530,8 @@ switch (command) {
         const msgs = getInbox(agent, { limit, includeDelivered: true });
         const delivered = msgs.filter(m => m.status === 'delivered');
         const unread = getUnreadCount(agent);
-        console.log(`\nQueue for agent: ${agent} | ${unread} pending | ${delivered.length} delivered (showing last ${limit})\n`);
-        if (msgs.length === 0) { console.log('  Queue empty'); break; }
-        console.table(msgs.map(m => ({
+        if (msgs.length === 0) { emit({ agent, pending: unread, delivered: 0, messages: [] }, 'Queue empty'); break; }
+        const rows = msgs.map(m => ({
           id: m.id.slice(0, 8),
           from: m.from_agent,
           kind: m.kind,
@@ -533,17 +539,21 @@ switch (command) {
           status: m.status,
           priority: m.priority,
           created: m.created_at,
-        })));
+        }));
+        emit(jsonMode ? { agent, pending: unread, delivered: delivered.length, messages: msgs } : rows, () => {
+          console.log(`\nQueue for agent: ${agent} | ${unread} pending | ${delivered.length} delivered (showing last ${limit})\n`);
+          console.table(rows);
+        });
         break;
       }
       case 'clear': {
         const r = markAllRead(args[0] || 'main');
-        console.log(`Cleared ${r.changes} messages`);
+        emit({ ok: true, agent: args[0] || 'main', changes: r.changes }, `Cleared ${r.changes} messages`);
         break;
       }
       case 'prune': {
         pruneMessages();
-        console.log('Pruned old messages (read/delivered >3d, system >3d, expired/failed >30d)');
+        emit({ ok: true, pruned: true }, 'Pruned old messages (read/delivered >3d, system >3d, expired/failed >30d)');
         break;
       }
       default: usage();
@@ -581,8 +591,8 @@ switch (command) {
       case 'list': {
         const { listActiveTaskGroups, getTaskGroupStatus } = await import('./task-tracker.js');
         const groups = listActiveTaskGroups();
-        if (groups.length === 0) { console.log('No active task groups'); break; }
-        console.table(groups.map(g => {
+        if (groups.length === 0) { emit([], 'No active task groups'); break; }
+        const rows = groups.map(g => {
           const status = getTaskGroupStatus(g.id);
           const agents = JSON.parse(g.expected_agents);
           return {
@@ -593,47 +603,53 @@ switch (command) {
             elapsed: `${status.elapsed}s`,
             timeout: `${g.timeout_s}s`,
           };
-        }));
+        });
+        emit(jsonMode ? groups : rows, () => console.table(rows));
         break;
       }
       case 'status': {
         const { getTaskGroupStatus } = await import('./task-tracker.js');
         const status = getTaskGroupStatus(args[0]);
-        if (!status) { console.error('Task group not found:', args[0]); process.exit(1); }
-        console.log(`\nTask Group: ${status.name}`);
-        console.log(`Status:     ${status.status}`);
-        console.log(`Elapsed:    ${status.elapsed}s / ${status.remaining_timeout + status.elapsed}s timeout`);
-        console.log(`\nAgents:`);
-        for (const a of status.agents) {
-          const icon = a.status === 'completed' ? '✅' : a.status === 'failed' ? '❌' : a.status === 'dead' ? '💀' : a.status === 'running' ? '🔄' : '⬜';
-          const dur = a.duration != null ? ` (${a.duration}s)` : '';
-          const detail = a.exit_message || a.error || '';
-          console.log(`  ${icon} ${a.label}: ${a.status}${dur}${detail ? ' — ' + detail : ''}`);
-        }
-        if (status.summary) {
-          console.log(`\nSummary:\n${status.summary}`);
-        }
+        if (!status) fail('Task group not found: ' + args[0]);
+        emit(status, () => {
+          console.log(`\nTask Group: ${status.name}`);
+          console.log(`Status:     ${status.status}`);
+          console.log(`Elapsed:    ${status.elapsed}s / ${status.remaining_timeout + status.elapsed}s timeout`);
+          console.log(`\nAgents:`);
+          for (const a of status.agents) {
+            const icon = a.status === 'completed' ? '✅' : a.status === 'failed' ? '❌' : a.status === 'dead' ? '💀' : a.status === 'running' ? '🔄' : '⬜';
+            const dur = a.duration != null ? ` (${a.duration}s)` : '';
+            const detail = a.exit_message || a.error || '';
+            console.log(`  ${icon} ${a.label}: ${a.status}${dur}${detail ? ' — ' + detail : ''}`);
+          }
+          if (status.summary) {
+            console.log(`\nSummary:\n${status.summary}`);
+          }
+        });
         break;
       }
       case 'create': {
         const { createTaskGroup } = await import('./task-tracker.js');
-        const group = createTaskGroup(JSON.parse(args[0]));
-        console.log('Created:', fmt(group));
+        let opts;
+        try { opts = JSON.parse(args[0]); } catch { fail('Invalid JSON. Usage: tasks create \'{"name":"..."}\''); }
+        const group = createTaskGroup(opts);
+        emit({ ok: true, group }, `Created: ${fmt(group)}`);
         break;
       }
       case 'history': {
         const limit = parseInt(args[0] || '10', 10);
-        const rows = getDb().prepare(
+        const groups = getDb().prepare(
           "SELECT * FROM task_tracker WHERE status != 'active' ORDER BY completed_at DESC LIMIT ?"
         ).all(limit);
-        if (rows.length === 0) { console.log('No completed task groups'); break; }
-        console.table(rows.map(g => ({
+        if (groups.length === 0) { emit([], 'No completed task groups'); break; }
+        const rows = groups.map(g => ({
           id: g.id.slice(0, 8) + '…',
           name: g.name,
           status: g.status,
           completed: g.completed_at,
           created_by: g.created_by,
-        })));
+        }));
+        emit(jsonMode ? groups : rows, () => console.table(rows));
         break;
       }
 
@@ -646,22 +662,20 @@ switch (command) {
         const exitMsg = msgParts.join(' ') || undefined;
 
         if (!trackerId || !agentLabel || !status) {
-          console.error('Usage: tasks heartbeat <trackerId> <agentLabel> running|completed|failed [message]');
-          process.exit(1);
+          fail('Usage: tasks heartbeat <trackerId> <agentLabel> running|completed|failed [message]');
         }
 
         if (status === 'running') {
           agentStarted(trackerId, agentLabel);
-          console.log(`✅ Heartbeat recorded: ${agentLabel} → running`);
+          emit({ ok: true, tracker_id: trackerId, agent: agentLabel, status: 'running' }, `Heartbeat recorded: ${agentLabel} -> running`);
         } else if (status === 'completed') {
           agentCompleted(trackerId, agentLabel, exitMsg);
-          console.log(`✅ Heartbeat recorded: ${agentLabel} → completed${exitMsg ? ` (${exitMsg})` : ''}`);
+          emit({ ok: true, tracker_id: trackerId, agent: agentLabel, status: 'completed', message: exitMsg }, `Heartbeat recorded: ${agentLabel} -> completed${exitMsg ? ` (${exitMsg})` : ''}`);
         } else if (status === 'failed') {
           agentFailed(trackerId, agentLabel, exitMsg || 'failed');
-          console.log(`✅ Heartbeat recorded: ${agentLabel} → failed${exitMsg ? ` (${exitMsg})` : ''}`);
+          emit({ ok: true, tracker_id: trackerId, agent: agentLabel, status: 'failed', message: exitMsg }, `Heartbeat recorded: ${agentLabel} -> failed${exitMsg ? ` (${exitMsg})` : ''}`);
         } else {
-          console.error(`Unknown status: "${status}". Valid values: running | completed | failed`);
-          process.exit(1);
+          fail(`Unknown status: "${status}". Valid values: running | completed | failed`);
         }
         break;
       }
@@ -675,12 +689,10 @@ switch (command) {
         const { registerAgentSession } = await import('./task-tracker.js');
         const [trackerId, agentLabel, sessionKey] = args;
         if (!trackerId || !agentLabel || !sessionKey) {
-          console.error('Usage: tasks register-session <trackerId> <agentLabel> <sessionKey>');
-          console.error('Example: tasks register-session abc-123 writer agent:main:subagent:xyz-456');
-          process.exit(1);
+          fail('Usage: tasks register-session <trackerId> <agentLabel> <sessionKey>');
         }
         registerAgentSession(trackerId, agentLabel, sessionKey);
-        console.log(`✅ Session registered: ${agentLabel} → ${sessionKey}`);
+        emit({ ok: true, tracker_id: trackerId, agent: agentLabel, session_key: sessionKey }, `Session registered: ${agentLabel} -> ${sessionKey}`);
         break;
       }
 
@@ -716,10 +728,10 @@ switch (command) {
     const { listIdempotencyForJob, getIdempotencyEntry, releaseIdempotencyKey, forcePruneIdempotency } = await import('./idempotency.js');
     switch (sub) {
       case 'status': {
-        if (!args[0]) { console.error('Usage: idem status <job-id>'); process.exit(1); }
+        if (!args[0]) fail('Usage: idem status <job-id>');
         const entries = listIdempotencyForJob(args[0]);
-        if (entries.length === 0) { console.log('No idempotency entries for this job'); break; }
-        console.table(entries.map(e => ({
+        if (entries.length === 0) { emit([], 'No idempotency entries for this job'); break; }
+        const rows = entries.map(e => ({
           key: e.key.slice(0, 12) + '…',
           run: e.run_id.slice(0, 8) + '…',
           status: e.status,
@@ -727,28 +739,29 @@ switch (command) {
           released: e.released_at || '-',
           expires: e.expires_at,
           hash: e.result_hash || '-',
-        })));
+        }));
+        emit(jsonMode ? entries : rows, () => console.table(rows));
         break;
       }
       case 'check': {
-        if (!args[0]) { console.error('Usage: idem check <key>'); process.exit(1); }
+        if (!args[0]) fail('Usage: idem check <key>');
         const entry = getIdempotencyEntry(args[0]);
-        if (!entry) { console.log('Key not found in ledger'); break; }
-        console.log(fmt(entry));
+        if (!entry) { emit({ found: false, key: args[0] }, 'Key not found in ledger'); break; }
+        emit(entry);
         break;
       }
       case 'release': {
-        if (!args[0]) { console.error('Usage: idem release <key>'); process.exit(1); }
+        if (!args[0]) fail('Usage: idem release <key>');
         const before = getIdempotencyEntry(args[0]);
-        if (!before) { console.error('Key not found in ledger'); process.exit(1); }
-        if (before.status === 'released') { console.log('Key already released'); break; }
+        if (!before) fail('Key not found in ledger');
+        if (before.status === 'released') { emit({ ok: true, key: args[0], already_released: true }, 'Key already released'); break; }
         releaseIdempotencyKey(args[0]);
-        console.log(`Released idempotency key: ${args[0].slice(0, 12)}…`);
+        emit({ ok: true, key: args[0], released: true }, `Released idempotency key: ${args[0].slice(0, 12)}…`);
         break;
       }
       case 'prune': {
         const result = forcePruneIdempotency();
-        console.log(`Pruned ${result} expired idempotency entries`);
+        emit({ ok: true, pruned: result }, `Pruned ${result} expired idempotency entries`);
         break;
       }
       default: usage();
@@ -766,14 +779,14 @@ switch (command) {
     switch (sub) {
       case 'map': {
         const mapped = mapTeamMessages(parseInt(args[0] || '200', 10));
-        console.log(`Mapped ${mapped} team message(s)`);
+        emit({ ok: true, mapped }, `Mapped ${mapped} team message(s)`);
         break;
       }
       case 'tasks': {
-        if (!args[0]) { console.error('Usage: team tasks <team-id> [limit]'); process.exit(1); }
-        const rows = listTeamTasks(args[0], parseInt(args[1] || '50', 10));
-        if (rows.length === 0) { console.log('No team tasks'); break; }
-        console.table(rows.map(t => ({
+        if (!args[0]) fail('Usage: team tasks <team-id> [limit]');
+        const tasks = listTeamTasks(args[0], parseInt(args[1] || '50', 10));
+        if (tasks.length === 0) { emit([], 'No team tasks'); break; }
+        const rows = tasks.map(t => ({
           team: t.team_id,
           task: t.id,
           member: t.member_id || '-',
@@ -782,17 +795,18 @@ switch (command) {
           gateStatus: t.gate_status || '-',
           updated: t.updated_at,
           completed: t.completed_at || '-',
-        })));
+        }));
+        emit(jsonMode ? tasks : rows, () => console.table(rows));
         break;
       }
       case 'events': {
-        if (!args[0]) { console.error('Usage: team events <team-id> [limit] [task-id]'); process.exit(1); }
+        if (!args[0]) fail('Usage: team events <team-id> [limit] [task-id]');
         const teamId = args[0];
         const limit = parseInt(args[1] || '50', 10);
         const taskId = args[2] || null;
-        const rows = listTeamMailboxEvents(teamId, { limit, taskId });
-        if (rows.length === 0) { console.log('No team events'); break; }
-        console.table(rows.map(e => ({
+        const events = listTeamMailboxEvents(teamId, { limit, taskId });
+        if (events.length === 0) { emit([], 'No team events'); break; }
+        const rows = events.map(e => ({
           id: e.id.slice(0, 8),
           team: e.team_id,
           member: e.member_id || '-',
@@ -800,35 +814,38 @@ switch (command) {
           message: e.message_id ? e.message_id.slice(0, 8) : '-',
           type: e.event_type,
           at: e.created_at,
-        })));
+        }));
+        emit(jsonMode ? events : rows, () => console.table(rows));
         break;
       }
       case 'gate': {
         if (!args[0] || !args[1] || !args[2]) {
-          console.error('Usage: team gate <team-id> <task-id> <members-json> [timeout-s]');
-          console.error('Example: team gate core-team deploy-001 "[\\"writer\\",\\"reviewer\\"]" 900');
-          process.exit(1);
+          fail('Usage: team gate <team-id> <task-id> <members-json> [timeout-s]\nExample: team gate core-team deploy-001 "[\\"writer\\",\\"reviewer\\"]" 900');
         }
         const teamId = args[0];
         const taskId = args[1];
-        const members = JSON.parse(args[2]);
+        let members;
+        try { members = JSON.parse(args[2]); } catch { fail('Invalid JSON for members list. Example: \'["writer","reviewer"]\''); }
         const timeoutS = parseInt(args[3] || '600', 10);
         const gate = createTeamTaskGate({ teamId, taskId, expectedMembers: members, timeoutS });
-        console.log('Gate opened:', fmt(gate));
+        emit({ ok: true, gate }, `Gate opened: ${fmt(gate)}`);
         break;
       }
       case 'check-gates': {
         const result = checkTeamTaskGates(parseInt(args[0] || '100', 10));
-        console.log(fmt(result));
+        emit(result);
         break;
       }
       case 'ack': {
-        if (!args[0]) { console.error('Usage: team ack <message-id> [actor] [note]'); process.exit(1); }
+        if (!args[0]) fail('Usage: team ack <message-id> [actor] [note]');
         const actor = args[1] || 'team-member';
         const detail = args.slice(2).join(' ') || null;
         const msg = ackTeamMessage(args[0], actor, detail);
-        if (!msg) { console.error('Team message not found:', args[0]); process.exit(1); }
-        console.log('Team ACK:', fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at }));
+        if (!msg) fail('Team message not found: ' + args[0]);
+        emit(
+          { ok: true, id: msg.id, status: msg.status, ack_at: msg.ack_at },
+          `Team ACK: ${fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at })}`
+        );
         break;
       }
       default: usage();
@@ -855,8 +872,7 @@ switch (command) {
       case 'add': {
         const [name, channel, target, ...descParts] = args;
         if (!name || !channel || !target) {
-          console.error('Usage: alias add <name> <channel> <target> [description]');
-          process.exit(1);
+          fail('Usage: alias add <name> <channel> <target> [description]');
         }
         const description = descParts.length > 0 ? descParts.join(' ') : null;
         db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
@@ -970,6 +986,9 @@ switch (command) {
   }
 
   default:
+    if (command) {
+      fail(`Unknown command: ${command}. Run without arguments for usage.`);
+    }
     usage();
-    process.exit(command ? 1 : 0);
+    process.exit(0);
 }

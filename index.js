@@ -10,4 +10,7 @@ export * as promptContext from './prompt-context.js';
 export * as retrieval from './retrieval.js';
 export * as runs from './runs.js';
 export * as shellResults from './shell-result.js';
+export * as idempotency from './idempotency.js';
+export * as taskTracker from './task-tracker.js';
+export * as teamAdapter from './team-adapter.js';
 export { SCHEDULER_SCHEMAS } from './scheduler-schema.js';

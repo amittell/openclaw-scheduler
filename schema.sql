@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   schedule_kind   TEXT NOT NULL DEFAULT 'cron',          -- 'cron' | 'at'
   schedule_at     TEXT DEFAULT NULL,                     -- ISO-8601 UTC timestamp, only for kind='at'
   schedule_cron   TEXT,                                  -- NULL allowed for at-jobs (use sentinel '0 0 31 2 *' on old DBs)
-  schedule_tz     TEXT NOT NULL DEFAULT 'America/New_York',
+  schedule_tz     TEXT NOT NULL DEFAULT 'UTC',
   
   -- Execution
   session_target  TEXT NOT NULL DEFAULT 'isolated',  -- 'main' | 'isolated' | 'shell'
@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS agents (
   session_key     TEXT,                               -- current active session key
   capabilities    TEXT,                               -- JSON array of capability tags
   delivery_channel TEXT,                              -- e.g. 'telegram'
-  delivery_to      TEXT,                              -- e.g. '484946046'
+  delivery_to      TEXT,                              -- e.g. '<telegram-user-id>'
   brand_name       TEXT,                              -- display name for notifications
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -251,9 +251,12 @@ CREATE TABLE IF NOT EXISTS delivery_aliases (
   created_at  TEXT DEFAULT (datetime('now'))
 );
 
+-- Example delivery aliases -- replace targets with real Telegram chat/user IDs.
+-- These placeholder IDs are non-functional; run `openclaw-scheduler aliases update`
+-- or INSERT your own rows to configure delivery routing.
 INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VALUES
-  ('team_room', 'telegram', '-1000000001', 'Team room'),
-  ('owner_dm',  'telegram', '1000000001',  'Owner DM');
+  ('team_room', 'telegram', '-1000000001', 'Team room (placeholder -- replace with real chat ID)'),
+  ('owner_dm',  'telegram', '1000000001',  'Owner DM (placeholder -- replace with real user ID)');
 
 -- ============================================================
 -- APPROVALS: HITL approval gates (v5)
@@ -424,7 +427,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (18);
 -- SEED JOBS
 -- ============================================================
 
--- Dispatch 529 Recovery: safety net — scans for 529-failed sessions and re-enqueues
+-- Dispatch 529 Recovery: safety net -- scans for 529-failed sessions and re-enqueues.
 INSERT OR IGNORE INTO jobs (
   id, name, enabled,
   schedule_cron, schedule_tz,

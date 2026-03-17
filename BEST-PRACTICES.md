@@ -64,7 +64,7 @@ Use `shell` when:
 **Delivery with shell jobs:**
 - `delivery_mode: "announce"` — sends output only on non-zero exit (perfect for failure alerts)
 - `delivery_mode: "announce-always"` — sends output every time
-- `delivery_mode: "none"` — background, check runs via `node cli.js runs list`
+- `delivery_mode: "none"` — background, check runs via `openclaw-scheduler runs list`
 
 **Shell jobs work great as chain parents too** — a shell build job can trigger an isolated deploy job on success.
 
@@ -213,7 +213,7 @@ Use `main` sparingly. It injects directly into your active agent session — the
 
 | Mode | Best for |
 |------|----------|
-| `none` | Background jobs — check results via `node cli.js runs list` |
+| `none` | Background jobs — check results via `openclaw-scheduler runs list` |
 | `announce` | LLM jobs with important output; shell jobs that should alert on failure |
 | `announce-always` | Monitoring/audit jobs where you want every result |
 
@@ -381,7 +381,7 @@ The handler job reads its inbox automatically at the start of its next run.
 
 ```bash
 # Send a message from one job to another
-node cli.js msg send monitor-agent handler-agent "Found 3 critical errors at 14:23"
+openclaw-scheduler msg send monitor-agent handler-agent "Found 3 critical errors at 14:23"
 ```
 
 ---
@@ -436,7 +436,7 @@ If something goes wrong:
 - Dispatcher checks active sessions every 30s — agents with active sessions stay "alive"
 - Agents that go silent for > 5 minutes AND whose tracker has timed out → marked dead
 - When all agents reach terminal state → delivery summary sent to your configured channel
-- Check anytime: `node cli.js tasks status <TRACKER_ID>`
+- Check anytime: `openclaw-scheduler tasks status <TRACKER_ID>`
 
 **Detecting sub-agents from other sessions:**
 
@@ -458,10 +458,10 @@ The scheduler (`~/.openclaw/scheduler/`) runs as a background service (LaunchAge
 and fires jobs independently of your chat sessions.
 
 ### Quick commands
-- Status: `cd ~/.openclaw/scheduler && node cli.js status`
-- List jobs: `node cli.js jobs list`
-- Add job: `node cli.js jobs add '<json>'`
-- View runs: `node cli.js runs list <job-id>`
+- Status: `openclaw-scheduler status`
+- List jobs: `openclaw-scheduler jobs list`
+- Add job: `openclaw-scheduler jobs add '<json>'`
+- View runs: `openclaw-scheduler runs list <job-id>`
 - Force run now: `sqlite3 scheduler.db "UPDATE jobs SET next_run_at = datetime('now','-1 second') WHERE name = 'Job Name'"`
 - Logs: `tail -f /tmp/openclaw-scheduler.log`
 

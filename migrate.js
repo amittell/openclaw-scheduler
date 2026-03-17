@@ -5,8 +5,10 @@ import { join } from 'path';
 import { initDb } from './db.js';
 import { createJob, listJobs } from './jobs.js';
 
+import { homedir } from 'os';
+
 const JOBS_JSON = process.env.OPENCLAW_JOBS_JSON
-  || join(process.env.HOME, '.openclaw/cron/jobs.json');
+  || join(process.env.HOME || homedir(), '.openclaw/cron/jobs.json');
 
 function cronFromSchedule(schedule) {
   // OpenClaw supports: cron (expr), every (everyMs), at (one-shot ISO)

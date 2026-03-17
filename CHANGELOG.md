@@ -2,7 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] — 2026-03-08
+## [0.2.0] -- 2026-03-11
+
+### Added
+- Strategy pattern refactor: decomposed 614-line `dispatchJob` closure into explicit `DispatchContext` + strategy functions (`prepareDispatch`, `executeStrategy`, `finalizeDispatch`) in new `dispatcher-strategies.js`
+- Auth profile resolution for isolated agent turns: `auth_profile` field on jobs supports `'inherit'` (looks up main session profile) or explicit `'provider:label'`
+- Drain-error retry: transient infrastructure errors (HTTP 529) bypass normal retry ladder and re-enqueue immediately
+- One-shot `at`-style scheduling via `schedule_kind: 'at'` and `schedule_at` fields (schema v18)
+- Complete TypeScript type coverage: 26 previously missing function signatures, 4 corrected return types, 51 missing schema columns added to `index.d.ts`
+- Expanded type smoke tests from 23 to 192+ lines exercising all typed APIs
+- 5 new test coverage areas: dispatcher-utils, dispatch-queue lifecycle, approval timeout/prune/count, run session/context, prompt-context edge cases
+- `idempotency`, `taskTracker`, and `teamAdapter` modules now exported from `index.js` for programmatic consumers
+
+### Fixed
+- `updateJobAfterRun` null guard prevents crash when job is deleted mid-dispatch
+- Shell timeout and retry exhaustion handling corrected
+- Boolean job flags normalized for SQLite writes
+- Numeric enabled flags treated as disabled on create
+
+### Changed
+- Default `schedule_tz` changed from `America/New_York` to `UTC` in schema, validation, and setup
+- `--json` mode wired through all CLI subcommands (msg, tasks, team, queue, idem) via `emit()`/`fail()` helpers
+- Dispatch subsystem portability: `process.execPath` replaces bare `node`, `__dirname`-relative paths replace hardcoded install paths
+- Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
+- `buildDispatchDeps()` wires 36+ dependencies via dependency injection
+- Test baseline updated to 753 passed
+- Schema baseline is now v18
+
+## [0.1.0] -- 2026-03-08
 
 First public release.
 
