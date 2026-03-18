@@ -1247,10 +1247,50 @@ function cmdResult(flags) {
  *   --summary <string>  Optional. One-line completion summary
  */
 async function cmdDone(flags) {
-  const label   = flags.label;
-  const summary = flags.summary || 'completed (agent signal)';
-  const sha     = flags.sha || null;
+  const label         = flags.label;
+  const rawSummary    = flags.summary || 'completed (agent signal)';
+  const sha           = flags.sha || null;
   if (!label) die('--label is required', 2);
+
+  // Bug 2 fix: reject planning-language summaries (agent calling done before work is done)
+  const PLANNING_PHRASES = [
+    'the approach should be',
+    'we need to apply',
+    'i will now',
+    'i need to',
+    'next step',
+    'the plan is',
+    'here is my plan',
+    'my approach',
+    'i should',
+    'to do this',
+    'let me now',
+    'i am going to',
+  ];
+  const lowerSummary = rawSummary.toLowerCase();
+  for (const phrase of PLANNING_PHRASES) {
+    // Word-boundary match: phrase must appear as a standalone unit (not mid-word)
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![a-z])${escaped}(?![a-z])`, 'i');
+    if (re.test(lowerSummary)) {
+      die(
+        'REJECTED: --summary reads like a plan, not a completion report. ' +
+        'Call `done` only AFTER the work is fully complete. ' +
+        'Summary must describe what was actually done.',
+        1,
+      );
+    }
+  }
+
+  // Bug 1 fix: truncate summary to 300 chars (delivery path silently truncates at 500)
+  const MAX_SUMMARY = 300;
+  let summary = rawSummary;
+  if (rawSummary.length > MAX_SUMMARY) {
+    process.stderr.write(
+      `[${BRAND}] warn: --summary truncated from ${rawSummary.length} chars to ${MAX_SUMMARY} chars\n`,
+    );
+    summary = rawSummary.slice(0, MAX_SUMMARY);
+  }
 
   // Validate --sha if provided
   if (sha) {

@@ -3663,6 +3663,161 @@ console.log('\n── Done Subcommand ──');
     assert(!noShaLabels['no-sha-task'].sha, 'done without --sha (backward compat): no sha in labels.json');
   }
 
+  // ── Bug 1 fix: summary truncation at 300 chars ────────────
+
+  // done with summary > 300 chars → truncated to 300 and warns on stderr
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'trunc-task': {
+        sessionKey: 'agent:main:subagent:trunc-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const longSummary = 'x'.repeat(350);
+    let truncStderr = '';
+    const truncOut = execFileSync(process.execPath, [
+      indexPath, 'done', '--label', 'trunc-task', '--summary', longSummary,
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 10000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // We can't easily capture stderr from execFileSync with stdio pipe, so
+    // just verify the stored summary is at most 300 chars
+    const truncObj = JSON.parse(truncOut.trim());
+    assert(truncObj.ok === true, 'done --summary truncation: ok=true');
+    assert(truncObj.summary.length === 300, 'done --summary truncation: summary truncated to 300 chars');
+    const truncLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(truncLabels['trunc-task'].summary.length === 300, 'done --summary truncation: labels.json summary at most 300 chars');
+    assert(truncLabels['trunc-task'].status === 'done', 'done --summary truncation: labels.json status=done');
+  }
+
+  // done with summary exactly 300 chars → accepted as-is (no truncation)
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'exact-trunc-task': {
+        sessionKey: 'agent:main:subagent:exact-trunc-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const exact300 = 'y'.repeat(300);
+    const exact300Out = execFileSync(process.execPath, [
+      indexPath, 'done', '--label', 'exact-trunc-task', '--summary', exact300,
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      timeout: 10000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const exact300Obj = JSON.parse(exact300Out.trim());
+    assert(exact300Obj.ok === true, 'done --summary exactly 300 chars: ok=true');
+    assert(exact300Obj.summary.length === 300, 'done --summary exactly 300 chars: summary preserved');
+  }
+
+  // ── Bug 2 fix: planning-language rejection ─────────────────
+
+  // done with planning phrases → rejected exit code 1
+  const planningPhrases = [
+    'The approach should be to refactor this module',
+    'We need to apply the patch first',
+    'I will now fix the bug',
+    'I need to update the file',
+    'Next step is to run tests',
+    'The plan is to rewrite this',
+    'Here is my plan for the fix',
+    'My approach will be incremental',
+    'I should start by reading the code',
+    'To do this I will edit the file',
+    'Let me now implement the solution',
+    'I am going to update the tests',
+  ];
+  for (const phrase of planningPhrases) {
+    writeFileSync(doneLabels, JSON.stringify({
+      'plan-reject-task': {
+        sessionKey: 'agent:main:subagent:plan-reject-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwPlan = false;
+    let planExitCode = null;
+    let planStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'plan-reject-task', '--summary', phrase,
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwPlan = true;
+      planExitCode = err.status;
+      planStderr = err.stderr || '';
+    }
+    assert(threwPlan, `done planning-phrase "${phrase.slice(0, 40)}...": rejected (non-zero exit)`);
+    assert(planExitCode === 1, `done planning-phrase "${phrase.slice(0, 40)}...": exit code 1`);
+    assert(planStderr.includes('REJECTED'), `done planning-phrase "${phrase.slice(0, 40)}...": stderr contains REJECTED`);
+
+    // Labels should NOT be updated
+    const planLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(planLabels['plan-reject-task'].status === 'running', `done planning-phrase "${phrase.slice(0, 40)}...": labels.json NOT updated to done`);
+  }
+
+  // done with legitimate completion summary → accepted (not a false positive)
+  const legitimateSummaries = [
+    'Refactored the auth module and added unit tests. All 42 tests pass.',
+    'Fixed the memory leak in the connection pool. Commit: abc1234.',
+    'Updated dependencies and resolved 3 CVEs. PR merged.',
+    'Implemented the rate-limit guard in cmdDone. Tests updated and passing.',
+  ];
+  for (const legit of legitimateSummaries) {
+    writeFileSync(doneLabels, JSON.stringify({
+      'legit-task': {
+        sessionKey: 'agent:main:subagent:legit-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let legitOut;
+    let legitThrew = false;
+    try {
+      legitOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'legit-task', '--summary', legit,
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      legitThrew = true;
+    }
+    assert(!legitThrew, `done legitimate summary "${legit.slice(0, 40)}...": not rejected (no false positive)`);
+    const legitObj = JSON.parse(legitOut.trim());
+    assert(legitObj.ok === true, `done legitimate summary "${legit.slice(0, 40)}...": ok=true`);
+  }
+
   rmSync(tempDone, { recursive: true, force: true });
 }
 
