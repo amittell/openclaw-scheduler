@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * inbox-consumer.mjs — Drain pending chilisaus queue messages → Telegram
+ * inbox-consumer.mjs — Drain pending scheduler queue messages → Telegram
  *
  * Reads pending messages addressed to the 'main' agent from the scheduler DB,
  * formats them, delivers directly via the gateway, and marks them read.
@@ -24,7 +24,7 @@
  *   OPENCLAW_GATEWAY_URL    — gateway base URL (default: http://127.0.0.1:18789)
  *   OPENCLAW_GATEWAY_TOKEN  — bearer token (or use ~/.openclaw/credentials/.gateway-token)
  *   INBOX_DELIVERY_CHANNEL  — Telegram channel name (default: telegram)
- *   INBOX_DELIVERY_TO       — Telegram target ID (default: 484946046)
+ *   INBOX_DELIVERY_TO       — Telegram target ID (required for delivery)
  *   SCHEDULER_DB            — override scheduler DB path
  */
 
