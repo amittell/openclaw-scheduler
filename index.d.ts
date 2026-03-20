@@ -88,6 +88,9 @@ export interface JobSpec {
   // Auth profile override
   auth_profile?: string | null;
 
+  // Delivery opt-out
+  delivery_opt_out_reason?: string | null;
+
   // Watchdog monitoring
   job_type?: 'standard' | 'watchdog';
   watchdog_target_label?: string | null;
@@ -115,6 +118,7 @@ export interface JobRecord extends JobSpec {
   payload_message: string;
   ttl_hours: number | null;
   auth_profile: string | null;
+  delivery_opt_out_reason: string | null;
 
   // Scheduling state (denormalized)
   next_run_at?: string | null;

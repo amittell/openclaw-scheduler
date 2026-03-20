@@ -1,6 +1,6 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-753%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-960%20passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-green)]()
 
@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 753 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 960 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -136,7 +136,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 753 passed, 0 failed
+npm test                             # should print: 960 passed, 0 failed
 npm run lint                         # static checks
 npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
@@ -1205,7 +1205,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (753 tests, in-memory SQLite)
+# Run all tests (960 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:

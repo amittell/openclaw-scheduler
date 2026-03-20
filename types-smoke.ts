@@ -65,6 +65,7 @@ const fullSpec: JobSpec = {
   delivery_guarantee: 'at-least-once',
   job_class: 'standard',
   preferred_session_key: 'my-key',
+  delivery_opt_out_reason: 'background job, no delivery needed',
 };
 void fullSpec;
 
