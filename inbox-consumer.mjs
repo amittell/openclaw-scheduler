@@ -29,13 +29,15 @@
  */
 
 import { join } from 'path';
+import { homedir } from 'os';
 import { watch } from 'fs';
 import { getDb } from './db.js';
 import { deliverMessage } from './gateway.js';
 
-const SCHEDULER_DIR  = join(process.env.HOME, '.openclaw', 'scheduler');
+const HOME_DIR = process.env.HOME || homedir();
+const SCHEDULER_DIR  = join(HOME_DIR, '.openclaw', 'scheduler');
 const _WAL_FILE       = join(SCHEDULER_DIR, 'scheduler.db-wal');
-const DELIVERY_TO    = process.env.INBOX_DELIVERY_TO      || '484946046';
+const DELIVERY_TO    = process.env.INBOX_DELIVERY_TO      || '';
 const DELIVERY_CH    = process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
 
 const WATCH_MODE = process.argv.includes('--watch');

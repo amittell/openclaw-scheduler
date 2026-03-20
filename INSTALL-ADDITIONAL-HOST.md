@@ -61,10 +61,10 @@ If `better-sqlite3` fails: `xcode-select --install` (macOS).
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 753 tests
+SCHEDULER_DB=:memory: node test.js  # 960 tests
 ```
 
-**All tests must pass before proceeding.** Total: 753 tests.
+**All tests must pass before proceeding.** Total: 960 tests.
 
 ---
 
@@ -287,7 +287,7 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 753/753
+- [ ] `SCHEDULER_DB=:memory: node test.js` → 960/960
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors

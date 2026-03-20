@@ -99,7 +99,7 @@ npm install --build-from-source
 $env:SCHEDULER_DB=":memory:"; node test.js
 ```
 
-All 753 tests must pass before continuing.
+All 960 tests must pass before continuing.
 
 ---
 
@@ -287,7 +287,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 753/753
+- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 960/960
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `pm2 status` → openclaw-scheduler is `online`
 - [ ] PM2 log has startup lines, no errors
