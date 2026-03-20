@@ -734,10 +734,34 @@ _pingInterval = setInterval(() => {
 }, PING_INTERVAL_MS);
 _pingInterval.unref(); // don't prevent Node.js from exiting naturally
 
-const deadline = Date.now() + timeoutS * 1000;
+const spawnTime = Date.now();
+let deadline = spawnTime + timeoutS * 1000;
 let consecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 10;
 let recoverySessionKey = null;  // captured during polling for steer/kill
+
+// Module-level state accessible by SIGTERM handler
+let lastKnownReply = null;
+
+// ── SIGTERM handler (scheduler kills watcher with SIGTERM before SIGKILL) ──
+// Ensures labels.json is updated and a delivery attempt is made even when killed.
+process.on('SIGTERM', () => {
+  process.stderr.write(`[watcher] SIGTERM received for ${label} — marking as interrupted\n`);
+  // Try to fetch the latest result before dying
+  try {
+    const result = dispatch('result', ['--label', label]);
+    if (result?.lastReply) lastKnownReply = result.lastReply;
+  } catch {}
+  // deliverResult marks the label done, writes stdout, and calls process.exit(0)
+  deliverResult(label, lastKnownReply, 'interrupted by watcher timeout');
+  process.exit(0); // safety net — deliverResult already calls exit
+});
+
+// ── Rolling deadline vars ────────────────────────────────────
+let lastTokens = null;
+let lastActivityAt = Date.now();
+const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
+const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
 
 // Track whether the session has EVER appeared in the gateway sessions list.
 // Used to distinguish spawn failures (session never appeared) from normal
@@ -761,6 +785,22 @@ while (Date.now() < deadline) {
 
   // Capture sessionKey for recovery steer/kill
   if (status.sessionKey) recoverySessionKey = status.sessionKey;
+
+  // ── Rolling deadline: extend when session shows token activity ──
+  const currentTokens = status?.liveness?.tokens ?? null;
+  if (currentTokens !== null && lastTokens !== null && currentTokens > lastTokens) {
+    const proposed = Date.now() + ROLLING_EXTEND_MS;
+    const cap = spawnTime + MAX_DEADLINE_EXTENSION;
+    const extension = Math.min(proposed, cap);
+    if (extension > deadline) {
+      deadline = extension;
+      process.stderr.write(
+        `[watcher] [${label}] activity detected (${lastTokens}→${currentTokens} tokens), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
+      );
+    }
+    lastActivityAt = Date.now();
+  }
+  if (currentTokens !== null) lastTokens = currentTokens;
 
   // Track session presence — two independent signals, either is sufficient.
   // 1. Sessions.json store (primary ground truth for dispatcher-spawned sessions)
