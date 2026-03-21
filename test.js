@@ -3207,6 +3207,75 @@ if (sub === 'status') {
   assert(ncStdout.includes('Task completed successfully!'), 'normal completion: watcher delivers lastReply in output');
   assert(!ncStdout.includes('SPAWN FAILURE'), 'normal completion: watcher does NOT report spawn failure');
 
+  // 3b. Interrupted: status auto-resolved as 'interrupted' (session went idle without calling done).
+  //     Mock always returns status=interrupted with the auto-resolve summary.
+  //     Watcher must: exit non-zero (exit 1), write ⚠️ warning to stdout,
+  //     and NOT deliver as a successful result.
+  {
+    const intTempDir = mkdtempSync(join(tmpdir(), 'watcher-intr-'));
+    const mockIntrPath = join(intTempDir, 'mock-interrupted.mjs');
+    const mockLabelsIntr = join(intTempDir, 'labels-intr.json');
+
+    writeFileSync(mockIntrPath, `
+const [,,sub] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'test-intr',
+    status: 'interrupted',
+    summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete. (session idle 15 min)',
+    sessionKey: 'agent:main:subagent:intr-uuid',
+    liveness: { ageMs: 900000, updatedAt: Date.now() - 900000 },
+    syncAction: 'auto-resolved as interrupted: session idle 15 min',
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'partial output', status: 'interrupted' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    writeFileSync(mockLabelsIntr, JSON.stringify({
+      'test-intr': {
+        sessionKey: 'agent:main:subagent:intr-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let intrExitCode;
+    let intrStdout;
+    try {
+      intrStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-intr', '--timeout', '30', '--poll-interval', '1'], {
+        env: {
+          ...process.env,
+          DISPATCH_INDEX_PATH: mockIntrPath,
+          DISPATCH_LABELS_PATH: mockLabelsIntr,
+        },
+        encoding: 'utf8',
+        timeout: 40000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      intrExitCode = 0;
+    } catch (err) {
+      intrExitCode = err.status ?? 1;
+      intrStdout   = err.stdout ?? '';
+    }
+    assert(intrExitCode === 1, 'interrupted: watcher exits non-zero (exit 1)');
+    assert(intrStdout.includes('⚠️'), 'interrupted: watcher writes ⚠️ warning to stdout');
+    assert(intrStdout.includes('went idle before completing'), 'interrupted: watcher reports session went idle');
+    assert(!intrStdout.includes('completed:'), 'interrupted: watcher does NOT deliver as successful completion');
+
+    // Also verify labels.json was updated to 'error' (not kept as 'interrupted' or 'running')
+    const finalLabels = JSON.parse(readFileSync(mockLabelsIntr, 'utf-8'));
+    assert(finalLabels['test-intr'].status === 'error', 'interrupted: watcher marks label as error in labels.json');
+
+    rmSync(intTempDir, { recursive: true, force: true });
+  }
+
   rmSync(tempDir, { recursive: true, force: true });
 }
 
@@ -3519,7 +3588,7 @@ console.log('\n── Sessions.json Detection ──');
   });
   const statusObjStale = JSON.parse(statusPresentStale.trim());
   assert(statusObjStale.ok === true, 'sessions.json present+stale: status ok');
-  assert(statusObjStale.status === 'done', 'sessions.json present+stale: auto-resolved to done');
+  assert(statusObjStale.status === 'interrupted', 'sessions.json present+stale: auto-resolved to interrupted (not done — agent never called done)');
   assert(statusObjStale.syncAction && statusObjStale.syncAction.includes('auto-resolved'), 'sessions.json present+stale: syncAction includes auto-resolved');
 
   // 4c. Absent (session key not in store) → gateway API fallback.
@@ -4373,7 +4442,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t2');
-    assert(result.status === 'done',   'watchdog guard t2: stale lastPing → falls through → auto-resolves');
+    assert(result.status === 'interrupted', 'watchdog guard t2: stale lastPing → falls through → auto-resolves as interrupted');
   }
 
   // ── Test 3: elapsedMs >= hardCeilingMs → resolves regardless of fresh ping ─
@@ -4398,7 +4467,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t3');
-    assert(result.status === 'done', 'watchdog guard t3: past hard ceiling → resolves regardless of fresh ping');
+    assert(result.status === 'interrupted', 'watchdog guard t3: past hard ceiling → resolves as interrupted regardless of fresh ping');
   }
 
   // ── Test 4: no lastPing (backward compat) → uses idleThresholdMs ─────
@@ -4428,7 +4497,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t4a');
-    assert(result.status === 'done', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves (idleThresholdMs path)');
+    assert(result.status === 'interrupted', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves as interrupted (idleThresholdMs path)');
   }
 
   // 4b: timeoutSeconds=1800 → idleThreshold=30 min. Session idle 15 min < 30 min → stays running.

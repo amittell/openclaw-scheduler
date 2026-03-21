@@ -943,6 +943,19 @@ while (Date.now() < deadline) {
       );
     }
 
+    // ── Interrupted: session auto-resolved as incomplete ──────────────────
+    // When cmdStatus auto-resolves a session as 'interrupted' (idle without
+    // calling done), deliver the lastReply for diagnostics but exit non-zero
+    // so the scheduler run is marked as error, not success.
+    if (status.status === 'interrupted') {
+      process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted — work may be incomplete\n`);
+      process.stdout.write(
+        `⚠️ chilisaus [${label}] session went idle before completing — work may be incomplete\n`
+      );
+      markLabelError(label, status.summary || 'interrupted: session went idle without calling done');
+      process.exit(1);
+    }
+
     // Reset 529 retryCount on successful completion
     if (status.status === 'done') {
       const currentRetryCount = getRetryCount(label);
@@ -986,6 +999,15 @@ if (finalStatus?.status === 'done') {
   markDoneSync(finalStatus?.summary || 'completed');
   process.stdout.write(`✅ dispatch [${label}] completed (status=done, no lastReply captured)\n`);
   process.exit(0);
+}
+// If status is interrupted (auto-resolved as incomplete), exit non-zero
+if (finalStatus?.status === 'interrupted') {
+  process.stderr.write(`[watcher] [${label}] final status=interrupted — session idle without completion\n`);
+  process.stdout.write(
+    `⚠️ chilisaus [${label}] session went idle before completing — work may be incomplete\n`
+  );
+  markLabelError(label, finalStatus?.summary || 'interrupted: session went idle without calling done');
+  process.exit(1);
 }
 
 // ── Token-based activity check before steering ────────────────────────────
