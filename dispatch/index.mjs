@@ -909,10 +909,10 @@ function cmdStatus(flags) {
         syncAction = `auto-resolved as 529 error: ${check.reason}`;
       } else {
         setLabel(label, {
-          status:  'done',
-          summary: `Auto-resolved: ${check.reason}`,
+          status:  'interrupted',
+          summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
         });
-        syncAction = `auto-resolved: ${check.reason}`;
+        syncAction = `auto-resolved as interrupted: ${check.reason}`;
       }
       // Disarm watchdog when session is auto-resolved
       disarmWatchdog(label);
@@ -1047,8 +1047,8 @@ async function cmdStuck(flags) {
         autoResolved.push({ label: name, reason: `529 error: ${check.reason}` });
       } else {
         setLabel(name, {
-          status:  'done',
-          summary: `Auto-resolved: ${check.reason}`,
+          status:  'interrupted',
+          summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
         });
         autoResolved.push({ label: name, reason: check.reason });
       }
@@ -1159,7 +1159,7 @@ function cmdSync(flags) {
     const check = checkSessionDone(entry.sessionKey, syncStore, syncThresh, true, spawnedAtMs);
 
     if (check.shouldResolve) {
-      const newStatus = check.is529 ? 'error' : 'done';
+      const newStatus = check.is529 ? 'error' : 'interrupted';
       changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
       if (!dryRun) {
         if (check.is529) {
@@ -1170,11 +1170,11 @@ function cmdSync(flags) {
           });
         } else {
           setLabel(name, {
-            status:  'done',
-            summary: `Synced: ${check.reason}`,
+            status:  'interrupted',
+            summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
           });
         }
-        // Disarm watchdog when session is synced as done
+        // Disarm watchdog when session is synced as interrupted
         disarmWatchdog(name);
       }
     }
