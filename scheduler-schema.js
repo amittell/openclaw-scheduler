@@ -16,7 +16,7 @@ export const SCHEDULER_SCHEMAS = {
       execution_intent: { type: 'string', enum: ['execute', 'plan'], default: 'execute' },
       execution_read_only: { type: 'boolean', default: false },
       overlap_policy: { type: 'string', enum: ['skip', 'allow', 'queue'], default: 'skip' },
-      run_timeout_ms: { type: 'integer', min: 1, default: 300000 },
+      run_timeout_ms: { type: 'integer', min: 1, required: true, description: 'Required: max ms a run may execute before timeout (no default — caller must be explicit)' },
       max_queued_dispatches: { type: 'integer', min: 1, default: 25 },
       max_pending_approvals: { type: 'integer', min: 1, default: 10 },
       max_trigger_fanout: { type: 'integer', min: 1, default: 25 },

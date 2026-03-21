@@ -30,6 +30,7 @@ Jobs:
   jobs get <id>                      Get job details
   jobs add <json> [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
                                      Add a job (--watchdog sets defaults for watchdog type)
+                                     run_timeout_ms is REQUIRED (no default — prevents indefinite runs)
                                      --at: one-shot schedule, e.g. '2026-03-10T16:47:00-04:00'
                                      --in: one-shot sugar, e.g. '15m', '2h', '30s', '1d'
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')

@@ -266,6 +266,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     throw new Error('output_summary_limit_bytes cannot be smaller than output_excerpt_limit_bytes');
   }
 
+  if (mode === 'create' && (merged.run_timeout_ms == null || merged.run_timeout_ms === 0)) {
+    throw new Error(
+      'run_timeout_ms is required and must be > 0 — this prevents jobs from running indefinitely.'
+    );
+  }
+
   return normalized;
 }
 

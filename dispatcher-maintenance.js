@@ -164,6 +164,7 @@ export function ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir }) {
         delivery_mode:    'none',
         overlap_policy:   'skip',
         enabled:          1,
+        run_timeout_ms:   120_000,  // 2 min: inbox consumer shell script should be fast
       });
 
       log('info', `Created inbox consumer job: ${jobName} → ${agent.delivery_channel}:${agent.delivery_to}`);
