@@ -735,6 +735,7 @@ async function cmdEnqueue(flags) {
           payload_kind:             'shellCommand',
           payload_message:          checkCmd,
           delivery_mode:            'none',
+          run_timeout_ms:           120_000,  // 2 min: watchdog shell check should be fast
           watchdog_target_label:    label,
           watchdog_check_cmd:       checkCmd,
           watchdog_timeout_min:     monitorTimeout,
