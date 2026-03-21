@@ -3577,9 +3577,10 @@ console.log('\n── Done Subcommand ──');
     },
   }) + '\n');
 
-  // Run: node index.mjs done --label my-task --summary "all done!"
+  // Run: node index.mjs done --label my-task --summary "all done!" --checklist '{"work_complete":true}'
   const doneOut = execFileSync(process.execPath, [
     indexPath, 'done', '--label', 'my-task', '--summary', 'all done!',
+    '--checklist', '{"work_complete":true}',
   ], {
     encoding: 'utf8',
     env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3601,7 +3602,8 @@ console.log('\n── Done Subcommand ──');
   //       direct subagent spawns that weren't tracked via enqueue.
   {
     const unregRaw = execFileSync(process.execPath,
-      [indexPath, 'done', '--label', 'nonexistent-label-xyz', '--summary', 'finished'],
+      [indexPath, 'done', '--label', 'nonexistent-label-xyz', '--summary', 'finished',
+       '--checklist', '{"work_complete":true}'],
       {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3655,6 +3657,7 @@ console.log('\n── Done Subcommand ──');
 
     const shaValidOut = execFileSync(process.execPath, [
       indexPath, 'done', '--label', 'sha-test-task', '--summary', 'sha test done', '--sha', validSha,
+      '--checklist', '{"work_complete":true,"pushed":true}',
     ], {
       encoding: 'utf8',
       env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3688,6 +3691,7 @@ console.log('\n── Done Subcommand ──');
     try {
       execFileSync(process.execPath, [
         indexPath, 'done', '--label', 'sha-reject-task', '--summary', 'should be rejected', '--sha', fakeSha,
+        '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3721,6 +3725,7 @@ console.log('\n── Done Subcommand ──');
 
     const noShaOut = execFileSync(process.execPath, [
       indexPath, 'done', '--label', 'no-sha-task', '--summary', 'no sha needed',
+      '--checklist', '{"work_complete":true}',
     ], {
       encoding: 'utf8',
       env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3753,6 +3758,7 @@ console.log('\n── Done Subcommand ──');
     let truncStderr = '';
     const truncOut = execFileSync(process.execPath, [
       indexPath, 'done', '--label', 'trunc-task', '--summary', longSummary,
+      '--checklist', '{"work_complete":true}',
     ], {
       encoding: 'utf8',
       env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3785,6 +3791,7 @@ console.log('\n── Done Subcommand ──');
     const exact300 = 'y'.repeat(300);
     const exact300Out = execFileSync(process.execPath, [
       indexPath, 'done', '--label', 'exact-trunc-task', '--summary', exact300,
+      '--checklist', '{"work_complete":true}',
     ], {
       encoding: 'utf8',
       env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3796,51 +3803,13 @@ console.log('\n── Done Subcommand ──');
     assert(exact300Obj.summary.length === 300, 'done --summary exactly 300 chars: summary preserved');
   }
 
-  // ── Bug 2 fix: planning-language rejection ─────────────────
+  // ── Structural checklist validation ─────────────────────────
 
-  // done with planning phrases → rejected exit code 1
-  const planningPhrases = [
-    'The approach should be to refactor this module',
-    'We need to apply the patch first',
-    'I will now fix the bug',
-    'I need to update the file',
-    'Next step is to run tests',
-    'The plan is to rewrite this',
-    'Here is my plan for the fix',
-    'My approach will be incremental',
-    'I should start by reading the code',
-    'To do this I will edit the file',
-    'Let me now implement the solution',
-    'I am going to update the tests',
-    // Extended phrases — bypass coverage
-    'Now let me look at isSafeToRetrySendError more carefully',
-    'Let me look at the test output',
-    'Now let me check the file',
-    'Let me check if tests pass',
-    'Let me read the current implementation',
-    'Let me examine the error',
-    'Let me first understand the context',
-    'Let me start by reading the code',
-    'Let me begin with the failing test',
-    'Let me get the current state',
-    'First let me verify the change',
-    'Before calling done, I need to verify',
-    'I will check the result',
-    'I will read the file',
-    'I will apply the patch now',
-    'I will start by running tests',
-    'I am about to commit the changes',
-    'About to push the commit',
-    'Going to apply the fix',
-    'Going to make the edit',
-    'Going to fix the issue now',
-    'Will now apply the changes',
-    'Will now make the commit',
-  ];
-  for (const phrase of planningPhrases) {
+  // done without --checklist → rejected (missing checklist)
+  {
     writeFileSync(doneLabels, JSON.stringify({
-      'plan-reject-task': {
-        sessionKey: 'agent:main:subagent:plan-reject-uuid',
+      'no-checklist-task': {
+        sessionKey: 'agent:main:subagent:no-checklist-uuid',
         status: 'running',
         agent: 'main',
         mode: 'fresh',
@@ -3849,12 +3818,12 @@ console.log('\n── Done Subcommand ──');
       },
     }) + '\n');
 
-    let threwPlan = false;
-    let planExitCode = null;
-    let planStderr = '';
+    let threwNoChecklist = false;
+    let noChecklistExitCode = null;
+    let noChecklistStderr = '';
     try {
       execFileSync(process.execPath, [
-        indexPath, 'done', '--label', 'plan-reject-task', '--summary', phrase,
+        indexPath, 'done', '--label', 'no-checklist-task', '--summary', 'done!',
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3862,25 +3831,175 @@ console.log('\n── Done Subcommand ──');
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
-      threwPlan = true;
-      planExitCode = err.status;
-      planStderr = err.stderr || '';
+      threwNoChecklist = true;
+      noChecklistExitCode = err.status;
+      noChecklistStderr = err.stderr || '';
     }
-    assert(threwPlan, `done planning-phrase "${phrase.slice(0, 40)}...": rejected (non-zero exit)`);
-    assert(planExitCode === 1, `done planning-phrase "${phrase.slice(0, 40)}...": exit code 1`);
-    assert(planStderr.includes('REJECTED'), `done planning-phrase "${phrase.slice(0, 40)}...": stderr contains REJECTED`);
+    assert(threwNoChecklist, 'done without --checklist: rejected (non-zero exit)');
+    assert(noChecklistExitCode === 1, 'done without --checklist: exit code 1');
+    assert(noChecklistStderr.includes('REJECTED'), 'done without --checklist: stderr contains REJECTED');
+    assert(noChecklistStderr.includes('--checklist'), 'done without --checklist: stderr mentions --checklist');
 
-    // Labels should NOT be updated
-    const planLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(planLabels['plan-reject-task'].status === 'running', `done planning-phrase "${phrase.slice(0, 40)}...": labels.json NOT updated to done`);
+    const noChecklistLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(noChecklistLabels['no-checklist-task'].status === 'running', 'done without --checklist: labels.json NOT updated');
   }
 
-  // done with legitimate completion summary → accepted (not a false positive)
+  // done with work_complete:false → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'work-incomplete-task': {
+        sessionKey: 'agent:main:subagent:work-incomplete-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwWorkIncomplete = false;
+    let workIncompleteExitCode = null;
+    let workIncompleteStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'work-incomplete-task', '--summary', 'done!',
+        '--checklist', '{"work_complete":false}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwWorkIncomplete = true;
+      workIncompleteExitCode = err.status;
+      workIncompleteStderr = err.stderr || '';
+    }
+    assert(threwWorkIncomplete, 'done with work_complete:false: rejected (non-zero exit)');
+    assert(workIncompleteExitCode === 1, 'done with work_complete:false: exit code 1');
+    assert(workIncompleteStderr.includes('REJECTED'), 'done with work_complete:false: stderr contains REJECTED');
+    assert(workIncompleteStderr.includes('work_complete'), 'done with work_complete:false: stderr mentions work_complete');
+
+    const workIncompleteLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(workIncompleteLabels['work-incomplete-task'].status === 'running', 'done with work_complete:false: labels.json NOT updated');
+  }
+
+  // done with tests_passed:false → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'tests-failed-task': {
+        sessionKey: 'agent:main:subagent:tests-failed-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwTestsFailed = false;
+    let testsFailedExitCode = null;
+    let testsFailedStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'tests-failed-task', '--summary', 'done!',
+        '--checklist', '{"work_complete":true,"tests_passed":false}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwTestsFailed = true;
+      testsFailedExitCode = err.status;
+      testsFailedStderr = err.stderr || '';
+    }
+    assert(threwTestsFailed, 'done with tests_passed:false: rejected (non-zero exit)');
+    assert(testsFailedExitCode === 1, 'done with tests_passed:false: exit code 1');
+    assert(testsFailedStderr.includes('REJECTED'), 'done with tests_passed:false: stderr contains REJECTED');
+    assert(testsFailedStderr.includes('tests_passed'), 'done with tests_passed:false: stderr mentions tests_passed');
+
+    const testsFailedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(testsFailedLabels['tests-failed-task'].status === 'running', 'done with tests_passed:false: labels.json NOT updated');
+  }
+
+  // done with pushed:false → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'push-failed-task': {
+        sessionKey: 'agent:main:subagent:push-failed-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwPushFailed = false;
+    let pushFailedExitCode = null;
+    let pushFailedStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'push-failed-task', '--summary', 'done!',
+        '--checklist', '{"work_complete":true,"pushed":false}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwPushFailed = true;
+      pushFailedExitCode = err.status;
+      pushFailedStderr = err.stderr || '';
+    }
+    assert(threwPushFailed, 'done with pushed:false: rejected (non-zero exit)');
+    assert(pushFailedExitCode === 1, 'done with pushed:false: exit code 1');
+    assert(pushFailedStderr.includes('REJECTED'), 'done with pushed:false: stderr contains REJECTED');
+    assert(pushFailedStderr.includes('pushed'), 'done with pushed:false: stderr mentions pushed');
+
+    const pushFailedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(pushFailedLabels['push-failed-task'].status === 'running', 'done with pushed:false: labels.json NOT updated');
+  }
+
+  // done with invalid JSON in --checklist → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'bad-json-task': {
+        sessionKey: 'agent:main:subagent:bad-json-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwBadJson = false;
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'bad-json-task', '--summary', 'done!',
+        '--checklist', 'not-valid-json',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwBadJson = (err.status === 1);
+    }
+    assert(threwBadJson, 'done with invalid JSON checklist: rejected (exit code 1)');
+  }
+
+  // done with valid checklist (all fields true) → accepted
   const legitimateSummaries = [
     'Refactored the auth module and added unit tests. All 42 tests pass.',
     'Fixed the memory leak in the connection pool. Commit: abc1234.',
     'Updated dependencies and resolved 3 CVEs. PR merged.',
-    'Implemented the rate-limit guard in cmdDone. Tests updated and passing.',
+    'Implemented the structural completion checklist in cmdDone. Tests updated and passing.',
   ];
   for (const legit of legitimateSummaries) {
     writeFileSync(doneLabels, JSON.stringify({
@@ -3899,6 +4018,7 @@ console.log('\n── Done Subcommand ──');
     try {
       legitOut = execFileSync(process.execPath, [
         indexPath, 'done', '--label', 'legit-task', '--summary', legit,
+        '--checklist', '{"work_complete":true,"tests_passed":true,"pushed":true}',
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -3908,9 +4028,42 @@ console.log('\n── Done Subcommand ──');
     } catch {
       legitThrew = true;
     }
-    assert(!legitThrew, `done legitimate summary "${legit.slice(0, 40)}...": not rejected (no false positive)`);
+    assert(!legitThrew, `done with valid checklist "${legit.slice(0, 40)}...": accepted (no false positive)`);
     const legitObj = JSON.parse(legitOut.trim());
-    assert(legitObj.ok === true, `done legitimate summary "${legit.slice(0, 40)}...": ok=true`);
+    assert(legitObj.ok === true, `done with valid checklist "${legit.slice(0, 40)}...": ok=true`);
+  }
+
+  // done with only work_complete:true (minimal checklist) → accepted
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'minimal-checklist-task': {
+        sessionKey: 'agent:main:subagent:minimal-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let minimalOut;
+    let minimalThrew = false;
+    try {
+      minimalOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'minimal-checklist-task', '--summary', 'Work done!',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      minimalThrew = true;
+    }
+    assert(!minimalThrew, 'done with minimal checklist {work_complete:true}: accepted');
+    const minimalObj = JSON.parse(minimalOut.trim());
+    assert(minimalObj.ok === true, 'done with minimal checklist: ok=true');
   }
 
   rmSync(tempDone, { recursive: true, force: true });

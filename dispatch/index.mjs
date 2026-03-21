@@ -596,10 +596,17 @@ async function cmdEnqueue(flags) {
   parts.push(`  4. You have verified the work is complete`);
   parts.push(``);
   parts.push(`Call this as your ABSOLUTE FINAL action — nothing else runs after this:`);
-  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' --summary "<what you actually did, including commit SHA if applicable>" --sha "<git commit SHA of your last push>"`);
+  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' \\`);
+  parts.push(`    --summary "<what you actually did>" \\`);
+  parts.push(`    --checklist '{"work_complete":true,"tests_passed":true,"pushed":true}' \\`);
+  parts.push(`    [--sha "<git commit SHA if applicable>"]`);
   parts.push(``);
+  parts.push(`Checklist rules:`);
+  parts.push(`  - work_complete MUST be true — you are asserting you have finished ALL assigned work`);
+  parts.push(`  - If tests failed or push failed, do NOT set tests_passed:true or pushed:true — instead continue working`);
+  parts.push(`  - Only include tests_passed/pushed if they apply to your task`);
   parts.push(`If your task involved git commits, --sha is required and must be the actual SHA of your pushed commit. The done script will reject invented or placeholder SHAs.`);
-  parts.push(`DO NOT call this while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
+  parts.push(`Do NOT call done while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
   parts.push(`---`);
   parts.push(``);
   parts.push(`---`);
@@ -1244,63 +1251,55 @@ function cmdResult(flags) {
  * Sets labels.json status=done so the watcher resolves immediately.
  *
  * Flags:
- *   --label <string>    Required. Label to mark as done
- *   --summary <string>  Optional. One-line completion summary
+ *   --label     <string>  Required. Label to mark as done
+ *   --summary   <string>  Optional. One-line completion summary
+ *   --checklist <json>    Required. JSON object asserting completion status.
+ *                         Must include work_complete:true. Optional: tests_passed, pushed.
+ *   --sha       <sha>     Optional. Git commit SHA of the final pushed commit.
  */
 async function cmdDone(flags) {
   const label         = flags.label;
   const rawSummary    = flags.summary || 'completed (agent signal)';
   const sha           = flags.sha || null;
+  const checklistRaw  = flags.checklist || null;
   if (!label) die('--label is required', 2);
 
-  // Bug 2 fix: reject planning-language summaries (agent calling done before work is done)
-  const PLANNING_PHRASES = [
-    'the approach should be',
-    'we need to apply',
-    'i will now',
-    'i need to',
-    'next step',
-    'the plan is',
-    'here is my plan',
-    'my approach',
-    'i should',
-    'to do this',
-    'let me now',
-    'i am going to',
-    // Extended phrases to close planning-language bypass (e.g. "Now let me look at...")
-    'let me look at',
-    'now let me',
-    'let me check',
-    'let me read',
-    'let me examine',
-    'let me first',
-    'let me start',
-    'let me begin',
-    'let me get',
-    'first let me',
-    'before calling done',
-    'i will check',
-    'i will read',
-    'i will apply',
-    'i will start',
-    'i am about to',
-    'about to',
-    'going to apply',
-    'going to make',
-    'going to fix',
-    'will now apply',
-    'will now make',
-  ];
-  const lowerSummary = rawSummary.toLowerCase();
-  for (const phrase of PLANNING_PHRASES) {
-    // Word-boundary match: phrase must appear as a standalone unit (not mid-word)
-    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`(?<![a-z])${escaped}(?![a-z])`, 'i');
-    if (re.test(lowerSummary)) {
+  // Structural completion checklist — replaces planning-phrase guard.
+  // Agents must assert completion status explicitly via structured fields.
+  if (!checklistRaw) {
+    die(
+      'REJECTED: --checklist is required. Pass --checklist with JSON object asserting completion status. ' +
+      "Example: --checklist '{\"work_complete\":true}' " +
+      'work_complete MUST be true — you are asserting all assigned work is finished. ' +
+      'Do NOT call done while planning, reading files, or mid-task.',
+      1,
+    );
+  }
+
+  let checklist;
+  try {
+    checklist = JSON.parse(checklistRaw);
+  } catch {
+    die("REJECTED: --checklist must be valid JSON. Example: '{\"work_complete\":true}'", 1);
+  }
+
+  if (!checklist.work_complete) {
+    die(
+      'REJECTED: checklist.work_complete must be true. ' +
+      'You are asserting all assigned work is done. ' +
+      'Do NOT call done until all work is complete.',
+      1,
+    );
+  }
+
+  // Validate optional fields if present — reject if any are explicitly false
+  const optionalValidated = ['tests_passed', 'pushed'];
+  for (const field of optionalValidated) {
+    if (field in checklist && checklist[field] === false) {
       die(
-        'REJECTED: --summary reads like a plan, not a completion report. ' +
-        'Call `done` only AFTER the work is fully complete. ' +
-        'Summary must describe what was actually done.',
+        `REJECTED: checklist.${field} is false. ` +
+        `Do not call done until all required checks pass. ` +
+        `Fix the failing ${field.replace('_', ' ')} before calling done.`,
         1,
       );
     }
