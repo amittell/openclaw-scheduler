@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v19).
+ * Brings any DB from any prior version up to the current schema (v20).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -14,56 +14,6 @@
  */
 
 import { getDb } from './db.js';
-
-function reconcileSeedJobs(db) {
-  try {
-    db.exec(`
-      INSERT OR IGNORE INTO jobs (
-        id, name, enabled,
-        schedule_cron, schedule_tz,
-        session_target, agent_id,
-        payload_kind, payload_message,
-        payload_timeout_seconds,
-        next_run_at,
-        created_at, updated_at
-      ) VALUES (
-        '8f2be5bd-b537-48c7-b277-44e934104ddc',
-        'Dispatch 529 Recovery',
-        1,
-        '*/10 * * * *',
-        'UTC',
-        'shell',
-        'main',
-        'shellCommand',
-        'node dispatch/529-recovery.mjs',
-        120,
-        datetime('now', '-1 second'),
-        datetime('now'),
-        datetime('now')
-      );
-
-      UPDATE jobs
-      SET
-        session_target = 'shell',
-        payload_kind = 'shellCommand',
-        payload_message = 'node dispatch/529-recovery.mjs',
-        next_run_at = CASE
-          WHEN enabled = 1 AND next_run_at IS NULL THEN datetime('now', '-1 second')
-          ELSE next_run_at
-        END,
-        updated_at = datetime('now')
-      WHERE
-        id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
-        AND (
-          session_target = 'isolated'
-          OR payload_message LIKE 'node ~/.openclaw/%/529-recovery.mjs'
-          OR (enabled = 1 AND next_run_at IS NULL)
-        );
-    `);
-  } catch {
-    // best effort; old schemas may be missing jobs columns before migration
-  }
-}
 
 export default function migrateConsolidate() {
   const db = getDb();
@@ -102,7 +52,6 @@ export default function migrateConsolidate() {
     && agentColumns.has('delivery_to')
     && agentColumns.has('brand_name');
   if (current >= 20 && hasLatestColumns && hasAgentDelivery) {
-    reconcileSeedJobs(db);
     return false;
   }
 
@@ -432,8 +381,6 @@ export default function migrateConsolidate() {
   for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]) {
     stmt.run(v);
   }
-
-  reconcileSeedJobs(db);
 
   return true;
 }

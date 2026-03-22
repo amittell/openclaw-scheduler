@@ -25,7 +25,7 @@
  * Usage: openclaw-scheduler <subcommand> [options]
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync, renameSync } from 'fs';
 import { dirname, join, resolve as pathResolve } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
@@ -134,7 +134,9 @@ function loadLabels() {
 }
 
 function saveLabels(labels) {
-  writeFileSync(LABELS_PATH, JSON.stringify(labels, null, 2) + '\n');
+  const tmp = LABELS_PATH + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+  renameSync(tmp, LABELS_PATH);
 }
 
 function getLabel(name) {
@@ -186,29 +188,6 @@ function gatewayCall(method, params = {}, opts = {}) {
     throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`, {
       cause: err,
     });
-  }
-}
-
-/**
- * Invoke a gateway tool via HTTP API with session context.
- * Uses /tools/invoke endpoint so gateway evaluates with full session-tree
- * visibility (sees subagents, unlike raw gatewayCall RPC).
- */
-function _gatewayToolInvoke(tool, args = {}, sessionKey = 'agent:main:main', opts = {}) {
-  try {
-    const body = JSON.stringify({ tool, args, sessionKey });
-    const raw = execFileSync('curl', [
-      '-s', '-X', 'POST',
-      `${GATEWAY_URL}/tools/invoke`,
-      '-H', 'Content-Type: application/json',
-      '-H', `Authorization: Bearer ${GATEWAY_TOKEN}`,
-      '-d', body,
-    ], { encoding: 'utf-8', timeout: (opts.timeout || 15000) + 5000, stdio: ['pipe', 'pipe', 'pipe'] });
-    const outer = JSON.parse(raw.trim());
-    if (outer?.result?.content?.[0]?.text) return JSON.parse(outer.result.content[0].text);
-    return outer?.result || null;
-  } catch {
-    return null;
   }
 }
 
@@ -586,10 +565,9 @@ async function cmdEnqueue(flags) {
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
-    const configPath = join(HOME_DIR, '.openclaw', 'openclaw.json');
     parts.push(`---`);
     parts.push(`CHECK_IN: To report progress, use curl:`);
-    parts.push(`GW_TOKEN=$(python3 -c "import json; print(json.load(open('` + configPath + `'))['gateway']['auth']['token'])")`);
+    parts.push(`GW_TOKEN=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))['gateway']['auth']['token'])")`);
     parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${deliverChannel || 'telegram'}","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);

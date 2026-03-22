@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import { mkdirSync, rmSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { createRequire } from 'module';
 
@@ -24,6 +24,11 @@ const run = spawnSync(process.execPath, ['test.js'], {
   env,
   stdio: 'inherit',
 });
+
+if (run.error) {
+  process.stderr.write(`[coverage] spawn error: ${run.error.message}\n`);
+  process.exit(1);
+}
 
 if (run.status !== 0) {
   process.exit(run.status ?? 1);
@@ -99,6 +104,15 @@ function findCoverageRecord(byFile, suffix) {
     if (record.path === suffix || record.path.endsWith(`/${suffix}`)) return record;
   }
   return null;
+}
+
+if (!existsSync(lcovPath)) {
+  process.stderr.write(`[coverage] lcov report not found: ${lcovPath}\n`);
+  process.exit(1);
+}
+if (!existsSync(summaryPath)) {
+  process.stderr.write(`[coverage] json-summary report not found: ${summaryPath}\n`);
+  process.exit(1);
 }
 
 const lcovContent = readFileSync(lcovPath, 'utf-8');

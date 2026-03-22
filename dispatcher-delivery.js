@@ -31,6 +31,7 @@ export function createDeliveryHelpers({ log, deliverMessage: _deliverMessage, re
         subject,
         body:       content,
         channel,
+        delivery_to: target,
       });
       log('info', `Enqueued: ${job.name}`, { channel, to: target });
     } catch (err) {

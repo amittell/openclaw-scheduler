@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 960 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 877 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -1205,7 +1205,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (960 tests, in-memory SQLite)
+# Run all tests (877 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:

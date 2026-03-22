@@ -115,15 +115,14 @@ print();
 
 print('── Step 2: Database migrations ─────────────────────────');
 try {
+  const { setDbPath } = await import(path.join(schedulerPath, 'db.js'));
+  setDbPath(schedulerDbPath);
   const migrate = (await import(path.join(schedulerPath, 'migrate-consolidate.js'))).default;
-  const Database = (await import('better-sqlite3')).default;
-  const db = new Database(schedulerDbPath);
-  const ran = migrate(db);
-  db.close();
+  const ran = migrate();
   if (ran) {
     ok(`Migrations applied → ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date (schema v18) → ${schedulerDbPath}`);
+    ok(`DB already up to date (schema v20) → ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);

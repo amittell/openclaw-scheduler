@@ -106,7 +106,7 @@ export function mapTeamMessages(limit = 100) {
       mapOne(msg);
       mapped++;
     } catch (err) {
-      process.stderr.write(`[team-adapter] mapOne error for msg ${msg.id}: ${err.message}
+      process.stderr.write(`[team-adapter] mapOne error for msg ${msg.id}: ${err?.message || String(err)}
 `);
     }
   }

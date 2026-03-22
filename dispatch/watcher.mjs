@@ -356,6 +356,9 @@ function respawnSession(label) {
       ];
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
+      if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
+      if (entry?.deliverTo) enqueueArgs.push('--deliver-to', entry.deliverTo);
+      if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
 
       execFileSync(process.execPath, enqueueArgs, {
         encoding: 'utf-8',
@@ -396,6 +399,9 @@ function respawnAfterGwRestart(label) {
     ];
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
+    if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
+    if (entry?.deliverTo) enqueueArgs.push('--deliver-to', entry.deliverTo);
+    if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
 
     execFileSync(process.execPath, enqueueArgs, {
       encoding: 'utf-8',
@@ -615,7 +621,7 @@ function markLabelDone(label, summary) {
       labels[label].updatedAt = new Date().toISOString();
       const tmp = LABELS_PATH + '.tmp.' + process.pid;
       writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
-      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+      renameSync(tmp, LABELS_PATH);
     }
   } catch (e) {
     process.stderr.write(`[watcher] markLabelDone failed: ${e.message}\n`);
@@ -631,13 +637,14 @@ function markLabelDone(label, summary) {
 function markLabelError(label, errorSummary) {
   try {
     const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    if (labels[label]?.status === 'done') return;
     if (labels[label]) {
       labels[label].status = 'error';
       labels[label].summary = errorSummary || 'failed without result';
       labels[label].updatedAt = new Date().toISOString();
       const tmp = LABELS_PATH + '.tmp.' + process.pid;
       writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
-      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+      renameSync(tmp, LABELS_PATH);
     }
   } catch (e) {
     process.stderr.write(`[watcher] markLabelError failed: ${e.message}\n`);
@@ -862,7 +869,7 @@ while (Date.now() < deadline) {
     // If the session was auto-resolved to 'done' (or 'spawn-warning') but was
     // never seen in the gateway, it never ran — this is a spawn failure.
     // Causes: auth timeout, quota exhaustion, gateway error at spawn time.
-    if (!sessionEverFound && (status.status === 'done' || status.status === 'spawn-warning')) {
+    if (!sessionEverFound && (status.status === 'done' || status.status === 'spawn-warning' || status.status === 'error')) {
       const spawnErrMsg =
         `[dispatch] SPAWN FAILURE: session ${status.sessionKey || '(unknown)'} never appeared ` +
         `in gateway — spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
@@ -1029,8 +1036,8 @@ function markDoneSync(summary) {
       labels[label].summary = summary;
       labels[label].updatedAt = new Date().toISOString();
       const tmp = LABELS_PATH + '.tmp.' + process.pid;
-      writeFileSync(tmp, JSON.stringify(labels, null, 2));
-      execFileSync('mv', [tmp, LABELS_PATH], { timeout: 5000 });
+      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+      renameSync(tmp, LABELS_PATH);
     }
   } catch (e) {
     process.stderr.write(`[watcher] markDoneSync failed: ${e.message}\n`);

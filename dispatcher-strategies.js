@@ -119,6 +119,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       jobId: job.id, runId: ctx.run.id,
       maxQueuedDispatches: job.max_queued_dispatches || 25,
     });
+    return;
   }
 
   // 6. Update job state
@@ -608,7 +609,7 @@ export async function executeAgent(job, ctx, deps) {
   const trimmed = content.trim();
 
   const isHeartbeatOk = matchesSentinel(trimmed, 'HEARTBEAT_OK');
-  const isNoFlush = trimmed === 'NO_FLUSH';
+  const isNoFlush = matchesSentinel(trimmed, 'NO_FLUSH');
   const isIdempotentSkip = matchesSentinel(trimmed, 'IDEMPOTENT_SKIP');
   const isTaskFailed = matchesSentinel(trimmed, 'TASK_FAILED');
   const isTransientError = detectTransientError(content);
@@ -637,7 +638,7 @@ export async function executeAgent(job, ctx, deps) {
 
   log('info', `Completed: ${job.name} (${turnResult.usage?.total_tokens || '?'} tokens)`, {
     runId: ctx.run.id,
-    durationMs: ctx.run.duration_ms,
+    durationMs: Date.now() - new Date(ctx.run.started_at.replace(' ', 'T') + 'Z').getTime(),
   });
 
   return result;
@@ -704,10 +705,6 @@ export async function executeStrategy(job, ctx, deps) {
     if (ctx.idemKey) releaseIdempotencyKey(ctx.idemKey);
     if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
 
-    if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-      await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
-    }
-
     if (shouldRetry(job, ctx.run.id)) {
       const retry = scheduleRetry(job, ctx.run.id);
       if (retry.dispatch) {
@@ -716,15 +713,22 @@ export async function executeStrategy(job, ctx, deps) {
         });
         getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
+        dequeueJob(job.id);
       } else {
         log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
           jobId: job.id, runId: ctx.run.id,
           maxQueuedDispatches: job.max_queued_dispatches || 25,
         });
+        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+          await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
+        }
         updateJobAfterRun(job, 'error');
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'cancelled');
       }
     } else {
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
+      }
       handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on failure');
       if (dequeueJob(job.id)) {
         log('info', `Dequeued pending dispatch for ${job.name} (after failure)`);

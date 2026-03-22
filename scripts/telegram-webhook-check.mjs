@@ -84,7 +84,7 @@ function readRecentTelegramFailures(dbPath) {
 
 export function chooseRepairWebhookUrl(webhookInfo, expectedWebhookUrl = '') {
   const currentUrl = webhookInfo?.url || '';
-  return firstNonEmpty(currentUrl, expectedWebhookUrl);
+  return firstNonEmpty(expectedWebhookUrl, currentUrl);
 }
 
 export function evaluateWebhookHealth({

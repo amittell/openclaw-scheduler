@@ -21,6 +21,7 @@ function tokenize(text) {
   return text
     .toLowerCase()
     .split(/\s+/)
+    .map(t => t.replace(/[^a-z0-9]/g, ''))
     .filter(t => t.length > 1 && !STOPWORDS.has(t));
 }
 
@@ -63,6 +64,25 @@ function tfidfScore(queryTokens, docTF, idf) {
   return score;
 }
 
+/**
+ * Extract readable text from a context_summary field.
+ * The field may be a JSON string (object with string values) or plain text.
+ */
+function extractSummaryText(raw) {
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      return Object.values(parsed)
+        .filter(v => typeof v === 'string')
+        .join(' ');
+    }
+    return String(parsed);
+  } catch {
+    return raw;
+  }
+}
+
 // ---- Exports ----
 
 /**
@@ -99,7 +119,7 @@ export function searchRunSummaries(jobId, query, limit = 5) {
 
   // Build TF for each doc
   const docTFs = candidates.map(c => {
-    const text = [c.context_summary || '', c.summary || ''].join(' ');
+    const text = [extractSummaryText(c.context_summary), c.summary || ''].join(' ');
     return computeTF(tokenize(text));
   });
 
@@ -107,7 +127,7 @@ export function searchRunSummaries(jobId, query, limit = 5) {
 
   // Score each candidate
   const scored = candidates.map((c, i) => {
-    const text = [c.context_summary || '', c.summary || ''].join(' ').toLowerCase();
+    const text = [extractSummaryText(c.context_summary), c.summary || ''].join(' ').toLowerCase();
     // Substring bonus
     const substringBonus = text.includes(queryLower) ? 1.0 : 0;
     // TF-IDF score

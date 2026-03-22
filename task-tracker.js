@@ -7,6 +7,12 @@ function sqliteNow() {
   return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
+function parseSqliteDate(s) {
+  if (!s) return null;
+  const normalized = s.includes('T') ? s : s.replace(' ', 'T');
+  return new Date(normalized.endsWith('Z') ? normalized : normalized + 'Z');
+}
+
 // ── Create a new tracked task group ─────────────────────────
 /**
  * @param {object} opts
@@ -187,6 +193,12 @@ export function checkDeadAgents() {
     markDead.run(now, agent.agent_id);
   }
 
+  // Check group completion for each affected tracker
+  const trackerIds = [...new Set(deadAgents.map(a => a.tracker_id))];
+  for (const trackerId of trackerIds) {
+    checkGroupCompletion(trackerId);
+  }
+
   return deadAgents;
 }
 
@@ -248,19 +260,19 @@ export function getTaskGroupStatus(trackerId) {
   const agents = db.prepare('SELECT * FROM task_tracker_agents WHERE tracker_id = ? ORDER BY agent_label').all(trackerId);
 
   const now = new Date();
-  const createdAt = new Date(tracker.created_at + 'Z');
+  const createdAt = parseSqliteDate(tracker.created_at) || new Date();
   const elapsedS = Math.floor((now - createdAt) / 1000);
   const remainingTimeout = Math.max(0, tracker.timeout_s - elapsedS);
 
   const agentStatuses = agents.map(a => {
     let duration = null;
     if (a.started_at && a.finished_at) {
-      const start = new Date(a.started_at + 'Z');
-      const end = new Date(a.finished_at + 'Z');
-      duration = Math.floor((end - start) / 1000);
+      const start = parseSqliteDate(a.started_at);
+      const end = parseSqliteDate(a.finished_at);
+      if (start && end) duration = Math.floor((end - start) / 1000);
     } else if (a.started_at) {
-      const start = new Date(a.started_at + 'Z');
-      duration = Math.floor((now - start) / 1000);
+      const start = parseSqliteDate(a.started_at);
+      if (start) duration = Math.floor((now - start) / 1000);
     }
 
     return {

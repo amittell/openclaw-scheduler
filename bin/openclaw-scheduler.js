@@ -2,6 +2,7 @@
 
 import { spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
+import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -82,7 +83,7 @@ function runDispatch(args) {
   const dispatchScript = join(root, 'dispatch', 'index.mjs');
   const env = { ...process.env };
   if (!env.DISPATCH_CONFIG_DIR) {
-    env.DISPATCH_CONFIG_DIR = join(process.env.HOME || '', '.openclaw', 'dispatch');
+    env.DISPATCH_CONFIG_DIR = join(process.env.HOME || homedir(), '.openclaw', 'dispatch');
   }
   const result = spawnSync(process.execPath, [dispatchScript, ...args], {
     stdio: 'inherit',
