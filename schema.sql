@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.6.0, schema version: 18)
+-- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 20)
 -- Full standalone scheduler + message router
 
 PRAGMA journal_mode = WAL;
@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Delivery opt-out (v19)
   delivery_opt_out_reason TEXT DEFAULT NULL,          -- set when delivery_mode='none' to explicitly skip delivery
+
+  -- Origin tracking (v20)
+  origin          TEXT DEFAULT NULL,                  -- where job was dispatched from: "telegram:<chat_id>", "system", etc.
 
   -- Watchdog monitoring (v13)
   job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
@@ -403,7 +406,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Fresh installs start at v12 (all columns already in schema above).
--- Existing installs are brought up to v12 by migrate-consolidate.js.
+-- Existing installs are brought up to v20 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -422,6 +425,8 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (15);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (16);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (17);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (18);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (19);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (20);
 
 -- ============================================================
 -- SEED JOBS

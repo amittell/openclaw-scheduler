@@ -83,6 +83,7 @@ function main() {
         delivery_channel: job.delivery?.channel || null,
         delivery_to: job.delivery?.to || null,
         delete_after_run: job.schedule?.kind === 'at',
+        origin: job.origin || 'system',
       });
 
       console.log(`  OK: ${job.name} → cron="${cron}" tz=${tz}`);

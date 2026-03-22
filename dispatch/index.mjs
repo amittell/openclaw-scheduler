@@ -460,7 +460,9 @@ function makeSessionKey(agentId) {
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
- *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call
+ *   --origin <origin>        Required. Where the job was dispatched from (e.g. "telegram:484946046", "system")
+ *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call.
+ *                            Defaults to origin chat ID when --origin is a "telegram:<id>" string.
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
  *   --mode <fresh|reuse>
@@ -486,8 +488,22 @@ async function cmdEnqueue(flags) {
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
-  const deliverTo      = flags['deliver-to']       || null;
-  const deliverChannel = flags['deliver-channel']   || 'telegram';
+  const origin      = flags.origin           || null;
+
+  // ── Auto-derive deliver-to from origin ─────────────────────────────────
+  // If origin is "telegram:<id>", use <id> as the default deliver-to target.
+  let defaultDeliverTo   = null;
+  let defaultDeliverCh   = 'telegram';
+  if (origin) {
+    const originMatch = /^([^:]+):(.+)$/.exec(origin);
+    if (originMatch) {
+      defaultDeliverCh  = originMatch[1];
+      defaultDeliverTo  = originMatch[2];
+    }
+  }
+
+  const deliverTo      = flags['deliver-to']       || defaultDeliverTo;
+  const deliverChannel = flags['deliver-channel']   || defaultDeliverCh || 'telegram';
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
 
@@ -612,6 +628,9 @@ async function cmdEnqueue(flags) {
   parts.push(`---`);
   parts.push(`DELIVERY RULE: Do NOT use the message tool, sessions_send, or any direct messaging to send updates or results to Telegram or any chat. Do NOT reference chat IDs, user IDs, or delivery targets in your work.`);
   parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically.`);
+  if (origin) {
+    parts.push(`Note: This job will be delivered to origin channel: ${origin}`);
+  }
   parts.push(`---`);
 
   const taskMessage = parts.join('\n');
@@ -645,6 +664,7 @@ async function cmdEnqueue(flags) {
       mode:      isFresh ? 'fresh' : 'reuse',
       model:     model || null,
       thinking,
+      origin:         origin || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
       status:         'running',
@@ -712,6 +732,7 @@ async function cmdEnqueue(flags) {
           overlap_policy:           'skip',
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
           run_now:                  true,
+          origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
         execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', jobSpec], {
@@ -750,6 +771,7 @@ async function cmdEnqueue(flags) {
           watchdog_alert_target:    alertTarget,
           watchdog_self_destruct:   1,
           watchdog_started_at:      new Date().toISOString(),
+          origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
         const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
@@ -1524,7 +1546,9 @@ Usage: openclaw-scheduler <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
+           --origin <o>  (required: "telegram:<chat_id>", "telegram:-<group_id>", or "system")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
+           (--deliver-to defaults to origin chat ID when --origin is "telegram:<id>")
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
 
   status   --label <l>

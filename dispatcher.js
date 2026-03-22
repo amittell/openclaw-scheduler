@@ -512,6 +512,7 @@ async function tick() {
             delete_after_run: spec.delete_after_run !== false ? 1 : 0,
             enabled: true,
             run_timeout_ms: spec.run_timeout_ms || 300_000,
+            origin: spec.origin || 'system',
           });
           // Fire immediately
           getDb().prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
