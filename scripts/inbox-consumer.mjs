@@ -53,8 +53,10 @@ function parsePositiveInt(input, fallback) {
 }
 
 function timeAgo(dateStr) {
-  const ts = new Date(`${dateStr}Z`).getTime();
-  if (!Number.isFinite(ts)) return 'unknown';
+  if (!dateStr) return 'unknown';
+  const normalized = dateStr.includes('T') ? dateStr : dateStr.replace(' ', 'T');
+  const ts = new Date(normalized.endsWith('Z') ? normalized : normalized + 'Z').getTime();
+  if (isNaN(ts)) return 'unknown';
   const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   if (sec < 60) return `${sec}s ago`;
   const min = Math.floor(sec / 60);

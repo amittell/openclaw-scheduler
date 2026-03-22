@@ -19,14 +19,14 @@
  *   1 — error
  */
 
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LABELS_PATH = join(__dirname, 'labels.json');
-const INDEX_PATH = join(__dirname, 'index.mjs');
+const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
+const INDEX_PATH  = process.env.DISPATCH_INDEX_PATH  || join(__dirname, 'index.mjs');
 
 const MAX_RETRIES = 3;
 // Only recover errors that happened within the last 60 minutes
@@ -58,7 +58,9 @@ function loadLabels() {
 }
 
 function saveLabels(labels) {
-  writeFileSync(LABELS_PATH, JSON.stringify(labels, null, 2) + '\n');
+  const tmp = LABELS_PATH + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+  renameSync(tmp, LABELS_PATH);
 }
 
 function notify(message) {

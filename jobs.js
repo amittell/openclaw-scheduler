@@ -168,7 +168,6 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
 
   if (mode === 'create') {
-    const isChild = !!merged.parent_id;
     const isAgentTurn =
       !isChild &&
       (merged.payload_kind === 'agentTurn' ||
@@ -438,7 +437,7 @@ export function createJob(opts) {
     normalized.schedule_tz || 'UTC',
     normalized.session_target || 'isolated',
     normalized.agent_id || 'main',
-    normalized.payload_kind || (normalized.session_target === 'main' ? 'systemEvent' : normalized.session_target === 'shell' ? 'shellCommand' : 'agentTurn'),
+    finalKind,
     normalized.payload_message,
     normalized.payload_model || null,
     normalized.payload_thinking || null,
@@ -553,10 +552,10 @@ export function updateJob(id, patch) {
   const sets = [];
   const values = [];
 
-  for (const [key, val] of Object.entries(normalized)) {
-    if (allowed.includes(key)) {
+  for (const key of allowed) {
+    if (key in normalized) {
       sets.push(`${key} = ?`);
-      values.push(val);
+      values.push(normalized[key]);
     }
   }
 
@@ -568,10 +567,10 @@ export function updateJob(id, patch) {
   db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
   // Recalculate next_run_at if schedule changed (cron jobs only)
-  if (normalized.schedule_cron || normalized.schedule_tz) {
-    const job = getJob(id);
-    if (job && job.schedule_kind !== 'at') {
-      const nextRun = job.parent_id ? null : nextRunFromCron(job.schedule_cron, job.schedule_tz);
+  if ((normalized.schedule_cron || normalized.schedule_tz) && current.schedule_cron && current.schedule_kind !== 'at') {
+    const refreshed = getJob(id);
+    if (refreshed && refreshed.schedule_cron && refreshed.schedule_kind !== 'at') {
+      const nextRun = refreshed.parent_id ? null : nextRunFromCron(refreshed.schedule_cron, refreshed.schedule_tz);
       db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
     }
   }
@@ -654,10 +653,11 @@ export function pruneExpiredJobs() {
     WHERE enabled = 0
       AND next_run_at > datetime('now', '+300 days')
   `).run();
-  // Delete any disabled job that's been sitting for >24h since last run (or creation if never ran)
+  // Delete disabled one-shot jobs that have been sitting for >24h since last run (or creation if never ran)
   const aged = db.prepare(`
     DELETE FROM jobs
     WHERE enabled = 0
+      AND delete_after_run = 1
       AND (
         (last_run_at IS NOT NULL AND last_run_at < datetime('now', '-24 hours'))
         OR (last_run_at IS NULL AND created_at < datetime('now', '-24 hours'))
@@ -834,7 +834,7 @@ export function scheduleRetry(job, failedRunId) {
   // Exponential backoff: 30s, 60s, 120s, etc.
   const delaySec = 30 * Math.pow(2, retryCount - 1);
   if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
-    if (!job.parent_id) {
+    if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
       db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
         .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
     } else {
@@ -848,7 +848,7 @@ export function scheduleRetry(job, failedRunId) {
     source_run_id: failedRunId,
     retry_of_run_id: failedRunId,
   });
-  if (!job.parent_id) {
+  if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
     db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
       .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
   } else {

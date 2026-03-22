@@ -26,7 +26,7 @@ All notable changes to this project will be documented in this file.
 - Dispatch subsystem portability: `process.execPath` replaces bare `node`, `__dirname`-relative paths replace hardcoded install paths
 - Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
-- Test baseline updated to 859 passed
+- Test baseline updated to 877 passed (859 main + 18 dispatch)
 - Schema baseline is now v18
 
 ## [0.1.0] -- 2026-03-08

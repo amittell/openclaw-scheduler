@@ -1,4 +1,4 @@
-# dispatch 🌶️
+# dispatch
 
 **Sub-agent dispatch CLI for OpenClaw — native gateway API edition.**
 

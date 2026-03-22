@@ -103,8 +103,9 @@ function snapshot() {
   const stagingFile = join(STAGING_DIR, 'scheduler-snapshot.db');
 
   // Use sqlite3 .backup for a consistent copy (handles WAL correctly)
+  const escapedPath = stagingFile.replace(/'/g, "'\\''");
   if (hasSqlite3()) {
-    const result = runSqlite3(DB_PATH, `.backup '${stagingFile}'`);
+    const result = runSqlite3(DB_PATH, `.backup '${escapedPath}'`);
     if (result === null && !existsSync(stagingFile)) {
       // Fallback: direct copy after WAL checkpoint
       log('warn', 'sqlite3 .backup failed, falling back to file copy');
@@ -145,9 +146,13 @@ function rollup() {
   mkdirSync(STAGING_DIR, { recursive: true });
   const stagingFile = join(STAGING_DIR, 'scheduler-rollup.db');
 
+  const escapedPath = stagingFile.replace(/'/g, "'\\''");
   if (hasSqlite3()) {
-    runSqlite3(DB_PATH, `.backup '${stagingFile}'`) ||
+    const result = runSqlite3(DB_PATH, `.backup '${escapedPath}'`);
+    if (result === null && !existsSync(stagingFile)) {
+      log('warn', 'sqlite3 .backup failed in rollup, falling back to file copy');
       copyFileSync(DB_PATH, stagingFile);
+    }
   } else {
     log('warn', 'sqlite3 not found in PATH, falling back to file copy');
     copyFileSync(DB_PATH, stagingFile);

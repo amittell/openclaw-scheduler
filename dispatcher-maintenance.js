@@ -132,9 +132,6 @@ export function expireStaleMessages({ expireMessages }) {
   expireMessages();
 }
 
-// Backward-compatible alias for callers that still reference the old name.
-export const deliverPendingMessages = expireStaleMessages;
-
 /**
  * Validate that a value does not contain shell metacharacters that could
  * enable injection when interpolated into a shell command string.
@@ -177,6 +174,7 @@ export function ensureAgentInboxJobs({ log, getDb, createJob }) {
       if (existing) continue;
 
       // Validate args are free of shell metacharacters before interpolation
+      assertSafeShellArg(agent.id, 'agent.id');
       assertSafeShellArg(agent.delivery_to, 'delivery_to');
       assertSafeShellArg(agent.delivery_channel, 'delivery_channel');
 

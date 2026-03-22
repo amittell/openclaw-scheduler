@@ -141,7 +141,7 @@ function steerSession(label, staleMins) {
 // ── Main ─────────────────────────────────────────────────────
 
 const args         = parseArgs(process.argv.slice(2));
-const thresholdMin = parsePositiveInt(args['threshold-min'], 45)  // coding tasks regularly take 30m+;
+const thresholdMin = parsePositiveInt(args['threshold-min'], 45);  // coding tasks regularly take 30m+
 const thresholdS   = thresholdMin * 60;
 const limit        = parsePositiveInt(args.limit, 20);
 
@@ -224,7 +224,6 @@ try {
 
     if (state[label]?.alertedAt) {
       // Already alerted -- don't re-steer or re-alert
-      alertRuns.push({ ...r, steerNote: 'steer=previously-alerted' });
       continue;
     }
 

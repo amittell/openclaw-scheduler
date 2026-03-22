@@ -20,7 +20,7 @@ export function runShellCommand(cmd, timeoutMs = 300000) {
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',
-        exitCode: Number.isInteger(err?.code) ? err.code : 0,
+        exitCode: Number.isInteger(err?.code) ? err.code : (err ? 1 : 0),
         signal: err?.signal || null,
         error: err || null,
       });

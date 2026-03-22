@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   max_trigger_fanout INTEGER NOT NULL DEFAULT 25,
 
   -- Delivery
-  delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'none'
+  delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'announce-always' | 'none'
   delivery_channel TEXT,
   delivery_to     TEXT,
   

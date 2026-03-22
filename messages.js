@@ -67,7 +67,6 @@ export function getMessage(id) {
   return msg;
 }
 
-// Typed priority for kind-based sorting (lower number = higher priority)
 /**
  * Get pending messages for an agent (inbox), ordered by typed priority then
  * numeric priority then time.

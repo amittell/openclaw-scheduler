@@ -285,7 +285,7 @@ const healthAlert = evaluateWebhookHealth({
 assert(healthAlert.status === 'ALERT', 'webhook health alert state');
 assert(healthAlert.issues.some(issue => issue.startsWith('pending_update_count=')), 'webhook health flags pending updates');
 assert(healthAlert.recommendation.includes('drop_pending_updates=true'), 'webhook health recommends drop pending repair');
-assert(chooseRepairWebhookUrl({ url: 'https://current.example/hook' }, 'https://expected.example/hook') === 'https://current.example/hook', 'repair uses current webhook url first');
+assert(chooseRepairWebhookUrl({ url: 'https://current.example/hook' }, 'https://expected.example/hook') === 'https://expected.example/hook', 'repair prefers expected webhook url over current');
 assert(chooseRepairWebhookUrl({ url: '' }, 'https://expected.example/hook') === 'https://expected.example/hook', 'repair falls back to expected webhook url');
 
 let webhookCheckFailed = false;
@@ -566,8 +566,8 @@ const pruned = pruneExpiredJobs();
 assert(pruned > 0, 'orphan pruned');
 assert(!getJob(orphan.id), 'orphan removed');
 
-// Aged disabled job cleanup
-const agedJob = createJob({ name: 'AgedDisabled', schedule_cron: '0 12 * * *', payload_message: 'aged', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+// Aged disabled one-shot job cleanup (only delete_after_run=1 jobs are pruned)
+const agedJob = createJob({ name: 'AgedDisabled', schedule_cron: '0 12 * * *', payload_message: 'aged', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system', delete_after_run: 1 });
 updateJob(agedJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
 const pruned2 = pruneExpiredJobs();
 assert(pruned2 > 0, 'aged disabled job pruned');
@@ -828,7 +828,7 @@ const unknownResult = runJobNow('nonexistent-uuid-xxxx');
 assert(unknownResult === undefined || unknownResult === null, 'runJobNow: returns null/undefined for missing id');
 
 // ═══════════════════════════════════════════════════════════
-// SECTION 7: payload_scope (cross-session sub-agent visibility)
+// SECTION 8: payload_scope (cross-session sub-agent visibility)
 // ═══════════════════════════════════════════════════════════
 
 console.log('\n── payload_scope ──');
@@ -1867,8 +1867,8 @@ const updatedShell = getJob(toShellJob.id);
 assert(updatedShell.session_target === 'shell', 'shell job update: session_target persisted');
 assert(updatedShell.payload_message === '/bin/echo updated', 'shell job update: command persisted');
 
-// Shell jobs are pruned like normal jobs (disabled + >24h → deleted)
-updateJob(shellJob.id, { enabled: 0, last_run_at: '2020-01-01 00:00:00' });
+// Shell one-shot jobs are pruned when disabled + >24h + delete_after_run=1
+updateJob(shellJob.id, { enabled: 0, delete_after_run: 1, last_run_at: '2020-01-01 00:00:00' });
 pruneExpiredJobs();
 assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
 
@@ -2159,10 +2159,10 @@ console.log('\n── Origin Field (v20) ──');
     payload_message: 'test',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
-    origin: 'telegram:484946046',
+    origin: 'telegram:1234567890',
   });
-  assert(originJob.origin === 'telegram:484946046', 'createJob stores origin');
-  assert(getJob(originJob.id).origin === 'telegram:484946046', 'getJob returns origin');
+  assert(originJob.origin === 'telegram:1234567890', 'createJob stores origin');
+  assert(getJob(originJob.id).origin === 'telegram:1234567890', 'getJob returns origin');
   deleteJob(originJob.id);
 
   // System origin is accepted
@@ -2184,9 +2184,9 @@ console.log('\n── Origin Field (v20) ──');
     payload_message: 'test',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
-    origin: 'telegram:-5240776892',
+    origin: 'telegram:-1001234567890',
   });
-  assert(groupJob.origin === 'telegram:-5240776892', 'createJob stores group chat origin');
+  assert(groupJob.origin === 'telegram:-1001234567890', 'createJob stores group chat origin');
   deleteJob(groupJob.id);
 
   // Child jobs are exempt from origin requirement
@@ -2264,7 +2264,7 @@ console.log('\n── Delivery Enforcement (v19) ──');
     schedule_cron: '0 9 * * *',
     payload_message: 'test',
     delivery_mode: 'announce',
-    delivery_to: '484946046',
+    delivery_to: '1234567890',
     delivery_channel: 'telegram',
     run_timeout_ms:   300_000, origin: 'system',
   });
@@ -4654,7 +4654,7 @@ console.log('\n── Post-Office Routing: gatewayNotify enqueues to messages ta
     run_id:         'rid-post-office',
     agent:          'main',
     status:         'ok',
-    deliverTo:      '484946046',
+    deliverTo:      '1234567890',
     deliveryChannel: 'telegram',
     summary:        'post-office test completed',
   });
@@ -4692,7 +4692,7 @@ console.log('\n── Post-Office Routing: handleDelivery (announce) enqueues to
     name: 'PostOfficeShellJob',
     delivery_mode: 'announce',
     delivery_channel: 'telegram',
-    delivery_to: '484946046',
+    delivery_to: '1234567890',
   };
   await handleDelivery(announceJob, '✅ shell job done — all tests passed');
 
@@ -4728,7 +4728,7 @@ console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) d
     name: 'SilentJob',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     delivery_channel: 'telegram',
-    delivery_to: '484946046',
+    delivery_to: '1234567890',
   };
   await handleDelivery(noneJob, 'should not be enqueued');
 

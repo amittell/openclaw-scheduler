@@ -17,6 +17,8 @@ function textBytes(value) {
   return Buffer.byteLength(toText(value), 'utf8');
 }
 
+// Note: limits are enforced by character count (UTF-16 code units), not byte count.
+// For ASCII shell output (the common case) these are equivalent.
 function truncateText(value, limit) {
   const text = toText(value).trim();
   if (!text) return { text: '', truncated: false, bytes: 0 };

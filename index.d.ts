@@ -494,7 +494,7 @@ export const runs: {
   updateHeartbeat(id: string): void;
   updateRunSession(id: string, sessionKey: string | null, sessionId: string | null): void;
   getStaleRuns(thresholdSeconds?: number): Array<RunRecord & { job_name: string; job_timeout_ms: number }>;
-  getTimedOutRuns(): Array<RunRecord & { job_name: string }>;
+  getTimedOutRuns(): Array<RunRecord & { job_name: string; job_timeout_ms: number }>;
   getRunningRuns(): Array<RunRecord & { job_name: string; job_timeout_ms: number }>;
   getRunningRunsByPool(poolName: string): Array<RunRecord & { job_name: string }>;
   pruneRuns(keepPerJob?: number): void;

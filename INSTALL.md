@@ -217,6 +217,8 @@ const job = createJob({
   payload_message: 'Reply with exactly: SCHEDULER_OK',
   delivery_mode: 'none',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created smoke test:', job.id);
@@ -240,6 +242,8 @@ const job = createJob({
   delivery_channel: 'telegram',
   delivery_to: 'YOUR_TELEGRAM_ID',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created Telegram test:', job.id);

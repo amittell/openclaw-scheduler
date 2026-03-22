@@ -1,5 +1,5 @@
 // Gateway API client — independent dispatch via chat completions + system events
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -222,8 +222,8 @@ export async function runAgentTurnWithActivityTimeout(opts) {
  */
 export async function sendSystemEvent(text, mode = 'now') {
   try {
-    const result = execSync(
-      `openclaw system event --text ${JSON.stringify(text)} --mode ${mode} --json`,
+    const result = execFileSync(
+      'openclaw', ['system', 'event', '--text', text, '--mode', mode, '--json'],
       { encoding: 'utf8', timeout: 30000 }
     );
     // Strip any non-JSON prefix (e.g. openclaw doctor output) before parsing

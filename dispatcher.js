@@ -75,7 +75,7 @@ import { checkApprovals } from './dispatcher-approvals.js';
 import {
   checkRunHealth,
   checkTaskTrackers,
-  deliverPendingMessages,
+  expireStaleMessages,
   ensureAgentInboxJobs,
 } from './dispatcher-maintenance.js';
 import {
@@ -115,6 +115,7 @@ let lastPrune = 0;
 let lastBackup = 0;
 let lastGatewayCheck = 0;
 let gatewayHealthy = true;
+let lastRollupBackup = 0;
 
 // ── Logging ─────────────────────────────────────────────────
 function log(level, msg, meta) {
@@ -172,10 +173,14 @@ async function replayOrphanedRuns() {
         log('info', `Disabled at-job after replay: ${run.job_name}`, { jobId: run.job_id });
       }
     } else {
-      // at-most-once: just advance the schedule
-      const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
-      if (nextRun) {
-        updateJob(run.job_id, { next_run_at: nextRun });
+      if (run.schedule_kind === 'at') {
+        updateJob(run.job_id, { enabled: false });
+        log('info', `Disabled at-job after crash (at-most-once): ${run.job_name}`, { jobId: run.job_id });
+      } else {
+        const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
+        if (nextRun) {
+          updateJob(run.job_id, { next_run_at: nextRun });
+        }
       }
       log('info', `Marked crashed: ${run.job_name} (at-most-once)`, { runId: run.id });
     }
@@ -512,6 +517,11 @@ async function tick() {
       for (const msg of spawnMsgs) {
         try {
           const spec = JSON.parse(msg.body);
+          if (!spec.payload_message || typeof spec.payload_message !== 'string' || !spec.payload_message.trim()) {
+            log('error', `Spawn message missing payload_message`, { msgId: msg.id, fromAgent: msg.from_agent });
+            markDelivered(msg.id);
+            continue;
+          }
           const child = createJob({
             name: spec.name || `Spawned by ${msg.from_agent}`,
             parent_id: msg.job_id || null,
@@ -558,7 +568,7 @@ async function tick() {
       log('error', `Team gate check error: ${err.message}`);
     }
     try {
-      deliverPendingMessages({ expireMessages });
+      expireStaleMessages({ expireMessages });
     } catch (err) {
       log('error', `Message delivery error: ${err.message}`);
     }
@@ -591,7 +601,7 @@ async function tick() {
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
       // Ensure inbox consumer jobs exist for agents with delivery config
-      ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir: __dirname });
+      ensureAgentInboxJobs({ log, getDb, createJob });
       // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL
       const cpResult = checkpointWal();
       if (cpResult) {
@@ -607,7 +617,8 @@ async function tick() {
   if (backupEnabled && now - lastBackup >= BACKUP_INTERVAL_MS) {
     lastBackup = now;
     try {
-      const isRollup = new Date().getMinutes() < (BACKUP_INTERVAL_MS / 60000);
+      const isRollup = now - lastRollupBackup >= 3600000;
+      if (isRollup) lastRollupBackup = now;
       const mode = isRollup ? 'rollup' : 'snapshot';
       const { execSync } = await import('child_process');
       execSync(`node "${join(__dirname, 'backup.js')}" ${mode}`, {

@@ -7,7 +7,8 @@ import { execFileSync } from 'child_process';
  */
 function commandExists(cmd) {
   try {
-    execFileSync('which', [cmd], { stdio: 'pipe' });
+    const isWin = process.platform === 'win32';
+    execFileSync(isWin ? 'where' : 'which', [cmd], { stdio: 'pipe' });
     return true;
   } catch {
     return false;
@@ -22,8 +23,10 @@ function commandExists(cmd) {
  *  2) $OPENCLAW_HOME/scheduler/dispatch/index.mjs
  *  3) $OPENCLAW_HOME/dispatch/index.mjs
  *
- * Returns { path, useBin } where useBin=true means call via `openclaw-scheduler`
- * directly rather than `node <path>`.
+ * @param {object} env - Environment variables (defaults to process.env).
+ * @param {function} exists - File existence check (defaults to existsSync).
+ * @returns {string} Absolute file path to the dispatch CLI entry point,
+ *   or the bare binary name 'openclaw-scheduler' when found in PATH.
  */
 export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
   const homeDir = env.HOME || '';
