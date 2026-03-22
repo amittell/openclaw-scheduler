@@ -101,6 +101,9 @@ export interface JobSpec {
   watchdog_self_destruct?: number | boolean;
   watchdog_started_at?: string | null;
 
+  // Origin tracking
+  origin?: string | null;
+
   // Convenience flag (create-time only)
   run_now?: boolean;
 

@@ -148,6 +148,11 @@ async function drainMessages(db, deliver) {
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+if (!DELIVERY_TO) {
+  process.stderr.write('[inbox-consumer] missing delivery target; set INBOX_DELIVERY_TO\n');
+  process.exit(1);
+}
+
 try {
   const db = getDb();
 

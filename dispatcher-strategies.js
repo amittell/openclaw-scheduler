@@ -119,7 +119,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       jobId: job.id, runId: ctx.run.id,
       maxQueuedDispatches: job.max_queued_dispatches || 25,
     });
-    return;
+    // Fall through to steps 6-9: updateJobAfterRun, dispatch status, children, dequeue
   }
 
   // 6. Update job state
