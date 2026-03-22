@@ -162,11 +162,14 @@ async function replayOrphanedRuns() {
     }
 
     if (run.delivery_guarantee === 'at-least-once') {
-      // Create a new run with replay_of pointing to the crashed run
-      const newRun = createRun(run.job_id, { run_timeout_ms: run.run_timeout_ms });
-      // Set replay_of on the new run (column may exist from migration)
-      db.prepare(`UPDATE runs SET replay_of = ? WHERE id = ?`).run(run.id, newRun.id);
-      log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, newRunId: newRun.id });
+      // Enqueue a dispatch so the normal dispatch flow creates and executes the replay run
+      const replayDispatch = enqueueDispatch(run.job_id, {
+        kind: 'retry',
+        scheduled_for: sqliteNow(-1000),
+        source_run_id: run.id,
+        retry_of_run_id: run.id,
+      });
+      log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, dispatchId: replayDispatch.id });
       // Prevent infinite re-dispatch of one-shot at-jobs
       if (run.schedule_kind === 'at') {
         updateJob(run.job_id, { enabled: false });

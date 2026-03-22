@@ -76,12 +76,13 @@ async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'teleg
   try {
     const body = `✅ [${label}] done — ${summary}`;
     sendMessage({
-      from_agent: 'dispatch',
-      to_agent:   'main',
-      kind:       'result',
-      subject:    label,
+      from_agent:  'dispatch',
+      to_agent:    'main',
+      kind:        'result',
+      subject:     label,
       body,
-      channel:    deliveryChannel,
+      channel:     deliveryChannel,
+      delivery_to: deliverTo,
     });
   } catch (e) {
     process.stderr.write(`[dispatch-hooks] post-office enqueue failed for ${label}: ${e.message}\n`);
