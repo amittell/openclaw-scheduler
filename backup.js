@@ -27,7 +27,7 @@
  *   node backup.js status       # Show backup stats
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -63,15 +63,32 @@ function mcPath(subpath) {
   return `${MC_ALIAS}/${BUCKET}/${PREFIX}/${subpath}`;
 }
 
-function run(cmd, opts = {}) {
+function hasSqlite3() {
   try {
-    return execSync(cmd, { encoding: 'utf8', timeout: 30000, ...opts }).trim();
+    execFileSync('which', ['sqlite3'], { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runFile(bin, args, opts = {}) {
+  try {
+    return execFileSync(bin, args, { encoding: 'utf8', timeout: 30000, stdio: 'pipe', ...opts }).trim();
   } catch (err) {
     if (!opts.ignoreError) {
-      log('error', `Command failed: ${cmd}\n${err.stderr || err.message}`);
+      log('error', `Command failed: ${bin} ${args.join(' ')}\n${err.stderr || err.message}`);
     }
     return null;
   }
+}
+
+function runSqlite3(dbPath, sqlCmd, opts = {}) {
+  return runFile('sqlite3', [dbPath, sqlCmd], opts);
+}
+
+function runMc(args, opts = {}) {
+  return runFile(MC_BIN, args, opts);
 }
 
 // ── Snapshot (5-min) ────────────────────────────────────────
@@ -86,11 +103,15 @@ function snapshot() {
   const stagingFile = join(STAGING_DIR, 'scheduler-snapshot.db');
 
   // Use sqlite3 .backup for a consistent copy (handles WAL correctly)
-  const backupCmd = `sqlite3 "${DB_PATH}" ".backup '${stagingFile}'"`;
-  const result = run(backupCmd);
-  if (result === null && !existsSync(stagingFile)) {
-    // Fallback: direct copy after WAL checkpoint
-    log('warn', 'sqlite3 .backup failed, falling back to file copy');
+  if (hasSqlite3()) {
+    const result = runSqlite3(DB_PATH, `.backup '${stagingFile}'`);
+    if (result === null && !existsSync(stagingFile)) {
+      // Fallback: direct copy after WAL checkpoint
+      log('warn', 'sqlite3 .backup failed, falling back to file copy');
+      copyFileSync(DB_PATH, stagingFile);
+    }
+  } else {
+    log('warn', 'sqlite3 not found in PATH, falling back to file copy');
     copyFileSync(DB_PATH, stagingFile);
   }
 
@@ -100,7 +121,7 @@ function snapshot() {
   const timeStr = `${String(d.getHours()).padStart(2, '0')}-${String(d.getMinutes()).padStart(2, '0')}`;
   const remotePath = mcPath(`snapshots/${dateStr}/${timeStr}.db`);
 
-  const uploadResult = run(`${MC_BIN} cp "${stagingFile}" "${remotePath}"`);
+  const uploadResult = runMc(['cp', stagingFile, remotePath]);
   if (uploadResult !== null) {
     log('info', `Snapshot shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
   } else {
@@ -123,8 +144,14 @@ function rollup() {
 
   mkdirSync(STAGING_DIR, { recursive: true });
   const stagingFile = join(STAGING_DIR, 'scheduler-rollup.db');
-  run(`sqlite3 "${DB_PATH}" ".backup '${stagingFile}'"`) ||
+
+  if (hasSqlite3()) {
+    runSqlite3(DB_PATH, `.backup '${stagingFile}'`) ||
+      copyFileSync(DB_PATH, stagingFile);
+  } else {
+    log('warn', 'sqlite3 not found in PATH, falling back to file copy');
     copyFileSync(DB_PATH, stagingFile);
+  }
 
   const size = statSync(stagingFile).size;
   const d = now();
@@ -132,7 +159,7 @@ function rollup() {
   const hourStr = String(d.getHours()).padStart(2, '0');
   const remotePath = mcPath(`rollups/${dateStr}/${hourStr}.db`);
 
-  run(`${MC_BIN} cp "${stagingFile}" "${remotePath}"`);
+  runMc(['cp', stagingFile, remotePath]);
   log('info', `Rollup shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
 
   try { unlinkSync(stagingFile); } catch {}
@@ -149,7 +176,7 @@ function pruneSnapshots() {
   const cutoffDate = cutoff.toISOString().slice(0, 10);
 
   // List snapshot date directories
-  const listing = run(`${MC_BIN} ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
+  const listing = runMc(['ls', mcPath('snapshots/'), '--json'], { ignoreError: true });
   if (!listing) return;
 
   let pruned = 0;
@@ -158,7 +185,7 @@ function pruneSnapshots() {
       const obj = JSON.parse(line);
       const dirName = obj.key?.replace(/\/$/, '');
       if (dirName && dirName < cutoffDate) {
-        run(`${MC_BIN} rm --recursive --force "${mcPath(`snapshots/${dirName}/`)}"`, { ignoreError: true });
+        runMc(['rm', '--recursive', '--force', mcPath(`snapshots/${dirName}/`)], { ignoreError: true });
         pruned++;
         log('info', `Pruned snapshot dir: ${dirName}`);
       }
@@ -171,7 +198,7 @@ function pruneRollups() {
   const cutoff = new Date(Date.now() - ROLLUP_RETENTION_DAYS * 86400 * 1000);
   const cutoffDate = cutoff.toISOString().slice(0, 10);
 
-  const listing = run(`${MC_BIN} ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
+  const listing = runMc(['ls', mcPath('rollups/'), '--json'], { ignoreError: true });
   if (!listing) return;
 
   let pruned = 0;
@@ -180,7 +207,7 @@ function pruneRollups() {
       const obj = JSON.parse(line);
       const dirName = obj.key?.replace(/\/$/, '');
       if (dirName && dirName < cutoffDate) {
-        run(`${MC_BIN} rm --recursive --force "${mcPath(`rollups/${dirName}/`)}"`, { ignoreError: true });
+        runMc(['rm', '--recursive', '--force', mcPath(`rollups/${dirName}/`)], { ignoreError: true });
         pruned++;
         log('info', `Pruned rollup dir: ${dirName}`);
       }
@@ -195,14 +222,14 @@ function restore() {
   let latest = null;
 
   // Try rollups first (more reliable)
-  const rollupDirs = run(`${MC_BIN} ls "${mcPath('rollups/')}" --json`, { ignoreError: true });
+  const rollupDirs = runMc(['ls', mcPath('rollups/'), '--json'], { ignoreError: true });
   if (rollupDirs) {
     const dirs = rollupDirs.split('\n').filter(Boolean).map(l => {
       try { return JSON.parse(l).key?.replace(/\/$/, ''); } catch { return null; }
     }).filter(Boolean).sort().reverse();
 
     for (const dir of dirs) {
-      const files = run(`${MC_BIN} ls "${mcPath(`rollups/${dir}/`)}" --json`, { ignoreError: true });
+      const files = runMc(['ls', mcPath(`rollups/${dir}/`), '--json'], { ignoreError: true });
       if (files) {
         const fList = files.split('\n').filter(Boolean).map(l => {
           try { return JSON.parse(l).key; } catch { return null; }
@@ -217,14 +244,14 @@ function restore() {
 
   // Try snapshots if no rollup found
   if (!latest) {
-    const snapDirs = run(`${MC_BIN} ls "${mcPath('snapshots/')}" --json`, { ignoreError: true });
+    const snapDirs = runMc(['ls', mcPath('snapshots/'), '--json'], { ignoreError: true });
     if (snapDirs) {
       const dirs = snapDirs.split('\n').filter(Boolean).map(l => {
         try { return JSON.parse(l).key?.replace(/\/$/, ''); } catch { return null; }
       }).filter(Boolean).sort().reverse();
 
       for (const dir of dirs) {
-        const files = run(`${MC_BIN} ls "${mcPath(`snapshots/${dir}/`)}" --json`, { ignoreError: true });
+        const files = runMc(['ls', mcPath(`snapshots/${dir}/`), '--json'], { ignoreError: true });
         if (files) {
           const fList = files.split('\n').filter(Boolean).map(l => {
             try { return JSON.parse(l).key; } catch { return null; }
@@ -255,16 +282,20 @@ function restore() {
   // Download and replace
   mkdirSync(STAGING_DIR, { recursive: true });
   const downloadPath = join(STAGING_DIR, 'restore.db');
-  const dlResult = run(`${MC_BIN} cp "${latest.path}" "${downloadPath}"`);
+  const dlResult = runMc(['cp', latest.path, downloadPath]);
   if (dlResult === null) {
     log('error', 'Download failed');
     process.exit(1);
   }
 
   // Verify the downloaded DB
-  const verify = run(`sqlite3 "${downloadPath}" "SELECT count(*) FROM jobs"`);
+  if (!hasSqlite3()) {
+    log('error', 'sqlite3 not found in PATH; cannot verify downloaded DB integrity');
+    process.exit(1);
+  }
+  const verify = runSqlite3(downloadPath, 'SELECT count(*) FROM jobs');
   if (verify === null) {
-    log('error', 'Downloaded DB is corrupt');
+    log('error', 'Downloaded DB failed verification (corrupt or missing expected tables)');
     process.exit(1);
   }
 
@@ -288,13 +319,17 @@ function status() {
   if (existsSync(DB_PATH)) {
     const st = statSync(DB_PATH);
     console.log(`Local DB: ${(st.size / 1024).toFixed(1)}KB, modified ${st.mtime.toISOString()}`);
-    const jobCount = run(`sqlite3 "${DB_PATH}" "SELECT count(*) FROM jobs"`) || '?';
-    console.log(`Jobs: ${jobCount}`);
+    if (hasSqlite3()) {
+      const jobCount = runSqlite3(DB_PATH, 'SELECT count(*) FROM jobs') || '?';
+      console.log(`Jobs: ${jobCount}`);
+    } else {
+      console.log('Jobs: ? (sqlite3 not found in PATH)');
+    }
   }
 
   // Snapshots
   console.log('\nSnapshots (last 24h):');
-  const snapDirs = run(`${MC_BIN} ls "${mcPath('snapshots/')}"`, { ignoreError: true });
+  const snapDirs = runMc(['ls', mcPath('snapshots/')], { ignoreError: true });
   if (snapDirs) {
     console.log(snapDirs);
   } else {
@@ -303,15 +338,15 @@ function status() {
 
   // Rollups
   console.log('\nRollups (last 7d):');
-  const rollupDirs = run(`${MC_BIN} ls "${mcPath('rollups/')}"`, { ignoreError: true });
-  if (rollupDirs) {
-    console.log(rollupDirs);
+  const rollupDirsOut = runMc(['ls', mcPath('rollups/')], { ignoreError: true });
+  if (rollupDirsOut) {
+    console.log(rollupDirsOut);
   } else {
     console.log('  (none)');
   }
 
   // Total size
-  const du = run(`${MC_BIN} du "${mcPath('')}"`, { ignoreError: true });
+  const du = runMc(['du', mcPath('')], { ignoreError: true });
   if (du) console.log(`\nTotal backup size: ${du}`);
 }
 

@@ -360,7 +360,7 @@ export function createJob(opts) {
   // Cycle detection + depth check for child jobs
   if (isChild) {
     const depth = getChainDepth(normalized.parent_id) + 1; // +1 for the new child
-    if (depth >= MAX_CHAIN_DEPTH) {
+    if (depth > MAX_CHAIN_DEPTH) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded. Chain would be ${depth} deep.`);
     }
   }
@@ -442,11 +442,11 @@ export function createJob(opts) {
     normalized.payload_message,
     normalized.payload_model || null,
     normalized.payload_thinking || null,
-    normalized.payload_timeout_seconds || 120,
+    normalized.payload_timeout_seconds ?? 120,
     normalized.execution_intent || 'execute',
     normalized.execution_read_only ? 1 : 0,
     normalized.overlap_policy || 'skip',
-    normalized.run_timeout_ms || 300000,
+    normalized.run_timeout_ms ?? 300000,
     normalized.max_queued_dispatches || 25,
     normalized.max_pending_approvals || 10,
     normalized.max_trigger_fanout || 25,
@@ -477,7 +477,7 @@ export function createJob(opts) {
     normalized.job_type || 'standard',
     normalized.watchdog_target_label || null,
     normalized.watchdog_check_cmd || null,
-    normalized.watchdog_timeout_min || null,
+    normalized.watchdog_timeout_min ?? null,
     normalized.watchdog_alert_channel || null,
     normalized.watchdog_alert_target || null,
     normalized.watchdog_self_destruct != null ? (normalized.watchdog_self_destruct ? 1 : 0) : 1,
@@ -545,7 +545,7 @@ export function updateJob(id, patch) {
   if (normalized.parent_id) {
     detectCycle(id, normalized.parent_id);
     const depth = getChainDepth(normalized.parent_id) + 1;
-    if (depth >= MAX_CHAIN_DEPTH) {
+    if (depth > MAX_CHAIN_DEPTH) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded.`);
     }
   }

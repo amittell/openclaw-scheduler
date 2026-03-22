@@ -222,6 +222,12 @@ try {
 
     // ── Phase 2 / Phase 3: Steer or Alert ───────────────────
 
+    if (state[label]?.alertedAt) {
+      // Already alerted -- don't re-steer or re-alert
+      alertRuns.push({ ...r, steerNote: 'steer=previously-alerted' });
+      continue;
+    }
+
     if (!state[label]) {
       // Phase 2: First detection — steer before alerting
       const staleMins = Math.round(r.stale_s / 60);
@@ -259,9 +265,9 @@ try {
           label,
         });
       } else {
-        // Tokens flat since steer → genuinely stuck → alert
+        // Tokens flat since steer -> genuinely stuck -> alert
         alertRuns.push({ ...r, steerNote: 'steer=ignored' });
-        delete state[label];
+        state[label] = { alertedAt: new Date().toISOString() };
         stateChanged = true;
       }
     }

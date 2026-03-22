@@ -59,7 +59,9 @@ export function finishRun(id, status, opts = {}) {
   const run = getRun(id);
   if (!run) return null;
 
-  const startedAt = new Date(run.started_at + 'Z').getTime();
+  const startedAt = run.started_at
+    ? new Date(run.started_at.endsWith('Z') ? run.started_at.replace(' ', 'T') : run.started_at.replace(' ', 'T') + 'Z').getTime()
+    : Date.now();
   const durationMs = Date.now() - startedAt;
 
   db.prepare(`

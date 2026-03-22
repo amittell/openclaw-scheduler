@@ -19,6 +19,9 @@ function sqliteNow() {
  * @returns {{ id: string, name: string, status: string, agents: Array<{agent_label: string, status: string}> }}
  */
 export function createTaskGroup({ name, expectedAgents, timeoutS = 600, createdBy = 'main', deliveryChannel, deliveryTo }) {
+  if (!Array.isArray(expectedAgents) || expectedAgents.length === 0) {
+    throw new Error('expectedAgents must be a non-empty array');
+  }
   const db = getDb();
   const id = randomUUID();
   const now = sqliteNow();
@@ -73,10 +76,9 @@ export function agentStarted(trackerId, agentLabel, sessionKey) {
   const now = sqliteNow();
   db.prepare(`
     UPDATE task_tracker_agents
-    SET status = 'running', started_at = ?, last_heartbeat = ?
-      ${sessionKey ? ', session_key = ?' : ''}
+    SET status = 'running', started_at = ?, last_heartbeat = ?, session_key = COALESCE(?, session_key)
     WHERE tracker_id = ? AND agent_label = ?
-  `).run(...(sessionKey ? [now, now, sessionKey, trackerId, agentLabel] : [now, now, trackerId, agentLabel]));
+  `).run(now, now, sessionKey || null, trackerId, agentLabel);
 }
 
 // ── Register session key (orchestrator sets this after spawning) ──

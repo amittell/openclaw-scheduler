@@ -12,6 +12,9 @@ const VALID_KINDS = new Set([
  * Send a message from one agent to another.
  */
 export function sendMessage(opts) {
+  if (!opts.from_agent) throw new Error('from_agent is required');
+  if (!opts.to_agent) throw new Error('to_agent is required');
+  if (opts.body == null) throw new Error('body is required');
   const db = getDb();
   const id = randomUUID();
   const kind = opts.kind || 'text';
@@ -57,7 +60,9 @@ export function sendMessage(opts) {
 export function getMessage(id) {
   const msg = getDb().prepare('SELECT * FROM messages WHERE id = ?').get(id);
   if (msg && msg.metadata) {
-    try { msg.metadata = JSON.parse(msg.metadata); } catch {}
+    try { msg.metadata = JSON.parse(msg.metadata); } catch (err) {
+      process.stderr.write(`[messages] JSON parse error for metadata: ${err.message}\n`);
+    }
   }
   return msg;
 }
@@ -336,14 +341,16 @@ function addReceipt(messageId, eventType, attempt = null, actor = 'system', deta
       INSERT INTO message_receipts (id, message_id, event_type, attempt, actor, detail)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(randomUUID(), messageId, eventType, attempt, actor, detail);
-  } catch {
-    // Backward compatibility for very old schemas before init/migrate.
+  } catch (err) {
+    process.stderr.write(`[messages] receipt insert error: ${err.message}\n`);
   }
 }
 
 function parseMetadata(msg) {
   if (msg && msg.metadata && typeof msg.metadata === 'string') {
-    try { msg.metadata = JSON.parse(msg.metadata); } catch {}
+    try { msg.metadata = JSON.parse(msg.metadata); } catch (err) {
+      process.stderr.write(`[messages] JSON parse error for metadata: ${err.message}\n`);
+    }
   }
   return msg;
 }

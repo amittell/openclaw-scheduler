@@ -1,9 +1,6 @@
 -- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 20)
 -- Full standalone scheduler + message router
 
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 -- ============================================================
 -- JOBS: scheduled tasks
 -- ============================================================
@@ -258,8 +255,8 @@ CREATE TABLE IF NOT EXISTS delivery_aliases (
 -- These placeholder IDs are non-functional; run `openclaw-scheduler aliases update`
 -- or INSERT your own rows to configure delivery routing.
 INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VALUES
-  ('team_room', 'telegram', '-1000000001', 'Team room (placeholder -- replace with real chat ID)'),
-  ('owner_dm',  'telegram', '1000000001',  'Owner DM (placeholder -- replace with real user ID)');
+  ('team_room', 'telegram', '-1000000001', 'Team room (placeholder -- replace with <your-telegram-chat-id>)'),
+  ('owner_dm',  'telegram', '1000000001',  'Owner DM (placeholder -- replace with <your-telegram-user-id>)');
 
 -- ============================================================
 -- APPROVALS: HITL approval gates (v5)

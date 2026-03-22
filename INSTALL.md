@@ -63,10 +63,10 @@ sudo dnf install gcc gcc-c++ make python3   # Fedora/RHEL
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 960 tests
+SCHEDULER_DB=:memory: node test.js
 ```
 
-**All tests must pass before proceeding.** Total: 960 tests.
+**All tests must pass before proceeding.**
 
 ---
 
@@ -202,6 +202,8 @@ sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 
 ## Step 9: Smoke Tests
 
+> **Note:** These smoke test commands use direct file imports and are for the git-clone install path. For npm installs, use `openclaw-scheduler` CLI commands instead.
+
 ### Isolated dispatch
 ```bash
 cd ~/.openclaw/scheduler
@@ -296,7 +298,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` -- 960/960
+- [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl list | grep scheduler` → running
 - [ ] Log file has startup lines, no errors

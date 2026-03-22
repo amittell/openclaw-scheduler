@@ -33,7 +33,8 @@ export function sqliteNow(offsetMs = 0) {
 }
 
 export function adaptiveDeferralMs(backlogDepth, baseMs = 10000) {
-  const multiplier = Math.max(1, Math.min(12, backlogDepth + 1));
+  const safeDepth = Number.isFinite(backlogDepth) ? backlogDepth : 0;
+  const multiplier = Math.max(1, Math.min(12, safeDepth + 1));
   return Math.min(300000, baseMs * multiplier);
 }
 
@@ -66,11 +67,11 @@ export function matchesSentinel(content, token) {
 export function detectTransientError(content) {
   if (!content || !content.trim()) return false;
   const trimmed = content.trim();
-  if (trimmed.length > 500) return false;
-  return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(trimmed));
+  const testStr = trimmed.length > 500 ? trimmed.slice(0, 500) : trimmed;
+  return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(testStr));
 }
 
 export function getBackoffMs(n) {
   const backoff = [30_000, 60_000, 300_000, 900_000, 3_600_000];
-  return backoff[Math.min(n - 1, backoff.length - 1)];
+  return backoff[Math.min(Math.max(n, 1) - 1, backoff.length - 1)];
 }

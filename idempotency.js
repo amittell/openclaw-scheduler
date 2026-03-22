@@ -7,7 +7,8 @@ import { getDb } from './db.js';
  * Deterministic: same job + same scheduled time = same key.
  */
 export function generateIdempotencyKey(jobId, scheduledTime) {
-  const raw = `${jobId}:${scheduledTime || new Date().toISOString()}`;
+  if (!scheduledTime) throw new Error('scheduledTime is required for deterministic idempotency key');
+  const raw = `${jobId}:${scheduledTime}`;
   return createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 

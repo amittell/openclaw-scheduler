@@ -5,6 +5,7 @@ import { getDb } from './db.js';
  * Register or update an agent.
  */
 export function upsertAgent(id, opts = {}) {
+  if (!id || typeof id !== 'string') throw new Error('Agent id must be a non-empty string');
   const db = getDb();
   db.prepare(`
     INSERT INTO agents (id, name, status, session_key, capabilities)

@@ -9,12 +9,12 @@
  */
 
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 
 // Point config resolution to this directory (chilisaus/config.json)
 const __dir = dirname(fileURLToPath(import.meta.url));
 process.env.DISPATCH_CONFIG_DIR = __dir;
 
 // Import and run the dispatch engine
-const dispatchPath = new URL('../scheduler/dispatch/index.mjs', new URL('file://' + __dir + '/')).pathname;
+const dispatchPath = join(__dir, 'index.mjs');
 await import(dispatchPath);

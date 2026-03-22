@@ -98,12 +98,12 @@ const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // ── Config ──────────────────────────────────────────────────
-const TICK_INTERVAL_MS = parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10);
-const STALE_THRESHOLD_S = parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '90', 10);
-const HEARTBEAT_CHECK_MS = parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || '30000', 10);
-const MESSAGE_DELIVERY_MS = parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS || '15000', 10);
-const PRUNE_INTERVAL_MS = parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10);
-const BACKUP_INTERVAL_MS = parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10); // 5 min
+const TICK_INTERVAL_MS = Math.max(1000, parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10));
+const STALE_THRESHOLD_S = Math.max(10, parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '90', 10));
+const HEARTBEAT_CHECK_MS = Math.max(5000, parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || '30000', 10));
+const MESSAGE_DELIVERY_MS = Math.max(5000, parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS || '15000', 10));
+const PRUNE_INTERVAL_MS = Math.max(60000, parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10));
+const BACKUP_INTERVAL_MS = Math.max(60000, parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10)); // 5 min
 let backupEnabled = process.env.SCHEDULER_BACKUP === '1' || process.env.SCHEDULER_BACKUP === 'true';
 const LOG_PREFIX = '[scheduler]';
 
@@ -113,6 +113,7 @@ let lastHeartbeatCheck = 0;
 let lastMessageDelivery = 0;
 let lastPrune = 0;
 let lastBackup = 0;
+let lastGatewayCheck = 0;
 let gatewayHealthy = true;
 
 // ── Logging ─────────────────────────────────────────────────
@@ -134,7 +135,7 @@ const { handleDelivery } = createDeliveryHelpers({
 async function replayOrphanedRuns() {
   const db = getDb();
   const orphaned = db.prepare(`
-    SELECT r.id, r.job_id, r.dispatch_queue_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms
+    SELECT r.id, r.job_id, r.dispatch_queue_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms, j.schedule_kind
     FROM runs r
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
@@ -165,6 +166,11 @@ async function replayOrphanedRuns() {
       // Set replay_of on the new run (column may exist from migration)
       db.prepare(`UPDATE runs SET replay_of = ? WHERE id = ?`).run(run.id, newRun.id);
       log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, newRunId: newRun.id });
+      // Prevent infinite re-dispatch of one-shot at-jobs
+      if (run.schedule_kind === 'at') {
+        updateJob(run.job_id, { enabled: false });
+        log('info', `Disabled at-job after replay: ${run.job_name}`, { jobId: run.job_id });
+      }
     } else {
       // at-most-once: just advance the schedule
       const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
@@ -242,6 +248,12 @@ async function dispatchJob(job, opts = {}) {
 
 
 // ── Build the prompt sent to the agent ──────────────────────
+/**
+ * Build the prompt sent to the agent for a given job and run.
+ *
+ * Side effect: calls markDelivered() on each pending inbox message injected
+ * into the prompt, so those messages will not be delivered again.
+ */
 function buildJobPrompt(job, run) {
   const parts = [`[scheduler:${job.id} ${job.name}]`];
   const executionNote = buildExecutionIntentNote(job);
@@ -376,7 +388,7 @@ function updateJobAfterRun(job, status) {
   }
 
   // Cron job: advance schedule
-  const nextRun = nextRunFromCron(job.schedule_cron, job.schedule_tz);
+  const nextRun = nextRunFromCron(freshJob.schedule_cron, freshJob.schedule_tz);
   patch.next_run_at = nextRun;
 
   // Backoff for errors
@@ -400,7 +412,8 @@ async function tick() {
   const now = Date.now();
 
   // Gateway health check
-  if (!gatewayHealthy || now % 60000 < TICK_INTERVAL_MS) {
+  if (!gatewayHealthy || now - lastGatewayCheck >= 60000) {
+    lastGatewayCheck = now;
     gatewayHealthy = await checkGatewayHealth();
     if (!gatewayHealthy) {
       log('warn', 'Gateway unreachable — isolated jobs will be deferred; shell/main jobs continue');
@@ -519,7 +532,7 @@ async function tick() {
           markDelivered(msg.id);
           log('info', `Spawned child job: ${child.name}`, { childId: child.id, parentJobId: msg.job_id });
         } catch (e) {
-          log('error', `Spawn message parse error: ${e.message}`);
+          log('error', `Spawn message parse error: ${e.message}`, { msgId: msg.id, fromAgent: msg.from_agent });
           markDelivered(msg.id); // Don't retry bad messages
         }
       }

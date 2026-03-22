@@ -88,7 +88,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       if (result.deliveryOverride) {
         await handleDelivery(job, result.deliveryOverride);
       } else if (result.status === 'error') {
-        const willRetry = job.max_retries > 0 && (ctx.run.retry_count || 0) < job.max_retries;
+        const willRetry = (job.max_retries ?? 0) > 0 && (ctx.run.retry_count || 0) < job.max_retries;
         const retryLabel = willRetry ? 'will retry' : 'no retries configured';
         await handleDelivery(job, `\u26a0\ufe0f Job soft-failed (${retryLabel}): ${job.name}\n\n${deliveryContent}`);
       } else {
@@ -234,7 +234,7 @@ export async function prepareDispatch(job, opts, deps) {
     if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'awaiting_approval');
     log('info', `Approval required for ${job.name} -- awaiting operator`, { approvalId: approval.id, runId: run.id });
     const msg = `\u26a0\ufe0f Job '${job.name}' requires approval.\nApprove: openclaw-scheduler jobs approve ${job.id}\nReject: openclaw-scheduler jobs reject ${job.id}`;
-    await handleDelivery(job, msg);
+    await handleDelivery({ ...job, delivery_mode: 'announce-always' }, msg);
     return null;
   }
 
@@ -290,7 +290,7 @@ export async function prepareDispatch(job, opts, deps) {
   }
 
   // Idempotency key generation
-  const scheduledTime = job.next_run_at;
+  const scheduledTime = job.schedule_at || job.next_run_at;
   let idemKey;
   if (dispatchKind === 'chain') {
     idemKey = generateChainIdempotencyKey(dispatchRecord.source_run_id || dispatchRecord.id, job.id);

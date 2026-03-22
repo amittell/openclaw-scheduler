@@ -128,11 +128,35 @@ export async function checkTaskTrackers({
   }
 }
 
-export function deliverPendingMessages({ expireMessages }) {
+export function expireStaleMessages({ expireMessages }) {
   expireMessages();
 }
 
-export function ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir }) {
+// Backward-compatible alias for callers that still reference the old name.
+export const deliverPendingMessages = expireStaleMessages;
+
+/**
+ * Validate that a value does not contain shell metacharacters that could
+ * enable injection when interpolated into a shell command string.
+ */
+function assertSafeShellArg(val, name) {
+  if (typeof val !== 'string') return;
+  if (/[`$\\;|&<>(){}[\]!#~]/.test(val)) {
+    throw new Error(`${name} contains unsafe shell characters: ${val}`);
+  }
+}
+
+/**
+ * Shell-safe single-quote escaping. Wraps the value in single quotes and
+ * escapes any embedded single quotes using the standard bash idiom
+ * 'foo'\''bar' which ends the current single-quoted string, inserts an
+ * escaped single quote, and reopens single quoting.
+ */
+function sq(val) {
+  return String(val).replace(/'/g, "'\\''");
+}
+
+export function ensureAgentInboxJobs({ log, getDb, createJob }) {
   try {
     const db = getDb();
 
@@ -152,8 +176,13 @@ export function ensureAgentInboxJobs({ log, getDb, createJob, schedulerDir }) {
       const existing = db.prepare('SELECT id FROM jobs WHERE name = ?').get(jobName);
       if (existing) continue;
 
-      // Create the inbox consumer job
-      const consumerCmd = `node ${schedulerDir}/scripts/inbox-consumer.mjs --agent ${agent.id} --to ${agent.delivery_to} --channel ${agent.delivery_channel}`;
+      // Validate args are free of shell metacharacters before interpolation
+      assertSafeShellArg(agent.delivery_to, 'delivery_to');
+      assertSafeShellArg(agent.delivery_channel, 'delivery_channel');
+
+      // Use the bin command registered in package.json so the job does not
+      // embed an absolute filesystem path that would break after upgrades.
+      const consumerCmd = `openclaw-inbox-consumer --agent '${sq(agent.id)}' --to '${sq(agent.delivery_to)}' --channel '${sq(agent.delivery_channel)}'`;
 
       createJob({
         name:             jobName,
