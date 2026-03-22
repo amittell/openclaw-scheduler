@@ -223,14 +223,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
 
   // Origin tracking (v20): required on creation for root (non-child) jobs.
-  // Format convention: "<channel>:<id>" e.g. "telegram:YOUR_USER_ID", "telegram:YOUR_GROUP_ID", or "system" for automated jobs.
+  // Format convention: "<channel>:<id>" e.g. "telegram:484946046", "telegram:-5240776892", or "system" for automated jobs.
   // Child jobs inherit origin context from parent and are exempt from this requirement.
-  // Note: origin is strongly recommended but not enforced here — enforcement happens at the
-  // dispatch CLI layer (cmdEnqueue) where the calling context is always known.
-  if (false && mode === 'create' && !isChild && !merged.origin) {
+  if (mode === 'create' && !isChild && !merged.origin) {
     throw new Error(
       'origin is required on job creation — pass the chat_id or channel identifier where the job was requested from ' +
-      '(e.g. "telegram:YOUR_USER_ID", "telegram:YOUR_GROUP_ID", "system" for automated/cron jobs).'
+      '(e.g. "telegram:484946046", "telegram:-5240776892", "system" for automated/cron jobs).'
     );
   }
   if (mode === 'create' || 'origin' in normalized) {

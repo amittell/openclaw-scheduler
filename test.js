@@ -2101,6 +2101,7 @@ console.log('\n── Job Spec Validation ──');
       schedule_cron: '0 9 * * *',
       payload_message: 'test',
       delivery_mode: 'none', delivery_opt_out_reason: 'test',
+      origin: 'system',
     }, null, 'create');
   } catch (e) {
     threwNoTimeout = e.message.includes('run_timeout_ms is required');
@@ -2115,6 +2116,7 @@ console.log('\n── Job Spec Validation ──');
       payload_message: 'test',
       delivery_mode: 'none', delivery_opt_out_reason: 'test',
       run_timeout_ms: 0,
+      origin: 'system',
     }, null, 'create');
   } catch (e) {
     // assertInt fires for 0 (min=1): "must be an integer >= 1"
@@ -2127,6 +2129,100 @@ console.log('\n── Job Spec Validation ──');
   // run_timeout_ms not required on update (partial patch)
   const noTimeoutUpdate = validateJobSpec({ name: 'patch name only' }, { schedule_cron: '0 9 * * *', payload_message: 'x', run_timeout_ms: 300_000 }, 'update');
   assert(noTimeoutUpdate !== undefined, 'validateJobSpec does not require run_timeout_ms on update');
+}
+
+console.log('\n── Origin Field (v20) ──');
+{
+  // Origin is required on root job creation
+  let threwNoOrigin = false;
+  try {
+    createJob({
+      name: 'NoOriginJob',
+      schedule_cron: '0 9 * * *',
+      payload_message: 'test',
+      delivery_mode: 'none', delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+    });
+  } catch (e) {
+    threwNoOrigin = e.message.includes('origin is required');
+  }
+  assert(threwNoOrigin, 'createJob throws when origin missing on root job');
+
+  // Origin is stored and retrievable
+  const originJob = createJob({
+    name: 'OriginJob',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'telegram:484946046',
+  });
+  assert(originJob.origin === 'telegram:484946046', 'createJob stores origin');
+  assert(getJob(originJob.id).origin === 'telegram:484946046', 'getJob returns origin');
+  deleteJob(originJob.id);
+
+  // System origin is accepted
+  const sysJob = createJob({
+    name: 'SystemOriginJob',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  assert(sysJob.origin === 'system', 'createJob stores "system" origin');
+  deleteJob(sysJob.id);
+
+  // Group chat origin is accepted
+  const groupJob = createJob({
+    name: 'GroupOriginJob',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'telegram:-5240776892',
+  });
+  assert(groupJob.origin === 'telegram:-5240776892', 'createJob stores group chat origin');
+  deleteJob(groupJob.id);
+
+  // Child jobs are exempt from origin requirement
+  const parentForOrigin = createJob({
+    name: 'OriginParent',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'parent',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const childNoOrigin = createJob({
+    name: 'ChildNoOriginRequired',
+    parent_id: parentForOrigin.id,
+    trigger_on: 'success',
+    payload_message: 'child task',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    // no origin — child jobs are exempt
+  });
+  assert(childNoOrigin && childNoOrigin.origin === null, 'child jobs do not require origin');
+  deleteJob(childNoOrigin.id);
+  deleteJob(parentForOrigin.id);
+
+  // origin is not required on update (partial patch)
+  const updateableOriginJob = createJob({
+    name: 'UpdateOrigin',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const updated = updateJob(updateableOriginJob.id, { origin: 'telegram:999' });
+  assert(updated.origin === 'telegram:999', 'updateJob can update origin');
+  deleteJob(updateableOriginJob.id);
+
+  // schema: origin column exists
+  const jCols = getDb().prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  assert(jCols.includes('origin'), 'jobs table has origin column');
 }
 
 console.log('\n── Delivery Enforcement (v19) ──');
@@ -2270,6 +2366,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
     payload_message: 'noop',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300000,
+    origin: 'system',
   });
   const dryRun = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', dryRunSpec, '--dry-run', '--json'], {
     cwd: process.cwd(),
@@ -2291,6 +2388,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
     payload_message: 'real',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300000,
+    origin: 'system',
   });
   const created = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', realSpec, '--json'], {
     cwd: process.cwd(),
@@ -2522,7 +2620,7 @@ console.log('\n── Auth Profile ──');
   assert(caught, 'auth_profile rejects non-string types');
 
   // Whitespace-only auth_profile normalizes to null (via normalizeNullableString)
-  const wsResult = validateJobSpec({ auth_profile: '  ', name: 'ok', schedule_cron: '0 0 * * *', payload_message: 'x', run_timeout_ms: 300_000 }, null, 'create');
+  const wsResult = validateJobSpec({ auth_profile: '  ', name: 'ok', schedule_cron: '0 0 * * *', payload_message: 'x', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
   assert(wsResult.auth_profile === null, 'auth_profile whitespace normalizes to null');
 
   // Validation: reject boolean type
@@ -2634,6 +2732,7 @@ console.log('\n── Migration Guard ──');
   assert(migratedRunCols.includes('shell_exit_code'), 'migration guard backfills shell_exit_code when version marker is already 14');
   assert(migratedRunCols.includes('shell_stdout_path'), 'migration guard backfills shell_stdout_path when version marker is already 14');
   assert(migratedJobCols.includes('execution_intent'), 'migration guard backfills execution_intent when version marker is already 14');
+  assert(migratedJobCols.includes('origin'), 'migration guard backfills origin (v20) when version marker is already 14');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });
