@@ -81,9 +81,7 @@
     "CODE_OF_CONDUCT.md",
     "INSTALL*.md",
     "UNINSTALL.md",
-    "BEST-PRACTICES.md",
-    "ai.openclaw.scheduler.plist",
-    "openclaw-scheduler.service"
+    "BEST-PRACTICES.md"
   ],
   "keywords": [
     "openclaw",
