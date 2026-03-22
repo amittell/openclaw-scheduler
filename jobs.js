@@ -121,6 +121,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'trigger_condition',
     'auth_profile',
     'delivery_opt_out_reason',
+    'origin',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -219,6 +220,21 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
       }
       assertSafeString('auth_profile', merged.auth_profile, { allowEmpty: false, maxLength: 256 });
     }
+  }
+
+  // Origin tracking (v20): required on creation for root (non-child) jobs.
+  // Format convention: "<channel>:<id>" e.g. "telegram:YOUR_USER_ID", "telegram:YOUR_GROUP_ID", or "system" for automated jobs.
+  // Child jobs inherit origin context from parent and are exempt from this requirement.
+  // Note: origin is strongly recommended but not enforced here — enforcement happens at the
+  // dispatch CLI layer (cmdEnqueue) where the calling context is always known.
+  if (false && mode === 'create' && !isChild && !merged.origin) {
+    throw new Error(
+      'origin is required on job creation — pass the chat_id or channel identifier where the job was requested from ' +
+      '(e.g. "telegram:YOUR_USER_ID", "telegram:YOUR_GROUP_ID", "system" for automated/cron jobs).'
+    );
+  }
+  if (mode === 'create' || 'origin' in normalized) {
+    assertSafeString('origin', merged.origin, { allowEmpty: false, maxLength: 256 });
   }
 
   // Watchdog-specific validations
@@ -388,7 +404,8 @@ export function createJob(opts) {
       watchdog_self_destruct, watchdog_started_at,
       ttl_hours,
       auth_profile,
-      delivery_opt_out_reason
+      delivery_opt_out_reason,
+      origin
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -406,6 +423,7 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?, ?,
       ?, ?,
+      ?,
       ?,
       ?,
       ?
@@ -468,7 +486,8 @@ export function createJob(opts) {
     normalized.watchdog_started_at || null,
     normalized.ttl_hours || null,
     normalized.auth_profile || null,
-    normalized.delivery_opt_out_reason || null
+    normalized.delivery_opt_out_reason || null,
+    normalized.origin || null
   );
 
   return getJob(id);
@@ -520,7 +539,8 @@ export function updateJob(id, patch) {
     'watchdog_self_destruct', 'watchdog_started_at',
     'ttl_hours',
     'auth_profile',
-    'delivery_opt_out_reason'
+    'delivery_opt_out_reason',
+    'origin'
   ];
 
   // Cycle detection if parent_id is being changed

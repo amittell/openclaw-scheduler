@@ -157,7 +157,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
     writeLabels(tmpDir, {});
     writeConfig(tmpDir, {
       name: 'test-dispatch',
-      deliverTo: '484946046',
+      deliverTo: '1234567890',
       deliveryChannel: 'telegram',
     });
 
@@ -200,7 +200,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
       assert(call.body?.tool === 'message',          'Test 2: tool=message in gateway call');
       assert(call.body?.args?.action === 'send',     'Test 2: action=send');
       assert(call.body?.args?.channel === 'telegram','Test 2: channel=telegram from config');
-      assert(call.body?.args?.target === '484946046','Test 2: target=deliverTo from config');
+      assert(call.body?.args?.target === '1234567890','Test 2: target=deliverTo from config');
       assert(
         typeof call.body?.args?.message === 'string' &&
         call.body.args.message.includes('unregistered-with-deliver'),
@@ -239,7 +239,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
     });
     writeConfig(tmpDir, {
       name: 'test-dispatch',
-      deliverTo: '484946046',
+      deliverTo: '1234567890',
       deliveryChannel: 'telegram',
     });
 

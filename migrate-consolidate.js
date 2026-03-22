@@ -6,7 +6,7 @@
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
- *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js, migrate-v17.js, migrate-v18.js, migrate-v19.js
+ *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js, migrate-v17.js, migrate-v18.js, migrate-v19.js, migrate-v20.js
  *
  * Safe to run multiple times — all operations are idempotent.
  * Note: schedule_cron NOT NULL constraint cannot be dropped via ALTER TABLE in SQLite.
@@ -95,12 +95,13 @@ export default function migrateConsolidate() {
     && jobColumns.has('auth_profile')
     && jobColumns.has('schedule_kind')
     && jobColumns.has('schedule_at')
-    && jobColumns.has('delivery_opt_out_reason');
+    && jobColumns.has('delivery_opt_out_reason')
+    && jobColumns.has('origin');
   const agentColumns = new Set(db.prepare('PRAGMA table_info(agents)').all().map(c => c.name));
   const hasAgentDelivery = agentColumns.has('delivery_channel')
     && agentColumns.has('delivery_to')
     && agentColumns.has('brand_name');
-  if (current >= 19 && hasLatestColumns && hasAgentDelivery) {
+  if (current >= 20 && hasLatestColumns && hasAgentDelivery) {
     reconcileSeedJobs(db);
     return false;
   }
@@ -196,6 +197,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN schedule_at TEXT DEFAULT NULL`,
     // v19: delivery opt-out reason
     `ALTER TABLE jobs ADD COLUMN delivery_opt_out_reason TEXT DEFAULT NULL`,
+    // v20: origin tracking
+    `ALTER TABLE jobs ADD COLUMN origin TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -426,7 +429,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]) {
     stmt.run(v);
   }
 
@@ -439,7 +442,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v19'
-    : 'DB already at v19 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v20'
+    : 'DB already at v20 — nothing to do'
   );
 }
