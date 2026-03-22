@@ -648,6 +648,8 @@ async function cmdEnqueue(flags) {
       status:         'running',
       summary:        null,
       error:          null,
+      // Fix 3: Store task prompt for gate checks in done (first 2000 chars)
+      taskPrompt:     message.slice(0, 2000),
     });
 
     // Fire dispatch.started hook (best-effort)
@@ -1251,17 +1253,21 @@ function cmdResult(flags) {
  * Sets labels.json status=done so the watcher resolves immediately.
  *
  * Flags:
- *   --label     <string>  Required. Label to mark as done
- *   --summary   <string>  Optional. One-line completion summary
- *   --checklist <json>    Required. JSON object asserting completion status.
- *                         Must include work_complete:true. Optional: tests_passed, pushed.
- *   --sha       <sha>     Optional. Git commit SHA of the final pushed commit.
+ *   --label      <string>  Required. Label to mark as done
+ *   --summary    <string>  Optional. One-line completion summary
+ *   --checklist  <json>    Required. JSON object asserting completion status.
+ *                          Must include work_complete:true. Optional: tests_passed, pushed.
+ *   --sha        <sha>     Optional (required when task involves git ops). Git commit SHA.
+ *   --force-done           Override minimum runtime guard (requires --reason).
+ *   --reason     <string>  Required with --force-done. Explains why short runtime is valid.
  */
 async function cmdDone(flags) {
   const label         = flags.label;
   const rawSummary    = flags.summary || 'completed (agent signal)';
   const sha           = flags.sha || null;
   const checklistRaw  = flags.checklist || null;
+  const forceDone     = !!(flags['force-done']);
+  const forceReason   = flags.reason || null;
   if (!label) die('--label is required', 2);
 
   // Structural completion checklist — replaces planning-phrase guard.
@@ -1315,6 +1321,56 @@ async function cmdDone(flags) {
     summary = rawSummary.slice(0, MAX_SUMMARY);
   }
 
+  const existing = getLabel(label);
+
+  // ── Fix 1: Minimum runtime guard ────────────────────────────────────────
+  // Prevent agents from calling done immediately after spawning before doing
+  // any real work. Threshold scales with the task's configured timeout.
+  if (existing) {
+    const spawnedAtMs   = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : null;
+    if (spawnedAtMs !== null) {
+      const elapsedMs   = Date.now() - spawnedAtMs;
+      const taskTimeout = Number(existing.timeoutSeconds) || 300;
+      const thresholdMs = taskTimeout > 600 ? 120_000 : 60_000;
+
+      if (elapsedMs < thresholdMs) {
+        if (!forceDone) {
+          const elapsedS = Math.round(elapsedMs / 1000);
+          die(
+            `REJECTED: Session ran for only ${elapsedS}s — suspiciously short for this task scope. ` +
+            `If work is genuinely complete, re-run with --force-done --reason "explanation".`,
+            1,
+          );
+        }
+        // --force-done present — require --reason
+        if (!forceReason || !forceReason.trim()) {
+          die(
+            'REJECTED: --force-done requires --reason explaining why short runtime is valid.',
+            1,
+          );
+        }
+        // Log warning for audit trail
+        process.stderr.write(
+          `[${BRAND}] warn: force-done used for label=${label} after ${Math.round(elapsedMs / 1000)}s, reason=${forceReason}\n`,
+        );
+      }
+    }
+  }
+
+  // ── Fix 2: SHA required when task involves git operations ────────────────
+  // If the stored task prompt references git operations, --sha is mandatory.
+  if (existing) {
+    const taskPrompt = existing.taskPrompt || '';
+    const gitPatterns = /git\s+push|force-with-lease|force-push|rebase|cherry-pick/i;
+    if (gitPatterns.test(taskPrompt) && !sha) {
+      die(
+        'REJECTED: Task involves git commits but --sha was not provided. ' +
+        'Pass --sha with the actual HEAD SHA of your pushed branch.',
+        1,
+      );
+    }
+  }
+
   // Validate --sha if provided
   if (sha) {
     // Sanitize: must be a valid git SHA (7–40 hex chars)
@@ -1329,7 +1385,6 @@ async function cmdDone(flags) {
     }
   }
 
-  const existing = getLabel(label);
   if (!existing) {
     // Label was never registered (e.g. direct subagent spawn, not via enqueue).
     // This is not an error — the work completed, the label just wasn't tracked.

@@ -3746,7 +3746,7 @@ console.log('\n── Done Subcommand ──');
       status: 'running',
       agent: 'main',
       mode: 'fresh',
-      spawnedAt: new Date().toISOString(),
+      spawnedAt: new Date(Date.now() - 90_000).toISOString(),
       timeoutSeconds: 300,
     },
   }) + '\n');
@@ -3821,7 +3821,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -3853,7 +3853,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -3892,7 +3892,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -3923,7 +3923,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -3956,7 +3956,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -3986,7 +3986,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4025,7 +4025,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4065,7 +4065,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4105,7 +4105,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4145,7 +4145,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4181,7 +4181,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4214,7 +4214,7 @@ console.log('\n── Done Subcommand ──');
         status: 'running',
         agent: 'main',
         mode: 'fresh',
-        spawnedAt: new Date().toISOString(),
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
       },
     }) + '\n');
@@ -4237,6 +4237,289 @@ console.log('\n── Done Subcommand ──');
     assert(!minimalThrew, 'done with minimal checklist {work_complete:true}: accepted');
     const minimalObj = JSON.parse(minimalOut.trim());
     assert(minimalObj.ok === true, 'done with minimal checklist: ok=true');
+  }
+
+  // ── Fix 1: Minimum runtime guard ────────────────────────────────────────
+
+  console.log('\n  ── Minimum Runtime Guard ──');
+
+  // Test 1: done called within 30s of spawn → rejected with "suspiciously short"
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'premature-done-task': {
+        sessionKey: 'agent:main:subagent:premature-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 10_000).toISOString(), // 10s ago
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwPremature = false;
+    let prematureExitCode = null;
+    let prematureStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'premature-done-task', '--summary', 'quick done',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwPremature = true;
+      prematureExitCode = err.status;
+      prematureStderr = err.stderr || '';
+    }
+    assert(threwPremature, 'runtime-guard: done within 30s → rejected (non-zero exit)');
+    assert(prematureExitCode === 1, 'runtime-guard: done within 30s → exit code 1');
+    assert(prematureStderr.includes('REJECTED'), 'runtime-guard: done within 30s → stderr contains REJECTED');
+    assert(prematureStderr.includes('suspiciously short'), 'runtime-guard: done within 30s → stderr mentions suspiciously short');
+    assert(prematureStderr.includes('--force-done'), 'runtime-guard: done within 30s → stderr mentions --force-done escape hatch');
+    const prematureLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(prematureLabels['premature-done-task'].status === 'running', 'runtime-guard: done within 30s → labels.json NOT updated');
+  }
+
+  // Test 2: done within 30s with --force-done but no --reason → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'force-no-reason-task': {
+        sessionKey: 'agent:main:subagent:force-no-reason-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 10_000).toISOString(), // 10s ago
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let threwForceNoReason = false;
+    let forceNoReasonExitCode = null;
+    let forceNoReasonStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'force-no-reason-task', '--summary', 'quick done',
+        '--checklist', '{"work_complete":true}', '--force-done',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwForceNoReason = true;
+      forceNoReasonExitCode = err.status;
+      forceNoReasonStderr = err.stderr || '';
+    }
+    assert(threwForceNoReason, 'runtime-guard: --force-done without --reason → rejected');
+    assert(forceNoReasonExitCode === 1, 'runtime-guard: --force-done without --reason → exit code 1');
+    assert(forceNoReasonStderr.includes('REJECTED'), 'runtime-guard: --force-done without --reason → stderr REJECTED');
+    assert(forceNoReasonStderr.includes('--reason'), 'runtime-guard: --force-done without --reason → stderr mentions --reason');
+    const forceNoReasonLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(forceNoReasonLabels['force-no-reason-task'].status === 'running', 'runtime-guard: --force-done without --reason → labels.json NOT updated');
+  }
+
+  // Test 3: done within 30s with --force-done --reason "audit only" → accepted
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'force-with-reason-task': {
+        sessionKey: 'agent:main:subagent:force-with-reason-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 10_000).toISOString(), // 10s ago
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let forceWithReasonOut;
+    let forceWithReasonThrew = false;
+    try {
+      forceWithReasonOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'force-with-reason-task', '--summary', 'audit only',
+        '--checklist', '{"work_complete":true}', '--force-done', '--reason', 'audit only — read-only task',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      forceWithReasonThrew = true;
+    }
+    assert(!forceWithReasonThrew, 'runtime-guard: --force-done --reason "audit only" → accepted');
+    const forceWithReasonObj = JSON.parse(forceWithReasonOut.trim());
+    assert(forceWithReasonObj.ok === true, 'runtime-guard: --force-done --reason → ok=true');
+    assert(forceWithReasonObj.status === 'done', 'runtime-guard: --force-done --reason → status=done');
+    const forceWithReasonLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(forceWithReasonLabels['force-with-reason-task'].status === 'done', 'runtime-guard: --force-done --reason → labels.json updated to done');
+  }
+
+  // Test 4: done called after 90s → accepted normally (no --force-done needed)
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'long-running-task': {
+        sessionKey: 'agent:main:subagent:long-running-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(), // 90s ago
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let longRunningOut;
+    let longRunningThrew = false;
+    try {
+      longRunningOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'long-running-task', '--summary', 'work done after 90s',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      longRunningThrew = true;
+    }
+    assert(!longRunningThrew, 'runtime-guard: done after 90s → accepted');
+    const longRunningObj = JSON.parse(longRunningOut.trim());
+    assert(longRunningObj.ok === true, 'runtime-guard: done after 90s → ok=true');
+    assert(longRunningObj.status === 'done', 'runtime-guard: done after 90s → status=done');
+  }
+
+  // ── Fix 2: SHA required when task involves git operations ────────────────
+
+  console.log('\n  ── Git SHA Required Gate ──');
+
+  // Test 5: task prompt contains "git push", --sha omitted → rejected
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'git-task-no-sha': {
+        sessionKey: 'agent:main:subagent:git-no-sha-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Fix the bug, commit and git push to main branch.',
+      },
+    }) + '\n');
+
+    let threwGitNoSha = false;
+    let gitNoShaExitCode = null;
+    let gitNoShaStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'git-task-no-sha', '--summary', 'pushed it',
+        '--checklist', '{"work_complete":true,"pushed":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      threwGitNoSha = true;
+      gitNoShaExitCode = err.status;
+      gitNoShaStderr = err.stderr || '';
+    }
+    assert(threwGitNoSha, 'git-sha-gate: git task without --sha → rejected');
+    assert(gitNoShaExitCode === 1, 'git-sha-gate: git task without --sha → exit code 1');
+    assert(gitNoShaStderr.includes('REJECTED'), 'git-sha-gate: git task without --sha → stderr REJECTED');
+    assert(gitNoShaStderr.includes('--sha'), 'git-sha-gate: git task without --sha → stderr mentions --sha');
+    const gitNoShaLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(gitNoShaLabels['git-task-no-sha'].status === 'running', 'git-sha-gate: git task without --sha → labels.json NOT updated');
+  }
+
+  // Test 6: task prompt contains "git push", --sha provided and valid → accepted
+  {
+    const validShaForGitTest = execFileSync('git', ['rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+      cwd: dirname(fileURLToPath(import.meta.url)),
+    }).trim();
+
+    writeFileSync(doneLabels, JSON.stringify({
+      'git-task-with-sha': {
+        sessionKey: 'agent:main:subagent:git-with-sha-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Fix the bug, commit and git push to main branch.',
+      },
+    }) + '\n');
+
+    let gitWithShaOut;
+    let gitWithShaThrew = false;
+    try {
+      gitWithShaOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'git-task-with-sha', '--summary', 'pushed it',
+        '--checklist', '{"work_complete":true,"pushed":true}',
+        '--sha', validShaForGitTest,
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      gitWithShaThrew = true;
+    }
+    assert(!gitWithShaThrew, 'git-sha-gate: git task with valid --sha → accepted');
+    const gitWithShaObj = JSON.parse(gitWithShaOut.trim());
+    assert(gitWithShaObj.ok === true, 'git-sha-gate: git task with valid --sha → ok=true');
+    assert(gitWithShaObj.status === 'done', 'git-sha-gate: git task with valid --sha → status=done');
+  }
+
+  // Test 7: task prompt has no git operations, --sha omitted → accepted
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'non-git-task-no-sha': {
+        sessionKey: 'agent:main:subagent:non-git-no-sha-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Read the logs and summarize findings.',
+      },
+    }) + '\n');
+
+    let nonGitNoShaOut;
+    let nonGitNoShaThrew = false;
+    try {
+      nonGitNoShaOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'non-git-task-no-sha', '--summary', 'summary done',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      nonGitNoShaThrew = true;
+    }
+    assert(!nonGitNoShaThrew, 'git-sha-gate: non-git task without --sha → accepted');
+    const nonGitNoShaObj = JSON.parse(nonGitNoShaOut.trim());
+    assert(nonGitNoShaObj.ok === true, 'git-sha-gate: non-git task without --sha → ok=true');
+    assert(nonGitNoShaObj.status === 'done', 'git-sha-gate: non-git task without --sha → status=done');
+  }
+
+  // ── Fix 3: taskPrompt stored by enqueue (validated via index.mjs source) ─
+
+  console.log('\n  ── Fix 3: taskPrompt stored ──');
+  {
+    const indexSrc = readFileSync(indexPath, 'utf8');
+    assert(indexSrc.includes('taskPrompt'), 'fix3: index.mjs stores taskPrompt in setLabel');
+    assert(indexSrc.includes('message.slice(0, 2000)'), 'fix3: taskPrompt is first 2000 chars of message');
+    assert(indexSrc.includes('existing.taskPrompt'), 'fix3: done checks existing.taskPrompt for git patterns');
   }
 
   rmSync(tempDone, { recursive: true, force: true });
