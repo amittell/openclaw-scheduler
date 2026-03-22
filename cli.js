@@ -351,6 +351,7 @@ switch (command) {
   case 'runs':
     switch (sub) {
       case 'list': {
+        if (!args[0]) fail('Usage: runs list <job-id> [limit]');
         const runs = getRunsForJob(args[0], parseInt(args[1] || '20', 10));
         const rows = runs.map(r => ({
           id: r.id.slice(0, 8),

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'fs';
+import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 import { resolveSchedulerDbPath } from '../paths.js';
 
@@ -232,6 +233,6 @@ async function main() {
   printResult(result);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main();
 }

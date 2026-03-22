@@ -77,10 +77,10 @@ node -e "require('better-sqlite3')" && echo "OK"
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js  # 960 tests
+SCHEDULER_DB=:memory: node test.js
 ```
 
-**All tests must pass before proceeding.** Total: 960 tests.
+**All tests must pass before proceeding.**
 
 ---
 
@@ -232,6 +232,8 @@ This is the Linux equivalent of macOS LaunchAgent's `RunAtLoad: true` + `KeepAli
 ---
 
 ## Step 9: Smoke Tests
+
+> **Note:** These smoke test commands use direct file imports and are for the git-clone install path. For npm installs, use `openclaw-scheduler` CLI commands instead.
 
 ### Isolated dispatch
 
@@ -473,7 +475,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` → 960/960
+- [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `systemctl --user status openclaw-scheduler` → active (running)
 - [ ] Log file has startup lines, no errors

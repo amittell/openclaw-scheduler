@@ -17,6 +17,9 @@ function cronFromSchedule(schedule) {
   }
   if (schedule.kind === 'every') {
     // Convert interval to approximate cron. everyMs → minutes
+    if (schedule.everyMs < 60000) {
+      console.warn(`  WARN: ${schedule.everyMs}ms interval rounded up to 1 minute (cron minimum)`);
+    }
     const mins = Math.max(1, Math.round(schedule.everyMs / 60000));
     if (mins < 60) return { cron: `*/${mins} * * * *`, tz: schedule.tz || 'America/New_York' };
     const hours = Math.round(mins / 60);

@@ -27,7 +27,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -43,9 +43,6 @@ const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
 const MAX_GW_RESTART_RETRIES = 2; // Max retries for gateway-restart-kill recovery
 
-// Startup grace period before declaring a session as spawn-failure.
-// Sessions take 2-5min to start processing due to LLM API queuing.
-const _STARTUP_GRACE_MS = 300_000; // 5 minutes — reserved for future startup-gate logic
 
 /** How often the watcher writes lastPing to labels.json (heartbeat signal).
  *  The watchdog guard in index.mjs treats pings older than 3× this as stale,
@@ -212,7 +209,9 @@ function loadLabels() {
  * Save labels.json directly.
  */
 function saveLabels(labels) {
-  writeFileSync(LABELS_PATH, JSON.stringify(labels, null, 2) + '\n');
+  const tmp = LABELS_PATH + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
+  renameSync(tmp, LABELS_PATH);
 }
 
 /**
@@ -554,7 +553,7 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
   if (!sessionId) return null;
 
   const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
-  let mtimeMs = null;
+  let mtimeMs;
   try {
     mtimeMs = statSync(jsonlPath).mtimeMs;
   } catch {
@@ -759,7 +758,6 @@ process.on('SIGTERM', () => {
 
 // ── Rolling deadline vars ────────────────────────────────────
 let lastTokens = null;
-let lastActivityAt = Date.now();
 const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
 const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
 
@@ -798,7 +796,6 @@ while (Date.now() < deadline) {
         `[watcher] [${label}] activity detected (${lastTokens}→${currentTokens} tokens), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
       );
     }
-    lastActivityAt = Date.now();
   }
   if (currentTokens !== null) lastTokens = currentTokens;
 

@@ -93,7 +93,7 @@ export async function runAgentTurn(opts) {
  * @param {string} opts.agentId           - Agent ID (default: 'main')
  * @param {string} opts.sessionKey        - Session key for matching activity
  * @param {string} opts.model             - Model override
- * @param {number} opts.idleTimeoutMs     - Per-check idle threshold in ms (default: 120000)
+ * @param {number} opts.idleTimeoutMs     - Per-check idle threshold; session aborts after 2x this value of continuous idle time
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')

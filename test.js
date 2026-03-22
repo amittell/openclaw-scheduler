@@ -614,14 +614,14 @@ assert(getChainDepth(cA.id) === 0, 'root depth = 0');
 assert(getChainDepth(cB.id) === 1, 'child depth = 1');
 assert(getChainDepth(cC.id) === 2, 'grandchild depth = 2');
 
-// Build 10-deep chain, verify 11th blocked
+// Build 11-deep chain, verify 12th blocked (MAX_CHAIN_DEPTH=10, depth > 10 throws)
 let deepParent = createJob({ name: 'D0', schedule_cron: '0 12 * * *', payload_message: 'd', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
-for (let i = 1; i <= 9; i++) {
+for (let i = 1; i <= 10; i++) {
   deepParent = createJob({ name: `D${i}`, parent_id: deepParent.id, trigger_on: 'success', payload_message: `d${i}`, delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 }
 let err4 = false;
-try { createJob({ name: 'D10', parent_id: deepParent.id, trigger_on: 'success', payload_message: 'too deep', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }); } catch { err4 = true; }
-assert(err4, 'depth 11 blocked by MAX_CHAIN_DEPTH');
+try { createJob({ name: 'D11', parent_id: deepParent.id, trigger_on: 'success', payload_message: 'too deep', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }); } catch { err4 = true; }
+assert(err4, 'depth 12 blocked by MAX_CHAIN_DEPTH');
 
 // ═══════════════════════════════════════════════════════════
 // SECTION 4: Retry logic (v3b)
@@ -1911,10 +1911,14 @@ console.log('\n── Transient Error Detection ──');
   assert(!detectTransientError(null), 'ignores: null');
   assert(!detectTransientError(undefined), 'ignores: undefined');
 
-  // Long response with keyword should NOT be flagged (real work mentioning the term)
-  const longResponse = 'I analyzed the system and found that the rate limit configuration needs updating. ' +
-    'Here are my recommendations: '.padEnd(600, 'x');
-  assert(!detectTransientError(longResponse), 'ignores: long response with keyword (>500 chars)');
+  // Long response with keyword only AFTER 500 chars should NOT be flagged
+  const longResponse = 'I analyzed the system and found the configuration needs updating. ' +
+    'Here are my recommendations: '.padEnd(550, 'x') + ' rate limit exceeded';
+  assert(!detectTransientError(longResponse), 'ignores: long response with keyword only after 500 chars');
+
+  // Long response with keyword IN first 500 chars IS flagged (infrastructure error with verbose stack)
+  const longInfraError = 'Error: rate limit exceeded. ' + 'Stack trace details: '.padEnd(600, 'x');
+  assert(detectTransientError(longInfraError), 'detects: long infra error with keyword in first 500 chars');
 
   // TASK_FAILED sentinel tests (uses matchesSentinel from dispatcher-utils.js)
   assert(matchesSentinel('TASK_FAILED', 'TASK_FAILED'), 'TASK_FAILED exact match');
@@ -3596,9 +3600,8 @@ console.log('\n── Sessions.json Detection ──');
   // index.mjs must default to 300_000 (not the old 90_000)
   assert(indexSrc.includes('300_000'), 'STARTUP_GRACE_MS: index.mjs uses 300_000');
   assert(!indexSrc.includes('90_000'), 'STARTUP_GRACE_MS: index.mjs does not use old 90_000');
-  // watcher.mjs must declare STARTUP_GRACE_MS = 300_000
-  assert(watcherSrc.includes('STARTUP_GRACE_MS'), 'STARTUP_GRACE_MS: watcher.mjs declares constant');
-  assert(watcherSrc.includes('300_000'), 'STARTUP_GRACE_MS: watcher.mjs uses 300_000');
+  // watcher.mjs: _STARTUP_GRACE_MS was removed (unused dead code, fix #40)
+  // index.mjs still uses 300_000 for its startup grace logic
 
   // ── 2. readSessionsStore present in both files ───────────────────────────
   assert(indexSrc.includes('readSessionsStore'), 'sessions.json: readSessionsStore in index.mjs');
@@ -3926,7 +3929,6 @@ console.log('\n── Done Subcommand ──');
     }) + '\n');
 
     const longSummary = 'x'.repeat(350);
-    let truncStderr = '';
     const truncOut = execFileSync(process.execPath, [
       indexPath, 'done', '--label', 'trunc-task', '--summary', longSummary,
       '--checklist', '{"work_complete":true}',

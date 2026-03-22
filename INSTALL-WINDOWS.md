@@ -99,7 +99,7 @@ npm install --build-from-source
 $env:SCHEDULER_DB=":memory:"; node test.js
 ```
 
-All 960 tests must pass before continuing.
+All tests must pass before continuing.
 
 ---
 
@@ -178,6 +178,8 @@ pm2 logs openclaw-scheduler --lines 20
 ---
 
 ### Step 8: Smoke Test
+
+> **Note:** These smoke test commands use direct file imports and are for the git-clone install path. For npm installs, use `openclaw-scheduler` CLI commands instead.
 
 ```powershell
 node --input-type=module -e "
@@ -287,7 +289,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` → 960/960
+- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `pm2 status` → openclaw-scheduler is `online`
 - [ ] PM2 log has startup lines, no errors

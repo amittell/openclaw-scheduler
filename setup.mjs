@@ -17,9 +17,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execSync } from 'child_process';
-import { randomUUID } from 'crypto';
+
 import { fileURLToPath } from 'url';
 import { ensureSchedulerDbParent, resolveSchedulerDbPath } from './paths.js';
+import { createJob } from './jobs.js';
+import { initDb } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -191,25 +193,32 @@ if (!deliverTo) {
   skip('You can add jobs manually with: node cli.js jobs add \'{ ... }\'');
 } else {
   try {
-    const Database = (await import('better-sqlite3')).default;
-    const db = new Database(schedulerDbPath);
+    await initDb();
 
-    const existing = db.prepare('SELECT name FROM jobs').all().map(r => r.name);
+    const { listJobs } = await import('./jobs.js');
+    const existingNames = listJobs().map(r => r.name);
 
     // Inbox Consumer
     const icScript = path.join(schedulerPath, 'scripts', 'inbox-consumer.mjs');
     const icName = 'Inbox Consumer';
-    if (existing.includes(icName)) {
+    if (existingNames.includes(icName)) {
       skip(`"${icName}" job already exists`);
     } else if (!fs.existsSync(icScript)) {
       warn(`inbox-consumer.mjs not found at ${icScript}`);
       warn('Install is incomplete. Re-clone scheduler repo or add the job manually.');
     } else {
-      db.prepare(`
-        INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 60, 'announce', 'telegram', ?, datetime('now', '-1 second'))
-      `).run(randomUUID(), icName, '*/5 * * * *', `node ${icScript} --to ${deliverTo}`, deliverTo);
+      createJob({
+        name: icName,
+        schedule_cron: '*/5 * * * *',
+        session_target: 'shell',
+        payload_message: `node ${icScript} --to ${deliverTo}`,
+        payload_timeout_seconds: 60,
+        delivery_mode: 'announce',
+        delivery_channel: 'telegram',
+        delivery_to: deliverTo,
+        run_timeout_ms: 120000,
+        enabled: true,
+      });
       ok(`Created "${icName}" job (*/5 * * * *)`);
     }
 
@@ -217,21 +226,26 @@ if (!deliverTo) {
     const srdName = 'Stuck Run Detector';
     const srdScript = path.join(schedulerPath, 'scripts', 'stuck-run-detector.mjs');
     const srdCmd = `node ${srdScript} --threshold-min 45`;  // coding tasks regularly take 30m+
-    if (existing.includes(srdName)) {
+    if (existingNames.includes(srdName)) {
       skip(`"${srdName}" job already exists`);
     } else if (!fs.existsSync(srdScript)) {
       warn(`stuck-run-detector.mjs not found at ${srdScript}`);
       warn('Install is incomplete. Re-clone scheduler repo or add the job manually.');
     } else {
-      db.prepare(`
-        INSERT INTO jobs (id, name, schedule_cron, enabled, session_target, payload_kind,
-          payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, next_run_at)
-        VALUES (?, ?, ?, 1, 'shell', 'shellCommand', ?, 30, 'announce', 'telegram', ?, datetime('now', '-1 second'))
-      `).run(randomUUID(), srdName, '*/10 * * * *', srdCmd, deliverTo);
+      createJob({
+        name: srdName,
+        schedule_cron: '*/10 * * * *',
+        session_target: 'shell',
+        payload_message: srdCmd,
+        payload_timeout_seconds: 30,
+        delivery_mode: 'announce',
+        delivery_channel: 'telegram',
+        delivery_to: deliverTo,
+        run_timeout_ms: 120000,
+        enabled: true,
+      });
       ok(`Created "${srdName}" job (*/10 * * * *)`);
     }
-
-    db.close();
   } catch (err) {
     warn(`Job creation failed: ${err.message}`);
   }

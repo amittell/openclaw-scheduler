@@ -1,13 +1,13 @@
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 
 /**
  * Check if a binary is available in PATH.
  */
 function commandExists(cmd) {
   try {
-    execSync(`command -v ${cmd}`, { stdio: 'pipe' });
+    execFileSync('which', [cmd], { stdio: 'pipe' });
     return true;
   } catch {
     return false;

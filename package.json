@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
+  "main": "./index.js",
   "bin": {
     "openclaw-scheduler": "bin/openclaw-scheduler.js",
     "openclaw-inbox-consumer": "inbox-consumer.mjs"
@@ -93,7 +94,7 @@
     "agent",
     "automation"
   ],
-  "author": "OpenClaw Community",
+  "author": "Alex Mittell",
   "license": "MIT",
   "repository": {
     "type": "git",

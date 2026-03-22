@@ -38,5 +38,5 @@ export function createDeliveryHelpers({ log, deliverMessage: _deliverMessage, re
     }
   }
 
-  return { resolveAlias, handleDelivery };
+  return { handleDelivery };
 }

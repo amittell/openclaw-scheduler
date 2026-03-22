@@ -102,25 +102,46 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
   if (msgs.length === 0) {
     return 0;
   }
-  const text = formatMessages(msgs, agentId);
-  try {
-    await deliverMessage(channel, to, text);
-  } catch (err) {
-    for (const msg of msgs) {
-      recordMessageAttempt(msg.id, {
-        ok: false,
-        actor: 'inbox-consumer',
-        error: err.message || 'delivery failed',
-      });
-    }
-    throw err;
-  }
+
+  // Group messages by kind for independent delivery attempts
+  const groups = new Map();
   for (const msg of msgs) {
-    recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
-    ackMessage(msg.id, 'inbox-consumer', `Delivered to ${channel}:${to}`);
+    const key = msg.kind || '_default';
+    if (!groups.has(key)) groups.set(key, { msgs: [] });
+    groups.get(key).msgs.push(msg);
   }
-  process.stdout.write(`[inbox-consumer] delivered ${msgs.length} message(s) to ${channel}:${to}\n`);
-  return msgs.length;
+
+  let delivered = 0;
+  const groupErrors = [];
+  for (const [, group] of groups) {
+    try {
+      const text = formatMessages(group.msgs, agentId);
+      await deliverMessage(channel, to, text);
+      for (const msg of group.msgs) {
+        recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
+        ackMessage(msg.id, 'inbox-consumer', `Delivered to ${channel}:${to}`);
+      }
+      delivered += group.msgs.length;
+    } catch (err) {
+      for (const msg of group.msgs) {
+        recordMessageAttempt(msg.id, {
+          ok: false,
+          actor: 'inbox-consumer',
+          error: err.message || 'delivery failed',
+        });
+      }
+      groupErrors.push(err);
+      // continue to next group instead of throwing
+    }
+  }
+
+  if (delivered > 0) {
+    process.stdout.write(`[inbox-consumer] delivered ${delivered} message(s) to ${channel}:${to}\n`);
+  }
+  if (groupErrors.length > 0) {
+    throw new Error(`Delivery failed for ${groupErrors.length} group(s): ${groupErrors.map(e => e.message).join('; ')}`);
+  }
+  return delivered;
 }
 
 const args = parseArgs(process.argv.slice(2));

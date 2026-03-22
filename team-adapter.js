@@ -100,11 +100,18 @@ export function mapTeamMessages(limit = 100) {
     `).run(now, msg.id);
   });
 
+  let mapped = 0;
   for (const msg of msgs) {
-    mapOne(msg);
+    try {
+      mapOne(msg);
+      mapped++;
+    } catch (err) {
+      process.stderr.write(`[team-adapter] mapOne error for msg ${msg.id}: ${err.message}
+`);
+    }
   }
 
-  return msgs.length;
+  return mapped;
 }
 
 export function listTeamTasks(teamId, limit = 50) {
