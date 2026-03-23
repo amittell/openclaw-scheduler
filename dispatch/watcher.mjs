@@ -951,6 +951,8 @@ while (Date.now() < deadline) {
     // When cmdStatus auto-resolves a session as 'interrupted' (idle without
     // calling done), deliver the lastReply for diagnostics but exit non-zero
     // so the scheduler run is marked as error, not success.
+    //
+    // NOTE: Always resolve as 'interrupted', never 'done'. Only agent-side cmdDone may set status=done.
     if (status.status === 'interrupted') {
       process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted — work may be incomplete\n`);
       process.stdout.write(

@@ -4522,6 +4522,318 @@ console.log('\n── Done Subcommand ──');
     assert(indexSrc.includes('existing.taskPrompt'), 'fix3: done checks existing.taskPrompt for git patterns');
   }
 
+  // ── Fix 1 (edge case): Old label with no taskPrompt + git args → warning, NOT rejected ──
+
+  console.log('\n  ── Fix 1: Old label missing taskPrompt (false negative guard) ──');
+  {
+    // Label has NO taskPrompt (enqueued before 6dfa458)
+    writeFileSync(doneLabels, JSON.stringify({
+      'old-label-no-prompt': {
+        sessionKey: 'agent:main:subagent:old-label-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        // No taskPrompt field — simulates label created before guard was added
+      },
+    }) + '\n');
+
+    let oldLabelOut;
+    let oldLabelThrew = false;
+    try {
+      oldLabelOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'old-label-no-prompt',
+        '--summary', 'completed old task',
+        '--checklist', '{"work_complete":true}',
+        // No --sha even though the label conceptually involves git work
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      oldLabelThrew = true;
+    }
+    assert(!oldLabelThrew, 'fix1-old-label: old label (no taskPrompt) → NOT rejected');
+    const oldLabelObj = JSON.parse(oldLabelOut.trim());
+    assert(oldLabelObj.ok === true, 'fix1-old-label: old label (no taskPrompt) → ok=true');
+    assert(oldLabelObj.status === 'done', 'fix1-old-label: old label (no taskPrompt) → status=done');
+    // Warning should be logged to stderr
+    // (We can't easily capture stderr from execFileSync without piping, but we verify behavior is correct)
+    const oldLabelLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(oldLabelLabels['old-label-no-prompt'].status === 'done', 'fix1-old-label: labels.json updated to done');
+    // Verify the warning is in the source
+    const indexSrcFix1 = readFileSync(indexPath, 'utf8');
+    assert(indexSrcFix1.includes('taskPrompt not stored for label='), 'fix1-old-label: warning message present in source');
+    assert(indexSrcFix1.includes('enqueued before guard'), 'fix1-old-label: warning mentions enqueued before guard');
+  }
+
+  // ── Fix 2 (edge case): Tightened regex prevents false positives; actual commands trigger gate ──
+
+  console.log('\n  ── Fix 2: Tightened git regex (prose vs command) ──');
+  {
+    // Test A: standalone "rebase" (no git prefix) → should NOT trigger SHA gate (old regex matched this)
+    writeFileSync(doneLabels, JSON.stringify({
+      'bare-rebase-mention': {
+        sessionKey: 'agent:main:subagent:bare-rebase-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        // The old regex /rebase/i would match this (false positive)
+        // The new regex requires \bgit\s+rebase\b → should NOT match
+        taskPrompt: 'Squash and rebase the commits locally before review.',
+      },
+    }) + '\n');
+
+    let bareRebaseOut;
+    let bareRebaseThrew = false;
+    try {
+      bareRebaseOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'bare-rebase-mention',
+        '--summary', 'reviewed',
+        '--checklist', '{"work_complete":true}',
+        // No --sha — should be accepted since bare "rebase" without "git " prefix is prose
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      bareRebaseThrew = true;
+    }
+    assert(!bareRebaseThrew, 'fix2-bare-rebase: "rebase" without "git " prefix → NOT rejected (old regex false positive fixed)');
+    const bareRebaseObj = JSON.parse(bareRebaseOut.trim());
+    assert(bareRebaseObj.ok === true, 'fix2-bare-rebase: bare rebase mention → ok=true');
+
+    // Test B: "git push origin main" in taskPrompt → SHOULD trigger SHA gate
+    writeFileSync(doneLabels, JSON.stringify({
+      'actual-git-cmd': {
+        sessionKey: 'agent:main:subagent:actual-git-cmd-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Fix the bug then git push origin main to deploy.',
+      },
+    }) + '\n');
+
+    let actualGitThrew = false;
+    let actualGitExitCode = null;
+    let actualGitStderr = '';
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'actual-git-cmd',
+        '--summary', 'pushed changes',
+        '--checklist', '{"work_complete":true}',
+        // No --sha — should be REJECTED since taskPrompt has actual git command
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      actualGitThrew = true;
+      actualGitExitCode = err.status;
+      actualGitStderr = err.stderr || '';
+    }
+    assert(actualGitThrew, 'fix2-actual-cmd: "git push origin main" in taskPrompt → rejected without --sha');
+    assert(actualGitExitCode === 1, 'fix2-actual-cmd: git command → exit code 1');
+    assert(actualGitStderr.includes('REJECTED'), 'fix2-actual-cmd: git command → stderr REJECTED');
+    assert(actualGitStderr.includes('--sha'), 'fix2-actual-cmd: git command → stderr mentions --sha');
+
+    // Also verify the regex is correct in source
+    const indexSrcFix2 = readFileSync(indexPath, 'utf8');
+    assert(
+      indexSrcFix2.includes('/\\bgit\\s+(push|rebase|cherry-pick)\\b|--force-with-lease|--force-push/i'),
+      'fix2-regex: tightened regex present in source',
+    );
+  }
+
+  // ── Fix 3 (edge case): Session activity check via gateway API ──
+
+  console.log('\n  ── Fix 3: Session activity check (idle session guard) ──');
+  {
+    // Verify the implementation is present in source
+    const indexSrcFix3 = readFileSync(indexPath, 'utf8');
+    assert(indexSrcFix3.includes('skip-activity-check'), 'fix3-activity: --skip-activity-check flag present in source');
+    assert(indexSrcFix3.includes('messageCount'), 'fix3-activity: messageCount check present in source');
+    assert(indexSrcFix3.includes('msgCount <= 2'), 'fix3-activity: ≤2 message threshold present in source');
+    assert(indexSrcFix3.includes('session activity check unavailable'), 'fix3-activity: graceful degradation warning present in source');
+
+    // Test: Gateway API unavailable → done accepted with warning (graceful degradation)
+    // In the test environment, no gateway is running, so fetch() will throw ECONNREFUSED.
+    // The done command should succeed (not rejected) and log a warning.
+    writeFileSync(doneLabels, JSON.stringify({
+      'activity-check-no-gw': {
+        sessionKey: 'agent:main:subagent:activity-no-gw-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Do some work and report.',
+      },
+    }) + '\n');
+
+    let noGwOut;
+    let noGwThrew = false;
+    try {
+      noGwOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'activity-check-no-gw',
+        '--summary', 'completed with no gateway',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        // Use a non-existent gateway URL so fetch definitely fails
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      noGwThrew = true;
+    }
+    assert(!noGwThrew, 'fix3-graceful-degradation: gateway API unavailable → done accepted (not rejected)');
+    const noGwObj = JSON.parse(noGwOut.trim());
+    assert(noGwObj.ok === true, 'fix3-graceful-degradation: gateway unavailable → ok=true');
+    assert(noGwObj.status === 'done', 'fix3-graceful-degradation: gateway unavailable → status=done');
+
+    // Test: --skip-activity-check bypasses the activity guard entirely
+    writeFileSync(doneLabels, JSON.stringify({
+      'activity-skip-check': {
+        sessionKey: 'agent:main:subagent:activity-skip-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Read-only task.',
+      },
+    }) + '\n');
+
+    let skipOut;
+    let skipThrew = false;
+    try {
+      skipOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'activity-skip-check',
+        '--summary', 'completed via skip',
+        '--checklist', '{"work_complete":true}',
+        '--skip-activity-check',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      skipThrew = true;
+    }
+    assert(!skipThrew, 'fix3-skip-activity-check: --skip-activity-check → done accepted');
+    const skipObj = JSON.parse(skipOut.trim());
+    assert(skipObj.ok === true, 'fix3-skip-activity-check: ok=true');
+  }
+
+  // ── Fix 4 (edge case): --timeout stored, threshold uses stored value ──
+
+  console.log('\n  ── Fix 4: Stored timeout used for threshold ──');
+  {
+    // Verify the source stores `timeout` in enqueue and reads `existing.timeout` in done
+    const indexSrcFix4 = readFileSync(indexPath, 'utf8');
+    assert(indexSrcFix4.includes('timeout:        timeoutS'), 'fix4: enqueue stores timeout in label entry');
+    assert(indexSrcFix4.includes('existing.timeout'), 'fix4: done reads existing.timeout for threshold');
+    assert(indexSrcFix4.includes('existing.timeout ?? existing.timeoutSeconds'), 'fix4: done falls back to timeoutSeconds');
+
+    // Test 7: label with timeout=3600 → threshold=120s (60s elapsed → still rejected)
+    writeFileSync(doneLabels, JSON.stringify({
+      'long-timeout-task': {
+        sessionKey: 'agent:main:subagent:long-timeout-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 61_000).toISOString(), // 61s ago
+        // timeout=3600 → threshold=120s, so 61s < 120s → should be REJECTED
+        timeout: 3600,
+        timeoutSeconds: 3600,
+      },
+    }) + '\n');
+
+    let longTimeoutThrew = false;
+    let longTimeoutExitCode = null;
+    try {
+      execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'long-timeout-task',
+        '--summary', 'quick done on long task',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      longTimeoutThrew = true;
+      longTimeoutExitCode = err.status;
+    }
+    assert(longTimeoutThrew, 'fix4-timeout-3600: 61s elapsed with timeout=3600 → rejected (threshold=120s)');
+    assert(longTimeoutExitCode === 1, 'fix4-timeout-3600: exit code 1');
+
+    // Test 8: label with timeout=60 → threshold=60s (61s elapsed → should be ACCEPTED)
+    writeFileSync(doneLabels, JSON.stringify({
+      'short-timeout-task': {
+        sessionKey: 'agent:main:subagent:short-timeout-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 61_000).toISOString(), // 61s ago
+        // timeout=60 → threshold=60s, so 61s > 60s → should be ACCEPTED
+        timeout: 60,
+        timeoutSeconds: 60,
+      },
+    }) + '\n');
+
+    let shortTimeoutOut;
+    let shortTimeoutThrew = false;
+    try {
+      shortTimeoutOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'short-timeout-task',
+        '--summary', 'completed short task',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      shortTimeoutThrew = true;
+    }
+    assert(!shortTimeoutThrew, 'fix4-timeout-60: 61s elapsed with timeout=60 → accepted (threshold=60s)');
+    const shortTimeoutObj = JSON.parse(shortTimeoutOut.trim());
+    assert(shortTimeoutObj.ok === true, 'fix4-timeout-60: ok=true');
+    assert(shortTimeoutObj.status === 'done', 'fix4-timeout-60: status=done');
+  }
+
+  // ── Fix 5: Watcher auto-resolve uses 'interrupted' not 'done' (source check) ──
+
+  console.log('\n  ── Fix 5: Watcher uses interrupted not done for auto-resolve ──');
+  {
+    const dispatchDir2 = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+    const watcherSrc = readFileSync(join(dispatchDir2, 'watcher.mjs'), 'utf8');
+    assert(
+      watcherSrc.includes("NOTE: Always resolve as 'interrupted', never 'done'. Only agent-side cmdDone may set status=done."),
+      'fix5: watcher.mjs has required auto-resolve comment',
+    );
+    // The 'interrupted' path uses markLabelError (not markLabelDone)
+    assert(watcherSrc.includes("status.status === 'interrupted'"), 'fix5: watcher handles interrupted status from cmdStatus');
+    assert(watcherSrc.includes('markLabelError(label'), 'fix5: watcher uses markLabelError (not markLabelDone) for interrupted path');
+  }
+
   rmSync(tempDone, { recursive: true, force: true });
 }
 
