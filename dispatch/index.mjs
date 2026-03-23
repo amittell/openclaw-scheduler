@@ -645,10 +645,12 @@ async function cmdEnqueue(flags) {
       origin:         origin || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
+      // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.
+      timeout:        timeoutS,
       status:         'running',
       summary:        null,
       error:          null,
-      // Fix 3: Store task prompt for gate checks in done (first 2000 chars)
+      // Store task prompt for gate checks in done (first 2000 chars)
       taskPrompt:     message.slice(0, 2000),
     });
 
@@ -1330,7 +1332,8 @@ async function cmdDone(flags) {
     const spawnedAtMs   = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : null;
     if (spawnedAtMs !== null) {
       const elapsedMs   = Date.now() - spawnedAtMs;
-      const taskTimeout = Number(existing.timeoutSeconds) || 300;
+      // Fix 4: Use stored timeout from label entry; fall back to timeoutSeconds, then 300.
+      const taskTimeout = Number(existing.timeout ?? existing.timeoutSeconds) || 300;
       const thresholdMs = taskTimeout > 600 ? 120_000 : 60_000;
 
       if (elapsedMs < thresholdMs) {
@@ -1359,15 +1362,30 @@ async function cmdDone(flags) {
 
   // ── Fix 2: SHA required when task involves git operations ────────────────
   // If the stored task prompt references git operations, --sha is mandatory.
+  // Fix 1 (edge case): old labels enqueued before 6dfa458 have no taskPrompt stored.
+  //   When taskPrompt is absent, skip the git-SHA check to avoid breaking existing labels,
+  //   but log a warning so operators know the guard was bypassed.
+  // Fix 2 (edge case): tightened regex uses word boundaries so prose mentions like
+  //   "do NOT use git push" do NOT trigger the gate; only actual commands do.
   if (existing) {
-    const taskPrompt = existing.taskPrompt || '';
-    const gitPatterns = /git\s+push|force-with-lease|force-push|rebase|cherry-pick/i;
-    if (gitPatterns.test(taskPrompt) && !sha) {
-      die(
-        'REJECTED: Task involves git commits but --sha was not provided. ' +
-        'Pass --sha with the actual HEAD SHA of your pushed branch.',
-        1,
+    const taskPrompt = existing.taskPrompt;
+    if (!taskPrompt) {
+      // taskPrompt absent — label enqueued before guard was added; skip check but warn.
+      process.stderr.write(
+        `[${BRAND}] warn: taskPrompt not stored for label=${label} (enqueued before guard), skipping git-SHA check\n`,
       );
+    } else {
+      // Tightened regex: \b word boundaries prevent matching prose mentions.
+      // "do NOT use git push here" → does NOT match.
+      // "git push origin main"     → matches.
+      const gitPatterns = /\bgit\s+(push|rebase|cherry-pick)\b|--force-with-lease|--force-push/i;
+      if (gitPatterns.test(taskPrompt) && !sha) {
+        die(
+          'REJECTED: Task involves git commits but --sha was not provided. ' +
+          'Pass --sha with the actual HEAD SHA of your pushed branch.',
+          1,
+        );
+      }
     }
   }
 
@@ -1382,6 +1400,40 @@ async function cmdDone(flags) {
       execFileSync('git', ['cat-file', '-e', sha + '^{commit}'], { stdio: 'pipe' });
     } catch {
       die(`REJECTED: SHA ${sha} not found in local git. Push your commits before calling done.`, 1);
+    }
+  }
+
+  // ── Fix 3: Session activity check ────────────────────────────────────────
+  // A session that was spawned 2h ago but did nothing (e.g. immediately called done)
+  // would pass the wall-clock guard. Check message count via the gateway sessions API
+  // to catch idle sessions regardless of wall-clock age.
+  // Escape hatches: --force-done (already accepted above) or --skip-activity-check.
+  if (existing && existing.sessionKey && !flags['skip-activity-check'] && !forceDone) {
+    try {
+      const sessionInfoRes = await fetch(
+        `${GATEWAY_URL}/sessions/${existing.sessionKey}`,
+        {
+          headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (sessionInfoRes.ok) {
+        const sessionInfo = await sessionInfoRes.json().catch(() => null);
+        const msgCount = sessionInfo?.messageCount ?? sessionInfo?.messages?.length ?? null;
+        if (msgCount !== null && msgCount <= 2) {
+          die(
+            `REJECTED: Session has only ${msgCount} messages — likely did not complete the assigned work. ` +
+            `Use --force-done --reason if work is genuinely complete, or --skip-activity-check to bypass this check.`,
+            1,
+          );
+        }
+      }
+      // Non-2xx (session not found, etc.) → skip check gracefully
+    } catch (activityErr) {
+      // Gateway API unavailable or timed out — skip check, log warning, do NOT fail.
+      process.stderr.write(
+        `[${BRAND}] warn: session activity check unavailable for label=${label}: ${activityErr.message} — skipping check\n`,
+      );
     }
   }
 
