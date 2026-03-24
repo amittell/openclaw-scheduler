@@ -944,7 +944,9 @@ function cmdStatus(flags) {
     if (sessionEntry) {
       liveness = {
         updatedAt: sessionEntry.updatedAt,
-        ageMs:     sessionEntry.updatedAt ? Date.now() - sessionEntry.updatedAt : null,
+        ageMs:     sessionEntry.updatedAt
+          ? Date.now() - (typeof sessionEntry.updatedAt === 'number' ? sessionEntry.updatedAt : new Date(sessionEntry.updatedAt).getTime())
+          : null,
         sessionId: sessionEntry.sessionId,
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
@@ -1585,7 +1587,9 @@ function cmdHeartbeat(flags) {
     return;
   }
 
-  const ageMs = sessionEntry.updatedAt ? Date.now() - sessionEntry.updatedAt : null;
+  const ageMs = sessionEntry.updatedAt
+    ? Date.now() - (typeof sessionEntry.updatedAt === 'number' ? sessionEntry.updatedAt : new Date(sessionEntry.updatedAt).getTime())
+    : null;
 
   out({
     ok:        true,

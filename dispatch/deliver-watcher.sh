@@ -44,7 +44,7 @@ REPLY=$(echo "$RESULT_JSON" | "$NODE_BIN" -e "
 let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
   try{const r=JSON.parse(d);console.log((r.lastReply||r.summary||'').trim().slice(0,3000));}catch(e){process.stderr.write('parse error: '+e.message+'\\n');}
 });
-" 2>/dev/null || echo "")
+" || echo "")
 
 if [ -n "$REPLY" ]; then
   # Mark as done in labels.json (best-effort)

@@ -167,7 +167,7 @@ export function buildRetrievalContext(job) {
   const lines = ['--- Prior Run Context ---'];
   for (const run of runs) {
     const date = run.started_at || 'unknown';
-    const summaryText = run.context_summary || '';
+    const summaryText = extractSummaryText(run.context_summary) || run.summary || '';
     lines.push(`[${date}] ${summaryText}`);
   }
   lines.push('--- End Prior Run Context ---');

@@ -36,18 +36,16 @@ export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
   // Explicit env override always wins
   if (env.DISPATCH_CLI && exists(env.DISPATCH_CLI)) return env.DISPATCH_CLI;
 
-  // Well-known paths in priority order
+  // Prefer installed bin in PATH (canonical entry point for npm consumers)
+  if (commandExists('openclaw-scheduler')) return 'openclaw-scheduler';
+
+  // Fall back to well-known file paths for dev/manual installs
   const candidates = [
     join(openclawHome, 'scheduler', 'dispatch', 'index.mjs'),
     join(openclawHome, 'dispatch', 'index.mjs'),
   ];
-  const found = candidates.find(p => exists(p));
-  if (found) return found;
 
-  // Fall back to bin in PATH — only when no explicit env or file candidates match
-  if (commandExists('openclaw-scheduler')) return 'openclaw-scheduler';
-
-  return candidates[0] || 'dispatch/index.mjs';
+  return candidates.find(p => exists(p)) || candidates[0] || 'dispatch/index.mjs';
 }
 
 /**

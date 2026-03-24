@@ -336,7 +336,9 @@ switch (command) {
         if (!approval) fail(`No pending approval for job: ${args[0]}`);
         const reason = args.slice(1).join(' ') || null;
         resolveApproval(approval.id, 'rejected', 'operator', reason);
-        finishRun(approval.run_id, 'cancelled', { error_message: reason || 'Rejected by operator' });
+        if (approval.run_id) {
+          finishRun(approval.run_id, 'cancelled', { error_message: reason || 'Rejected by operator' });
+        }
         emit(
           { ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'rejected', reason },
           `Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`

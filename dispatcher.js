@@ -135,7 +135,7 @@ const { handleDelivery } = createDeliveryHelpers({
 async function replayOrphanedRuns() {
   const db = getDb();
   const orphaned = db.prepare(`
-    SELECT r.id, r.job_id, r.dispatch_queue_id, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms, j.schedule_kind
+    SELECT r.id, r.job_id, r.dispatch_queue_id, r.idempotency_key, j.delivery_guarantee, j.name as job_name, j.schedule_cron, j.schedule_tz, j.run_timeout_ms, j.schedule_kind
     FROM runs r
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
@@ -154,10 +154,9 @@ async function replayOrphanedRuns() {
     }
 
     // Release any idempotency key held by the crashed run so replays can reclaim
-    const crashedRunFull = db.prepare('SELECT idempotency_key FROM runs WHERE id = ?').get(run.id);
-    if (crashedRunFull?.idempotency_key) {
-      releaseIdempotencyKey(crashedRunFull.idempotency_key);
-      log('info', `Released idempotency key for crashed run`, { runId: run.id, key: crashedRunFull.idempotency_key.slice(0, 8) });
+    if (run.idempotency_key) {
+      releaseIdempotencyKey(run.idempotency_key);
+      log('info', `Released idempotency key for crashed run`, { runId: run.id, key: run.idempotency_key.slice(0, 8) });
     }
 
     if (run.delivery_guarantee === 'at-least-once') {
