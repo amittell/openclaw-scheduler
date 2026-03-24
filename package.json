@@ -26,7 +26,9 @@
     "lint": "eslint . --max-warnings=0",
     "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs",
     "typecheck": "tsc --project tsconfig.json",
-    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run coverage && npm pack --dry-run"
+    "verify:smoke": "node scripts/verify-local.mjs --smoke",
+    "verify:local": "node scripts/verify-local.mjs",
+    "prepublishOnly": "npm run verify:local"
   },
   "files": [
     "bin",
@@ -42,6 +44,7 @@
     "scripts/stuck-run-detector.mjs",
     "scripts/stuck-detector.sh",
     "scripts/coverage.mjs",
+    "scripts/verify-local.mjs",
     "scripts/telegram-webhook-check.mjs",
     "agents.js",
     "approval.js",
