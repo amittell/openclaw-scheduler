@@ -1433,17 +1433,17 @@ console.log('\n── Schema Baseline ──');
   assert(msgCols.includes('last_error'), 'messages has last_error column');
   assert(msgCols.includes('team_mapped_at'), 'messages has team_mapped_at column');
 
-  // Verify seeded 529 recovery job is runnable and valid for shell dispatch
+  // Verify schema-seeded 529 recovery job (inserted by schema.sql, not test-specific)
+  const recoveryId = '8f2be5bd-b537-48c7-b277-44e934104ddc';
   const recovery = getDb().prepare(`
     SELECT id, enabled, session_target, payload_kind, payload_message, next_run_at
-    FROM jobs
-    WHERE id = '8f2be5bd-b537-48c7-b277-44e934104ddc'
-  `).get();
-  assert(recovery !== undefined, 'seeded 529 recovery job exists');
-  assert(recovery.session_target === 'shell', 'seeded 529 recovery target is shell');
-  assert(recovery.payload_kind === 'shellCommand', 'seeded 529 recovery payload_kind is shellCommand');
-  assert(recovery.payload_message === 'node dispatch/529-recovery.mjs', 'seeded 529 recovery command path is repo-local');
-  assert(recovery.enabled === 0, 'seeded 529 recovery job is disabled by default (opt-in for consumers)');
+    FROM jobs WHERE id = ?
+  `).get(recoveryId);
+  assert(recovery !== undefined, 'schema seeds 529 recovery job');
+  assert(recovery.session_target === 'shell', '529 recovery target is shell');
+  assert(recovery.payload_kind === 'shellCommand', '529 recovery payload_kind is shellCommand');
+  assert(recovery.payload_message === 'node dispatch/529-recovery.mjs', '529 recovery command is repo-local');
+  assert(recovery.enabled === 0, '529 recovery job is disabled by default (opt-in for consumers)');
 }
 
 console.log('\n── v5: Task Tracker ──');

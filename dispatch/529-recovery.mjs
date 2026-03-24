@@ -103,7 +103,8 @@ function respawnSession(label, entry) {
     if (entry?.thinking) args.push('--thinking', entry.thinking);
     if (entry?.deliverTo) {
       args.push('--deliver-to', entry.deliverTo);
-      args.push('--delivery-mode', 'announce');
+      if (entry?.deliveryMode) args.push('--delivery-mode', entry.deliveryMode);
+      if (entry?.deliverChannel) args.push('--deliver-channel', entry.deliverChannel);
     }
 
     execFileSync(process.execPath, args, {

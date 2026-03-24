@@ -138,7 +138,7 @@ export function expireStaleMessages({ expireMessages }) {
  */
 function assertSafeShellArg(val, name) {
   if (typeof val !== 'string') return;
-  if (/[`$\\;|&<>(){}[\]!#~]/.test(val)) {
+  if (/[`$\\;|&<>(){}[\]!#~\n\r]/.test(val)) {
     throw new Error(`${name} contains unsafe shell characters: ${val}`);
   }
 }
