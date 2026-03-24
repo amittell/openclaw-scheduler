@@ -170,11 +170,9 @@ async function replayOrphanedRuns() {
         retry_of_run_id: run.id,
       });
       log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, dispatchId: replayDispatch.id });
-      // Prevent infinite re-dispatch of one-shot at-jobs
-      if (run.schedule_kind === 'at') {
-        updateJob(run.job_id, { enabled: false });
-        log('info', `Disabled at-job after replay: ${run.job_name}`, { jobId: run.job_id });
-      }
+      // Note: at-jobs are disabled by updateJobAfterRun after the replay completes.
+      // Disabling here would cause the replay dispatch to be cancelled by the tick
+      // loop (which skips disabled jobs).
     } else {
       if (run.schedule_kind === 'at') {
         updateJob(run.job_id, { enabled: false });

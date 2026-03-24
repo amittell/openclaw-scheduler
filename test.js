@@ -1438,7 +1438,7 @@ console.log('\n── Schema Baseline ──');
   assert(recovery.session_target === 'shell', 'seeded 529 recovery target is shell');
   assert(recovery.payload_kind === 'shellCommand', 'seeded 529 recovery payload_kind is shellCommand');
   assert(recovery.payload_message === 'node dispatch/529-recovery.mjs', 'seeded 529 recovery command path is repo-local');
-  assert(recovery.next_run_at !== null, 'seeded 529 recovery job is schedulable (next_run_at set)');
+  assert(recovery.enabled === 0, 'seeded 529 recovery job is disabled by default (opt-in for consumers)');
 }
 
 console.log('\n── v5: Task Tracker ──');

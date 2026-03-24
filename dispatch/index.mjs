@@ -706,14 +706,14 @@ async function cmdEnqueue(flags) {
     // completes, outputs result). The scheduler's handleDelivery delivers with
     // retry, alias resolution, and audit trail in scheduler.db.
     // Gateway deliver:true is kept as a fast-path secondary (see deliver flag above).
+    const sq = s => String(s).replace(/'/g, "'\\''");
     let schedulerWatcherOk = false;
     if (deliverTo && deliverMode !== 'none') {
       try {
         const watcherPath = join(__dirname, 'watcher.mjs');
-        const escapedLabel = label.replace(/'/g, "'\\''");
         // Watcher timeout = session timeout + 120s buffer for startup/polling
         const watcherTimeoutS = timeoutS + 120;
-        const watcherCmd = `DISPATCH_LABELS_PATH='${LABELS_PATH}' '${process.execPath}' '${watcherPath}' --label '${escapedLabel}' --timeout ${watcherTimeoutS} --poll-interval 20`;
+        const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -749,7 +749,7 @@ async function cmdEnqueue(flags) {
     let watchdogJobId = null;
     if (monitorEnabled && deliverTo) {
       try {
-        const checkCmd = `'${process.execPath}' '${join(__dirname, 'index.mjs')}' stuck --label '${label.replace(/'/g, "'\\''")}' --threshold-min ${monitorTimeout}`;
+        const checkCmd = `'${sq(process.execPath)}' '${sq(join(__dirname, 'index.mjs'))}' stuck --label '${sq(label)}' --threshold-min ${monitorTimeout}`;
         const alertChannel = deliverChannel || 'telegram';
         const alertTarget  = deliverTo;
         const watchdogSpec = JSON.stringify({

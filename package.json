@@ -6,7 +6,7 @@
   "main": "./index.js",
   "bin": {
     "openclaw-scheduler": "bin/openclaw-scheduler.js",
-    "openclaw-inbox-consumer": "inbox-consumer.mjs"
+    "openclaw-inbox-consumer": "scripts/inbox-consumer.mjs"
   },
   "types": "./index.d.ts",
   "exports": {
@@ -42,6 +42,7 @@
     "scripts/inbox-consumer.mjs",
     "scripts/stuck-run-detector.mjs",
     "scripts/stuck-detector.sh",
+    "scripts/coverage.mjs",
     "scripts/telegram-webhook-check.mjs",
     "agents.js",
     "approval.js",

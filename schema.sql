@@ -441,7 +441,7 @@ INSERT OR IGNORE INTO jobs (
 ) VALUES (
   '8f2be5bd-b537-48c7-b277-44e934104ddc',
   'Dispatch 529 Recovery',
-  1,
+  0,
   '*/10 * * * *',
   'UTC',
   'shell',
@@ -449,7 +449,7 @@ INSERT OR IGNORE INTO jobs (
   'shellCommand',
   'node dispatch/529-recovery.mjs',
   120,
-  datetime('now', '-1 second'),
+  NULL,
   datetime('now'),
   datetime('now')
 );

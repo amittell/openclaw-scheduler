@@ -440,11 +440,17 @@ export async function executeWatchdog(job, ctx, deps) {
     }
     result.skipDelivery = true;
 
-  } else {
+  } else if (exitCode === 0) {
     result.summary = `Watchdog check: target still running (${elapsedMin}min elapsed)`;
     result.skipDelivery = true;
     log('debug', `Watchdog: target still running: ${job.watchdog_target_label}`, {
       jobId: job.id, elapsedMin,
+    });
+  } else {
+    result.summary = `Watchdog check command returned unexpected exit code ${exitCode}`;
+    result.status = 'error';
+    log('warn', `Watchdog: unexpected exit code for ${job.watchdog_target_label}`, {
+      jobId: job.id, exitCode, stderr: stderr.slice(0, 200),
     });
   }
 
