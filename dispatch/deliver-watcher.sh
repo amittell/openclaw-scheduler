@@ -40,11 +40,10 @@ run_dispatch() {
 
 # Check if the agent produced a reply (direct check, no idle threshold)
 RESULT_JSON=$(run_dispatch result --label "$LABEL" 2>/dev/null || echo '{}')
-REPLY=$(echo "$RESULT_JSON" | python3 -c "
-import sys, json
-r = json.load(sys.stdin)
-text = r.get('lastReply') or r.get('summary') or ''
-print(text.strip()[:3000])
+REPLY=$(echo "$RESULT_JSON" | "$NODE_BIN" -e "
+let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+  try{const r=JSON.parse(d);console.log((r.lastReply||r.summary||'').trim().slice(0,3000));}catch{}
+});
 " 2>/dev/null || echo "")
 
 if [ -n "$REPLY" ]; then

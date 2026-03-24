@@ -40,7 +40,7 @@ function deriveErrorMessage(result, timeoutMs) {
 }
 
 function writeOutputArtifact(kind, runId, text, artifactsDir) {
-  if (!runId || !text.trim()) return null;
+  if (!artifactsDir || !runId || !text.trim()) return null;
   const baseDir = ensureArtifactsDir(join(artifactsDir, 'runs', runId));
   const filePath = join(baseDir, `${kind}.txt`);
   writeFileSync(filePath, text, 'utf8');

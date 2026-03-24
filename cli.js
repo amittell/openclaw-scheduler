@@ -3,7 +3,7 @@
 import { readFileSync } from 'fs';
 import { initDb, getDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
-import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
+import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, finishRun } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, listMessageReceipts, getTeamMessages,
@@ -336,7 +336,7 @@ switch (command) {
         if (!approval) fail(`No pending approval for job: ${args[0]}`);
         const reason = args.slice(1).join(' ') || null;
         resolveApproval(approval.id, 'rejected', 'operator', reason);
-        getDb().prepare("UPDATE runs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'awaiting_approval'").run(approval.run_id);
+        finishRun(approval.run_id, 'cancelled', { error_message: reason || 'Rejected by operator' });
         emit(
           { ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'rejected', reason },
           `Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`
@@ -377,7 +377,12 @@ switch (command) {
         const pathField = kind === 'stderr' ? 'shell_stderr_path' : 'shell_stdout_path';
         const textField = kind === 'stderr' ? 'shell_stderr' : 'shell_stdout';
         const filePath = run[pathField];
-        const payload = filePath ? readFileSync(filePath, 'utf8') : (run[textField] || '');
+        let payload;
+        try {
+          payload = filePath ? readFileSync(filePath, 'utf8') : (run[textField] || '');
+        } catch (err) {
+          fail(`Cannot read output file ${filePath}: ${err.message}`);
+        }
         if (jsonMode) {
           emit({ ok: true, run_id: run.id, kind, file_path: filePath || null, content: payload });
         } else {

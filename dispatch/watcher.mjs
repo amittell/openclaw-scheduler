@@ -332,11 +332,14 @@ function respawnSession(label) {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Mark as running again in labels.json
-    labels[label].status = 'running';
-    labels[label].error = null;
-    labels[label].updatedAt = new Date().toISOString();
-    saveLabels(labels);
+    // Reload labels after execFileSync (child may have modified labels.json)
+    const freshLabels = loadLabels();
+    if (freshLabels[label]) {
+      freshLabels[label].status = 'running';
+      freshLabels[label].error = null;
+      freshLabels[label].updatedAt = new Date().toISOString();
+      saveLabels(freshLabels);
+    }
 
     process.stderr.write(`[watcher] respawned [${label}] via send (reuse session)\n`);
     return true;
@@ -850,7 +853,8 @@ while (Date.now() < deadline) {
       await sleep(retryResult.delayMs);
 
       if (respawnSession(label)) {
-        // Session respawned — continue polling loop
+        // Session respawned — reset consecutive failures for the fresh session
+        consecutiveFailures = 0;
         process.stderr.write(`[watcher] [${label}] retry ${retryResult.newRetryCount} dispatched, continuing poll...\n`);
         await sleep(pollS * 1000);
         continue;
