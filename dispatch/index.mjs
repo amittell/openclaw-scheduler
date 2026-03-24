@@ -582,7 +582,7 @@ async function cmdEnqueue(flags) {
   if (deliverTo) {
     parts.push(`---`);
     parts.push(`CHECK_IN: To report progress, use curl:`);
-    parts.push(`GW_TOKEN=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))['gateway']['auth']['token'])")`);
+    parts.push(`GW_TOKEN=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.openclaw/openclaw.json','utf8')).gateway.auth.token)")`);
     parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${deliverChannel || 'telegram'}","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);

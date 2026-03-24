@@ -119,7 +119,7 @@ function snapshot() {
   const size = statSync(stagingFile).size;
   const d = now();
   const dateStr = d.toISOString().slice(0, 10);
-  const timeStr = `${String(d.getHours()).padStart(2, '0')}-${String(d.getMinutes()).padStart(2, '0')}`;
+  const timeStr = `${String(d.getUTCHours()).padStart(2, '0')}-${String(d.getUTCMinutes()).padStart(2, '0')}`;
   const remotePath = mcPath(`snapshots/${dateStr}/${timeStr}.db`);
 
   const uploadResult = runMc(['cp', stagingFile, remotePath]);
@@ -161,7 +161,7 @@ function rollup() {
   const size = statSync(stagingFile).size;
   const d = now();
   const dateStr = d.toISOString().slice(0, 10);
-  const hourStr = String(d.getHours()).padStart(2, '0');
+  const hourStr = String(d.getUTCHours()).padStart(2, '0');
   const remotePath = mcPath(`rollups/${dateStr}/${hourStr}.db`);
 
   runMc(['cp', stagingFile, remotePath]);

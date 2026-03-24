@@ -1,6 +1,6 @@
 import { sendMessage } from './messages.js';
 
-export function createDeliveryHelpers({ log, deliverMessage: _deliverMessage, resolveDeliveryAlias }) {
+export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
   function resolveAlias(target) {
     if (!target) return null;
     return resolveDeliveryAlias(target);

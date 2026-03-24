@@ -1096,14 +1096,19 @@ assert(aliasCols.includes('target'),      'delivery_aliases.target column');
 assert(aliasCols.includes('description'), 'delivery_aliases.description column');
 assert(aliasCols.includes('created_at'),  'delivery_aliases.created_at column');
 
-// Seeded aliases must be present
+// Insert test fixture aliases (no longer seeded in schema — placeholder data removed for npm publish)
+db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
+  .run('team_room', 'telegram', '-1000000001', 'Team room');
+db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
+  .run('owner_dm', 'telegram', '1000000001', 'Owner DM');
+
 const teamRoomRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
-assert(teamRoomRow !== undefined,               'seeded alias: team_room exists');
+assert(teamRoomRow !== undefined,               'fixture alias: team_room exists');
 assert(teamRoomRow?.channel === 'telegram',     'team_room channel = telegram');
 assert(teamRoomRow?.target  === '-1000000001',  'team_room target = -1000000001');
 
 const ownerDmRow = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('owner_dm');
-assert(ownerDmRow !== undefined,              'seeded alias: owner_dm exists');
+assert(ownerDmRow !== undefined,              'fixture alias: owner_dm exists');
 assert(ownerDmRow?.channel === 'telegram',    'owner_dm channel = telegram');
 assert(ownerDmRow?.target  === '1000000001',  'owner_dm target = 1000000001');
 
@@ -1118,7 +1123,7 @@ assert(testRow?.description === 'Test channel',  'alias add: description correct
 
 // List aliases
 const allAliases = db.prepare('SELECT * FROM delivery_aliases ORDER BY alias').all();
-assert(allAliases.length >= 3, 'alias list: at least 3 aliases (2 seeded + 1 added)');
+assert(allAliases.length >= 3, 'alias list: at least 3 aliases (2 fixtures + 1 added)');
 assert(allAliases.some(a => a.alias === 'team_room'), 'alias list: team_room present');
 assert(allAliases.some(a => a.alias === 'owner_dm'),  'alias list: owner_dm present');
 assert(allAliases.some(a => a.alias === 'testchan'),    'alias list: testchan present');
@@ -1177,7 +1182,7 @@ assert(removedRow === undefined, 'alias remove: testchan deleted');
 
 // Seed aliases still intact after removal of different alias
 const stillTeamRoom = db.prepare('SELECT * FROM delivery_aliases WHERE alias = ?').get('team_room');
-assert(stillTeamRoom !== undefined, 'seed alias team_room still intact after other alias removed');
+assert(stillTeamRoom !== undefined, 'fixture alias team_room still intact after other alias removed');
 
 // Upsert (INSERT OR REPLACE) works for alias updates
 db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')

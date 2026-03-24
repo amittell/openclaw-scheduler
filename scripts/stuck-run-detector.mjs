@@ -27,6 +27,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { tmpdir } from 'os';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './dispatch-cli-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -34,7 +35,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ── Paths ────────────────────────────────────────────────────
 
 const LABELS_PATH  = join(__dirname, '..', 'dispatch', 'labels.json');
-const STATE_PATH   = '/tmp/stuck-detector-state.json';
+const STATE_PATH   = process.env.STUCK_STATE_PATH || join(tmpdir(), 'stuck-detector-state.json');
 const DISPATCH_CLI = resolveDispatchCliPath(process.env);
 
 // ── Constants ────────────────────────────────────────────────
