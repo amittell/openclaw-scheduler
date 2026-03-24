@@ -714,7 +714,6 @@ export async function executeStrategy(job, ctx, deps) {
         getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
         dequeueJob(job.id);
-        handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on failure (retry scheduled)');
       } else {
         log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
           jobId: job.id, runId: ctx.run.id,
