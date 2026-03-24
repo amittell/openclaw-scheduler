@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Dispatch subsystem portability: `process.execPath` replaces bare `node`, `__dirname`-relative paths replace hardcoded install paths
 - Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
+- Full validation gate moved into local verification commands (`npm run verify:local` / `npm run verify:smoke`); GitHub Actions now runs a single lightweight smoke job
 - Test baseline updated to 929 passed
 - Schema baseline is now v20
 
