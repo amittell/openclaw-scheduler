@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 - Strategy pattern refactor: decomposed 614-line `dispatchJob` closure into explicit `DispatchContext` + strategy functions (`prepareDispatch`, `executeStrategy`, `finalizeDispatch`) in new `dispatcher-strategies.js`
 - Auth profile resolution for isolated agent turns: `auth_profile` field on jobs supports `'inherit'` (looks up main session profile) or explicit `'provider:label'`
 - Drain-error retry: transient infrastructure errors (HTTP 529) bypass normal retry ladder and re-enqueue immediately
-- One-shot `at`-style scheduling via `schedule_kind: 'at'` and `schedule_at` fields (schema v18)
+- One-shot `at`-style scheduling via `schedule_kind: 'at'` and `schedule_at` fields (schema v20)
 - Complete TypeScript type coverage: 26 previously missing function signatures, 4 corrected return types, 51 missing schema columns added to `index.d.ts`
 - Expanded type smoke tests from 23 to 192+ lines exercising all typed APIs
 - 5 new test coverage areas: dispatcher-utils, dispatch-queue lifecycle, approval timeout/prune/count, run session/context, prompt-context edge cases
@@ -27,7 +27,7 @@ All notable changes to this project will be documented in this file.
 - Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
 - Test baseline updated to 924 passed
-- Schema baseline is now v18
+- Schema baseline is now v20
 
 ## [0.1.0] -- 2026-03-08
 

@@ -13,7 +13,7 @@ const JOBS_JSON = process.env.OPENCLAW_JOBS_JSON
 function cronFromSchedule(schedule) {
   // OpenClaw supports: cron (expr), every (everyMs), at (one-shot ISO)
   if (schedule.kind === 'cron') {
-    return { cron: schedule.expr, tz: schedule.tz || 'America/New_York' };
+    return { cron: schedule.expr, tz: schedule.tz || 'UTC' };
   }
   if (schedule.kind === 'every') {
     // Convert interval to approximate cron. everyMs → minutes
@@ -21,9 +21,9 @@ function cronFromSchedule(schedule) {
       console.warn(`  WARN: ${schedule.everyMs}ms interval rounded up to 1 minute (cron minimum)`);
     }
     const mins = Math.max(1, Math.round(schedule.everyMs / 60000));
-    if (mins < 60) return { cron: `*/${mins} * * * *`, tz: schedule.tz || 'America/New_York' };
+    if (mins < 60) return { cron: `*/${mins} * * * *`, tz: schedule.tz || 'UTC' };
     const hours = Math.round(mins / 60);
-    return { cron: `0 */${hours} * * *`, tz: schedule.tz || 'America/New_York' };
+    return { cron: `0 */${hours} * * *`, tz: schedule.tz || 'UTC' };
   }
   if (schedule.kind === 'at') {
     // One-shot: create a cron that fires once (we'll mark delete_after_run)

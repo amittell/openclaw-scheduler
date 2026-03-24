@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 877 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 928 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -136,7 +136,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 924 passed, 0 failed
+npm test                             # should print: 928 passed, 0 failed
 npm run lint                         # static checks
 npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
@@ -827,7 +827,7 @@ openclaw-scheduler agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 18 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 20 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -1097,7 +1097,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v18`).
+As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v20`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1114,7 +1114,7 @@ As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (basel
 
 | Version | Date | Schema | Key changes |
 |---------|------|--------|-------------|
-| 0.2.0 | 2026-03-11 | v18 | Dispatch `done` hardening, auth profile support, one-shot `at` scheduling, expanded type coverage, UTC scheduling defaults, and portability/runtime fixes |
+| 0.2.0 | 2026-03-11 | v20 | Dispatch `done` hardening, auth profile support, one-shot `at` scheduling, expanded type coverage, UTC scheduling defaults, and portability/runtime fixes |
 | 0.1.0 | 2026-03-08 | v14 | First public release: workflow engine, structured shell failure triage, watchdog jobs, output offloading, execution-intent controls, safer migration checks, and public-release cleanup |
 
 ### Pre-public development milestones
@@ -1167,8 +1167,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v18) — all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v18
+├── schema.sql             # Complete schema (v20) — all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v20
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -1206,7 +1206,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (877 tests, in-memory SQLite)
+# Run all tests (928 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:

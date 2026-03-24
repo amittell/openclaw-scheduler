@@ -41,6 +41,7 @@
     "scripts/dispatch-cli-utils.mjs",
     "scripts/inbox-consumer.mjs",
     "scripts/stuck-run-detector.mjs",
+    "scripts/stuck-detector.sh",
     "scripts/telegram-webhook-check.mjs",
     "agents.js",
     "approval.js",
