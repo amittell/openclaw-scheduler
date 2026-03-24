@@ -37,6 +37,8 @@ import { onStarted, onFinished, onStuck } from './hooks.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
+let labelsCache = null;
+let labelsCacheSignature = null;
 
 // ── Invocation Directory ─────────────────────────────────────
 // When invoked via symlink (e.g. my-brand/index.mjs -> dispatch/index.mjs),
@@ -140,11 +142,29 @@ function taskRequiresGitSha(taskPrompt) {
 
 // ── Labels Ledger ────────────────────────────────────────────
 
-function loadLabels() {
+function getLabelsSignature() {
   try {
-    return JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    const stats = statSync(LABELS_PATH);
+    return `${stats.mtimeMs}:${stats.size}`;
   } catch {
-    return {};
+    return 'missing';
+  }
+}
+
+function loadLabels() {
+  const signature = getLabelsSignature();
+  if (labelsCache && labelsCacheSignature === signature) {
+    return labelsCache;
+  }
+  try {
+    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    labelsCache = labels;
+    labelsCacheSignature = signature;
+    return labels;
+  } catch {
+    labelsCache = {};
+    labelsCacheSignature = 'missing';
+    return labelsCache;
   }
 }
 
@@ -152,6 +172,17 @@ function saveLabels(labels) {
   const tmp = LABELS_PATH + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
   renameSync(tmp, LABELS_PATH);
+  labelsCache = labels;
+  labelsCacheSignature = getLabelsSignature();
+}
+
+function mutateLabels(mutator) {
+  const labels = loadLabels();
+  const changed = mutator(labels);
+  if (changed !== false) {
+    saveLabels(labels);
+  }
+  return labels;
 }
 
 function getLabel(name) {
@@ -159,9 +190,9 @@ function getLabel(name) {
 }
 
 function setLabel(name, data) {
-  const labels = loadLabels();
-  labels[name] = { ...labels[name], ...data, updatedAt: new Date().toISOString() };
-  saveLabels(labels);
+  const labels = mutateLabels((current) => {
+    current[name] = { ...current[name], ...data, updatedAt: new Date().toISOString() };
+  });
   return labels[name];
 }
 

@@ -26,7 +26,7 @@
     "lint": "eslint . --max-warnings=0",
     "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs",
     "typecheck": "tsc --project tsconfig.json",
-    "prepublishOnly": "npm test && npm run typecheck"
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run coverage && npm pack --dry-run"
   },
   "files": [
     "bin",

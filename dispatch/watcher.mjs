@@ -37,6 +37,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
 const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
 const HOME_DIR = process.env.HOME || homedir();
+let labelsCache = null;
+let labelsCacheSignature = null;
 
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
@@ -199,11 +201,29 @@ function isGatewayRestartKill(summary) {
 /**
  * Load labels.json directly (avoids going through CLI for speed).
  */
-function loadLabels() {
+function getLabelsSignature() {
   try {
-    return JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    const stats = statSync(LABELS_PATH);
+    return `${stats.mtimeMs}:${stats.size}`;
   } catch {
-    return {};
+    return 'missing';
+  }
+}
+
+function loadLabels() {
+  const signature = getLabelsSignature();
+  if (labelsCache && labelsCacheSignature === signature) {
+    return labelsCache;
+  }
+  try {
+    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    labelsCache = labels;
+    labelsCacheSignature = signature;
+    return labels;
+  } catch {
+    labelsCache = {};
+    labelsCacheSignature = 'missing';
+    return labelsCache;
   }
 }
 
@@ -214,6 +234,27 @@ function saveLabels(labels) {
   const tmp = LABELS_PATH + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
   renameSync(tmp, LABELS_PATH);
+  labelsCache = labels;
+  labelsCacheSignature = getLabelsSignature();
+}
+
+function mutateLabels(mutator) {
+  const labels = loadLabels();
+  const changed = mutator(labels);
+  if (changed !== false) {
+    saveLabels(labels);
+  }
+  return labels;
+}
+
+function updateExistingLabel(label, mutator) {
+  return mutateLabels((labels) => {
+    if (!labels[label]) return false;
+    const changed = mutator(labels[label], labels);
+    if (changed === false) return false;
+    labels[label].updatedAt = new Date().toISOString();
+    return true;
+  });
 }
 
 /**
@@ -228,12 +269,9 @@ function getRetryCount(label) {
  * Update retryCount for a label.
  */
 function setRetryCount(label, count) {
-  const labels = loadLabels();
-  if (labels[label]) {
-    labels[label].retryCount = count;
-    labels[label].updatedAt = new Date().toISOString();
-    saveLabels(labels);
-  }
+  updateExistingLabel(label, (entry) => {
+    entry.retryCount = count;
+  });
 }
 
 /**
@@ -248,12 +286,9 @@ function getGwRestartRetryCount(label) {
  * Update the gateway-restart retry count for a label.
  */
 function setGwRestartRetryCount(label, count) {
-  const labels = loadLabels();
-  if (labels[label]) {
-    labels[label].gwRestartRetryCount = count;
-    labels[label].updatedAt = new Date().toISOString();
-    saveLabels(labels);
-  }
+  updateExistingLabel(label, (entry) => {
+    entry.gwRestartRetryCount = count;
+  });
 }
 
 /**
@@ -281,13 +316,10 @@ function notify(message) {
 function attempt529Retry(label, retryCount, errorMsg) {
   if (retryCount >= MAX_529_RETRIES) {
     // Max retries exceeded
-    const labels = loadLabels();
-    if (labels[label]) {
-      labels[label].status = 'error';
-      labels[label].error = `max_retries_exceeded (${retryCount}x 529): ${errorMsg}`;
-      labels[label].updatedAt = new Date().toISOString();
-      saveLabels(labels);
-    }
+    updateExistingLabel(label, (entry) => {
+      entry.status = 'error';
+      entry.error = `max_retries_exceeded (${retryCount}x 529): ${errorMsg}`;
+    });
     notify(`🌶️ Dispatch: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) — giving up`);
     return false;
   }
@@ -333,13 +365,10 @@ function respawnSession(label) {
     });
 
     // Reload labels after execFileSync (child may have modified labels.json)
-    const freshLabels = loadLabels();
-    if (freshLabels[label]) {
-      freshLabels[label].status = 'running';
-      freshLabels[label].error = null;
-      freshLabels[label].updatedAt = new Date().toISOString();
-      saveLabels(freshLabels);
-    }
+    updateExistingLabel(label, (entry) => {
+      entry.status = 'running';
+      entry.error = null;
+    });
 
     process.stderr.write(`[watcher] respawned [${label}] via send (reuse session)\n`);
     return true;
@@ -415,12 +444,9 @@ function respawnAfterGwRestart(label) {
     });
 
     // enqueue sets the label to 'running' with a new sessionKey — also reset error field
-    const refreshed = loadLabels();
-    if (refreshed[label]) {
-      refreshed[label].error = null;
-      refreshed[label].updatedAt = new Date().toISOString();
-      saveLabels(refreshed);
-    }
+    updateExistingLabel(label, (entry) => {
+      entry.error = null;
+    });
 
     process.stderr.write(`[watcher] respawned [${label}] via fresh enqueue after gateway restart\n`);
     return true;
@@ -619,15 +645,11 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
  */
 function markLabelDone(label, summary) {
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
-    if (labels[label] && labels[label].status !== 'done') {
-      labels[label].status = 'done';
-      labels[label].summary = summary || labels[label].summary || null;
-      labels[label].updatedAt = new Date().toISOString();
-      const tmp = LABELS_PATH + '.tmp.' + process.pid;
-      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
-      renameSync(tmp, LABELS_PATH);
-    }
+    updateExistingLabel(label, (entry) => {
+      if (entry.status === 'done') return false;
+      entry.status = 'done';
+      entry.summary = summary || entry.summary || null;
+    });
   } catch (e) {
     process.stderr.write(`[watcher] markLabelDone failed: ${e.message}\n`);
   }
@@ -641,16 +663,11 @@ function markLabelDone(label, summary) {
  */
 function markLabelError(label, errorSummary) {
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
-    if (labels[label]?.status === 'done') return;
-    if (labels[label]) {
-      labels[label].status = 'error';
-      labels[label].summary = errorSummary || 'failed without result';
-      labels[label].updatedAt = new Date().toISOString();
-      const tmp = LABELS_PATH + '.tmp.' + process.pid;
-      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
-      renameSync(tmp, LABELS_PATH);
-    }
+    updateExistingLabel(label, (entry) => {
+      if (entry.status === 'done') return false;
+      entry.status = 'error';
+      entry.summary = errorSummary || 'failed without result';
+    });
   } catch (e) {
     process.stderr.write(`[watcher] markLabelError failed: ${e.message}\n`);
   }
@@ -728,17 +745,15 @@ if (!label) {
 // tool calls, docker builds, long pytest runs, etc.
 // Cleared automatically by the process.on('exit') handler above.
 //
-// Race-condition note: loadLabels() always reads fresh from disk (no in-memory cache),
-// so each heartbeat tick gets the latest state before patching only the lastPing field.
-// The read-modify-write window is tiny (synchronous) and worst-case a concurrent writer
-// wins one tick, which is benign — the next tick will re-establish the ping.
+// Race-condition note: labels.json is cached by file mtime/size to avoid reparsing on
+// every heartbeat tick, but each tick still re-validates the on-disk signature before
+// patching lastPing. Worst case a concurrent writer wins one tick; the next tick repairs it.
 _pingInterval = setInterval(() => {
   try {
-    const lbs = loadLabels();
-    if (lbs[label]?.status === 'running') {
-      lbs[label].lastPing = new Date().toISOString();
-      saveLabels(lbs);
-    }
+    updateExistingLabel(label, (entry) => {
+      if (entry.status !== 'running') return false;
+      entry.lastPing = new Date().toISOString();
+    });
   } catch {
     // Best-effort — never crash the watcher over a ping failure
   }
@@ -1038,15 +1053,10 @@ function getTokenCount(sessionKey) {
 
 function markDoneSync(summary) {
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
-    if (labels[label]) {
-      labels[label].status = 'done';
-      labels[label].summary = summary;
-      labels[label].updatedAt = new Date().toISOString();
-      const tmp = LABELS_PATH + '.tmp.' + process.pid;
-      writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
-      renameSync(tmp, LABELS_PATH);
-    }
+    updateExistingLabel(label, (entry) => {
+      entry.status = 'done';
+      entry.summary = summary;
+    });
   } catch (e) {
     process.stderr.write(`[watcher] markDoneSync failed: ${e.message}\n`);
   }
