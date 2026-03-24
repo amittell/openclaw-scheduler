@@ -37,10 +37,28 @@ import { deliverMessage } from './gateway.js';
 const HOME_DIR = process.env.HOME || homedir();
 const SCHEDULER_DIR  = join(HOME_DIR, '.openclaw', 'scheduler');
 const _WAL_FILE       = join(SCHEDULER_DIR, 'scheduler.db-wal');
-const DELIVERY_TO    = process.env.INBOX_DELIVERY_TO      || '';
-const DELIVERY_CH    = process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
 
-const WATCH_MODE = process.argv.includes('--watch');
+// Parse CLI flags (--to, --channel, --agent) with env var fallbacks
+function parseFlags(argv) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--watch') { flags.watch = true; continue; }
+    const next = argv[i + 1];
+    if (a.startsWith('--') && next && !next.startsWith('--')) {
+      flags[a.slice(2)] = next;
+      i++;
+    }
+  }
+  return flags;
+}
+
+const cliFlags    = parseFlags(process.argv.slice(2));
+const DELIVERY_TO = cliFlags.to      || process.env.INBOX_DELIVERY_TO      || '';
+const DELIVERY_CH = cliFlags.channel || process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
+const AGENT_ID    = cliFlags.agent   || process.env.INBOX_AGENT            || 'main';
+
+const WATCH_MODE = Boolean(cliFlags.watch);
 
 // Messages that fail delivery this many times are marked 'failed' to prevent infinite retry loops.
 const MAX_DELIVERY_ATTEMPTS = 5;
@@ -99,11 +117,11 @@ async function drainMessages(db, deliver) {
   const msgs = db.prepare(`
     SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority, delivery_attempts
     FROM messages
-    WHERE (to_agent = 'main' OR to_agent = 'broadcast')
+    WHERE (to_agent = ? OR to_agent = 'broadcast')
       AND status IN ('pending', 'delivered')
     ORDER BY priority DESC, created_at ASC
     LIMIT 50
-  `).all();
+  `).all(AGENT_ID);
 
   if (msgs.length === 0) {
     return 0;

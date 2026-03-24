@@ -409,9 +409,9 @@ function updateJobAfterRun(job, status) {
 
   updateJob(job.id, patch);
 
-  if (status === 'ok' && job.delete_after_run) {
-    log('info', `Deleting one-shot: ${job.name}`);
-    deleteJob(job.id);
+  if (status === 'ok' && freshJob.delete_after_run) {
+    log('info', `Deleting one-shot: ${freshJob.name}`);
+    deleteJob(freshJob.id);
   }
 }
 

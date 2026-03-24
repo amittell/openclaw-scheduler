@@ -714,6 +714,7 @@ export async function executeStrategy(job, ctx, deps) {
         getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
         dequeueJob(job.id);
+        handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on failure (retry scheduled)');
       } else {
         log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
           jobId: job.id, runId: ctx.run.id,
@@ -723,7 +724,7 @@ export async function executeStrategy(job, ctx, deps) {
           await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
         }
         updateJobAfterRun(job, 'error');
-        if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'cancelled');
+        if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
       }
     } else {
       if (['announce', 'announce-always'].includes(job.delivery_mode)) {
@@ -734,7 +735,7 @@ export async function executeStrategy(job, ctx, deps) {
         log('info', `Dequeued pending dispatch for ${job.name} (after failure)`);
       }
       updateJobAfterRun(job, 'error');
-      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'cancelled');
+      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
     }
 
     return { ...makeDefaultResult(), status: 'error', earlyReturn: true };

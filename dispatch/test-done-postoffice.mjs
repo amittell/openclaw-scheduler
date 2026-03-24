@@ -203,15 +203,17 @@ console.log('\ndispatch done — post-office delivery tests\n');
   const tmpDir = makeTempDir();
   let gw = null;
   try {
-    // Pre-register a label so it hits the existing path (not unregistered)
+    // Pre-register a label so it hits the existing path (not unregistered).
+    // Backdate spawnedAt by 5 minutes to exceed the premature-done guard threshold.
+    const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
     writeLabels(tmpDir, {
       'registered-label': {
         sessionKey:  'agent:main:subagent:test-uuid',
         runId:       'test-run-id',
         agent:       'main',
         status:      'running',
-        spawnedAt:   new Date().toISOString(),
-        updatedAt:   new Date().toISOString(),
+        spawnedAt:   fiveMinAgo,
+        updatedAt:   fiveMinAgo,
       }
     });
     writeConfig(tmpDir, {

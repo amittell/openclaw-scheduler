@@ -43,6 +43,8 @@ const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
 const MAX_GW_RESTART_RETRIES = 2; // Max retries for gateway-restart-kill recovery
 
+const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
+const ACTIVITY_POLL_MS = 30_000;
 
 /** How often the watcher writes lastPing to labels.json (heartbeat signal).
  *  The watchdog guard in index.mjs treats pings older than 3× this as stale,
@@ -1045,9 +1047,6 @@ function markDoneSync(summary) {
     process.stderr.write(`[watcher] markDoneSync failed: ${e.message}\n`);
   }
 }
-
-const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
-const ACTIVITY_POLL_MS = 30_000;
 
 const statusAtDeadline = dispatch('status', ['--label', label]);
 let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null;

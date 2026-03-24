@@ -635,7 +635,7 @@ export const idempotency: {
   claimIdempotencyKey(key: string, jobId: string, runId: string, expiresAt: string): boolean;
   releaseIdempotencyKey(key: string): void;
   updateIdempotencyResultHash(key: string, content: string): void;
-  pruneIdempotencyLedger(): SqliteRunResult;
+  pruneIdempotencyLedger(): number;
   listIdempotencyForJob(jobId: string, limit?: number): Array<Record<string, unknown>>;
   forcePruneIdempotency(): number;
 };

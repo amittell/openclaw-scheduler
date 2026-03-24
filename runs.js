@@ -141,7 +141,7 @@ export function getStaleRuns(thresholdSeconds = 90) {
  */
 export function getTimedOutRuns() {
   return getDb().prepare(`
-    SELECT r.*, j.name as job_name
+    SELECT r.*, j.name as job_name, j.run_timeout_ms as job_timeout_ms
     FROM runs r
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
