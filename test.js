@@ -4512,6 +4512,41 @@ console.log('\n── Done Subcommand ──');
     assert(nonGitNoShaObj.status === 'done', 'git-sha-gate: non-git task without --sha → status=done');
   }
 
+  // Test 8: negated git prose should NOT trigger the SHA gate
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'negated-git-prose': {
+        sessionKey: 'agent:main:subagent:negated-git-prose-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+        taskPrompt: 'Do NOT use git push here; just inspect and summarize findings.',
+      },
+    }) + '\n');
+
+    let negatedGitOut;
+    let negatedGitThrew = false;
+    try {
+      negatedGitOut = execFileSync(process.execPath, [
+        indexPath, 'done', '--label', 'negated-git-prose', '--summary', 'summary done',
+        '--checklist', '{"work_complete":true}',
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch {
+      negatedGitThrew = true;
+    }
+    assert(!negatedGitThrew, 'git-sha-gate: negated git prose without --sha → accepted');
+    const negatedGitObj = JSON.parse(negatedGitOut.trim());
+    assert(negatedGitObj.ok === true, 'git-sha-gate: negated git prose without --sha → ok=true');
+    assert(negatedGitObj.status === 'done', 'git-sha-gate: negated git prose without --sha → status=done');
+  }
+
   // ── Fix 3: taskPrompt stored by enqueue (validated via index.mjs source) ─
 
   console.log('\n  ── Fix 3: taskPrompt stored ──');
@@ -4648,11 +4683,15 @@ console.log('\n── Done Subcommand ──');
     assert(actualGitStderr.includes('REJECTED'), 'fix2-actual-cmd: git command → stderr REJECTED');
     assert(actualGitStderr.includes('--sha'), 'fix2-actual-cmd: git command → stderr mentions --sha');
 
-    // Also verify the regex is correct in source
+    // Also verify the helper is present in source
     const indexSrcFix2 = readFileSync(indexPath, 'utf8');
     assert(
-      indexSrcFix2.includes('/\\bgit\\s+(push|rebase|cherry-pick)\\b|--force-with-lease|--force-push/i'),
-      'fix2-regex: tightened regex present in source',
+      indexSrcFix2.includes('taskRequiresGitSha'),
+      'fix2-regex: taskRequiresGitSha helper present in source',
+    );
+    assert(
+      indexSrcFix2.includes('negatedContext'),
+      'fix2-regex: negated context handling present in source',
     );
   }
 

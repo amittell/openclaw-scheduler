@@ -107,6 +107,33 @@ node dispatch/index.mjs result --label "ticket-42"
 Reads the session transcript via `chat.history` and returns the last assistant
 message.
 
+### `done` — mark a tracked session complete
+
+```bash
+node dispatch/index.mjs done \
+  --label "ticket-42" \
+  --summary "Work complete" \
+  --checklist '{"work_complete":true}'
+```
+
+Marks the label as `done` immediately so the watcher can resolve the run without
+waiting for timeout polling.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--label` | required | Label to mark complete |
+| `--summary` | `completed (agent signal)` | One-line completion summary |
+| `--checklist` | required | JSON object. Must include `work_complete:true`; optional fields like `tests_passed` and `pushed` may not be `false` |
+| `--sha` | — | Required when the stored task prompt includes real git commands like `git push`, `git rebase`, `git cherry-pick`, `--force-with-lease`, or `--force-push` |
+| `--force-done` | false | Override the minimum-runtime guard for legitimate short tasks |
+| `--reason` | — | Required with `--force-done`; records why an unusually short session is still valid |
+| `--skip-activity-check` | false | Bypass the gateway message-count heuristic when that check is too strict for the task |
+
+Notes:
+- The minimum runtime guard rejects very short sessions unless `--force-done --reason ...` is provided.
+- Older labels created before `taskPrompt` storage will warn and skip the git-SHA gate.
+- Gateway activity checks fail open: if the session API is unavailable, `done` logs a warning and continues.
+
 ### `send` — message a running session
 
 ```bash
