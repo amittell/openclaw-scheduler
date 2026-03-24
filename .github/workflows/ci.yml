@@ -1,9 +1,10 @@
 name: CI
 
-# GitHub Actions disabled — billing credits exhausted.
-# All checks run locally via git pre-push hook (.git/hooks/pre-push).
-# Re-enable by restoring the on: push/pull_request triggers.
 on:
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
     inputs:
       reason:
