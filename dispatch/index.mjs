@@ -123,6 +123,21 @@ function parseFlags(argv) {
   return flags;
 }
 
+function taskRequiresGitSha(taskPrompt) {
+  if (!taskPrompt || typeof taskPrompt !== 'string') return false;
+
+  const commandPattern = /\bgit\s+(push|rebase|cherry-pick)\b|(?:^|\s)--force-with-lease\b|(?:^|\s)--force-push\b/ig;
+  let match;
+  while ((match = commandPattern.exec(taskPrompt)) !== null) {
+    const before = taskPrompt.slice(Math.max(0, match.index - 40), match.index);
+    const negatedContext = /\b(?:do\s+not|don't|dont|never)\s+(?:use|run|call|invoke)?\s*$/i.test(before)
+      || /\bavoid\s+(?:using\s+)?$/i.test(before)
+      || /\bwithout\s+(?:using\s+)?$/i.test(before);
+    if (!negatedContext) return true;
+  }
+  return false;
+}
+
 // ── Labels Ledger ────────────────────────────────────────────
 
 function loadLabels() {
@@ -1375,11 +1390,7 @@ async function cmdDone(flags) {
         `[${BRAND}] warn: taskPrompt not stored for label=${label} (enqueued before guard), skipping git-SHA check\n`,
       );
     } else {
-      // Tightened regex: \b word boundaries prevent matching prose mentions.
-      // "do NOT use git push here" → does NOT match.
-      // "git push origin main"     → matches.
-      const gitPatterns = /\bgit\s+(push|rebase|cherry-pick)\b|--force-with-lease|--force-push/i;
-      if (gitPatterns.test(taskPrompt) && !sha) {
+      if (taskRequiresGitSha(taskPrompt) && !sha) {
         die(
           'REJECTED: Task involves git commits but --sha was not provided. ' +
           'Pass --sha with the actual HEAD SHA of your pushed branch.',
