@@ -3105,6 +3105,14 @@ console.log('\n── Dispatcher Integration ──');
         `).get(context.rootJobId),
         { timeoutMs: 5000, intervalMs: 100, label: 'pending retry dispatch' }
       );
+
+      const prematureChildRuns = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM runs
+        WHERE job_id = ? AND finished_at IS NOT NULL
+      `).get(context.childJobId).c;
+      assert(prematureChildRuns === 0, 'dispatcher integration: failure child does not fire before retry exhaustion');
+
       probeDb.prepare(`
         UPDATE job_dispatch_queue
         SET scheduled_for = datetime('now', '-1 second')

@@ -294,7 +294,7 @@ const idemEntry: Record<string, unknown> | null = idempotency.getIdempotencyEntr
 const idemClaimed: boolean = idempotency.claimIdempotencyKey(idemKey, 'job-1', 'run-1', '2026-12-31');
 idempotency.releaseIdempotencyKey(idemKey);
 idempotency.updateIdempotencyResultHash(idemKey, 'content');
-const idemPruned: SqliteRunResult = idempotency.pruneIdempotencyLedger();
+const idemPruned: number = idempotency.pruneIdempotencyLedger();
 const idemList: Array<Record<string, unknown>> = idempotency.listIdempotencyForJob('job-1', 10);
 const idemForce: number = idempotency.forcePruneIdempotency();
 
