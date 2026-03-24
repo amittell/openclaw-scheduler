@@ -956,7 +956,7 @@ while (Date.now() < deadline) {
     if (status.status === 'interrupted') {
       process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted — work may be incomplete\n`);
       process.stdout.write(
-        `⚠️ chilisaus [${label}] session went idle before completing — work may be incomplete\n`
+        `⚠️ dispatch [${label}] session went idle before completing — work may be incomplete\n`
       );
       markLabelError(label, status.summary || 'interrupted: session went idle without calling done');
       process.exit(1);
@@ -1010,7 +1010,7 @@ if (finalStatus?.status === 'done') {
 if (finalStatus?.status === 'interrupted') {
   process.stderr.write(`[watcher] [${label}] final status=interrupted — session idle without completion\n`);
   process.stdout.write(
-    `⚠️ chilisaus [${label}] session went idle before completing — work may be incomplete\n`
+    `⚠️ dispatch [${label}] session went idle before completing — work may be incomplete\n`
   );
   markLabelError(label, finalStatus?.summary || 'interrupted: session went idle without calling done');
   process.exit(1);

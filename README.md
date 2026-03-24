@@ -758,7 +758,7 @@ openclaw-scheduler jobs add '{
   "name": "Inbox Consumer",
   "schedule_cron": "*/5 * * * *",
   "session_target": "shell",
-  "payload_message": "node ~/.openclaw/scheduler/scripts/inbox-consumer.mjs --to YOUR_TELEGRAM_ID",
+  "payload_message": "npm exec --prefix ~/.openclaw/scheduler openclaw-inbox-consumer -- --to YOUR_TELEGRAM_ID",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_TELEGRAM_ID",
@@ -1114,6 +1114,7 @@ As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (basel
 
 | Version | Date | Schema | Key changes |
 |---------|------|--------|-------------|
+| 0.2.0 | 2026-03-11 | v18 | Dispatch `done` hardening, auth profile support, one-shot `at` scheduling, expanded type coverage, UTC scheduling defaults, and portability/runtime fixes |
 | 0.1.0 | 2026-03-08 | v14 | First public release: workflow engine, structured shell failure triage, watchdog jobs, output offloading, execution-intent controls, safer migration checks, and public-release cleanup |
 
 ### Pre-public development milestones
