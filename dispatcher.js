@@ -128,7 +128,6 @@ function log(level, msg, meta) {
 
 const { handleDelivery } = createDeliveryHelpers({
   log,
-  deliverMessage,
   resolveDeliveryAlias,
 });
 

@@ -51,7 +51,6 @@ All other commands are forwarded to scheduler CLI (cli.js):
   openclaw-scheduler jobs list
   openclaw-scheduler runs running
   openclaw-scheduler msg send system main "hello"
-  openclaw-scheduler status
 
 Flags:
   --json               Output machine-readable JSON (supported by all CLI subcommands)

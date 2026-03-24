@@ -1132,7 +1132,11 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
       process.exit(1);
     }
     // Still in store — check if updatedAt advanced (tool call still running)
-    const updatedAt = entry.updatedAt;
+    // Normalize: updatedAt may be seconds or milliseconds depending on agent framework version
+    const rawUpdatedAt = entry.updatedAt;
+    const updatedAt = (typeof rawUpdatedAt === 'number' && rawUpdatedAt < 1e12)
+      ? rawUpdatedAt * 1000   // seconds → milliseconds
+      : rawUpdatedAt;
     if (typeof updatedAt === 'number' && updatedAt > flatSince) {
       process.stderr.write(`[watcher] ${label} no tokens but updatedAt advanced — tool call active, resetting flat timer\n`);
       flatSince = Date.now();

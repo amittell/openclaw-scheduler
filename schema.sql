@@ -254,9 +254,10 @@ CREATE TABLE IF NOT EXISTS delivery_aliases (
 -- Example delivery aliases -- replace targets with real Telegram chat/user IDs.
 -- These placeholder IDs are non-functional; run `openclaw-scheduler aliases update`
 -- or INSERT your own rows to configure delivery routing.
-INSERT OR IGNORE INTO delivery_aliases (alias, channel, target, description) VALUES
-  ('team_room', 'telegram', '-1000000001', 'Team room (placeholder -- replace with <your-telegram-chat-id>)'),
-  ('owner_dm',  'telegram', '1000000001',  'Owner DM (placeholder -- replace with <your-telegram-user-id>)');
+-- Example delivery aliases (not seeded — add via CLI or SQL):
+--   INSERT INTO delivery_aliases (alias, channel, target, description) VALUES
+--     ('team_room', 'telegram', '<your-chat-id>', 'Team room'),
+--     ('owner_dm',  'telegram', '<your-user-id>', 'Owner DM');
 
 -- ============================================================
 -- APPROVALS: HITL approval gates (v5)

@@ -37,7 +37,6 @@
     "dispatch/index.mjs",
     "dispatch/README.md",
     "dispatch/watcher.mjs",
-    "inbox-consumer.mjs",
     "scripts/dispatch-cli-utils.mjs",
     "scripts/inbox-consumer.mjs",
     "scripts/stuck-run-detector.mjs",
