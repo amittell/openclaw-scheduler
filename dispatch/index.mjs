@@ -322,6 +322,51 @@ function readSessionsStore(agent = 'main') {
 }
 
 /**
+ * Auto-detect the originating channel from the most recently active main session.
+ * Reads sessions.json, finds sessions active within the last 10 minutes,
+ * excludes subagent sessions, returns deliveryContext.to of the most recent one.
+ *
+ * @returns {string|null} - e.g. "telegram:-1003892419349", or null if not found
+ */
+function getActiveOriginFromSessions() {
+  const store = readSessionsStore("main");
+  if (!store) return null;
+
+  let best = null;
+  let bestTime = 0;
+  const TEN_MIN_MS = 10 * 60 * 1000;
+
+  for (const [key, session] of Object.entries(store)) {
+    // Only consider main sessions, not subagents
+    // Pattern: agent:main:<channel>:<type>:<id>  but NOT agent:main:subagent:*
+    if (!key.startsWith("agent:main:")) continue;
+    if (key.includes(":subagent:")) continue;
+
+    const updatedAt = session.updatedAt
+      ? (typeof session.updatedAt === "number"
+          ? session.updatedAt
+          : new Date(session.updatedAt).getTime())
+      : 0;
+
+    // Must be recently active
+    if (Date.now() - updatedAt > TEN_MIN_MS) continue;
+
+    if (updatedAt > bestTime) {
+      // Prefer deliveryContext.to if available
+      const deliveryTo = session.deliveryContext?.to || null;
+      if (deliveryTo) {
+        bestTime = updatedAt;
+        // deliveryContext.to format: "telegram:-1003892419349"
+        // Convert to origin format: "telegram:-1003892419349"
+        best = deliveryTo;
+      }
+    }
+  }
+
+  return best;
+}
+
+/**
  * Parse the agent ID from a session key.
  * Session key format: agent:{agentId}:...
  * Falls back to 'main' for malformed keys.
@@ -513,7 +558,15 @@ async function cmdEnqueue(flags) {
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
-  const origin      = flags.origin           || null;
+  let origin = flags.origin || null;
+
+  // Auto-detect origin from active sessions if not explicitly provided
+  if (!origin) {
+    origin = getActiveOriginFromSessions();
+    if (origin) {
+      process.stderr.write(`[${BRAND}] auto-detected origin from active session: ${origin}\n`);
+    }
+  }
 
   // ── Auto-derive deliver-to from origin ─────────────────────────────────
   // If origin is "telegram:<id>", use <id> as the default deliver-to target.
@@ -546,7 +599,9 @@ async function cmdEnqueue(flags) {
   const _effectiveDeliveryMode = deliverMode;
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
-      '--deliver-to is required for agentTurn jobs, or pass --no-monitor "<reason>" to explicitly skip.',
+      "--origin is required for agentTurn jobs (e.g. --origin telegram:-1003892419349). " +
+      "deliver-to is auto-derived from origin. " +
+      "Or pass --no-monitor \"<reason>\" to explicitly skip delivery.",
       2
     );
   }
@@ -1677,7 +1732,7 @@ Usage: openclaw-scheduler <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
-           --origin <o>  (required: "telegram:<chat_id>", "telegram:-<group_id>", or "system")
+           [--origin <o>]  (auto-detected from active session; override with e.g. "telegram:-1003892419349")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
            (--deliver-to defaults to origin chat ID when --origin is "telegram:<id>")
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
