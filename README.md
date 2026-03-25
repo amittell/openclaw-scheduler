@@ -10,7 +10,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 
 **Repo:** `github.com/amittell/openclaw-scheduler`
 **Location:** `~/.openclaw/scheduler/`
-**Service:** `ai.openclaw.scheduler` (macOS LaunchAgent)
+**Service:** `ai.openclaw.scheduler` (macOS LaunchDaemon)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
 **Tests:** 929 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
@@ -164,7 +164,7 @@ The wizard will:
 - Append scheduler queue/inbox-consumer entries to your agent's `MEMORY.md` and `workspace-index.md`
 - Create **Inbox Consumer** + **Stuck Run Detector** scheduler jobs
 - Configure dispatcher auto-start service:
-  - macOS: LaunchAgent (optional)
+  - macOS: LaunchDaemon (recommended)
   - Linux/WSL2: systemd user service (or PM2 fallback)
 
 After setup:
@@ -176,7 +176,7 @@ tail -5 /tmp/openclaw-scheduler.log   # live logs
 ```
 
 Dispatcher setup is covered in:
-- [INSTALL.md](INSTALL.md) (macOS LaunchAgent)
+- [INSTALL.md](INSTALL.md) (macOS LaunchDaemon)
 - [INSTALL-LINUX.md](INSTALL-LINUX.md) (Linux/WSL2 systemd + PM2 fallback)
 - [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) (WSL2 setup path)
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
@@ -187,7 +187,7 @@ For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.m
 
 | Platform | Service Manager | Shell Jobs | Status |
 |----------|----------------|------------|--------|
-| macOS | LaunchAgent | `/bin/zsh` | ✅ Tested |
+| macOS | LaunchDaemon | `/bin/zsh` | ✅ Tested |
 | Linux | systemd user service | `/bin/bash` | ✅ Supported |
 | Windows (WSL2) | systemd (WSL2) / PM2 (WSL1) | `/bin/bash` | ✅ Supported |
 | Windows (native) | — | — | ❌ Not supported — use WSL2 |
@@ -214,7 +214,7 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 │    ├─ Tool execution (exec, browser, k8s...) │
 │    └─ Memory search                          │
 │                                              │
-│  Scheduler (LaunchAgent)                     │
+│  Scheduler (LaunchDaemon)                    │
 │    ├─ SQLite DB (scheduler.db)               │
 │    ├─ Job dispatch via chat completions      │
 │    ├─ Workflow chain engine                  │
@@ -803,7 +803,7 @@ node backup.js prune
 
 Requires `mc` (MinIO client) in PATH and a configured `backupstore` alias.
 
-**Built-in (when running via LaunchAgent):**
+**Built-in (when running via LaunchDaemon):**
 - Snapshot every 5 minutes (`SCHEDULER_BACKUP_MS`)
 - Rollup on the first tick of each hour
 
@@ -1033,19 +1033,17 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 > **Platform note:** The commands below are for macOS (launchctl). For Linux, see [INSTALL-LINUX.md](INSTALL-LINUX.md). For Windows, see [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
 
 ```bash
-# Start
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+# Start / bootstrap
+sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 
 # Stop
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl bootout system/ai.openclaw.scheduler
 
 # Restart
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist && \
-  sleep 1 && \
-  launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl kickstart -k system/ai.openclaw.scheduler
 
 # Status
-launchctl list | grep scheduler
+sudo launchctl print system/ai.openclaw.scheduler
 ps aux | grep dispatcher | grep -v grep
 
 # Logs
@@ -1055,7 +1053,7 @@ tail -f /tmp/openclaw-scheduler.log
 openclaw-scheduler status
 ```
 
-LaunchAgent config: `RunAtLoad: true`, `KeepAlive: true` (auto-restart on crash).
+LaunchDaemon config: `RunAtLoad: true`, `KeepAlive: true`, `UserName: <your-user>` (auto-restart on crash, survives headless reboot).
 
 ---
 
@@ -1193,7 +1191,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │   └── telegram-webhook-check.mjs   # Telegram webhook health check / repair utility
 │
 │  Service & docs
-├── ai.openclaw.scheduler.plist  # macOS LaunchAgent template
+├── ai.openclaw.scheduler.plist  # macOS LaunchDaemon template
 ├── INSTALL.md             # Full installation guide — macOS (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
 ├── INSTALL-LINUX.md       # Installation guide for Linux (systemd user service)
@@ -1416,14 +1414,14 @@ sqlite3 scheduler.db "SELECT * FROM schema_migrations"
 ### Service won't start
 
 ```bash
-plutil -lint ~/Library/LaunchAgents/ai.openclaw.scheduler.plist  # Valid plist?
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-launchctl list | grep scheduler
+sudo plutil -lint /Library/LaunchDaemons/ai.openclaw.scheduler.plist  # Valid plist?
+sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
+sudo launchctl print system/ai.openclaw.scheduler
 ```
 
 ### Logs not updating
 
-Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have crashed — check `launchctl list | grep scheduler` (exit code in second column, 0 = running).
+Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have crashed — check `sudo launchctl print system/ai.openclaw.scheduler`.
 
 ### Job shows 'awaiting_approval'
 

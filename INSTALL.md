@@ -137,15 +137,17 @@ openclaw gateway restart
 
 ---
 
-## Step 8: Install LaunchAgent
+## Step 8: Install LaunchDaemon
 
-Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
+Create `/Library/LaunchDaemons/ai.openclaw.scheduler.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>Comment</key>
+    <string>OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)</string>
     <key>Label</key>
     <string>ai.openclaw.scheduler</string>
     <key>ProgramArguments</key>
@@ -154,8 +156,14 @@ Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
         <string>--no-warnings</string>
         <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
     </array>
+    <key>UserName</key>
+    <string>YOUR_USER</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_USER</string>
         <key>OPENCLAW_GATEWAY_URL</key>
         <string>http://127.0.0.1:18789</string>
         <key>OPENCLAW_GATEWAY_TOKEN</key>
@@ -179,22 +187,23 @@ Create `~/Library/LaunchAgents/ai.openclaw.scheduler.plist`:
     <string>/tmp/openclaw-scheduler.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/openclaw-scheduler.log</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 </dict>
 </plist>
 ```
 
 **Replace** `YOUR_USER` and `YOUR_GATEWAY_TOKEN` with actual values.
 
-Load it:
+Install and bootstrap it:
 ```bash
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo install -o root -g wheel -m 644 ai.openclaw.scheduler.plist /Library/LaunchDaemons/ai.openclaw.scheduler.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
 Verify:
 ```bash
-launchctl list | grep scheduler
+sudo launchctl print system/ai.openclaw.scheduler
 sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ```
 
@@ -284,7 +293,7 @@ If anything goes wrong:
 
 ```bash
 # 1. Stop scheduler
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl bootout system/ai.openclaw.scheduler
 
 # 2. Re-enable OC cron
 openclaw cron edit <job-id> --enable  # for each job
@@ -304,7 +313,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 - [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
-- [ ] `launchctl list | grep scheduler` → running
+- [ ] `sudo launchctl print system/ai.openclaw.scheduler` → running
 - [ ] Log file has startup lines, no errors
 - [ ] OC cron → all disabled
 - [ ] OC heartbeat → `0m`

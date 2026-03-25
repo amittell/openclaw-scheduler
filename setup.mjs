@@ -9,7 +9,7 @@
  *  1. Runs DB migrations (creates/upgrades scheduler.db)
  *  2. Appends scheduler queue/consumer entries to MEMORY.md + workspace-index.md
  *  3. Creates Inbox Consumer + Stuck Run Detector scheduler jobs
- *  4. Installs the macOS LaunchAgent (optional)
+ *  4. Installs the macOS LaunchDaemon (optional)
  */
 
 import readline from 'readline';
@@ -57,6 +57,17 @@ function getNpmConfigValue(key) {
   }
 }
 
+function getGatewayToken(homeDir) {
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    const cfgPath = path.join(homeDir, '.openclaw', 'openclaw.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    return cfg?.gateway?.auth?.token || '';
+  } catch {
+    return '';
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 print();
@@ -68,7 +79,7 @@ print('This wizard will:');
 print('  • Run DB migrations');
 print('  • Add scheduler queue + consumer notes to agent memory files');
 print('  • Create Inbox Consumer + Stuck Run Detector jobs');
-print('  • Install the macOS LaunchAgent (optional)');
+print('  • Install the macOS LaunchDaemon (optional)');
 print();
 
 // ─── Step 1: Paths ────────────────────────────────────────────────────────────
@@ -150,7 +161,7 @@ const indexSection = `### Scheduler & Dispatch
 
 | File | Covers | Load |
 |------|--------|------|
-| \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. LaunchAgent: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
+| \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. LaunchDaemon: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
 | \`${schedulerPath}/cli.js\` | Queue + run operations: \`msg send\`, \`msg inbox\`, \`runs running\`, \`runs stale\`. | Day-to-day scheduler operations |
 | \`${schedulerPath}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
 | \`${schedulerPath}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
@@ -274,53 +285,73 @@ const wslVersion = isWSL && (() => {
 
 // ── macOS ──────────────────────────────────────────────────────────────────
 if (platform === 'darwin') {
-  print('── Step 5: Service (macOS LaunchAgent) ─────────────────');
-  const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.scheduler.plist');
+  print('── Step 5: Service (macOS LaunchDaemon) ────────────────');
+  const plistPath = '/Library/LaunchDaemons/ai.openclaw.scheduler.plist';
+  const tmpPlistPath = path.join(os.tmpdir(), 'ai.openclaw.scheduler.plist');
+  const serviceUser = os.userInfo().username;
+  const gatewayToken = getGatewayToken(os.homedir());
+  const envPath = process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin';
   if (fs.existsSync(plistPath)) {
-    skip('LaunchAgent already installed');
+    skip('LaunchDaemon already installed');
     print(`  Path: ${plistPath}`);
-    print('  To restart: launchctl kickstart -k gui/$UID/ai.openclaw.scheduler');
+    print('  To restart: sudo launchctl kickstart -k system/ai.openclaw.scheduler');
   } else {
-    const install = await confirm('Install LaunchAgent (auto-start on login)?');
+    const install = await confirm('Install LaunchDaemon (recommended, survives reboot without login)?');
     if (install) {
+      const tokenXml = gatewayToken
+        ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${gatewayToken}</string>\n`
+        : '';
       const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>Comment</key>
+  <string>OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)</string>
   <key>Label</key>
   <string>ai.openclaw.scheduler</string>
   <key>ProgramArguments</key>
   <array>
     <string>${nodePath}</string>
+    <string>--no-warnings</string>
     <string>${indexPath}</string>
   </array>
+  <key>UserName</key>
+  <string>${serviceUser}</string>
   <key>WorkingDirectory</key>
   <string>${schedulerPath}</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HOME</key>
+    <string>${os.homedir()}</string>
+    <key>PATH</key>
+    <string>${envPath}</string>
     <key>OPENCLAW_GATEWAY_URL</key>
     <string>${gatewayUrl}</string>
     <key>SCHEDULER_DB</key>
     <string>${schedulerDbPath}</string>
-  </dict>
+${tokenXml}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>${logPath}</string>
   <key>StandardErrorPath</key>
   <string>${logPath}</string>
 </dict>
 </plist>`;
-      fs.writeFileSync(plistPath, plist);
+      fs.writeFileSync(tmpPlistPath, plist);
       try {
-        execSync(`launchctl load "${plistPath}"`);
-        ok('LaunchAgent installed and loaded');
+        execSync(`sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${plistPath}"`, { stdio: 'inherit' });
+        execSync(`sudo launchctl bootstrap system "${plistPath}"`, { stdio: 'inherit' });
+        ok('LaunchDaemon installed and bootstrapped');
       } catch (err) {
-        ok(`LaunchAgent plist written → ${plistPath}`);
-        warn(`Auto-load failed: ${err.message.trim()}`);
-        warn(`Run manually: launchctl load "${plistPath}"`);
+        ok(`LaunchDaemon plist written → ${tmpPlistPath}`);
+        warn(`Auto-bootstrap failed: ${err.message.trim()}`);
+        warn(`Run manually: sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${plistPath}"`);
+        warn(`Then: sudo launchctl bootstrap system "${plistPath}"`);
       }
       print(`  Logs: ${logPath}`);
     } else {
@@ -483,8 +514,8 @@ print();
 print('Next steps:');
 
 if (platform === 'darwin') {
-  print('  • Check service:  launchctl list | grep openclaw');
-  print('  • Restart:        launchctl kickstart -k gui/$UID/ai.openclaw.scheduler');
+  print('  • Check service:  sudo launchctl print system/ai.openclaw.scheduler');
+  print('  • Restart:        sudo launchctl kickstart -k system/ai.openclaw.scheduler');
 } else if (platform === 'linux') {
   if (isWSL) {
     print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');

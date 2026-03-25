@@ -227,7 +227,7 @@ By default, systemd user services stop when you log out. To keep the scheduler r
 loginctl enable-linger $USER
 ```
 
-This is the Linux equivalent of macOS LaunchAgent's `RunAtLoad: true` + `KeepAlive: true`.
+This is the Linux equivalent of macOS LaunchDaemon `RunAtLoad: true` + `KeepAlive: true`.
 
 ---
 
@@ -360,7 +360,7 @@ node cli.js status
 
 ## Optional: QMD Memory Daemon (if using QMD as memory backend)
 
-If your OpenClaw instance uses QMD for hybrid memory search (`memory.backend = "qmd"`), you need a persistent systemd service for the QMD MCP daemon — equivalent to the macOS LaunchAgent on `com.openclaw.qmd-daemon`.
+If your OpenClaw instance uses QMD for hybrid memory search (`memory.backend = "qmd"`), you need a persistent systemd service for the QMD MCP daemon -- equivalent to the macOS launchd service on `com.openclaw.qmd-daemon`.
 
 ### Key rules (learned the hard way)
 
