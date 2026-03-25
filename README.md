@@ -1191,7 +1191,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │   └── telegram-webhook-check.mjs   # Telegram webhook health check / repair utility
 │
 │  Service & docs
-├── ai.openclaw.scheduler.plist  # macOS LaunchDaemon template
+├── /Library/LaunchDaemons/ai.openclaw.scheduler.plist  # macOS LaunchDaemon location after install
 ├── INSTALL.md             # Full installation guide — macOS (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
 ├── INSTALL-LINUX.md       # Installation guide for Linux (systemd user service)
