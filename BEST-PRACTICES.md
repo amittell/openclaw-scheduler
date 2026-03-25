@@ -74,7 +74,7 @@ When using shell jobs to keep a background daemon (e.g. QMD, a model server, a v
 
 **Rule 1: The daemon wrapper script must block.**
 
-If your LaunchAgent/systemd service runs a wrapper script that sets up the daemon and then exits, the service manager restarts the script immediately — potentially spawning multiple daemon instances fighting for the same port, causing hangs or crashes.
+If your launchd/systemd service runs a wrapper script that sets up the daemon and then exits, the service manager restarts the script immediately -- potentially spawning multiple daemon instances fighting for the same port, causing hangs or crashes.
 
 ```bash
 # ❌ Wrong — script exits after setup, KeepAlive loops it immediately
@@ -89,7 +89,7 @@ DAEMON_PID=$!
 wait $DAEMON_PID           # blocks until daemon dies → then service restarts cleanly
 ```
 
-On macOS (`KeepAlive: true` LaunchAgent) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
+On macOS (`KeepAlive: true` LaunchDaemon) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
 
 **Rule 2: Keepalive jobs must exercise the actual hot path.**
 
@@ -454,7 +454,7 @@ Here's a complete, self-contained entry to add to your workspace `MEMORY.md` or 
 ```markdown
 ## OpenClaw Scheduler — How to Use
 
-The scheduler (`~/.openclaw/scheduler/`) runs as a background service (LaunchAgent / systemd) 
+The scheduler (`~/.openclaw/scheduler/`) runs as a background service (LaunchDaemon / systemd) 
 and fires jobs independently of your chat sessions.
 
 ### Quick commands

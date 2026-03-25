@@ -139,7 +139,7 @@ openclaw gateway restart
 
 ## Step 8: Install LaunchDaemon
 
-Create `/Library/LaunchDaemons/ai.openclaw.scheduler.plist`:
+Create `/Library/LaunchDaemons/ai.openclaw.scheduler.plist` with `sudo`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -195,9 +195,8 @@ Create `/Library/LaunchDaemons/ai.openclaw.scheduler.plist`:
 
 **Replace** `YOUR_USER` and `YOUR_GATEWAY_TOKEN` with actual values.
 
-Install and bootstrap it:
+Bootstrap it:
 ```bash
-sudo install -o root -g wheel -m 644 ai.openclaw.scheduler.plist /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
