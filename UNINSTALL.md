@@ -12,8 +12,8 @@ Two levels of removal:
 ### macOS
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
-rm ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl bootout system/ai.openclaw.scheduler
+sudo rm /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
 ### Linux

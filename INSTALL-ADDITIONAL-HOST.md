@@ -1,6 +1,6 @@
 # Installing OpenClaw Scheduler on an Additional Host
 
-This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own LaunchAgent — they don't share state. This is not a replication setup; each host schedules and dispatches jobs independently.
+This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own LaunchDaemon -- they don't share state. This is not a replication setup; each host schedules and dispatches jobs independently.
 
 > **Starting fresh:** Unlike migrating from OC cron, on an additional host you'll typically create jobs from scratch. Use the job examples in README.md.
 
@@ -15,7 +15,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 
-> **macOS PATH note:** If installed via Homebrew, `node` and `npm` live at `/opt/homebrew/bin/`. If your terminal doesn't find them, run `export PATH="/opt/homebrew/bin:$PATH"` or add it to your `~/.zprofile`. The LaunchAgent template already includes the correct PATH.
+> **macOS PATH note:** If installed via Homebrew, `node` and `npm` live at `/opt/homebrew/bin/`. If your terminal doesn't find them, run `export PATH="/opt/homebrew/bin:$PATH"` or add it to your `~/.zprofile`. The LaunchDaemon template already includes the correct PATH.
 
 ---
 
@@ -119,11 +119,10 @@ openclaw gateway restart
 
 ---
 
-## Step 7: Install LaunchAgent
+## Step 7: Install LaunchDaemon
 
 ```bash
-mkdir -p ~/Library/LaunchAgents
-nano ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo nano /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
 Create or edit the plist — replace `YOUR_USER` and `YOUR_GATEWAY_TOKEN`:
@@ -135,6 +134,8 @@ The template looks like:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>Comment</key>
+    <string>OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)</string>
     <key>Label</key>
     <string>ai.openclaw.scheduler</string>
     <key>ProgramArguments</key>
@@ -143,12 +144,20 @@ The template looks like:
         <string>--no-warnings</string>
         <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
     </array>
+    <key>UserName</key>
+    <string>YOUR_USER</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_USER</string>
         <key>OPENCLAW_GATEWAY_URL</key>
         <string>http://127.0.0.1:18789</string>
         <key>OPENCLAW_GATEWAY_TOKEN</key>
         <string>YOUR_GATEWAY_TOKEN</string>
+        <key>SCHEDULER_DB</key>
+        <string>/Users/YOUR_USER/.openclaw/scheduler/scheduler.db</string>
         <key>SCHEDULER_TICK_MS</key>
         <string>10000</string>
         <key>SCHEDULER_STALE_THRESHOLD_S</key>
@@ -166,20 +175,20 @@ The template looks like:
     <string>/tmp/openclaw-scheduler.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/openclaw-scheduler.log</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 </dict>
 </plist>
 ```
 
-Load it:
+Bootstrap it:
 ```bash
-launchctl load ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
 Verify:
 ```bash
-launchctl list | grep scheduler
+sudo launchctl print system/ai.openclaw.scheduler
 sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ```
 
@@ -273,7 +282,7 @@ If anything goes wrong:
 
 ```bash
 # 1. Stop scheduler
-launchctl unload ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo launchctl bootout system/ai.openclaw.scheduler
 
 # 2. Re-enable OC cron (if you disabled it)
 openclaw cron edit <job-id> --enable  # for each job
@@ -291,7 +300,7 @@ openclaw gateway restart
 
 - [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
-- [ ] `launchctl list | grep scheduler` → running
+- [ ] `sudo launchctl print system/ai.openclaw.scheduler` → running
 - [ ] Log file has startup lines, no errors
 - [ ] OC cron → all disabled (if applicable)
 - [ ] OC heartbeat → `0m` (if applicable)
