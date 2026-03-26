@@ -599,9 +599,11 @@ async function cmdEnqueue(flags) {
   const _effectiveDeliveryMode = deliverMode;
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
-      "--origin is required for agentTurn jobs (e.g. --origin telegram:-1003892419349). " +
-      "deliver-to is auto-derived from origin. " +
-      "Or pass --no-monitor \"<reason>\" to explicitly skip delivery.",
+      "REJECTED: --deliver-to is required for dispatch jobs.\n" +
+      "Pass --deliver-to <chat_id> (e.g. --deliver-to -5240776892 for the AI Assisted Degeneracy group, " +
+      "or --deliver-to 484946046 for Alex DM).\n" +
+      "Alternatively, pass --origin telegram:<chat_id> to auto-derive the delivery target.\n" +
+      "Pass --no-monitor \"<reason>\" only if you explicitly want to skip delivery (audit trail required).",
       2
     );
   }

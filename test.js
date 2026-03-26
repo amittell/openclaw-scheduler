@@ -5383,6 +5383,153 @@ console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) d
   assert(after.cnt === before.cnt, 'handleDelivery(none): does not enqueue any message');
 }
 
+// ═══════════════════════════════════════════════════════════
+// SECTION: inbox-consumer per-message delivery routing (v21)
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── inbox-consumer per-message delivery_to routing ──');
+{
+  const liveDb = getDb();
+
+  // Verify schema: messages.delivery_to column exists
+  const msgColsV21 = liveDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  assert(msgColsV21.includes('delivery_to'), 'messages.delivery_to column exists (v21)');
+
+  // Verify schema_migrations has v21
+  const v21 = liveDb.prepare('SELECT version FROM schema_migrations WHERE version = 21').get();
+  assert(v21 !== undefined, 'schema_migrations has v21');
+
+  // Test 1: sendMessage stores delivery_to
+  const m1 = sendMessage({
+    from_agent:  'scheduler',
+    to_agent:    'main',
+    kind:        'result',
+    subject:     'group-result',
+    body:        'Job completed in group chat',
+    channel:     'telegram',
+    delivery_to: '-5240776892',
+  });
+  assert(m1.delivery_to === '-5240776892', 'sendMessage stores delivery_to on message');
+  assert(m1.channel === 'telegram', 'sendMessage stores channel on message');
+
+  // Test 2: sendMessage without delivery_to → null
+  const m2 = sendMessage({
+    from_agent: 'scheduler',
+    to_agent:   'main',
+    kind:       'result',
+    subject:    'dm-result',
+    body:       'Job completed for DM delivery',
+    channel:    'telegram',
+  });
+  assert(m2.delivery_to === null, 'sendMessage without delivery_to → null');
+
+  // Test 3: getMessage returns delivery_to
+  const fetched1 = getMessage(m1.id);
+  assert(fetched1.delivery_to === '-5240776892', 'getMessage returns delivery_to correctly');
+
+  // Test 4: inbox-consumer selectPendingMessages query returns delivery_to and channel
+  // We simulate this by running the same SQL used in inbox-consumer
+  const pendingMsgs = liveDb.prepare(`
+    SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority,
+           delivery_to, channel
+    FROM messages
+    WHERE (to_agent = ? OR to_agent = 'broadcast')
+      AND status IN ('pending', 'delivered')
+    ORDER BY priority DESC, created_at ASC
+    LIMIT 10
+  `).all('main');
+
+  const withDeliveryTo = pendingMsgs.filter(m => m.delivery_to === '-5240776892');
+  assert(withDeliveryTo.length >= 1, 'selectPendingMessages returns messages with delivery_to set');
+  assert(withDeliveryTo[0].channel === 'telegram', 'selectPendingMessages returns channel on message');
+
+  const withoutDeliveryTo = pendingMsgs.filter(m => m.id === m2.id);
+  assert(withoutDeliveryTo.length >= 1, 'selectPendingMessages returns messages without delivery_to');
+  assert(withoutDeliveryTo[0].delivery_to === null, 'selectPendingMessages: delivery_to is null when not set');
+
+  // Test 5: per-message routing logic (mirrors inbox-consumer drainOnce)
+  // Message WITH delivery_to → routes to delivery_to, not the default --to
+  const defaultTo = '484946046';
+  const defaultChannel = 'telegram';
+
+  {
+    const msg = withDeliveryTo[0];
+    const msgTarget = msg.delivery_to || defaultTo;
+    const msgChannel = msg.channel || defaultChannel;
+    assert(msgTarget === '-5240776892', 'routing: msg.delivery_to used when present (not default --to)');
+    assert(msgChannel === 'telegram', 'routing: msg.channel used when present');
+  }
+
+  // Test 6: Message WITHOUT delivery_to → falls back to default --to
+  {
+    const msg = withoutDeliveryTo[0];
+    const msgTarget = msg.delivery_to || defaultTo;
+    const msgChannel = msg.channel || defaultChannel;
+    assert(msgTarget === defaultTo, 'routing: falls back to default --to when delivery_to is null');
+    assert(msgChannel === defaultChannel, 'routing: falls back to default channel when msg.channel is null');
+  }
+
+  // Test 7: Message with channel set → uses that channel, not default
+  const m3 = sendMessage({
+    from_agent:  'scheduler',
+    to_agent:    'main',
+    kind:        'result',
+    subject:     'whatsapp-result',
+    body:        'Job completed for WhatsApp',
+    channel:     'whatsapp',
+    delivery_to: '15551234567',
+  });
+  {
+    const msgTarget = m3.delivery_to || defaultTo;
+    const msgChannel = m3.channel || defaultChannel;
+    assert(msgTarget === '15551234567', 'routing: uses msg.delivery_to for whatsapp message');
+    assert(msgChannel === 'whatsapp', 'routing: uses msg.channel (whatsapp) not default (telegram)');
+  }
+
+  // Test 8: dispatcher-delivery.js sendMessage includes delivery_to (integration check)
+  // handleDelivery already calls sendMessage with delivery_to — verify it's stored
+  const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
+  const deliveryLogs = [];
+  const { handleDelivery: handleDeliveryV21 } = createDeliveryHelpers({
+    log: (level, msg, meta) => deliveryLogs.push({ level, msg, meta }),
+    resolveDeliveryAlias: () => null,
+  });
+
+  const jobV21 = {
+    name: 'GroupChatJob',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '-5240776892',
+  };
+  await handleDeliveryV21(jobV21, '🎉 group job done');
+
+  const groupMsg = liveDb.prepare(
+    "SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND subject='GroupChatJob' ORDER BY created_at DESC LIMIT 1"
+  ).get();
+  assert(groupMsg !== undefined, 'dispatcher-delivery: message created for group chat job');
+  assert(groupMsg.delivery_to === '-5240776892', 'dispatcher-delivery: delivery_to stored on message from handleDelivery');
+  assert(groupMsg.channel === 'telegram', 'dispatcher-delivery: channel stored on message from handleDelivery');
+
+  // Clean up
+  markAllRead('main');
+}
+
+console.log('\n── dispatch/index.mjs --deliver-to error message ──');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexSrc = readFileSync(join(dispatchDir, 'index.mjs'), 'utf8');
+
+  // Verify improved error message contains --deliver-to guidance
+  assert(indexSrc.includes('REJECTED: --deliver-to is required for dispatch jobs'), 'dispatch error: REJECTED prefix present');
+  assert(indexSrc.includes('-5240776892'), 'dispatch error: AI Assisted Degeneracy group ID example present');
+  assert(indexSrc.includes('484946046'), 'dispatch error: Alex DM example present');
+  assert(indexSrc.includes('--origin telegram:<chat_id>'), 'dispatch error: --origin auto-derive guidance present');
+  assert(indexSrc.includes('audit trail required'), 'dispatch error: --no-monitor audit trail note present');
+
+  // Verify the old confusing message is gone
+  assert(!indexSrc.includes('--origin is required for agentTurn jobs'), 'dispatch error: old confusing --origin message removed');
+}
+
 closeDb();
 console.log(`\n${'═'.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
