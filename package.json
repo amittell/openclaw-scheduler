@@ -30,6 +30,9 @@
     "verify:local": "node scripts/verify-local.mjs",
     "prepublishOnly": "npm run verify:local"
   },
+  "overrides": {
+    "flatted": "^3.4.2"
+  },
   "files": [
     "bin",
     "dispatch/529-recovery.mjs",
@@ -113,7 +116,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "c8": "^11.0.0",
-    "eslint": "^10.0.2",
+    "eslint": "^10.1.0",
     "globals": "^17.4.0",
     "typescript": "^5.9.2"
   }
