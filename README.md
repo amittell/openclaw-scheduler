@@ -144,7 +144,7 @@ npm run verify:local                 # full local maintainer gate
 npm run verify:smoke                 # lightweight smoke gate used by GitHub Actions
 ```
 
-GitHub Actions intentionally stays minimal: one Ubuntu/Node 20 smoke run on pull requests or manual dispatch. The full release gate runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
+GitHub Actions intentionally stays minimal: one Ubuntu/Node 20 smoke run on pushes to `main`, pull requests, or manual dispatch. The full release gate runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
 
 The package also exports a small safe programmatic API surface for tooling:
 
