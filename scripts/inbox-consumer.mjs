@@ -80,7 +80,8 @@ function formatMessages(msgs, agentId) {
 
 function selectPendingMessages(db, agentId, limit) {
   return db.prepare(`
-    SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority
+    SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority,
+           delivery_to, channel
     FROM messages
     WHERE (to_agent = ? OR to_agent = 'broadcast')
       AND status IN ('pending', 'delivered')
@@ -116,12 +117,21 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
   let delivered = 0;
   const groupErrors = [];
   for (const [, group] of groups) {
+    // Determine routing: use per-message delivery_to/channel when present,
+    // fall back to the default --to / --channel args.
+    // All messages in a group share the same kind, but may have different targets
+    // if they were enqueued with explicit delivery_to. To keep grouping meaningful,
+    // we use the first message's delivery_to as the representative for the group.
+    const firstMsg = group.msgs[0];
+    const msgTarget = firstMsg.delivery_to || to;
+    const msgChannel = firstMsg.channel || channel;
+
     try {
       const text = formatMessages(group.msgs, agentId);
-      await deliverMessage(channel, to, text);
+      await deliverMessage(msgChannel, msgTarget, text);
       for (const msg of group.msgs) {
         recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
-        ackMessage(msg.id, 'inbox-consumer', `Delivered to ${channel}:${to}`);
+        ackMessage(msg.id, 'inbox-consumer', `Delivered to ${msgChannel}:${msgTarget}`);
       }
       delivered += group.msgs.length;
     } catch (err) {
@@ -138,7 +148,7 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
   }
 
   if (delivered > 0) {
-    process.stdout.write(`[inbox-consumer] delivered ${delivered} message(s) to ${channel}:${to}\n`);
+    process.stdout.write(`[inbox-consumer] delivered ${delivered} message(s)\n`);
   }
   if (groupErrors.length > 0) {
     throw new Error(`Delivery failed for ${groupErrors.length} group(s): ${groupErrors.map(e => e.message).join('; ')}`);

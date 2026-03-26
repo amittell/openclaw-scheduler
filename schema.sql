@@ -193,6 +193,7 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Priority & delivery
   priority        INTEGER NOT NULL DEFAULT 0,         -- higher = more urgent (0=normal, 1=high, 2=urgent)
   channel         TEXT,                               -- optional: route via specific channel
+  delivery_to     TEXT,                               -- optional: target chat/user id for outbound delivery
   
   -- Status
   status          TEXT NOT NULL DEFAULT 'pending',    -- pending|delivered|read|expired|failed
@@ -425,6 +426,7 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (17);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (18);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (19);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (20);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (21);
 
 -- ============================================================
 -- SEED JOBS

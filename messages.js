@@ -26,10 +26,10 @@ export function sendMessage(opts) {
   db.prepare(`
     INSERT INTO messages (
       id, from_agent, to_agent, team_id, member_id, task_id, reply_to,
-      kind, subject, body, metadata, priority, channel, status,
+      kind, subject, body, metadata, priority, channel, delivery_to, status,
       expires_at, job_id, run_id, owner, ack_required
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
   `).run(
     id,
     opts.from_agent,
@@ -44,6 +44,7 @@ export function sendMessage(opts) {
     opts.metadata ? JSON.stringify(opts.metadata) : null,
     opts.priority || 0,
     opts.channel || null,
+    opts.delivery_to || null,
     opts.expires_at || null,
     opts.job_id || null,
     opts.run_id || null,

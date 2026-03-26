@@ -51,7 +51,9 @@ export default function migrateConsolidate() {
   const hasAgentDelivery = agentColumns.has('delivery_channel')
     && agentColumns.has('delivery_to')
     && agentColumns.has('brand_name');
-  if (current >= 20 && hasLatestColumns && hasAgentDelivery) {
+  const msgColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map(c => c.name));
+  const hasMsgDeliveryTo = msgColumns.has('delivery_to');
+  if (current >= 21 && hasLatestColumns && hasAgentDelivery && hasMsgDeliveryTo) {
     return false;
   }
 
@@ -100,6 +102,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE messages ADD COLUMN last_error TEXT`,
     `ALTER TABLE messages ADD COLUMN team_mapped_at TEXT`,
+    // v21: per-message delivery routing
+    `ALTER TABLE messages ADD COLUMN delivery_to TEXT`,
     // v11: durable non-cron dispatches
     `ALTER TABLE approvals ADD COLUMN dispatch_queue_id TEXT`,
     // v12: structured shell results
@@ -378,7 +382,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]) {
     stmt.run(v);
   }
 
@@ -389,7 +393,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v20'
-    : 'DB already at v20 — nothing to do'
+    ? 'Consolidation migration applied — DB is now at schema v21'
+    : 'DB already at v21 — nothing to do'
   );
 }
