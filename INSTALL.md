@@ -105,6 +105,13 @@ This imports jobs from `~/.openclaw/cron/jobs.json` → SQLite, converting sched
 - `every` → approximate cron (e.g., 30min → `*/30 * * * *`)
 - `at` → one-shot with `delete_after_run=true`
 
+Good default approach:
+- if the old job was just a script, keep it as a `shell` job
+- if the old job was really “run a prompt on a schedule,” rewrite it as an `isolated` job
+- if two jobs depended on manual ordering, convert them into a parent/child chain instead of two independent schedules
+
+For copy-paste examples, see [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
+
 Verify:
 ```bash
 node cli.js jobs list

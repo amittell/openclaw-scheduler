@@ -3,6 +3,7 @@
 This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own LaunchDaemon -- they don't share state. This is not a replication setup; each host schedules and dispatches jobs independently.
 
 > **Starting fresh:** Unlike migrating from OC cron, on an additional host you'll typically create jobs from scratch. Use the job examples in README.md.
+> **Need copy-paste examples?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
 
 ---
 

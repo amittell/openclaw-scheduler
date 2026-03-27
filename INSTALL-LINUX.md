@@ -4,6 +4,7 @@ Step-by-step guide to deploy the scheduler on a Linux host running OpenClaw.
 
 > **macOS?** See [INSTALL.md](INSTALL.md).
 > **Windows?** See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
+> **Need examples or migration help?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
 
 ---
 
