@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
+import { sqliteNow } from './dispatcher-utils.js';
 
 const VALID_DISPATCH_KINDS = new Set(['manual', 'chain', 'retry']);
 const VALID_DISPATCH_STATUSES = new Set([
@@ -9,12 +10,6 @@ const VALID_DISPATCH_STATUSES = new Set([
   'done',
   'cancelled',
 ]);
-
-// Private copy of sqliteNow to avoid circular dependency with dispatcher-utils.js.
-// Must stay in sync with the sqliteNow exported from dispatcher-utils.js.
-function sqliteNow(offsetMs = 0) {
-  return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-}
 
 function assertKind(kind) {
   if (!VALID_DISPATCH_KINDS.has(kind)) {

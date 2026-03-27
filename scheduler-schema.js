@@ -1,7 +1,7 @@
 export const SCHEDULER_SCHEMAS = {
   jobs: {
     type: 'object',
-    required: ['name', 'payload_message'],
+    required: ['name', 'payload_message', 'run_timeout_ms'], // origin also required for non-child jobs
     fields: {
       name: { type: 'string', maxLength: 200 },
       enabled: { type: 'boolean', default: true },

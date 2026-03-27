@@ -109,17 +109,22 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-/** Parse --flag value pairs from argv */
+/** Parse --flag value pairs from argv (supports both --flag value and --flag=value) */
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = argv[i + 1];
-    if (a.startsWith('--') && next && !next.startsWith('--')) {
-      flags[a.slice(2)] = next;
-      i++;
-    } else if (a.startsWith('--')) {
-      flags[a.slice(2)] = true;
+    if (a.startsWith('--')) {
+      const eqIdx = a.indexOf('=');
+      if (eqIdx > 0) {
+        flags[a.slice(2, eqIdx)] = a.slice(eqIdx + 1);
+      } else if (next && !next.startsWith('--')) {
+        flags[a.slice(2)] = next;
+        i++;
+      } else {
+        flags[a.slice(2)] = true;
+      }
     }
   }
   return flags;
@@ -210,13 +215,14 @@ function gatewayCall(method, params = {}, opts = {}) {
   args.push('--params', JSON.stringify(params));
   args.push('--timeout', String(timeout));
   if (expectFinal) args.push('--expect-final');
-  if (GATEWAY_TOKEN) args.push('--token', GATEWAY_TOKEN);
+  const childEnv = GATEWAY_TOKEN ? { ...process.env, OPENCLAW_GATEWAY_TOKEN: GATEWAY_TOKEN } : process.env;
 
   try {
     const result = execFileSync('openclaw', args, {
       encoding: 'utf-8',
       timeout:  timeout + 5000,
       stdio:    ['pipe', 'pipe', 'pipe'],
+      env:      childEnv,
     });
     // Strip non-JSON prefix lines (e.g. plugin init logs leaking to stdout)
     const trimmed = result.trim();
@@ -530,7 +536,7 @@ function makeSessionKey(agentId) {
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
- *   --origin <origin>        Required. Where the job was dispatched from (e.g. "telegram:484946046", "system")
+ *   --origin <origin>        Required. Where the job was dispatched from (e.g. "telegram:<your-user-id>", "system")
  *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call.
  *                            Defaults to origin chat ID when --origin is a "telegram:<id>" string.
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
@@ -589,7 +595,6 @@ async function cmdEnqueue(flags) {
   // ── Watchdog monitoring flags ─────────────────────────────
   const noMonitorRaw    = flags['no-monitor'];
   const noMonitor       = !!noMonitorRaw;
-  const _deliveryOptOutReason = typeof noMonitorRaw === 'string' ? noMonitorRaw : null;
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
   const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
   const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
@@ -598,7 +603,6 @@ async function cmdEnqueue(flags) {
   // ── Delivery enforcement for agentTurn jobs ─────────────────
   // agentTurn jobs must have a delivery target OR explicitly opt out via --no-monitor "<reason>"
   const isAgentTurn = !flags['payload-kind'] || flags['payload-kind'] === 'agentTurn';
-  const _effectiveDeliveryMode = deliverMode;
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
       "REJECTED: --deliver-to is required for dispatch jobs.\n" +
@@ -1736,7 +1740,7 @@ Usage: openclaw-scheduler <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
-           [--origin <o>]  (auto-detected from active session; override with e.g. "telegram:-1003892419349")
+           [--origin <o>]  (auto-detected from active session; override with e.g. "telegram:<your-group-id>")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
            (--deliver-to defaults to origin chat ID when --origin is "telegram:<id>")
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]

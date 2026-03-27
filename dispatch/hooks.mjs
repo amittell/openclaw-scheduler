@@ -40,24 +40,26 @@ async function lokiPush(event, payload) {
     }],
   });
 
-  await fetch(LOKI_URL, {
+  const res = await fetch(LOKI_URL, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
     signal:  AbortSignal.timeout(TIMEOUT_MS),
   });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 }
 
 // ── Webhook push ────────────────────────────────────────────
 
 async function webhookPush(event, payload) {
   if (!WEBHOOK_URL) return;
-  await fetch(WEBHOOK_URL, {
+  const res = await fetch(WEBHOOK_URL, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ event, ts: Date.now(), host: HOST, ...payload }),
     signal:  AbortSignal.timeout(TIMEOUT_MS),
   });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 }
 
 // ── Post-office notification ─────────────────────────────────
@@ -75,7 +77,7 @@ async function webhookPush(event, payload) {
 async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram') {
   try {
     const body = `✅ [${label}] done — ${summary}`;
-    sendMessage({
+    await sendMessage({
       from_agent:  'dispatch',
       to_agent:    'main',
       kind:        'result',

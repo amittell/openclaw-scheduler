@@ -294,7 +294,6 @@ const idemEntry: Record<string, unknown> | null = idempotency.getIdempotencyEntr
 const idemClaimed: boolean = idempotency.claimIdempotencyKey(idemKey, 'job-1', 'run-1', '2026-12-31');
 idempotency.releaseIdempotencyKey(idemKey);
 idempotency.updateIdempotencyResultHash(idemKey, 'content');
-const idemPruned: number = idempotency.pruneIdempotencyLedger();
 const idemList: Array<Record<string, unknown>> = idempotency.listIdempotencyForJob('job-1', 10);
 const idemForce: number = idempotency.forcePruneIdempotency();
 
@@ -341,6 +340,6 @@ void healthy; void waited;
 void home; void dbPath; void parent; void backupDir; void artifactsDir; void ensuredDir;
 void ctx; void normalized; void parts;
 void idemKey; void chainKey; void runNowKey; void idemCheck; void idemEntry;
-void idemClaimed; void idemPruned; void idemList; void idemForce;
+void idemClaimed; void idemList; void idemForce;
 void tgOpts; void tgGet; void tgActive; void tgCompletion;
 void mapped; void teamTasks; void teamEvents; void gateOpts; void ackResult;

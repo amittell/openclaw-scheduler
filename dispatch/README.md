@@ -313,7 +313,7 @@ Key improvements:
 - **Mid-session steering** — `send`/`steer` inject messages into running sessions
 - **No DB dependency** — labels.json is a simple JSON file
 - **Session reuse** — `--mode reuse` continues conversations
-- **Simpler** — ~450 lines vs ~300+ lines + DB schema + dispatcher integration
+- **Simpler** -- single-file CLI vs multi-file DB schema + dispatcher integration
 
 ---
 

@@ -12,7 +12,8 @@ Environment=OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN
 Environment=SCHEDULER_DB=%h/.openclaw/scheduler/scheduler.db
 Environment=SCHEDULER_TICK_MS=10000
 Environment=SCHEDULER_STALE_THRESHOLD_S=90
-Environment=SCHEDULER_DEBUG=1
+# Uncomment to enable verbose logging:
+# Environment=SCHEDULER_DEBUG=1
 Restart=always
 RestartSec=5
 StandardOutput=append:/tmp/openclaw-scheduler.log

@@ -73,6 +73,11 @@ export async function runAgentTurn(opts) {
       sessionKey: resp.headers.get('x-openclaw-session-key') || sessionKey,
       raw: data,
     };
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Agent turn timed out after ${Math.round(timeoutMs / 1000)}s`, { cause: err });
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -220,7 +225,12 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 /**
  * Send a system event to the main session.
  */
+const VALID_MODES = new Set(['now', 'queue']);
+
 export async function sendSystemEvent(text, mode = 'now') {
+  if (!VALID_MODES.has(mode)) {
+    throw new Error(`Invalid mode '${mode}': must be one of ${[...VALID_MODES].join(', ')}`);
+  }
   try {
     const result = execFileSync(
       'openclaw', ['system', 'event', '--text', text, '--mode', mode, '--json'],

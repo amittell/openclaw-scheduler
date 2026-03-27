@@ -27,7 +27,7 @@ All notable changes to this project will be documented in this file.
 - Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
 - Full validation gate moved into local verification commands (`npm run verify:local` / `npm run verify:smoke`); GitHub Actions now runs a single lightweight smoke job
-- Test baseline updated to 1001 passed
+- Test baseline updated to 993 passed
 - Schema baseline is now v20
 
 ## [0.1.0] -- 2026-03-08

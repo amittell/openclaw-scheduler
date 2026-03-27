@@ -33,9 +33,25 @@ function sqliteNow(offsetMs = 0) {
   return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
+const PATCHABLE_COLUMNS = new Set([
+  'enabled', 'name', 'schedule_cron', 'schedule_tz', 'schedule_at', 'schedule_kind',
+  'next_run_at', 'last_run_at', 'last_status', 'payload_message', 'payload_model',
+  'payload_thinking', 'payload_timeout_seconds', 'session_target', 'run_timeout_ms',
+  'max_retries', 'retry_count', 'consecutive_errors',
+  'delivery_mode', 'delivery_channel', 'delivery_to', 'delivery_opt_out_reason',
+  'delete_after_run', 'ttl_hours', 'auth_profile', 'origin',
+  'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
+  'watchdog_check_cmd', 'watchdog_timeout_min', 'watchdog_started_at',
+  'watchdog_target_label', 'watchdog_alert_channel', 'watchdog_alert_target',
+  'watchdog_self_destruct',
+]);
+
 function applyJobPatch(jobId, patch) {
   const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
   if (entries.length === 0) return;
+  for (const [key] of entries) {
+    if (!PATCHABLE_COLUMNS.has(key)) throw new Error(`applyJobPatch: disallowed column "${key}"`);
+  }
   const sets = entries.map(([key]) => `${key} = ?`).join(', ');
   getDb().prepare(`UPDATE jobs SET ${sets} WHERE id = ?`).run(...entries.map(([, value]) => value), jobId);
 }
@@ -284,12 +300,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
 
   // Origin tracking (v20): required on creation for root (non-child) jobs.
-  // Format convention: "<channel>:<id>" e.g. "telegram:484946046", "telegram:-5240776892", or "system" for automated jobs.
+  // Format convention: "<channel>:<id>" e.g. "telegram:<your-user-id>", "telegram:<your-group-id>", or "system" for automated jobs.
   // Child jobs inherit origin context from parent and are exempt from this requirement.
   if (mode === 'create' && !isChild && !merged.origin) {
     throw new Error(
       'origin is required on job creation — pass the chat_id or channel identifier where the job was requested from ' +
-      '(e.g. "telegram:484946046", "telegram:-5240776892", "system" for automated/cron jobs).'
+      '(e.g. "telegram:<your-user-id>", "telegram:<your-group-id>", "system" for automated/cron jobs).'
     );
   }
   if (mode === 'create' || 'origin' in normalized) {
@@ -715,13 +731,6 @@ export function getDueAtJobs() {
  */
 export function pruneExpiredJobs() {
   const db = getDb();
-  // Delete disabled one-shot jobs (delete_after_run=1) that already have a last_run_at
-  const oneShots = db.prepare(`
-    DELETE FROM jobs
-    WHERE enabled = 0
-      AND delete_after_run = 1
-      AND last_run_at IS NOT NULL
-  `).run();
   // Delete disabled one-shot jobs that have been sitting for >24h since last run (or creation if never ran)
   const aged = db.prepare(`
     DELETE FROM jobs
@@ -746,7 +755,7 @@ export function pruneExpiredJobs() {
       AND last_run_at IS NOT NULL
       AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
   `).run();
-  return oneShots.changes + aged.changes + orphans.changes + ttlExpired.changes;
+  return aged.changes + orphans.changes + ttlExpired.changes;
 }
 
 /**

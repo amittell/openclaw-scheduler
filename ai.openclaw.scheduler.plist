@@ -22,13 +22,20 @@
         <string>10000</string>
         <key>SCHEDULER_STALE_THRESHOLD_S</key>
         <string>90</string>
+        <!-- Uncomment to enable verbose logging:
         <key>SCHEDULER_DEBUG</key>
         <string>1</string>
+        -->
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Replace YOUR_USER with your macOS username -->
+    <key>UserName</key>
+    <string>YOUR_USER</string>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>

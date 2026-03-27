@@ -111,8 +111,6 @@ export default function migrateConsolidate() {
     `ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE messages ADD COLUMN last_error TEXT`,
     `ALTER TABLE messages ADD COLUMN team_mapped_at TEXT`,
-    // v21: per-message delivery routing
-    `ALTER TABLE messages ADD COLUMN delivery_to TEXT`,
     // v11: durable non-cron dispatches
     `ALTER TABLE approvals ADD COLUMN dispatch_queue_id TEXT`,
     // v12: structured shell results
@@ -161,6 +159,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN delivery_opt_out_reason TEXT DEFAULT NULL`,
     // v20: origin tracking
     `ALTER TABLE jobs ADD COLUMN origin TEXT DEFAULT NULL`,
+    // v21: per-message delivery routing
+    `ALTER TABLE messages ADD COLUMN delivery_to TEXT`,
   ];
 
   for (const sql of alters) {

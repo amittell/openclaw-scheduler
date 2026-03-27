@@ -176,7 +176,8 @@ Environment=OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN
 Environment=SCHEDULER_DB=%h/.openclaw/scheduler/scheduler.db
 Environment=SCHEDULER_TICK_MS=10000
 Environment=SCHEDULER_STALE_THRESHOLD_S=90
-Environment=SCHEDULER_DEBUG=1
+# Uncomment to enable verbose logging:
+# Environment=SCHEDULER_DEBUG=1
 Restart=always
 RestartSec=5
 StandardOutput=append:/tmp/openclaw-scheduler.log
@@ -199,8 +200,9 @@ nano ~/.config/systemd/user/openclaw-scheduler.service
    ```
    If node is not at `/usr/bin/node`, update the `ExecStart` line:
    ```ini
-   ExecStart=/home/youruser/.nvm/versions/node/v20.19.5/bin/node --no-warnings /home/youruser/.openclaw/scheduler/dispatcher.js
+   ExecStart=/home/youruser/.nvm/versions/node/vX.Y.Z/bin/node --no-warnings /home/youruser/.openclaw/scheduler/dispatcher.js
    ```
+   Replace `vX.Y.Z` with your installed Node.js version (run `node --version` to check).
    Note: `%h` expands to your home directory in systemd user units.
 
 **Enable and start:**
@@ -403,7 +405,10 @@ loginctl enable-linger $USER   # keep running without active login session
 #!/bin/bash
 export XDG_CONFIG_HOME=$HOME/.openclaw/agents/main/qmd/xdg-config
 export XDG_CACHE_HOME=$HOME/.openclaw/agents/main/qmd/xdg-cache
-QMD=$HOME/node_modules/@tobilu/qmd/qmd
+# Set QMD_PATH to the location of your qmd binary.
+# If installed globally: QMD_PATH=$(which qmd)
+# If installed locally via npm: QMD_PATH=$HOME/node_modules/@tobilu/qmd/qmd
+QMD_PATH="/path/to/qmd"
 BRIDGE="python3 $HOME/.openclaw/scripts/mcporter-qmd.py"
 
 # Wait for model storage to be available (adjust path as needed)
@@ -413,7 +418,7 @@ for i in {1..30}; do
 done
 
 # Start QMD in background — do NOT exec into it or the wait below won't work
-$QMD mcp --http --port 8181 &
+$QMD_PATH mcp --http --port 8181 &
 QMD_PID=$!
 
 # Wait for port
@@ -440,7 +445,7 @@ wait $QMD_PID
   "name": "QMD Daemon Keepalive",
   "schedule_cron": "*/10 * * * *",
   "session_target": "shell",
-  "payload_message": "python3 /home/user/.openclaw/scripts/mcporter-qmd.py call qmd.deep_search --args '{"query":"memory","limit":1,"minScore":0,"collection":"memory-root-main"}' --timeout 30000 > /dev/null 2>&1 && echo 'QMD warm' || echo 'QMD cold'",
+  "payload_message": "python3 /home/user/.openclaw/scripts/mcporter-qmd.py call qmd.deep_search --args '{\"query\":\"memory\",\"limit\":1,\"minScore\":0,\"collection\":\"memory-root-main\"}' --timeout 30000 > /dev/null 2>&1 && echo 'QMD warm' || echo 'QMD cold'",
   "delivery_mode": "none"
 }
 ```

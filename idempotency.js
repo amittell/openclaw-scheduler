@@ -102,14 +102,6 @@ export function updateIdempotencyResultHash(key, content) {
 }
 
 /**
- * Prune expired idempotency ledger entries. Returns number of entries deleted.
- */
-export function pruneIdempotencyLedger() {
-  const result = getDb().prepare("DELETE FROM idempotency_ledger WHERE expires_at < datetime('now')").run();
-  return result.changes;
-}
-
-/**
  * List recent idempotency entries for a job.
  */
 export function listIdempotencyForJob(jobId, limit = 20) {

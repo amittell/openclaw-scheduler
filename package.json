@@ -47,8 +47,6 @@
     "scripts/inbox-consumer.mjs",
     "scripts/stuck-run-detector.mjs",
     "scripts/stuck-detector.sh",
-    "scripts/coverage.mjs",
-    "scripts/verify-local.mjs",
     "scripts/telegram-webhook-check.mjs",
     "agents.js",
     "approval.js",

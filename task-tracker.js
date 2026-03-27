@@ -179,7 +179,7 @@ export function checkDeadAgents() {
       AND t.status = 'active'
       AND (julianday(?) - julianday(t.created_at)) * 86400 >= t.timeout_s
       AND (a.last_heartbeat IS NULL
-           OR (julianday(?) - julianday(a.last_heartbeat)) * 86400 > 300)
+           OR (julianday(?) - julianday(a.last_heartbeat)) * 86400 > MIN(300, COALESCE(t.timeout_s, 300)))
   `).all(now, now);
 
   // Mark them as dead
