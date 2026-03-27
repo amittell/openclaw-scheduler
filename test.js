@@ -374,13 +374,13 @@ assert(getStaleRuns(90).some(r => r.id === staleRun.id), 'stale run detected');
 // ── getStaleRuns: shell vs agent jobs ────────────────────────
 console.log('\n── getStaleRuns: shell vs agent jobs ──');
 
-// Create a shell job (systemEvent) for stale testing
+// Create a shell job (shellCommand) for stale testing
 const shellJobForStale = createJob({
   name: 'Shell Stale Test Job',
   schedule_cron: '*/5 * * * *',
   payload_message: 'echo hello',
-  session_target: 'main',
-  payload_kind: 'systemEvent',
+  session_target: 'shell',
+  payload_kind: 'shellCommand',
   delivery_mode: 'none',
   delivery_opt_out_reason: 'test',
   run_timeout_ms: 120000,
@@ -656,6 +656,13 @@ const recentDisabled = createJob({ name: 'RecentDisabled', schedule_cron: '0 12 
 updateJob(recentDisabled.id, { enabled: 0 });
 pruneExpiredJobs();
 assert(getJob(recentDisabled.id), 'recently disabled job kept');
+
+// Disabled annual cron job should NOT be pruned just because next_run_at is far away
+const pausedAnnual = createJob({ name: 'PausedAnnual', schedule_cron: '0 0 1 1 *', payload_message: 'annual', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+updateJob(pausedAnnual.id, { enabled: 0 });
+db.prepare("UPDATE jobs SET next_run_at = datetime('now', '+350 days') WHERE id = ?").run(pausedAnnual.id);
+pruneExpiredJobs();
+assert(getJob(pausedAnnual.id), 'disabled annual cron job kept');
 
 // ═══════════════════════════════════════════════════════════
 // SECTION 3: Cycle detection + max depth (v3b)
@@ -2414,6 +2421,37 @@ console.log('\n── Delivery Enforcement (v19) ──');
   const j7u = updateJob(j7.id, { delivery_opt_out_reason: 'updated reason' });
   assert(j7u.delivery_opt_out_reason === 'updated reason', 'delivery_opt_out_reason updateable');
   deleteJob(j7.id);
+
+  // Test 8: root agentTurn cannot be updated into delivery_mode="none" without opt-out reason
+  const j8 = createJob({
+    name: 'UpdateToNoDeliveryRequiresReason',
+    schedule_cron: '0 9 * * *',
+    payload_message: 'test',
+    delivery_mode: 'announce',
+    delivery_to: '1234567890',
+    delivery_channel: 'telegram',
+    run_timeout_ms:   300_000, origin: 'system',
+  });
+  let threwUpdateNoReason = false;
+  try {
+    updateJob(j8.id, {
+      delivery_mode: 'none',
+      delivery_channel: null,
+      delivery_to: null,
+    });
+  } catch (e) {
+    threwUpdateNoReason = e.message.includes('delivery_opt_out_reason');
+  }
+  assert(threwUpdateNoReason, 'updateJob rejects root agentTurn -> delivery_mode "none" without opt-out reason');
+
+  const j8u = updateJob(j8.id, {
+    delivery_mode: 'none',
+    delivery_channel: null,
+    delivery_to: null,
+    delivery_opt_out_reason: 'internal monitoring, no human delivery needed',
+  });
+  assert(j8u.delivery_mode === 'none' && j8u.delivery_opt_out_reason, 'updateJob allows root agentTurn -> delivery_mode "none" with opt-out reason');
+  deleteJob(j8.id);
 }
 
 console.log('\n── delivery_to Required for Announce Modes ──');
@@ -5183,6 +5221,24 @@ assert(AT_JOB_CRON_SENTINEL === '0 0 31 2 *', 'AT_JOB_CRON_SENTINEL is the expec
   // Disabled at-job NOT returned by getDueAtJobs
   const dueAfterDisable = getDueAtJobs();
   assert(!dueAfterDisable.some(j => j.id === atFuture.id), 'disabled at-job not returned by getDueAtJobs');
+
+  // ISO-8601 schedule_at input is normalized and still due when appropriate
+  const isoPastInput = new Date(Date.now() - 2 * 60000).toISOString();
+  const atIsoPast = createJob({
+    name: 'At-Job ISO Past Test',
+    schedule_kind: 'at',
+    schedule_at: isoPastInput,
+    schedule_cron: AT_JOB_CRON_SENTINEL,
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'at-job iso past payload',
+    delete_after_run: 1,
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms:   300_000, origin: 'system',
+  });
+  assert(atIsoPast.schedule_at.includes(' '), 'ISO schedule_at normalized to SQLite UTC format');
+  assert(getDueAtJobs().some(j => j.id === atIsoPast.id), 'getDueAtJobs returns at-job created from ISO schedule_at');
+  deleteJob(atIsoPast.id);
 
   // Clean up
   deleteJob(atFuture.id);

@@ -38,6 +38,25 @@ function normalizeNullableString(value) {
   return value.trim() === '' ? null : value;
 }
 
+function normalizeSqliteUtcDateTime(name, value) {
+  if (value == null) return null;
+  if (typeof value !== 'string') {
+    throw new Error(`${name} must be a string`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`${name} cannot be empty`);
+  }
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return trimmed;
+  }
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`${name} must be a valid datetime`);
+  }
+  return parsed.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
 function assertSafeString(name, value, opts = {}) {
   if (value == null) return;
   if (typeof value !== 'string') {
@@ -159,6 +178,8 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (merged.schedule_at != null) {
     assertSafeString('schedule_at', merged.schedule_at, { maxLength: 64 });
+    normalized.schedule_at = normalizeSqliteUtcDateTime('schedule_at', merged.schedule_at);
+    merged.schedule_at = normalized.schedule_at;
   }
   if (mode === 'create' || 'schedule_tz' in normalized) {
     assertSafeString('schedule_tz', merged.schedule_tz || 'UTC', { maxLength: 128 });
@@ -188,7 +209,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     }
   }
 
-  if (mode === 'create') {
+  {
     const isAgentTurn =
       !isChild &&
       (merged.payload_kind === 'agentTurn' ||
@@ -655,8 +676,9 @@ export function getDueAtJobs() {
 }
 
 /**
- * Prune expired disabled jobs (one-shots that already ran, or disabled jobs
- * whose next_run_at is in the past and won't fire again).
+ * Prune expired disabled jobs.
+ * This intentionally avoids guessing whether a disabled cron job is "expired":
+ * paused recurring jobs may legitimately have a next_run_at far in the future.
  */
 export function pruneExpiredJobs() {
   const db = getDb();
@@ -666,13 +688,6 @@ export function pruneExpiredJobs() {
     WHERE enabled = 0
       AND delete_after_run = 1
       AND last_run_at IS NOT NULL
-  `).run();
-  // Delete disabled jobs whose cron only matches dates in the past (one-time crons like '0 4 18 2 *')
-  // by checking if next_run_at is >30 days from now (means it wrapped to next year = expired)
-  const stale = db.prepare(`
-    DELETE FROM jobs
-    WHERE enabled = 0
-      AND next_run_at > datetime('now', '+300 days')
   `).run();
   // Delete disabled one-shot jobs that have been sitting for >24h since last run (or creation if never ran)
   const aged = db.prepare(`
@@ -698,7 +713,7 @@ export function pruneExpiredJobs() {
       AND last_run_at IS NOT NULL
       AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
   `).run();
-  return oneShots.changes + stale.changes + aged.changes + orphans.changes + ttlExpired.changes;
+  return oneShots.changes + aged.changes + orphans.changes + ttlExpired.changes;
 }
 
 /**
