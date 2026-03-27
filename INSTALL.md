@@ -1,6 +1,6 @@
-# Installing OpenClaw Scheduler on a New Host
+# Installing OpenClaw Scheduler on macOS
 
-Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., `scheduler-host.local`).
+Step-by-step guide to deploy the scheduler on a macOS OpenClaw instance.
 
 If you just want the fastest path to a working local install, start with the npm-first flow and [Five-Minute Setup in the README](README.md#five-minute-setup). This document is the full host deployment guide.
 
@@ -146,72 +146,45 @@ openclaw gateway restart
 
 ---
 
-## Step 8: Install LaunchDaemon
+## Step 8: Choose a macOS launchd mode
 
-Create `/Library/LaunchDaemons/ai.openclaw.scheduler.plist` with `sudo`:
+OpenClaw Scheduler supports both common macOS service styles:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Comment</key>
-    <string>OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)</string>
-    <key>Label</key>
-    <string>ai.openclaw.scheduler</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/bin/node</string>
-        <string>--no-warnings</string>
-        <string>/Users/YOUR_USER/.openclaw/scheduler/dispatcher.js</string>
-    </array>
-    <key>UserName</key>
-    <string>YOUR_USER</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USER/.openclaw/scheduler</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>/Users/YOUR_USER</string>
-        <key>OPENCLAW_GATEWAY_URL</key>
-        <string>http://127.0.0.1:18789</string>
-        <key>OPENCLAW_GATEWAY_TOKEN</key>
-        <string>YOUR_GATEWAY_TOKEN</string>
-        <key>SCHEDULER_DB</key>
-        <string>/Users/YOUR_USER/.openclaw/scheduler/scheduler.db</string>
-        <key>SCHEDULER_TICK_MS</key>
-        <string>10000</string>
-        <key>SCHEDULER_STALE_THRESHOLD_S</key>
-        <string>90</string>
-        <key>SCHEDULER_DEBUG</key>
-        <string>1</string>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/openclaw-scheduler.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/openclaw-scheduler.log</string>
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-</dict>
-</plist>
+- **LaunchAgent**: best for a personal Mac that auto-logs in and should run the scheduler inside your user session
+- **LaunchDaemon**: best for a headless Mac or for starting before login
+
+The simplest path is to let the setup wizard install the launchd plist for you:
+
+```bash
+cd ~/.openclaw/scheduler
+node setup.mjs --service-mode agent
+# or:
+node setup.mjs --service-mode daemon
 ```
 
-**Replace** `YOUR_USER` and `YOUR_GATEWAY_TOKEN` with actual values.
+If you installed from npm:
 
-Bootstrap it:
 ```bash
-sudo launchctl bootstrap system /Library/LaunchDaemons/ai.openclaw.scheduler.plist
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup --service-mode agent
+# or:
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup --service-mode daemon
 ```
 
-Verify:
+What each mode does:
+
+- `agent` writes `~/Library/LaunchAgents/ai.openclaw.scheduler.plist` and bootstraps `gui/$UID/ai.openclaw.scheduler`
+- `daemon` writes `/Library/LaunchDaemons/ai.openclaw.scheduler.plist` and bootstraps `system/ai.openclaw.scheduler`
+
+Verify the mode you chose:
+
 ```bash
+# LaunchAgent
+launchctl print gui/$UID/ai.openclaw.scheduler
+
+# LaunchDaemon
 sudo launchctl print system/ai.openclaw.scheduler
+
+# Either mode
 sleep 5 && tail -5 /tmp/openclaw-scheduler.log
 ```
 
@@ -301,7 +274,8 @@ If anything goes wrong:
 
 ```bash
 # 1. Stop scheduler
-sudo launchctl bootout system/ai.openclaw.scheduler
+launchctl bootout gui/$UID/ai.openclaw.scheduler     # if using LaunchAgent
+sudo launchctl bootout system/ai.openclaw.scheduler  # if using LaunchDaemon
 
 # 2. Re-enable OC cron
 openclaw cron edit <job-id> --enable  # for each job
@@ -321,7 +295,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 - [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
 - [ ] `node cli.js status` → shows jobs, 0 stale
-- [ ] `sudo launchctl print system/ai.openclaw.scheduler` → running
+- [ ] `launchctl print gui/$UID/ai.openclaw.scheduler` or `sudo launchctl print system/ai.openclaw.scheduler` → running
 - [ ] Log file has startup lines, no errors
 - [ ] OC cron → all disabled
 - [ ] OC heartbeat → `0m`

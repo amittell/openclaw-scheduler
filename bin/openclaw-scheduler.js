@@ -29,7 +29,8 @@ function printUsage() {
 openclaw-scheduler <command> [args]
 
 Commands:
-  setup            Run interactive setup wizard
+  setup [--service-mode agent|daemon|skip]
+                   Run interactive setup wizard
   start            Start dispatcher loop
   migrate          Import OC cron jobs from ~/.openclaw/cron/jobs.json
   webhook-check    Run Telegram webhook health check / repair utility
