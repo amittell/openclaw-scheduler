@@ -391,8 +391,11 @@ function respawnSession(label) {
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
       if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
-      if (entry?.deliverTo) enqueueArgs.push('--deliver-to', entry.deliverTo);
-      if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
+      if (entry?.deliverTo) {
+        enqueueArgs.push('--deliver-to', entry.deliverTo);
+        if (entry?.deliveryMode) enqueueArgs.push('--delivery-mode', entry.deliveryMode);
+        if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
+      }
 
       execFileSync(process.execPath, enqueueArgs, {
         encoding: 'utf-8',
@@ -434,8 +437,11 @@ function respawnAfterGwRestart(label) {
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
     if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
-    if (entry?.deliverTo) enqueueArgs.push('--deliver-to', entry.deliverTo);
-    if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
+    if (entry?.deliverTo) {
+      enqueueArgs.push('--deliver-to', entry.deliverTo);
+      if (entry?.deliveryMode) enqueueArgs.push('--delivery-mode', entry.deliveryMode);
+      if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
+    }
 
     execFileSync(process.execPath, enqueueArgs, {
       encoding: 'utf-8',

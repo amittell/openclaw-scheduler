@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 20)
+-- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 21)
 -- Full standalone scheduler + message router
 
 -- ============================================================

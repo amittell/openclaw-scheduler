@@ -37,6 +37,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const LABELS_PATH  = join(__dirname, '..', 'dispatch', 'labels.json');
 const STATE_PATH   = process.env.STUCK_STATE_PATH || join(tmpdir(), 'stuck-detector-state.json');
 const DISPATCH_CLI = resolveDispatchCliPath(process.env);
+const DISPATCH_IS_BIN = !DISPATCH_CLI.includes('/') && !DISPATCH_CLI.includes('\\');
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -96,7 +97,10 @@ function saveState(state) {
  */
 function getDispatchLiveness(label) {
   try {
-    const result = execFileSync(process.execPath, [DISPATCH_CLI, 'status', '--label', label], {
+    const execArgs = DISPATCH_IS_BIN
+      ? [DISPATCH_CLI, ['status', '--label', label]]
+      : [process.execPath, [DISPATCH_CLI, 'status', '--label', label]];
+    const result = execFileSync(execArgs[0], execArgs[1], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -127,7 +131,10 @@ function steerSession(label, staleMins) {
     `If you are done, call the done signal as instructed in your prompt.`,
   ].join(' ');
   try {
-    execFileSync(process.execPath, [DISPATCH_CLI, 'send', '--label', label, '--message', msg], {
+    const execArgs = DISPATCH_IS_BIN
+      ? [DISPATCH_CLI, ['send', '--label', label, '--message', msg]]
+      : [process.execPath, [DISPATCH_CLI, 'send', '--label', label, '--message', msg]];
+    execFileSync(execArgs[0], execArgs[1], {
       encoding: 'utf-8',
       timeout: 15_000,
       stdio: ['pipe', 'pipe', 'pipe'],

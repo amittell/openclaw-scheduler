@@ -558,6 +558,7 @@ async function cmdEnqueue(flags) {
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
+  if (!Number.isFinite(timeoutS) || timeoutS <= 0) die('--timeout must be a positive integer', 2);
   let origin = flags.origin || null;
 
   // Auto-detect origin from active sessions if not explicitly provided
@@ -592,6 +593,7 @@ async function cmdEnqueue(flags) {
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
   const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
   const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
+  if (!Number.isFinite(monitorTimeout) || monitorTimeout <= 0) die('--monitor-timeout must be a positive integer', 2);
 
   // ── Delivery enforcement for agentTurn jobs ─────────────────
   // agentTurn jobs must have a delivery target OR explicitly opt out via --no-monitor "<reason>"
@@ -600,8 +602,8 @@ async function cmdEnqueue(flags) {
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
       "REJECTED: --deliver-to is required for dispatch jobs.\n" +
-      "Pass --deliver-to <chat_id> (e.g. --deliver-to -5240776892 for the AI Assisted Degeneracy group, " +
-      "or --deliver-to 484946046 for Alex DM).\n" +
+      "Pass --deliver-to <chat_id> (e.g. --deliver-to -1001234567890 for a group, " +
+      "or --deliver-to 123456789 for a DM).\n" +
       "Alternatively, pass --origin telegram:<chat_id> to auto-derive the delivery target.\n" +
       "Pass --no-monitor \"<reason>\" only if you explicitly want to skip delivery (audit trail required).",
       2

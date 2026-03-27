@@ -1347,7 +1347,6 @@ console.log('\n── v5: Job Class / Flush Hook ──');
 
 console.log('\n── v5: Context Summary ──');
 {
-  import('./runs.js').then(m => m.updateContextSummary); // verify export exists
   const j = createJob({ name: 'ctx-job', schedule_cron: '0 * * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   const run = createRun(j.id, { run_timeout_ms: 60000 });
 
@@ -5927,8 +5926,8 @@ console.log('\n── dispatch/index.mjs --deliver-to error message ──');
 
   // Verify improved error message contains --deliver-to guidance
   assert(indexSrc.includes('REJECTED: --deliver-to is required for dispatch jobs'), 'dispatch error: REJECTED prefix present');
-  assert(indexSrc.includes('-5240776892'), 'dispatch error: AI Assisted Degeneracy group ID example present');
-  assert(indexSrc.includes('484946046'), 'dispatch error: Alex DM example present');
+  assert(indexSrc.includes('-1001234567890'), 'dispatch error: generic group ID example present');
+  assert(indexSrc.includes('123456789'), 'dispatch error: generic DM example present');
   assert(indexSrc.includes('--origin telegram:<chat_id>'), 'dispatch error: --origin auto-derive guidance present');
   assert(indexSrc.includes('audit trail required'), 'dispatch error: --no-monitor audit trail note present');
 

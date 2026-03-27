@@ -109,7 +109,9 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
   // Group messages by kind for independent delivery attempts
   const groups = new Map();
   for (const msg of msgs) {
-    const key = msg.kind || '_default';
+    const target = msg.delivery_to || to || '_default_target';
+    const ch = msg.channel || channel || '_default_channel';
+    const key = `${msg.kind || '_default'}:${ch}:${target}`;
     if (!groups.has(key)) groups.set(key, { msgs: [] });
     groups.get(key).msgs.push(msg);
   }
