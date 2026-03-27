@@ -146,9 +146,10 @@ async function replayOrphanedRuns() {
 
   for (const run of orphaned) {
     log('info', `Found orphaned run for ${run.job_name}`, { runId: run.id, jobId: run.job_id });
+    const crashedAt = sqliteNow();
 
     // Mark old run as crashed
-    db.prepare(`UPDATE runs SET status = 'crashed', finished_at = datetime('now') WHERE id = ?`).run(run.id);
+    db.prepare(`UPDATE runs SET status = 'crashed', finished_at = ? WHERE id = ?`).run(crashedAt, run.id);
     if (run.dispatch_queue_id) {
       setDispatchStatus(run.dispatch_queue_id, 'done');
     }
@@ -160,6 +161,15 @@ async function replayOrphanedRuns() {
     }
 
     if (run.delivery_guarantee === 'at-least-once') {
+      const replayPatch = {
+        last_run_at: crashedAt,
+        last_status: 'crashed',
+      };
+      if (run.schedule_kind !== 'at') {
+        replayPatch.next_run_at = nextRunFromCron(run.schedule_cron, run.schedule_tz);
+      }
+      updateJob(run.job_id, replayPatch);
+
       // Enqueue a dispatch so the normal dispatch flow creates and executes the replay run
       const replayDispatch = enqueueDispatch(run.job_id, {
         kind: 'retry',
@@ -183,6 +193,61 @@ async function replayOrphanedRuns() {
       }
       log('info', `Marked crashed: ${run.job_name} (at-most-once)`, { runId: run.id });
     }
+  }
+}
+
+function reconcileQueuedRetrySchedules() {
+  const db = getDb();
+  const queuedRetries = db.prepare(`
+    SELECT DISTINCT
+      j.id,
+      j.name,
+      j.parent_id,
+      j.schedule_kind,
+      j.schedule_cron,
+      j.schedule_tz,
+      j.next_run_at,
+      j.schedule_at,
+      j.last_run_at
+    FROM jobs j
+    JOIN job_dispatch_queue q ON q.job_id = j.id
+    WHERE q.dispatch_kind = 'retry'
+      AND q.status IN ('pending', 'claimed', 'awaiting_approval')
+      AND j.enabled = 1
+      AND j.parent_id IS NULL
+  `).all();
+
+  if (queuedRetries.length === 0) return;
+
+  const now = Date.now();
+  const parseMaybeDate = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const parsed = value.includes('T')
+      ? new Date(value)
+      : new Date(value.replace(' ', 'T') + 'Z');
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+
+  for (const job of queuedRetries) {
+    const patch = {};
+    if (job.schedule_kind === 'at') {
+      const scheduledAt = parseMaybeDate(job.schedule_at);
+      const lastRunAt = parseMaybeDate(job.last_run_at);
+      if (scheduledAt && (!lastRunAt || lastRunAt < scheduledAt)) {
+        patch.last_run_at = sqliteNow();
+      }
+    } else {
+      const nextRunAt = parseMaybeDate(job.next_run_at);
+      if (nextRunAt && nextRunAt.getTime() <= now) {
+        patch.next_run_at = nextRunFromCron(job.schedule_cron, job.schedule_tz);
+      }
+    }
+    if (Object.keys(patch).length === 0) continue;
+    updateJob(job.id, patch);
+    log('info', `Reconciled root schedule while retry is queued: ${job.name}`, {
+      jobId: job.id,
+      patch,
+    });
   }
 }
 
@@ -671,6 +736,7 @@ async function main() {
 
   // Replay orphaned runs from previous crash (delivery guarantee support)
   await replayOrphanedRuns();
+  reconcileQueuedRetrySchedules();
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));

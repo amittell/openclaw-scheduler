@@ -32,6 +32,13 @@ function sqliteNow(offsetMs = 0) {
   return new Date(Date.now() + offsetMs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
+function applyJobPatch(jobId, patch) {
+  const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
+  if (entries.length === 0) return;
+  const sets = entries.map(([key]) => `${key} = ?`).join(', ');
+  getDb().prepare(`UPDATE jobs SET ${sets} WHERE id = ?`).run(...entries.map(([, value]) => value), jobId);
+}
+
 function normalizeNullableString(value) {
   if (value == null) return null;
   if (typeof value !== 'string') return value;
@@ -882,13 +889,16 @@ export function scheduleRetry(job, failedRunId) {
   const retryCount = (failedRun?.retry_count || 0) + 1;
   // Exponential backoff: 30s, 60s, 120s, etc.
   const delaySec = 30 * Math.pow(2, retryCount - 1);
+  const retryPatch = {
+    consecutive_errors: 0,
+    last_run_at: sqliteNow(),
+    last_status: 'error',
+  };
+  if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
+    retryPatch.next_run_at = nextRunFromCron(job.schedule_cron, job.schedule_tz);
+  }
   if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
-    if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
-      db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
-        .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
-    } else {
-      db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
-    }
+    applyJobPatch(job.id, retryPatch);
     return { retryCount, delaySec, retryOf: failedRunId, dispatch: null, skipped: true };
   }
   const dispatch = enqueueDispatch(job.id, {
@@ -897,12 +907,7 @@ export function scheduleRetry(job, failedRunId) {
     source_run_id: failedRunId,
     retry_of_run_id: failedRunId,
   });
-  if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
-    db.prepare(`UPDATE jobs SET next_run_at = ?, consecutive_errors = 0 WHERE id = ?`)
-      .run(nextRunFromCron(job.schedule_cron, job.schedule_tz), job.id);
-  } else {
-    db.prepare(`UPDATE jobs SET consecutive_errors = 0 WHERE id = ?`).run(job.id);
-  }
+  applyJobPatch(job.id, retryPatch);
   // Store retry metadata for the next run
   return { retryCount, delaySec, retryOf: failedRunId, dispatch };
 }
