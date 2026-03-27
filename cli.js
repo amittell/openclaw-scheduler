@@ -373,6 +373,7 @@ switch (command) {
         break;
       }
       case 'output': {
+        if (!args[0]) fail('Usage: runs output <run-id> [stdout|stderr]');
         const run = getRun(args[0]);
         if (!run) fail(`Run not found: ${args[0]}`);
         const kind = (args[1] || 'stdout').toLowerCase();
