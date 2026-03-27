@@ -323,6 +323,40 @@ updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
 updateJob(job.id, { enabled: false });
 assert(getJob(job.id).enabled === 0, 'boolean enabled=false updates to disabled');
+
+const updateCronToAt = createJob({ name: 'UpdateCronToAt', schedule_cron: '0 8 * * *', payload_message: 'cron->at', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+let threwMissingScheduleAtOnUpdate = false;
+try {
+  updateJob(updateCronToAt.id, { schedule_kind: 'at', schedule_cron: null });
+} catch (e) {
+  threwMissingScheduleAtOnUpdate = e.message.includes('schedule_at');
+}
+assert(threwMissingScheduleAtOnUpdate, 'updateJob rejects cron->at without schedule_at');
+
+const rootForTopology = createJob({ name: 'RootForTopology', schedule_cron: '0 9 * * *', payload_message: 'root topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+const childForTopology = createJob({ name: 'ChildForTopology', parent_id: rootForTopology.id, trigger_on: 'success', schedule_cron: '0 11 * * *', payload_message: 'child topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+const promotedChild = updateJob(childForTopology.id, { parent_id: null });
+assert(promotedChild.parent_id === null, 'child promotion clears parent_id');
+assert(promotedChild.next_run_at !== null, 'promoting child to root recalculates next_run_at');
+const demotedRoot = updateJob(rootForTopology.id, { parent_id: promotedChild.id, trigger_on: 'success' });
+assert(demotedRoot.parent_id === promotedChild.id, 'root demotion stores parent_id');
+assert(demotedRoot.next_run_at === null, 'demoting root to child clears next_run_at');
+
+const atToCron = createJob({
+  name: 'AtToCron',
+  schedule_kind: 'at',
+  schedule_at: '2026-03-27 18:00:00',
+  schedule_cron: AT_JOB_CRON_SENTINEL,
+  payload_message: 'at->cron',
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 300_000,
+  origin: 'system'
+});
+const atToCronUpdated = updateJob(atToCron.id, { schedule_kind: 'cron', schedule_cron: '0 10 * * *', schedule_at: null });
+assert(atToCronUpdated.schedule_kind === 'cron', 'at->cron update stores cron kind');
+assert(atToCronUpdated.next_run_at !== '2026-03-27 18:00:00', 'at->cron update recalculates next_run_at');
+
 assert(listJobs().length >= 1, 'listJobs');
 const budgetedJob = createJob({
   name: 'Budgeted Agent Job',
@@ -2958,6 +2992,139 @@ console.log('\n── Migration Guard ──');
   assert(migratedRunCols.includes('shell_stdout_path'), 'migration guard backfills shell_stdout_path when version marker is already 14');
   assert(migratedJobCols.includes('execution_intent'), 'migration guard backfills execution_intent when version marker is already 14');
   assert(migratedJobCols.includes('origin'), 'migration guard backfills origin (v20) when version marker is already 14');
+  closeDb();
+
+  rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
+  await initDb();
+}
+
+console.log('\n── Legacy At-Job Normalization ──');
+{
+  const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-at-migrate-'));
+  const legacyDbPath = join(legacyDir, 'scheduler.db');
+  const legacyDb = new Database(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      schedule_kind TEXT NOT NULL DEFAULT 'cron',
+      schedule_at TEXT DEFAULT NULL,
+      schedule_cron TEXT,
+      schedule_tz TEXT NOT NULL DEFAULT 'UTC',
+      session_target TEXT NOT NULL DEFAULT 'isolated',
+      agent_id TEXT DEFAULT 'main',
+      payload_kind TEXT NOT NULL,
+      payload_message TEXT NOT NULL,
+      payload_timeout_seconds INTEGER DEFAULT 120,
+      execution_intent TEXT NOT NULL DEFAULT 'execute',
+      execution_read_only INTEGER NOT NULL DEFAULT 0,
+      overlap_policy TEXT NOT NULL DEFAULT 'skip',
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      max_queued_dispatches INTEGER NOT NULL DEFAULT 25,
+      max_pending_approvals INTEGER NOT NULL DEFAULT 10,
+      max_trigger_fanout INTEGER NOT NULL DEFAULT 25,
+      delivery_mode TEXT DEFAULT 'none',
+      delivery_channel TEXT,
+      delivery_to TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      delete_after_run INTEGER NOT NULL DEFAULT 0,
+      ttl_hours INTEGER DEFAULT NULL,
+      parent_id TEXT,
+      trigger_on TEXT,
+      trigger_delay_s INTEGER DEFAULT 0,
+      trigger_condition TEXT DEFAULT NULL,
+      max_retries INTEGER DEFAULT 0,
+      queued_count INTEGER DEFAULT 0,
+      payload_scope TEXT NOT NULL DEFAULT 'own',
+      resource_pool TEXT DEFAULT NULL,
+      delivery_guarantee TEXT DEFAULT 'at-most-once',
+      job_class TEXT DEFAULT 'standard',
+      approval_required INTEGER DEFAULT 0,
+      approval_timeout_s INTEGER DEFAULT 3600,
+      approval_auto TEXT DEFAULT 'reject',
+      context_retrieval TEXT DEFAULT 'none',
+      context_retrieval_limit INTEGER DEFAULT 5,
+      output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536,
+      output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000,
+      output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000,
+      output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
+      preferred_session_key TEXT DEFAULT NULL,
+      auth_profile TEXT DEFAULT NULL,
+      delivery_opt_out_reason TEXT DEFAULT NULL,
+      origin TEXT DEFAULT NULL,
+      job_type TEXT NOT NULL DEFAULT 'standard',
+      watchdog_target_label TEXT,
+      watchdog_check_cmd TEXT,
+      watchdog_timeout_min INTEGER,
+      watchdog_alert_channel TEXT,
+      watchdog_alert_target TEXT,
+      watchdog_self_destruct INTEGER NOT NULL DEFAULT 1,
+      watchdog_started_at TEXT,
+      next_run_at TEXT,
+      last_run_at TEXT,
+      last_status TEXT,
+      consecutive_errors INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT,
+      duration_ms INTEGER,
+      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now')),
+      session_key TEXT,
+      session_id TEXT,
+      summary TEXT,
+      error_message TEXT,
+      shell_exit_code INTEGER,
+      shell_signal TEXT,
+      shell_timed_out INTEGER NOT NULL DEFAULT 0,
+      shell_stdout TEXT,
+      shell_stderr TEXT,
+      shell_stdout_path TEXT,
+      shell_stderr_path TEXT,
+      shell_stdout_bytes INTEGER NOT NULL DEFAULT 0,
+      shell_stderr_bytes INTEGER NOT NULL DEFAULT 0,
+      dispatched_at TEXT,
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      retry_count INTEGER DEFAULT 0,
+      retry_of TEXT,
+      triggered_by_run TEXT,
+      dispatch_queue_id TEXT,
+      context_summary TEXT,
+      replay_of TEXT,
+      idempotency_key TEXT
+    );
+    CREATE TABLE messages (id TEXT PRIMARY KEY, to_agent TEXT, status TEXT, created_at TEXT, delivery_to TEXT);
+    CREATE TABLE task_tracker_agents (id TEXT PRIMARY KEY, session_key TEXT, last_heartbeat TEXT);
+    CREATE TABLE approvals (id TEXT PRIMARY KEY, job_id TEXT, run_id TEXT, dispatch_queue_id TEXT, status TEXT, requested_at TEXT, resolved_at TEXT, resolved_by TEXT, notes TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, status TEXT, last_seen_at TEXT, session_key TEXT, capabilities TEXT, delivery_channel TEXT, delivery_to TEXT, brand_name TEXT, created_at TEXT);
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (21);
+  `);
+  legacyDb.prepare(`
+    INSERT INTO jobs (
+      id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
+      session_target, agent_id, payload_kind, payload_message,
+      delivery_mode, delete_after_run, next_run_at, run_timeout_ms,
+      delivery_opt_out_reason, origin
+    ) VALUES (?, ?, 1, 'at', ?, '0 0 31 2 *', 'UTC', 'isolated', 'main', 'agentTurn', 'legacy at job', 'none', 1, ?, 300000, 'test', 'system')
+  `).run('legacy-at-job', 'LegacyAtJob', '2026-03-27T18:00:00.000Z', '2026-03-27T18:00:00.000Z');
+  legacyDb.close();
+
+  closeDb();
+  setDbPath(legacyDbPath);
+  await initDb();
+  const normalizedLegacyAt = getJob('legacy-at-job');
+  assert(normalizedLegacyAt.schedule_at === '2026-03-27 18:00:00', 'migration normalizes legacy ISO schedule_at');
+  assert(getDueAtJobs().some(j => j.id === 'legacy-at-job'), 'legacy ISO at-job is due after migration/init');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });
