@@ -371,6 +371,84 @@ const staleRun = createRun(job.id, { run_timeout_ms: 1000 });
 db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-120 seconds') WHERE id = ?").run(staleRun.id);
 assert(getStaleRuns(90).some(r => r.id === staleRun.id), 'stale run detected');
 
+// ── getStaleRuns: shell vs agent jobs ────────────────────────
+console.log('\n── getStaleRuns: shell vs agent jobs ──');
+
+// Create a shell job (systemEvent) for stale testing
+const shellJobForStale = createJob({
+  name: 'Shell Stale Test Job',
+  schedule_cron: '*/5 * * * *',
+  payload_message: 'echo hello',
+  session_target: 'main',
+  payload_kind: 'systemEvent',
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 120000,
+  origin: 'system',
+});
+
+// Create an agent job (agentTurn) for stale testing
+const agentJobForStale = createJob({
+  name: 'Agent Stale Test Job',
+  schedule_cron: '*/5 * * * *',
+  payload_message: 'Do something',
+  session_target: 'isolated',
+  payload_kind: 'agentTurn',
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 300000,
+  origin: 'system',
+});
+
+// Test 1: Shell job running 95s with run_timeout_ms=120000 → NOT stale (95s < 120s)
+{
+  const r = createRun(shellJobForStale.id, { run_timeout_ms: 120000 });
+  db.prepare("UPDATE runs SET started_at = datetime('now', '-95 seconds') WHERE id = ?").run(r.id);
+  assert(!getStaleRuns(90).some(x => x.id === r.id),
+    'shell job at 95s with 120s timeout → NOT stale');
+  finishRun(r.id, 'ok');
+}
+
+// Test 2: Shell job running 130s with run_timeout_ms=120000 → IS stale (130s > 120s)
+{
+  const r = createRun(shellJobForStale.id, { run_timeout_ms: 120000 });
+  db.prepare("UPDATE runs SET started_at = datetime('now', '-130 seconds') WHERE id = ?").run(r.id);
+  assert(getStaleRuns(90).some(x => x.id === r.id),
+    'shell job at 130s with 120s timeout → IS stale');
+  finishRun(r.id, 'ok');
+}
+
+// Test 3: Agent job with last_heartbeat 95s ago → IS stale (heartbeat path)
+{
+  const r = createRun(agentJobForStale.id, { run_timeout_ms: 300000 });
+  db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-95 seconds') WHERE id = ?").run(r.id);
+  assert(getStaleRuns(90).some(x => x.id === r.id),
+    'agent job with heartbeat 95s ago → IS stale');
+  finishRun(r.id, 'ok');
+}
+
+// Test 4: Agent job with last_heartbeat 30s ago → NOT stale
+{
+  const r = createRun(agentJobForStale.id, { run_timeout_ms: 300000 });
+  db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-30 seconds') WHERE id = ?").run(r.id);
+  assert(!getStaleRuns(90).some(x => x.id === r.id),
+    'agent job with heartbeat 30s ago → NOT stale');
+  finishRun(r.id, 'ok');
+}
+
+// Test 5: Shell job running 200s with run_timeout_ms=300000 → NOT stale (200s < 300s)
+// Confirms shell jobs with remaining budget are never false-positive stale.
+// Note: run_timeout_ms has a NOT NULL constraint in schema, so NULL is not representable;
+// the guard in the query is defensive only. The real invariant is: elapsed < timeout → not stale.
+{
+  const r = createRun(shellJobForStale.id, { run_timeout_ms: 300000 });
+  db.prepare("UPDATE runs SET started_at = datetime('now', '-200 seconds') WHERE id = ?").run(r.id);
+  assert(!getStaleRuns(90).some(x => x.id === r.id),
+    'shell job at 200s with 300s timeout → NOT flagged by stale detector');
+  finishRun(r.id, 'ok');
+}
+console.log('  getStaleRuns: shell vs agent jobs: all 5 assertions passed');
+
 // ── Timeout ─────────────────────────────────────────────────
 console.log('\nTimeout:');
 const toRun = createRun(job.id, { run_timeout_ms: 1 });
