@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS LaunchDaemon)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 929 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 954 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 ---
@@ -24,36 +24,38 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 3. [When To Use It](#when-to-use-it)
 4. [What Replaced What](#what-replaced-what)
 5. [Quick Start](#quick-start)
-6. [Platform Support](#platform-support)
-7. [Architecture](#architecture)
-8. [How Jobs Execute](#how-jobs-execute)
-9. [Delivery Modes](#delivery-modes)
-10. [Delivery Aliases](#delivery-aliases)
-11. [Shell Jobs](#shell-jobs)
-12. [HITL Approval Gates](#hitl-approval-gates)
-13. [Idempotency](#idempotency)
-14. [Context Retrieval](#context-retrieval)
-15. [Task Tracker](#task-tracker)
-16. [Resource Pools](#resource-pools)
-17. [Workflow Chains](#workflow-chains)
-18. [Retry Logic](#retry-logic)
-19. [Chain Safety](#chain-safety)
-20. [Inter-Agent Messaging](#inter-agent-messaging)
-21. [Backup & Recovery](#backup--recovery)
-22. [Agent Registry](#agent-registry)
-23. [Database Schema](#database-schema)
-24. [CLI Reference](#cli-reference)
-25. [Configuration](#configuration)
-26. [Service Management](#service-management)
-27. [Error Handling & Backoff](#error-handling--backoff)
-28. [Migration & History](#migration--history)
-29. [Removing the Scheduler](#removing-the-scheduler)
-30. [Best Practices](#best-practices)
-31. [File Reference](#file-reference)
-32. [Testing](#testing)
-33. [Companion Scripts](#companion-scripts)
-34. [Sub-agent Dispatch](#sub-agent-dispatch)
-35. [Troubleshooting](#troubleshooting)
+6. [Five-Minute Setup](#five-minute-setup)
+7. [Starter Recipes](#starter-recipes)
+8. [Platform Support](#platform-support)
+9. [Architecture](#architecture)
+10. [How Jobs Execute](#how-jobs-execute)
+11. [Delivery Modes](#delivery-modes)
+12. [Delivery Aliases](#delivery-aliases)
+13. [Shell Jobs](#shell-jobs)
+14. [HITL Approval Gates](#hitl-approval-gates)
+15. [Idempotency](#idempotency)
+16. [Context Retrieval](#context-retrieval)
+17. [Task Tracker](#task-tracker)
+18. [Resource Pools](#resource-pools)
+19. [Workflow Chains](#workflow-chains)
+20. [Retry Logic](#retry-logic)
+21. [Chain Safety](#chain-safety)
+22. [Inter-Agent Messaging](#inter-agent-messaging)
+23. [Backup & Recovery](#backup--recovery)
+24. [Agent Registry](#agent-registry)
+25. [Database Schema](#database-schema)
+26. [CLI Reference](#cli-reference)
+27. [Configuration](#configuration)
+28. [Service Management](#service-management)
+29. [Error Handling & Backoff](#error-handling--backoff)
+30. [Migration & History](#migration--history)
+31. [Removing the Scheduler](#removing-the-scheduler)
+32. [Best Practices](#best-practices)
+33. [File Reference](#file-reference)
+34. [Testing](#testing)
+35. [Companion Scripts](#companion-scripts)
+36. [Sub-agent Dispatch](#sub-agent-dispatch)
+37. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -113,6 +115,8 @@ Do not use it if simple cron is enough. If all you need is “run one thing ever
 ---
 
 ## Quick Start
+
+If you are new, use the npm-first path below and then jump straight to [Five-Minute Setup](#five-minute-setup). The rest of this README is the deeper reference manual.
 
 ### Option A: npm-first (publish/install flow)
 
@@ -180,6 +184,155 @@ Dispatcher setup is covered in:
 - [INSTALL-LINUX.md](INSTALL-LINUX.md) (Linux/WSL2 systemd + PM2 fallback)
 - [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) (WSL2 setup path)
 For additional hosts, see [INSTALL-ADDITIONAL-HOST.md](INSTALL-ADDITIONAL-HOST.md).
+
+---
+
+## Five-Minute Setup
+
+This is the shortest path from "I installed it" to "I have a real job running."
+
+### 1. Install and initialize
+
+```bash
+mkdir -p ~/.openclaw/scheduler
+npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
+ocs setup
+ocs status
+```
+
+What this does:
+- installs the package into `~/.openclaw/scheduler`
+- creates or migrates `scheduler.db`
+- installs the scheduler service
+- creates the built-in helper jobs like `Inbox Consumer` and `Stuck Run Detector`
+
+If you plan to use the scheduler often, add the `ocs` alias to your shell profile.
+
+### 2. Add your first real job
+
+This example runs a simple shell health check every 15 minutes.
+
+```bash
+ocs jobs add '{
+  "name": "Disk Space Check",
+  "schedule_cron": "*/15 * * * *",
+  "session_target": "shell",
+  "payload_message": "df -h /",
+  "delivery_mode": "none",
+  "origin": "system"
+}'
+```
+
+What it means in plain English:
+- `schedule_cron`: run every 15 minutes
+- `session_target: "shell"`: run a shell command directly, no AI needed
+- `payload_message`: the command to run
+- `delivery_mode: "none"`: do not send the output anywhere automatically
+- `origin: "system"`: this job was created by the system, not from a user chat
+
+### 3. Run it now and inspect the result
+
+```bash
+ocs jobs list
+# copy the job ID for "Disk Space Check"
+
+ocs jobs run <job-id>
+ocs runs list <job-id> 5
+```
+
+If you want the full run record:
+
+```bash
+ocs runs get <run-id>
+```
+
+At that point you have a working scheduler install, a real job, and visible run history. Everything after this is layering on more power: AI jobs, delivery, retries, workflow chains, and approvals.
+
+---
+
+## Starter Recipes
+
+These are copy-paste examples for the most common first workflows.
+
+### 1. Shell health check with failure alerts
+
+Use this when you want a script to run reliably even if the OpenClaw gateway is down.
+
+```bash
+ocs jobs add '{
+  "name": "API Health Check",
+  "schedule_cron": "*/15 * * * *",
+  "session_target": "shell",
+  "payload_message": "curl -fsS http://127.0.0.1:8080/health || exit 1",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Why this is useful:
+- it runs even if the gateway is unhealthy
+- it only announces on failure
+- every run is stored in history
+
+### 2. Daily AI summary
+
+Use this when you want a scheduled agent report instead of a shell script.
+
+```bash
+ocs jobs add '{
+  "name": "Daily Ops Summary",
+  "schedule_cron": "0 9 * * *",
+  "schedule_tz": "America/New_York",
+  "session_target": "isolated",
+  "payload_message": "Summarize the last 24 hours of important errors, deploys, and follow-ups in 5 bullet points.",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Why this is useful:
+- the agent runs in its own isolated session
+- the result is delivered every time
+- the run history stays separate from your personal chat threads
+
+### 3. Approval-gated follow-up step
+
+Use this when a risky step should wait for a human before it runs.
+
+```bash
+ocs jobs add '{
+  "name": "Delete Old Backups",
+  "parent_id": "<parent-job-id>",
+  "trigger_on": "success",
+  "approval_required": 1,
+  "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "session_target": "shell",
+  "payload_message": "find /backups -type f -mtime +14 -delete",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Why this is useful:
+- the parent job can run automatically
+- the risky cleanup step pauses until someone approves it
+- the scheduler records who approved or rejected it
+
+Approve or reject later with:
+
+```bash
+ocs approvals list
+ocs jobs approve <job-id>
+ocs jobs reject <job-id> "Not today"
+```
 
 ---
 

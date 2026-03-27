@@ -2,6 +2,8 @@
 
 Step-by-step guide to deploy the scheduler on another OpenClaw instance (e.g., `scheduler-host.local`).
 
+If you just want the fastest path to a working local install, start with the npm-first flow and [Five-Minute Setup in the README](README.md#five-minute-setup). This document is the full host deployment guide.
+
 ---
 
 ## Prerequisites
