@@ -31,6 +31,7 @@
     "prepublishOnly": "npm run verify:local"
   },
   "overrides": {
+    "brace-expansion": "^5.0.5",
     "flatted": "^3.4.2"
   },
   "files": [
