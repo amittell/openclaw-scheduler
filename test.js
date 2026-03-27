@@ -798,6 +798,30 @@ const singleRetryRun2 = createRun(singleRetryJob.id, {
 finishRun(singleRetryRun2.id, 'error', { error_message: 'second fail' });
 assert(!shouldRetry(singleRetryJob, singleRetryRun2.id), 'retry attempt inherits retry_count and exhausts max_retries');
 
+const retryAtTs = new Date(Date.now() - 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+const retryAtJob = createJob({
+  name: 'RetryAtJob',
+  schedule_kind: 'at',
+  schedule_at: retryAtTs,
+  schedule_cron: AT_JOB_CRON_SENTINEL,
+  payload_message: 'retry at job',
+  delete_after_run: 0,
+  max_retries: 1,
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 300_000,
+  origin: 'system',
+});
+const retryAtRun = createRun(retryAtJob.id, { run_timeout_ms: 300000 });
+finishRun(retryAtRun.id, 'error', { error_message: 'retry at fail' });
+const retryAtDispatch = scheduleRetry(retryAtJob, retryAtRun.id);
+const retryAtFresh = getJob(retryAtJob.id);
+assert(retryAtDispatch.dispatch.dispatch_kind === 'retry', 'at-job retry creates durable dispatch');
+assert(retryAtFresh.last_run_at !== null, 'at-job retry records last_run_at to suppress duplicate root dispatch');
+assert(retryAtFresh.last_status === 'error', 'at-job retry records last_status');
+assert(!getDueAtJobs().some(j => j.id === retryAtJob.id), 'at-job with queued retry is not still due via getDueAtJobs');
+deleteJob(retryAtJob.id);
+
 // ═══════════════════════════════════════════════════════════
 // SECTION 5: Cancellation (v3b)
 // ═══════════════════════════════════════════════════════════
@@ -3544,6 +3568,162 @@ console.log('\n── Dispatcher Integration ──');
       assert(childRun.status === 'ok', 'dispatcher integration: failure child fires after retries exhaust');
       assert(childRun.triggered_by_run === rootRuns[1].id, 'dispatcher integration: failure child links to final failed run');
       assert(remainingRetryDispatches === 0, 'dispatcher integration: no extra retry dispatch remains after exhaustion');
+    },
+  });
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, context }) => {
+      const { generateIdempotencyKey, claimIdempotencyKey } = await import('./idempotency.js');
+      const replayRoot = addJob({
+        name: 'dispatcher-replay-root',
+        schedule_cron: '0 0 31 2 *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'printf replay-root-ok',
+        delivery_guarantee: 'at-least-once',
+        delivery_mode: 'none',
+        delivery_opt_out_reason: 'test',
+        run_timeout_ms: 300_000,
+        origin: 'system',
+      });
+      const staleDue = new Date(Date.now() - 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+      updateJob(replayRoot.id, { next_run_at: staleDue });
+      const replayKey = generateIdempotencyKey(replayRoot.id, staleDue);
+      const orphanedRun = createRun(replayRoot.id, {
+        run_timeout_ms: 300000,
+        idempotency_key: replayKey,
+      });
+      claimIdempotencyKey(
+        replayKey,
+        replayRoot.id,
+        orphanedRun.id,
+        new Date(Date.now() + 3600000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
+      );
+      context.rootJobId = replayRoot.id;
+      context.orphanedRunId = orphanedRun.id;
+      context.replayKey = replayKey;
+    },
+    exercise: async ({ probeDb, context }) => {
+      const crashedRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT status, finished_at
+          FROM runs
+          WHERE id = ?
+        `).get(context.orphanedRunId),
+        { timeoutMs: 5000, intervalMs: 100, label: 'orphaned run replay mark crashed' }
+      );
+      assert(crashedRun.status === 'crashed', 'dispatcher replay marks orphaned run as crashed');
+
+      const replayRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT id, status, idempotency_key
+          FROM runs
+          WHERE job_id = ?
+            AND id != ?
+            AND finished_at IS NOT NULL
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT 1
+        `).get(context.rootJobId, context.orphanedRunId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'replay dispatch run' }
+      );
+      const refreshedJob = probeDb.prepare(`
+        SELECT next_run_at
+        FROM jobs
+        WHERE id = ?
+      `).get(context.rootJobId);
+
+      await sleep(500);
+      const totalRuns = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM runs
+        WHERE job_id = ?
+      `).get(context.rootJobId).c;
+      const pendingRetryDispatches = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM job_dispatch_queue
+        WHERE job_id = ?
+          AND dispatch_kind = 'retry'
+          AND status = 'pending'
+      `).get(context.rootJobId).c;
+
+      assert(replayRun.status === 'ok', 'dispatcher replay dispatch completes successfully after startup recovery');
+      assert(replayRun.idempotency_key !== context.replayKey, 'dispatcher replay uses a fresh idempotency key');
+      assert(refreshedJob.next_run_at === null, 'startup replay clears stale due next_run_at for sentinel cron jobs');
+      assert(totalRuns === 2, 'startup replay creates exactly one replay run without duplicate due-loop inserts');
+      assert(pendingRetryDispatches === 0, 'startup replay drains queued retry dispatch instead of leaving it stuck pending');
+    },
+  });
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, context }) => {
+      const { generateIdempotencyKey } = await import('./idempotency.js');
+      const reconciledRoot = addJob({
+        name: 'dispatcher-reconcile-retry-root',
+        schedule_cron: '0 0 31 2 *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'printf queued-retry-ok',
+        delivery_guarantee: 'at-least-once',
+        delivery_mode: 'none',
+        delivery_opt_out_reason: 'test',
+        run_timeout_ms: 300_000,
+        origin: 'system',
+      });
+      const staleDue = new Date(Date.now() - 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+      updateJob(reconciledRoot.id, { next_run_at: staleDue });
+      const staleKey = generateIdempotencyKey(reconciledRoot.id, staleDue);
+      const crashedRun = createRun(reconciledRoot.id, {
+        run_timeout_ms: 300000,
+        idempotency_key: staleKey,
+      });
+      finishRun(crashedRun.id, 'crashed', { error_message: 'startup recovery pending' });
+      enqueueDispatch(reconciledRoot.id, {
+        kind: 'retry',
+        scheduled_for: new Date(Date.now() - 1000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''),
+        source_run_id: crashedRun.id,
+        retry_of_run_id: crashedRun.id,
+      });
+      context.rootJobId = reconciledRoot.id;
+      context.crashedRunId = crashedRun.id;
+      context.staleKey = staleKey;
+    },
+    exercise: async ({ probeDb, context }) => {
+      const replayRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT id, status, idempotency_key
+          FROM runs
+          WHERE job_id = ?
+            AND id != ?
+            AND finished_at IS NOT NULL
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT 1
+        `).get(context.rootJobId, context.crashedRunId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'queued retry replay run' }
+      );
+      const refreshedJob = probeDb.prepare(`
+        SELECT next_run_at
+        FROM jobs
+        WHERE id = ?
+      `).get(context.rootJobId);
+      await sleep(500);
+      const totalRuns = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM runs
+        WHERE job_id = ?
+      `).get(context.rootJobId).c;
+      const pendingRetryDispatches = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM job_dispatch_queue
+        WHERE job_id = ?
+          AND dispatch_kind = 'retry'
+          AND status = 'pending'
+      `).get(context.rootJobId).c;
+
+      assert(replayRun.status === 'ok', 'startup reconciliation lets queued retry dispatch execute for stale due jobs');
+      assert(replayRun.idempotency_key !== context.staleKey, 'queued retry replay uses a fresh idempotency key');
+      assert(refreshedJob.next_run_at === null, 'startup reconciliation clears stale next_run_at when retry is already queued');
+      assert(totalRuns === 2, 'startup reconciliation avoids duplicate root dispatch attempts');
+      assert(pendingRetryDispatches === 0, 'startup reconciliation drains the existing retry dispatch');
     },
   });
 }
