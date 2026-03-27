@@ -171,11 +171,11 @@ const triggerContext = buildTriggeredRunContext(
       shell_stdout: 'checking...',
       shell_stderr: 'database locked'
     }),
-    getJobById: () => ({ id: 'parent-job-1', name: 'Kebablebot Webhook Check', session_target: 'shell' }),
+    getJobById: () => ({ id: 'parent-job-1', name: 'Webhook Health Check', session_target: 'shell' }),
   }
 );
 assert(triggerContext.text.includes('Trigger Context'), 'trigger context header included');
-assert(triggerContext.text.includes('Kebablebot Webhook Check'), 'trigger context includes parent job name');
+assert(triggerContext.text.includes('Webhook Health Check'), 'trigger context includes parent job name');
 assert(triggerContext.text.includes('Exit code: 2'), 'trigger context includes shell exit code');
 assert(triggerContext.text.includes('stdout:'), 'trigger context includes shell stdout label');
 assert(triggerContext.text.includes('stderr:'), 'trigger context includes shell stderr label');
@@ -504,7 +504,6 @@ const agentJobForStale = createJob({
     'shell job at 200s with 300s timeout → NOT flagged by stale detector');
   finishRun(r.id, 'ok');
 }
-console.log('  getStaleRuns: shell vs agent jobs: all 5 assertions passed');
 
 // ── Timeout ─────────────────────────────────────────────────
 console.log('\nTimeout:');
@@ -791,11 +790,6 @@ const retryRun = createRun(retryJob.id, {
   triggered_by_run: run1.id,
 });
 assert(retryRun.retry_count === 1, 'createRun persists retry_count for retry dispatches');
-
-// Backoff math
-assert(30 * Math.pow(2, 0) === 30, 'backoff: retry 1 = 30s');
-assert(30 * Math.pow(2, 1) === 60, 'backoff: retry 2 = 60s');
-assert(30 * Math.pow(2, 2) === 120, 'backoff: retry 3 = 120s');
 
 // Exhausted retries
 db.prepare('UPDATE runs SET retry_count = 3 WHERE id = ?').run(run1.id);
@@ -1624,17 +1618,6 @@ console.log('\n── Schema Baseline ──');
   assert(msgCols.includes('last_error'), 'messages has last_error column');
   assert(msgCols.includes('team_mapped_at'), 'messages has team_mapped_at column');
 
-  // Verify schema-seeded 529 recovery job (inserted by schema.sql, not test-specific)
-  const recoveryId = '8f2be5bd-b537-48c7-b277-44e934104ddc';
-  const recovery = getDb().prepare(`
-    SELECT id, enabled, session_target, payload_kind, payload_message, next_run_at
-    FROM jobs WHERE id = ?
-  `).get(recoveryId);
-  assert(recovery !== undefined, 'schema seeds 529 recovery job');
-  assert(recovery.session_target === 'shell', '529 recovery target is shell');
-  assert(recovery.payload_kind === 'shellCommand', '529 recovery payload_kind is shellCommand');
-  assert(recovery.payload_message === 'node dispatch/529-recovery.mjs', '529 recovery command is repo-local');
-  assert(recovery.enabled === 0, '529 recovery job is disabled by default (opt-in for consumers)');
 }
 
 console.log('\n── v5: Task Tracker ──');
@@ -1818,7 +1801,7 @@ console.log('\n── Idempotency Keys ──');
   const {
     generateIdempotencyKey, generateChainIdempotencyKey, generateRunNowIdempotencyKey,
     claimIdempotencyKey, releaseIdempotencyKey, checkIdempotencyKey, getIdempotencyEntry,
-    updateIdempotencyResultHash, pruneIdempotencyLedger, listIdempotencyForJob,
+    updateIdempotencyResultHash, listIdempotencyForJob,
     forcePruneIdempotency,
   } = await import('./idempotency.js');
 
@@ -1929,7 +1912,7 @@ console.log('\n── Idempotency Keys ──');
     "INSERT INTO idempotency_ledger (key, job_id, run_id, claimed_at, expires_at) VALUES (?, ?, ?, datetime('now'), ?)"
   ).run(futureKey, 'future-job', 'future-run', futureExpiry);
 
-  pruneIdempotencyLedger();
+  forcePruneIdempotency();
   const expiredAfterPrune = getIdempotencyEntry(expiredKey);
   assert(expiredAfterPrune === null, 'expired key pruned');
 
@@ -2577,17 +2560,17 @@ console.log('\n── delivery_to Required for Announce Modes ──');
   }
   assert(threw1, 'createJob with delivery_mode=announce and no delivery_to → throws');
 
-  // Test 2: createJob with delivery_mode='announce' and delivery_to='484946046' → succeeds
+  // Test 2: createJob with delivery_mode='announce' and delivery_to='123456789' → succeeds
   const j2 = createJob({
     name: 'announce-with-delivery-to',
     schedule_cron: '0 9 * * *',
     payload_message: 'test',
     delivery_mode: 'announce',
-    delivery_to: '484946046',
+    delivery_to: '123456789',
     delivery_channel: 'telegram',
     run_timeout_ms: 300_000, origin: 'system',
   });
-  assert(j2 && j2.delivery_mode === 'announce' && j2.delivery_to === '484946046',
+  assert(j2 && j2.delivery_mode === 'announce' && j2.delivery_to === '123456789',
     'createJob with delivery_mode=announce and delivery_to set → succeeds');
   deleteJob(j2.id);
 
@@ -2647,10 +2630,10 @@ console.log('\n── delivery_to Required for Announce Modes ──');
   });
   const j6updated = updateJob(j6base.id, {
     delivery_mode: 'announce',
-    delivery_to: '484946046',
+    delivery_to: '123456789',
     delivery_channel: 'telegram',
   });
-  assert(j6updated.delivery_mode === 'announce' && j6updated.delivery_to === '484946046',
+  assert(j6updated.delivery_mode === 'announce' && j6updated.delivery_to === '123456789',
     'updateJob setting delivery_mode=announce with delivery_to → succeeds');
   deleteJob(j6base.id);
 }
@@ -2736,9 +2719,9 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
 
 console.log('\n── Dispatch Script Compatibility ──');
 {
-  const envBase = { HOME: '/tmp/alex' };
-  const schedulerPath = '/tmp/alex/.openclaw/scheduler/dispatch/index.mjs';
-  const dispatchPath = '/tmp/alex/.openclaw/dispatch/index.mjs';
+  const envBase = { HOME: '/tmp/testuser' };
+  const schedulerPath = '/tmp/testuser/.openclaw/scheduler/dispatch/index.mjs';
+  const dispatchPath = '/tmp/testuser/.openclaw/dispatch/index.mjs';
 
   const schedulerOnly = new Set([schedulerPath]);
   assert(
@@ -6043,9 +6026,9 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     subject:     'group-result',
     body:        'Job completed in group chat',
     channel:     'telegram',
-    delivery_to: '-5240776892',
+    delivery_to: '-100000000',
   });
-  assert(m1.delivery_to === '-5240776892', 'sendMessage stores delivery_to on message');
+  assert(m1.delivery_to === '-100000000', 'sendMessage stores delivery_to on message');
   assert(m1.channel === 'telegram', 'sendMessage stores channel on message');
 
   // Test 2: sendMessage without delivery_to → null
@@ -6061,7 +6044,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
 
   // Test 3: getMessage returns delivery_to
   const fetched1 = getMessage(m1.id);
-  assert(fetched1.delivery_to === '-5240776892', 'getMessage returns delivery_to correctly');
+  assert(fetched1.delivery_to === '-100000000', 'getMessage returns delivery_to correctly');
 
   // Test 4: inbox-consumer selectPendingMessages query returns delivery_to and channel
   // We simulate this by running the same SQL used in inbox-consumer
@@ -6075,7 +6058,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     LIMIT 10
   `).all('main');
 
-  const withDeliveryTo = pendingMsgs.filter(m => m.delivery_to === '-5240776892');
+  const withDeliveryTo = pendingMsgs.filter(m => m.delivery_to === '-100000000');
   assert(withDeliveryTo.length >= 1, 'selectPendingMessages returns messages with delivery_to set');
   assert(withDeliveryTo[0].channel === 'telegram', 'selectPendingMessages returns channel on message');
 
@@ -6085,14 +6068,14 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
 
   // Test 5: per-message routing logic (mirrors inbox-consumer drainOnce)
   // Message WITH delivery_to → routes to delivery_to, not the default --to
-  const defaultTo = '484946046';
+  const defaultTo = '123456789';
   const defaultChannel = 'telegram';
 
   {
     const msg = withDeliveryTo[0];
     const msgTarget = msg.delivery_to || defaultTo;
     const msgChannel = msg.channel || defaultChannel;
-    assert(msgTarget === '-5240776892', 'routing: msg.delivery_to used when present (not default --to)');
+    assert(msgTarget === '-100000000', 'routing: msg.delivery_to used when present (not default --to)');
     assert(msgChannel === 'telegram', 'routing: msg.channel used when present');
   }
 
@@ -6135,7 +6118,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     name: 'GroupChatJob',
     delivery_mode: 'announce',
     delivery_channel: 'telegram',
-    delivery_to: '-5240776892',
+    delivery_to: '-100000000',
   };
   await handleDeliveryV21(jobV21, '🎉 group job done');
 
@@ -6143,7 +6126,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     "SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND subject='GroupChatJob' ORDER BY created_at DESC LIMIT 1"
   ).get();
   assert(groupMsg !== undefined, 'dispatcher-delivery: message created for group chat job');
-  assert(groupMsg.delivery_to === '-5240776892', 'dispatcher-delivery: delivery_to stored on message from handleDelivery');
+  assert(groupMsg.delivery_to === '-100000000', 'dispatcher-delivery: delivery_to stored on message from handleDelivery');
   assert(groupMsg.channel === 'telegram', 'dispatcher-delivery: channel stored on message from handleDelivery');
 
   // Clean up

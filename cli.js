@@ -427,6 +427,7 @@ switch (command) {
     switch (sub) {
       case 'send': {
         const [from, to, ...bodyParts] = args;
+        if (!from || !to) fail('Usage: msg send <from> <to> <body>');
         const msg = sendMessage({ from_agent: from, to_agent: to, body: bodyParts.join(' ') });
         emit({ ok: true, message: msg }, `Sent: ${fmt(msg)}`);
         break;
@@ -490,7 +491,7 @@ switch (command) {
         emit(msgs, () => {
           for (const m of msgs) {
             console.log(`[${m.from_agent} → ${m.to_agent}] (${m.status}) ${m.created_at}`);
-            console.log(`  ${m.body.slice(0, 200)}`);
+            console.log(`  ${(m.body || '').slice(0, 200)}`);
             console.log();
           }
         });
@@ -525,7 +526,7 @@ switch (command) {
       }
       case 'read': markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break;
       case 'readall': { const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
-      case 'unread': { const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
+      case 'unread': { if (!args[0]) fail('Usage: msg unread <agent-id>'); const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
       default: usage();
     }
     break;
@@ -563,7 +564,7 @@ switch (command) {
       }
       case 'prune': {
         pruneMessages();
-        emit({ ok: true, pruned: true }, 'Pruned old messages (read/delivered >3d, system >3d, expired/failed >30d)');
+        emit({ ok: true, pruned: true }, 'Pruned old messages (delivered >3d, system/result >3d, read/expired/failed >30d)');
         break;
       }
       default: usage();
@@ -604,7 +605,12 @@ switch (command) {
         if (groups.length === 0) { emit([], 'No active task groups'); break; }
         const rows = groups.map(g => {
           const status = getTaskGroupStatus(g.id);
-          const agents = JSON.parse(g.expected_agents);
+          if (!status) return null;
+          let agents;
+          try { agents = JSON.parse(g.expected_agents); } catch (e) {
+            process.stderr.write('Warning: failed to parse expected_agents JSON for group ' + g.id + ': ' + e.message + '\n');
+            agents = [];
+          }
           return {
             id: g.id.slice(0, 8) + '…',
             name: g.name,
@@ -613,7 +619,7 @@ switch (command) {
             elapsed: `${status.elapsed}s`,
             timeout: `${g.timeout_s}s`,
           };
-        });
+        }).filter(r => r !== null);
         emit(jsonMode ? groups : rows, () => console.table(rows));
         break;
       }
@@ -743,7 +749,7 @@ switch (command) {
         if (entries.length === 0) { emit([], 'No idempotency entries for this job'); break; }
         const rows = entries.map(e => ({
           key: e.key.slice(0, 12) + '…',
-          run: e.run_id.slice(0, 8) + '…',
+          run: (e.run_id?.slice(0, 8) || '-') + '…',
           status: e.status,
           claimed: e.claimed_at,
           released: e.released_at || '-',

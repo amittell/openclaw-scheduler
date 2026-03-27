@@ -161,8 +161,10 @@ pm2 start dispatcher.js --name openclaw-scheduler `
   --env OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789 `
   --env OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN `
   --env SCHEDULER_TICK_MS=10000 `
-  --env SCHEDULER_STALE_THRESHOLD_S=90 `
-  --env SCHEDULER_DEBUG=1
+  --env SCHEDULER_STALE_THRESHOLD_S=90
+
+# Optional verbose logging:
+pm2 restart openclaw-scheduler --update-env --env SCHEDULER_DEBUG=1
 
 # Save PM2 process list (persists across restarts)
 pm2 save

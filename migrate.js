@@ -22,8 +22,16 @@ function cronFromSchedule(schedule) {
     }
     const mins = Math.max(1, Math.round(schedule.everyMs / 60000));
     if (mins < 60) return { cron: `*/${mins} * * * *`, tz: schedule.tz || 'UTC' };
-    const hours = Math.round(mins / 60);
-    return { cron: `0 */${hours} * * *`, tz: schedule.tz || 'UTC' };
+    const hours = Math.max(1, Math.round(mins / 60));
+    const remaining = mins % 60;
+    const clampedHours = Math.min(hours, 23);
+    if (hours > 23) {
+      console.warn(`  WARN: ${schedule.everyMs}ms interval exceeds 23 hours; clamping to */23 hours`);
+    }
+    if (remaining !== 0) {
+      console.warn(`  WARN: ${schedule.everyMs}ms interval (${mins}min) cannot be represented exactly in standard cron; approximating to every ${clampedHours} hour(s)`);
+    }
+    return { cron: `0 */${clampedHours} * * *`, tz: schedule.tz || 'UTC' };
   }
   if (schedule.kind === 'at') {
     // One-shot: create a cron that fires once (we'll mark delete_after_run)
@@ -67,6 +75,16 @@ function main() {
     try {
       const { cron, tz } = cronFromSchedule(job.schedule);
 
+      let deliveryMode = job.delivery?.mode || 'announce';
+      const deliveryTo = job.delivery?.to || null;
+      let deliveryOptOutReason = null;
+
+      if ((deliveryMode === 'announce' || deliveryMode === 'announce-always') && !deliveryTo) {
+        console.warn(`  WARN: ${job.name}: delivery_mode='${deliveryMode}' but no delivery_to configured; downgrading to 'none'`);
+        deliveryMode = 'none';
+        deliveryOptOutReason = 'migrated: no delivery target configured';
+      }
+
       createJob({
         id: job.id,
         name: job.name,
@@ -82,9 +100,10 @@ function main() {
         payload_timeout_seconds: job.payload?.timeoutSeconds || 120,
         overlap_policy: 'skip',
         run_timeout_ms: 300000,
-        delivery_mode: job.delivery?.mode || 'announce',
+        delivery_mode: deliveryMode,
         delivery_channel: job.delivery?.channel || null,
-        delivery_to: job.delivery?.to || null,
+        delivery_to: deliveryTo,
+        delivery_opt_out_reason: deliveryOptOutReason,
         delete_after_run: job.schedule?.kind === 'at',
         origin: job.origin || 'system',
       });

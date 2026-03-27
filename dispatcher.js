@@ -23,7 +23,7 @@ import {
   claimIdempotencyKey as _claimIdemKey,
   releaseIdempotencyKey as _releaseIdemKey,
   updateIdempotencyResultHash as _updateIdemHash,
-  pruneIdempotencyLedger as _pruneIdemLedger,
+  forcePruneIdempotency as _pruneIdemLedger,
 } from './idempotency.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -586,14 +586,33 @@ async function tick() {
             markDelivered(msg.id);
             continue;
           }
+          const VALID_SPAWN_SESSION_TARGETS = ['isolated', 'shell'];
+          const VALID_SPAWN_DELIVERY_MODES = ['none', 'announce', 'announce-always'];
+
+          let sessionTarget = spec.session_target || 'isolated';
+          if (!VALID_SPAWN_SESSION_TARGETS.includes(sessionTarget)) {
+            log('warn', `Spawn: invalid session_target "${sessionTarget}", defaulting to "isolated"`, {
+              msgId: msg.id, fromAgent: msg.from_agent,
+            });
+            sessionTarget = 'isolated';
+          }
+
+          let deliveryMode = spec.delivery_mode || 'none';
+          if (!VALID_SPAWN_DELIVERY_MODES.includes(deliveryMode)) {
+            log('warn', `Spawn: invalid delivery_mode "${deliveryMode}", defaulting to "none"`, {
+              msgId: msg.id, fromAgent: msg.from_agent,
+            });
+            deliveryMode = 'none';
+          }
+
           const child = createJob({
             name: spec.name || `Spawned by ${msg.from_agent}`,
             parent_id: msg.job_id || null,
             schedule_cron: spec.schedule_cron,
             payload_message: spec.payload_message,
-            session_target: spec.session_target || 'isolated',
+            session_target: sessionTarget,
             agent_id: spec.agent_id || msg.to_agent || 'main',
-            delivery_mode: spec.delivery_mode || 'none',
+            delivery_mode: deliveryMode,
             delivery_channel: spec.delivery_channel,
             delivery_to: spec.delivery_to,
             delete_after_run: spec.delete_after_run !== false ? 1 : 0,

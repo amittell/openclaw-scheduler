@@ -164,8 +164,12 @@ function rollup() {
   const hourStr = String(d.getUTCHours()).padStart(2, '0');
   const remotePath = mcPath(`rollups/${dateStr}/${hourStr}.db`);
 
-  runMc(['cp', stagingFile, remotePath]);
-  log('info', `Rollup shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
+  const rollupResult = runMc(['cp', stagingFile, remotePath]);
+  if (rollupResult !== null) {
+    log('info', `Rollup shipped: ${remotePath} (${(size / 1024).toFixed(1)}KB)`);
+  } else {
+    log('error', `Failed to upload rollup to ${remotePath}`);
+  }
 
   try { unlinkSync(stagingFile); } catch {}
 

@@ -101,6 +101,7 @@ function respawnSession(label, entry) {
     ];
     if (entry?.model) args.push('--model', entry.model);
     if (entry?.thinking) args.push('--thinking', entry.thinking);
+    if (entry?.origin) args.push('--origin', entry.origin);
     if (entry?.deliverTo) {
       args.push('--deliver-to', entry.deliverTo);
       if (entry?.deliveryMode) args.push('--delivery-mode', entry.deliveryMode);

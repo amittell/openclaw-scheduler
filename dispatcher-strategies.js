@@ -642,9 +642,14 @@ export async function executeAgent(job, ctx, deps) {
     result.skipDelivery = true;
   }
 
+  // Announce mode: only deliver on error (consistent with shell job behavior)
+  if (job.delivery_mode === 'announce' && effectiveStatus === 'ok') {
+    result.skipDelivery = true;
+  }
+
   log('info', `Completed: ${job.name} (${turnResult.usage?.total_tokens || '?'} tokens)`, {
     runId: ctx.run.id,
-    durationMs: Date.now() - new Date(ctx.run.started_at.replace(' ', 'T') + 'Z').getTime(),
+    durationMs: Date.now() - new Date(ctx.run.started_at.endsWith('Z') ? ctx.run.started_at.replace(' ', 'T') : ctx.run.started_at.replace(' ', 'T') + 'Z').getTime(),
   });
 
   return result;

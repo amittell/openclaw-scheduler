@@ -59,9 +59,10 @@ export function finishRun(id, status, opts = {}) {
   const run = getRun(id);
   if (!run) return null;
 
-  const startedAt = run.started_at
-    ? new Date(run.started_at.endsWith('Z') ? run.started_at.replace(' ', 'T') : run.started_at.replace(' ', 'T') + 'Z').getTime()
-    : Date.now();
+  const iso = run.started_at
+    ? (run.started_at.includes('T') ? run.started_at : run.started_at.replace(' ', 'T') + 'Z')
+    : null;
+  const startedAt = iso ? new Date(iso).getTime() : Date.now();
   const durationMs = Date.now() - startedAt;
 
   db.prepare(`
@@ -152,8 +153,18 @@ export function getStaleRuns(thresholdSeconds = 90) {
 }
 
 /**
- * Find runs that have exceeded their absolute timeout.
- * This is the fallback when heartbeat-based detection isn't available.
+ * Find runs that have exceeded their absolute timeout (run_timeout_ms).
+ *
+ * Important overlap note: this function may return runs also returned by
+ * `getStaleRuns`. Both queries match running runs that have exceeded their
+ * run_timeout_ms. Callers must check the run's current status before acting
+ * on results to avoid double-processing (e.g., finishing an already-finished run).
+ *
+ * This function serves as the fallback for when heartbeat-based stale detection
+ * is not available -- for example, shell jobs that have no heartbeat mechanism,
+ * or agent jobs whose first heartbeat has not yet arrived. Unlike `getStaleRuns`,
+ * which requires a heartbeat timestamp to compare against, this function uses
+ * only the run's started_at and run_timeout_ms columns.
  */
 export function getTimedOutRuns() {
   return getDb().prepare(`

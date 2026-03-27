@@ -41,10 +41,15 @@ function deriveErrorMessage(result, timeoutMs) {
 
 function writeOutputArtifact(kind, runId, text, artifactsDir) {
   if (!artifactsDir || !runId || !text.trim()) return null;
-  const baseDir = ensureArtifactsDir(join(artifactsDir, 'runs', runId));
-  const filePath = join(baseDir, `${kind}.txt`);
-  writeFileSync(filePath, text, 'utf8');
-  return filePath;
+  try {
+    const baseDir = ensureArtifactsDir(join(artifactsDir, 'runs', runId));
+    const filePath = join(baseDir, `${kind}.txt`);
+    writeFileSync(filePath, text, 'utf8');
+    return filePath;
+  } catch (err) {
+    process.stderr.write(`[shell-result] writeOutputArtifact failed for ${kind} (run ${runId}): ${err.message}\n`);
+    return null;
+  }
 }
 
 function formatOutputBlock(label, excerpt, artifactPath, bytes) {

@@ -32,7 +32,7 @@ export function upsertAgent(id, opts = {}) {
 export function getAgent(id) {
   const agent = getDb().prepare('SELECT * FROM agents WHERE id = ?').get(id);
   if (agent && agent.capabilities) {
-    try { agent.capabilities = JSON.parse(agent.capabilities); } catch {}
+    try { agent.capabilities = JSON.parse(agent.capabilities); } catch (e) { process.stderr.write('Warning: failed to parse capabilities JSON: ' + e.message + '\n'); }
   }
   return agent;
 }
@@ -42,7 +42,7 @@ export function getAgent(id) {
  */
 export function listAgents() {
   return getDb().prepare('SELECT * FROM agents ORDER BY id').all().map(a => {
-    if (a.capabilities) try { a.capabilities = JSON.parse(a.capabilities); } catch {}
+    if (a.capabilities) try { a.capabilities = JSON.parse(a.capabilities); } catch (e) { process.stderr.write('Warning: failed to parse capabilities JSON: ' + e.message + '\n'); }
     return a;
   });
 }

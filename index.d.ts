@@ -114,7 +114,7 @@ export interface JobRecord extends JobSpec {
   id: string;
   enabled: number;
   schedule_kind: 'cron' | 'at';
-  schedule_cron: string;
+  schedule_cron: string | null;
   schedule_at: string | null;
   schedule_tz: string;
   payload_kind: 'systemEvent' | 'agentTurn' | 'shellCommand';
@@ -203,6 +203,7 @@ export interface MessageRecord {
   // Priority & delivery
   priority?: number;
   channel?: string | null;
+  delivery_to?: string | null;
 
   // Status
   status?: string | null;
@@ -320,6 +321,7 @@ export interface SendMessageOpts {
   run_id?: string | null;
   owner?: string | null;
   ack_required?: number | boolean;
+  delivery_to?: string | null;
 }
 
 export interface CreateRunOpts {
@@ -635,7 +637,6 @@ export const idempotency: {
   claimIdempotencyKey(key: string, jobId: string, runId: string, expiresAt: string): boolean;
   releaseIdempotencyKey(key: string): void;
   updateIdempotencyResultHash(key: string, content: string): void;
-  pruneIdempotencyLedger(): number;
   listIdempotencyForJob(jobId: string, limit?: number): Array<Record<string, unknown>>;
   forcePruneIdempotency(): number;
 };

@@ -54,11 +54,11 @@ export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
  */
 export function resolveDispatchLabel(jobName, labels = {}) {
   if (labels[jobName]) return jobName;
-  for (const prefix of ['dispatch-deliver:']) {
-    if (jobName.startsWith(prefix)) {
-      const suffix = jobName.slice(prefix.length);
-      if (labels[suffix]) return suffix;
-    }
+  // Match any branded deliver job: <brand>-deliver:<label>
+  const deliverMatch = jobName.match(/^.+-deliver:(.+)$/);
+  if (deliverMatch) {
+    const suffix = deliverMatch[1];
+    if (labels[suffix]) return suffix;
   }
   return null;
 }

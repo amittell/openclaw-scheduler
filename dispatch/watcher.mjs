@@ -77,13 +77,14 @@ function gatewayCall(method, params = {}, opts = {}) {
   const args = ['gateway', 'call', method, '--json'];
   args.push('--params', JSON.stringify(params));
   args.push('--timeout', String(timeout));
-  if (GW_TOKEN) args.push('--token', GW_TOKEN);
+  const childEnv = GW_TOKEN ? { ...process.env, OPENCLAW_GATEWAY_TOKEN: GW_TOKEN } : process.env;
 
   try {
     const result = execFileSync('openclaw', args, {
       encoding: 'utf-8',
       timeout: timeout + 5000,
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: childEnv,
     });
     return JSON.parse(result.trim());
   } catch (err) {
@@ -120,16 +121,22 @@ function getSessionStoreEntry(sessionKey) {
   return (store && sessionKey in store) ? store[sessionKey] : null;
 }
 
+/** Parse --flag value pairs from argv (supports both --flag value and --flag=value) */
 function parseFlags(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = argv[i + 1];
-    if (a.startsWith('--') && next && !next.startsWith('--')) {
-      flags[a.slice(2)] = next;
-      i++;
-    } else if (a.startsWith('--')) {
-      flags[a.slice(2)] = true;
+    if (a.startsWith('--')) {
+      const eqIdx = a.indexOf('=');
+      if (eqIdx > 0) {
+        flags[a.slice(2, eqIdx)] = a.slice(eqIdx + 1);
+      } else if (next && !next.startsWith('--')) {
+        flags[a.slice(2)] = next;
+        i++;
+      } else {
+        flags[a.slice(2)] = true;
+      }
     }
   }
   return flags;
@@ -784,9 +791,8 @@ process.on('SIGTERM', () => {
     const result = dispatch('result', ['--label', label]);
     if (result?.lastReply) lastKnownReply = result.lastReply;
   } catch {}
-  // deliverResult marks the label done, writes stdout, and calls process.exit(0)
+  // deliverResult calls process.exit(0) internally
   deliverResult(label, lastKnownReply, 'interrupted by watcher timeout');
-  process.exit(0); // safety net — deliverResult already calls exit
 });
 
 // ── Rolling deadline vars ────────────────────────────────────
@@ -1091,9 +1097,8 @@ if (sessionInternalId) {
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
   if (r?.lastReply) {
-    markDoneSync('completed before deadline monitoring');
+    // deliverResult calls process.exit(0) internally
     deliverResult(label, r.lastReply, statusAtDeadline?.summary || null);
-    process.exit(0);
   }
   // Status is explicitly done — exit cleanly, no timeout noise
   if (statusAtDeadline?.status === 'done') {
@@ -1127,12 +1132,12 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   if (st?.sessionKey && !tokenSessionKey) tokenSessionKey = st.sessionKey;
   if (st?.status === 'done') {
     const r = dispatch('result', ['--label', label]);
-    markDoneSync('completed during activity window');
+    // deliverResult calls process.exit(0) internally
     deliverResult(label, r?.lastReply, st.summary);
   }
   const r2 = dispatch('result', ['--label', label]);
   if (r2?.lastReply) {
-    markDoneSync('completed during activity window');
+    // deliverResult calls process.exit(0) internally
     deliverResult(label, r2.lastReply, null);
   }
 
@@ -1221,15 +1226,13 @@ if (sessionInternalId) {
       const stExt = dispatch('status', ['--label', label]);
       if (stExt?.status === 'done') {
         const rExt = dispatch('result', ['--label', label]);
-        markDoneSync('completed during extended mid-turn wait');
+        // deliverResult calls process.exit(0) internally
         deliverResult(label, rExt?.lastReply, stExt.summary);
-        process.exit(0);
       }
       const rExt2 = dispatch('result', ['--label', label]);
       if (rExt2?.lastReply) {
-        markDoneSync('completed during extended mid-turn wait');
+        // deliverResult calls process.exit(0) internally
         deliverResult(label, rExt2.lastReply, null);
-        process.exit(0);
       }
 
       // JSONL mtime check during extended wait
@@ -1280,12 +1283,12 @@ for (const round of steerRounds) {
   const st2 = dispatch('status', ['--label', label]);
   if (st2?.status === 'done') {
     const r3 = dispatch('result', ['--label', label]);
-    markDoneSync('completed during steer recovery');
+    // deliverResult calls process.exit(0) internally
     deliverResult(label, r3?.lastReply, st2.summary);
   }
   const r3 = dispatch('result', ['--label', label]);
   if (r3?.lastReply) {
-    markDoneSync('completed during steer recovery');
+    // deliverResult calls process.exit(0) internally
     deliverResult(label, r3.lastReply, null);
   }
 
