@@ -15,6 +15,12 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Tests:** 954 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
+In practice, this gives you:
+- scheduled jobs with real run history instead of “it probably ran”
+- shell jobs that still work when the gateway is unhealthy
+- AI jobs that stay isolated from your personal chats
+- chains, retries, and approval gates for workflows that are bigger than one cron line
+
 ---
 
 ## Table of Contents
@@ -26,36 +32,37 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 5. [Quick Start](#quick-start)
 6. [Five-Minute Setup](#five-minute-setup)
 7. [Starter Recipes](#starter-recipes)
-8. [Platform Support](#platform-support)
-9. [Architecture](#architecture)
-10. [How Jobs Execute](#how-jobs-execute)
-11. [Delivery Modes](#delivery-modes)
-12. [Delivery Aliases](#delivery-aliases)
-13. [Shell Jobs](#shell-jobs)
-14. [HITL Approval Gates](#hitl-approval-gates)
-15. [Idempotency](#idempotency)
-16. [Context Retrieval](#context-retrieval)
-17. [Task Tracker](#task-tracker)
-18. [Resource Pools](#resource-pools)
-19. [Workflow Chains](#workflow-chains)
-20. [Retry Logic](#retry-logic)
-21. [Chain Safety](#chain-safety)
-22. [Inter-Agent Messaging](#inter-agent-messaging)
-23. [Backup & Recovery](#backup--recovery)
-24. [Agent Registry](#agent-registry)
-25. [Database Schema](#database-schema)
-26. [CLI Reference](#cli-reference)
-27. [Configuration](#configuration)
-28. [Service Management](#service-management)
-29. [Error Handling & Backoff](#error-handling--backoff)
-30. [Migration & History](#migration--history)
-31. [Removing the Scheduler](#removing-the-scheduler)
-32. [Best Practices](#best-practices)
-33. [File Reference](#file-reference)
-34. [Testing](#testing)
-35. [Companion Scripts](#companion-scripts)
-36. [Sub-agent Dispatch](#sub-agent-dispatch)
-37. [Troubleshooting](#troubleshooting)
+8. [Common Migrations](#common-migrations)
+9. [Platform Support](#platform-support)
+10. [Architecture](#architecture)
+11. [How Jobs Execute](#how-jobs-execute)
+12. [Delivery Modes](#delivery-modes)
+13. [Delivery Aliases](#delivery-aliases)
+14. [Shell Jobs](#shell-jobs)
+15. [HITL Approval Gates](#hitl-approval-gates)
+16. [Idempotency](#idempotency)
+17. [Context Retrieval](#context-retrieval)
+18. [Task Tracker](#task-tracker)
+19. [Resource Pools](#resource-pools)
+20. [Workflow Chains](#workflow-chains)
+21. [Retry Logic](#retry-logic)
+22. [Chain Safety](#chain-safety)
+23. [Inter-Agent Messaging](#inter-agent-messaging)
+24. [Backup & Recovery](#backup--recovery)
+25. [Agent Registry](#agent-registry)
+26. [Database Schema](#database-schema)
+27. [CLI Reference](#cli-reference)
+28. [Configuration](#configuration)
+29. [Service Management](#service-management)
+30. [Error Handling & Backoff](#error-handling--backoff)
+31. [Migration & History](#migration--history)
+32. [Removing the Scheduler](#removing-the-scheduler)
+33. [Best Practices](#best-practices)
+34. [File Reference](#file-reference)
+35. [Testing](#testing)
+36. [Companion Scripts](#companion-scripts)
+37. [Sub-agent Dispatch](#sub-agent-dispatch)
+38. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -333,6 +340,149 @@ ocs approvals list
 ocs jobs approve <job-id>
 ocs jobs reject <job-id> "Not today"
 ```
+
+---
+
+## Common Migrations
+
+If you already have cron jobs, OpenClaw cron entries, or shell scripts, this is the simplest way to think about the conversion.
+
+### 1. OpenClaw built-in cron -> import first, then clean up
+
+If your jobs already live in `~/.openclaw/cron/jobs.json`, start with the importer:
+
+```bash
+cd ~/.openclaw/scheduler
+node migrate.js
+node cli.js jobs list
+```
+
+Then disable the old scheduler path:
+
+```bash
+openclaw cron edit <job-id> --disable
+openclaw config set cron.enabled false
+openclaw config set agents.defaults.heartbeat.every "0m"
+```
+
+Use this path when the existing jobs are already OpenClaw-native. It gets you into SQLite quickly, then you can refine the imported jobs later.
+
+### 2. Plain shell cron line -> `session_target: "shell"`
+
+If you have a normal cron line like:
+
+```cron
+*/5 * * * * /usr/local/bin/check-api.sh
+```
+
+Convert it to:
+
+```bash
+ocs jobs add '{
+  "name": "API Check",
+  "schedule_cron": "*/5 * * * *",
+  "session_target": "shell",
+  "payload_message": "/usr/local/bin/check-api.sh",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Choose `shell` when the task is deterministic and you do not need AI reasoning.
+
+### 3. AI-ish cron job -> `session_target: "isolated"`
+
+If the old job was really “run a prompt every morning”, use an isolated agent job instead of a shell script:
+
+```bash
+ocs jobs add '{
+  "name": "Daily Status Summary",
+  "schedule_cron": "0 8 * * *",
+  "schedule_tz": "America/New_York",
+  "session_target": "isolated",
+  "payload_message": "Summarize the most important errors, deploys, and follow-ups from the last 24 hours in 5 bullet points.",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Choose `isolated` when the job needs reasoning, writing, summarization, or tools.
+
+### 4. Two cron jobs with manual ordering -> parent/child chain
+
+If your current workflow is:
+- run a backup
+- wait
+- run verification
+
+Model that as a chain instead of two unrelated cron entries:
+
+```bash
+ocs jobs add '{
+  "name": "Nightly Backup",
+  "schedule_cron": "0 2 * * *",
+  "session_target": "shell",
+  "payload_message": "/usr/local/bin/nightly-backup.sh",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+Then create the follow-up:
+
+```bash
+ocs jobs add '{
+  "name": "Verify Nightly Backup",
+  "parent_id": "<backup-job-id>",
+  "trigger_on": "success",
+  "trigger_delay_s": 60,
+  "session_target": "shell",
+  "payload_message": "/usr/local/bin/verify-backup.sh",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+This is one of the biggest upgrades over plain cron: the second step now runs because the first step succeeded, not because the clock happened to reach another minute.
+
+### 5. Risky follow-up -> add `approval_required`
+
+If the current process is “job runs, then a human decides whether to continue,” model that decision directly:
+
+```bash
+ocs jobs add '{
+  "name": "Delete Temp Files",
+  "parent_id": "<analysis-job-id>",
+  "trigger_on": "success",
+  "approval_required": 1,
+  "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "session_target": "shell",
+  "payload_message": "find /tmp/myapp -type f -mtime +7 -delete",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID",
+  "origin": "system"
+}'
+```
+
+That keeps the job automated, but only up to the point where human judgment is actually needed.
+
+### Rule of thumb
+
+When converting existing work:
+- start with `shell` unless you clearly need AI reasoning
+- add delivery only if someone really needs to see the output
+- use chains when one step depends on another
+- use approvals when the next step would be annoying, expensive, or risky if it ran by mistake
 
 ---
 

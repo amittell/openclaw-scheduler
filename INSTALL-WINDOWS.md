@@ -1,6 +1,8 @@
 # Installing OpenClaw Scheduler on Windows
 
 > **TL;DR:** Use WSL2. It's faster to set up, fully supported, and eliminates every Windows-specific limitation listed in this guide.
+>
+> **Need examples or migration help?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
 
 ---
 
