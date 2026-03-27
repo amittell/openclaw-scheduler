@@ -166,7 +166,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (!isChild && !isAtJob && !merged.schedule_cron) {
     throw new Error('schedule_cron is required for root cron jobs');
   }
-  if (isAtJob && mode === 'create' && !merged.schedule_at) {
+  if (isAtJob && !merged.schedule_at) {
     throw new Error('schedule_at is required for at-jobs (use --at or --in)');
   }
   if (merged.schedule_cron) {
@@ -386,6 +386,18 @@ export function nextRunFromCron(cronExpr, tz) {
   return next.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
+function deriveNextRunAt(job, { preserveRunNow = false } = {}) {
+  if (!job || job.parent_id) return null;
+  if (preserveRunNow && job.run_now) {
+    return sqliteNow(-1000);
+  }
+  if (job.schedule_kind === 'at') {
+    return job.schedule_at || null;
+  }
+  if (!job.schedule_cron) return null;
+  return nextRunFromCron(job.schedule_cron, job.schedule_tz || 'UTC');
+}
+
 /**
  * Create a new job.
  */
@@ -411,15 +423,14 @@ export function createJob(opts) {
   const finalKind = normalized.payload_kind || (finalTarget === 'main' ? 'systemEvent' : finalTarget === 'shell' ? 'shellCommand' : 'agentTurn');
   validateJobPayload(finalTarget, finalKind);
 
-  let nextRun;
-  if (normalized.run_now) {
-    nextRun = sqliteNow(-1000);
-  } else if (isAtJob) {
-    // At-jobs fire at schedule_at; use provided next_run_at or derive from schedule_at
-    nextRun = normalized.next_run_at || normalized.schedule_at || null;
-  } else {
-    nextRun = isChild ? null : nextRunFromCron(cronExpr, normalized.schedule_tz || 'UTC');
-  }
+  const nextRun = normalized.next_run_at || deriveNextRunAt({
+    ...normalized,
+    parent_id: normalized.parent_id || null,
+    schedule_kind: normalized.schedule_kind || 'cron',
+    schedule_at: normalized.schedule_at || null,
+    schedule_cron: cronExpr,
+    schedule_tz: normalized.schedule_tz || 'UTC',
+  }, { preserveRunNow: true });
 
   const stmt = db.prepare(`
     INSERT INTO jobs (
@@ -608,11 +619,12 @@ export function updateJob(id, patch) {
 
   db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
-  // Recalculate next_run_at if schedule changed (cron jobs only)
-  if ((normalized.schedule_cron || normalized.schedule_tz) && current.schedule_cron && current.schedule_kind !== 'at') {
+  const schedulingFieldsChanged = ['schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz', 'parent_id']
+    .some((key) => key in normalized);
+  if (schedulingFieldsChanged && !('next_run_at' in normalized)) {
     const refreshed = getJob(id);
-    if (refreshed && refreshed.schedule_cron && refreshed.schedule_kind !== 'at') {
-      const nextRun = refreshed.parent_id ? null : nextRunFromCron(refreshed.schedule_cron, refreshed.schedule_tz);
+    if (refreshed) {
+      const nextRun = deriveNextRunAt(refreshed);
       db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
     }
   }
@@ -669,9 +681,10 @@ export function getDueAtJobs() {
     WHERE schedule_kind = 'at'
       AND enabled = 1
       AND schedule_at IS NOT NULL
-      AND schedule_at <= datetime('now')
-      AND (last_run_at IS NULL OR last_run_at < schedule_at)
-    ORDER BY schedule_at ASC
+      AND datetime(schedule_at) IS NOT NULL
+      AND datetime(schedule_at) <= datetime('now')
+      AND (last_run_at IS NULL OR datetime(last_run_at) < datetime(schedule_at))
+    ORDER BY datetime(schedule_at) ASC, schedule_at ASC
   `).all();
 }
 

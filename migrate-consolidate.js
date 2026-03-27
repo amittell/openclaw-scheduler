@@ -53,7 +53,16 @@ export default function migrateConsolidate() {
     && agentColumns.has('brand_name');
   const msgColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map(c => c.name));
   const hasMsgDeliveryTo = msgColumns.has('delivery_to');
-  if (current >= 21 && hasLatestColumns && hasAgentDelivery && hasMsgDeliveryTo) {
+  const legacyAtIsoCount = (jobColumns.has('schedule_kind') && jobColumns.has('schedule_at'))
+    ? (db.prepare(`
+        SELECT COUNT(*) AS cnt
+        FROM jobs
+        WHERE schedule_kind = 'at'
+          AND schedule_at IS NOT NULL
+          AND instr(schedule_at, 'T') > 0
+      `).get()?.cnt ?? 0)
+    : 0;
+  if (current >= 21 && hasLatestColumns && hasAgentDelivery && hasMsgDeliveryTo && legacyAtIsoCount === 0) {
     return false;
   }
 
@@ -156,6 +165,28 @@ export default function migrateConsolidate() {
 
   for (const sql of alters) {
     try { db.exec(sql); } catch { /* column already exists — ignore */ }
+  }
+
+  // Normalize legacy ISO schedule_at / next_run_at values for at-jobs so due checks
+  // use a consistent SQLite UTC datetime format after upgrades.
+  try {
+    db.exec(`
+      UPDATE jobs
+      SET schedule_at = strftime('%Y-%m-%d %H:%M:%S', schedule_at)
+      WHERE schedule_kind = 'at'
+        AND schedule_at IS NOT NULL
+        AND instr(schedule_at, 'T') > 0
+        AND strftime('%Y-%m-%d %H:%M:%S', schedule_at) IS NOT NULL;
+
+      UPDATE jobs
+      SET next_run_at = strftime('%Y-%m-%d %H:%M:%S', next_run_at)
+      WHERE schedule_kind = 'at'
+        AND next_run_at IS NOT NULL
+        AND instr(next_run_at, 'T') > 0
+        AND strftime('%Y-%m-%d %H:%M:%S', next_run_at) IS NOT NULL;
+    `);
+  } catch {
+    /* best-effort normalization for legacy rows */
   }
 
   // ── Tables that may be absent on very old installs ────────────────────
