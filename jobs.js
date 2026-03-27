@@ -167,6 +167,27 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
 
+  // Enforce: delivery_to is required when delivery_mode is explicitly set to
+  // 'announce' or 'announce-always'. Validates on create (when delivery_mode is
+  // explicitly provided) and on update (when delivery_mode is being changed or
+  // the merged record would end up in announce mode without a delivery_to).
+  {
+    const modeExplicitlySet = 'delivery_mode' in normalized;
+    const deliveryToExplicitlySet = 'delivery_to' in normalized;
+    const effectiveMode = merged.delivery_mode || 'announce';
+    const isAnnounceMode = ['announce', 'announce-always'].includes(effectiveMode);
+
+    if (isAnnounceMode && (modeExplicitlySet || deliveryToExplicitlySet)) {
+      // Re-evaluate: if mode is being set to announce OR delivery_to is being
+      // cleared on an announce-mode job, check the merged delivery_to is present.
+      if (!merged.delivery_to || (typeof merged.delivery_to === 'string' && merged.delivery_to.trim() === '')) {
+        throw new Error(
+          'delivery_to is required when delivery_mode is "announce" or "announce-always"'
+        );
+      }
+    }
+  }
+
   if (mode === 'create') {
     const isAgentTurn =
       !isChild &&

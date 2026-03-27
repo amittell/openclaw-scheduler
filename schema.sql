@@ -111,7 +111,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   next_run_at     TEXT,
   last_run_at     TEXT,
   last_status     TEXT,
-  consecutive_errors INTEGER NOT NULL DEFAULT 0
+  consecutive_errors INTEGER NOT NULL DEFAULT 0,
+
+  -- Delivery target constraint: announce modes require a delivery_to
+  CHECK (
+    delivery_mode NOT IN ('announce', 'announce-always')
+    OR (delivery_to IS NOT NULL AND delivery_to != '')
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_next_run ON jobs(next_run_at) WHERE enabled = 1;
@@ -439,6 +445,7 @@ INSERT OR IGNORE INTO jobs (
   session_target, agent_id,
   payload_kind, payload_message,
   payload_timeout_seconds,
+  delivery_mode, delivery_opt_out_reason,
   next_run_at,
   created_at, updated_at
 ) VALUES (
@@ -452,6 +459,7 @@ INSERT OR IGNORE INTO jobs (
   'shellCommand',
   'node dispatch/529-recovery.mjs',
   120,
+  'none', 'internal shell job; no human delivery needed',
   NULL,
   datetime('now'),
   datetime('now')
