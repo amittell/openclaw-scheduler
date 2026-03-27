@@ -333,6 +333,22 @@ try {
 }
 assert(threwMissingScheduleAtOnUpdate, 'updateJob rejects cron->at without schedule_at');
 
+let threwInvalidScheduleKind = false;
+try {
+  createJob({ name: 'InvalidScheduleKind', schedule_kind: 'banana', schedule_cron: '*/5 * * * *', payload_message: 'invalid schedule kind', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+} catch (e) {
+  threwInvalidScheduleKind = e.message.includes('schedule_kind');
+}
+assert(threwInvalidScheduleKind, 'createJob rejects invalid schedule_kind values');
+
+let threwSentinelRootCron = false;
+try {
+  createJob({ name: 'InvalidSentinelCronRoot', schedule_cron: AT_JOB_CRON_SENTINEL, payload_message: 'invalid sentinel root', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+} catch (e) {
+  threwSentinelRootCron = e.message.includes('reserved at-job sentinel');
+}
+assert(threwSentinelRootCron, 'createJob rejects reserved at-job sentinel for root cron jobs');
+
 const rootForTopology = createJob({ name: 'RootForTopology', schedule_cron: '0 9 * * *', payload_message: 'root topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const childForTopology = createJob({ name: 'ChildForTopology', parent_id: rootForTopology.id, trigger_on: 'success', schedule_cron: '0 11 * * *', payload_message: 'child topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const promotedChild = updateJob(childForTopology.id, { parent_id: null });
@@ -353,6 +369,13 @@ const atToCron = createJob({
   run_timeout_ms: 300_000,
   origin: 'system'
 });
+let threwAtToCronWithoutRealCron = false;
+try {
+  updateJob(atToCron.id, { schedule_kind: 'cron', schedule_at: null });
+} catch (e) {
+  threwAtToCronWithoutRealCron = e.message.includes('reserved at-job sentinel');
+}
+assert(threwAtToCronWithoutRealCron, 'updateJob rejects at->cron when the sentinel cron is still in place');
 const atToCronUpdated = updateJob(atToCron.id, { schedule_kind: 'cron', schedule_cron: '0 10 * * *', schedule_at: null });
 assert(atToCronUpdated.schedule_kind === 'cron', 'at->cron update stores cron kind');
 assert(atToCronUpdated.next_run_at !== '2026-03-27 18:00:00', 'at->cron update recalculates next_run_at');
@@ -821,6 +844,32 @@ assert(retryAtFresh.last_run_at !== null, 'at-job retry records last_run_at to s
 assert(retryAtFresh.last_status === 'error', 'at-job retry records last_status');
 assert(!getDueAtJobs().some(j => j.id === retryAtJob.id), 'at-job with queued retry is not still due via getDueAtJobs');
 deleteJob(retryAtJob.id);
+
+const skippedRetryAtTs = new Date(Date.now() - 60000).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+const skippedRetryAtJob = createJob({
+  name: 'SkippedRetryAtJob',
+  schedule_kind: 'at',
+  schedule_at: skippedRetryAtTs,
+  schedule_cron: AT_JOB_CRON_SENTINEL,
+  payload_message: 'retry at job skipped',
+  delete_after_run: 0,
+  max_retries: 1,
+  max_queued_dispatches: 1,
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 300_000,
+  origin: 'system',
+});
+enqueueDispatch(skippedRetryAtJob.id, { kind: 'manual' });
+const skippedRetryAtRun = createRun(skippedRetryAtJob.id, { run_timeout_ms: 300000 });
+finishRun(skippedRetryAtRun.id, 'error', { error_message: 'retry at skip fail' });
+const skippedRetryAtResult = scheduleRetry(skippedRetryAtJob, skippedRetryAtRun.id);
+const skippedRetryAtFresh = getJob(skippedRetryAtJob.id);
+assert(skippedRetryAtResult.dispatch === null && skippedRetryAtResult.skipped === true, 'at-job retry skip reports no queued dispatch when backlog is full');
+assert(skippedRetryAtFresh.last_run_at === null, 'at-job retry skip does not mutate last_run_at when no retry dispatch is created');
+assert(skippedRetryAtFresh.last_status === null, 'at-job retry skip does not mutate last_status when no retry dispatch is created');
+assert(getDueAtJobs().some(j => j.id === skippedRetryAtJob.id), 'at-job remains due if retry dispatch was not actually queued');
+deleteJob(skippedRetryAtJob.id);
 
 // ═══════════════════════════════════════════════════════════
 // SECTION 5: Cancellation (v3b)
@@ -3196,7 +3245,7 @@ console.log('\n── Dispatcher Utils ──');
 
 console.log('\n── Dispatch Queue Lifecycle ──');
 {
-  const dqJob = createJob({ name: 'dq-lifecycle', schedule_cron: '0 0 31 2 *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const dqJob = createJob({ name: 'dq-lifecycle', schedule_cron: '0 8 * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
 
   // claimDispatch
   const d1 = enqueueDispatch(dqJob.id, { kind: 'manual' });
@@ -3289,7 +3338,7 @@ console.log('\n── Approval Timeout / Prune / Count ──');
 
 console.log('\n── Run Session & Context Summary ──');
 {
-  const rsJob = createJob({ name: 'run-session-test', schedule_cron: '0 0 31 2 *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const rsJob = createJob({ name: 'run-session-test', schedule_cron: '0 8 * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
 
   // updateRunSession
   const rs1 = createRun(rsJob.id, { run_timeout_ms: 60000 });
@@ -3442,7 +3491,7 @@ console.log('\n── Dispatcher Integration ──');
     prepare: async ({ addJob, triggerJob, context }) => {
       const timeoutJob = addJob({
         name: 'dispatcher-timeout',
-        schedule_cron: '0 0 31 2 *',
+        schedule_cron: '0 8 * * *',
         session_target: 'shell',
         payload_kind: 'shellCommand',
         payload_message: 'sleep 2',
@@ -3474,7 +3523,7 @@ console.log('\n── Dispatcher Integration ──');
     prepare: async ({ addJob, triggerJob, context }) => {
       const root = addJob({
         name: 'dispatcher-retry-root',
-        schedule_cron: '0 0 31 2 *',
+        schedule_cron: '0 8 * * *',
         session_target: 'shell',
         payload_kind: 'shellCommand',
         payload_message: 'echo retry-root && exit 9',
@@ -3576,7 +3625,7 @@ console.log('\n── Dispatcher Integration ──');
       const { generateIdempotencyKey, claimIdempotencyKey } = await import('./idempotency.js');
       const replayRoot = addJob({
         name: 'dispatcher-replay-root',
-        schedule_cron: '0 0 31 2 *',
+        schedule_cron: '0 8 * * *',
         session_target: 'shell',
         payload_kind: 'shellCommand',
         payload_message: 'printf replay-root-ok',
@@ -3602,6 +3651,7 @@ console.log('\n── Dispatcher Integration ──');
       context.rootJobId = replayRoot.id;
       context.orphanedRunId = orphanedRun.id;
       context.replayKey = replayKey;
+      context.staleDue = staleDue;
     },
     exercise: async ({ probeDb, context }) => {
       const crashedRun = await waitFor(
@@ -3648,7 +3698,7 @@ console.log('\n── Dispatcher Integration ──');
 
       assert(replayRun.status === 'ok', 'dispatcher replay dispatch completes successfully after startup recovery');
       assert(replayRun.idempotency_key !== context.replayKey, 'dispatcher replay uses a fresh idempotency key');
-      assert(refreshedJob.next_run_at === null, 'startup replay clears stale due next_run_at for sentinel cron jobs');
+      assert(refreshedJob.next_run_at !== context.staleDue, 'startup replay advances stale due next_run_at after crash recovery');
       assert(totalRuns === 2, 'startup replay creates exactly one replay run without duplicate due-loop inserts');
       assert(pendingRetryDispatches === 0, 'startup replay drains queued retry dispatch instead of leaving it stuck pending');
     },
@@ -3659,7 +3709,7 @@ console.log('\n── Dispatcher Integration ──');
       const { generateIdempotencyKey } = await import('./idempotency.js');
       const reconciledRoot = addJob({
         name: 'dispatcher-reconcile-retry-root',
-        schedule_cron: '0 0 31 2 *',
+        schedule_cron: '0 8 * * *',
         session_target: 'shell',
         payload_kind: 'shellCommand',
         payload_message: 'printf queued-retry-ok',
@@ -3686,6 +3736,7 @@ console.log('\n── Dispatcher Integration ──');
       context.rootJobId = reconciledRoot.id;
       context.crashedRunId = crashedRun.id;
       context.staleKey = staleKey;
+      context.staleDue = staleDue;
     },
     exercise: async ({ probeDb, context }) => {
       const replayRun = await waitFor(
@@ -3721,7 +3772,7 @@ console.log('\n── Dispatcher Integration ──');
 
       assert(replayRun.status === 'ok', 'startup reconciliation lets queued retry dispatch execute for stale due jobs');
       assert(replayRun.idempotency_key !== context.staleKey, 'queued retry replay uses a fresh idempotency key');
-      assert(refreshedJob.next_run_at === null, 'startup reconciliation clears stale next_run_at when retry is already queued');
+      assert(refreshedJob.next_run_at !== context.staleDue, 'startup reconciliation advances stale next_run_at when retry is already queued');
       assert(totalRuns === 2, 'startup reconciliation avoids duplicate root dispatch attempts');
       assert(pendingRetryDispatches === 0, 'startup reconciliation drains the existing retry dispatch');
     },

@@ -15,6 +15,7 @@ const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
 const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan']);
+const VALID_SCHEDULE_KINDS = new Set(['cron', 'at']);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -154,6 +155,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
 
   const merged = { ...(currentJob || {}), ...normalized };
   const isChild = !!merged.parent_id;
+  if (mode === 'create' || 'schedule_kind' in normalized) {
+    assertEnum('schedule_kind', merged.schedule_kind || 'cron', VALID_SCHEDULE_KINDS);
+  }
 
   if (mode === 'create' || 'name' in normalized) {
     assertSafeString('name', merged.name, { maxLength: 200 });
@@ -178,7 +182,16 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (merged.schedule_cron) {
     assertSafeString('schedule_cron', merged.schedule_cron, { maxLength: 128 });
-    // Skip cron validation for the sentinel (never-fires placeholder for at-jobs)
+    const sentinelUsedAsRealCron = merged.schedule_cron === AT_JOB_CRON_SENTINEL && !isAtJob && !isChild;
+    if (sentinelUsedAsRealCron && (
+      mode === 'create'
+      || 'schedule_cron' in normalized
+      || 'schedule_kind' in normalized
+      || 'parent_id' in normalized
+    )) {
+      throw new Error('schedule_cron cannot use the reserved at-job sentinel for root cron jobs');
+    }
+    // Skip cron validation for the sentinel (never-fires placeholder for at-jobs/children)
     if (merged.schedule_cron !== AT_JOB_CRON_SENTINEL) {
       nextRunFromCron(merged.schedule_cron, merged.schedule_tz || 'UTC');
     }
@@ -898,7 +911,6 @@ export function scheduleRetry(job, failedRunId) {
     retryPatch.next_run_at = nextRunFromCron(job.schedule_cron, job.schedule_tz);
   }
   if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
-    applyJobPatch(job.id, retryPatch);
     return { retryCount, delaySec, retryOf: failedRunId, dispatch: null, skipped: true };
   }
   const dispatch = enqueueDispatch(job.id, {
