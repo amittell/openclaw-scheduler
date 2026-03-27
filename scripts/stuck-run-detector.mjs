@@ -34,7 +34,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Paths ────────────────────────────────────────────────────
 
-const LABELS_PATH  = join(__dirname, '..', 'dispatch', 'labels.json');
+const LABELS_PATH  = process.env.DISPATCH_LABELS_PATH || join(__dirname, '..', 'dispatch', 'labels.json');
 const STATE_PATH   = process.env.STUCK_STATE_PATH || join(tmpdir(), 'stuck-detector-state.json');
 const DISPATCH_CLI = resolveDispatchCliPath(process.env);
 const DISPATCH_IS_BIN = !DISPATCH_CLI.includes('/') && !DISPATCH_CLI.includes('\\');
