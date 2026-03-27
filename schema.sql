@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   
   -- Schedule: cron or one-shot 'at'
   schedule_kind   TEXT NOT NULL DEFAULT 'cron',          -- 'cron' | 'at'
-  schedule_at     TEXT DEFAULT NULL,                     -- ISO-8601 UTC timestamp, only for kind='at'
+  schedule_at     TEXT DEFAULT NULL,                     -- SQLite UTC timestamp ('YYYY-MM-DD HH:MM:SS'), only for kind='at'
   schedule_cron   TEXT,                                  -- NULL allowed for at-jobs (use sentinel '0 0 31 2 *' on old DBs)
   schedule_tz     TEXT NOT NULL DEFAULT 'UTC',
   

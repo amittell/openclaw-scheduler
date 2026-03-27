@@ -122,11 +122,11 @@ export function updateRunSession(id, sessionKey, sessionId) {
 }
 
 /**
- * Find stale runs: treats shell jobs and agent jobs differently.
+ * Find stale runs: treats shell jobs and session-based jobs differently.
  *
- * - Agent jobs (payload_kind != 'systemEvent'): stale if last_heartbeat older than thresholdSeconds.
- *   These are session-based and emit heartbeats — silence means stuck.
- * - Shell jobs (payload_kind = 'systemEvent'): stale only if elapsed time > run_timeout_ms.
+ * - Session-based jobs (session_target != 'shell'): stale if last_heartbeat older than thresholdSeconds.
+ *   These jobs emit heartbeats via gateway/session activity — silence means stuck.
+ * - Shell jobs (session_target = 'shell'): stale only if elapsed time > run_timeout_ms.
  *   Shell jobs have no heartbeat mechanism; they run until exit. Use timeout as the upper bound.
  *   Shell jobs with run_timeout_ms IS NULL are NOT flagged — that's getTimedOutRuns' concern.
  *
@@ -140,12 +140,12 @@ export function getStaleRuns(thresholdSeconds = 90) {
     WHERE r.status = 'running'
       AND (
         -- Shell jobs: stale only if they exceed their absolute run_timeout_ms
-        (j.payload_kind = 'systemEvent'
+        (j.session_target = 'shell'
           AND r.run_timeout_ms IS NOT NULL
           AND (julianday('now') - julianday(r.started_at)) * 86400000 > r.run_timeout_ms)
         OR
-        -- Agent jobs: stale if last_heartbeat not updated within threshold
-        (j.payload_kind != 'systemEvent'
+        -- Session-based jobs: stale if last_heartbeat not updated within threshold
+        (j.session_target != 'shell'
           AND r.last_heartbeat < datetime('now', '-' || ? || ' seconds'))
       )
   `).all(thresholdSeconds);
