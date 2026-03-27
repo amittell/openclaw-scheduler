@@ -3187,6 +3187,146 @@ console.log('\n── Legacy At-Job Normalization ──');
   await initDb();
 }
 
+console.log('\n── Legacy Payload Normalization ──');
+{
+  const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-legacy-payload-'));
+  const legacyDbPath = join(legacyDir, 'scheduler.db');
+  const legacyDb = new Database(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      schedule_kind TEXT NOT NULL DEFAULT 'cron',
+      schedule_at TEXT DEFAULT NULL,
+      schedule_cron TEXT,
+      schedule_tz TEXT NOT NULL DEFAULT 'UTC',
+      session_target TEXT NOT NULL DEFAULT 'isolated',
+      agent_id TEXT DEFAULT 'main',
+      payload_kind TEXT NOT NULL,
+      payload_message TEXT NOT NULL,
+      payload_timeout_seconds INTEGER DEFAULT 120,
+      execution_intent TEXT NOT NULL DEFAULT 'execute',
+      execution_read_only INTEGER NOT NULL DEFAULT 0,
+      overlap_policy TEXT NOT NULL DEFAULT 'skip',
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      max_queued_dispatches INTEGER NOT NULL DEFAULT 25,
+      max_pending_approvals INTEGER NOT NULL DEFAULT 10,
+      max_trigger_fanout INTEGER NOT NULL DEFAULT 25,
+      delivery_mode TEXT DEFAULT 'none',
+      delivery_channel TEXT,
+      delivery_to TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      delete_after_run INTEGER NOT NULL DEFAULT 0,
+      ttl_hours INTEGER DEFAULT NULL,
+      parent_id TEXT,
+      trigger_on TEXT,
+      trigger_delay_s INTEGER DEFAULT 0,
+      trigger_condition TEXT DEFAULT NULL,
+      max_retries INTEGER DEFAULT 0,
+      queued_count INTEGER DEFAULT 0,
+      payload_scope TEXT NOT NULL DEFAULT 'own',
+      resource_pool TEXT DEFAULT NULL,
+      delivery_guarantee TEXT DEFAULT 'at-most-once',
+      job_class TEXT DEFAULT 'standard',
+      approval_required INTEGER DEFAULT 0,
+      approval_timeout_s INTEGER DEFAULT 3600,
+      approval_auto TEXT DEFAULT 'reject',
+      context_retrieval TEXT DEFAULT 'none',
+      context_retrieval_limit INTEGER DEFAULT 5,
+      output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536,
+      output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000,
+      output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000,
+      output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
+      preferred_session_key TEXT DEFAULT NULL,
+      auth_profile TEXT DEFAULT NULL,
+      delivery_opt_out_reason TEXT DEFAULT NULL,
+      origin TEXT DEFAULT NULL,
+      job_type TEXT NOT NULL DEFAULT 'standard',
+      watchdog_target_label TEXT,
+      watchdog_check_cmd TEXT,
+      watchdog_timeout_min INTEGER,
+      watchdog_alert_channel TEXT,
+      watchdog_alert_target TEXT,
+      watchdog_self_destruct INTEGER NOT NULL DEFAULT 1,
+      watchdog_started_at TEXT,
+      next_run_at TEXT,
+      last_run_at TEXT,
+      last_status TEXT,
+      consecutive_errors INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT,
+      duration_ms INTEGER,
+      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now')),
+      session_key TEXT,
+      session_id TEXT,
+      summary TEXT,
+      error_message TEXT,
+      shell_exit_code INTEGER,
+      shell_signal TEXT,
+      shell_timed_out INTEGER NOT NULL DEFAULT 0,
+      shell_stdout TEXT,
+      shell_stderr TEXT,
+      shell_stdout_path TEXT,
+      shell_stderr_path TEXT,
+      shell_stdout_bytes INTEGER NOT NULL DEFAULT 0,
+      shell_stderr_bytes INTEGER NOT NULL DEFAULT 0,
+      dispatched_at TEXT,
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      retry_count INTEGER DEFAULT 0,
+      retry_of TEXT,
+      triggered_by_run TEXT,
+      dispatch_queue_id TEXT,
+      context_summary TEXT,
+      replay_of TEXT,
+      idempotency_key TEXT
+    );
+    CREATE TABLE messages (id TEXT PRIMARY KEY, to_agent TEXT, status TEXT, created_at TEXT, delivery_to TEXT);
+    CREATE TABLE task_tracker_agents (id TEXT PRIMARY KEY, session_key TEXT, last_heartbeat TEXT);
+    CREATE TABLE approvals (id TEXT PRIMARY KEY, job_id TEXT, run_id TEXT, dispatch_queue_id TEXT, status TEXT, requested_at TEXT, resolved_at TEXT, resolved_by TEXT, notes TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, status TEXT, last_seen_at TEXT, session_key TEXT, capabilities TEXT, delivery_channel TEXT, delivery_to TEXT, brand_name TEXT, created_at TEXT);
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (21);
+  `);
+  legacyDb.prepare(`
+    INSERT INTO jobs (
+      id, name, enabled, schedule_kind, schedule_cron, schedule_tz,
+      session_target, agent_id, payload_kind, payload_message,
+      delivery_mode, delivery_opt_out_reason, run_timeout_ms, origin, next_run_at
+    ) VALUES (?, ?, 1, 'cron', '0 * * * *', 'UTC', 'shell', 'main', 'agentTurn', 'legacy shell job', 'none', NULL, 300000, 'system', datetime('now', '-1 minute'))
+  `).run('legacy-shell-job', 'LegacyShellJob');
+  legacyDb.prepare(`
+    INSERT INTO jobs (
+      id, name, enabled, schedule_kind, schedule_cron, schedule_tz,
+      session_target, agent_id, payload_kind, payload_message,
+      delivery_mode, delivery_opt_out_reason, run_timeout_ms, origin, next_run_at
+    ) VALUES (?, ?, 1, 'cron', '15 * * * *', 'UTC', 'isolated', 'main', 'agentTurn', 'legacy isolated job', 'none', NULL, 300000, 'system', datetime('now', '+1 hour'))
+  `).run('legacy-isolated-job', 'LegacyIsolatedJob');
+  legacyDb.close();
+
+  closeDb();
+  setDbPath(legacyDbPath);
+  await initDb();
+  const normalizedShell = getJob('legacy-shell-job');
+  const normalizedIsolated = getJob('legacy-isolated-job');
+  assert(normalizedShell.payload_kind === 'shellCommand', 'migration normalizes legacy shell payload_kind to shellCommand');
+  assert(normalizedIsolated.delivery_opt_out_reason === 'legacy scheduler job intentionally suppresses automatic delivery', 'migration backfills delivery_opt_out_reason for legacy root agentTurn jobs');
+  closeDb();
+
+  rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
+  await initDb();
+}
+
 console.log('\n── Dispatcher Utils ──');
 {
   // sqliteNow returns valid datetime string

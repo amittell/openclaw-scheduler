@@ -524,7 +524,7 @@ switch (command) {
         emit(jsonMode ? receipts : rows, () => console.table(rows));
         break;
       }
-      case 'read': markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break;
+      case 'read': { if (!args[0]) fail('Usage: msg read <message-id>'); markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break; }
       case 'readall': { const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
       case 'unread': { if (!args[0]) fail('Usage: msg unread <agent-id>'); const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
       default: usage();

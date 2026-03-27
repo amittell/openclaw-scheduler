@@ -31,7 +31,7 @@ export interface JobSpec {
 
   // Payload
   payload_kind?: 'systemEvent' | 'agentTurn' | 'shellCommand';
-  payload_message?: string;
+  payload_message: string;
   payload_model?: string | null;
   payload_thinking?: string | null;
   payload_timeout_seconds?: number;
@@ -41,7 +41,7 @@ export interface JobSpec {
 
   // Overlap & timeout
   overlap_policy?: 'skip' | 'allow' | 'queue';
-  run_timeout_ms?: number;
+  run_timeout_ms: number;
   max_queued_dispatches?: number;
   max_pending_approvals?: number;
   max_trigger_fanout?: number;

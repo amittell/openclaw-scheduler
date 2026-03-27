@@ -62,7 +62,33 @@ export default function migrateConsolidate() {
           AND instr(schedule_at, 'T') > 0
       `).get()?.cnt ?? 0)
     : 0;
-  if (current >= 21 && hasLatestColumns && hasAgentDelivery && hasMsgDeliveryTo && legacyAtIsoCount === 0) {
+  const legacyPayloadMismatchCount = (jobColumns.has('session_target') && jobColumns.has('payload_kind'))
+    ? (db.prepare(`
+        SELECT COUNT(*) AS cnt
+        FROM jobs
+        WHERE (session_target = 'shell' AND payload_kind != 'shellCommand')
+           OR (session_target = 'main' AND payload_kind != 'systemEvent')
+      `).get()?.cnt ?? 0)
+    : 0;
+  const legacyMissingDeliveryOptOutCount = (jobColumns.has('payload_kind') && jobColumns.has('delivery_mode') && jobColumns.has('delivery_opt_out_reason'))
+    ? (db.prepare(`
+        SELECT COUNT(*) AS cnt
+        FROM jobs
+        WHERE parent_id IS NULL
+          AND payload_kind = 'agentTurn'
+          AND delivery_mode = 'none'
+          AND (delivery_opt_out_reason IS NULL OR trim(delivery_opt_out_reason) = '')
+      `).get()?.cnt ?? 0)
+    : 0;
+  if (
+    current >= 21
+    && hasLatestColumns
+    && hasAgentDelivery
+    && hasMsgDeliveryTo
+    && legacyAtIsoCount === 0
+    && legacyPayloadMismatchCount === 0
+    && legacyMissingDeliveryOptOutCount === 0
+  ) {
     return false;
   }
 
@@ -184,6 +210,32 @@ export default function migrateConsolidate() {
         AND next_run_at IS NOT NULL
         AND instr(next_run_at, 'T') > 0
         AND strftime('%Y-%m-%d %H:%M:%S', next_run_at) IS NOT NULL;
+    `);
+  } catch {
+    /* best-effort normalization for legacy rows */
+  }
+
+  // Normalize legacy session_target/payload_kind mismatches left behind by older
+  // imports or hand-edited rows so current validation/dispatch rules behave
+  // consistently on upgraded installs.
+  try {
+    db.exec(`
+      UPDATE jobs
+      SET payload_kind = 'shellCommand'
+      WHERE session_target = 'shell'
+        AND payload_kind != 'shellCommand';
+
+      UPDATE jobs
+      SET payload_kind = 'systemEvent'
+      WHERE session_target = 'main'
+        AND payload_kind != 'systemEvent';
+
+      UPDATE jobs
+      SET delivery_opt_out_reason = 'legacy scheduler job intentionally suppresses automatic delivery'
+      WHERE parent_id IS NULL
+        AND payload_kind = 'agentTurn'
+        AND delivery_mode = 'none'
+        AND (delivery_opt_out_reason IS NULL OR trim(delivery_opt_out_reason) = '');
     `);
   } catch {
     /* best-effort normalization for legacy rows */

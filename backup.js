@@ -65,7 +65,7 @@ function mcPath(subpath) {
 
 function hasSqlite3() {
   try {
-    execFileSync('which', ['sqlite3'], { stdio: 'pipe' });
+    execFileSync('sqlite3', ['--version'], { stdio: 'pipe' });
     return true;
   } catch {
     return false;
@@ -173,10 +173,11 @@ function rollup() {
 
   try { unlinkSync(stagingFile); } catch {}
 
-  // Prune old snapshots (>24h)
-  pruneSnapshots();
-  // Prune old rollups (>7d)
-  pruneRollups();
+  // Only prune if the rollup uploaded successfully -- avoid deleting the only copies
+  if (rollupResult !== null) {
+    pruneSnapshots();
+    pruneRollups();
+  }
 }
 
 // ── Prune ───────────────────────────────────────────────────

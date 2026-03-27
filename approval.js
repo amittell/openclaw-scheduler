@@ -85,6 +85,7 @@ export function getTimedOutApprovals() {
     FROM approvals a
     JOIN jobs j ON a.job_id = j.id
     WHERE a.status = 'pending'
+      AND j.approval_timeout_s IS NOT NULL
       AND (julianday('now') - julianday(a.requested_at)) * 86400 > j.approval_timeout_s
   `).all();
 }

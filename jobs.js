@@ -37,7 +37,7 @@ const PATCHABLE_COLUMNS = new Set([
   'enabled', 'name', 'schedule_cron', 'schedule_tz', 'schedule_at', 'schedule_kind',
   'next_run_at', 'last_run_at', 'last_status', 'payload_message', 'payload_model',
   'payload_thinking', 'payload_timeout_seconds', 'session_target', 'run_timeout_ms',
-  'max_retries', 'retry_count', 'consecutive_errors',
+  'max_retries', 'consecutive_errors',
   'delivery_mode', 'delivery_channel', 'delivery_to', 'delivery_opt_out_reason',
   'delete_after_run', 'ttl_hours', 'auth_profile', 'origin',
   'output_excerpt_limit_bytes', 'output_summary_limit_bytes',

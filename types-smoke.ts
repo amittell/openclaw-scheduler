@@ -29,6 +29,7 @@ const jobSpec: JobSpec = {
   name: 'Type smoke',
   schedule_cron: '0 0 31 2 *',
   payload_message: 'echo ok',
+  run_timeout_ms: 300000,
   session_target: 'shell',
   payload_kind: 'shellCommand',
 };
@@ -43,6 +44,7 @@ const watchdogSpec: JobSpec = {
   name: 'Watchdog smoke',
   schedule_cron: '*/5 * * * *',
   payload_message: 'echo check',
+  run_timeout_ms: 300000,
   session_target: 'shell',
   payload_kind: 'shellCommand',
   job_type: 'watchdog',
@@ -59,6 +61,8 @@ void watchdogSpec;
 // ---- jobs: additional fields ----
 const fullSpec: JobSpec = {
   name: 'Full smoke',
+  payload_message: 'echo full',
+  run_timeout_ms: 300000,
   payload_scope: 'global',
   payload_model: 'gpt-5-mini',
   payload_thinking: 'extended',

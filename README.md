@@ -12,7 +12,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 993 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** 995 (full suite, in-memory SQLite + dispatcher integration)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 In practice, this gives you:
@@ -147,7 +147,7 @@ For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather th
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 993 passed, 0 failed
+npm test                             # should print: 995 passed, 0 failed
 npm run lint                         # static checks
 npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
@@ -870,7 +870,7 @@ openclaw-scheduler jobs add '{
   "parent_id": "abc123...",
   "trigger_on": "failure",
   "delivery_mode": "announce",
-  "delivery_to": "1000000001"
+  "delivery_to": "YOUR_TELEGRAM_ID"
 }'
 ```
 
@@ -1090,7 +1090,7 @@ node backup.js rollup
 node backup.js status
 
 # Restore from snapshot
-node backup.js restore scheduler-backups/scheduler/snapshots/2026-02-26/14-00.db
+node backup.js restore
 
 # Prune old backups
 node backup.js prune
@@ -1100,9 +1100,9 @@ node backup.js prune
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MC_ALIAS` | `backupstore` | MinIO client alias |
-| `BUCKET` | `scheduler-backups` | MinIO bucket name |
-| `PREFIX` | `scheduler` | Path prefix within bucket |
+| `SCHEDULER_BACKUP_MC_ALIAS` | `backupstore` | MinIO client alias |
+| `SCHEDULER_BACKUP_BUCKET` | `scheduler-backups` | MinIO bucket name |
+| `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Path prefix within bucket |
 
 Requires `mc` (MinIO client) in PATH and a configured `backupstore` alias.
 
@@ -1549,7 +1549,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (993 tests, in-memory SQLite)
+# Run all tests (995 tests, in-memory SQLite)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:
@@ -1783,7 +1783,7 @@ openclaw-scheduler jobs approve <id>   # or reject
 
 ```bash
 mc alias list   # verify backupstore alias configured
-# Check: MC_ALIAS, BUCKET, PREFIX env vars or defaults in backup.js
+# Check: SCHEDULER_BACKUP_MC_ALIAS, SCHEDULER_BACKUP_BUCKET, SCHEDULER_BACKUP_PREFIX env vars or defaults in backup.js
 # Verify MinIO is reachable: mc ls backupstore/
 ```
 
