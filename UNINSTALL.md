@@ -11,6 +11,17 @@ Two levels of removal:
 
 ### macOS
 
+Remove the launchd mode you actually used:
+
+**LaunchAgent**
+
+```bash
+launchctl bootout gui/$UID/ai.openclaw.scheduler
+rm ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+```
+
+**LaunchDaemon**
+
 ```bash
 sudo launchctl bootout system/ai.openclaw.scheduler
 sudo rm /Library/LaunchDaemons/ai.openclaw.scheduler.plist

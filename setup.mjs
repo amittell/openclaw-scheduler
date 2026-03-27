@@ -9,7 +9,7 @@
  *  1. Runs DB migrations (creates/upgrades scheduler.db)
  *  2. Appends scheduler queue/consumer entries to MEMORY.md + workspace-index.md
  *  3. Creates Inbox Consumer + Stuck Run Detector scheduler jobs
- *  4. Installs the macOS LaunchDaemon (optional)
+ *  4. Installs a macOS launchd service (LaunchAgent or LaunchDaemon, optional)
  */
 
 import readline from 'readline';
@@ -24,6 +24,73 @@ import { createJob } from './jobs.js';
 import { initDb } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const VALID_MAC_SERVICE_MODES = new Set(['agent', 'daemon', 'skip']);
+
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function printSetupUsage() {
+  process.stdout.write(`OpenClaw Scheduler setup
+
+Usage:
+  node setup.mjs [--service-mode agent|daemon|skip]
+
+Options:
+  --service-mode <mode>   macOS only. Choose launchd install mode.
+                          agent  -> user LaunchAgent (best for auto-login workstation use)
+                          daemon -> system LaunchDaemon (best for headless/pre-login startup)
+                          skip   -> do not install a macOS service
+  -h, --help             Show this help
+`);
+}
+
+function parseSetupArgs(argv) {
+  const options = { help: false, serviceMode: null };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      options.help = true;
+      continue;
+    }
+    if (arg === '--service-mode') {
+      const value = argv[i + 1];
+      if (!value) throw new Error('--service-mode requires a value: agent, daemon, or skip');
+      options.serviceMode = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--service-mode=')) {
+      options.serviceMode = arg.split('=')[1] || '';
+      continue;
+    }
+    throw new Error(`Unknown option: ${arg}`);
+  }
+  if (options.serviceMode && !VALID_MAC_SERVICE_MODES.has(options.serviceMode)) {
+    throw new Error(`Invalid --service-mode "${options.serviceMode}". Use agent, daemon, or skip.`);
+  }
+  return options;
+}
+
+const setupOptions = (() => {
+  try {
+    return parseSetupArgs(process.argv.slice(2));
+  } catch (err) {
+    process.stderr.write(`Error: ${err.message}\n`);
+    printSetupUsage();
+    process.exit(1);
+  }
+})();
+
+if (setupOptions.help) {
+  printSetupUsage();
+  process.exit(0);
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,7 +146,7 @@ print('This wizard will:');
 print('  • Run DB migrations');
 print('  • Add scheduler queue + consumer notes to agent memory files');
 print('  • Create Inbox Consumer + Stuck Run Detector jobs');
-print('  • Install the macOS LaunchDaemon (optional)');
+print('  • Install a macOS LaunchAgent or LaunchDaemon (optional)');
 print();
 
 // ─── Step 1: Paths ────────────────────────────────────────────────────────────
@@ -161,7 +228,7 @@ const indexSection = `### Scheduler & Dispatch
 
 | File | Covers | Load |
 |------|--------|------|
-| \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. LaunchDaemon: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
+| \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. launchd service: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
 | \`${schedulerPath}/cli.js\` | Queue + run operations: \`msg send\`, \`msg inbox\`, \`runs running\`, \`runs stale\`. | Day-to-day scheduler operations |
 | \`${schedulerPath}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
 | \`${schedulerPath}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
@@ -282,53 +349,119 @@ const isWSL = platform === 'linux' && (
 const wslVersion = isWSL && (() => {
   try { return fs.readFileSync('/proc/version', 'utf8').includes('WSL2') ? 2 : 1; } catch { return null; }
 })();
+let macServiceSummary = null;
 
 // ── macOS ──────────────────────────────────────────────────────────────────
 if (platform === 'darwin') {
-  print('── Step 5: Service (macOS LaunchDaemon) ────────────────');
-  const plistPath = '/Library/LaunchDaemons/ai.openclaw.scheduler.plist';
-  const tmpPlistPath = path.join(os.tmpdir(), 'ai.openclaw.scheduler.plist');
+  print('── Step 5: Service (macOS launchd) ─────────────────────');
   const serviceUser = os.userInfo().username;
+  const serviceUid = typeof process.getuid === 'function' ? process.getuid() : null;
   const gatewayToken = getGatewayToken(os.homedir());
   const envPath = process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin';
-  if (fs.existsSync(plistPath)) {
-    skip('LaunchDaemon already installed');
-    print(`  Path: ${plistPath}`);
-    print('  To restart: sudo launchctl kickstart -k system/ai.openclaw.scheduler');
+  const serviceModes = {
+    agent: {
+      mode: 'agent',
+      title: 'LaunchAgent',
+      label: 'ai.openclaw.scheduler',
+      plistPath: path.join(os.homedir(), 'Library', 'LaunchAgents', 'ai.openclaw.scheduler.plist'),
+      domain: serviceUid == null ? null : `gui/${serviceUid}`,
+      installPrompt: 'Install LaunchAgent (recommended for a personal Mac with auto-login)?',
+      comment: 'OpenClaw Scheduler -- LaunchAgent (best for workstation/auto-login use)',
+      installMode: 'user',
+    },
+    daemon: {
+      mode: 'daemon',
+      title: 'LaunchDaemon',
+      label: 'ai.openclaw.scheduler',
+      plistPath: '/Library/LaunchDaemons/ai.openclaw.scheduler.plist',
+      domain: 'system',
+      installPrompt: 'Install LaunchDaemon (recommended for a headless Mac or startup before login)?',
+      comment: 'OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)',
+      installMode: 'system',
+    },
+  };
+  const existingModes = Object.values(serviceModes).filter(cfg => fs.existsSync(cfg.plistPath));
+  let selectedServiceMode = setupOptions.serviceMode;
+  if (!selectedServiceMode) {
+    print('  Choose how the scheduler should start on macOS:');
+    print('  • agent  = user LaunchAgent (best for personal Macs with auto-login)');
+    print('  • daemon = system LaunchDaemon (best for headless or pre-login startup)');
+    print('  • skip   = do not install a service right now');
+    selectedServiceMode = (await ask('Service mode', 'agent')).toLowerCase();
+    while (!VALID_MAC_SERVICE_MODES.has(selectedServiceMode)) {
+      warn('Choose agent, daemon, or skip.');
+      selectedServiceMode = (await ask('Service mode', 'agent')).toLowerCase();
+    }
+  }
+
+  if (selectedServiceMode === 'skip') {
+    skip('Skipped macOS service install');
+    print('  Re-run later with: node setup.mjs --service-mode agent');
+    print('                 or: node setup.mjs --service-mode daemon');
   } else {
-    const install = await confirm('Install LaunchDaemon (recommended, survives reboot without login)?');
-    if (install) {
-      const tokenXml = gatewayToken
-        ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${gatewayToken}</string>\n`
-        : '';
-      const plist = `<?xml version="1.0" encoding="UTF-8"?>
+    const service = serviceModes[selectedServiceMode];
+    const otherModes = existingModes.filter(cfg => cfg.mode !== service.mode);
+    if (otherModes.length) {
+      warn(`Detected existing ${otherModes.map(cfg => cfg.title).join(' + ')} install(s):`);
+      for (const cfg of otherModes) {
+        print(`  • ${cfg.title}: ${cfg.plistPath}`);
+      }
+      const continueWithDuplicate = await confirm(`Install ${service.title} anyway? (This can run two schedulers if you leave both enabled)`);
+      if (!continueWithDuplicate) {
+        skip(`Skipped ${service.title} install`);
+        if (otherModes.length > 0) {
+          print(`  Leaving existing ${otherModes[0].title} in place.`);
+          macServiceSummary = otherModes[0];
+        }
+      } else {
+        macServiceSummary = service;
+      }
+    } else {
+      macServiceSummary = service;
+    }
+
+    if (macServiceSummary && fs.existsSync(service.plistPath)) {
+      skip(`${service.title} already installed`);
+      print(`  Path: ${service.plistPath}`);
+      if (service.domain) {
+        const restartPrefix = service.mode === 'daemon' ? 'sudo ' : '';
+        print(`  To restart: ${restartPrefix}launchctl kickstart -k ${service.domain}/${service.label}`);
+      }
+    } else if (macServiceSummary) {
+      const install = await confirm(service.installPrompt);
+      if (install) {
+        const tokenXml = gatewayToken
+          ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${xmlEscape(gatewayToken)}</string>\n`
+          : '';
+        const userXml = service.mode === 'daemon'
+          ? `  <key>UserName</key>\n  <string>${xmlEscape(serviceUser)}</string>\n`
+          : '';
+        const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Comment</key>
-  <string>OpenClaw Scheduler -- LaunchDaemon (survives headless reboots)</string>
+  <string>${xmlEscape(service.comment)}</string>
   <key>Label</key>
-  <string>ai.openclaw.scheduler</string>
+  <string>${service.label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
+    <string>${xmlEscape(nodePath)}</string>
     <string>--no-warnings</string>
-    <string>${indexPath}</string>
+    <string>${xmlEscape(indexPath)}</string>
   </array>
-  <key>UserName</key>
-  <string>${serviceUser}</string>
-  <key>WorkingDirectory</key>
-  <string>${schedulerPath}</string>
+${userXml}  <key>WorkingDirectory</key>
+  <string>${xmlEscape(schedulerPath)}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>${os.homedir()}</string>
+    <string>${xmlEscape(os.homedir())}</string>
     <key>PATH</key>
-    <string>${envPath}</string>
+    <string>${xmlEscape(envPath)}</string>
     <key>OPENCLAW_GATEWAY_URL</key>
-    <string>${gatewayUrl}</string>
+    <string>${xmlEscape(gatewayUrl)}</string>
     <key>SCHEDULER_DB</key>
-    <string>${schedulerDbPath}</string>
+    <string>${xmlEscape(schedulerDbPath)}</string>
 ${tokenXml}  </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -337,25 +470,41 @@ ${tokenXml}  </dict>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(logPath)}</string>
 </dict>
 </plist>`;
-      fs.writeFileSync(tmpPlistPath, plist);
-      try {
-        execSync(`sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${plistPath}"`, { stdio: 'inherit' });
-        execSync(`sudo launchctl bootstrap system "${plistPath}"`, { stdio: 'inherit' });
-        ok('LaunchDaemon installed and bootstrapped');
-      } catch (err) {
-        ok(`LaunchDaemon plist written → ${tmpPlistPath}`);
-        warn(`Auto-bootstrap failed: ${err.message.trim()}`);
-        warn(`Run manually: sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${plistPath}"`);
-        warn(`Then: sudo launchctl bootstrap system "${plistPath}"`);
+        if (service.mode === 'daemon') {
+          const tmpPlistPath = path.join(os.tmpdir(), 'ai.openclaw.scheduler.plist');
+          fs.writeFileSync(tmpPlistPath, plist);
+          try {
+            execSync(`sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`, { stdio: 'inherit' });
+            execSync(`sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
+            ok(`${service.title} installed and bootstrapped`);
+          } catch (err) {
+            ok(`${service.title} plist written → ${tmpPlistPath}`);
+            warn(`Auto-bootstrap failed: ${err.message.trim()}`);
+            warn(`Run manually: sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`);
+            warn(`Then: sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`);
+          }
+        } else {
+          fs.mkdirSync(path.dirname(service.plistPath), { recursive: true });
+          fs.writeFileSync(service.plistPath, plist);
+          try {
+            execSync(`launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
+            ok(`${service.title} installed and bootstrapped`);
+          } catch (err) {
+            ok(`${service.title} plist written → ${service.plistPath}`);
+            warn(`Auto-bootstrap failed: ${err.message.trim()}`);
+            warn(`Run manually: launchctl bootstrap ${service.domain} "${service.plistPath}"`);
+          }
+        }
+        print(`  Logs: ${logPath}`);
+      } else {
+        skip(`Skipped ${service.title} install — run again to install later`);
+        macServiceSummary = null;
       }
-      print(`  Logs: ${logPath}`);
-    } else {
-      skip('Skipped — run again to install later');
     }
   }
 
@@ -373,6 +522,8 @@ ${tokenXml}  </dict>
   } else {
     print('── Step 5: Service (Linux) ─────────────────────────────');
   }
+
+  const gatewayToken = getGatewayToken(os.homedir());
 
   // Detect whether systemd user session is available
   let hasSystemd = false;
@@ -407,8 +558,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${schedulerPath}
-ExecStart=${nodePath} ${indexPath}
-Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}
+ExecStart=${nodePath} --no-warnings ${indexPath}
+Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}${gatewayToken ? `\nEnvironment=OPENCLAW_GATEWAY_TOKEN=${gatewayToken}` : ''}
 Environment=SCHEDULER_DB=${schedulerDbPath}
 Restart=always
 RestartSec=5
@@ -514,8 +665,15 @@ print();
 print('Next steps:');
 
 if (platform === 'darwin') {
-  print('  • Check service:  sudo launchctl print system/ai.openclaw.scheduler');
-  print('  • Restart:        sudo launchctl kickstart -k system/ai.openclaw.scheduler');
+  if (macServiceSummary?.domain) {
+    const prefix = macServiceSummary.mode === 'daemon' ? 'sudo ' : '';
+    print(`  • Service mode:   ${macServiceSummary.title}`);
+    print(`  • Check service:  ${prefix}launchctl print ${macServiceSummary.domain}/${macServiceSummary.label}`);
+    print(`  • Restart:        ${prefix}launchctl kickstart -k ${macServiceSummary.domain}/${macServiceSummary.label}`);
+  } else {
+    print('  • Install later:  node setup.mjs --service-mode agent');
+    print('                    node setup.mjs --service-mode daemon');
+  }
 } else if (platform === 'linux') {
   if (isWSL) {
     print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');

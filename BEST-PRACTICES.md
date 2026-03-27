@@ -89,7 +89,7 @@ DAEMON_PID=$!
 wait $DAEMON_PID           # blocks until daemon dies → then service restarts cleanly
 ```
 
-On macOS (`KeepAlive: true` LaunchDaemon) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
+On macOS (`KeepAlive: true` launchd, whether LaunchAgent or LaunchDaemon) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
 
 **Rule 2: Keepalive jobs must exercise the actual hot path.**
 
@@ -454,7 +454,7 @@ Here's a complete, self-contained entry to add to your workspace `MEMORY.md` or 
 ```markdown
 ## OpenClaw Scheduler — How to Use
 
-The scheduler (`~/.openclaw/scheduler/`) runs as a background service (LaunchDaemon / systemd) 
+The scheduler (`~/.openclaw/scheduler/`) runs as a background service (launchd / systemd) 
 and fires jobs independently of your chat sessions.
 
 ### Quick commands
