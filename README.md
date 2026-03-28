@@ -150,6 +150,39 @@ npm rebuild better-sqlite3
 
 This is commonly needed after a Homebrew Node upgrade on macOS or any major Node ABI change.
 
+### macOS shell setup for ad hoc commands
+
+If you use `zsh` on macOS, put your minimal Homebrew PATH bootstrap in `~/.zshenv`, not only in `~/.zprofile` or `~/.zshrc`.
+
+Why:
+- `launchd` services do not depend on your interactive shell startup files
+- ad hoc commands like `ssh host 'node cli.js status'` run a non-interactive shell
+- non-interactive `zsh` reads `~/.zshenv`, but does not read `~/.zprofile`
+
+Recommended `~/.zshenv`:
+
+```zsh
+# ~/.zshenv — sourced by all zsh instances, including non-interactive SSH commands
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+```
+
+If you load OpenClaw completions in `~/.zshrc`, initialize completions first so `compdef` is available:
+
+```zsh
+autoload -Uz compinit
+compinit
+
+if [ -f "$HOME/.openclaw/completions/openclaw.zsh" ]; then
+  source "$HOME/.openclaw/completions/openclaw.zsh"
+fi
+```
+
+Avoid pinning a versioned Node path like `/opt/homebrew/opt/node@22/bin` in shell startup files. Prefer the stable Homebrew symlink `/opt/homebrew/bin/node`, which survives normal `brew upgrade node`.
+
 ### Option B: source clone (dev/contributor flow)
 
 ```bash

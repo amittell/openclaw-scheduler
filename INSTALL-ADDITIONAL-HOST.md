@@ -16,7 +16,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 
-> **macOS PATH note:** If installed via Homebrew, `node` and `npm` live at `/opt/homebrew/bin/`. If your terminal doesn't find them, run `export PATH="/opt/homebrew/bin:$PATH"` or add it to your `~/.zprofile`. The generated launchd plist includes the correct PATH.
+> **macOS PATH note:** If installed via Homebrew, put the minimal PATH bootstrap in `~/.zshenv`, not only `~/.zprofile`, so non-interactive commands like `ssh host 'node cli.js status'` can find `node` too.
 
 ---
 
@@ -65,6 +65,42 @@ npm rebuild better-sqlite3
 ```
 
 This is especially common after `brew upgrade node` on macOS or any major Node version switch.
+
+---
+
+## Step 2.5: Fix macOS shell PATH and completions
+
+If this additional host uses `zsh`, configure shell startup so both interactive terminals and non-interactive remote commands can find Homebrew Node.
+
+Recommended `~/.zshenv`:
+
+```zsh
+# ~/.zshenv — sourced by all zsh instances, including non-interactive SSH commands
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+```
+
+If you load OpenClaw completions in `~/.zshrc`, initialize completions first:
+
+```zsh
+autoload -Uz compinit
+compinit
+
+if [ -f "$HOME/.openclaw/completions/openclaw.zsh" ]; then
+  source "$HOME/.openclaw/completions/openclaw.zsh"
+fi
+```
+
+Avoid version-pinned Node paths like `/opt/homebrew/opt/node@22/bin`. Prefer `/opt/homebrew/bin/node`.
+
+Quick verification:
+
+```bash
+ssh "$HOST" 'command -v node && node -v'
+```
 
 ---
 

@@ -74,6 +74,47 @@ sudo dnf install gcc gcc-c++ make python3   # Fedora/RHEL
 
 ---
 
+## Step 2.5: Fix macOS shell PATH and completions
+
+If you use `zsh` on macOS, make sure Homebrew is available to non-interactive shells too.
+
+This matters for commands like:
+- `ssh host 'node cli.js status'`
+- remote admin scripts
+- one-off maintenance commands that do not run inside an interactive terminal
+
+`~/.zprofile` is not enough for that case. Put the minimal PATH bootstrap in `~/.zshenv`:
+
+```zsh
+# ~/.zshenv — sourced by all zsh instances, including non-interactive SSH commands
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+```
+
+If you load OpenClaw completions in `~/.zshrc`, run `compinit` before sourcing them:
+
+```zsh
+autoload -Uz compinit
+compinit
+
+if [ -f "$HOME/.openclaw/completions/openclaw.zsh" ]; then
+  source "$HOME/.openclaw/completions/openclaw.zsh"
+fi
+```
+
+Avoid version-pinned Node PATH entries like `/opt/homebrew/opt/node@22/bin`. Use `/opt/homebrew/bin/node` instead so normal `brew upgrade node` keeps working.
+
+Verify:
+
+```bash
+ssh "$HOST" 'command -v node && node -v'
+```
+
+---
+
 ## Step 3: Run Tests
 
 ```bash
