@@ -745,6 +745,36 @@ function shutdown(signal) {
   process.exit(0);
 }
 
+// ── Startup repair ─────────────────────────────────────────
+/**
+ * Find enabled root cron jobs with NULL next_run_at and recompute their schedule.
+ * Guards against insertion bugs (e.g. via direct DB write or a CLI code-path that
+ * skips nextRunFromCron) that leave a job permanently dormant.
+ */
+function repairNullNextRunAt() {
+  const db = getDb();
+  const broken = db.prepare(`
+    SELECT id, name, schedule_cron, schedule_tz
+    FROM jobs
+    WHERE enabled = 1
+      AND next_run_at IS NULL
+      AND parent_id IS NULL
+      AND schedule_cron IS NOT NULL
+      AND schedule_cron != '0 0 31 2 *'
+  `).all();
+
+  if (broken.length === 0) return;
+
+  const fix = db.prepare(`UPDATE jobs SET next_run_at = ? WHERE id = ?`);
+  for (const job of broken) {
+    const next = nextRunFromCron(job.schedule_cron, job.schedule_tz || 'UTC');
+    if (next) {
+      fix.run(next, job.id);
+      log('warn', `Repaired null next_run_at for job "${job.name}" → ${next}`);
+    }
+  }
+}
+
 async function main() {
   log('info', `Starting OpenClaw Scheduler v${SCHEDULER_VERSION}`, {
     tickMs: TICK_INTERVAL_MS,
@@ -762,6 +792,9 @@ async function main() {
   // Replay orphaned runs from previous crash (delivery guarantee support)
   await replayOrphanedRuns();
   reconcileQueuedRetrySchedules();
+
+  // Repair any enabled cron jobs with NULL next_run_at (scheduling bug defence)
+  repairNullNextRunAt();
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
