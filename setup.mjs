@@ -295,6 +295,7 @@ if (!deliverTo) {
         delivery_to: deliverTo,
         run_timeout_ms: 120000,
         enabled: true,
+        origin: 'system',
       });
       ok(`Created "${icName}" job (*/5 * * * *)`);
     }
@@ -320,6 +321,7 @@ if (!deliverTo) {
         delivery_to: deliverTo,
         run_timeout_ms: 120000,
         enabled: true,
+        origin: 'system',
       });
       ok(`Created "${srdName}" job (*/10 * * * *)`);
     }

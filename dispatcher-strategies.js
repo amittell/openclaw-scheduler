@@ -733,6 +733,10 @@ export async function executeStrategy(job, ctx, deps) {
         if (['announce', 'announce-always'].includes(job.delivery_mode)) {
           await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
         }
+        handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on exception-retry-skipped');
+        if (dequeueJob(job.id)) {
+          log('info', `Dequeued pending dispatch for ${job.name} (after exception-retry-skipped)`);
+        }
         updateJobAfterRun(job, 'error');
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
       }
