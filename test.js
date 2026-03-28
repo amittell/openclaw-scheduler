@@ -3927,6 +3927,72 @@ console.log('\n── Dispatcher Integration ──');
 
   await withTempDispatcher({
     prepare: async ({ addJob, triggerJob, context }) => {
+      const root = addJob({
+        name: 'dispatcher-retry-skipped-root',
+        schedule_cron: '0 8 * * *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo retry-skipped-root && exit 7',
+        max_retries: 1,
+        max_queued_dispatches: 1,
+        delivery_mode: 'none',
+        delivery_opt_out_reason: 'test',
+        run_timeout_ms: 300_000,
+        origin: 'system',
+      });
+      const child = addJob({
+        name: 'dispatcher-retry-skipped-child',
+        parent_id: root.id,
+        trigger_on: 'failure',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo retry-skipped-child-fired',
+        delivery_mode: 'none',
+        delivery_opt_out_reason: 'test',
+        run_timeout_ms: 300_000,
+      });
+      context.rootJobId = root.id;
+      context.childJobId = child.id;
+      triggerJob(root.id);
+    },
+    exercise: async ({ probeDb, context }) => {
+      const rootRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT id, status
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+          ORDER BY started_at ASC, rowid ASC
+          LIMIT 1
+        `).get(context.rootJobId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'retry-skipped root run' }
+      );
+
+      const childRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT status, triggered_by_run, summary
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+          ORDER BY started_at ASC, rowid ASC
+          LIMIT 1
+        `).get(context.childJobId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'retry-skipped failure child' }
+      );
+
+      const retryDispatches = probeDb.prepare(`
+        SELECT COUNT(*) AS c
+        FROM job_dispatch_queue
+        WHERE job_id = ? AND dispatch_kind = 'retry'
+      `).get(context.rootJobId).c;
+
+      assert(rootRun.status === 'error', 'dispatcher integration: retry-skipped root run finishes as error');
+      assert(childRun.status === 'ok', 'dispatcher integration: failure child fires when retry cannot be queued');
+      assert(childRun.triggered_by_run === rootRun.id, 'dispatcher integration: retry-skipped child links to failed run');
+      assert(retryDispatches === 0, 'dispatcher integration: retry-skipped path does not create retry dispatches');
+    },
+  });
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, triggerJob, context }) => {
       const timeoutJob = addJob({
         name: 'dispatcher-timeout',
         schedule_cron: '0 8 * * *',
