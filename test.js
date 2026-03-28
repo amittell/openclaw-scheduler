@@ -2753,15 +2753,17 @@ console.log('\n── Dispatch Script Compatibility ──');
   const schedulerPath = '/tmp/testuser/.openclaw/scheduler/dispatch/index.mjs';
   const dispatchPath = '/tmp/testuser/.openclaw/dispatch/index.mjs';
 
+  const noBin = () => false; // stub out binary-in-PATH check so file fallbacks are tested
+
   const schedulerOnly = new Set([schedulerPath]);
   assert(
-    resolveDispatchCliPath(envBase, p => schedulerOnly.has(p)) === schedulerPath,
+    resolveDispatchCliPath(envBase, p => schedulerOnly.has(p), noBin) === schedulerPath,
     'resolveDispatchCliPath prefers scheduler/dispatch path when available'
   );
 
   const dispatchOnly = new Set([dispatchPath]);
   assert(
-    resolveDispatchCliPath(envBase, p => dispatchOnly.has(p)) === dispatchPath,
+    resolveDispatchCliPath(envBase, p => dispatchOnly.has(p), noBin) === dispatchPath,
     'resolveDispatchCliPath falls back to dispatch path when scheduler path missing'
   );
 
@@ -2770,7 +2772,8 @@ console.log('\n── Dispatch Script Compatibility ──');
   assert(
     resolveDispatchCliPath(
       { ...envBase, DISPATCH_CLI: explicitDispatch },
-      p => explicitSet.has(p)
+      p => explicitSet.has(p),
+      noBin,
     ) === explicitDispatch,
     'resolveDispatchCliPath prioritizes DISPATCH_CLI override'
   );
