@@ -812,9 +812,11 @@ async function cmdEnqueue(flags) {
         const watcherTimeoutS = timeoutS + 120;
         const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
+        const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
-          schedule_cron:            '0 0 31 2 *',  // never-cron; run_now triggers it once
+          schedule_kind:            'at',
+          schedule_at:              nowUtc,
           session_target:           'shell',
           payload_kind:             'shellCommand',
           payload_message:          watcherCmd,
@@ -825,7 +827,6 @@ async function cmdEnqueue(flags) {
           ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
           run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
-          run_now:                  true,
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
