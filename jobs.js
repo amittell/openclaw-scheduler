@@ -203,6 +203,25 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (isChild && isAtJob) {
     throw new Error('child jobs cannot use schedule_kind "at" — use trigger_delay_s for delayed chain execution');
   }
+  const triggerFieldsTouched = mode === 'create'
+    || 'parent_id' in normalized
+    || 'trigger_on' in normalized
+    || 'trigger_delay_s' in normalized
+    || 'trigger_condition' in normalized;
+  if (isChild && !merged.trigger_on) {
+    throw new Error('child jobs require trigger_on ("success", "failure", or "complete")');
+  }
+  if (!isChild && triggerFieldsTouched) {
+    if (merged.trigger_on != null) {
+      throw new Error('trigger_on is a child-only field');
+    }
+    if ((merged.trigger_delay_s || 0) > 0) {
+      throw new Error('trigger_delay_s is a child-only field');
+    }
+    if (merged.trigger_condition != null) {
+      throw new Error('trigger_condition is a child-only field');
+    }
+  }
   if (!isChild && !isAtJob && !merged.schedule_cron) {
     throw new Error('schedule_cron is required for root cron jobs');
   }

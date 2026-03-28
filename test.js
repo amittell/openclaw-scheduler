@@ -356,7 +356,14 @@ assert(threwSentinelRootCron, 'createJob rejects reserved at-job sentinel for ro
 
 const rootForTopology = createJob({ name: 'RootForTopology', schedule_cron: '0 9 * * *', payload_message: 'root topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const childForTopology = createJob({ name: 'ChildForTopology', parent_id: rootForTopology.id, trigger_on: 'success', schedule_cron: '0 11 * * *', payload_message: 'child topology', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
-const promotedChild = updateJob(childForTopology.id, { parent_id: null });
+let threwPromoteWithTrigger = false;
+try {
+  updateJob(childForTopology.id, { parent_id: null });
+} catch (e) {
+  threwPromoteWithTrigger = e.message.includes('trigger_on is a child-only field');
+}
+assert(threwPromoteWithTrigger, 'promoting child to root requires clearing child-only trigger fields');
+const promotedChild = updateJob(childForTopology.id, { parent_id: null, trigger_on: null });
 assert(promotedChild.parent_id === null, 'child promotion clears parent_id');
 assert(promotedChild.next_run_at !== null, 'promoting child to root recalculates next_run_at');
 const demotedRoot = updateJob(rootForTopology.id, { parent_id: promotedChild.id, trigger_on: 'success' });
@@ -365,12 +372,12 @@ assert(demotedRoot.next_run_at === null, 'demoting root to child clears next_run
 const childNoOrigin = createJob({ name: 'ChildNoOrigin', parent_id: rootForTopology.id, trigger_on: 'success', schedule_cron: '0 12 * * *', payload_message: 'child without origin', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000 });
 let threwPromoteNoOrigin = false;
 try {
-  updateJob(childNoOrigin.id, { parent_id: null });
+  updateJob(childNoOrigin.id, { parent_id: null, trigger_on: null });
 } catch (e) {
   threwPromoteNoOrigin = e.message.includes('origin is required');
 }
 assert(threwPromoteNoOrigin, 'promoting a child to a root job requires origin');
-const promotedWithOrigin = updateJob(childNoOrigin.id, { parent_id: null, origin: 'system' });
+const promotedWithOrigin = updateJob(childNoOrigin.id, { parent_id: null, trigger_on: null, origin: 'system' });
 assert(promotedWithOrigin.origin === 'system' && promotedWithOrigin.parent_id === null, 'child promotion succeeds when origin is provided');
 
 const atToCron = createJob({
@@ -683,6 +690,81 @@ try {
   threwMissingParentUpdate = e.message.includes('parent job does not exist');
 }
 assert(threwMissingParentUpdate, 'updateJob rejects nonexistent parent_id');
+
+let threwMissingChildTriggerCreate = false;
+try {
+  createJob({
+    name: 'MissingChildTrigger',
+    parent_id: parent.id,
+    payload_message: 'dead child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+} catch (e) {
+  threwMissingChildTriggerCreate = e.message.includes('child jobs require trigger_on');
+}
+assert(threwMissingChildTriggerCreate, 'createJob rejects child jobs without trigger_on');
+
+let threwMissingChildTriggerUpdate = false;
+try {
+  updateJob(childSuccess.id, { trigger_on: null });
+} catch (e) {
+  threwMissingChildTriggerUpdate = e.message.includes('child jobs require trigger_on');
+}
+assert(threwMissingChildTriggerUpdate, 'updateJob rejects clearing trigger_on on child jobs');
+
+let threwRootTriggerOn = false;
+try {
+  createJob({
+    name: 'RootTriggerOn',
+    schedule_cron: '0 10 * * *',
+    trigger_on: 'success',
+    payload_message: 'root noop trigger',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+} catch (e) {
+  threwRootTriggerOn = e.message.includes('trigger_on is a child-only field');
+}
+assert(threwRootTriggerOn, 'createJob rejects trigger_on on root jobs');
+
+let threwRootTriggerDelay = false;
+try {
+  createJob({
+    name: 'RootTriggerDelay',
+    schedule_cron: '0 10 * * *',
+    trigger_delay_s: 60,
+    payload_message: 'root noop delay',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+} catch (e) {
+  threwRootTriggerDelay = e.message.includes('trigger_delay_s is a child-only field');
+}
+assert(threwRootTriggerDelay, 'createJob rejects trigger_delay_s on root jobs');
+
+let threwRootTriggerCondition = false;
+try {
+  createJob({
+    name: 'RootTriggerCondition',
+    schedule_cron: '0 10 * * *',
+    trigger_condition: 'contains:ALERT',
+    payload_message: 'root noop condition',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+} catch (e) {
+  threwRootTriggerCondition = e.message.includes('trigger_condition is a child-only field');
+}
+assert(threwRootTriggerCondition, 'createJob rejects trigger_condition on root jobs');
 
 // Triggered on success
 const onSuccess = getTriggeredChildren(parent.id, 'ok');
@@ -2317,6 +2399,8 @@ console.log('\n── Job Spec Validation ──');
   try {
     validateJobSpec({
       name: 'Bad Regex',
+      parent_id: 'parent-for-regex-validation',
+      trigger_on: 'success',
       schedule_cron: '0 9 * * *',
       payload_message: 'test',
       trigger_condition: 'regex:(',
@@ -3903,25 +3987,29 @@ console.log('\n── Dispatcher Integration ──');
       triggerJob(disabledManual.id);
     },
     exercise: async ({ probeDb, context }) => {
-      const completedRun = await waitFor(
-        () => probeDb.prepare(`
-          SELECT status, summary
-          FROM runs
-          WHERE job_id = ? AND finished_at IS NOT NULL
-          ORDER BY started_at DESC, rowid DESC
-          LIMIT 1
-        `).get(context.jobId),
+      const completion = await waitFor(
+        () => {
+          const run = probeDb.prepare(`
+            SELECT status, summary, finished_at
+            FROM runs
+            WHERE job_id = ? AND finished_at IS NOT NULL
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT 1
+          `).get(context.jobId);
+          const dispatch = probeDb.prepare(`
+            SELECT status, dispatch_kind
+            FROM job_dispatch_queue
+            WHERE job_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+          `).get(context.jobId);
+          if (run?.finished_at && dispatch?.status === 'done') return { run, dispatch };
+          return null;
+        },
         { timeoutMs: 10000, intervalMs: 100, label: 'disabled manual dispatch run' }
       );
-      const dispatchRow = probeDb.prepare(`
-        SELECT status, dispatch_kind
-        FROM job_dispatch_queue
-        WHERE job_id = ?
-        ORDER BY created_at DESC, rowid DESC
-        LIMIT 1
-      `).get(context.jobId);
-      assert(completedRun.status === 'ok', 'dispatcher integration: disabled manual job still executes');
-      assert(dispatchRow.dispatch_kind === 'manual' && dispatchRow.status === 'done', 'dispatcher integration: disabled manual dispatch completes instead of being cancelled');
+      assert(completion.run.status === 'ok', 'dispatcher integration: disabled manual job still executes');
+      assert(completion.dispatch.dispatch_kind === 'manual' && completion.dispatch.status === 'done', 'dispatcher integration: disabled manual dispatch completes instead of being cancelled');
     },
   });
 
