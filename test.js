@@ -323,6 +323,11 @@ updateJob(job.id, { name: 'Updated' });
 assert(getJob(job.id).name === 'Updated', 'updateJob');
 updateJob(job.id, { enabled: false });
 assert(getJob(job.id).enabled === 0, 'boolean enabled=false updates to disabled');
+const pausedRootJob = createJob({ name: 'PausedRootJob', enabled: 0, schedule_cron: '0 13 * * *', payload_message: 'paused root', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
+updateJob(pausedRootJob.id, { next_run_at: '2000-01-01 00:00:00' });
+const resumedRootJob = updateJob(pausedRootJob.id, { enabled: 1 });
+assert(resumedRootJob.next_run_at !== '2000-01-01 00:00:00', 're-enabling root cron job recalculates next_run_at');
+assert(!getDueJobs().some(j => j.id === pausedRootJob.id), 're-enabled root cron job is not immediately due from stale next_run_at');
 
 const updateCronToAt = createJob({ name: 'UpdateCronToAt', schedule_cron: '0 8 * * *', payload_message: 'cron->at', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 let threwMissingScheduleAtOnUpdate = false;
@@ -357,6 +362,16 @@ assert(promotedChild.next_run_at !== null, 'promoting child to root recalculates
 const demotedRoot = updateJob(rootForTopology.id, { parent_id: promotedChild.id, trigger_on: 'success' });
 assert(demotedRoot.parent_id === promotedChild.id, 'root demotion stores parent_id');
 assert(demotedRoot.next_run_at === null, 'demoting root to child clears next_run_at');
+const childNoOrigin = createJob({ name: 'ChildNoOrigin', parent_id: rootForTopology.id, trigger_on: 'success', schedule_cron: '0 12 * * *', payload_message: 'child without origin', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000 });
+let threwPromoteNoOrigin = false;
+try {
+  updateJob(childNoOrigin.id, { parent_id: null });
+} catch (e) {
+  threwPromoteNoOrigin = e.message.includes('origin is required');
+}
+assert(threwPromoteNoOrigin, 'promoting a child to a root job requires origin');
+const promotedWithOrigin = updateJob(childNoOrigin.id, { parent_id: null, origin: 'system' });
+assert(promotedWithOrigin.origin === 'system' && promotedWithOrigin.parent_id === null, 'child promotion succeeds when origin is provided');
 
 const atToCron = createJob({
   name: 'AtToCron',
@@ -1004,6 +1019,10 @@ assert(triggered.dispatch_id, 'runJobNow returns dispatch id');
 const manualDispatch = getDispatch(triggered.dispatch_id);
 assert(manualDispatch.dispatch_kind === 'manual', 'runJobNow creates manual dispatch');
 assert(getDueDispatches().some(d => d.id === manualDispatch.id), 'runJobNow dispatch appears in dispatch queue');
+const disabledManualJob = createJob({ name: 'DisabledManualJob', enabled: 0, schedule_cron: '0 5 * * *', payload_message: 'manual while disabled', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+const disabledManualDispatch = runJobNow(disabledManualJob.id);
+assert(disabledManualDispatch.dispatch_id, 'runJobNow creates manual dispatch for disabled job');
+assert(getDueDispatches().some(d => d.id === disabledManualDispatch.dispatch_id), 'disabled job manual dispatch is queued');
 
 // 6. runJobNow does NOT change the schedule_cron (normal schedule is preserved)
 assert(triggered.schedule_cron === '0 4 * * *', 'runJobNow: schedule_cron unchanged');
@@ -3612,6 +3631,46 @@ console.log('\n── Dispatcher Integration ──');
       await initDb();
     }
   }
+
+  await withTempDispatcher({
+    prepare: async ({ addJob, triggerJob, context }) => {
+      const disabledManual = addJob({
+        name: 'dispatcher-disabled-manual',
+        enabled: 0,
+        schedule_cron: '0 8 * * *',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'printf disabled-manual-ok',
+        delivery_mode: 'none',
+        delivery_opt_out_reason: 'test',
+        run_timeout_ms: 300_000,
+        origin: 'system',
+      });
+      context.jobId = disabledManual.id;
+      triggerJob(disabledManual.id);
+    },
+    exercise: async ({ probeDb, context }) => {
+      const completedRun = await waitFor(
+        () => probeDb.prepare(`
+          SELECT status, summary
+          FROM runs
+          WHERE job_id = ? AND finished_at IS NOT NULL
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT 1
+        `).get(context.jobId),
+        { timeoutMs: 10000, intervalMs: 100, label: 'disabled manual dispatch run' }
+      );
+      const dispatchRow = probeDb.prepare(`
+        SELECT status, dispatch_kind
+        FROM job_dispatch_queue
+        WHERE job_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+      `).get(context.jobId);
+      assert(completedRun.status === 'ok', 'dispatcher integration: disabled manual job still executes');
+      assert(dispatchRow.dispatch_kind === 'manual' && dispatchRow.status === 'done', 'dispatcher integration: disabled manual dispatch completes instead of being cancelled');
+    },
+  });
 
   await withTempDispatcher({
     prepare: async ({ addJob, triggerJob, context }) => {

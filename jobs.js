@@ -305,7 +305,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // Origin tracking (v20): required on creation for root (non-child) jobs.
   // Format convention: "<channel>:<id>" e.g. "telegram:<your-user-id>", "telegram:<your-group-id>", or "system" for automated jobs.
   // Child jobs inherit origin context from parent and are exempt from this requirement.
-  if (mode === 'create' && !isChild && !merged.origin) {
+  const promotedToRoot = mode === 'update'
+    && !!currentJob?.parent_id
+    && 'parent_id' in normalized
+    && !isChild;
+  if ((mode === 'create' || promotedToRoot) && !isChild && !merged.origin) {
     throw new Error(
       'origin is required on job creation — pass the chat_id or channel identifier where the job was requested from ' +
       '(e.g. "telegram:<your-user-id>", "telegram:<your-group-id>", "system" for automated/cron jobs).'
@@ -660,7 +664,10 @@ export function updateJob(id, patch) {
 
   const schedulingFieldsChanged = ['schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz', 'parent_id']
     .some((key) => key in normalized);
-  if (schedulingFieldsChanged && !('next_run_at' in normalized)) {
+  const reenabledRootJob = 'enabled' in normalized
+    && !!normalized.enabled
+    && !current.enabled;
+  if ((schedulingFieldsChanged || reenabledRootJob) && !('next_run_at' in normalized)) {
     const refreshed = getJob(id);
     if (refreshed) {
       const nextRun = deriveNextRunAt(refreshed);
@@ -679,8 +686,9 @@ export function deleteJob(id) {
 }
 
 /**
- * Schedule an existing job for immediate execution by setting next_run_at to 1 second in the past.
- * The job's cron schedule is unchanged; after it runs, updateJobAfterRun restores normal scheduling.
+ * Schedule an existing job for immediate execution via a durable manual dispatch.
+ * Manual dispatches can run even when the job is disabled, without mutating the
+ * stored cron schedule.
  */
 export function runJobNow(id) {
   const job = getJob(id);
