@@ -659,6 +659,31 @@ assert(childComplete.trigger_on === 'complete', 'trigger_on = complete');
 // getChildJobs
 assert(getChildJobs(parent.id).length === 3, 'getChildJobs returns 3');
 
+let threwMissingParentCreate = false;
+try {
+  createJob({
+    name: 'MissingParentChild',
+    parent_id: 'does-not-exist',
+    trigger_on: 'success',
+    payload_message: 'missing parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+} catch (e) {
+  threwMissingParentCreate = e.message.includes('parent job does not exist');
+}
+assert(threwMissingParentCreate, 'createJob rejects nonexistent parent_id');
+
+let threwMissingParentUpdate = false;
+try {
+  updateJob(childSuccess.id, { parent_id: 'missing-parent' });
+} catch (e) {
+  threwMissingParentUpdate = e.message.includes('parent job does not exist');
+}
+assert(threwMissingParentUpdate, 'updateJob rejects nonexistent parent_id');
+
 // Triggered on success
 const onSuccess = getTriggeredChildren(parent.id, 'ok');
 assert(onSuccess.length === 2, 'success triggers 2 (success + complete)');
@@ -3104,8 +3129,84 @@ console.log('\n── Migration Guard ──');
   assert(migratedJobCols.includes('execution_intent'), 'migration guard backfills execution_intent when version marker is already 14');
   assert(migratedJobCols.includes('origin'), 'migration guard backfills origin (v20) when version marker is already 14');
   assert(migratedMsgCols.includes('to_agent') && migratedMsgCols.includes('status'), 'migration guard backfills base messages columns on partial legacy tables');
+  assert(migratedMsgCols.includes('reply_to') && migratedMsgCols.includes('body') && migratedMsgCols.includes('metadata'),
+    'migration guard backfills modern messages columns on partial legacy tables');
   assert(migratedApprovalCols.includes('job_id') && migratedApprovalCols.includes('status'), 'migration guard backfills base approvals columns on partial legacy tables');
   assert(migratedTtaCols.includes('tracker_id') && migratedTtaCols.includes('status'), 'migration guard backfills base task_tracker_agents columns on partial legacy tables');
+  const migratedMsg = sendMessage({ from_agent: 'legacy-a', to_agent: 'legacy-b', body: 'migrated hello' });
+  assert(migratedMsg.body === 'migrated hello', 'sendMessage works after message-column migration');
+  closeDb();
+
+  rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
+  await initDb();
+}
+
+console.log('\n── Partial Legacy Jobs + Messages Migration ──');
+{
+  const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-legacy-jobs-msg-'));
+  const legacyDbPath = join(legacyDir, 'scheduler.db');
+  const legacyDb = new Database(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      schedule_cron TEXT NOT NULL,
+      schedule_tz TEXT NOT NULL DEFAULT 'UTC',
+      session_target TEXT NOT NULL DEFAULT 'isolated',
+      payload_kind TEXT NOT NULL,
+      payload_message TEXT NOT NULL,
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      delivery_mode TEXT DEFAULT 'none',
+      delivery_opt_out_reason TEXT DEFAULT NULL,
+      origin TEXT DEFAULT NULL
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      started_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE messages (id TEXT PRIMARY KEY, to_agent TEXT);
+    CREATE TABLE approvals (id TEXT PRIMARY KEY);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, status TEXT, last_seen_at TEXT, session_key TEXT, capabilities TEXT);
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (14);
+  `);
+  legacyDb.close();
+
+  closeDb();
+  setDbPath(legacyDbPath);
+  let migrationLogs = '';
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk, encoding, cb) => {
+    migrationLogs += String(chunk);
+    if (typeof cb === 'function') cb();
+    return true;
+  });
+  try {
+    await initDb();
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
+  const migratedDb = getDb();
+  const migratedJobCols = migratedDb.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  const migratedMsgCols = migratedDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  assert(!migrationLogs.includes('migrate-consolidate error'), 'partial legacy job/message migration completes without consolidate errors');
+  assert(!migrationLogs.includes('Schema apply warning'), 'partial legacy job/message migration completes without schema warnings');
+  assert(migratedJobCols.includes('parent_id') && migratedJobCols.includes('next_run_at')
+    && migratedJobCols.includes('last_run_at') && migratedJobCols.includes('last_status')
+    && migratedJobCols.includes('consecutive_errors'),
+  'partial legacy jobs gain scheduling-state columns');
+  assert(migratedMsgCols.includes('reply_to') && migratedMsgCols.includes('subject')
+    && migratedMsgCols.includes('body') && migratedMsgCols.includes('metadata'),
+  'partial legacy messages gain modern message columns');
+  const migratedMsg = sendMessage({ from_agent: 'a', to_agent: 'b', body: 'partial migration ok' });
+  assert(migratedMsg.body === 'partial migration ok', 'sendMessage works after partial legacy job/message migration');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });
@@ -3239,6 +3340,121 @@ console.log('\n── Legacy At-Job Normalization ──');
   const normalizedLegacyAt = getJob('legacy-at-job');
   assert(normalizedLegacyAt.schedule_at === '2026-03-27 18:00:00', 'migration normalizes legacy ISO schedule_at');
   assert(getDueAtJobs().some(j => j.id === 'legacy-at-job'), 'legacy ISO at-job is due after migration/init');
+  closeDb();
+
+  rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
+  await initDb();
+}
+
+console.log('\n── Partial Current Schema Consolidation ──');
+{
+  const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-partial-current-'));
+  const legacyDbPath = join(legacyDir, 'scheduler.db');
+  const legacyDb = new Database(legacyDbPath);
+  legacyDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      enabled INTEGER,
+      schedule_cron TEXT,
+      schedule_tz TEXT,
+      session_target TEXT,
+      payload_kind TEXT,
+      payload_message TEXT,
+      run_timeout_ms INTEGER,
+      job_type TEXT,
+      execution_intent TEXT,
+      max_queued_dispatches INTEGER,
+      output_offload_threshold_bytes INTEGER,
+      ttl_hours INTEGER,
+      auth_profile TEXT,
+      schedule_kind TEXT,
+      schedule_at TEXT,
+      delivery_mode TEXT,
+      delivery_opt_out_reason TEXT,
+      origin TEXT,
+      parent_id TEXT,
+      next_run_at TEXT
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT,
+      status TEXT,
+      started_at TEXT,
+      last_heartbeat TEXT,
+      run_timeout_ms INTEGER,
+      dispatch_queue_id TEXT,
+      shell_exit_code INTEGER,
+      shell_signal TEXT,
+      shell_timed_out INTEGER,
+      shell_stdout TEXT,
+      shell_stderr TEXT,
+      shell_stdout_path TEXT,
+      shell_stderr_path TEXT
+    );
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      status TEXT,
+      last_seen_at TEXT,
+      session_key TEXT,
+      capabilities TEXT,
+      delivery_channel TEXT,
+      delivery_to TEXT,
+      brand_name TEXT,
+      created_at TEXT
+    );
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      to_agent TEXT,
+      status TEXT,
+      created_at TEXT,
+      delivery_to TEXT
+    );
+    CREATE TABLE task_tracker_agents (
+      id TEXT PRIMARY KEY,
+      session_key TEXT,
+      last_heartbeat TEXT
+    );
+    CREATE TABLE approvals (
+      id TEXT PRIMARY KEY,
+      job_id TEXT,
+      run_id TEXT,
+      status TEXT,
+      requested_at TEXT
+    );
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (21);
+  `);
+  legacyDb.close();
+
+  closeDb();
+  setDbPath(legacyDbPath);
+  let migrationLogs = '';
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk, encoding, cb) => {
+    migrationLogs += String(chunk);
+    if (typeof cb === 'function') cb();
+    return true;
+  });
+  try {
+    await initDb();
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
+  const migratedDb = getDb();
+  const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
+  const migratedMsgCols = migratedDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  const migratedTtaCols = migratedDb.prepare('PRAGMA table_info(task_tracker_agents)').all().map(c => c.name);
+  assert(!migrationLogs.includes('migrate-consolidate error'), 'partial current-schema migration completes without consolidate errors');
+  assert(!migrationLogs.includes('Schema apply warning'), 'partial current-schema migration completes without schema warnings');
+  assert(migratedRunCols.includes('idempotency_key'), 'partial current-schema migration backfills runs.idempotency_key');
+  assert(migratedMsgCols.includes('team_id'), 'partial current-schema migration backfills messages.team_id');
+  assert(migratedTtaCols.includes('tracker_id'), 'partial current-schema migration backfills task_tracker_agents.tracker_id');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });

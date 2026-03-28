@@ -13,7 +13,15 @@
  * At-jobs on existing DBs use sentinel '0 0 31 2 *' to satisfy the constraint.
  */
 
+import { Cron } from 'croner';
 import { getDb } from './db.js';
+
+function nextRunFromCron(cronExpr, tz) {
+  const cron = new Cron(cronExpr, { timezone: tz || 'UTC' });
+  const next = cron.nextRun();
+  if (!next) return null;
+  return next.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
 
 export default function migrateConsolidate() {
   const db = getDb();
@@ -32,33 +40,56 @@ export default function migrateConsolidate() {
   const current = hasTable('schema_migrations')
     ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
     : 0;
-  const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
-  const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(c => c.name));
+  const columnsFor = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  const hasColumns = (actual, required) => required.every((name) => actual.has(name));
+  const jobColumns = columnsFor('jobs');
+  const runColumns = columnsFor('runs');
+  const agentColumns = columnsFor('agents');
+  const msgColumns = columnsFor('messages');
+  const approvalColumns = columnsFor('approvals');
+  const trackerColumns = columnsFor('task_tracker');
+  const trackerAgentColumns = columnsFor('task_tracker_agents');
   const hasLatestColumns =
-    jobColumns.has('job_type')
-    && jobColumns.has('execution_intent')
-    && jobColumns.has('max_queued_dispatches')
-    && jobColumns.has('output_offload_threshold_bytes')
-    && runColumns.has('dispatch_queue_id')
-    && runColumns.has('shell_exit_code')
-    && runColumns.has('shell_signal')
-    && runColumns.has('shell_timed_out')
-    && runColumns.has('shell_stdout')
-    && runColumns.has('shell_stderr')
-    && runColumns.has('shell_stdout_path')
-    && runColumns.has('shell_stderr_path')
-    && jobColumns.has('ttl_hours')
-    && jobColumns.has('auth_profile')
-    && jobColumns.has('schedule_kind')
-    && jobColumns.has('schedule_at')
-    && jobColumns.has('delivery_opt_out_reason')
-    && jobColumns.has('origin');
-  const agentColumns = new Set(db.prepare('PRAGMA table_info(agents)').all().map(c => c.name));
-  const hasAgentDelivery = agentColumns.has('delivery_channel')
-    && agentColumns.has('delivery_to')
-    && agentColumns.has('brand_name');
-  const msgColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map(c => c.name));
-  const hasMsgDeliveryTo = msgColumns.has('delivery_to');
+    hasColumns(jobColumns, [
+      'job_type', 'execution_intent', 'execution_read_only',
+      'agent_id', 'payload_model', 'payload_thinking', 'payload_timeout_seconds',
+      'overlap_policy', 'max_queued_dispatches', 'max_pending_approvals',
+      'max_trigger_fanout', 'output_store_limit_bytes',
+      'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
+      'output_offload_threshold_bytes', 'ttl_hours', 'auth_profile',
+      'schedule_kind', 'schedule_at', 'delivery_channel', 'delivery_to',
+      'delivery_opt_out_reason', 'origin', 'parent_id', 'created_at',
+      'updated_at', 'delete_after_run', 'next_run_at', 'last_run_at',
+      'last_status', 'consecutive_errors',
+    ])
+    && hasColumns(runColumns, [
+      'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
+      'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path',
+      'shell_stdout_bytes', 'shell_stderr_bytes', 'idempotency_key',
+      'summary', 'error_message', 'session_key', 'session_id',
+      'dispatched_at', 'last_heartbeat',
+    ])
+    && hasColumns(agentColumns, ['delivery_channel', 'delivery_to', 'brand_name'])
+    && hasColumns(msgColumns, [
+      'from_agent', 'to_agent', 'reply_to', 'kind', 'subject', 'body',
+      'metadata', 'priority', 'channel', 'delivery_to', 'status',
+      'delivered_at', 'read_at', 'expires_at', 'created_at', 'job_id',
+      'run_id', 'owner', 'team_id', 'member_id', 'task_id',
+      'ack_required', 'ack_at', 'delivery_attempts', 'last_error',
+      'team_mapped_at',
+    ])
+    && hasColumns(approvalColumns, [
+      'job_id', 'run_id', 'dispatch_queue_id', 'status', 'requested_at',
+      'resolved_at', 'resolved_by', 'notes',
+    ])
+    && hasColumns(trackerColumns, [
+      'name', 'created_at', 'created_by', 'expected_agents', 'timeout_s',
+      'status', 'completed_at', 'delivery_channel', 'delivery_to', 'summary',
+    ])
+    && hasColumns(trackerAgentColumns, [
+      'tracker_id', 'agent_label', 'status', 'started_at', 'finished_at',
+      'exit_message', 'error', 'session_key', 'last_heartbeat',
+    ]);
   const legacyAtIsoCount = (jobColumns.has('schedule_kind') && jobColumns.has('schedule_at'))
     ? (db.prepare(`
         SELECT COUNT(*) AS cnt
@@ -76,7 +107,12 @@ export default function migrateConsolidate() {
            OR (session_target = 'main' AND payload_kind != 'systemEvent')
       `).get()?.cnt ?? 0)
     : 0;
-  const legacyMissingDeliveryOptOutCount = (jobColumns.has('payload_kind') && jobColumns.has('delivery_mode') && jobColumns.has('delivery_opt_out_reason'))
+  const legacyMissingDeliveryOptOutCount = (
+    jobColumns.has('parent_id')
+    && jobColumns.has('payload_kind')
+    && jobColumns.has('delivery_mode')
+    && jobColumns.has('delivery_opt_out_reason')
+  )
     ? (db.prepare(`
         SELECT COUNT(*) AS cnt
         FROM jobs
@@ -89,8 +125,6 @@ export default function migrateConsolidate() {
   if (
     current >= 21
     && hasLatestColumns
-    && hasAgentDelivery
-    && hasMsgDeliveryTo
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
@@ -101,10 +135,29 @@ export default function migrateConsolidate() {
   // ── Column additions (all idempotent — column already exists = silent ignore) ─
 
   const alters = [
+    // Legacy partial-table backfills for jobs
+    `ALTER TABLE jobs ADD COLUMN agent_id TEXT DEFAULT 'main'`,
+    `ALTER TABLE jobs ADD COLUMN payload_model TEXT`,
+    `ALTER TABLE jobs ADD COLUMN payload_thinking TEXT`,
+    `ALTER TABLE jobs ADD COLUMN payload_timeout_seconds INTEGER DEFAULT 120`,
+    `ALTER TABLE jobs ADD COLUMN overlap_policy TEXT NOT NULL DEFAULT 'skip'`,
+    `ALTER TABLE jobs ADD COLUMN delivery_channel TEXT`,
+    `ALTER TABLE jobs ADD COLUMN delivery_to TEXT`,
+    `ALTER TABLE jobs ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE jobs ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE jobs ADD COLUMN delete_after_run INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE jobs ADD COLUMN next_run_at TEXT`,
+    `ALTER TABLE jobs ADD COLUMN last_run_at TEXT`,
+    `ALTER TABLE jobs ADD COLUMN last_status TEXT`,
+    `ALTER TABLE jobs ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0`,
     // Legacy partial-table backfills for messages
     `ALTER TABLE messages ADD COLUMN to_agent TEXT`,
     `ALTER TABLE messages ADD COLUMN from_agent TEXT`,
+    `ALTER TABLE messages ADD COLUMN reply_to TEXT`,
     `ALTER TABLE messages ADD COLUMN kind TEXT`,
+    `ALTER TABLE messages ADD COLUMN subject TEXT`,
+    `ALTER TABLE messages ADD COLUMN body TEXT`,
+    `ALTER TABLE messages ADD COLUMN metadata TEXT`,
     `ALTER TABLE messages ADD COLUMN content TEXT`,
     `ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE messages ADD COLUMN channel TEXT`,
@@ -147,6 +200,15 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN trigger_delay_s INTEGER DEFAULT 0`,
     // v3b: retry logic
     `ALTER TABLE jobs ADD COLUMN max_retries INTEGER DEFAULT 0`,
+    `ALTER TABLE runs ADD COLUMN finished_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN duration_ms INTEGER`,
+    `ALTER TABLE runs ADD COLUMN last_heartbeat TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE runs ADD COLUMN session_key TEXT`,
+    `ALTER TABLE runs ADD COLUMN session_id TEXT`,
+    `ALTER TABLE runs ADD COLUMN summary TEXT`,
+    `ALTER TABLE runs ADD COLUMN error_message TEXT`,
+    `ALTER TABLE runs ADD COLUMN dispatched_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN run_timeout_ms INTEGER NOT NULL DEFAULT 300000`,
     `ALTER TABLE runs ADD COLUMN retry_count INTEGER DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN retry_of TEXT`,
     `ALTER TABLE runs ADD COLUMN triggered_by_run TEXT`,
@@ -257,6 +319,47 @@ export default function migrateConsolidate() {
         AND instr(next_run_at, 'T') > 0
         AND strftime('%Y-%m-%d %H:%M:%S', next_run_at) IS NOT NULL;
     `);
+  } catch {
+    /* best-effort normalization for legacy rows */
+  }
+
+  // Backfill modern message body from the old content column when present.
+  try {
+    db.exec(`
+      UPDATE messages
+      SET body = COALESCE(body, content)
+      WHERE content IS NOT NULL
+        AND (body IS NULL OR trim(body) = '');
+    `);
+  } catch {
+    /* best-effort normalization for legacy rows */
+  }
+
+  // Backfill root scheduling state for legacy jobs that gained next_run_at late.
+  try {
+    const rowsNeedingNextRun = db.prepare(`
+      SELECT id, schedule_kind, schedule_at, schedule_cron, schedule_tz, parent_id
+      FROM jobs
+      WHERE next_run_at IS NULL
+    `).all();
+    const updateNextRun = db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?');
+    for (const row of rowsNeedingNextRun) {
+      let nextRun = null;
+      if (!row.parent_id) {
+        if (row.schedule_kind === 'at') {
+          nextRun = row.schedule_at || null;
+        } else if (row.schedule_cron) {
+          try {
+            nextRun = nextRunFromCron(row.schedule_cron, row.schedule_tz || 'UTC');
+          } catch {
+            nextRun = null;
+          }
+        }
+      }
+      if (nextRun !== null) {
+        updateNextRun.run(nextRun, row.id);
+      }
+    }
   } catch {
     /* best-effort normalization for legacy rows */
   }
