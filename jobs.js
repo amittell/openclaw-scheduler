@@ -81,6 +81,13 @@ function normalizeSqliteUtcDateTime(name, value) {
   return parsed.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
 
+function assertParentJobExists(parentId) {
+  const parent = getDb().prepare('SELECT id FROM jobs WHERE id = ?').get(parentId);
+  if (!parent) {
+    throw new Error(`parent job does not exist: ${parentId}`);
+  }
+}
+
 function assertSafeString(name, value, opts = {}) {
   if (value == null) return;
   if (typeof value !== 'string') {
@@ -458,6 +465,8 @@ export function createJob(opts) {
 
   // Cycle detection + depth check for child jobs
   if (isChild) {
+    assertParentJobExists(normalized.parent_id);
+    detectCycle(id, normalized.parent_id);
     const depth = getChainDepth(normalized.parent_id) + 1; // +1 for the new child
     if (depth > MAX_CHAIN_DEPTH) {
       throw new Error(`Max chain depth (${MAX_CHAIN_DEPTH}) exceeded. Chain would be ${depth} deep.`);
@@ -641,6 +650,7 @@ export function updateJob(id, patch) {
 
   // Cycle detection if parent_id is being changed
   if (normalized.parent_id) {
+    assertParentJobExists(normalized.parent_id);
     detectCycle(id, normalized.parent_id);
     const depth = getChainDepth(normalized.parent_id) + 1;
     if (depth > MAX_CHAIN_DEPTH) {
