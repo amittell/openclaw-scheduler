@@ -93,6 +93,12 @@ If `better-sqlite3` fails with a build error, make sure Visual Studio Build Tool
 npm install --build-from-source
 ```
 
+If Node changes later on this machine, rebuild the native binding before restarting the scheduler:
+```powershell
+cd $env:USERPROFILE\.openclaw\scheduler
+npm rebuild better-sqlite3
+```
+
 ---
 
 ### Step 3: Run Tests

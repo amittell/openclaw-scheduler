@@ -73,6 +73,12 @@ If `better-sqlite3` still fails, check that `node-gyp` can find Python:
 node -e "require('better-sqlite3')" && echo "OK"
 ```
 
+If the host's Node runtime changes later, rebuild the native binding before restarting the scheduler:
+```bash
+cd ~/.openclaw/scheduler
+npm rebuild better-sqlite3
+```
+
 ---
 
 ## Step 3: Run Tests
