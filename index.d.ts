@@ -536,7 +536,7 @@ export const approvals: {
 };
 
 export const agents: {
-  upsertAgent(id: string, opts?: { name?: string; status?: string; session_key?: string | null; capabilities?: JsonValue | null }): AgentRecord;
+  upsertAgent(id: string, opts?: { name?: string; status?: string; session_key?: string | null; capabilities?: JsonValue | null; delivery_channel?: string | null; delivery_to?: string | null; brand_name?: string | null }): AgentRecord;
   getAgent(id: string): AgentRecord | undefined;
   listAgents(): AgentRecord[];
   setAgentStatus(id: string, status: string, sessionKey?: string | null): void;

@@ -27,6 +27,7 @@
  *   node backup.js status       # Show backup stats
  */
 
+import Database from 'better-sqlite3';
 import { execFileSync } from 'child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
@@ -61,6 +62,28 @@ function now() {
 
 function mcPath(subpath) {
   return `${MC_ALIAS}/${BUCKET}/${PREFIX}/${subpath}`;
+}
+
+/**
+ * Create a consistent backup of the SQLite database. Checkpoints WAL first
+ * via better-sqlite3 (no external sqlite3 binary needed), then copies the
+ * main DB file. This is safe for WAL-mode databases.
+ * Returns true on success, false on failure.
+ */
+function backupDatabase(srcPath, destPath) {
+  try {
+    const src = new Database(srcPath, { readonly: false, fileMustExist: true });
+    try {
+      src.pragma('wal_checkpoint(TRUNCATE)');
+    } finally {
+      src.close();
+    }
+    copyFileSync(srcPath, destPath);
+    return true;
+  } catch (err) {
+    log('warn', `Database backup failed: ${err.message}`);
+    return false;
+  }
 }
 
 function hasSqlite3() {
@@ -102,17 +125,9 @@ function snapshot() {
   mkdirSync(STAGING_DIR, { recursive: true });
   const stagingFile = join(STAGING_DIR, 'scheduler-snapshot.db');
 
-  // Use sqlite3 .backup for a consistent copy (handles WAL correctly)
-  const escapedPath = stagingFile.replace(/'/g, "'\\''");
-  if (hasSqlite3()) {
-    const result = runSqlite3(DB_PATH, `.backup '${escapedPath}'`);
-    if (result === null && !existsSync(stagingFile)) {
-      // Fallback: direct copy after WAL checkpoint
-      log('warn', 'sqlite3 .backup failed, falling back to file copy');
-      copyFileSync(DB_PATH, stagingFile);
-    }
-  } else {
-    log('warn', 'sqlite3 not found in PATH, falling back to file copy');
+  // Checkpoint WAL and copy the database file
+  if (!backupDatabase(DB_PATH, stagingFile)) {
+    log('warn', 'Structured backup failed, falling back to direct file copy');
     copyFileSync(DB_PATH, stagingFile);
   }
 
@@ -146,15 +161,8 @@ function rollup() {
   mkdirSync(STAGING_DIR, { recursive: true });
   const stagingFile = join(STAGING_DIR, 'scheduler-rollup.db');
 
-  const escapedPath = stagingFile.replace(/'/g, "'\\''");
-  if (hasSqlite3()) {
-    const result = runSqlite3(DB_PATH, `.backup '${escapedPath}'`);
-    if (result === null && !existsSync(stagingFile)) {
-      log('warn', 'sqlite3 .backup failed in rollup, falling back to file copy');
-      copyFileSync(DB_PATH, stagingFile);
-    }
-  } else {
-    log('warn', 'sqlite3 not found in PATH, falling back to file copy');
+  if (!backupDatabase(DB_PATH, stagingFile)) {
+    log('warn', 'Structured backup failed in rollup, falling back to direct file copy');
     copyFileSync(DB_PATH, stagingFile);
   }
 
@@ -360,17 +368,23 @@ function status() {
   if (du) console.log(`\nTotal backup size: ${du}`);
 }
 
-// ── Main ────────────────────────────────────────────────────
-const command = process.argv[2] || 'status';
+// ── Exports for programmatic consumers ───────────────────────
+export { snapshot, rollup, restore, status, pruneSnapshots, pruneRollups };
 
-switch (command) {
-  case 'snapshot': snapshot(); break;
-  case 'rollup': rollup(); break;
-  case 'restore': restore(); break;
-  case 'status': status(); break;
-  case 'prune': pruneSnapshots(); pruneRollups(); break;
-  default:
-    console.error(`Unknown command: ${command}`);
-    console.error('Usage: node backup.js [snapshot|rollup|restore|status|prune]');
-    process.exit(1);
+// ── Main (only runs when executed directly, not when imported) ──
+import { fileURLToPath } from 'url';
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const command = process.argv[2] || 'status';
+
+  switch (command) {
+    case 'snapshot': snapshot(); break;
+    case 'rollup': rollup(); break;
+    case 'restore': restore(); break;
+    case 'status': status(); break;
+    case 'prune': pruneSnapshots(); pruneRollups(); break;
+    default:
+      console.error(`Unknown command: ${command}`);
+      console.error('Usage: node backup.js [snapshot|rollup|restore|status|prune]');
+      process.exit(1);
+  }
 }

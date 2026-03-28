@@ -167,6 +167,8 @@ openclaw gateway restart
 
 ## Step 7: Choose a macOS launchd mode
 
+> **Linux hosts:** For Linux additional hosts, follow the systemd setup in [INSTALL-LINUX.md](INSTALL-LINUX.md) instead of this step.
+
 On an additional host, the same choice applies:
 
 - **LaunchAgent**: best for a personal Mac with auto-login

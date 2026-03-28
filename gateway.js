@@ -7,17 +7,30 @@ import { getDb } from './db.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const HOME_DIR = process.env.HOME || homedir();
-function loadGatewayToken() {
-  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
-  try {
-    return readFileSync(join(HOME_DIR, '.openclaw/credentials/.gateway-token'), 'utf-8').trim();
-  } catch { return null; }
-}
-const GATEWAY_TOKEN = loadGatewayToken();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
+let _cachedToken;
+let _tokenLoaded = false;
+
+function getGatewayToken() {
+  if (!_tokenLoaded) {
+    _tokenLoaded = true;
+    if (process.env.OPENCLAW_GATEWAY_TOKEN) {
+      _cachedToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+    } else {
+      try {
+        const tokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH
+          || join(HOME_DIR, '.openclaw/credentials/.gateway-token');
+        _cachedToken = readFileSync(tokenPath, 'utf-8').trim();
+      } catch { _cachedToken = null; }
+    }
+  }
+  return _cachedToken;
+}
+
 function authHeaders() {
-  return GATEWAY_TOKEN ? { 'Authorization': `Bearer ${GATEWAY_TOKEN}` } : {};
+  const token = getGatewayToken();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
 }
 
 // ── Chat Completions (independent dispatch) ─────────────────

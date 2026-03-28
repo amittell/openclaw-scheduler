@@ -25,7 +25,7 @@ export async function checkRunHealth({
     if (!job) continue;
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-      await handleDelivery(job, `⏱ Job timed out (stale): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s`);
+      await handleDelivery(job, `[timeout] Job timed out (stale): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s`);
     }
     if (dequeueJob(job.id)) {
       log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout)`);
@@ -44,7 +44,7 @@ export async function checkRunHealth({
     if (!job) continue;
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-      await handleDelivery(job, `⏱ Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
+      await handleDelivery(job, `[timeout] Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
     }
     if (dequeueJob(job.id)) {
       log('info', `Dequeued pending dispatch for ${job.name} (after absolute timeout)`);
@@ -102,8 +102,8 @@ export async function checkTaskTrackers({
       const result = checkGroupCompletion(group.id);
       if (!result) continue;
       const status = getTaskGroupStatus(group.id);
-      const emoji = result.status === 'completed' ? '✅' : '❌';
-      const msg = `${emoji} Task group "${group.name}" ${result.status}\n\n${result.summary || ''}`;
+      const statusTag = result.status === 'completed' ? '[ok]' : '[FAILED]';
+      const msg = `${statusTag} Task group "${group.name}" ${result.status}\n\n${result.summary || ''}`;
       log('info', `Task group ${result.status}: ${group.name}`, {
         trackerId: group.id,
         status: status?.status || result.status,
@@ -146,13 +146,13 @@ function assertSafeShellArg(val, name) {
 }
 
 /**
- * Shell-safe single-quote escaping. Wraps the value in single quotes and
- * escapes any embedded single quotes using the standard bash idiom
+ * Shell-safe single-quote escaping. Returns a fully-quoted token wrapped
+ * in single quotes. Embedded single quotes use the standard bash idiom
  * 'foo'\''bar' which ends the current single-quoted string, inserts an
  * escaped single quote, and reopens single quoting.
  */
 function sq(val) {
-  return String(val).replace(/'/g, "'\\''");
+  return "'" + String(val).replace(/'/g, "'\\''") + "'";
 }
 
 export function ensureAgentInboxJobs({ log, getDb, createJob }) {
@@ -182,7 +182,7 @@ export function ensureAgentInboxJobs({ log, getDb, createJob }) {
 
       // Use the bin command registered in package.json so the job does not
       // embed an absolute filesystem path that would break after upgrades.
-      const consumerCmd = `openclaw-inbox-consumer --agent '${sq(agent.id)}' --to '${sq(agent.delivery_to)}' --channel '${sq(agent.delivery_channel)}'`;
+      const consumerCmd = `openclaw-inbox-consumer --agent ${sq(agent.id)} --to ${sq(agent.delivery_to)} --channel ${sq(agent.delivery_channel)}`;
 
       createJob({
         name:             jobName,

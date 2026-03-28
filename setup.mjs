@@ -157,7 +157,7 @@ const defaultWorkspace = path.join(os.homedir(), '.openclaw', 'workspace');
 const workspacePath = await ask('Workspace path', defaultWorkspace);
 const defaultGateway = 'http://127.0.0.1:18789';
 const gatewayUrl = await ask('Gateway URL', defaultGateway);
-const deliverTo = await ask('Telegram delivery ID for alerts (user or group ID)');
+const deliverTo = await ask('Telegram delivery ID for alerts (user or group ID, or blank to skip)');
 const schedulerDbPath = resolveSchedulerDbPath({ env: process.env });
 if (schedulerDbPath !== ':memory:') ensureSchedulerDbParent(schedulerDbPath);
 
@@ -288,7 +288,7 @@ if (!deliverTo) {
         name: icName,
         schedule_cron: '*/5 * * * *',
         session_target: 'shell',
-        payload_message: `node ${icScript} --to ${deliverTo}`,
+        payload_message: `node ${icScript} --to '${deliverTo.replace(/'/g, "'\\''")}'`,
         payload_timeout_seconds: 60,
         delivery_mode: 'announce',
         delivery_channel: 'telegram',
@@ -422,7 +422,9 @@ if (platform === 'darwin') {
       macServiceSummary = service;
     }
 
-    if (macServiceSummary && fs.existsSync(service.plistPath)) {
+    if (macServiceSummary && macServiceSummary !== service) {
+      // User declined new service and kept existing one -- skip install block
+    } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
       skip(`${service.title} already installed`);
       print(`  Path: ${service.plistPath}`);
       if (service.domain) {
@@ -478,14 +480,16 @@ ${tokenXml}  </dict>
 </dict>
 </plist>`;
         if (service.mode === 'daemon') {
-          const tmpPlistPath = path.join(os.tmpdir(), 'ai.openclaw.scheduler.plist');
-          fs.writeFileSync(tmpPlistPath, plist);
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-'));
+          const tmpPlistPath = path.join(tmpDir, 'ai.openclaw.scheduler.plist');
+          fs.writeFileSync(tmpPlistPath, plist, { mode: 0o600 });
           try {
             execSync(`sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`, { stdio: 'inherit' });
             execSync(`sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
+            try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
             ok(`${service.title} installed and bootstrapped`);
           } catch (err) {
-            ok(`${service.title} plist written → ${tmpPlistPath}`);
+            ok(`${service.title} plist written -> ${tmpPlistPath}`);
             warn(`Auto-bootstrap failed: ${err.message.trim()}`);
             warn(`Run manually: sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`);
             warn(`Then: sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`);
@@ -571,8 +575,8 @@ StandardError=append:${logPath}
 [Install]
 WantedBy=default.target
 `;
-        fs.mkdirSync(unitDir, { recursive: true });
-        fs.writeFileSync(unitPath, unit);
+        fs.mkdirSync(unitDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(unitPath, unit, { mode: 0o600 });
         try {
           execSync('systemctl --user daemon-reload');
           execSync('systemctl --user enable --now openclaw-scheduler');

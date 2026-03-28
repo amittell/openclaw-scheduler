@@ -40,6 +40,7 @@ export default function migrateConsolidate() {
   const current = hasTable('schema_migrations')
     ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
     : 0;
+  // SQLite PRAGMA does not support bound parameters; table names here are all hardcoded literals.
   const columnsFor = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
   const hasColumns = (actual, required) => required.every((name) => actual.has(name));
   const jobColumns = columnsFor('jobs');

@@ -70,8 +70,8 @@ export function finishRun(id, status, opts = {}) {
       status = ?,
       finished_at = datetime('now'),
       duration_ms = ?,
-      summary = ?,
-      error_message = ?,
+      summary = COALESCE(?, summary),
+      error_message = COALESCE(?, error_message),
       context_summary = COALESCE(?, context_summary),
       shell_exit_code = COALESCE(?, shell_exit_code),
       shell_signal = COALESCE(?, shell_signal),
@@ -145,11 +145,14 @@ export function getStaleRuns(thresholdSeconds = 90) {
           AND r.run_timeout_ms IS NOT NULL
           AND (julianday('now') - julianday(r.started_at)) * 86400000 > r.run_timeout_ms)
         OR
-        -- Session-based jobs: stale if last_heartbeat not updated within threshold
+        -- Session-based jobs: stale if last_heartbeat not updated within threshold,
+        -- or if they never heartbeated and started_at is past the threshold (startup grace)
         (j.session_target != 'shell'
-          AND r.last_heartbeat < datetime('now', '-' || ? || ' seconds'))
+          AND (r.last_heartbeat < datetime('now', '-' || ? || ' seconds')
+               OR (r.last_heartbeat IS NULL
+                   AND r.started_at < datetime('now', '-' || ? || ' seconds'))))
       )
-  `).all(thresholdSeconds);
+  `).all(thresholdSeconds, thresholdSeconds);
 }
 
 /**

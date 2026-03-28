@@ -17,15 +17,27 @@ function textBytes(value) {
   return Buffer.byteLength(toText(value), 'utf8');
 }
 
-// Note: limits are enforced by character count (UTF-16 code units), not byte count.
-// For ASCII shell output (the common case) these are equivalent.
-function truncateText(value, limit) {
+// Truncate to a byte limit (UTF-8). Slices at a character boundary that
+// does not exceed the byte budget, so multi-byte characters are never split.
+function truncateText(value, limitBytes) {
   const text = toText(value).trim();
   if (!text) return { text: '', truncated: false, bytes: 0 };
   const bytes = textBytes(text);
-  if (text.length <= limit) return { text, truncated: false, bytes };
+  if (bytes <= limitBytes) return { text, truncated: false, bytes };
+  // Walk characters until we exceed the byte budget minus suffix room
+  const suffix = '\n...[truncated]';
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8');
+  const target = Math.max(0, limitBytes - suffixBytes);
+  let usedBytes = 0;
+  let cutIndex = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (usedBytes + charBytes > target) break;
+    usedBytes += charBytes;
+    cutIndex += char.length;
+  }
   return {
-    text: `${text.slice(0, Math.max(0, limit - 24))}\n...[truncated]`,
+    text: text.slice(0, cutIndex) + suffix,
     truncated: true,
     bytes,
   };

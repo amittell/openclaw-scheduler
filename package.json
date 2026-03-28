@@ -87,7 +87,8 @@
     "CODE_OF_CONDUCT.md",
     "INSTALL*.md",
     "UNINSTALL.md",
-    "BEST-PRACTICES.md"
+    "BEST-PRACTICES.md",
+    "QUICK-START.md"
   ],
   "keywords": [
     "openclaw",

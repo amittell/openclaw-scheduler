@@ -230,10 +230,10 @@ export function checkGroupCompletion(trackerId) {
   // Build summary
   const summaryParts = agents.map(a => {
     const label = a.agent_label;
-    if (a.status === 'completed') return `✅ ${label}: ${a.exit_message || 'done'}`;
-    if (a.status === 'failed') return `❌ ${label}: ${a.error || 'failed'}`;
-    if (a.status === 'dead') return `💀 ${label}: timed out`;
-    return `⬜ ${label}: ${a.status}`;
+    if (a.status === 'completed') return `[ok] ${label}: ${a.exit_message || 'done'}`;
+    if (a.status === 'failed') return `[FAILED] ${label}: ${a.error || 'failed'}`;
+    if (a.status === 'dead') return `[DEAD] ${label}: timed out`;
+    return `[${a.status}] ${label}`;
   });
   const summary = summaryParts.join('\n');
 

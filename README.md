@@ -1,18 +1,18 @@
 # OpenClaw Scheduler
 
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](INSTALL.md)
+[![CI](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Node](https://img.shields.io/badge/node-%E2%89%A520-green)]()
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-green)](https://nodejs.org)
 
 A durable orchestration runtime for [OpenClaw](https://openclaw.ai) agents and shell workflows. Use it when built-in cron and heartbeat stop being enough: jobs fail and disappear into logs, shell scripts depend on gateway uptime, multi-step workflows need retries and approvals, and you want a real audit trail for what ran, what failed, and what triggered what.
 
 It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler that keeps full run history, supports shell and agent steps in the same workflow, and lets you build chains like `shell check -> agent diagnosis -> human approval -> remediation`.
 
 **Repo:** `github.com/amittell/openclaw-scheduler`
-**Location:** `~/.openclaw/scheduler/`
+**Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
 **Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** 1037 (full suite, in-memory SQLite + dispatcher integration)
+**Tests:** run with `npm test` (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 In practice, this gives you:
@@ -109,6 +109,8 @@ Do not use it if simple cron is enough. If all you need is “run one thing ever
 
 ## What Replaced What
 
+> If you have never used OpenClaw's built-in cron, skip migration and go directly to [Five-Minute Setup](#five-minute-setup).
+
 | Before (OC built-in) | After (scheduler) |
 |----------------------|-------------------|
 | `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with full run history |
@@ -123,7 +125,9 @@ Do not use it if simple cron is enough. If all you need is “run one thing ever
 
 ## Quick Start
 
-If you are new, use the npm-first path below and then jump straight to [Five-Minute Setup](#five-minute-setup). The rest of this README is the deeper reference manual.
+**New to the scheduler?** Start with [QUICK-START.md](QUICK-START.md) -- a focused guide covering installation, converting existing OpenClaw crons, and building your first workflow chain.
+
+For the full reference, use the npm-first path below and then jump straight to [Five-Minute Setup](#five-minute-setup).
 
 ### Option A: npm-first (publish/install flow)
 
@@ -1120,6 +1124,8 @@ openclaw-scheduler jobs add '{
 
 ## Backup & Recovery
 
+MinIO backups are disabled by default. Set `SCHEDULER_BACKUP=1` to enable. Requires `mc` (MinIO client) installed and configured with a `backupstore` alias.
+
 The scheduler can back up its SQLite database to MinIO automatically.
 
 ```bash
@@ -1551,6 +1557,13 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 │
 │  Core scheduler
 ├── dispatcher.js          # Main process — tick loop, dispatch, chains, retry, backups
+├── dispatcher-strategies.js  # Dispatch strategy functions (prepare, execute, finalize)
+├── dispatcher-maintenance.js # Stale run reaping, TTL pruning, WAL checkpoints
+├── dispatcher-approvals.js   # Approval timeout resolution and auto-approve/reject
+├── dispatcher-delivery.js    # Post-run delivery pipeline (announce, announce-always)
+├── dispatcher-shell.js       # Shell job execution and result normalization
+├── dispatcher-utils.js       # Shared dispatcher helpers and dependency wiring
+├── dispatch-queue.js         # Durable dispatch queue (manual runs, retries, chain triggers)
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
 ├── schema.sql             # Complete schema (v21) — all tables and columns, no incremental DDL
 ├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v21
@@ -1582,6 +1595,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── INSTALL-WINDOWS.md     # Installation guide for Windows (WSL2 or PM2)
 ├── UNINSTALL.md           # Removal guide (all platforms)
 ├── BEST-PRACTICES.md      # Job type selection, prompt writing, agent integration
+├── QUICK-START.md         # Focused guide: install, convert crons, first workflow
 ├── openclaw-scheduler.service  # Linux systemd user service template
 ├── CHANGELOG.md           # Version history
 └── README.md              # This file

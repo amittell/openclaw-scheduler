@@ -410,8 +410,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs start at v12 (all columns already in schema above).
--- Existing installs are brought up to v20 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-21 (all columns already in schema above).
+-- Existing installs are brought up to v21 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
