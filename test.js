@@ -735,6 +735,23 @@ db.prepare("UPDATE jobs SET next_run_at = datetime('now', '+350 days') WHERE id 
 pruneExpiredJobs();
 assert(getJob(pausedAnnual.id), 'disabled annual cron job kept');
 
+const stagedFutureAt = createJob({
+  name: 'StagedFutureAt',
+  schedule_kind: 'at',
+  schedule_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+  payload_message: 'future staged one-shot',
+  delete_after_run: 1,
+  enabled: 0,
+  delivery_mode: 'none',
+  delivery_opt_out_reason: 'test',
+  run_timeout_ms: 300_000,
+  origin: 'system',
+});
+db.prepare("UPDATE jobs SET created_at = datetime('now', '-48 hours') WHERE id = ?").run(stagedFutureAt.id);
+pruneExpiredJobs();
+assert(getJob(stagedFutureAt.id), 'disabled future one-shot job is not pruned before it ever runs');
+deleteJob(stagedFutureAt.id);
+
 // ═══════════════════════════════════════════════════════════
 // SECTION 3: Cycle detection + max depth (v3b)
 // ═══════════════════════════════════════════════════════════
@@ -3061,14 +3078,34 @@ console.log('\n── Migration Guard ──');
 
   closeDb();
   setDbPath(legacyDbPath);
-  await initDb();
+  let migrationLogs = '';
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk, encoding, cb) => {
+    migrationLogs += String(chunk);
+    if (typeof cb === 'function') cb();
+    return true;
+  });
+  try {
+    await initDb();
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
   const migratedDb = getDb();
   const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
   const migratedJobCols = migratedDb.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
+  const migratedMsgCols = migratedDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+  const migratedApprovalCols = migratedDb.prepare('PRAGMA table_info(approvals)').all().map(c => c.name);
+  const migratedTtaCols = migratedDb.prepare('PRAGMA table_info(task_tracker_agents)').all().map(c => c.name);
+  assert(!migrationLogs.includes('migrate-consolidate error'), 'migration guard completes without consolidate errors on partial legacy tables');
+  assert(!migrationLogs.includes('Schema apply warning'), 'migration guard completes without schema-apply warnings on partial legacy tables');
+  assert(!migrationLogs.includes('Schema re-apply warning'), 'migration guard completes without schema re-apply warnings on partial legacy tables');
   assert(migratedRunCols.includes('shell_exit_code'), 'migration guard backfills shell_exit_code when version marker is already 14');
   assert(migratedRunCols.includes('shell_stdout_path'), 'migration guard backfills shell_stdout_path when version marker is already 14');
   assert(migratedJobCols.includes('execution_intent'), 'migration guard backfills execution_intent when version marker is already 14');
   assert(migratedJobCols.includes('origin'), 'migration guard backfills origin (v20) when version marker is already 14');
+  assert(migratedMsgCols.includes('to_agent') && migratedMsgCols.includes('status'), 'migration guard backfills base messages columns on partial legacy tables');
+  assert(migratedApprovalCols.includes('job_id') && migratedApprovalCols.includes('status'), 'migration guard backfills base approvals columns on partial legacy tables');
+  assert(migratedTtaCols.includes('tracker_id') && migratedTtaCols.includes('status'), 'migration guard backfills base task_tracker_agents columns on partial legacy tables');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });
@@ -5785,6 +5822,64 @@ assert(AT_JOB_CRON_SENTINEL === '0 0 31 2 *', 'AT_JOB_CRON_SENTINEL is the expec
   const dueCronJobs = getDueJobs();
   assert(!dueCronJobs.some(j => j.id === atPast.id), 'getDueJobs (cron) does NOT include past at-job');
   assert(!dueCronJobs.some(j => j.id === atFuture.id), 'getDueJobs (cron) does NOT include future at-job');
+
+  const atParent = createJob({
+    name: 'At-Parent',
+    schedule_cron: '0 9 * * *',
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'parent for child at-job guard',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000, origin: 'system',
+  });
+  let threwChildAt = false;
+  try {
+    createJob({
+      name: 'Child At Rejected',
+      parent_id: atParent.id,
+      trigger_on: 'success',
+      schedule_kind: 'at',
+      schedule_at: past,
+      payload_message: 'child at-job should be rejected',
+      delivery_mode: 'none',
+      run_timeout_ms: 300_000,
+    });
+  } catch (e) {
+    threwChildAt = e.message.includes('child jobs cannot use schedule_kind "at"');
+  }
+  assert(threwChildAt, 'createJob rejects child at-jobs');
+
+  getDb().prepare(`
+    INSERT INTO jobs (
+      id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
+      session_target, agent_id, payload_kind, payload_message,
+      delivery_mode, delete_after_run, next_run_at, run_timeout_ms,
+      parent_id, trigger_on, delivery_opt_out_reason, origin
+    ) VALUES (
+      'legacy-child-at', 'Legacy Child At', 1, 'at', ?, ?, 'UTC',
+      'isolated', 'main', 'agentTurn', 'legacy child at payload',
+      'none', 1, ?, 300000,
+      ?, 'success', NULL, NULL
+    )
+  `).run(past, AT_JOB_CRON_SENTINEL, past, atParent.id);
+  getDb().prepare(`
+    INSERT INTO jobs (
+      id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
+      session_target, agent_id, payload_kind, payload_message,
+      delivery_mode, delete_after_run, next_run_at, run_timeout_ms,
+      parent_id, trigger_on, delivery_opt_out_reason, origin
+    ) VALUES (
+      'legacy-child-cron', 'Legacy Child Cron', 1, 'cron', NULL, '*/5 * * * *', 'UTC',
+      'isolated', 'main', 'agentTurn', 'legacy child cron payload',
+      'none', 0, ?, 300000,
+      ?, 'success', NULL, NULL
+    )
+  `).run(past, atParent.id);
+  assert(!getDueAtJobs().some(j => j.id === 'legacy-child-at'), 'getDueAtJobs ignores legacy child at-jobs');
+  assert(!getDueJobs().some(j => j.id === 'legacy-child-cron'), 'getDueJobs ignores legacy child cron jobs');
+  deleteJob('legacy-child-at');
+  deleteJob('legacy-child-cron');
+  deleteJob(atParent.id);
 
   // at-job with delete_after_run=1: after firing, delete the row
   updateJob(atPast.id, { last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '') });

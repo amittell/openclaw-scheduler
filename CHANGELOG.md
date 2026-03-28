@@ -19,6 +19,9 @@ All notable changes to this project will be documented in this file.
 - Shell timeout and retry exhaustion handling corrected
 - Boolean job flags normalized for SQLite writes
 - Numeric enabled flags treated as disabled on create
+- Child jobs can no longer self-fire as autonomous one-shot schedules; due selectors are root-only
+- Disabled future one-shot jobs are no longer pruned before they ever run
+- Consolidation migration now backfills partial legacy message/task-tracker tables without noisy fallback errors
 
 ### Changed
 - Default `schedule_tz` changed from `America/New_York` to `UTC` in schema, validation, and setup
@@ -27,7 +30,7 @@ All notable changes to this project will be documented in this file.
 - Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
 - Full validation gate moved into local verification commands (`npm run verify:local` / `npm run verify:smoke`); GitHub Actions now runs a single lightweight smoke job
-- Test baseline updated to 1003 passed
+- Test baseline updated to 1013 passed
 - Schema baseline is now v20
 
 ## [0.1.0] -- 2026-03-08

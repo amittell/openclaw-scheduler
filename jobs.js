@@ -193,6 +193,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     validateJobPayload(finalTarget, finalKind);
   }
   const isAtJob = merged.schedule_kind === 'at';
+  if (isChild && isAtJob) {
+    throw new Error('child jobs cannot use schedule_kind "at" — use trigger_delay_s for delayed chain execution');
+  }
   if (!isChild && !isAtJob && !merged.schedule_cron) {
     throw new Error('schedule_cron is required for root cron jobs');
   }
@@ -711,6 +714,7 @@ export function getDueJobs() {
   return getDb().prepare(`
     SELECT * FROM jobs
     WHERE enabled = 1
+      AND parent_id IS NULL
       AND next_run_at IS NOT NULL
       AND next_run_at <= datetime('now')
       AND (schedule_kind IS NULL OR schedule_kind = 'cron')
@@ -727,6 +731,7 @@ export function getDueAtJobs() {
     SELECT * FROM jobs
     WHERE schedule_kind = 'at'
       AND enabled = 1
+      AND parent_id IS NULL
       AND schedule_at IS NOT NULL
       AND datetime(schedule_at) IS NOT NULL
       AND datetime(schedule_at) <= datetime('now')
@@ -742,15 +747,14 @@ export function getDueAtJobs() {
  */
 export function pruneExpiredJobs() {
   const db = getDb();
-  // Delete disabled one-shot jobs that have been sitting for >24h since last run (or creation if never ran)
+  // Delete disabled one-shot jobs that have actually run and have been sitting
+  // for >24h. Never-run disabled jobs may be intentionally staged for later.
   const aged = db.prepare(`
     DELETE FROM jobs
     WHERE enabled = 0
       AND delete_after_run = 1
-      AND (
-        (last_run_at IS NOT NULL AND last_run_at < datetime('now', '-24 hours'))
-        OR (last_run_at IS NULL AND created_at < datetime('now', '-24 hours'))
-      )
+      AND last_run_at IS NOT NULL
+      AND last_run_at < datetime('now', '-24 hours')
   `).run();
   // Delete orphaned children whose parent no longer exists
   const orphans = db.prepare(`

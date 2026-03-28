@@ -17,15 +17,21 @@ import { getDb } from './db.js';
 
 export default function migrateConsolidate() {
   const db = getDb();
+  const hasTable = (name) => !!db.prepare(`
+    SELECT 1
+    FROM sqlite_master
+    WHERE type = 'table' AND name = ?
+    LIMIT 1
+  `).get(name);
 
   // Already fully up to date?
   // Note: we can't just check schema_migrations version — schema.sql inserts
   // version markers via INSERT OR IGNORE, but CREATE TABLE IF NOT EXISTS
   // doesn't add new columns to existing tables. So we also check if the
   // latest column actually exists before skipping.
-  const current = db.prepare(
-    'SELECT MAX(version) as v FROM schema_migrations'
-  ).get()?.v ?? 0;
+  const current = hasTable('schema_migrations')
+    ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
+    : 0;
   const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
   const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map(c => c.name));
   const hasLatestColumns =
@@ -95,6 +101,46 @@ export default function migrateConsolidate() {
   // ── Column additions (all idempotent — column already exists = silent ignore) ─
 
   const alters = [
+    // Legacy partial-table backfills for messages
+    `ALTER TABLE messages ADD COLUMN to_agent TEXT`,
+    `ALTER TABLE messages ADD COLUMN from_agent TEXT`,
+    `ALTER TABLE messages ADD COLUMN kind TEXT`,
+    `ALTER TABLE messages ADD COLUMN content TEXT`,
+    `ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE messages ADD COLUMN channel TEXT`,
+    `ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE messages ADD COLUMN delivered_at TEXT`,
+    `ALTER TABLE messages ADD COLUMN read_at TEXT`,
+    `ALTER TABLE messages ADD COLUMN expires_at TEXT`,
+    `ALTER TABLE messages ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE messages ADD COLUMN job_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN run_id TEXT`,
+    // Legacy partial-table backfills for approvals
+    `ALTER TABLE approvals ADD COLUMN job_id TEXT`,
+    `ALTER TABLE approvals ADD COLUMN run_id TEXT`,
+    `ALTER TABLE approvals ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE approvals ADD COLUMN requested_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE approvals ADD COLUMN resolved_at TEXT`,
+    `ALTER TABLE approvals ADD COLUMN resolved_by TEXT`,
+    `ALTER TABLE approvals ADD COLUMN notes TEXT`,
+    // Legacy partial-table backfills for task tracking
+    `ALTER TABLE task_tracker ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE task_tracker ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP`,
+    `ALTER TABLE task_tracker ADD COLUMN created_by TEXT NOT NULL DEFAULT 'main'`,
+    `ALTER TABLE task_tracker ADD COLUMN expected_agents TEXT NOT NULL DEFAULT '[]'`,
+    `ALTER TABLE task_tracker ADD COLUMN timeout_s INTEGER NOT NULL DEFAULT 600`,
+    `ALTER TABLE task_tracker ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`,
+    `ALTER TABLE task_tracker ADD COLUMN completed_at TEXT`,
+    `ALTER TABLE task_tracker ADD COLUMN delivery_channel TEXT`,
+    `ALTER TABLE task_tracker ADD COLUMN delivery_to TEXT`,
+    `ALTER TABLE task_tracker ADD COLUMN summary TEXT`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN tracker_id TEXT`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN agent_label TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN started_at TEXT`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN finished_at TEXT`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN exit_message TEXT`,
+    `ALTER TABLE task_tracker_agents ADD COLUMN error TEXT`,
     // v3: workflow chaining
     `ALTER TABLE jobs ADD COLUMN parent_id TEXT`,
     `ALTER TABLE jobs ADD COLUMN trigger_on TEXT`,
