@@ -102,32 +102,20 @@ const cmd = args[0] || '';
 if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
   printUsage();
   process.exit(0);
-}
-
-if (cmd === 'setup') {
+} else if (cmd === 'setup') {
   runScript('setup.mjs', args.slice(1));
-}
-
-if (cmd === 'start' || cmd === 'dispatcher') {
+} else if (cmd === 'start' || cmd === 'dispatcher') {
   runScript('dispatcher.js', args.slice(1));
-}
-
-if (cmd === 'migrate') {
+} else if (cmd === 'migrate') {
   runScript('migrate.js', args.slice(1));
-}
-
-if (cmd === 'webhook-check') {
+} else if (cmd === 'webhook-check') {
   runScript('scripts/telegram-webhook-check.mjs', args.slice(1));
-}
-
-if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
+} else if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   process.stdout.write(`${pkg.name} ${pkg.version}\n`);
   process.exit(0);
-}
-
-// Route dispatch subcommands to dispatch/index.mjs
-if (DISPATCH_SUBCOMMANDS.has(cmd)) {
+} else if (DISPATCH_SUBCOMMANDS.has(cmd)) {
+  // Route dispatch subcommands to dispatch/index.mjs
   // If the command is 'dispatch', strip it and pass the rest
   // If it's a convenience alias (enqueue, status, etc.), pass everything as-is
   if (cmd === 'dispatch') {
@@ -135,6 +123,7 @@ if (DISPATCH_SUBCOMMANDS.has(cmd)) {
   } else {
     runDispatch(args);
   }
+} else {
+  // All other commands forwarded to scheduler CLI (cli.js)
+  runScript('cli.js', args);
 }
-
-runScript('cli.js', args);

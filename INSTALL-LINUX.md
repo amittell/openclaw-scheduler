@@ -369,7 +369,9 @@ node cli.js status
 
 ## Optional: QMD Memory Daemon (if using QMD as memory backend)
 
-If your OpenClaw instance uses QMD for hybrid memory search (`memory.backend = "qmd"`), you need a persistent systemd service for the QMD MCP daemon -- equivalent to the macOS launchd service on `com.openclaw.qmd-daemon`.
+> **Skip this entire section if you do not use QMD for hybrid memory search.** Most OpenClaw installations do not use QMD. This section is only relevant if your OpenClaw config has `memory.backend = "qmd"`.
+
+If your OpenClaw instance uses QMD for hybrid memory search, you need a persistent systemd service for the QMD MCP daemon -- equivalent to the macOS launchd service on `com.openclaw.qmd-daemon`.
 
 ### Key rules (learned the hard way)
 
@@ -414,12 +416,13 @@ export XDG_CACHE_HOME=$HOME/.openclaw/agents/main/qmd/xdg-cache
 # Set QMD_PATH to the location of your qmd binary.
 # If installed globally: QMD_PATH=$(which qmd)
 # If installed locally via npm: QMD_PATH=$HOME/node_modules/@tobilu/qmd/qmd
-QMD_PATH="/path/to/qmd"
+QMD_PATH="$(which qmd)"   # adjust if qmd is installed in a non-PATH location
 BRIDGE="python3 $HOME/.openclaw/scripts/mcporter-qmd.py"
 
-# Wait for model storage to be available (adjust path as needed)
+# Wait for model storage to be available (adjust path to your cache dir)
+QMD_CACHE_DIR="$XDG_CACHE_HOME"
 for i in {1..30}; do
-    [ -d "/path/to/qmd-cache" ] && break
+    [ -d "$QMD_CACHE_DIR" ] && break
     sleep 2
 done
 
@@ -451,7 +454,7 @@ wait $QMD_PID
   "name": "QMD Daemon Keepalive",
   "schedule_cron": "*/10 * * * *",
   "session_target": "shell",
-  "payload_message": "python3 /home/user/.openclaw/scripts/mcporter-qmd.py call qmd.deep_search --args '{\"query\":\"memory\",\"limit\":1,\"minScore\":0,\"collection\":\"memory-root-main\"}' --timeout 30000 > /dev/null 2>&1 && echo 'QMD warm' || echo 'QMD cold'",
+  "payload_message": "python3 ~/.openclaw/scripts/mcporter-qmd.py call qmd.deep_search --args '{\"query\":\"memory\",\"limit\":1,\"minScore\":0,\"collection\":\"YOUR_COLLECTION\"}' --timeout 30000 > /dev/null 2>&1 && echo 'QMD warm' || echo 'QMD cold'",
   "delivery_mode": "none"
 }
 ```

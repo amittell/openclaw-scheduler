@@ -16,7 +16,6 @@ secrets/
 backupstore/
 .backup-staging/
 logs/
-chilisaus/
 coverage/
 .nyc_output/
 config.json

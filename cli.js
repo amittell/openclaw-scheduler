@@ -379,6 +379,7 @@ switch (command) {
         const run = getRun(args[0]);
         if (!run) fail(`Run not found: ${args[0]}`);
         const kind = (args[1] || 'stdout').toLowerCase();
+        if (kind !== 'stdout' && kind !== 'stderr') fail('Usage: runs output <run-id> [stdout|stderr]');
         const pathField = kind === 'stderr' ? 'shell_stderr_path' : 'shell_stdout_path';
         const textField = kind === 'stderr' ? 'shell_stderr' : 'shell_stdout';
         const filePath = run[pathField];
@@ -429,7 +430,7 @@ switch (command) {
     switch (sub) {
       case 'send': {
         const [from, to, ...bodyParts] = args;
-        if (!from || !to) fail('Usage: msg send <from> <to> <body>');
+        if (!from || !to || !bodyParts.length) fail('Usage: msg send <from> <to> <body>');
         const msg = sendMessage({ from_agent: from, to_agent: to, body: bodyParts.join(' ') });
         emit({ ok: true, message: msg }, `Sent: ${fmt(msg)}`);
         break;

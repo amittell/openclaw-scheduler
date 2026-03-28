@@ -146,53 +146,56 @@ async function replayOrphanedRuns() {
 
   for (const run of orphaned) {
     log('info', `Found orphaned run for ${run.job_name}`, { runId: run.id, jobId: run.job_id });
-    const crashedAt = sqliteNow();
 
-    // Mark old run as crashed
-    db.prepare(`UPDATE runs SET status = 'crashed', finished_at = ? WHERE id = ?`).run(crashedAt, run.id);
-    if (run.dispatch_queue_id) {
-      setDispatchStatus(run.dispatch_queue_id, 'done');
-    }
+    // Wrap all per-run operations in a transaction so crash between steps
+    // cannot leave the run marked crashed without the corresponding retry enqueued.
+    const processOrphan = db.transaction(() => {
+      const crashedAt = sqliteNow();
 
-    // Release any idempotency key held by the crashed run so replays can reclaim
-    if (run.idempotency_key) {
-      releaseIdempotencyKey(run.idempotency_key);
-      log('info', `Released idempotency key for crashed run`, { runId: run.id, key: run.idempotency_key.slice(0, 8) });
-    }
-
-    if (run.delivery_guarantee === 'at-least-once') {
-      const replayPatch = {
-        last_run_at: crashedAt,
-        last_status: 'crashed',
-      };
-      if (run.schedule_kind !== 'at') {
-        replayPatch.next_run_at = nextRunFromCron(run.schedule_cron, run.schedule_tz);
+      // Mark old run as crashed
+      db.prepare(`UPDATE runs SET status = 'crashed', finished_at = ? WHERE id = ?`).run(crashedAt, run.id);
+      if (run.dispatch_queue_id) {
+        setDispatchStatus(run.dispatch_queue_id, 'done');
       }
-      updateJob(run.job_id, replayPatch);
 
-      // Enqueue a dispatch so the normal dispatch flow creates and executes the replay run
-      const replayDispatch = enqueueDispatch(run.job_id, {
-        kind: 'retry',
-        scheduled_for: sqliteNow(-1000),
-        source_run_id: run.id,
-        retry_of_run_id: run.id,
-      });
-      log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, dispatchId: replayDispatch.id });
-      // Note: at-jobs are disabled by updateJobAfterRun after the replay completes.
-      // Disabling here would cause the replay dispatch to be cancelled by the tick
-      // loop (which skips disabled jobs).
-    } else {
-      if (run.schedule_kind === 'at') {
-        updateJob(run.job_id, { enabled: false });
-        log('info', `Disabled at-job after crash (at-most-once): ${run.job_name}`, { jobId: run.job_id });
-      } else {
-        const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
-        if (nextRun) {
-          updateJob(run.job_id, { next_run_at: nextRun });
+      // Release any idempotency key held by the crashed run so replays can reclaim
+      if (run.idempotency_key) {
+        releaseIdempotencyKey(run.idempotency_key);
+        log('info', `Released idempotency key for crashed run`, { runId: run.id, key: run.idempotency_key.slice(0, 8) });
+      }
+
+      if (run.delivery_guarantee === 'at-least-once') {
+        const replayPatch = {
+          last_run_at: crashedAt,
+          last_status: 'crashed',
+        };
+        if (run.schedule_kind !== 'at') {
+          replayPatch.next_run_at = nextRunFromCron(run.schedule_cron, run.schedule_tz);
         }
+        updateJob(run.job_id, replayPatch);
+
+        // Enqueue a dispatch so the normal dispatch flow creates and executes the replay run
+        const replayDispatch = enqueueDispatch(run.job_id, {
+          kind: 'retry',
+          scheduled_for: sqliteNow(-1000),
+          source_run_id: run.id,
+          retry_of_run_id: run.id,
+        });
+        log('info', `Replaying run for ${run.job_name} (at-least-once)`, { oldRunId: run.id, dispatchId: replayDispatch.id });
+      } else {
+        if (run.schedule_kind === 'at') {
+          updateJob(run.job_id, { enabled: false });
+          log('info', `Disabled at-job after crash (at-most-once): ${run.job_name}`, { jobId: run.job_id });
+        } else {
+          const nextRun = nextRunFromCron(run.schedule_cron, run.schedule_tz);
+          if (nextRun) {
+            updateJob(run.job_id, { next_run_at: nextRun });
+          }
+        }
+        log('info', `Marked crashed: ${run.job_name} (at-most-once)`, { runId: run.id });
       }
-      log('info', `Marked crashed: ${run.job_name} (at-most-once)`, { runId: run.id });
-    }
+    });
+    processOrphan();
   }
 }
 
@@ -367,10 +370,13 @@ function buildJobPrompt(job, run) {
         ? `[${msg.kind}]${msg.owner ? ` (owner: ${msg.owner})` : ''} `
         : '';
       parts.push(`From: ${msg.from_agent} | ${msg.kind} | ${msg.subject || '(no subject)'}`);
+      const bodyExcerpt = msg.body.length > 500
+        ? msg.body.slice(0, 500) + '\n[... message truncated]'
+        : msg.body;
       if (kindLabel) {
-        parts.push(`${kindLabel}${msg.body.slice(0, 500)}`);
+        parts.push(`${kindLabel}${bodyExcerpt}`);
       } else {
-        parts.push(msg.body.slice(0, 500));
+        parts.push(bodyExcerpt);
       }
       parts.push('---');
       markDelivered(msg.id);
@@ -609,26 +615,31 @@ async function tick() {
             deliveryMode = 'none';
           }
 
-          const child = createJob({
-            name: spec.name || `Spawned by ${msg.from_agent}`,
-            parent_id: msg.job_id || null,
-            schedule_cron: spec.schedule_cron,
-            payload_message: spec.payload_message,
-            session_target: sessionTarget,
-            agent_id: spec.agent_id || msg.to_agent || 'main',
-            delivery_mode: deliveryMode,
-            delivery_channel: spec.delivery_channel,
-            delivery_to: spec.delivery_to,
-            delivery_opt_out_reason: spec.delivery_opt_out_reason
-              || (deliveryMode === 'none' ? 'spawned-child' : null),
-            delete_after_run: spec.delete_after_run !== false ? 1 : 0,
-            enabled: true,
-            run_timeout_ms: spec.run_timeout_ms || 300_000,
-            origin: spec.origin || 'system',
-          });
-          // Fire immediately
-          getDb().prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(child.id);
-          markDelivered(msg.id);
+          // Wrap job creation + message ack in a transaction so a crash
+          // between the two cannot leave an unacked spawn that replays.
+          const child = getDb().transaction(() => {
+            const c = createJob({
+              name: spec.name || `Spawned by ${msg.from_agent}`,
+              parent_id: msg.job_id || null,
+              schedule_cron: spec.schedule_cron,
+              payload_message: spec.payload_message,
+              session_target: sessionTarget,
+              agent_id: spec.agent_id || msg.to_agent || 'main',
+              delivery_mode: deliveryMode,
+              delivery_channel: spec.delivery_channel,
+              delivery_to: spec.delivery_to,
+              delivery_opt_out_reason: spec.delivery_opt_out_reason
+                || (deliveryMode === 'none' ? 'spawned-child' : null),
+              delete_after_run: spec.delete_after_run !== false ? 1 : 0,
+              enabled: true,
+              run_timeout_ms: spec.run_timeout_ms || 300_000,
+              origin: spec.origin || 'system',
+            });
+            // Fire immediately
+            getDb().prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(c.id);
+            markDelivered(msg.id);
+            return c;
+          })();
           log('info', `Spawned child job: ${child.name}`, { childId: child.id, parentJobId: msg.job_id });
         } catch (e) {
           log('error', `Spawn message parse error: ${e.message}`, { msgId: msg.id, fromAgent: msg.from_agent });
@@ -705,25 +716,27 @@ async function tick() {
   // 5. Backup to MinIO (every BACKUP_INTERVAL_MS, default 5 min; set SCHEDULER_BACKUP=1 to enable)
   if (backupEnabled && now - lastBackup >= BACKUP_INTERVAL_MS) {
     lastBackup = now;
-    try {
-      const isRollup = now - lastRollupBackup >= 3600000;
-      if (isRollup) lastRollupBackup = now;
-      const mode = isRollup ? 'rollup' : 'snapshot';
-      const { execSync } = await import('child_process');
-      execSync(`node "${join(__dirname, 'backup.js')}" ${mode}`, {
-        timeout: 30000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      log('debug', `Backup ${mode} completed`);
-    } catch (err) {
-      const msg = err.stderr?.toString()?.trim() || err.message;
-      if (msg.includes('not found') || msg.includes('ENOENT')) {
-        log('warn', `Backup disabled: mc binary not found. Install mc to use backups.`);
-        backupEnabled = false;
+    const isRollup = now - lastRollupBackup >= 3600000;
+    if (isRollup) lastRollupBackup = now;
+    const mode = isRollup ? 'rollup' : 'snapshot';
+    // Run backup in a child process without blocking the event loop
+    const { execFile } = await import('child_process');
+    execFile(process.execPath, [join(__dirname, 'backup.js'), mode], {
+      timeout: 30000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }, (err, _stdout, stderr) => {
+      if (err) {
+        const msg = stderr?.trim() || err.message;
+        if (msg.includes('not found') || msg.includes('ENOENT')) {
+          log('warn', `Backup disabled: mc binary not found. Install mc to use backups.`);
+          backupEnabled = false;
+        } else {
+          log('error', `Backup failed: ${msg}`);
+        }
       } else {
-        log('error', `Backup failed: ${msg}`);
+        log('debug', `Backup ${mode} completed`);
       }
-    }
+    });
   }
 }
 

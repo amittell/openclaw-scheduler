@@ -320,19 +320,14 @@ Key improvements:
 ## Stuck Run Detector (cron job)
 
 ```bash
-openclaw cron add '{
+openclaw-scheduler jobs add '{
   "name": "Stuck Session Detector",
-  "schedule": "*/10 * * * *",
-  "sessionTarget": "shell",
-  "payload": {
-    "kind": "shellCommand",
-    "message": "node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15"
-  },
-  "delivery": {
-    "mode": "announce",
-    "channel": "telegram",
-    "to": "YOUR_TELEGRAM_ID"
-  }
+  "schedule_cron": "*/10 * * * *",
+  "session_target": "shell",
+  "payload_message": "node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_TELEGRAM_ID"
 }'
 ```
 

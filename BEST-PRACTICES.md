@@ -52,7 +52,7 @@ Use `shell` when:
 **Examples:**
 
 ```json
-{ "session_target": "shell", "payload_message": "/home/user/scripts/backup.sh" }
+{ "session_target": "shell", "payload_message": "~/scripts/backup.sh" }
 
 { "session_target": "shell", "payload_message": "df -h / | grep -E '^/dev' | awk '{print $5}'" }
 

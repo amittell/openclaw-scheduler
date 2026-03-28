@@ -34,9 +34,7 @@ function cronFromSchedule(schedule) {
     return { cron: `0 */${clampedHours} * * *`, tz: schedule.tz || 'UTC' };
   }
   if (schedule.kind === 'at') {
-    // One-shot: create a cron that fires once (we'll mark delete_after_run)
-    // For now, use a placeholder cron that fires every minute — the job will delete after first run
-    // In practice, we'd need to compute the specific minute/hour/day
+    // One-shot: compute the specific minute/hour/day cron that fires once
     const d = new Date(schedule.at);
     return {
       cron: `${d.getUTCMinutes()} ${d.getUTCHours()} ${d.getUTCDate()} ${d.getUTCMonth() + 1} *`,
@@ -52,7 +50,13 @@ function main() {
     process.exit(1);
   }
 
-  const data = JSON.parse(readFileSync(JOBS_JSON, 'utf8'));
+  let data;
+  try {
+    data = JSON.parse(readFileSync(JOBS_JSON, 'utf8'));
+  } catch (err) {
+    console.error(`Failed to parse ${JOBS_JSON}: ${err.message}`);
+    process.exit(1);
+  }
   const jobs = data.jobs || [];
 
   console.log(`Found ${jobs.length} job(s) in ${JOBS_JSON}`);

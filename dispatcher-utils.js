@@ -60,13 +60,17 @@ export function buildExecutionIntentNote(job) {
  */
 export function matchesSentinel(content, token) {
   if (!content) return false;
-  const re = new RegExp(`^${token}(?:$|[\\s:])`);
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^${escaped}(?:$|[\\s:])`);
   return re.test(content.trim());
 }
 
 export function detectTransientError(content) {
   if (!content || !content.trim()) return false;
   const trimmed = content.trim();
+  // Check only the first 500 chars: transient errors from the gateway/model API appear
+  // at the start of the response. Long agent responses may discuss errors in their analysis
+  // without being actual errors -- checking more would cause false positives.
   const testStr = trimmed.length > 500 ? trimmed.slice(0, 500) : trimmed;
   return TRANSIENT_ERROR_PATTERNS.some(pattern => pattern.test(testStr));
 }

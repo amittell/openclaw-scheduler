@@ -124,7 +124,7 @@ function respawnSession(label, entry) {
 const labels = loadLabels();
 const now = Date.now();
 const results = [];
-  for (const [name, entry] of Object.entries(labels)) {
+for (const [name, entry] of Object.entries(labels)) {
   // Only look at error-state sessions
   if (entry.status !== 'error') continue;
 

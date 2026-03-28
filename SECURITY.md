@@ -27,3 +27,8 @@ Security-sensitive areas include:
 - installation and service configuration
 
 Please report unsafe defaults, credential leaks, or privilege boundary issues.
+
+## Response Timeline
+
+- **Acknowledgment:** within 7 days of receipt.
+- **Resolution:** within 30--90 days depending on severity and complexity.

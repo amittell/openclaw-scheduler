@@ -112,7 +112,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       if (result.retryFiresChildren && !result.skipChildren) {
         handleTriggeredChildren(job.id, 'error', result.content, ctx.run.id, ' on soft failure');
       }
-      log('info', `${result.status === 'error' ? 'Failed' : 'Completed'}: ${job.name} (retry scheduled)`, { runId: ctx.run.id });
+      log('info', `Failed: ${job.name} (retry scheduled)`, { runId: ctx.run.id });
       return; // retry path handles everything
     }
     log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
@@ -419,7 +419,7 @@ export async function executeWatchdog(job, ctx, deps) {
       `- Dispatched: ${job.watchdog_started_at || 'unknown'}`,
       `- Running for: ${elapsedMin} minutes (threshold: ${job.watchdog_timeout_min || '?'} min)`,
       `- Reason: ${reason}`,
-      `- Check: ${checkCmd}`,
+      `- Check: ${checkCmd.split(/\s/)[0]}${checkCmd.length > 80 ? ' [...]' : ''}`,
       stderr ? `- Error: ${stderr.slice(0, 500)}` : null,
       stdout ? `- Output: ${stdout.slice(0, 500)}` : null,
     ].filter(Boolean).join('\n');
@@ -649,7 +649,9 @@ export async function executeAgent(job, ctx, deps) {
 
   log('info', `Completed: ${job.name} (${turnResult.usage?.total_tokens || '?'} tokens)`, {
     runId: ctx.run.id,
-    durationMs: Date.now() - new Date(ctx.run.started_at.endsWith('Z') ? ctx.run.started_at.replace(' ', 'T') : ctx.run.started_at.replace(' ', 'T') + 'Z').getTime(),
+    durationMs: ctx.run.started_at
+      ? Date.now() - new Date(ctx.run.started_at.replace(' ', 'T') + (ctx.run.started_at.endsWith('Z') ? '' : 'Z')).getTime()
+      : null,
   });
 
   return result;
@@ -724,7 +726,9 @@ export async function executeStrategy(job, ctx, deps) {
         });
         getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-        dequeueJob(job.id);
+        if (dequeueJob(job.id)) {
+          log('info', `Dequeued pending dispatch for ${job.name} (after exception-retry)`);
+        }
       } else {
         log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
           jobId: job.id, runId: ctx.run.id,

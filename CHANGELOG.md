@@ -31,7 +31,7 @@ All notable changes to this project will be documented in this file.
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
 - Full validation gate moved into local verification commands (`npm run verify:local` / `npm run verify:smoke`); GitHub Actions now runs a single lightweight smoke job
 - Test baseline updated to 1037 passed
-- Schema baseline is now v20
+- Schema baseline is now v21
 
 ## [0.1.0] -- 2026-03-08
 

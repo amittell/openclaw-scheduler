@@ -677,7 +677,12 @@ async function cmdEnqueue(flags) {
     parts.push(`---`);
     parts.push(`CHECK_IN: To report progress, use curl:`);
     parts.push(`GW_TOKEN=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.openclaw/openclaw.json','utf8')).gateway.auth.token)")`);
-    parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${deliverChannel || 'telegram'}","target":"${deliverTo}","message":"📍 [${label}] <your status here>"},"sessionKey":"main"}'`);
+    // Sanitize values for safe embedding in JSON inside a shell single-quoted string
+    const safeJson = (v) => String(v || '').replace(/[\\'"\n\r]/g, '');
+    const safeChannel = safeJson(deliverChannel || 'telegram');
+    const safeTarget = safeJson(deliverTo);
+    const safeLabel = safeJson(label);
+    parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);
     parts.push(``);

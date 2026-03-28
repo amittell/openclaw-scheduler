@@ -62,6 +62,7 @@ export function getDueDispatches(limit = 100) {
     JOIN jobs j ON q.job_id = j.id
     WHERE q.status = 'pending'
       AND q.scheduled_for <= datetime('now')
+      AND (j.enabled = 1 OR q.dispatch_kind = 'manual')
     ORDER BY q.scheduled_for ASC, q.created_at ASC
     LIMIT ?
   `).all(limit);

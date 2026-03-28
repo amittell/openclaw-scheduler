@@ -328,7 +328,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
       entry.error = `max_retries_exceeded (${retryCount}x 529): ${errorMsg}`;
     });
     notify(`🌶️ Dispatch: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) — giving up`);
-    return false;
+    return { retry: false };
   }
 
   const newRetryCount = retryCount + 1;
@@ -343,7 +343,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
   // Update retryCount in labels.json BEFORE sleeping (persist intent)
   setRetryCount(label, newRetryCount);
 
-  return { delayMs, newRetryCount };
+  return { retry: true, delayMs, newRetryCount };
 }
 
 /**
@@ -867,7 +867,7 @@ while (Date.now() < deadline) {
       const retryCount = getRetryCount(label);
       const retryResult = attempt529Retry(label, retryCount, errorMsg);
 
-      if (retryResult === false) {
+      if (!retryResult.retry) {
         // Max retries exceeded — deliver error
         process.stdout.write(
           `🌶️ *dispatch* [${label}] failed after ${MAX_529_RETRIES} retries (529 overload)\n` +
