@@ -411,10 +411,11 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      await fetch(`${GATEWAY_URL}/health`, {
+      const resp = await fetch(`${GATEWAY_URL}/health`, {
         headers: authHeaders(),
         signal: AbortSignal.timeout(Math.min(intervalMs, 5000)),
       });
+      try { await resp.body?.cancel(); } catch {}
       return true; // Any response means gateway is up
     } catch {
       // Not up yet — wait and retry

@@ -15,7 +15,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 
 | File | Purpose |
 |---|---|
-| `index.mjs` | CLI entry point — 8 subcommands |
+| `index.mjs` | CLI entry point — 10 subcommands |
 | `hooks.mjs` | Lifecycle event emitter (Loki + optional HTTP webhook) |
 | `labels.json` | Local label→session ledger (gitignored) |
 | `README.md` | This file |
@@ -259,11 +259,11 @@ minute until the agent produces a reply, then delivers via the scheduler's
 
 ```
 dispatch enqueue --deliver-to <telegram-user-id>
-  → gateway agent call (deliver: false, fire-and-forget)
-  → scheduler job: dispatch-deliver:<label> (*/1 * * * *, shell, one-shot)
-  → watcher polls: node dispatch/index.mjs result --label <label>
-  → on success (exit 0): scheduler delivers output to telegram/<telegram-user-id>
-  → job self-deletes (delete_after_run: true)
+  -> gateway agent call (deliver: false, fire-and-forget)
+  -> scheduler job: <brand>-deliver:<label> (run_now: true, shell, one-shot)
+  -> watcher.mjs: long-running blocking process polls session status
+  -> on success (exit 0): scheduler delivers output to telegram/<telegram-user-id>
+  -> job auto-prunes via ttl_hours (default 48h)
 ```
 
 **Why scheduler instead of gateway `deliver:true`?**

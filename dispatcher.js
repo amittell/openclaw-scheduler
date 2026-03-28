@@ -615,6 +615,8 @@ async function tick() {
             delivery_mode: deliveryMode,
             delivery_channel: spec.delivery_channel,
             delivery_to: spec.delivery_to,
+            delivery_opt_out_reason: spec.delivery_opt_out_reason
+              || (deliveryMode === 'none' ? 'spawned-child' : null),
             delete_after_run: spec.delete_after_run !== false ? 1 : 0,
             enabled: true,
             run_timeout_ms: spec.run_timeout_ms || 300_000,
