@@ -25,10 +25,11 @@ function commandExists(cmd) {
  *
  * @param {object} env - Environment variables (defaults to process.env).
  * @param {function} exists - File existence check (defaults to existsSync).
+ * @param {function} cmdExists - Binary-in-PATH check (defaults to commandExists).
  * @returns {string} Absolute file path to the dispatch CLI entry point,
  *   or the bare binary name 'openclaw-scheduler' when found in PATH.
  */
-export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
+export function resolveDispatchCliPath(env = process.env, exists = existsSync, cmdExists = commandExists) {
   const homeDir = env.HOME || '';
   const openclawHome = env.OPENCLAW_HOME
     || (homeDir ? join(homeDir, '.openclaw') : '.openclaw');
@@ -37,7 +38,7 @@ export function resolveDispatchCliPath(env = process.env, exists = existsSync) {
   if (env.DISPATCH_CLI && exists(env.DISPATCH_CLI)) return env.DISPATCH_CLI;
 
   // Prefer installed bin in PATH (canonical entry point for npm consumers)
-  if (commandExists('openclaw-scheduler')) return 'openclaw-scheduler';
+  if (cmdExists('openclaw-scheduler')) return 'openclaw-scheduler';
 
   // Fall back to well-known file paths for dev/manual installs
   const candidates = [
