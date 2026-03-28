@@ -517,7 +517,11 @@ async function tick() {
     const dueDispatches = getDueDispatches();
     for (const dispatchRecord of dueDispatches) {
       const job = getJob(dispatchRecord.job_id);
-      if (!job || !job.enabled) {
+      if (!job) {
+        setDispatchStatus(dispatchRecord.id, 'cancelled');
+        continue;
+      }
+      if (!job.enabled && dispatchRecord.dispatch_kind !== 'manual') {
         setDispatchStatus(dispatchRecord.id, 'cancelled');
         continue;
       }
