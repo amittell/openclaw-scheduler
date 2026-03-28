@@ -37,31 +37,48 @@ export function getResolvedDbPath() {
 export async function initDb() {
   const db = getDb();
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-
-  // Apply schema once first (best effort). This is enough for net-new installs.
-  try {
-    db.exec(schema);
-  } catch (err) {
-    process.stderr.write(`${new Date().toISOString()} [db] Initial schema apply warning: ${err.message}\n`);
-  }
-
-  // Bring existing DBs to the consolidated schema version.
-  try {
-    const { default: consolidate } = await import('./migrate-consolidate.js');
-    const applied = consolidate();
-    if (applied) {
-      process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
+  const hasUserTables = (db.prepare(`
+    SELECT COUNT(*) AS cnt
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name NOT LIKE 'sqlite_%'
+  `).get()?.cnt ?? 0) > 0;
+  const applySchema = (label) => {
+    try {
+      db.exec(schema);
+      return true;
+    } catch (err) {
+      process.stderr.write(`${new Date().toISOString()} [db] ${label}: ${err.message}\n`);
+      return false;
     }
-  } catch (err) {
-    process.stderr.write(`${new Date().toISOString()} [db] migrate-consolidate error: ${err.message}\n`);
+  };
+  const runConsolidate = async () => {
+    try {
+      const { default: consolidate } = await import('./migrate-consolidate.js');
+      const applied = consolidate();
+      if (applied) {
+        process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
+      }
+    } catch (err) {
+      process.stderr.write(`${new Date().toISOString()} [db] migrate-consolidate error: ${err.message}\n`);
+    }
+  };
+
+  if (hasUserTables) {
+    // Existing installs: normalize via migration first so schema re-apply doesn't
+    // trip over legacy partial tables/indexes.
+    await runConsolidate();
+    applySchema('Schema apply warning');
+    return db;
   }
+
+  // Net-new installs: create the baseline schema, then run consolidation in case
+  // a package upgrade adds idempotent backfills the base schema doesn't need.
+  applySchema('Initial schema apply warning');
+  await runConsolidate();
 
   // Re-apply schema so indexes/table defs are fully aligned after consolidation.
-  try {
-    db.exec(schema);
-  } catch (err) {
-    process.stderr.write(`${new Date().toISOString()} [db] Schema re-apply warning: ${err.message}\n`);
-  }
+  applySchema('Schema re-apply warning');
 
   return db;
 }
