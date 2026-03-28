@@ -332,7 +332,7 @@ function readSessionsStore(agent = 'main') {
  * Reads sessions.json, finds sessions active within the last 10 minutes,
  * excludes subagent sessions, returns deliveryContext.to of the most recent one.
  *
- * @returns {string|null} - e.g. "telegram:-1003892419349", or null if not found
+ * @returns {string|null} - e.g. "telegram:-1001234567890", or null if not found
  */
 function getActiveOriginFromSessions() {
   const store = readSessionsStore("main");
@@ -362,8 +362,8 @@ function getActiveOriginFromSessions() {
       const deliveryTo = session.deliveryContext?.to || null;
       if (deliveryTo) {
         bestTime = updatedAt;
-        // deliveryContext.to format: "telegram:-1003892419349"
-        // Convert to origin format: "telegram:-1003892419349"
+        // deliveryContext.to format: "telegram:-1001234567890"
+        // Convert to origin format: "telegram:-1001234567890"
         best = deliveryTo;
       }
     }
@@ -752,6 +752,9 @@ async function cmdEnqueue(flags) {
       model:     model || null,
       thinking,
       origin:         origin || null,
+      deliverTo:      deliverTo || null,
+      deliverChannel: deliverChannel || null,
+      deliveryMode:   deliverMode || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
       // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.

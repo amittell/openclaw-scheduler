@@ -1300,6 +1300,11 @@ for (const round of steerRounds) {
       await sleep(5000);
       const st3 = dispatch('status', ['--label', label]);
       if (st3?.status === 'done') {
+        // Check if a result was captured before marking as error
+        const r4 = dispatch('result', ['--label', label]);
+        if (r4?.lastReply) {
+          deliverResult(label, r4.lastReply, st3.summary); // deliverResult calls process.exit(0)
+        }
         markLabelError(label, 'timed out — killed after steer attempts (no result captured)');
         process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts — no result captured\n`);
         process.exit(1);

@@ -2927,20 +2927,20 @@ console.log('\n── Auth Profile ──');
   // Validation: reject non-string types
   let caught = false;
   try {
-    validateJobSpec({ auth_profile: 123, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x' }, null, 'create');
+    validateJobSpec({ auth_profile: 123, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_to: '123456789' }, null, 'create');
   } catch (e) {
     caught = e.message.includes('auth_profile must be a string');
   }
   assert(caught, 'auth_profile rejects non-string types');
 
   // Whitespace-only auth_profile normalizes to null (via normalizeNullableString)
-  const wsResult = validateJobSpec({ auth_profile: '  ', name: 'ok', schedule_cron: '0 0 * * *', payload_message: 'x', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
+  const wsResult = validateJobSpec({ auth_profile: '  ', name: 'ok', schedule_cron: '0 0 * * *', payload_message: 'x', run_timeout_ms: 300_000, origin: 'system', delivery_to: '123456789' }, null, 'create');
   assert(wsResult.auth_profile === null, 'auth_profile whitespace normalizes to null');
 
   // Validation: reject boolean type
   caught = false;
   try {
-    validateJobSpec({ auth_profile: true, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x' }, null, 'create');
+    validateJobSpec({ auth_profile: true, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_to: '123456789' }, null, 'create');
   } catch (e) {
     caught = e.message.includes('auth_profile must be a string');
   }

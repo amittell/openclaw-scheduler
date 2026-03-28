@@ -18,8 +18,8 @@ function commandExists(cmd) {
 /**
  * Resolve the dispatch CLI path with backward-compatible fallbacks.
  * Priority:
- *  0) openclaw-scheduler bin (in PATH) -- preferred public interface
- *  1) DISPATCH_CLI env override
+ *  0) DISPATCH_CLI env override -- explicit override always wins
+ *  1) openclaw-scheduler bin (in PATH) -- preferred public interface for npm consumers
  *  2) $OPENCLAW_HOME/scheduler/dispatch/index.mjs
  *  3) $OPENCLAW_HOME/dispatch/index.mjs
  *

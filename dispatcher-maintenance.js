@@ -32,8 +32,10 @@ export async function checkRunHealth({
     }
   }
 
+  const staleRunIds = new Set(staleRuns.map(r => r.id));
   const timedOut = getTimedOutRuns();
   for (const run of timedOut) {
+    if (staleRunIds.has(run.id)) continue; // already handled above
     log('warn', `Timed out: ${run.job_name}`, { runId: run.id, timeoutMs: run.run_timeout_ms });
     finishRun(run.id, 'timeout', {
       error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,

@@ -323,6 +323,7 @@ switch (command) {
         break;
       }
       case 'approve': {
+        if (!args[0]) fail('Usage: jobs approve <job-id>');
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
         if (!approval) fail(`No pending approval for job: ${args[0]}`);
@@ -331,6 +332,7 @@ switch (command) {
         break;
       }
       case 'reject': {
+        if (!args[0]) fail('Usage: jobs reject <job-id> [reason]');
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
         if (!approval) fail(`No pending approval for job: ${args[0]}`);
@@ -525,7 +527,7 @@ switch (command) {
         break;
       }
       case 'read': { if (!args[0]) fail('Usage: msg read <message-id>'); markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break; }
-      case 'readall': { const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
+      case 'readall': { if (!args[0]) fail('Usage: msg readall <agent-id>'); const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
       case 'unread': { if (!args[0]) fail('Usage: msg unread <agent-id>'); const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
       default: usage();
     }
@@ -588,6 +590,7 @@ switch (command) {
       }
       case 'get': emit(getAgent(args[0])); break;
       case 'register': {
+        if (!args[0]) fail('Usage: agents register <agent-id> [name]');
         const a = upsertAgent(args[0], { name: args[1] || args[0] });
         emit({ ok: true, agent: a }, `Registered: ${fmt(a)}`);
         break;

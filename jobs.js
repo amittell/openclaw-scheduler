@@ -134,7 +134,10 @@ function validateTriggerConditionSyntax(condition) {
     } catch (err) {
       throw new Error(`Invalid trigger_condition regex: ${err.message}`, { cause: err });
     }
+    return;
   }
+  // Unknown prefix -- reject early rather than silently falling back to substring match
+  throw new Error('trigger_condition must start with "contains:" or "regex:"');
 }
 
 export function validateJobSpec(opts, currentJob = null, mode = 'create') {
@@ -234,7 +237,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     const effectiveMode = merged.delivery_mode || 'announce';
     const isAnnounceMode = ['announce', 'announce-always'].includes(effectiveMode);
 
-    if (isAnnounceMode && (modeExplicitlySet || deliveryToExplicitlySet)) {
+    if (isAnnounceMode && (mode === 'create' || modeExplicitlySet || deliveryToExplicitlySet)) {
       // Re-evaluate: if mode is being set to announce OR delivery_to is being
       // cleared on an announce-mode job, check the merged delivery_to is present.
       if (!merged.delivery_to || (typeof merged.delivery_to === 'string' && merged.delivery_to.trim() === '')) {
@@ -747,10 +750,11 @@ export function pruneExpiredJobs() {
     WHERE parent_id IS NOT NULL
       AND parent_id NOT IN (SELECT id FROM jobs)
   `).run();
-  // TTL pruning: delete jobs that have completed and are past their ttl_hours window
+  // TTL pruning: delete disabled jobs that have completed and are past their ttl_hours window
   const ttlExpired = db.prepare(`
     DELETE FROM jobs
     WHERE ttl_hours IS NOT NULL
+      AND enabled = 0
       AND last_status IN ('ok', 'error', 'timeout')
       AND last_run_at IS NOT NULL
       AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
@@ -799,8 +803,8 @@ export function evalTriggerCondition(condition, content) {
       return false; // Invalid regex never matches
     }
   }
-  // Unknown prefix — treat as literal substring match for safety
-  return str.includes(condition);
+  // Unknown prefix — unreachable: validateTriggerConditionSyntax rejects these at write time
+  return false;
 }
 
 /**
@@ -850,8 +854,12 @@ export function dequeueJob(jobId) {
   if (!job || job.queued_count <= 0) return false;
   const db = getDb();
   db.prepare('UPDATE jobs SET queued_count = queued_count - 1 WHERE id = ?').run(jobId);
-  // Schedule it to fire on the next tick
-  db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(jobId);
+  // Schedule it to fire on the next tick -- but not for at-jobs, which are one-shot
+  // and will be disabled by updateJobAfterRun. Setting next_run_at here would cause
+  // getDueAtJobs to re-fire an already-completed at-job.
+  if (job.schedule_kind !== 'at') {
+    db.prepare(`UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`).run(jobId);
+  }
   return true;
 }
 
