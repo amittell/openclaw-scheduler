@@ -141,6 +141,15 @@ This installs the package without cloning the repo. The launcher command maps to
 
 For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather than `node_modules/openclaw-scheduler/`, so upgrades do not trample the database path.
 
+If your Node runtime changes later, rebuild the native SQLite binding before restarting the scheduler:
+
+```bash
+cd ~/.openclaw/scheduler
+npm rebuild better-sqlite3
+```
+
+This is commonly needed after a Homebrew Node upgrade on macOS or any major Node ABI change.
+
 ### Option B: source clone (dev/contributor flow)
 
 ```bash

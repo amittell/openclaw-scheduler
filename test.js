@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, renameSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -89,36 +89,6 @@ async function stopChild(child) {
 setDbPath(':memory:');
 await initDb();
 const db = getDb();
-
-// ── Production labels.json safety cleanup ────────────────────
-// Ensures test-* labels never accumulate in the real dispatch/labels.json.
-// All watcher/dispatch tests use isolated DISPATCH_LABELS_PATH env vars, but
-// this acts as a belt-and-suspenders guard against leftover entries from any
-// past or future test runs that might trigger isGatewayRestartKill() on gateway restart.
-const PRODUCTION_LABELS_PATH = join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'labels.json');
-
-function scrubTestLabels(path) {
-  if (!existsSync(path)) return 0;
-  try {
-    const data = JSON.parse(readFileSync(path, 'utf-8'));
-    const testKeys = Object.keys(data).filter(k => /^test-/.test(k));
-    if (testKeys.length === 0) return 0;
-    for (const k of testKeys) delete data[k];
-    const tmp = path + '.tmp.' + process.pid;
-    writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-    renameSync(tmp, path); // atomic, same as dispatch internals
-    return testKeys.length;
-  } catch {
-    return 0;
-  }
-}
-
-// Run cleanup at start and register exit cleanup
-const startScrubbed = scrubTestLabels(PRODUCTION_LABELS_PATH);
-if (startScrubbed > 0) {
-  console.log(`⚠️  Removed ${startScrubbed} stale test-* label(s) from production labels.json`);
-}
-process.on('exit', () => scrubTestLabels(PRODUCTION_LABELS_PATH));
 
 console.log('🧪 Scheduler v2 test suite\n');
 

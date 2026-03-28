@@ -57,6 +57,15 @@ Installs `better-sqlite3` (native, compiles for your arch) and `croner`.
 
 If `better-sqlite3` fails: `xcode-select --install` (macOS).
 
+If Node changes later on this host, rebuild the native binding before restarting the scheduler:
+
+```bash
+cd ~/.openclaw/scheduler
+npm rebuild better-sqlite3
+```
+
+This is especially common after `brew upgrade node` on macOS or any major Node version switch.
+
 ---
 
 ## Step 3: Run Tests
