@@ -472,7 +472,7 @@ export async function prepareDispatch(job, opts, deps) {
           // Get parent session from last run or re-resolve
           let parentSession = null;
           const lastRun = getDatabase().prepare(
-            'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1'
+            'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1'
           ).get(parentJob.id, 'ok');
 
           if (lastRun?.identity_resolved) {
