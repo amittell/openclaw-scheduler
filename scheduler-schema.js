@@ -46,11 +46,43 @@ export const SCHEDULER_SCHEMAS = {
       delivery_opt_out_reason: { type: 'string', nullable: true, maxLength: 256 },
       delete_after_run: { type: 'boolean', default: false },
       run_now: { type: 'boolean', default: false, note: 'create-time convenience flag' },
+
+      // v0.2 Identity
+      identity_principal: { type: 'string', nullable: true },
+      identity_run_as: { type: 'string', nullable: true },
+      identity_attestation: { type: 'string', nullable: true },
+      identity_ref: { type: 'string', nullable: true },
+      identity_subject_kind: { type: 'string', enum: ['agent', 'service', 'workload', 'user', 'composite', 'delegated-agent', 'unknown'], nullable: true },
+      identity_subject_principal: { type: 'string', nullable: true },
+      identity_trust_level: { type: 'string', enum: ['untrusted', 'restricted', 'supervised', 'autonomous'], nullable: true },
+      identity_delegation_mode: { type: 'string', enum: ['none', 'on-behalf-of', 'impersonation'], nullable: true },
+      identity: { type: 'string', nullable: true, description: 'JSON blob: full identity declaration' },
+
+      // v0.2 Authorization Proof
+      authorization_proof_ref: { type: 'string', nullable: true },
+      authorization_proof: { type: 'string', nullable: true, description: 'JSON blob: authorization proof structure' },
+
+      // v0.2 Authorization
+      authorization_ref: { type: 'string', nullable: true },
+      authorization: { type: 'string', nullable: true, description: 'JSON blob: authorization policy declaration' },
+
+      // v0.2 Evidence
+      evidence_ref: { type: 'string', nullable: true },
+      evidence: { type: 'string', nullable: true, description: 'JSON blob: evidence collection declaration' },
+
+      // v0.2 Contract
+      contract_required_trust_level: { type: 'string', enum: ['untrusted', 'restricted', 'supervised', 'autonomous'], nullable: true },
+      contract_trust_enforcement: { type: 'string', enum: ['none', 'warn', 'block'], nullable: true },
+      contract_sandbox: { type: 'string', nullable: true, description: 'JSON blob: sandbox constraints' },
+      contract_allowed_paths: { type: 'string', nullable: true, description: 'JSON blob: allowed filesystem paths' },
+      contract_network: { type: 'string', nullable: true, description: 'JSON blob: network access policy' },
+      contract_max_cost_usd: { type: 'number', nullable: true, min: 0 },
+      contract_audit: { type: 'string', nullable: true, description: 'JSON blob: audit configuration' },
     },
   },
   runs: {
     statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary'],
   },
   approvals: {
     statuses: ['pending', 'approved', 'rejected', 'timed_out', 'dispatched'],
