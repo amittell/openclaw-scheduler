@@ -123,9 +123,9 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   // 1c. Provider cleanup
   if (ctx.materializationCleanup) {
     try {
-      const { provider } = ctx.materializationCleanup;
+      const { provider, cleanupState } = ctx.materializationCleanup;
       if (typeof provider.cleanup === 'function') {
-        await provider.cleanup(ctx.materializationCleanup, { env: process.env });
+        await provider.cleanup(cleanupState, { env: process.env, cwd: process.cwd() });
       }
     } catch (err) {
       log('warn', `Provider cleanup failed for ${job.name}: ${err.message}`, { jobId: job.id });
@@ -535,6 +535,17 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
+  if (v02Outcomes.identity_resolved?.source === 'provider-error') {
+    return abortPreparedRun(
+      job,
+      run,
+      'Identity resolution failed: ' + (v02Outcomes.identity_resolved.error || 'provider error'),
+      v02Outcomes,
+      { dispatchRecord, idemKey },
+      deps,
+    );
+  }
+
   if (hasV02Identity || hasV02Contract || v02Outcomes.identity_resolved != null) {
     v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
     if (v02Outcomes.trust_evaluation?.decision === 'warn') {
@@ -558,10 +569,17 @@ export async function prepareDispatch(job, opts, deps) {
   if (job.authorization_proof || job.authorization_proof_ref) {
     v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
     if (v02Outcomes.authorization_proof_verification?.verified === false) {
-      log('warn', `Authorization proof verification failed for ${job.name}: ${v02Outcomes.authorization_proof_verification.error || 'verification returned false'}`, {
-        jobId: job.id,
-        runId: run.id,
-      });
+      const proofError = v02Outcomes.authorization_proof_verification.error || 'verification returned false';
+      // Proof verification failure is blocking: the job declared a proof
+      // requirement, so proceeding without a valid proof violates policy.
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization proof verification failed: ' + proofError,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+      );
     }
   }
 
@@ -580,6 +598,18 @@ export async function prepareDispatch(job, opts, deps) {
         deps,
       );
     }
+    if (v02Outcomes.authorization_decision?.decision === 'escalate') {
+      // Escalation means the authorization provider wants a human decision.
+      // Abort the dispatch so the approval system (or operator) can intervene.
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization requires escalation: ' + (v02Outcomes.authorization_decision.reason || 'provider requested escalation'),
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+      );
+    }
   }
 
   // Materialization phase
@@ -593,17 +623,20 @@ export async function prepareDispatch(job, opts, deps) {
       try {
         const identityBlob = safeParse(job.identity) || {};
         const presentation = identityBlob.presentation || {};
-        const matResult = provider.materialize(
+        const matResult = await provider.materialize(
           v02Outcomes.identity_resolved.session,
           presentation,
           { env: process.env, cwd: process.cwd() }
         );
-        if (matResult.materialized) {
+        if (matResult?.materialized) {
           materializedEnv = matResult.env_vars || null;
           if (matResult.cleanup_required) {
             materializationCleanup = {
               provider,
-              session: v02Outcomes.identity_resolved.session,
+              cleanupState: {
+                session: v02Outcomes.identity_resolved.session,
+                ...matResult,
+              },
             };
           }
         }
