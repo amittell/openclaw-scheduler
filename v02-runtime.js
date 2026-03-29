@@ -47,9 +47,10 @@ function trustIndex(level) {
 
 /**
  * Extract and normalize identity declaration from a job record.
- * When ctx.getIdentityProvider is available and the identity blob references
- * a provider, the provider is called first. Structural resolution is the
- * fallback for jobs that do not reference a provider or when no ctx is given.
+ * When the identity blob references a provider, that provider must be
+ * available in ctx. Provider-backed declarations fail closed when the plugin
+ * is missing or errors. Structural resolution is the fallback only for jobs
+ * that do not reference a provider.
  *
  * @param {object} job - Job record with v0.2 identity fields.
  * @param {object} [ctx={}] - Optional context with provider accessors.
@@ -74,6 +75,14 @@ export async function resolveIdentity(job, ctx = {}) {
 
   if (providerName) {
     const provider = ctx.getIdentityProvider?.(providerName);
+    if (!provider) {
+      return {
+        provider: providerName,
+        error: `identity provider not loaded: ${providerName}`,
+        transient: false,
+        source: 'provider-error',
+      };
+    }
     if (provider) {
       try {
         const scope = blob?.scope || blob?.auth?.scopes?.[0] || null;
@@ -248,9 +257,10 @@ const KNOWN_PROOF_METHODS = ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 
 
 /**
  * Validate authorization proof structure.
- * When ctx.getProofVerifier is available and the proof blob references a
- * provider, the verifier is called first. Structural validation is the
- * fallback.
+ * When the proof blob references a provider or verifier, that verifier must be
+ * available in ctx. Provider-backed verification fails closed when the plugin
+ * is missing or errors. Structural validation is the fallback only for proofs
+ * without an explicit verifier.
  *
  * @param {object} job - Job record with v0.2 authorization_proof fields.
  * @param {object} [ctx={}] - Optional context with provider accessors.
@@ -287,6 +297,16 @@ export async function verifyAuthorizationProof(job, ctx = {}) {
   const verifierName = blob.verifier || blob.provider || null;
   if (verifierName) {
     const verifier = ctx.getProofVerifier?.(verifierName);
+    if (!verifier) {
+      return {
+        verified: false,
+        method,
+        ref: blobRef,
+        error: `proof verifier not loaded: ${verifierName}`,
+        source: 'provider-error',
+        provider: verifierName,
+      };
+    }
     if (verifier) {
       try {
         const result = await verifier.verifyProof(
@@ -334,9 +354,10 @@ export async function verifyAuthorizationProof(job, ctx = {}) {
 
 /**
  * Evaluate authorization policy.
- * When ctx.getAuthorizationProvider is available and the authorization blob
- * references a provider, the provider is called first. Structural evaluation
- * is the fallback.
+ * When the authorization blob references a provider, that provider must be
+ * available in ctx. Provider-backed authorization fails closed when the
+ * plugin is missing or errors. Structural evaluation is the fallback only for
+ * policies without an explicit provider.
  *
  * @param {object} job - Job record with v0.2 authorization fields.
  * @param {object|null} identityResult - Output of resolveIdentity().
@@ -374,6 +395,15 @@ export async function evaluateAuthorization(job, identityResult, trustResult, ct
   const providerName = blob.provider || blob.authorization_provider || null;
   if (providerName) {
     const provider = ctx.getAuthorizationProvider?.(providerName);
+    if (!provider) {
+      return {
+        decision: 'deny',
+        reason: `authorization provider not loaded: ${providerName}`,
+        ref: blobRef,
+        source: 'provider-error',
+        provider: providerName,
+      };
+    }
     if (provider) {
       try {
         const result = await provider.authorize(
