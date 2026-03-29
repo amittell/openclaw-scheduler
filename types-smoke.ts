@@ -383,7 +383,8 @@ void v02Finish;
 
 // ---- v0.2 Runtime module ----
 void v02Runtime.TRUST_LEVELS;
-const identity: ResolvedIdentity | null = v02Runtime.resolveIdentity({ identity_principal: 'test' });
+const identityP: Promise<ResolvedIdentity | null> = v02Runtime.resolveIdentity({ identity_principal: 'test' });
+const identity: ResolvedIdentity | null = null as unknown as Awaited<typeof identityP>;
 if (identity) {
   void identity.subject_kind;
   void identity.principal;
@@ -394,10 +395,12 @@ if (identity) {
 const trust: TrustEvaluation = v02Runtime.evaluateTrust({}, identity);
 void trust.effective_level; void trust.required_level; void trust.decision; void trust.reason;
 
-const proofResult: AuthorizationProofResult | null = v02Runtime.verifyAuthorizationProof({});
+const proofResultP: Promise<AuthorizationProofResult | null> = v02Runtime.verifyAuthorizationProof({});
+const proofResult: AuthorizationProofResult | null = null as unknown as Awaited<typeof proofResultP>;
 if (proofResult) { void proofResult.verified; void proofResult.method; void proofResult.ref; }
 
-const authResult: AuthorizationResult | null = v02Runtime.evaluateAuthorization({}, identity, trust);
+const authResultP: Promise<AuthorizationResult | null> = v02Runtime.evaluateAuthorization({}, identity, trust);
+const authResult: AuthorizationResult | null = null as unknown as Awaited<typeof authResultP>;
 if (authResult) { void authResult.decision; void authResult.reason; void authResult.ref; }
 
 const evidenceResult: EvidenceResult | null = v02Runtime.generateEvidence({}, null, null);

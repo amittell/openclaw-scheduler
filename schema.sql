@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 22)
+-- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 23)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -128,6 +128,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   contract_network              TEXT DEFAULT NULL,
   contract_max_cost_usd         REAL DEFAULT NULL,
   contract_audit                TEXT DEFAULT NULL,
+
+  -- v0.2 Child Credential Policy (v23)
+  child_credential_policy   TEXT DEFAULT NULL,
 
   -- Watchdog monitoring (v13)
   job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
@@ -450,8 +453,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-22 (all columns already in schema above).
--- Existing installs are brought up to v22 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-23 (all columns already in schema above).
+-- Existing installs are brought up to v23 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -474,3 +477,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (19);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (20);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (21);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (22);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (23);

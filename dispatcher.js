@@ -87,6 +87,9 @@ import {
   executeStrategy,
   finalizeDispatch,
 } from './dispatcher-strategies.js';
+import {
+  loadProviders, getIdentityProvider, getAuthorizationProvider, getProofVerifier,
+} from './provider-registry.js';
 
 // ── Idempotency Key Wrappers ────────────────────────────────
 // The shared module (idempotency.js) uses jobId strings; dispatcher wraps with job objects.
@@ -314,6 +317,10 @@ function buildDispatchDeps() {
     resolveIdentity, evaluateTrust, verifyAuthorizationProof,
     evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
     persistV02Outcomes,
+    // Provider registry
+    getIdentityProvider,
+    getAuthorizationProvider,
+    getProofVerifier,
   };
 }
 
@@ -806,6 +813,11 @@ async function main() {
   });
 
   await initDb();
+
+  // Load provider plugins if configured
+  if (process.env.SCHEDULER_PROVIDER_PATH) {
+    await loadProviders(process.env.SCHEDULER_PROVIDER_PATH);
+  }
 
   // Register default agent
   upsertAgent('main', { name: 'Main Agent', status: 'idle', capabilities: ['*'] });

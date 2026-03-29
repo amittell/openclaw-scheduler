@@ -40,6 +40,16 @@ export function makeDefaultResult() {
   };
 }
 
+/** Safely parse a JSON string. Returns parsed value or null on failure. */
+function safeParse(str) {
+  if (str == null || str === '') return null;
+  try {
+    return JSON.parse(str);
+  } catch (_e) {
+    return null;
+  }
+}
+
 /**
  * Uniform post-execution ceremony. Processes the DispatchResult from any strategy.
  *
@@ -73,6 +83,18 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       if (evidence) ctx.v02Outcomes.evidence_record = evidence;
     }
     persistV02Outcomes(ctx.run.id, ctx.v02Outcomes);
+  }
+
+  // 1c. Provider cleanup
+  if (ctx.materializationCleanup) {
+    try {
+      const { provider } = ctx.materializationCleanup;
+      if (typeof provider.cleanup === 'function') {
+        await provider.cleanup(ctx.materializationCleanup, { env: process.env });
+      }
+    } catch (err) {
+      log('warn', `Provider cleanup failed for ${job.name}: ${err.message}`, { jobId: job.id });
+    }
   }
 
   // 2. Idempotency key management
@@ -367,12 +389,21 @@ export async function prepareDispatch(job, opts, deps) {
     releaseIdempotencyKey: releaseIdemKey,
   } = deps;
 
+  // Build provider context for v0.2 runtime calls
+  const providerCtx = {
+    getIdentityProvider: deps.getIdentityProvider,
+    getAuthorizationProvider: deps.getAuthorizationProvider,
+    getProofVerifier: deps.getProofVerifier,
+    env: process.env,
+    cwd: process.cwd(),
+  };
+
   const v02Outcomes = {};
   const hasV02Identity = job.identity || job.identity_trust_level || job.identity_ref;
   const hasV02Contract = job.contract_required_trust_level;
 
   if (hasV02Identity || hasV02Contract) {
-    v02Outcomes.identity_resolved = resolveIdentity(job);
+    v02Outcomes.identity_resolved = await resolveIdentity(job, providerCtx);
     v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
 
     if (v02Outcomes.trust_evaluation && v02Outcomes.trust_evaluation.decision === 'deny') {
@@ -388,12 +419,12 @@ export async function prepareDispatch(job, opts, deps) {
   }
 
   if (job.authorization_proof || job.authorization_proof_ref) {
-    v02Outcomes.authorization_proof_verification = verifyAuthorizationProof(job);
+    v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
   }
 
   if (job.authorization || job.authorization_ref) {
-    v02Outcomes.authorization_decision = evaluateAuthorization(
-      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation
+    v02Outcomes.authorization_decision = await evaluateAuthorization(
+      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation, providerCtx
     );
 
     if (v02Outcomes.authorization_decision && v02Outcomes.authorization_decision.decision === 'deny') {
@@ -413,7 +444,122 @@ export async function prepareDispatch(job, opts, deps) {
     if (handoff) v02Outcomes.credential_handoff_summary = handoff;
   }
 
-  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes };
+  // Child credential policy enforcement
+  if (job.parent_id && hasV02Identity) {
+    const { getDb: getDatabase } = deps;
+    const parentJob = getDatabase().prepare(
+      'SELECT id, child_credential_policy, identity, auth_profile FROM jobs WHERE id = ?'
+    ).get(job.parent_id);
+
+    if (parentJob) {
+      const effectivePolicy = job.child_credential_policy
+        || parentJob.child_credential_policy
+        || 'none';
+
+      if (effectivePolicy === 'none') {
+        // No credentials from parent; suppress any identity the child resolved on its own
+        v02Outcomes.identity_resolved = null;
+      } else if (effectivePolicy === 'inherit' && parentJob.auth_profile) {
+        // Inherit parent's auth profile
+        job.auth_profile = parentJob.auth_profile;
+      } else if (effectivePolicy === 'downscope') {
+        // Downscope: resolve narrower credentials via provider
+        const parentIdentityBlob = safeParse(parentJob.identity);
+        const providerName = parentIdentityBlob?.provider || parentIdentityBlob?.auth?.provider;
+        const provider = deps.getIdentityProvider?.(providerName);
+
+        if (provider && typeof provider.prepareHandoff === 'function') {
+          // Get parent session from last run or re-resolve
+          let parentSession = null;
+          const lastRun = getDatabase().prepare(
+            'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1'
+          ).get(parentJob.id, 'ok');
+
+          if (lastRun?.identity_resolved) {
+            const parsed = safeParse(lastRun.identity_resolved);
+            parentSession = parsed?.session || null;
+          }
+
+          if (!parentSession && provider.resolveSession) {
+            // Fallback: re-resolve parent identity
+            try {
+              const parentScope = parentIdentityBlob?.scope || parentIdentityBlob?.auth?.scopes?.[0] || null;
+              const reResolved = await provider.resolveSession(
+                { profile: parentIdentityBlob, instanceId: parentJob.id, scope: parentScope },
+                { env: process.env, cwd: process.cwd() }
+              );
+              if (reResolved.ok) parentSession = reResolved.session;
+            } catch (_err) { /* fall through */ }
+          }
+
+          if (parentSession) {
+            const childIdentityBlob = safeParse(job.identity) || {};
+            const childScope = childIdentityBlob?.scope || childIdentityBlob?.auth?.scopes?.[0] || null;
+
+            try {
+              const handoffResult = await provider.prepareHandoff(
+                parentSession,
+                { target_scope: childScope, parent_profile: parentIdentityBlob },
+                { env: process.env, cwd: process.cwd() }
+              );
+
+              if (handoffResult.prepared) {
+                // Override the identity resolution with the handoff session
+                v02Outcomes.identity_resolved = {
+                  provider: providerName,
+                  session: handoffResult.session,
+                  source: 'provider',
+                  subject_kind: handoffResult.session?.subject?.kind || 'unknown',
+                  principal: handoffResult.session?.subject?.principal || null,
+                  trust_level: handoffResult.session?.trust?.effective_level || null,
+                  delegation_mode: null,
+                  raw: childIdentityBlob,
+                };
+              } else {
+                log('warn', `Downscope handoff failed for ${job.name}: ${handoffResult.error}`, { jobId: job.id });
+              }
+            } catch (err) {
+              log('warn', `Downscope handoff error for ${job.name}: ${err.message}`, { jobId: job.id });
+            }
+          }
+        }
+      }
+      // 'independent': uses child's own identity (no parent involvement)
+    }
+  }
+
+  // Materialization phase
+  let materializedEnv = null;
+  let materializationCleanup = null;
+
+  if (v02Outcomes.identity_resolved?.source === 'provider' && v02Outcomes.identity_resolved.session) {
+    const providerName = v02Outcomes.identity_resolved.provider;
+    const provider = deps.getIdentityProvider?.(providerName);
+    if (provider && typeof provider.materialize === 'function') {
+      try {
+        const identityBlob = safeParse(job.identity) || {};
+        const presentation = identityBlob.presentation || {};
+        const matResult = provider.materialize(
+          v02Outcomes.identity_resolved.session,
+          presentation,
+          { env: process.env, cwd: process.cwd() }
+        );
+        if (matResult.materialized) {
+          materializedEnv = matResult.env_vars || null;
+          if (matResult.cleanup_required) {
+            materializationCleanup = {
+              provider,
+              session: v02Outcomes.identity_resolved.session,
+            };
+          }
+        }
+      } catch (err) {
+        log('warn', `Materialization failed for ${job.name}: ${err.message}`, { jobId: job.id });
+      }
+    }
+  }
+
+  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes, materializedEnv, materializationCleanup };
 }
 
 // ── Strategy: Watchdog ──────────────────────────────────────
@@ -550,7 +696,7 @@ export async function executeShell(job, ctx, deps) {
   const { runShellCommand, normalizeShellResult, log } = deps;
   const result = makeDefaultResult();
 
-  const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms);
+  const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms, ctx.materializedEnv || null);
   const shellResult = normalizeShellResult(shellExec, {
     runId: ctx.run.id,
     timeoutMs: job.run_timeout_ms,

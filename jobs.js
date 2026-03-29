@@ -54,6 +54,7 @@ const PATCHABLE_COLUMNS = new Set([
   'contract_required_trust_level', 'contract_trust_enforcement',
   'contract_sandbox', 'contract_allowed_paths', 'contract_network',
   'contract_max_cost_usd', 'contract_audit',
+  'child_credential_policy',
 ]);
 
 function applyJobPatch(jobId, patch) {
@@ -218,6 +219,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'contract_allowed_paths',
     'contract_network',
     'contract_audit',
+    'child_credential_policy',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -437,6 +439,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   assertSafeString('contract_audit', merged.contract_audit, { maxLength: 128 });
 
+  // --- v0.2 Child Credential Policy ---
+  assertEnum('child_credential_policy', merged.child_credential_policy,
+    new Set(['none', 'inherit', 'downscope', 'independent']),
+    { nullable: true });
+
   // Watchdog-specific validations
   if (merged.job_type === 'watchdog') {
     if (!merged.watchdog_check_cmd) {
@@ -627,7 +634,8 @@ export function createJob(opts) {
       evidence_ref, evidence,
       contract_required_trust_level, contract_trust_enforcement,
       contract_sandbox, contract_allowed_paths, contract_network,
-      contract_max_cost_usd, contract_audit
+      contract_max_cost_usd, contract_audit,
+      child_credential_policy
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -657,7 +665,8 @@ export function createJob(opts) {
       ?, ?,
       ?, ?,
       ?, ?, ?,
-      ?, ?
+      ?, ?,
+      ?
     )
   `);
 
@@ -740,7 +749,8 @@ export function createJob(opts) {
     normalized.contract_allowed_paths || null,
     normalized.contract_network || null,
     normalized.contract_max_cost_usd ?? null,
-    normalized.contract_audit || null
+    normalized.contract_audit || null,
+    normalized.child_credential_policy || null
   );
 
   return getJob(id);
@@ -804,6 +814,7 @@ export function updateJob(id, patch) {
     'contract_required_trust_level', 'contract_trust_enforcement',
     'contract_sandbox', 'contract_allowed_paths', 'contract_network',
     'contract_max_cost_usd', 'contract_audit',
+    'child_credential_policy',
   ];
 
   // Cycle detection if parent_id is being changed

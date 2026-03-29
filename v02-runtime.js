@@ -47,17 +47,66 @@ function trustIndex(level) {
 
 /**
  * Extract and normalize identity declaration from a job record.
+ * When ctx.getIdentityProvider is available and the identity blob references
+ * a provider, the provider is called first. Structural resolution is the
+ * fallback for jobs that do not reference a provider or when no ctx is given.
  *
  * @param {object} job - Job record with v0.2 identity fields.
- * @returns {{ subject_kind, principal, trust_level, delegation_mode, raw }}
- *          or null if no identity is declared.
+ * @param {object} [ctx={}] - Optional context with provider accessors.
+ * @returns {Promise<{ subject_kind, principal, trust_level, delegation_mode, raw } | null>}
  */
-export function resolveIdentity(job) {
+export async function resolveIdentity(job, ctx = {}) {
   if (!job) return null;
 
   // Attempt to parse the JSON blob first; scalar fields serve as fallback.
   const parseErr = {};
   const blob = safeParse(job.identity, parseErr);
+
+  // Try provider-based resolution before structural fallback.
+  const providerName = (blob && typeof blob === 'object' && !Array.isArray(blob))
+    ? (blob.provider || blob.auth?.provider || null)
+    : null;
+
+  if (providerName) {
+    const provider = ctx.getIdentityProvider?.(providerName);
+    if (provider) {
+      try {
+        const scope = blob?.scope || blob?.auth?.scopes?.[0] || null;
+        const result = await provider.resolveSession(
+          { profile: blob, instanceId: job.id, scope },
+          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+        );
+        if (!result.ok) {
+          return {
+            provider: providerName,
+            error: result.error,
+            transient: result.transient ?? true,
+            source: 'provider-error',
+          };
+        }
+        return {
+          provider: providerName,
+          session: result.session,
+          source: 'provider',
+          // Include structural fields for backward compat
+          subject_kind: result.session?.subject?.kind || 'unknown',
+          principal: result.session?.subject?.principal || null,
+          trust_level: result.session?.trust?.effective_level || blob?.trust?.level || null,
+          delegation_mode: blob?.subject?.delegation_mode || null,
+          raw: blob,
+        };
+      } catch (err) {
+        return {
+          provider: providerName,
+          error: err.message,
+          transient: true,
+          source: 'provider-error',
+        };
+      }
+    }
+  }
+
+  // Fallback: structural resolution (original logic).
 
   if (parseErr.message && job.identity != null && job.identity !== '') {
     // The blob was present but malformed -- report the error while still
@@ -188,12 +237,15 @@ const KNOWN_PROOF_METHODS = ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 
 
 /**
  * Validate authorization proof structure.
- * MVP: structural validation only -- no cryptographic verification.
+ * When ctx.getProofVerifier is available and the proof blob references a
+ * provider, the verifier is called first. Structural validation is the
+ * fallback.
  *
  * @param {object} job - Job record with v0.2 authorization_proof fields.
- * @returns {{ verified: boolean, method, ref, error? }} or null if no proof declared.
+ * @param {object} [ctx={}] - Optional context with provider accessors.
+ * @returns {Promise<{ verified: boolean, method, ref, error? } | null>}
  */
-export function verifyAuthorizationProof(job) {
+export async function verifyAuthorizationProof(job, ctx = {}) {
   if (!job) return null;
 
   const proofStr = job.authorization_proof;
@@ -220,6 +272,39 @@ export function verifyAuthorizationProof(job) {
   const method = blob.method || null;
   const blobRef = blob.ref || proofRef;
 
+  // Try provider-based verification before structural fallback.
+  const verifierName = blob.verifier || blob.provider || null;
+  if (verifierName) {
+    const verifier = ctx.getProofVerifier?.(verifierName);
+    if (verifier) {
+      try {
+        const result = await verifier.verifyProof(
+          { proof: blob, ref: blobRef, jobId: job.id },
+          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+        );
+        return {
+          verified: !!result.verified,
+          method,
+          ref: blobRef,
+          source: 'provider',
+          provider: verifierName,
+          ...(result.error ? { error: result.error } : {}),
+        };
+      } catch (err) {
+        return {
+          verified: false,
+          method,
+          ref: blobRef,
+          error: err.message,
+          source: 'provider-error',
+          provider: verifierName,
+        };
+      }
+    }
+  }
+
+  // Fallback: structural validation (original logic).
+
   if (!method) {
     return { verified: false, method: null, ref: blobRef, error: 'authorization_proof missing required "method" field' };
   }
@@ -238,16 +323,17 @@ export function verifyAuthorizationProof(job) {
 
 /**
  * Evaluate authorization policy.
- * MVP: structural validation and basic decision propagation. No external
- * provider calls (OPA, Cedar, etc.) -- those are future work.
+ * When ctx.getAuthorizationProvider is available and the authorization blob
+ * references a provider, the provider is called first. Structural evaluation
+ * is the fallback.
  *
  * @param {object} job - Job record with v0.2 authorization fields.
  * @param {object|null} identityResult - Output of resolveIdentity().
  * @param {object|null} trustResult - Output of evaluateTrust().
- * @returns {{ decision: 'permit'|'deny'|'escalate', reason, ref }} or null if
- *          no authorization declared.
+ * @param {object} [ctx={}] - Optional context with provider accessors.
+ * @returns {Promise<{ decision: 'permit'|'deny'|'escalate', reason, ref } | null>}
  */
-export function evaluateAuthorization(job, identityResult, trustResult) {
+export async function evaluateAuthorization(job, identityResult, trustResult, ctx = {}) {
   if (!job) return null;
 
   const authStr = job.authorization;
@@ -272,6 +358,37 @@ export function evaluateAuthorization(job, identityResult, trustResult) {
   }
 
   const blobRef = blob.ref || authRef;
+
+  // Try provider-based authorization before structural fallback.
+  const providerName = blob.provider || blob.authorization_provider || null;
+  if (providerName) {
+    const provider = ctx.getAuthorizationProvider?.(providerName);
+    if (provider) {
+      try {
+        const result = await provider.authorize(
+          { policy: blob, identity: identityResult, trust: trustResult, ref: blobRef, jobId: job.id },
+          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+        );
+        return {
+          decision: result.decision || 'deny',
+          reason: result.reason || `provider ${providerName} returned ${result.decision}`,
+          ref: blobRef,
+          source: 'provider',
+          provider: providerName,
+        };
+      } catch (err) {
+        return {
+          decision: 'deny',
+          reason: `authorization provider error: ${err.message}`,
+          ref: blobRef,
+          source: 'provider-error',
+          provider: providerName,
+        };
+      }
+    }
+  }
+
+  // Fallback: structural evaluation (original logic).
 
   // If the blob contains an explicit decision, honor it.
   if (blob.decision === 'deny') {

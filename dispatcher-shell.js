@@ -12,11 +12,11 @@ export const DEFAULT_SHELL = process.env.SCHEDULER_SHELL
       ? 'cmd.exe'
       : '/bin/bash');
 
-export function runShellCommand(cmd, timeoutMs = 300000) {
+export function runShellCommand(cmd, timeoutMs = 300000, env = null) {
   if (!cmd || typeof cmd !== 'string') throw new Error('Shell command must be a non-empty string');
   const safeTimeout = (Number.isFinite(timeoutMs) && timeoutMs > 0) ? timeoutMs : 300_000;
   return new Promise((resolve) => {
-    execCb(cmd, { timeout: safeTimeout, maxBuffer: 64 * 1024 * 1024, shell: DEFAULT_SHELL }, (err, stdout, stderr) => {
+    execCb(cmd, { timeout: safeTimeout, maxBuffer: 64 * 1024 * 1024, shell: DEFAULT_SHELL, env: env ? { ...process.env, ...env } : undefined }, (err, stdout, stderr) => {
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',

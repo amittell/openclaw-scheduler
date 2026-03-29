@@ -473,6 +473,47 @@ if (!v1Threw) {
   assert(v1Fetched.payload_message === 'uptime', 'v1 payload_message persists');
 }
 
+// ═══════════════════════════════════════════════════════════════
+// (f) child_credential_policy field stored in scheduler
+// ═══════════════════════════════════════════════════════════════
+
+console.log('\nchild_credential_policy field stored in scheduler:');
+
+{
+  const ccpSpec = {
+    id: 'test-ccp-stored',
+    name: 'ccp storage test',
+    schedule_cron: '0 9 * * *',
+    schedule_tz: 'UTC',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo ccp',
+    run_timeout_ms: 30000,
+    delivery_mode: 'none',
+    origin: 'test',
+    child_credential_policy: 'downscope',
+  };
+
+  let ccpValidated;
+  let ccpThrew = false;
+  try {
+    ccpValidated = validateJobSpec(ccpSpec, null, 'create');
+  } catch (err) {
+    ccpThrew = true;
+    console.error(`    validateJobSpec threw for ccp spec: ${err.message}`);
+  }
+  assert(!ccpThrew, 'child_credential_policy spec validates without error');
+
+  if (!ccpThrew) {
+    const ccpCreated = createJob(ccpValidated);
+    assert(ccpCreated != null, 'child_credential_policy job created');
+
+    const ccpFetched = getJob(ccpCreated.id);
+    assert(ccpFetched != null, 'child_credential_policy job fetched');
+    assert(ccpFetched.child_credential_policy === 'downscope', 'child_credential_policy round-trips as downscope');
+  }
+}
+
 // ── Summary ───────────────────────────────────────────────────
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
