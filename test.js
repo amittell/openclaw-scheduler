@@ -7537,6 +7537,14 @@ console.log('\n── v0.2 verifyAuthorizationProof ──');
   });
   assert(unknownMethod.verified === false, 'verifyAuthorizationProof: unknown method verified is false');
   assert(unknownMethod.error.includes('unrecognized'), 'verifyAuthorizationProof: unknown method error message');
+
+  // Explicit verifier with no loaded plugin -> fail closed
+  const missingVerifier = await verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+  }, {});
+  assert(missingVerifier.verified === false, 'verifyAuthorizationProof: missing explicit verifier fails closed');
+  assert(missingVerifier.source === 'provider-error', 'verifyAuthorizationProof: missing explicit verifier reports provider-error');
+  assert(missingVerifier.error.includes('not loaded'), 'verifyAuthorizationProof: missing explicit verifier error mentions not loaded');
 }
 
 console.log('\n── v0.2 evaluateAuthorization ──');
@@ -7604,6 +7612,17 @@ console.log('\n── v0.2 evaluateAuthorization ──');
     { authorization: 'not-json' }, null, null
   );
   assert(badAuthJson.decision === 'deny', 'evaluateAuthorization: invalid JSON -> deny');
+
+  // Explicit provider with no loaded plugin -> fail closed
+  const missingAuthProvider = await evaluateAuthorization(
+    { authorization: JSON.stringify({ provider: 'missing-authz-provider' }) },
+    { principal: 'agent:test' },
+    { decision: 'permit', reason: 'trust ok' },
+    {}
+  );
+  assert(missingAuthProvider.decision === 'deny', 'evaluateAuthorization: missing explicit provider fails closed');
+  assert(missingAuthProvider.source === 'provider-error', 'evaluateAuthorization: missing explicit provider reports provider-error');
+  assert(missingAuthProvider.reason.includes('not loaded'), 'evaluateAuthorization: missing explicit provider error mentions not loaded');
 }
 
 console.log('\n── v0.2 generateEvidence ──');
@@ -7886,6 +7905,15 @@ console.log('\n── v0.2 resolveIdentity with provider ──');
   assert(errorResult.source === 'provider-error', 'resolveIdentity with provider error: source is provider-error');
   assert(errorResult.transient === true, 'resolveIdentity with provider error: transient is true');
   assert(errorResult.error === 'Vault timeout', 'resolveIdentity with provider error: error message matches');
+
+  const missingProviderResult = await resolveIdentity({
+    id: 'test-provider-missing',
+    identity: JSON.stringify({ provider: 'missing-provider', scope: 'full' }),
+  }, {});
+  assert(missingProviderResult !== null, 'resolveIdentity with missing provider: returns non-null');
+  assert(missingProviderResult.source === 'provider-error', 'resolveIdentity with missing provider: source is provider-error');
+  assert(missingProviderResult.transient === false, 'resolveIdentity with missing provider: transient is false');
+  assert(missingProviderResult.error.includes('not loaded'), 'resolveIdentity with missing provider: error mentions not loaded');
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -8033,6 +8061,56 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   assert(providerErrorUpdates === 1, 'prepareDispatch: provider identity resolution failure updates job state');
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(providerErrorJob.id);
   deleteJob(providerErrorJob.id);
+
+  const missingVerifierJob = createJob({
+    name: 'prepare-dispatch-missing-verifier',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo missing verifier',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+  });
+  const missingVerifierCtx = await prepareDispatch(
+    getJob(missingVerifierJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(missingVerifierCtx === null, 'prepareDispatch: missing proof verifier fails closed');
+  const missingVerifierRun = getRunsForJob(missingVerifierJob.id, 1)[0];
+  assert(missingVerifierRun.status === 'error', 'prepareDispatch: missing proof verifier finishes run as error');
+  assert(missingVerifierRun.error_message.includes('proof verifier not loaded'), 'prepareDispatch: missing proof verifier stores reason');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(missingVerifierJob.id);
+  deleteJob(missingVerifierJob.id);
+
+  const missingAuthzProviderJob = createJob({
+    name: 'prepare-dispatch-missing-authz-provider',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo missing authz provider',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:missing-authz',
+    authorization: JSON.stringify({ provider: 'missing-authz-provider' }),
+  });
+  const missingAuthzProviderCtx = await prepareDispatch(
+    getJob(missingAuthzProviderJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(missingAuthzProviderCtx === null, 'prepareDispatch: missing authorization provider fails closed');
+  const missingAuthzProviderRun = getRunsForJob(missingAuthzProviderJob.id, 1)[0];
+  assert(missingAuthzProviderRun.status === 'error', 'prepareDispatch: missing authorization provider finishes run as error');
+  assert(missingAuthzProviderRun.error_message.includes('authorization provider not loaded'), 'prepareDispatch: missing authorization provider stores reason');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(missingAuthzProviderJob.id);
+  deleteJob(missingAuthzProviderJob.id);
 
   const parentForNone = createJob({
     name: 'prepare-dispatch-parent-none',

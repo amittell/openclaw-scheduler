@@ -543,6 +543,27 @@ directly as the `x-openclaw-auth-profile` header value without resolution.
 
 ---
 
+## Local Provider Plugins
+
+The scheduler can load local identity, authorization, and proof-verifier
+plugins from `SCHEDULER_PROVIDER_PATH` at startup. Every `*.js` file in that
+directory is imported and registered by `provider-registry.js`.
+
+This is a high-trust boundary:
+
+- `SCHEDULER_PROVIDER_PATH` should point only to operator-controlled code.
+- The directory should not be writable by untrusted users or automation.
+- If a job explicitly references a provider or verifier and that plugin is not
+  loaded, the v0.2 runtime fails closed instead of falling back to structural
+  checks.
+
+Reference:
+- `dispatcher.js` lines 818-819
+- `provider-registry.js` lines 8-35
+- `v02-runtime.js` lines 50-122, 250-324, 338-414
+
+---
+
 ## Cancellation and Interruption
 
 ### Current State
