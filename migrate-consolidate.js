@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v22).
+ * Brings any DB from any prior version up to the current schema (v23).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -71,6 +71,7 @@ export default function migrateConsolidate() {
       'contract_required_trust_level', 'contract_trust_enforcement',
       'contract_sandbox', 'contract_allowed_paths', 'contract_network',
       'contract_max_cost_usd', 'contract_audit',
+      'child_credential_policy',
     ])
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
@@ -136,7 +137,7 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 22
+    current >= 23
     && hasLatestColumns
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
@@ -342,6 +343,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN authorization_proof_verification TEXT DEFAULT NULL`,
     `ALTER TABLE runs ADD COLUMN evidence_record TEXT DEFAULT NULL`,
     `ALTER TABLE runs ADD COLUMN credential_handoff_summary TEXT DEFAULT NULL`,
+    // v23: child credential policy
+    `ALTER TABLE jobs ADD COLUMN child_credential_policy TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -667,7 +670,7 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]) {
     stmt.run(v);
   }
 
@@ -678,7 +681,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v22'
-    : 'DB already at v22 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v23'
+    : 'DB already at v23 -- nothing to do'
   );
 }

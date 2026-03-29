@@ -843,10 +843,10 @@ export interface CredentialHandoffSummary {
 
 export const v02Runtime: {
   TRUST_LEVELS: readonly string[];
-  resolveIdentity(job: Record<string, unknown>): ResolvedIdentity | null;
+  resolveIdentity(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<ResolvedIdentity | null>;
   evaluateTrust(job: Record<string, unknown>, resolvedIdentity: ResolvedIdentity | null): TrustEvaluation;
-  verifyAuthorizationProof(job: Record<string, unknown>): AuthorizationProofResult | null;
-  evaluateAuthorization(job: Record<string, unknown>, identityResult: ResolvedIdentity | null, trustResult: TrustEvaluation | null): AuthorizationResult | null;
+  verifyAuthorizationProof(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<AuthorizationProofResult | null>;
+  evaluateAuthorization(job: Record<string, unknown>, identityResult: ResolvedIdentity | null, trustResult: TrustEvaluation | null, ctx?: Record<string, unknown>): Promise<AuthorizationResult | null>;
   generateEvidence(job: Record<string, unknown>, runResult: Record<string, unknown> | null, outcomes: Record<string, unknown> | null): EvidenceResult | null;
   summarizeCredentialHandoff(job: Record<string, unknown>): CredentialHandoffSummary | null;
 };

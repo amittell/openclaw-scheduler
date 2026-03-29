@@ -52,6 +52,8 @@ import {
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
   TRUST_LEVELS,
 } from './v02-runtime.js';
+import { runShellCommand } from './dispatcher-shell.js';
+import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
 // ── Test harness ────────────────────────────────────────────
@@ -7324,7 +7326,7 @@ console.log('\n── v0.2 Storage Round-Trip ──');
 console.log('\n── v0.2 resolveIdentity ──');
 {
   // With identity JSON blob
-  const blobResult = resolveIdentity({
+  const blobResult = await resolveIdentity({
     identity: JSON.stringify({
       subject_kind: 'agent',
       principal: 'agent:test-1',
@@ -7340,7 +7342,7 @@ console.log('\n── v0.2 resolveIdentity ──');
   assert(blobResult.raw !== null && typeof blobResult.raw === 'object', 'resolveIdentity: blob raw is parsed object');
 
   // With scalar fields only (no blob)
-  const scalarResult = resolveIdentity({
+  const scalarResult = await resolveIdentity({
     identity_principal: 'user:alex',
     identity_subject_kind: 'user',
     identity_trust_level: 'autonomous',
@@ -7353,14 +7355,14 @@ console.log('\n── v0.2 resolveIdentity ──');
   assert(scalarResult.raw === null, 'resolveIdentity: scalar raw is null');
 
   // With no identity at all
-  const nullResult = resolveIdentity({});
+  const nullResult = await resolveIdentity({});
   assert(nullResult === null, 'resolveIdentity: empty job returns null');
 
-  const nullJobResult = resolveIdentity(null);
+  const nullJobResult = await resolveIdentity(null);
   assert(nullJobResult === null, 'resolveIdentity: null job returns null');
 
   // With malformed JSON blob and scalar fallback
-  const malformedResult = resolveIdentity({
+  const malformedResult = await resolveIdentity({
     identity: 'not-valid-json',
     identity_principal: 'fallback-principal',
     identity_subject_kind: 'workload',
@@ -7449,7 +7451,7 @@ console.log('\n── v0.2 evaluateTrust ──');
 console.log('\n── v0.2 verifyAuthorizationProof ──');
 {
   // Valid proof structure -> verified:true
-  const validProof = verifyAuthorizationProof({
+  const validProof = await verifyAuthorizationProof({
     authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'jwt-ref-1' }),
     authorization_proof_ref: 'urn:proof:1',
   });
@@ -7460,19 +7462,19 @@ console.log('\n── v0.2 verifyAuthorizationProof ──');
 
   // All known methods accepted
   for (const method of ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 'oidc', 'saml', 'custom']) {
-    const r = verifyAuthorizationProof({
+    const r = await verifyAuthorizationProof({
       authorization_proof: JSON.stringify({ method }),
     });
     assert(r.verified === true, `verifyAuthorizationProof: method ${method} accepted`);
   }
 
   // No proof -> null
-  const noProof = verifyAuthorizationProof({});
+  const noProof = await verifyAuthorizationProof({});
   assert(noProof === null, 'verifyAuthorizationProof: no proof -> null');
-  assert(verifyAuthorizationProof(null) === null, 'verifyAuthorizationProof: null job -> null');
+  assert(await verifyAuthorizationProof(null) === null, 'verifyAuthorizationProof: null job -> null');
 
   // Only ref, no inline proof -> verified:false with error
-  const refOnly = verifyAuthorizationProof({
+  const refOnly = await verifyAuthorizationProof({
     authorization_proof_ref: 'urn:proof:orphan',
   });
   assert(refOnly !== null, 'verifyAuthorizationProof: ref-only returns non-null');
@@ -7480,21 +7482,21 @@ console.log('\n── v0.2 verifyAuthorizationProof ──');
   assert(refOnly.error && refOnly.error.includes('empty'), 'verifyAuthorizationProof: ref-only error mentions empty');
 
   // Invalid JSON -> verified:false
-  const badJson = verifyAuthorizationProof({
+  const badJson = await verifyAuthorizationProof({
     authorization_proof: 'not-json',
   });
   assert(badJson.verified === false, 'verifyAuthorizationProof: invalid JSON verified is false');
   assert(badJson.error.includes('parse failed'), 'verifyAuthorizationProof: invalid JSON error message');
 
   // Missing method field -> verified:false
-  const noMethod = verifyAuthorizationProof({
+  const noMethod = await verifyAuthorizationProof({
     authorization_proof: JSON.stringify({ ref: 'some-ref' }),
   });
   assert(noMethod.verified === false, 'verifyAuthorizationProof: missing method verified is false');
   assert(noMethod.error.includes('method'), 'verifyAuthorizationProof: missing method error message');
 
   // Unrecognized method -> verified:false
-  const unknownMethod = verifyAuthorizationProof({
+  const unknownMethod = await verifyAuthorizationProof({
     authorization_proof: JSON.stringify({ method: 'telepathy' }),
   });
   assert(unknownMethod.verified === false, 'verifyAuthorizationProof: unknown method verified is false');
@@ -7504,18 +7506,18 @@ console.log('\n── v0.2 verifyAuthorizationProof ──');
 console.log('\n── v0.2 evaluateAuthorization ──');
 {
   // No authorization -> null
-  assert(evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
-  assert(evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
+  assert(await evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
+  assert(await evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
 
   // Ref only -> permit
-  const refOnlyAuth = evaluateAuthorization(
+  const refOnlyAuth = await evaluateAuthorization(
     { authorization_ref: 'urn:authz:1' }, null, null
   );
   assert(refOnlyAuth.decision === 'permit', 'evaluateAuthorization: ref-only -> permit');
   assert(refOnlyAuth.ref === 'urn:authz:1', 'evaluateAuthorization: ref-only ref');
 
   // Explicit deny in policy
-  const explicitDeny = evaluateAuthorization(
+  const explicitDeny = await evaluateAuthorization(
     { authorization: JSON.stringify({ decision: 'deny', reason: 'test deny' }) },
     null, null
   );
@@ -7523,14 +7525,14 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(explicitDeny.reason === 'test deny', 'evaluateAuthorization: explicit deny reason');
 
   // Explicit escalate in policy
-  const explicitEscalate = evaluateAuthorization(
+  const explicitEscalate = await evaluateAuthorization(
     { authorization: JSON.stringify({ decision: 'escalate', reason: 'needs review' }) },
     null, null
   );
   assert(explicitEscalate.decision === 'escalate', 'evaluateAuthorization: explicit escalate in policy');
 
   // Trust deny propagation (depends_on_trust default true)
-  const trustDenyPropagation = evaluateAuthorization(
+  const trustDenyPropagation = await evaluateAuthorization(
     { authorization: JSON.stringify({ decision: 'permit' }) },
     { trust_level: 'restricted' },
     { decision: 'deny', reason: 'trust too low' }
@@ -7539,7 +7541,7 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(trustDenyPropagation.reason.includes('trust evaluation denied'), 'evaluateAuthorization: trust deny reason propagated');
 
   // Trust deny with depends_on_trust: false -> no propagation
-  const noTrustDep = evaluateAuthorization(
+  const noTrustDep = await evaluateAuthorization(
     { authorization: JSON.stringify({ decision: 'permit', depends_on_trust: false }) },
     null,
     { decision: 'deny', reason: 'trust too low' }
@@ -7547,14 +7549,14 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(noTrustDep.decision === 'permit', 'evaluateAuthorization: depends_on_trust=false ignores trust deny');
 
   // Requires identity but none resolved -> deny
-  const reqIdentity = evaluateAuthorization(
+  const reqIdentity = await evaluateAuthorization(
     { authorization: JSON.stringify({ requires_identity: true }) },
     null, null
   );
   assert(reqIdentity.decision === 'deny', 'evaluateAuthorization: requires_identity without identity -> deny');
 
   // Requires identity with identity -> permit
-  const withIdentity = evaluateAuthorization(
+  const withIdentity = await evaluateAuthorization(
     { authorization: JSON.stringify({ requires_identity: true }) },
     { principal: 'agent:test' },
     null
@@ -7562,7 +7564,7 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(withIdentity.decision === 'permit', 'evaluateAuthorization: requires_identity with identity -> permit');
 
   // Invalid JSON -> deny
-  const badAuthJson = evaluateAuthorization(
+  const badAuthJson = await evaluateAuthorization(
     { authorization: 'not-json' }, null, null
   );
   assert(badAuthJson.decision === 'deny', 'evaluateAuthorization: invalid JSON -> deny');
@@ -7758,6 +7760,181 @@ console.log('\n── v0.2 Capabilities CLI ──');
   assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
   assert(capsOut.features.delegation_validation === false, 'capabilities: delegation_validation not yet enabled');
   assert(capsOut.features.runtime_execution === true, 'capabilities: runtime_execution enabled');
+}
+
+// ═══════════════════════════════════════════════════════════
+// v0.2 resolveIdentity with mock provider
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── v0.2 resolveIdentity with provider ──');
+{
+  // resolveIdentity with provider in ctx resolves via provider
+  const providerJob = {
+    id: 'test-provider-resolve',
+    identity: JSON.stringify({
+      provider: 'test-provider',
+      scope: 'full',
+      trust: { level: 'supervised' },
+    }),
+  };
+
+  const mockProvider = {
+    name: 'test-provider',
+    type: 'identity',
+    resolveSession(_request, _ctx) {
+      return {
+        ok: true,
+        session: {
+          subject: { kind: 'service', principal: 'test:mock' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+  };
+
+  const ctx = {
+    getIdentityProvider: (name) => name === 'test-provider' ? mockProvider : null,
+  };
+
+  const provResult = await resolveIdentity(providerJob, ctx);
+  assert(provResult !== null, 'resolveIdentity with provider: returns non-null');
+  assert(provResult.source === 'provider', 'resolveIdentity with provider: source is provider');
+  assert(provResult.session !== null && typeof provResult.session === 'object', 'resolveIdentity with provider: session present');
+  assert(provResult.session.subject.kind === 'service', 'resolveIdentity with provider: session subject kind');
+  assert(provResult.session.subject.principal === 'test:mock', 'resolveIdentity with provider: session subject principal');
+
+  // resolveIdentity without ctx falls back to structural
+  const noCtxJob = {
+    id: 'test-no-ctx',
+    identity: JSON.stringify({
+      subject_kind: 'agent',
+      principal: 'agent:structural',
+      trust_level: 'restricted',
+    }),
+  };
+  const structuralResult = await resolveIdentity(noCtxJob);
+  assert(structuralResult !== null, 'resolveIdentity without ctx: returns non-null');
+  assert(structuralResult.source === undefined || structuralResult.source !== 'provider', 'resolveIdentity without ctx: not from provider');
+  assert(structuralResult.subject_kind === 'agent', 'resolveIdentity without ctx: structural subject_kind');
+  assert(structuralResult.principal === 'agent:structural', 'resolveIdentity without ctx: structural principal');
+
+  // resolveIdentity with empty ctx also falls back to structural
+  const emptyCtxResult = await resolveIdentity(noCtxJob, {});
+  assert(emptyCtxResult !== null, 'resolveIdentity with empty ctx: returns non-null');
+  assert(emptyCtxResult.subject_kind === 'agent', 'resolveIdentity with empty ctx: structural subject_kind');
+
+  // resolveIdentity with provider error returns transient error
+  const errorProvider = {
+    name: 'error-provider',
+    type: 'identity',
+    resolveSession(_request, _ctx) {
+      return { ok: false, transient: true, error: 'Vault timeout' };
+    },
+  };
+
+  const errorJob = {
+    id: 'test-provider-error',
+    identity: JSON.stringify({
+      provider: 'error-provider',
+      scope: 'full',
+    }),
+  };
+
+  const errorCtx = {
+    getIdentityProvider: (name) => name === 'error-provider' ? errorProvider : null,
+  };
+
+  const errorResult = await resolveIdentity(errorJob, errorCtx);
+  assert(errorResult !== null, 'resolveIdentity with provider error: returns non-null');
+  assert(errorResult.source === 'provider-error', 'resolveIdentity with provider error: source is provider-error');
+  assert(errorResult.transient === true, 'resolveIdentity with provider error: transient is true');
+  assert(errorResult.error === 'Vault timeout', 'resolveIdentity with provider error: error message matches');
+}
+
+// ═══════════════════════════════════════════════════════════
+// Provider Registry
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Provider Registry ──');
+{
+  // loadProviders loads mock-stripe from test-providers directory
+  resetProviderRegistry();
+  const testProvidersDir = join(dirname(fileURLToPath(import.meta.url)), 'test-providers');
+  await loadProviders(testProvidersDir);
+  const mockStripe = getIdentityProvider('mock-stripe');
+  assert(mockStripe !== null, 'loadProviders: mock-stripe loaded');
+  assert(mockStripe.type === 'identity', 'loadProviders: mock-stripe type is identity');
+  assert(mockStripe.name === 'mock-stripe', 'loadProviders: mock-stripe name matches');
+
+  // getIdentityProvider returns null for unknown provider
+  const unknown = getIdentityProvider('nonexistent');
+  assert(unknown === null, 'getIdentityProvider: returns null for unknown provider');
+
+  // Clean up registry state
+  resetProviderRegistry();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Shell env var injection
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Shell env var injection ──');
+{
+  const shellResult = await runShellCommand('echo $TEST_INJECT_VAR', 5000, { TEST_INJECT_VAR: 'hello_from_test' });
+  assert(shellResult.stdout.includes('hello_from_test'), 'runShellCommand: env vars passed to subprocess');
+}
+
+// ═══════════════════════════════════════════════════════════
+// child_credential_policy validation
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── child_credential_policy validation ──');
+{
+  // validateJobSpec accepts valid child_credential_policy values
+  const validPolicies = ['downscope', 'inherit', 'none', 'independent'];
+  for (const policy of validPolicies) {
+    let threw = false;
+    try {
+      validateJobSpec({
+        id: `test-ccp-valid-${policy}`,
+        name: `ccp valid ${policy}`,
+        schedule_cron: '0 9 * * *',
+        schedule_tz: 'UTC',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo test',
+        run_timeout_ms: 30000,
+        delivery_mode: 'none',
+        origin: 'test',
+        child_credential_policy: policy,
+      }, null, 'create');
+    } catch {
+      threw = true;
+    }
+    assert(!threw, `validateJobSpec accepts child_credential_policy: '${policy}'`);
+  }
+
+  // validateJobSpec rejects invalid child_credential_policy
+  let invalidThrew = false;
+  try {
+    validateJobSpec({
+      id: 'test-ccp-invalid',
+      name: 'ccp invalid',
+      schedule_cron: '0 9 * * *',
+      schedule_tz: 'UTC',
+      session_target: 'shell',
+      payload_kind: 'shellCommand',
+      payload_message: 'echo test',
+      run_timeout_ms: 30000,
+      delivery_mode: 'none',
+      origin: 'test',
+      child_credential_policy: 'invalid',
+    }, null, 'create');
+  } catch {
+    invalidThrew = true;
+  }
+  assert(invalidThrew, 'validateJobSpec rejects invalid child_credential_policy');
 }
 
 closeDb();
