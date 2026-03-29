@@ -78,6 +78,7 @@ export const SCHEDULER_SCHEMAS = {
       contract_network: { type: 'string', nullable: true, description: 'JSON blob: network access policy' },
       contract_max_cost_usd: { type: 'number', nullable: true, min: 0 },
       contract_audit: { type: 'string', nullable: true, description: 'JSON blob: audit configuration' },
+      child_credential_policy: { type: 'string', nullable: true, enum: ['none', 'inherit', 'downscope', 'independent'], description: 'Credential flow policy for child tasks' },
     },
   },
   runs: {

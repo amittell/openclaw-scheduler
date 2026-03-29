@@ -1014,7 +1014,7 @@ switch (command) {
     const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
     const capabilities = {
       scheduler_version: pkg.version,
-      schema_version: 22,
+      schema_version: 23,
       handoff_version: '2',
       features: {
         approvals: 'runtime',

@@ -140,7 +140,7 @@ function assertJsonBlob(name, value, maxBytes = 32768) {
   try {
     JSON.parse(value);
   } catch (e) {
-    throw new Error(`${name} is not valid JSON: ${e.message}`);
+    throw new Error(`${name} is not valid JSON: ${e.message}`, { cause: e });
   }
 }
 
