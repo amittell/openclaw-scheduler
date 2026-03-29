@@ -349,12 +349,13 @@ const v02Spec: JobSpec = {
   evidence_ref: 'ev-ref-1',
   evidence: '{"collect":["logs","metrics"]}',
   contract_required_trust_level: 'supervised',
-  contract_trust_enforcement: 'block',
+  contract_trust_enforcement: 'advisory',
   contract_sandbox: '{"isolation":"container"}',
   contract_allowed_paths: '["/tmp"]',
   contract_network: '{"egress":"deny"}',
   contract_max_cost_usd: 1.50,
   contract_audit: '{"level":"full"}',
+  child_credential_policy: 'downscope',
 };
 void v02Spec;
 

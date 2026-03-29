@@ -132,12 +132,13 @@ export interface JobSpec {
 
   // v0.2 Contract
   contract_required_trust_level?: 'untrusted' | 'restricted' | 'supervised' | 'autonomous' | null;
-  contract_trust_enforcement?: 'none' | 'warn' | 'block' | null;
+  contract_trust_enforcement?: 'none' | 'warn' | 'block' | 'advisory' | 'strict' | null;
   contract_sandbox?: string | null;
   contract_allowed_paths?: string | null;
   contract_network?: string | null;
   contract_max_cost_usd?: number | null;
   contract_audit?: string | null;
+  child_credential_policy?: 'none' | 'inherit' | 'downscope' | 'independent' | null;
 
   [key: string]: unknown;
 }
