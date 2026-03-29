@@ -425,7 +425,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     new Set(['untrusted', 'restricted', 'supervised', 'autonomous']),
     { nullable: true });
   assertEnum('contract_trust_enforcement', merged.contract_trust_enforcement,
-    new Set(['none', 'warn', 'block']),
+    new Set(['none', 'warn', 'block', 'advisory', 'strict']),
     { nullable: true });
   assertSafeString('contract_sandbox', merged.contract_sandbox, { maxLength: 128 });
   assertJsonBlob('contract_allowed_paths', merged.contract_allowed_paths);
