@@ -29,6 +29,7 @@ import {
   getStaleRuns, getTimedOutRuns,
   updateHeartbeat, pruneRuns,
   getRunningRunsByPool, updateRunSession, updateContextSummary,
+  persistV02Outcomes,
 } from './runs.js';
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
@@ -46,6 +47,11 @@ import {
 } from './dispatcher-utils.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
+import {
+  resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+  evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+  TRUST_LEVELS,
+} from './v02-runtime.js';
 import * as publicApi from './index.js';
 
 // ── Test harness ────────────────────────────────────────────
@@ -2859,6 +2865,18 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
   }));
   assert(runOut.dispatch_kind === 'manual' && typeof runOut.dispatch_id === 'string', 'jobs run --json returns durable dispatch');
 
+  // Test: jobs cancel with no ID should fail
+  try {
+    execFileSync(process.execPath, [cliPath, 'jobs', 'cancel', '--json'], {
+      cwd: process.cwd(),
+      env: baseEnv,
+      encoding: 'utf8',
+    });
+    assert(false, 'jobs cancel with no ID should have thrown');
+  } catch (err) {
+    assert(err.status !== 0, 'jobs cancel with no ID exits non-zero');
+  }
+
   rmSync(tempRoot, { recursive: true, force: true });
 }
 
@@ -3813,9 +3831,54 @@ console.log('\n── Approval Timeout / Prune / Count ──');
   // ap1 was resolved recently, should still exist
   assert(getApproval(ap1.id) !== undefined, 'recent resolved approval survives prune');
 
-  finishRun(aRun1.id, 'ok');
-  finishRun(aRun2.id, 'cancelled');
   deleteJob(aJob.id);
+}
+
+console.log('\n── finishRun status guard ──');
+{
+  const guardJob = createJob({ name: 'finish-guard-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const guardRun = createRun(guardJob.id, { run_timeout_ms: 300_000 });
+  finishRun(guardRun.id, 'ok', { summary: 'first finish' });
+  const afterFirst = getRun(guardRun.id);
+  assert(afterFirst.status === 'ok', 'finishRun sets ok status');
+
+  const firstDurationMs = afterFirst.duration_ms;
+
+  // Attempt to overwrite ok with error — should be a no-op (WHERE guard rejects non-matching status)
+  finishRun(guardRun.id, 'error', { summary: 'second finish', error_message: 'should not apply' });
+  const afterSecond = getRun(guardRun.id);
+  assert(afterSecond.status === 'ok', 'finishRun does not overwrite terminal status');
+  assert(afterSecond.summary === 'first finish', 'finishRun does not overwrite terminal summary');
+  assert(afterSecond.duration_ms === firstDurationMs, 'finishRun does not recalculate duration_ms on guarded no-op');
+
+  deleteJob(guardJob.id);
+}
+
+console.log('\n── resolveApproval invalid status ──');
+{
+  const { createApproval, resolveApproval } = await import('./approval.js');
+  const rvJob = createJob({ name: 'resolve-validate-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const rvRun = createRun(rvJob.id, { run_timeout_ms: 300_000 });
+  const rvApproval = createApproval(rvJob.id, rvRun.id);
+
+  let threw = false;
+  try { resolveApproval(rvApproval.id, 'bogus_status', 'operator'); } catch (err) {
+    threw = true;
+    assert(err.message.includes('Invalid approval status'), `resolveApproval rejects invalid status: ${err.message}`);
+  }
+  assert(threw, 'resolveApproval throws on invalid status');
+
+  // Verify 'pending' is also not a valid resolution status
+  let threwPending = false;
+  try { resolveApproval(rvApproval.id, 'pending', 'operator'); } catch { threwPending = true; }
+  assert(threwPending, 'resolveApproval rejects pending as resolution status');
+
+  // Valid status still works
+  const resolved = resolveApproval(rvApproval.id, 'rejected', 'operator', 'test cleanup');
+  assert(resolved.status === 'rejected', 'resolveApproval still accepts valid status');
+
+  finishRun(rvRun.id, 'cancelled');
+  deleteJob(rvJob.id);
 }
 
 console.log('\n── Run Session & Context Summary ──');
@@ -6814,6 +6877,887 @@ console.log('\n── dispatch/index.mjs --deliver-to error message ──');
 
   // Verify the old confusing message is gone
   assert(!indexSrc.includes('--origin is required for agentTurn jobs'), 'dispatch error: old confusing --origin message removed');
+}
+
+// ============================================================
+// SECTION: v0.2 Runtime Features
+// ============================================================
+
+console.log('\n── v0.2 Schema Column Verification ──');
+{
+  const liveDb = getDb();
+  const jobCols = liveDb.prepare("PRAGMA table_info(jobs)").all().map(c => c.name);
+  const v02JobCols = [
+    'identity_principal', 'identity_run_as', 'identity_attestation',
+    'identity_ref', 'identity_subject_kind', 'identity_subject_principal',
+    'identity_trust_level', 'identity_delegation_mode', 'identity',
+    'authorization_proof_ref', 'authorization_proof',
+    'authorization_ref', 'authorization',
+    'evidence_ref', 'evidence',
+    'contract_required_trust_level', 'contract_trust_enforcement',
+    'contract_sandbox', 'contract_allowed_paths', 'contract_network',
+    'contract_max_cost_usd', 'contract_audit',
+  ];
+  for (const col of v02JobCols) {
+    assert(jobCols.includes(col), `jobs table should have column ${col}`);
+  }
+
+  const runCols = liveDb.prepare("PRAGMA table_info(runs)").all().map(c => c.name);
+  const v02RunCols = [
+    'identity_resolved', 'trust_evaluation', 'authorization_decision',
+    'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary',
+  ];
+  for (const col of v02RunCols) {
+    assert(runCols.includes(col), `runs table should have column ${col}`);
+  }
+}
+
+console.log('\n── v0.2 Validation: valid fields accepted ──');
+{
+  const v02Job = createJob({
+    name: 'v02-valid-fields',
+    schedule_cron: '0 4 * * *',
+    payload_message: 'identity test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_principal: 'agent:scheduler-v2',
+    identity_run_as: 'service-account-main',
+    identity_attestation: 'self-signed',
+    identity_ref: 'urn:openclaw:identity:agent:scheduler-v2',
+    identity_subject_kind: 'agent',
+    identity_subject_principal: 'agent:scheduler-v2',
+    identity_trust_level: 'supervised',
+    identity_delegation_mode: 'none',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:scheduler-v2', trust_level: 'supervised' }),
+    authorization_proof_ref: 'urn:openclaw:proof:abc123',
+    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'abc123' }),
+    authorization_ref: 'urn:openclaw:authz:policy-1',
+    authorization: JSON.stringify({ decision: 'permit', reason: 'pre-approved' }),
+    evidence_ref: 'urn:openclaw:evidence:run-log-1',
+    evidence: JSON.stringify({ collect: ['stdout', 'stderr'], retention: '30d' }),
+    contract_required_trust_level: 'supervised',
+    contract_trust_enforcement: 'block',
+    contract_sandbox: 'docker',
+    contract_allowed_paths: JSON.stringify(['/tmp', '/data']),
+    contract_network: 'restricted',
+    contract_max_cost_usd: 1.50,
+    contract_audit: 'full',
+  });
+  assert(v02Job && v02Job.id, 'v0.2 job with all fields created successfully');
+  assert(v02Job.identity_principal === 'agent:scheduler-v2', 'v0.2 identity_principal stored');
+  assert(v02Job.identity_trust_level === 'supervised', 'v0.2 identity_trust_level stored');
+  assert(v02Job.identity_subject_kind === 'agent', 'v0.2 identity_subject_kind stored');
+  assert(v02Job.identity_delegation_mode === 'none', 'v0.2 identity_delegation_mode stored');
+  assert(v02Job.contract_required_trust_level === 'supervised', 'v0.2 contract_required_trust_level stored');
+  assert(v02Job.contract_trust_enforcement === 'block', 'v0.2 contract_trust_enforcement stored');
+  assert(v02Job.contract_max_cost_usd === 1.50, 'v0.2 contract_max_cost_usd stored');
+  assert(v02Job.contract_audit === 'full', 'v0.2 contract_audit stored');
+  assert(v02Job.contract_sandbox === 'docker', 'v0.2 contract_sandbox stored');
+  assert(v02Job.contract_network === 'restricted', 'v0.2 contract_network stored');
+}
+
+console.log('\n── v0.2 Validation: invalid enum rejected ──');
+{
+  let threwInvalidTrustLevel = false;
+  try {
+    createJob({
+      name: 'v02-bad-trust',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad trust',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_trust_level: 'invalid',
+    });
+  } catch (e) {
+    threwInvalidTrustLevel = e.message.includes('identity_trust_level');
+  }
+  assert(threwInvalidTrustLevel, 'createJob rejects invalid identity_trust_level enum');
+
+  let threwInvalidSubjectKind = false;
+  try {
+    createJob({
+      name: 'v02-bad-subject-kind',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad subject kind',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_subject_kind: 'bogus',
+    });
+  } catch (e) {
+    threwInvalidSubjectKind = e.message.includes('identity_subject_kind');
+  }
+  assert(threwInvalidSubjectKind, 'createJob rejects invalid identity_subject_kind enum');
+
+  let threwInvalidDelegation = false;
+  try {
+    createJob({
+      name: 'v02-bad-delegation',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad delegation',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_delegation_mode: 'nope',
+    });
+  } catch (e) {
+    threwInvalidDelegation = e.message.includes('identity_delegation_mode');
+  }
+  assert(threwInvalidDelegation, 'createJob rejects invalid identity_delegation_mode enum');
+
+  let threwInvalidContractTrust = false;
+  try {
+    createJob({
+      name: 'v02-bad-contract-trust',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad contract trust',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_required_trust_level: 'ultra',
+    });
+  } catch (e) {
+    threwInvalidContractTrust = e.message.includes('contract_required_trust_level');
+  }
+  assert(threwInvalidContractTrust, 'createJob rejects invalid contract_required_trust_level enum');
+
+  let threwInvalidEnforcement = false;
+  try {
+    createJob({
+      name: 'v02-bad-enforcement',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad enforcement',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_trust_enforcement: 'punish',
+    });
+  } catch (e) {
+    threwInvalidEnforcement = e.message.includes('contract_trust_enforcement');
+  }
+  assert(threwInvalidEnforcement, 'createJob rejects invalid contract_trust_enforcement enum');
+}
+
+console.log('\n── v0.2 Validation: invalid JSON blob rejected ──');
+{
+  let threwBadIdentityJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-identity-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad json',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: 'not-json',
+    });
+  } catch (e) {
+    threwBadIdentityJson = e.message.includes('identity') && e.message.includes('JSON');
+  }
+  assert(threwBadIdentityJson, 'createJob rejects non-JSON identity blob');
+
+  let threwBadAuthProofJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-auth-proof-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad auth proof',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      authorization_proof: '{broken',
+    });
+  } catch (e) {
+    threwBadAuthProofJson = e.message.includes('authorization_proof') && e.message.includes('JSON');
+  }
+  assert(threwBadAuthProofJson, 'createJob rejects non-JSON authorization_proof blob');
+
+  let threwBadAuthJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-auth-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad authorization',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      authorization: 'not{valid',
+    });
+  } catch (e) {
+    threwBadAuthJson = e.message.includes('authorization') && e.message.includes('JSON');
+  }
+  assert(threwBadAuthJson, 'createJob rejects non-JSON authorization blob');
+
+  let threwBadEvidenceJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-evidence-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad evidence',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      evidence: 'nope[',
+    });
+  } catch (e) {
+    threwBadEvidenceJson = e.message.includes('evidence') && e.message.includes('JSON');
+  }
+  assert(threwBadEvidenceJson, 'createJob rejects non-JSON evidence blob');
+
+  let threwBadAllowedPaths = false;
+  try {
+    createJob({
+      name: 'v02-bad-allowed-paths',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad paths',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_allowed_paths: 'just-a-string',
+    });
+  } catch (e) {
+    threwBadAllowedPaths = e.message.includes('contract_allowed_paths') && e.message.includes('JSON');
+  }
+  assert(threwBadAllowedPaths, 'createJob rejects non-JSON contract_allowed_paths blob');
+}
+
+console.log('\n── v0.2 Validation: null values accepted (all optional) ──');
+{
+  const minimalJob = createJob({
+    name: 'v02-no-v02-fields',
+    schedule_cron: '0 6 * * *',
+    payload_message: 'minimal job',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  assert(minimalJob && minimalJob.id, 'job with no v0.2 fields created successfully');
+  assert(minimalJob.identity_principal === null, 'identity_principal defaults to null');
+  assert(minimalJob.identity_trust_level === null, 'identity_trust_level defaults to null');
+  assert(minimalJob.identity === null, 'identity defaults to null');
+  assert(minimalJob.authorization === null, 'authorization defaults to null');
+  assert(minimalJob.evidence === null, 'evidence defaults to null');
+  assert(minimalJob.contract_required_trust_level === null, 'contract_required_trust_level defaults to null');
+  assert(minimalJob.contract_max_cost_usd === null, 'contract_max_cost_usd defaults to null');
+}
+
+console.log('\n── v0.2 Validation: contract_max_cost_usd ──');
+{
+  let threwNegativeCost = false;
+  try {
+    createJob({
+      name: 'v02-negative-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'negative cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: -1.0,
+    });
+  } catch (e) {
+    threwNegativeCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwNegativeCost, 'createJob rejects negative contract_max_cost_usd');
+
+  let threwInfiniteCost = false;
+  try {
+    createJob({
+      name: 'v02-infinite-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'infinite cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: Infinity,
+    });
+  } catch (e) {
+    threwInfiniteCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwInfiniteCost, 'createJob rejects Infinity contract_max_cost_usd');
+
+  let threwStringCost = false;
+  try {
+    createJob({
+      name: 'v02-string-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'string cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: 'five',
+    });
+  } catch (e) {
+    threwStringCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwStringCost, 'createJob rejects non-numeric contract_max_cost_usd');
+
+  const zeroCostJob = createJob({
+    name: 'v02-zero-cost',
+    schedule_cron: '0 5 * * *',
+    payload_message: 'zero cost',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    contract_max_cost_usd: 0,
+  });
+  assert(zeroCostJob.contract_max_cost_usd === 0, 'createJob accepts zero contract_max_cost_usd');
+
+  const validCostJob = createJob({
+    name: 'v02-valid-cost',
+    schedule_cron: '0 5 * * *',
+    payload_message: 'valid cost',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    contract_max_cost_usd: 99.99,
+  });
+  assert(validCostJob.contract_max_cost_usd === 99.99, 'createJob stores valid contract_max_cost_usd');
+}
+
+console.log('\n── v0.2 Storage Round-Trip ──');
+{
+  const identityBlob = JSON.stringify({
+    subject_kind: 'service',
+    principal: 'svc:data-pipeline',
+    trust_level: 'autonomous',
+    delegation_mode: 'on-behalf-of',
+    presentation: {
+      mode: 'inject-env',
+      bindings: [
+        { env: 'SVC_TOKEN', source: 'vault:secret/svc/token', cleanup: true },
+        { env: 'SVC_CERT', source: 'vault:secret/svc/cert' },
+      ],
+      cleanup_required: false,
+    },
+  });
+  const authProofBlob = JSON.stringify({ method: 'hmac', ref: 'proof-ref-456', payload: 'base64data' });
+  const authBlob = JSON.stringify({ decision: 'permit', reason: 'approved by policy engine', depends_on_trust: true });
+  const evidenceBlob = JSON.stringify({ collect: ['stdout', 'exit_code'], retention: '90d', format: 'json' });
+  const allowedPathsBlob = JSON.stringify(['/opt/data', '/var/log']);
+
+  const rtJob = createJob({
+    name: 'v02-roundtrip',
+    schedule_cron: '0 7 * * *',
+    payload_message: 'roundtrip test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_principal: 'svc:data-pipeline',
+    identity_run_as: 'data-runner',
+    identity_attestation: 'oidc',
+    identity_ref: 'urn:openclaw:identity:svc:data-pipeline',
+    identity_subject_kind: 'service',
+    identity_subject_principal: 'svc:data-pipeline',
+    identity_trust_level: 'autonomous',
+    identity_delegation_mode: 'on-behalf-of',
+    identity: identityBlob,
+    authorization_proof_ref: 'urn:openclaw:proof:456',
+    authorization_proof: authProofBlob,
+    authorization_ref: 'urn:openclaw:authz:policy-2',
+    authorization: authBlob,
+    evidence_ref: 'urn:openclaw:evidence:log-2',
+    evidence: evidenceBlob,
+    contract_required_trust_level: 'autonomous',
+    contract_trust_enforcement: 'warn',
+    contract_sandbox: 'nsjail',
+    contract_allowed_paths: allowedPathsBlob,
+    contract_network: 'egress-only',
+    contract_max_cost_usd: 25.00,
+    contract_audit: 'minimal',
+  });
+
+  const fetched = getJob(rtJob.id);
+  assert(fetched.identity_principal === 'svc:data-pipeline', 'roundtrip: identity_principal');
+  assert(fetched.identity_run_as === 'data-runner', 'roundtrip: identity_run_as');
+  assert(fetched.identity_attestation === 'oidc', 'roundtrip: identity_attestation');
+  assert(fetched.identity_ref === 'urn:openclaw:identity:svc:data-pipeline', 'roundtrip: identity_ref');
+  assert(fetched.identity_subject_kind === 'service', 'roundtrip: identity_subject_kind');
+  assert(fetched.identity_subject_principal === 'svc:data-pipeline', 'roundtrip: identity_subject_principal');
+  assert(fetched.identity_trust_level === 'autonomous', 'roundtrip: identity_trust_level');
+  assert(fetched.identity_delegation_mode === 'on-behalf-of', 'roundtrip: identity_delegation_mode');
+  assert(fetched.identity === identityBlob, 'roundtrip: identity JSON blob');
+  assert(fetched.authorization_proof_ref === 'urn:openclaw:proof:456', 'roundtrip: authorization_proof_ref');
+  assert(fetched.authorization_proof === authProofBlob, 'roundtrip: authorization_proof JSON blob');
+  assert(fetched.authorization_ref === 'urn:openclaw:authz:policy-2', 'roundtrip: authorization_ref');
+  assert(fetched.authorization === authBlob, 'roundtrip: authorization JSON blob');
+  assert(fetched.evidence_ref === 'urn:openclaw:evidence:log-2', 'roundtrip: evidence_ref');
+  assert(fetched.evidence === evidenceBlob, 'roundtrip: evidence JSON blob');
+  assert(fetched.contract_required_trust_level === 'autonomous', 'roundtrip: contract_required_trust_level');
+  assert(fetched.contract_trust_enforcement === 'warn', 'roundtrip: contract_trust_enforcement');
+  assert(fetched.contract_sandbox === 'nsjail', 'roundtrip: contract_sandbox');
+  assert(fetched.contract_allowed_paths === allowedPathsBlob, 'roundtrip: contract_allowed_paths');
+  assert(fetched.contract_network === 'egress-only', 'roundtrip: contract_network');
+  assert(fetched.contract_max_cost_usd === 25.00, 'roundtrip: contract_max_cost_usd');
+  assert(fetched.contract_audit === 'minimal', 'roundtrip: contract_audit');
+
+  // Update a v0.2 field and verify
+  updateJob(rtJob.id, { contract_max_cost_usd: 50.00 });
+  const updated = getJob(rtJob.id);
+  assert(updated.contract_max_cost_usd === 50.00, 'roundtrip: updateJob changes contract_max_cost_usd');
+  assert(updated.identity_principal === 'svc:data-pipeline', 'roundtrip: updateJob preserves untouched v0.2 fields');
+
+  updateJob(rtJob.id, { identity_trust_level: 'restricted' });
+  const updated2 = getJob(rtJob.id);
+  assert(updated2.identity_trust_level === 'restricted', 'roundtrip: updateJob changes identity_trust_level');
+}
+
+console.log('\n── v0.2 resolveIdentity ──');
+{
+  // With identity JSON blob
+  const blobResult = resolveIdentity({
+    identity: JSON.stringify({
+      subject_kind: 'agent',
+      principal: 'agent:test-1',
+      trust_level: 'supervised',
+      delegation_mode: 'none',
+    }),
+  });
+  assert(blobResult !== null, 'resolveIdentity: blob returns non-null');
+  assert(blobResult.subject_kind === 'agent', 'resolveIdentity: blob subject_kind');
+  assert(blobResult.principal === 'agent:test-1', 'resolveIdentity: blob principal');
+  assert(blobResult.trust_level === 'supervised', 'resolveIdentity: blob trust_level');
+  assert(blobResult.delegation_mode === 'none', 'resolveIdentity: blob delegation_mode');
+  assert(blobResult.raw !== null && typeof blobResult.raw === 'object', 'resolveIdentity: blob raw is parsed object');
+
+  // With scalar fields only (no blob)
+  const scalarResult = resolveIdentity({
+    identity_principal: 'user:alex',
+    identity_subject_kind: 'user',
+    identity_trust_level: 'autonomous',
+    identity_delegation_mode: 'on-behalf-of',
+  });
+  assert(scalarResult !== null, 'resolveIdentity: scalars returns non-null');
+  assert(scalarResult.subject_kind === 'user', 'resolveIdentity: scalar subject_kind');
+  assert(scalarResult.principal === 'user:alex', 'resolveIdentity: scalar principal');
+  assert(scalarResult.trust_level === 'autonomous', 'resolveIdentity: scalar trust_level');
+  assert(scalarResult.raw === null, 'resolveIdentity: scalar raw is null');
+
+  // With no identity at all
+  const nullResult = resolveIdentity({});
+  assert(nullResult === null, 'resolveIdentity: empty job returns null');
+
+  const nullJobResult = resolveIdentity(null);
+  assert(nullJobResult === null, 'resolveIdentity: null job returns null');
+
+  // With malformed JSON blob and scalar fallback
+  const malformedResult = resolveIdentity({
+    identity: 'not-valid-json',
+    identity_principal: 'fallback-principal',
+    identity_subject_kind: 'workload',
+  });
+  assert(malformedResult !== null, 'resolveIdentity: malformed blob with scalars returns non-null');
+  assert(malformedResult.principal === 'fallback-principal', 'resolveIdentity: malformed blob falls back to scalar principal');
+  assert(malformedResult.raw && malformedResult.raw.error, 'resolveIdentity: malformed blob includes error in raw');
+}
+
+console.log('\n── v0.2 evaluateTrust ──');
+{
+  // Sufficient trust + block enforcement -> permit
+  const permitResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    { trust_level: 'autonomous' }
+  );
+  assert(permitResult.decision === 'permit', 'evaluateTrust: sufficient trust with block -> permit');
+  assert(permitResult.effective_level === 'autonomous', 'evaluateTrust: effective level from identity');
+  assert(permitResult.required_level === 'supervised', 'evaluateTrust: required level from contract');
+
+  // Exact match -> permit
+  const exactResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    { trust_level: 'supervised' }
+  );
+  assert(exactResult.decision === 'permit', 'evaluateTrust: exact trust match -> permit');
+
+  // Insufficient trust + block -> deny
+  const denyResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'block' },
+    { trust_level: 'restricted' }
+  );
+  assert(denyResult.decision === 'deny', 'evaluateTrust: insufficient trust with block -> deny');
+  assert(denyResult.reason.includes('restricted'), 'evaluateTrust: deny reason includes effective level');
+
+  // Insufficient trust + warn -> warn
+  const warnResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'warn' },
+    { trust_level: 'supervised' }
+  );
+  assert(warnResult.decision === 'warn', 'evaluateTrust: insufficient trust with warn -> warn');
+
+  // Insufficient trust + none -> permit
+  const noneEnforcementResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'none' },
+    { trust_level: 'restricted' }
+  );
+  assert(noneEnforcementResult.decision === 'permit', 'evaluateTrust: insufficient trust with none enforcement -> permit');
+
+  // No required trust level -> permit
+  const noReqResult = evaluateTrust({}, { trust_level: 'supervised' });
+  assert(noReqResult.decision === 'permit', 'evaluateTrust: no required trust -> permit');
+  assert(noReqResult.reason.includes('no trust requirement'), 'evaluateTrust: no requirement reason');
+
+  // No enforcement -> permit
+  const noEnforcementResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous' },
+    { trust_level: 'restricted' }
+  );
+  assert(noEnforcementResult.decision === 'permit', 'evaluateTrust: no enforcement defaults to none -> permit');
+
+  // No effective trust level + block -> deny
+  const noEffectiveBlockResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    null
+  );
+  assert(noEffectiveBlockResult.decision === 'deny', 'evaluateTrust: no effective trust + block -> deny');
+
+  // No effective trust level + warn -> warn
+  const noEffectiveWarnResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'warn' },
+    null
+  );
+  assert(noEffectiveWarnResult.decision === 'warn', 'evaluateTrust: no effective trust + warn -> warn');
+
+  // Null job -> permit
+  const nullJobTrust = evaluateTrust(null, null);
+  assert(nullJobTrust.decision === 'permit', 'evaluateTrust: null job -> permit');
+
+  // Trust level ordering
+  assert(TRUST_LEVELS.indexOf('untrusted') < TRUST_LEVELS.indexOf('restricted'), 'TRUST_LEVELS: untrusted < restricted');
+  assert(TRUST_LEVELS.indexOf('restricted') < TRUST_LEVELS.indexOf('supervised'), 'TRUST_LEVELS: restricted < supervised');
+  assert(TRUST_LEVELS.indexOf('supervised') < TRUST_LEVELS.indexOf('autonomous'), 'TRUST_LEVELS: supervised < autonomous');
+}
+
+console.log('\n── v0.2 verifyAuthorizationProof ──');
+{
+  // Valid proof structure -> verified:true
+  const validProof = verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'jwt-ref-1' }),
+    authorization_proof_ref: 'urn:proof:1',
+  });
+  assert(validProof !== null, 'verifyAuthorizationProof: valid proof returns non-null');
+  assert(validProof.verified === true, 'verifyAuthorizationProof: valid proof verified is true');
+  assert(validProof.method === 'signed-jwt', 'verifyAuthorizationProof: method extracted');
+  assert(validProof.ref === 'jwt-ref-1', 'verifyAuthorizationProof: ref from blob');
+
+  // All known methods accepted
+  for (const method of ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 'oidc', 'saml', 'custom']) {
+    const r = verifyAuthorizationProof({
+      authorization_proof: JSON.stringify({ method }),
+    });
+    assert(r.verified === true, `verifyAuthorizationProof: method ${method} accepted`);
+  }
+
+  // No proof -> null
+  const noProof = verifyAuthorizationProof({});
+  assert(noProof === null, 'verifyAuthorizationProof: no proof -> null');
+  assert(verifyAuthorizationProof(null) === null, 'verifyAuthorizationProof: null job -> null');
+
+  // Only ref, no inline proof -> verified:false with error
+  const refOnly = verifyAuthorizationProof({
+    authorization_proof_ref: 'urn:proof:orphan',
+  });
+  assert(refOnly !== null, 'verifyAuthorizationProof: ref-only returns non-null');
+  assert(refOnly.verified === false, 'verifyAuthorizationProof: ref-only verified is false');
+  assert(refOnly.error && refOnly.error.includes('empty'), 'verifyAuthorizationProof: ref-only error mentions empty');
+
+  // Invalid JSON -> verified:false
+  const badJson = verifyAuthorizationProof({
+    authorization_proof: 'not-json',
+  });
+  assert(badJson.verified === false, 'verifyAuthorizationProof: invalid JSON verified is false');
+  assert(badJson.error.includes('parse failed'), 'verifyAuthorizationProof: invalid JSON error message');
+
+  // Missing method field -> verified:false
+  const noMethod = verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ ref: 'some-ref' }),
+  });
+  assert(noMethod.verified === false, 'verifyAuthorizationProof: missing method verified is false');
+  assert(noMethod.error.includes('method'), 'verifyAuthorizationProof: missing method error message');
+
+  // Unrecognized method -> verified:false
+  const unknownMethod = verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ method: 'telepathy' }),
+  });
+  assert(unknownMethod.verified === false, 'verifyAuthorizationProof: unknown method verified is false');
+  assert(unknownMethod.error.includes('unrecognized'), 'verifyAuthorizationProof: unknown method error message');
+}
+
+console.log('\n── v0.2 evaluateAuthorization ──');
+{
+  // No authorization -> null
+  assert(evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
+  assert(evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
+
+  // Ref only -> permit
+  const refOnlyAuth = evaluateAuthorization(
+    { authorization_ref: 'urn:authz:1' }, null, null
+  );
+  assert(refOnlyAuth.decision === 'permit', 'evaluateAuthorization: ref-only -> permit');
+  assert(refOnlyAuth.ref === 'urn:authz:1', 'evaluateAuthorization: ref-only ref');
+
+  // Explicit deny in policy
+  const explicitDeny = evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'deny', reason: 'test deny' }) },
+    null, null
+  );
+  assert(explicitDeny.decision === 'deny', 'evaluateAuthorization: explicit deny in policy');
+  assert(explicitDeny.reason === 'test deny', 'evaluateAuthorization: explicit deny reason');
+
+  // Explicit escalate in policy
+  const explicitEscalate = evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'escalate', reason: 'needs review' }) },
+    null, null
+  );
+  assert(explicitEscalate.decision === 'escalate', 'evaluateAuthorization: explicit escalate in policy');
+
+  // Trust deny propagation (depends_on_trust default true)
+  const trustDenyPropagation = evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'permit' }) },
+    { trust_level: 'restricted' },
+    { decision: 'deny', reason: 'trust too low' }
+  );
+  assert(trustDenyPropagation.decision === 'deny', 'evaluateAuthorization: trust deny propagation -> deny');
+  assert(trustDenyPropagation.reason.includes('trust evaluation denied'), 'evaluateAuthorization: trust deny reason propagated');
+
+  // Trust deny with depends_on_trust: false -> no propagation
+  const noTrustDep = evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'permit', depends_on_trust: false }) },
+    null,
+    { decision: 'deny', reason: 'trust too low' }
+  );
+  assert(noTrustDep.decision === 'permit', 'evaluateAuthorization: depends_on_trust=false ignores trust deny');
+
+  // Requires identity but none resolved -> deny
+  const reqIdentity = evaluateAuthorization(
+    { authorization: JSON.stringify({ requires_identity: true }) },
+    null, null
+  );
+  assert(reqIdentity.decision === 'deny', 'evaluateAuthorization: requires_identity without identity -> deny');
+
+  // Requires identity with identity -> permit
+  const withIdentity = evaluateAuthorization(
+    { authorization: JSON.stringify({ requires_identity: true }) },
+    { principal: 'agent:test' },
+    null
+  );
+  assert(withIdentity.decision === 'permit', 'evaluateAuthorization: requires_identity with identity -> permit');
+
+  // Invalid JSON -> deny
+  const badAuthJson = evaluateAuthorization(
+    { authorization: 'not-json' }, null, null
+  );
+  assert(badAuthJson.decision === 'deny', 'evaluateAuthorization: invalid JSON -> deny');
+}
+
+console.log('\n── v0.2 generateEvidence ──');
+{
+  // With evidence declaration
+  const evidenceResult = generateEvidence(
+    {
+      evidence: JSON.stringify({ collect: ['stdout'], retention: '30d', format: 'json' }),
+      evidence_ref: 'urn:evidence:1',
+    },
+    { id: 'run-1', status: 'ok' },
+    { identity_resolved: { principal: 'agent:test' }, trust_evaluation: { decision: 'permit' } }
+  );
+  assert(evidenceResult !== null, 'generateEvidence: returns non-null for evidence declaration');
+  assert(evidenceResult.evidence_ref === 'urn:evidence:1', 'generateEvidence: evidence_ref');
+  assert(typeof evidenceResult.created_at === 'string', 'generateEvidence: created_at is string');
+  assert(evidenceResult.payload_summary.collect[0] === 'stdout', 'generateEvidence: collect from blob');
+  assert(evidenceResult.payload_summary.retention === '30d', 'generateEvidence: retention from blob');
+  assert(evidenceResult.payload_summary.format === 'json', 'generateEvidence: format from blob');
+  assert(evidenceResult.payload_summary.run_id === 'run-1', 'generateEvidence: run_id in summary');
+  assert(evidenceResult.payload_summary.run_status === 'ok', 'generateEvidence: run_status in summary');
+  assert(Array.isArray(evidenceResult.payload_summary.outcome_fields_present), 'generateEvidence: outcome fields listed');
+  assert(evidenceResult.payload_summary.outcome_fields_present.includes('identity_resolved'), 'generateEvidence: identity_resolved in outcome fields');
+
+  // No evidence -> null
+  assert(generateEvidence({}, null, null) === null, 'generateEvidence: no evidence -> null');
+  assert(generateEvidence(null, null, null) === null, 'generateEvidence: null job -> null');
+
+  // Ref only (no inline evidence blob)
+  const refOnlyEvidence = generateEvidence(
+    { evidence_ref: 'urn:evidence:2' }, null, null
+  );
+  assert(refOnlyEvidence !== null, 'generateEvidence: ref-only returns non-null');
+  assert(refOnlyEvidence.evidence_ref === 'urn:evidence:2', 'generateEvidence: ref-only evidence_ref');
+
+  // Invalid evidence JSON -> returns with error in payload_summary
+  const badEvidence = generateEvidence(
+    { evidence: 'broken{json', evidence_ref: 'urn:evidence:3' }, null, null
+  );
+  assert(badEvidence !== null, 'generateEvidence: bad JSON returns non-null');
+  assert(badEvidence.payload_summary.error && badEvidence.payload_summary.error.includes('parse failed'), 'generateEvidence: bad JSON error in payload_summary');
+}
+
+console.log('\n── v0.2 summarizeCredentialHandoff ──');
+{
+  // With presentation bindings
+  const handoffResult = summarizeCredentialHandoff({
+    identity: JSON.stringify({
+      presentation: {
+        mode: 'inject-env',
+        bindings: [
+          { env: 'TOKEN', source: 'vault:secret/token', cleanup: true },
+          { env: 'CERT', source: 'vault:secret/cert' },
+        ],
+      },
+    }),
+  });
+  assert(handoffResult !== null, 'summarizeCredentialHandoff: returns non-null for presentation');
+  assert(handoffResult.mode === 'inject-env', 'summarizeCredentialHandoff: mode');
+  assert(handoffResult.bindings_count === 2, 'summarizeCredentialHandoff: bindings_count');
+  assert(handoffResult.cleanup_required === true, 'summarizeCredentialHandoff: cleanup_required from binding');
+
+  // With credential_handoff alias
+  const aliasResult = summarizeCredentialHandoff({
+    identity: JSON.stringify({
+      credential_handoff: {
+        mode: 'file-mount',
+        bindings: [{ path: '/run/secrets/key' }],
+        cleanup_required: true,
+      },
+    }),
+  });
+  assert(aliasResult !== null, 'summarizeCredentialHandoff: credential_handoff alias works');
+  assert(aliasResult.mode === 'file-mount', 'summarizeCredentialHandoff: alias mode');
+  assert(aliasResult.cleanup_required === true, 'summarizeCredentialHandoff: alias cleanup_required');
+
+  // No presentation -> null
+  assert(summarizeCredentialHandoff({}) === null, 'summarizeCredentialHandoff: no identity -> null');
+  assert(summarizeCredentialHandoff(null) === null, 'summarizeCredentialHandoff: null job -> null');
+  assert(summarizeCredentialHandoff({ identity: JSON.stringify({ subject_kind: 'agent' }) }) === null, 'summarizeCredentialHandoff: identity without presentation -> null');
+
+  // Malformed identity JSON -> error
+  const malformedHandoff = summarizeCredentialHandoff({ identity: 'not-json' });
+  assert(malformedHandoff !== null, 'summarizeCredentialHandoff: malformed JSON returns non-null');
+  assert(malformedHandoff.error && malformedHandoff.error.includes('parse failed'), 'summarizeCredentialHandoff: malformed JSON error');
+  assert(malformedHandoff.bindings_count === 0, 'summarizeCredentialHandoff: malformed JSON bindings_count is 0');
+}
+
+console.log('\n── v0.2 persistV02Outcomes ──');
+{
+  const outcomeJob = createJob({
+    name: 'v02-persist-outcomes',
+    schedule_cron: '0 8 * * *',
+    payload_message: 'outcome test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const outcomeRun = createRun(outcomeJob.id, { run_timeout_ms: 60000 });
+
+  const identityResolved = { subject_kind: 'agent', principal: 'agent:test', trust_level: 'supervised' };
+  const trustEvaluation = { effective_level: 'supervised', required_level: 'supervised', decision: 'permit', reason: 'meets requirement' };
+  const authDecision = { decision: 'permit', reason: 'pre-approved', ref: 'urn:authz:1' };
+  const proofVerification = { verified: true, method: 'signed-jwt', ref: 'jwt-ref' };
+  const evidenceRecord = { evidence_ref: 'urn:evidence:1', created_at: '2026-03-28T00:00:00Z', hash: null, payload_summary: {} };
+  const handoffSummary = { mode: 'inject-env', bindings_count: 2, cleanup_required: true };
+
+  persistV02Outcomes(outcomeRun.id, {
+    identity_resolved: identityResolved,
+    trust_evaluation: trustEvaluation,
+    authorization_decision: authDecision,
+    authorization_proof_verification: proofVerification,
+    evidence_record: evidenceRecord,
+    credential_handoff_summary: handoffSummary,
+  });
+
+  const fetchedRun = getRun(outcomeRun.id);
+  assert(fetchedRun.identity_resolved !== null, 'persistV02Outcomes: identity_resolved stored');
+  assert(fetchedRun.trust_evaluation !== null, 'persistV02Outcomes: trust_evaluation stored');
+  assert(fetchedRun.authorization_decision !== null, 'persistV02Outcomes: authorization_decision stored');
+  assert(fetchedRun.authorization_proof_verification !== null, 'persistV02Outcomes: authorization_proof_verification stored');
+  assert(fetchedRun.evidence_record !== null, 'persistV02Outcomes: evidence_record stored');
+  assert(fetchedRun.credential_handoff_summary !== null, 'persistV02Outcomes: credential_handoff_summary stored');
+
+  // Verify JSON serialization round-trip
+  const parsedIdentity = JSON.parse(fetchedRun.identity_resolved);
+  assert(parsedIdentity.principal === 'agent:test', 'persistV02Outcomes: identity_resolved JSON roundtrip principal');
+  assert(parsedIdentity.trust_level === 'supervised', 'persistV02Outcomes: identity_resolved JSON roundtrip trust_level');
+
+  const parsedTrust = JSON.parse(fetchedRun.trust_evaluation);
+  assert(parsedTrust.decision === 'permit', 'persistV02Outcomes: trust_evaluation JSON roundtrip decision');
+
+  const parsedAuth = JSON.parse(fetchedRun.authorization_decision);
+  assert(parsedAuth.decision === 'permit', 'persistV02Outcomes: authorization_decision JSON roundtrip decision');
+  assert(parsedAuth.ref === 'urn:authz:1', 'persistV02Outcomes: authorization_decision JSON roundtrip ref');
+
+  const parsedProof = JSON.parse(fetchedRun.authorization_proof_verification);
+  assert(parsedProof.verified === true, 'persistV02Outcomes: authorization_proof_verification JSON roundtrip verified');
+  assert(parsedProof.method === 'signed-jwt', 'persistV02Outcomes: authorization_proof_verification JSON roundtrip method');
+
+  const parsedEvidence = JSON.parse(fetchedRun.evidence_record);
+  assert(parsedEvidence.evidence_ref === 'urn:evidence:1', 'persistV02Outcomes: evidence_record JSON roundtrip ref');
+
+  const parsedHandoff = JSON.parse(fetchedRun.credential_handoff_summary);
+  assert(parsedHandoff.mode === 'inject-env', 'persistV02Outcomes: credential_handoff_summary JSON roundtrip mode');
+  assert(parsedHandoff.bindings_count === 2, 'persistV02Outcomes: credential_handoff_summary JSON roundtrip bindings_count');
+
+  // Verify null/undefined outcomes are safely ignored
+  persistV02Outcomes(outcomeRun.id, { identity_resolved: undefined });
+  const unchanged = getRun(outcomeRun.id);
+  assert(unchanged.identity_resolved === fetchedRun.identity_resolved, 'persistV02Outcomes: undefined value does not overwrite');
+
+  // Verify unknown columns are ignored
+  persistV02Outcomes(outcomeRun.id, { nonexistent_field: 'should be ignored' });
+  const stillOk = getRun(outcomeRun.id);
+  assert(stillOk.identity_resolved === fetchedRun.identity_resolved, 'persistV02Outcomes: unknown columns ignored');
+
+  // Verify null input is safely handled
+  persistV02Outcomes(outcomeRun.id, null);
+  persistV02Outcomes(outcomeRun.id, undefined);
+  // If we got here without throwing, the safety check passed
+  assert(true, 'persistV02Outcomes: null/undefined outcomes handled gracefully');
+
+  // Verify string values are stored as-is (not double-serialized)
+  persistV02Outcomes(outcomeRun.id, { identity_resolved: '{"raw":"string"}' });
+  const stringStored = getRun(outcomeRun.id);
+  assert(stringStored.identity_resolved === '{"raw":"string"}', 'persistV02Outcomes: string values stored as-is');
+}
+
+console.log('\n── v0.2 Capabilities CLI ──');
+{
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
+  const capsOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'capabilities', '--json'], {
+    cwd: process.cwd(),
+    env: { ...process.env, SCHEDULER_DB: ':memory:' },
+    encoding: 'utf8',
+  }));
+  assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
+  assert(capsOut.schema_version === 22, 'capabilities: schema_version is 22');
+  assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
+  assert(capsOut.features, 'capabilities: features object present');
+  assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');
+  assert(capsOut.features.runtime_identity_resolution === true, 'capabilities: runtime_identity_resolution enabled');
+  assert(capsOut.features.trust_evaluation === true, 'capabilities: trust_evaluation enabled');
+  assert(capsOut.features.authorization_proof_verification === true, 'capabilities: authorization_proof_verification enabled');
+  assert(capsOut.features.authorization_hook === true, 'capabilities: authorization_hook enabled');
+  assert(capsOut.features.evidence_generation === true, 'capabilities: evidence_generation enabled');
+  assert(capsOut.features.credential_handoff === true, 'capabilities: credential_handoff enabled');
+  assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
+  assert(capsOut.features.delegation_validation === false, 'capabilities: delegation_validation not yet enabled');
+  assert(capsOut.features.runtime_execution === true, 'capabilities: runtime_execution enabled');
 }
 
 closeDb();

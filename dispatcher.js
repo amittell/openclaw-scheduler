@@ -33,8 +33,12 @@ const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
 import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
-  updateRunSession, pruneRuns, updateContextSummary
+  updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes
 } from './runs.js';
+import {
+  resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+  evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+} from './v02-runtime.js';
 import {
   getInbox, markDelivered,
   expireMessages, pruneMessages
@@ -306,6 +310,10 @@ function buildDispatchDeps() {
     dequeueJob,
     // Drain-error retry
     isDrainError, enqueueDispatch, getJob,
+    // v0.2 runtime
+    resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+    evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+    persistV02Outcomes,
   };
 }
 
@@ -424,7 +432,7 @@ function buildJobPrompt(job, run) {
     parts.push('respond with: IDEMPOTENT_SKIP');
   }
 
-  parts.push('\n' + job.payload_message);
+  parts.push('\n' + (job.payload_message ?? ''));
   return { prompt: parts.join('\n'), contextMeta };
 }
 
@@ -559,6 +567,8 @@ async function tick() {
         updateJobAfterRun,
         handleDelivery,
         dequeueJob,
+        shouldRetry,
+        scheduleRetry,
         staleThresholdSeconds: STALE_THRESHOLD_S,
       });
     } catch (err) {
