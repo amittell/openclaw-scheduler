@@ -65,6 +65,16 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     ...result.runFinishFields,
   });
 
+  // 1b. v0.2 evidence and outcome persistence
+  if (ctx.v02Outcomes) {
+    const { generateEvidence, persistV02Outcomes } = deps;
+    if (job.evidence || job.evidence_ref) {
+      const evidence = generateEvidence(job, result, ctx.v02Outcomes);
+      if (evidence) ctx.v02Outcomes.evidence_record = evidence;
+    }
+    persistV02Outcomes(ctx.run.id, ctx.v02Outcomes);
+  }
+
   // 2. Idempotency key management
   if (ctx.idemKey) {
     if (result.idemAction === 'keep') {
@@ -350,7 +360,60 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
-  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch };
+  // v0.2 runtime evaluation
+  const {
+    resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+    evaluateAuthorization, summarizeCredentialHandoff, persistV02Outcomes,
+    releaseIdempotencyKey: releaseIdemKey,
+  } = deps;
+
+  const v02Outcomes = {};
+  const hasV02Identity = job.identity || job.identity_trust_level || job.identity_ref;
+  const hasV02Contract = job.contract_required_trust_level;
+
+  if (hasV02Identity || hasV02Contract) {
+    v02Outcomes.identity_resolved = resolveIdentity(job);
+    v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
+
+    if (v02Outcomes.trust_evaluation && v02Outcomes.trust_evaluation.decision === 'deny') {
+      finishRun(run.id, 'error', {
+        summary: 'Trust enforcement blocked dispatch: ' + v02Outcomes.trust_evaluation.reason,
+        error_message: v02Outcomes.trust_evaluation.reason,
+      });
+      persistV02Outcomes(run.id, v02Outcomes);
+      if (idemKey) releaseIdemKey(idemKey);
+      if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'done');
+      return null;
+    }
+  }
+
+  if (job.authorization_proof || job.authorization_proof_ref) {
+    v02Outcomes.authorization_proof_verification = verifyAuthorizationProof(job);
+  }
+
+  if (job.authorization || job.authorization_ref) {
+    v02Outcomes.authorization_decision = evaluateAuthorization(
+      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation
+    );
+
+    if (v02Outcomes.authorization_decision && v02Outcomes.authorization_decision.decision === 'deny') {
+      finishRun(run.id, 'error', {
+        summary: 'Authorization denied: ' + v02Outcomes.authorization_decision.reason,
+        error_message: v02Outcomes.authorization_decision.reason,
+      });
+      persistV02Outcomes(run.id, v02Outcomes);
+      if (idemKey) releaseIdemKey(idemKey);
+      if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'done');
+      return null;
+    }
+  }
+
+  if (hasV02Identity) {
+    const handoff = summarizeCredentialHandoff(job);
+    if (handoff) v02Outcomes.credential_handoff_summary = handoff;
+  }
+
+  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes };
 }
 
 // ── Strategy: Watchdog ──────────────────────────────────────
