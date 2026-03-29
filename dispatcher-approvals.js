@@ -22,6 +22,7 @@ export async function checkApprovals({
             UPDATE runs
             SET status = 'approved',
                 finished_at = datetime('now'),
+                duration_ms = CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER),
                 summary = COALESCE(summary, 'Approval granted (timeout auto-approve)')
             WHERE id = ? AND status IN ('awaiting_approval', 'pending')
           `).run(approval.run_id);
@@ -72,6 +73,7 @@ export async function checkApprovals({
           UPDATE runs
           SET status = 'approved',
               finished_at = datetime('now'),
+              duration_ms = CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER),
               summary = COALESCE(summary, 'Approved by operator')
           WHERE id = ? AND status IN ('awaiting_approval', 'pending')
         `).run(approval.run_id);

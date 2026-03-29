@@ -45,6 +45,7 @@ import {
   matchesSentinel, detectTransientError, adaptiveDeferralMs,
   buildExecutionIntentNote, getBackoffMs, sqliteNow,
 } from './dispatcher-utils.js';
+import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
 import {
@@ -541,6 +542,59 @@ console.log('\nTimeout:');
 const toRun = createRun(job.id, { run_timeout_ms: 1 });
 db.prepare("UPDATE runs SET started_at = datetime('now', '-10 seconds') WHERE id = ?").run(toRun.id);
 assert(getTimedOutRuns().some(r => r.id === toRun.id), 'timeout detected');
+
+{
+  const timeoutRetryJob = createJob({
+    name: 'timeout-retry-health-check',
+    schedule_cron: '*/5 * * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo timeout retry',
+    overlap_policy: 'queue',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: 'timeout-retry-target',
+    run_timeout_ms: 1,
+    max_retries: 1,
+    origin: 'system',
+  });
+  enqueueJob(timeoutRetryJob.id);
+  const timeoutRetryRun = createRun(timeoutRetryJob.id, { run_timeout_ms: 1, status: 'running' });
+  const timeoutRetryMessages = [];
+
+  await checkRunHealth({
+    log() {},
+    getDb,
+    getRunningRuns: () => [timeoutRetryRun],
+    getStaleRuns: () => [],
+    getTimedOutRuns: () => [{ ...timeoutRetryRun, job_name: timeoutRetryJob.name, run_timeout_ms: 1 }],
+    finishRun,
+    getJob,
+    updateJobAfterRun() {},
+    async handleDelivery(_job, content) {
+      timeoutRetryMessages.push(content);
+    },
+    dequeueJob,
+    shouldRetry,
+    scheduleRetry,
+    staleThresholdSeconds: 90,
+  });
+
+  const refreshedTimeoutRetryRun = getRun(timeoutRetryRun.id);
+  const refreshedTimeoutRetryJob = getJob(timeoutRetryJob.id);
+  const retryDispatches = listDispatchesForJob(timeoutRetryJob.id, 10);
+
+  assert(refreshedTimeoutRetryRun.retry_count === 1, 'checkRunHealth timeout retry persists retry_count on the timed-out run');
+  assert(refreshedTimeoutRetryRun.status === 'timeout', 'checkRunHealth timeout retry preserves run timeout status');
+  assert(refreshedTimeoutRetryJob.last_status === 'timeout', 'checkRunHealth timeout retry records last_status as timeout');
+  assert(refreshedTimeoutRetryJob.queued_count === 0, 'checkRunHealth timeout retry drains queued overlap backlog');
+  assert(!shouldRetry(refreshedTimeoutRetryJob, timeoutRetryRun.id), 'checkRunHealth timeout retry exhausts max_retries for the timed-out run');
+  assert(retryDispatches.some(d => d.dispatch_kind === 'retry' && d.status === 'pending'), 'checkRunHealth timeout retry enqueues a retry dispatch');
+  assert(timeoutRetryMessages.length === 1 && timeoutRetryMessages[0].includes('will retry'), 'checkRunHealth timeout retry still delivers a timeout notice');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(timeoutRetryJob.id);
+  deleteJob(timeoutRetryJob.id);
+}
 
 // ── Agents ──────────────────────────────────────────────────
 console.log('\nAgents:');

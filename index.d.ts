@@ -802,11 +802,16 @@ export const SCHEDULER_SCHEMAS: {
 // -- v0.2 Runtime result interfaces --
 
 export interface ResolvedIdentity {
+  provider?: string;
+  session?: Record<string, unknown> | null;
+  source?: 'provider' | 'provider-error';
   subject_kind: string;
   principal: string | null;
   trust_level: string | null;
   delegation_mode: string | null;
   raw: Record<string, unknown> | null;
+  transient?: boolean;
+  error?: string;
 }
 
 export interface TrustEvaluation {
@@ -820,6 +825,8 @@ export interface AuthorizationProofResult {
   verified: boolean;
   method: string | null;
   ref: string | null;
+  source?: 'provider' | 'provider-error';
+  provider?: string;
   error?: string;
 }
 
@@ -827,6 +834,8 @@ export interface AuthorizationResult {
   decision: 'permit' | 'deny' | 'escalate';
   reason: string;
   ref: string | null;
+  source?: 'provider' | 'provider-error';
+  provider?: string;
 }
 
 export interface EvidenceResult {

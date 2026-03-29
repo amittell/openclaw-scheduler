@@ -260,6 +260,8 @@ const job = createJob({
   payload_message: 'Reply with exactly: SCHEDULER_OK',
   delivery_mode: 'none',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created smoke test:', job.id);
@@ -283,6 +285,8 @@ const job = createJob({
   payload_message: 'echo scheduler_shell_ok',
   delivery_mode: 'announce-always',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created shell smoke test:', job.id);
@@ -305,6 +309,8 @@ const job = createJob({
   delivery_channel: 'telegram',
   delivery_to: 'YOUR_TELEGRAM_ID',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created Telegram test:', job.id);
@@ -501,3 +507,9 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 - [ ] Telegram test → message received
 - [ ] First real job → fires on schedule
 - [ ] `loginctl enable-linger $USER` → confirmed (for always-on servers)
+
+---
+
+## Upgrading
+
+Already have the scheduler installed and need to update to a newer version? See [UPGRADING.md](UPGRADING.md).

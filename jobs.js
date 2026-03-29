@@ -1105,7 +1105,7 @@ export function shouldRetry(job, runId) {
 /**
  * Schedule a retry for a failed run. Returns the new retry run's next_run_at or null.
  */
-export function scheduleRetry(job, failedRunId) {
+export function scheduleRetry(job, failedRunId, opts = {}) {
   const db = getDb();
   const failedRun = db.prepare('SELECT retry_count FROM runs WHERE id = ?').get(failedRunId);
   const retryCount = (failedRun?.retry_count || 0) + 1;
@@ -1113,7 +1113,7 @@ export function scheduleRetry(job, failedRunId) {
   const delaySec = 30 * Math.pow(2, retryCount - 1);
   const retryPatch = {
     last_run_at: sqliteNow(),
-    last_status: 'error',
+    last_status: opts.lastStatus || 'error',
   };
   if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
     retryPatch.next_run_at = nextRunFromCron(job.schedule_cron, job.schedule_tz);

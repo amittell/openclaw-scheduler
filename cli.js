@@ -1012,9 +1012,10 @@ switch (command) {
   // ── Capabilities ────────────────────────────────────────
   case 'capabilities': {
     const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    const schemaVersion = getDb().prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;
     const capabilities = {
       scheduler_version: pkg.version,
-      schema_version: 23,
+      schema_version: schemaVersion,
       handoff_version: '2',
       features: {
         approvals: 'runtime',
