@@ -53,7 +53,7 @@ import {
   TRUST_LEVELS,
 } from './v02-runtime.js';
 import { runShellCommand } from './dispatcher-shell.js';
-import { prepareDispatch } from './dispatcher-strategies.js';
+import { prepareDispatch, finalizeDispatch } from './dispatcher-strategies.js';
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
@@ -7453,6 +7453,37 @@ console.log('\n── v0.2 evaluateTrust ──');
   assert(TRUST_LEVELS.indexOf('supervised') < TRUST_LEVELS.indexOf('autonomous'), 'TRUST_LEVELS: supervised < autonomous');
 }
 
+console.log('\n── v0.2 evaluateTrust enforcement normalization ──');
+{
+  // advisory normalizes to warn
+  const advisoryResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'advisory' },
+    { trust_level: 'supervised' }
+  );
+  assert(advisoryResult.decision === 'warn', 'evaluateTrust: advisory normalizes to warn');
+
+  // strict normalizes to block
+  const strictResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'strict' },
+    { trust_level: 'restricted' }
+  );
+  assert(strictResult.decision === 'deny', 'evaluateTrust: strict normalizes to block (deny)');
+
+  // advisory with no effective trust -> warn
+  const advisoryNoTrust = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'advisory' },
+    null
+  );
+  assert(advisoryNoTrust.decision === 'warn', 'evaluateTrust: advisory + no effective trust -> warn');
+
+  // strict with sufficient trust -> permit
+  const strictSufficient = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'strict' },
+    { trust_level: 'autonomous' }
+  );
+  assert(strictSufficient.decision === 'permit', 'evaluateTrust: strict + sufficient trust -> permit');
+}
+
 console.log('\n── v0.2 verifyAuthorizationProof ──');
 {
   // Valid proof structure -> verified:true
@@ -7961,6 +7992,48 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(scalarIdentityJob.id);
   deleteJob(scalarIdentityJob.id);
 
+  const providerErrorJob = createJob({
+    name: 'prepare-dispatch-provider-error',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo provider error',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'error-provider', scope: 'full' }),
+    authorization: JSON.stringify({ requires_identity: true }),
+  });
+  let providerErrorUpdates = 0;
+  const providerErrorCtx = await prepareDispatch(
+    getJob(providerErrorJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'error-provider'
+        ? {
+            name: 'error-provider',
+            type: 'identity',
+            resolveSession() {
+              return { ok: false, transient: true, error: 'Vault timeout' };
+            },
+          }
+        : null,
+      updateJobAfterRun(_job, status) {
+        if (status === 'error') providerErrorUpdates++;
+      },
+    }),
+  );
+  assert(providerErrorCtx === null, 'prepareDispatch: provider identity resolution failures fail closed');
+  const providerErrorRun = getRunsForJob(providerErrorJob.id, 1)[0];
+  assert(providerErrorRun.status === 'error', 'prepareDispatch: provider identity resolution failure finishes run as error');
+  assert(providerErrorRun.error_message.includes('Identity resolution failed: Vault timeout'), 'prepareDispatch: provider identity resolution failure stores reason');
+  const providerErrorIdentity = JSON.parse(getRun(providerErrorRun.id).identity_resolved);
+  assert(providerErrorIdentity.source === 'provider-error', 'prepareDispatch: provider identity resolution failure persists provider-error outcome');
+  assert(providerErrorUpdates === 1, 'prepareDispatch: provider identity resolution failure updates job state');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(providerErrorJob.id);
+  deleteJob(providerErrorJob.id);
+
   const parentForNone = createJob({
     name: 'prepare-dispatch-parent-none',
     schedule_cron: '0 8 * * *',
@@ -8077,6 +8150,107 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentForDownscope.id, downscopeChild.id);
   deleteJob(downscopeChild.id);
   deleteJob(parentForDownscope.id);
+
+  const cleanupCalls = [];
+  const asyncProviderJob = createJob({
+    name: 'prepare-dispatch-async-materialize',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo async materialize',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'async-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  const asyncProvider = {
+    name: 'async-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'async-provider',
+          subject: { kind: 'service', principal: 'svc:async' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    async materialize(_session, _presentation) {
+      await Promise.resolve();
+      return {
+        materialized: true,
+        env_vars: { ASYNC_PROVIDER_TOKEN: 'token-123' },
+        cleanup_required: true,
+        cleanup_token: 'cleanup-123',
+        temp_path: '/tmp/async-provider-token',
+      };
+    },
+    async cleanup(state) {
+      cleanupCalls.push(state);
+      return { cleaned: true };
+    },
+  };
+  const asyncProviderCtx = await prepareDispatch(
+    getJob(asyncProviderJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
+    }),
+  );
+  assert(asyncProviderCtx !== null, 'prepareDispatch: async provider materialization returns dispatch context');
+  assert(asyncProviderCtx?.materializedEnv?.ASYNC_PROVIDER_TOKEN === 'token-123', 'prepareDispatch: async provider materialization awaits env vars');
+  await finalizeDispatch(
+    getJob(asyncProviderJob.id),
+    asyncProviderCtx,
+    {
+      status: 'ok',
+      summary: 'async materialize test',
+      content: '',
+      errorMessage: null,
+      runFinishFields: {},
+      deliveryOverride: null,
+      skipDelivery: true,
+      skipJobUpdate: true,
+      skipChildren: true,
+      skipDequeue: true,
+      skipAgentCleanup: true,
+      idemAction: 'noop',
+      retryFiresChildren: false,
+      earlyReturn: false,
+    },
+    {
+      finishRun,
+      updateIdempotencyResultHash() {},
+      releaseIdempotencyKey() {},
+      setAgentStatus() {},
+      handleDelivery() {},
+      shouldRetry: () => false,
+      scheduleRetry() {
+        throw new Error('scheduleRetry should not be called in async materialize test');
+      },
+      getDb,
+      updateJobAfterRun() {},
+      setDispatchStatus() {},
+      handleTriggeredChildren() {},
+      dequeueJob: () => false,
+      log() {},
+      generateEvidence,
+      persistV02Outcomes,
+    },
+  );
+  assert(cleanupCalls.length === 1, 'finalizeDispatch: async provider cleanup is invoked once');
+  assert(cleanupCalls[0].cleanup_token === 'cleanup-123', 'finalizeDispatch: provider cleanup receives materialization metadata');
+  assert(cleanupCalls[0].temp_path === '/tmp/async-provider-token', 'finalizeDispatch: provider cleanup receives cleanup path');
+  assert(cleanupCalls[0].session.subject.principal === 'svc:async', 'finalizeDispatch: provider cleanup retains session details');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(asyncProviderJob.id);
+  deleteJob(asyncProviderJob.id);
 }
 
 // ═══════════════════════════════════════════════════════════
