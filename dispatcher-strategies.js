@@ -79,7 +79,8 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   if (ctx.v02Outcomes) {
     const { generateEvidence, persistV02Outcomes } = deps;
     if (job.evidence || job.evidence_ref) {
-      const evidence = generateEvidence(job, result, ctx.v02Outcomes);
+      const runMetadata = { id: ctx.run.id, status: result.status };
+      const evidence = generateEvidence(job, runMetadata, ctx.v02Outcomes);
       if (evidence) ctx.v02Outcomes.evidence_record = evidence;
     }
     persistV02Outcomes(ctx.run.id, ctx.v02Outcomes);
@@ -444,7 +445,12 @@ export async function prepareDispatch(job, opts, deps) {
     if (handoff) v02Outcomes.credential_handoff_summary = handoff;
   }
 
-  // Child credential policy enforcement
+  // Child credential policy enforcement.
+  // This runs AFTER trust/auth evaluation intentionally: if the child's own
+  // identity fails trust or authorization gates above, dispatch aborts before
+  // reaching this point. The policy only narrows (downscope) or removes (none)
+  // credentials -- it never escalates. The mutated identity_resolved is what
+  // gets materialized and persisted in v02Outcomes.
   if (job.parent_id && hasV02Identity) {
     const { getDb: getDatabase } = deps;
     const parentJob = getDatabase().prepare(

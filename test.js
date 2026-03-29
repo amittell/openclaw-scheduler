@@ -3833,6 +3833,9 @@ console.log('\n── Approval Timeout / Prune / Count ──');
   // ap1 was resolved recently, should still exist
   assert(getApproval(ap1.id) !== undefined, 'recent resolved approval survives prune');
 
+  // Cleanup: remove approvals and runs for this job to avoid leaking state
+  getDb().prepare('DELETE FROM approvals WHERE job_id = ?').run(aJob.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(aJob.id);
   deleteJob(aJob.id);
 }
 
@@ -6899,6 +6902,7 @@ console.log('\n── v0.2 Schema Column Verification ──');
     'contract_required_trust_level', 'contract_trust_enforcement',
     'contract_sandbox', 'contract_allowed_paths', 'contract_network',
     'contract_max_cost_usd', 'contract_audit',
+    'child_credential_policy',
   ];
   for (const col of v02JobCols) {
     assert(jobCols.includes(col), `jobs table should have column ${col}`);
@@ -7747,7 +7751,7 @@ console.log('\n── v0.2 Capabilities CLI ──');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 22, 'capabilities: schema_version is 22');
+  assert(capsOut.schema_version === 23, 'capabilities: schema_version is 23');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

@@ -71,7 +71,7 @@ function toSchedulerSpec(compiledJob) {
 
 setDbPath(':memory:');
 await initDb();
-const db = getDb();
+const _db = getDb();
 
 console.log('agentcli integration tests\n');
 

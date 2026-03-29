@@ -53,7 +53,12 @@ function trustIndex(level) {
  *
  * @param {object} job - Job record with v0.2 identity fields.
  * @param {object} [ctx={}] - Optional context with provider accessors.
- * @returns {Promise<{ subject_kind, principal, trust_level, delegation_mode, raw } | null>}
+ * @returns {Promise<
+ *   { subject_kind, principal, trust_level, delegation_mode, raw } |
+ *   { provider, session, source: 'provider', subject_kind, principal, trust_level, delegation_mode, raw } |
+ *   { provider, error, transient, source: 'provider-error' } |
+ *   null
+ * >}
  */
 export async function resolveIdentity(job, ctx = {}) {
   if (!job) return null;
@@ -189,9 +194,15 @@ export function evaluateTrust(job, resolvedIdentity) {
     return { effective_level: effectiveLevel, required_level: requiredLevel, decision: 'permit', reason: `unrecognized required trust level: ${requiredLevel}` };
   }
 
+  // Normalize enforcement: agentcli uses advisory/strict, runtime uses warn/block.
+  const rawEnforcement = job.contract_trust_enforcement || 'none';
+  const normalizedEnforcement = rawEnforcement === 'advisory' ? 'warn'
+    : rawEnforcement === 'strict' ? 'block'
+    : rawEnforcement;
+
   if (effectiveLevel == null) {
     // No effective level declared -- enforcement determines outcome.
-    const enforcement = job.contract_trust_enforcement || 'none';
+    const enforcement = normalizedEnforcement;
     if (enforcement === 'block') {
       return { effective_level: null, required_level: requiredLevel, decision: 'deny', reason: 'no trust level declared; enforcement is block' };
     }
@@ -203,7 +214,7 @@ export function evaluateTrust(job, resolvedIdentity) {
 
   if (effectiveIdx < 0) {
     // Effective level not in canonical list.
-    const enforcement = job.contract_trust_enforcement || 'none';
+    const enforcement = normalizedEnforcement;
     if (enforcement === 'block') {
       return { effective_level: effectiveLevel, required_level: requiredLevel, decision: 'deny', reason: `unrecognized effective trust level: ${effectiveLevel}` };
     }
@@ -218,7 +229,7 @@ export function evaluateTrust(job, resolvedIdentity) {
   }
 
   // Effective is below required -- check enforcement.
-  const enforcement = job.contract_trust_enforcement || 'none';
+  const enforcement = normalizedEnforcement;
   if (enforcement === 'block') {
     return { effective_level: effectiveLevel, required_level: requiredLevel, decision: 'deny', reason: `trust level ${effectiveLevel} is below required ${requiredLevel}` };
   }
@@ -411,7 +422,7 @@ export async function evaluateAuthorization(job, identityResult, trustResult, ct
   }
 
   // Default: permit. Actual OPA/provider calls are future work.
-  return { decision: blob.decision === 'permit' ? 'permit' : 'permit', reason: blob.reason || 'authorization policy permits (structural check only)', ref: blobRef };
+  return { decision: 'permit', reason: blob.reason || 'authorization policy permits (structural check only)', ref: blobRef };
 }
 
 // ---------------------------------------------------------------------------
