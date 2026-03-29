@@ -72,7 +72,7 @@ export const SCHEDULER_SCHEMAS = {
 
       // v0.2 Contract
       contract_required_trust_level: { type: 'string', enum: ['untrusted', 'restricted', 'supervised', 'autonomous'], nullable: true },
-      contract_trust_enforcement: { type: 'string', enum: ['none', 'warn', 'block'], nullable: true },
+      contract_trust_enforcement: { type: 'string', enum: ['none', 'warn', 'block', 'advisory', 'strict'], nullable: true, description: 'advisory/strict normalize to warn/block at runtime' },
       contract_sandbox: { type: 'string', nullable: true, description: 'JSON blob: sandbox constraints' },
       contract_allowed_paths: { type: 'string', nullable: true, description: 'JSON blob: allowed filesystem paths' },
       contract_network: { type: 'string', nullable: true, description: 'JSON blob: network access policy' },

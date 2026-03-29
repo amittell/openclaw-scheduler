@@ -50,6 +50,40 @@ function safeParse(str) {
   }
 }
 
+function hasIdentityDeclaration(job) {
+  if (!job) return false;
+  return job.identity != null
+    || job.identity_ref != null
+    || job.identity_principal != null
+    || job.identity_run_as != null
+    || job.identity_attestation != null
+    || job.identity_subject_kind != null
+    || job.identity_subject_principal != null
+    || job.identity_trust_level != null
+    || job.identity_delegation_mode != null;
+}
+
+function abortPreparedRun(job, run, summary, outcomes, state, deps) {
+  const {
+    finishRun, persistV02Outcomes, releaseIdempotencyKey, updateJobAfterRun,
+    setDispatchStatus, handleTriggeredChildren, dequeueJob, log,
+  } = deps;
+
+  finishRun(run.id, 'error', {
+    summary,
+    error_message: summary,
+  });
+  persistV02Outcomes(run.id, outcomes);
+  if (state.idemKey) releaseIdempotencyKey(state.idemKey);
+  updateJobAfterRun(job, 'error');
+  if (state.dispatchRecord) setDispatchStatus(state.dispatchRecord.id, 'done');
+  handleTriggeredChildren(job.id, 'error', summary, run.id);
+  if (dequeueJob(job.id)) {
+    log('info', `Dequeued pending dispatch for ${job.name}`);
+  }
+  return null;
+}
+
 /**
  * Uniform post-execution ceremony. Processes the DispatchResult from any strategy.
  *
@@ -386,8 +420,7 @@ export async function prepareDispatch(job, opts, deps) {
   // v0.2 runtime evaluation
   const {
     resolveIdentity, evaluateTrust, verifyAuthorizationProof,
-    evaluateAuthorization, summarizeCredentialHandoff, persistV02Outcomes,
-    releaseIdempotencyKey: releaseIdemKey,
+    evaluateAuthorization, summarizeCredentialHandoff,
   } = deps;
 
   // Build provider context for v0.2 runtime calls
@@ -400,44 +433,13 @@ export async function prepareDispatch(job, opts, deps) {
   };
 
   const v02Outcomes = {};
-  const hasV02Identity = job.identity || job.identity_trust_level || job.identity_ref;
+  const hasV02Identity = hasIdentityDeclaration(job);
   const hasV02Contract = job.contract_required_trust_level;
+  const needsAuthorization = job.authorization || job.authorization_ref;
+  const shouldResolveIdentity = hasV02Identity || hasV02Contract || needsAuthorization;
 
-  if (hasV02Identity || hasV02Contract) {
+  if (shouldResolveIdentity) {
     v02Outcomes.identity_resolved = await resolveIdentity(job, providerCtx);
-    v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
-
-    if (v02Outcomes.trust_evaluation && v02Outcomes.trust_evaluation.decision === 'deny') {
-      finishRun(run.id, 'error', {
-        summary: 'Trust enforcement blocked dispatch: ' + v02Outcomes.trust_evaluation.reason,
-        error_message: v02Outcomes.trust_evaluation.reason,
-      });
-      persistV02Outcomes(run.id, v02Outcomes);
-      if (idemKey) releaseIdemKey(idemKey);
-      if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'done');
-      return null;
-    }
-  }
-
-  if (job.authorization_proof || job.authorization_proof_ref) {
-    v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
-  }
-
-  if (job.authorization || job.authorization_ref) {
-    v02Outcomes.authorization_decision = await evaluateAuthorization(
-      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation, providerCtx
-    );
-
-    if (v02Outcomes.authorization_decision && v02Outcomes.authorization_decision.decision === 'deny') {
-      finishRun(run.id, 'error', {
-        summary: 'Authorization denied: ' + v02Outcomes.authorization_decision.reason,
-        error_message: v02Outcomes.authorization_decision.reason,
-      });
-      persistV02Outcomes(run.id, v02Outcomes);
-      if (idemKey) releaseIdemKey(idemKey);
-      if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'done');
-      return null;
-    }
   }
 
   if (hasV02Identity) {
@@ -446,12 +448,11 @@ export async function prepareDispatch(job, opts, deps) {
   }
 
   // Child credential policy enforcement.
-  // This runs AFTER trust/auth evaluation intentionally: if the child's own
-  // identity fails trust or authorization gates above, dispatch aborts before
-  // reaching this point. The policy only narrows (downscope) or removes (none)
-  // credentials -- it never escalates. The mutated identity_resolved is what
-  // gets materialized and persisted in v02Outcomes.
-  if (job.parent_id && hasV02Identity) {
+  // Apply this BEFORE trust/auth evaluation so later gates see the effective
+  // identity that will actually be materialized for the run. The policy can
+  // narrow (downscope) or remove (none) credentials, and it may also inherit
+  // the parent's auth_profile for downstream gateway calls.
+  if (job.parent_id) {
     const { getDb: getDatabase } = deps;
     const parentJob = getDatabase().prepare(
       'SELECT id, child_credential_policy, identity, auth_profile FROM jobs WHERE id = ?'
@@ -531,6 +532,53 @@ export async function prepareDispatch(job, opts, deps) {
         }
       }
       // 'independent': uses child's own identity (no parent involvement)
+    }
+  }
+
+  if (hasV02Identity || hasV02Contract || v02Outcomes.identity_resolved != null) {
+    v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
+    if (v02Outcomes.trust_evaluation?.decision === 'warn') {
+      log('warn', `Trust evaluation warning for ${job.name}: ${v02Outcomes.trust_evaluation.reason}`, {
+        jobId: job.id,
+        runId: run.id,
+      });
+    }
+    if (v02Outcomes.trust_evaluation?.decision === 'deny') {
+      return abortPreparedRun(
+        job,
+        run,
+        'Trust enforcement blocked dispatch: ' + v02Outcomes.trust_evaluation.reason,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+      );
+    }
+  }
+
+  if (job.authorization_proof || job.authorization_proof_ref) {
+    v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
+    if (v02Outcomes.authorization_proof_verification?.verified === false) {
+      log('warn', `Authorization proof verification failed for ${job.name}: ${v02Outcomes.authorization_proof_verification.error || 'verification returned false'}`, {
+        jobId: job.id,
+        runId: run.id,
+      });
+    }
+  }
+
+  if (needsAuthorization) {
+    v02Outcomes.authorization_decision = await evaluateAuthorization(
+      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation, providerCtx
+    );
+
+    if (v02Outcomes.authorization_decision?.decision === 'deny') {
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization denied: ' + v02Outcomes.authorization_decision.reason,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+      );
     }
   }
 
