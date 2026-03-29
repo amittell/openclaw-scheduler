@@ -387,22 +387,27 @@ void v02Runtime.TRUST_LEVELS;
 const identityP: Promise<ResolvedIdentity | null> = v02Runtime.resolveIdentity({ identity_principal: 'test' });
 const identity: ResolvedIdentity | null = null as unknown as Awaited<typeof identityP>;
 if (identity) {
+  void identity.provider;
+  void identity.session;
+  void identity.source;
   void identity.subject_kind;
   void identity.principal;
   void identity.trust_level;
   void identity.delegation_mode;
   void identity.raw;
+  void identity.transient;
+  void identity.error;
 }
 const trust: TrustEvaluation = v02Runtime.evaluateTrust({}, identity);
 void trust.effective_level; void trust.required_level; void trust.decision; void trust.reason;
 
 const proofResultP: Promise<AuthorizationProofResult | null> = v02Runtime.verifyAuthorizationProof({});
 const proofResult: AuthorizationProofResult | null = null as unknown as Awaited<typeof proofResultP>;
-if (proofResult) { void proofResult.verified; void proofResult.method; void proofResult.ref; }
+if (proofResult) { void proofResult.verified; void proofResult.method; void proofResult.ref; void proofResult.source; void proofResult.provider; }
 
 const authResultP: Promise<AuthorizationResult | null> = v02Runtime.evaluateAuthorization({}, identity, trust);
 const authResult: AuthorizationResult | null = null as unknown as Awaited<typeof authResultP>;
-if (authResult) { void authResult.decision; void authResult.reason; void authResult.ref; }
+if (authResult) { void authResult.decision; void authResult.reason; void authResult.ref; void authResult.source; void authResult.provider; }
 
 const evidenceResult: EvidenceResult | null = v02Runtime.generateEvidence({}, null, null);
 if (evidenceResult) { void evidenceResult.evidence_ref; void evidenceResult.created_at; void evidenceResult.hash; void evidenceResult.payload_summary; }

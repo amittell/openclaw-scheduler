@@ -87,7 +87,7 @@ export async function runAgentTurn(opts) {
       raw: data,
     };
   } catch (err) {
-    if (err.name === 'AbortError') {
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       throw new Error(`Agent turn timed out after ${Math.round(timeoutMs / 1000)}s`, { cause: err });
     }
     throw err;
@@ -212,7 +212,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     };
   } catch (err) {
     // Translate AbortError into descriptive messages
-    if (err.name === 'AbortError') {
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       if (abortReason === 'idle_timeout') {
         throw new Error(
           `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s — aborted (activity-based timeout)`,

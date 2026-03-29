@@ -566,6 +566,7 @@ async function tick() {
     try {
       await checkRunHealth({
         log,
+        getDb,
         getRunningRuns,
         getStaleRuns,
         getTimedOutRuns,

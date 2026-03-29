@@ -344,6 +344,12 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ---
 
+## Upgrading
+
+Already have the scheduler installed and need to update to a newer version? See [UPGRADING.md](UPGRADING.md).
+
+---
+
 ## Validation Checklist
 
 - [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed

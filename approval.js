@@ -61,7 +61,12 @@ export function countPendingApprovalsForJob(jobId) {
 /**
  * Resolve an approval (approve / reject / timed_out).
  */
+const VALID_APPROVAL_STATUSES = new Set(['approved', 'rejected', 'timed_out']);
+
 export function resolveApproval(id, status, resolvedBy, notes) {
+  if (!VALID_APPROVAL_STATUSES.has(status)) {
+    throw new Error(`Invalid approval status '${status}': must be one of ${[...VALID_APPROVAL_STATUSES].join(', ')}`);
+  }
   const db = getDb();
   db.prepare(`
     UPDATE approvals SET

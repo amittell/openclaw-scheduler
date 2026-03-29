@@ -1,5 +1,6 @@
 export async function checkRunHealth({
   log,
+  getDb,
   getRunningRuns,
   getStaleRuns,
   getTimedOutRuns,
@@ -8,6 +9,8 @@ export async function checkRunHealth({
   updateJobAfterRun,
   handleDelivery,
   dequeueJob,
+  shouldRetry,
+  scheduleRetry,
   staleThresholdSeconds,
 }) {
   const runningRuns = getRunningRuns();
@@ -23,6 +26,23 @@ export async function checkRunHealth({
     });
     const job = getJob(run.job_id);
     if (!job) continue;
+    if (shouldRetry(job, run.id)) {
+      const retry = scheduleRetry(job, run.id, { lastStatus: 'timeout' });
+      if (retry && !retry.skipped) {
+        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+          await handleDelivery(
+            job,
+            `[timeout] Job timed out (stale, will retry): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`
+          );
+        }
+        if (dequeueJob(job.id)) {
+          log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout retry scheduling)`);
+        }
+        log('info', `Scheduled retry ${retry.retryCount} for timed-out stale run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
+        continue;
+      }
+    }
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
       await handleDelivery(job, `[timeout] Job timed out (stale): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s`);
@@ -42,6 +62,23 @@ export async function checkRunHealth({
     });
     const job = getJob(run.job_id);
     if (!job) continue;
+    if (shouldRetry(job, run.id)) {
+      const retry = scheduleRetry(job, run.id, { lastStatus: 'timeout' });
+      if (retry && !retry.skipped) {
+        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
+        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+          await handleDelivery(
+            job,
+            `[timeout] Job timed out (will retry): ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`
+          );
+        }
+        if (dequeueJob(job.id)) {
+          log('info', `Dequeued pending dispatch for ${job.name} (after timeout retry scheduling)`);
+        }
+        log('info', `Scheduled retry ${retry.retryCount} for timed-out run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
+        continue;
+      }
+    }
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
       await handleDelivery(job, `[timeout] Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
@@ -203,4 +240,3 @@ export function ensureAgentInboxJobs({ log, getDb, createJob }) {
     log('error', `ensureAgentInboxJobs error: ${err.message}`);
   }
 }
-
