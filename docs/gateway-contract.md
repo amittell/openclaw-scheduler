@@ -560,6 +560,43 @@ Validation rules:
 - Arrays, non-plain objects, and null/undefined values are rejected.
 - Empty objects are omitted.
 - All values must be strings.
+- Serialization uses `Object.fromEntries` on validated entries so hidden
+  `toJSON` hooks on the original object cannot alter the payload.
+
+### Precedence when both headers are present
+
+A request may include both `x-openclaw-auth-profile` and
+`x-openclaw-env-inject`. These are complementary, not competing:
+
+- `x-openclaw-auth-profile` selects which credential profile the gateway
+  uses for upstream API calls (model provider routing).
+- `x-openclaw-env-inject` injects task-scoped environment variables into
+  the child session's process environment (credential materialization).
+
+If the gateway receives both, it should apply both: select the auth profile
+for provider routing, and merge the env vars into the child environment.
+Neither header overrides the other.
+
+### Header size limits
+
+Materialized env maps should be kept small (a handful of API keys and
+scope tokens). The scheduler does not enforce a size limit, but HTTP
+proxies and gateways typically cap individual header values at 8 KB.
+Gateway implementations should reject `x-openclaw-env-inject` values
+that exceed a reasonable threshold (suggested: 8192 bytes) and return
+`431 Request Header Fields Too Large`.
+
+### Receiver-side implementation notes
+
+When the gateway parses `x-openclaw-env-inject`, it must use a safe
+merge strategy. Specifically:
+
+- Parse the header value with `JSON.parse`.
+- Validate the result is a plain object (not an array, not a prototype
+  chain exploit).
+- Merge only string-valued entries into the child process environment.
+- Do not use recursive merge or spread into `Object.prototype` --
+  naive merge enables prototype pollution.
 
 This path requires matching receiver-side support in the gateway. Until that
 support is available, `auth_profile` forwarding remains the compatibility path
