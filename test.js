@@ -8965,9 +8965,22 @@ console.log('\n── independent child trust cap ──');
     delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
     origin: 'system',
-    identity: JSON.stringify({ provider: 'test-provider', trust_level: 'supervised' }),
+    identity: JSON.stringify({ provider: 'test-provider' }),
     child_credential_policy: 'independent',
   });
+  const parentRun = createRun(parentJob.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: {
+      provider: 'test-provider',
+      session: {
+        subject: { kind: 'agent', principal: 'agent:parent' },
+        trust: { effective_level: 'supervised' },
+        credentials: {},
+      },
+      source: 'provider',
+    },
+  });
+  finishRun(parentRun.id, 'ok', { summary: 'parent ok' });
 
   const childJob = createJob({
     name: 'trust-cap-child',
@@ -8996,7 +9009,7 @@ console.log('\n── independent child trust cap ──');
   assert(childRun.status === 'error', 'independent trust cap: run finishes as error');
   assert(childRun.error_message.includes('exceeds parent trust level'), 'independent trust cap: error mentions trust escalation');
 
-  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(childJob.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentJob.id, childJob.id);
   deleteJob(childJob.id);
   deleteJob(parentJob.id);
 }
@@ -9015,9 +9028,22 @@ console.log('\n── independent child within trust cap passes ──');
     delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
     origin: 'system',
-    identity: JSON.stringify({ provider: 'test-provider', trust_level: 'autonomous' }),
+    identity: JSON.stringify({ provider: 'test-provider' }),
     child_credential_policy: 'independent',
   });
+  const parentRunOk = createRun(parentJobOk.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRunOk.id, {
+    identity_resolved: {
+      provider: 'test-provider',
+      session: {
+        subject: { kind: 'agent', principal: 'agent:parent-ok' },
+        trust: { effective_level: 'autonomous' },
+        credentials: {},
+      },
+      source: 'provider',
+    },
+  });
+  finishRun(parentRunOk.id, 'ok', { summary: 'parent ok' });
 
   const childJobOk = createJob({
     name: 'trust-cap-child-ok',
@@ -9043,7 +9069,7 @@ console.log('\n── independent child within trust cap passes ──');
   );
   assert(childCtxOk !== null, 'independent trust cap: child within parent trust level proceeds');
   if (childCtxOk) finishRun(childCtxOk.run.id, 'cancelled', { summary: 'test cleanup' });
-  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(childJobOk.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentJobOk.id, childJobOk.id);
   deleteJob(childJobOk.id);
   deleteJob(parentJobOk.id);
 }
@@ -9082,7 +9108,7 @@ console.log('\n── downscope trust elevation detection ──');
     delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
     origin: 'system',
-    identity: JSON.stringify({ provider: 'elevating-provider', trust_level: 'supervised' }),
+    identity: JSON.stringify({ provider: 'elevating-provider' }),
     child_credential_policy: 'downscope',
   });
 
