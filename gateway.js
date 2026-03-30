@@ -28,9 +28,14 @@ function getGatewayToken() {
   return _cachedToken;
 }
 
-function authHeaders() {
+function authHeaders(scopes = null) {
   const token = getGatewayToken();
-  return token ? { 'Authorization': `Bearer ${token}`, 'x-openclaw-scopes': 'operator.write' } : {};
+  return token
+    ? {
+      'Authorization': `Bearer ${token}`,
+      ...(scopes ? { 'x-openclaw-scopes': scopes } : {}),
+    }
+    : {};
 }
 
 /**
@@ -94,7 +99,7 @@ export async function runAgentTurn(opts) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders('operator.write'),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
@@ -223,7 +228,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders('operator.write'),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),

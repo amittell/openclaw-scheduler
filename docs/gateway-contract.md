@@ -29,6 +29,10 @@ Authorization: Bearer <token>
 If neither source provides a token, requests are sent without an
 `Authorization` header.
 
+Scope headers are endpoint-specific. When the scheduler needs a scoped gateway
+operation, the per-endpoint contract below defines the additional
+`x-openclaw-scopes` header.
+
 **dispatch/index.mjs** uses a slightly different resolution path for the CLI
 context: it checks `OPENCLAW_GATEWAY_TOKEN` first, then falls back to reading
 `~/.openclaw/openclaw.json` at `gateway.auth.token`.
@@ -66,6 +70,7 @@ single user message to an agent and receives the complete assistant response.
 |---|---|---|
 | `Content-Type` | Yes | Always `application/json` |
 | `Authorization` | Conditional | `Bearer <token>` when token is available |
+| `x-openclaw-scopes` | Conditional | `operator.write` when a bearer token is sent. This scope header is specific to chat-completions dispatch. |
 | `x-openclaw-agent-id` | Conditional | Agent ID string (e.g. `main`). Omitted when falsy. |
 | `x-openclaw-session-key` | Conditional | Session key for continuity. Omitted when not provided. |
 | `x-openclaw-auth-profile` | Conditional | Auth profile override. Omitted when null. See "Auth-Profile Forwarding" below. |
