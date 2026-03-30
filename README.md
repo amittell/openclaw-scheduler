@@ -1828,6 +1828,21 @@ The watchdog disarms itself automatically when the agent calls `done`, when `sta
 
 ---
 
+## Trust Architecture
+
+The scheduler acts as a control-plane broker for child execution principals.
+Child tasks are bounded actors that receive only the credentials the scheduler
+gives them and cannot escalate their own authority. The credential model
+supports both precreated scoped keys and dynamic per-task key minting via
+identity providers.
+
+For the full trust model -- including when the scheduler/child boundary is a
+real security boundary vs. an operational one, the credential flow from
+operator to child, and what the model does and does not guarantee -- see
+[docs/trust-architecture.md](docs/trust-architecture.md).
+
+---
+
 ## Troubleshooting
 
 ### Dispatcher isn't dispatching
