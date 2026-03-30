@@ -50,6 +50,24 @@ function safeParse(str) {
   }
 }
 
+function getIdentityTrustLevel(identity) {
+  if (!identity || typeof identity !== 'object') return null;
+  return identity.trust_level
+    || identity.trust?.effective_level
+    || identity.trust?.level
+    || identity.session?.trust?.effective_level
+    || identity.session?.trust?.level
+    || identity.raw?.trust_level
+    || identity.raw?.trust?.effective_level
+    || identity.raw?.trust?.level
+    || null;
+}
+
+function getJobTrustLevel(job, parsedIdentity = null) {
+  const identityBlob = parsedIdentity || safeParse(job?.identity);
+  return getIdentityTrustLevel(identityBlob) || job?.identity_trust_level || null;
+}
+
 function hasIdentityDeclaration(job) {
   if (!job) return false;
   return job.identity != null
@@ -496,13 +514,22 @@ export async function prepareDispatch(job, opts, deps) {
   if (job.parent_id) {
     const { getDb: getDatabase } = deps;
     const parentJob = getDatabase().prepare(
-      'SELECT id, child_credential_policy, identity, auth_profile FROM jobs WHERE id = ?'
+      'SELECT id, child_credential_policy, identity, identity_trust_level, auth_profile FROM jobs WHERE id = ?'
     ).get(job.parent_id);
 
     if (parentJob) {
       const effectivePolicy = job.child_credential_policy
         || parentJob.child_credential_policy
         || 'none';
+      const parentIdentityBlob = safeParse(parentJob.identity);
+      const lastSuccessfulParentRun = (effectivePolicy === 'downscope' || effectivePolicy === 'independent')
+        ? getDatabase().prepare(
+          'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1'
+        ).get(parentJob.id, 'ok')
+        : null;
+      const parentResolvedIdentity = lastSuccessfulParentRun?.identity_resolved
+        ? safeParse(lastSuccessfulParentRun.identity_resolved)
+        : null;
 
       if (effectivePolicy === 'none') {
         // No credentials from parent; suppress any identity the child resolved on its own
@@ -515,22 +542,13 @@ export async function prepareDispatch(job, opts, deps) {
         // Downscope: resolve narrower credentials via provider.
         // Fail closed on every path -- if downscope is declared, we must
         // either produce a downscoped session or abort dispatch.
-        const parentIdentityBlob = safeParse(parentJob.identity);
         const providerName = parentIdentityBlob?.provider || parentIdentityBlob?.auth?.provider;
         const provider = deps.getIdentityProvider?.(providerName);
         let downscopeApplied = false;
 
         if (provider && typeof provider.prepareHandoff === 'function') {
           // Get parent session from last run or re-resolve
-          let parentSession = null;
-          const lastRun = getDatabase().prepare(
-            'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1'
-          ).get(parentJob.id, 'ok');
-
-          if (lastRun?.identity_resolved) {
-            const parsed = safeParse(lastRun.identity_resolved);
-            parentSession = parsed?.session || null;
-          }
+          let parentSession = parentResolvedIdentity?.session || null;
 
           if (!parentSession && provider.resolveSession) {
             // Fallback: re-resolve parent identity
@@ -561,8 +579,10 @@ export async function prepareDispatch(job, opts, deps) {
                 // Verify handoff actually downscoped: child trust must not
                 // exceed parent. A provider that returns an elevated session
                 // violates the downscope contract.
-                const parentTrustLevel = parentIdentityBlob?.trust_level || null;
-                const childTrustLevel = handoffResult.session?.trust?.effective_level || null;
+                const parentTrustLevel = getIdentityTrustLevel(parentResolvedIdentity)
+                  || getIdentityTrustLevel({ session: parentSession })
+                  || getJobTrustLevel(parentJob, parentIdentityBlob);
+                const childTrustLevel = getIdentityTrustLevel({ session: handoffResult.session });
                 const { compareTrustLevels } = deps;
                 if (parentTrustLevel && childTrustLevel && compareTrustLevels(childTrustLevel, parentTrustLevel) > 0) {
                   log('warn', `Downscope handoff elevated trust from "${parentTrustLevel}" to "${childTrustLevel}" for ${job.name}`, { jobId: job.id });
@@ -608,9 +628,8 @@ export async function prepareDispatch(job, opts, deps) {
         // Child uses its own resolved identity, but cannot exceed the parent's
         // trust level. Without this cap, a child could declare a higher trust
         // level than the parent and bypass the parent's authorization scope.
-        const parentTrustLevel = parentJob.identity
-          ? (safeParse(parentJob.identity)?.trust_level || null)
-          : null;
+        const parentTrustLevel = getIdentityTrustLevel(parentResolvedIdentity)
+          || getJobTrustLevel(parentJob, parentIdentityBlob);
         const childTrustLevel = v02Outcomes.identity_resolved?.trust_level || null;
         if (parentTrustLevel && childTrustLevel) {
           const { compareTrustLevels } = deps;
