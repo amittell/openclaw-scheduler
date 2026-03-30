@@ -56,13 +56,14 @@ In practice, this gives you:
 29. [Service Management](#service-management)
 30. [Error Handling & Backoff](#error-handling--backoff)
 31. [Migration & History](#migration--history)
-32. [Removing the Scheduler](#removing-the-scheduler)
-33. [Best Practices](#best-practices)
-34. [File Reference](#file-reference)
-35. [Testing](#testing)
-36. [Companion Scripts](#companion-scripts)
-37. [Sub-agent Dispatch](#sub-agent-dispatch)
-38. [Troubleshooting](#troubleshooting)
+32. [Upgrading](#upgrading)
+33. [Removing the Scheduler](#removing-the-scheduler)
+34. [Best Practices](#best-practices)
+35. [File Reference](#file-reference)
+36. [Testing](#testing)
+37. [Companion Scripts](#companion-scripts)
+38. [Sub-agent Dispatch](#sub-agent-dispatch)
+39. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -193,7 +194,7 @@ Avoid pinning a versioned Node path like `/opt/homebrew/opt/node@22/bin` in shel
 git clone https://github.com/amittell/openclaw-scheduler ~/.openclaw/scheduler
 cd ~/.openclaw/scheduler
 npm install
-npm test                             # should print: 1037 passed, 0 failed
+npm test                             # should end with: 0 failed
 npm run lint                         # static checks
 npm run typecheck                    # exported API declarations
 npm run coverage                     # coverage summary + lcov report
@@ -694,8 +695,8 @@ Each isolated job prompt includes:
 | Mode | When output is delivered |
 |------|-------------------------|
 | `none` | Never (background jobs) |
-| `announce` | LLM jobs: any non-HEARTBEAT_OK response. Shell jobs: non-zero exit only |
-| `announce-always` | Always delivers output (LLM or shell) |
+| `announce` | Agent jobs: delivers when run status is not `ok`. Shell jobs: non-zero exit only. Silently skipped for `main` session jobs (use `announce-always` instead) |
+| `announce-always` | Always delivers output (LLM or shell), including `main` session jobs |
 
 > **Note:** delivery is suppressed if `delivery_channel` or `delivery_to` are absent, regardless of `delivery_mode`.
 
@@ -996,9 +997,9 @@ A running agent can create new jobs on the fly by sending a `spawn` message:
 ### Visualizing Chains
 
 ```bash
-openclaw-scheduler jobs tree <job-id>
+openclaw-scheduler jobs tree
 
-# Output:
+# Output (all root jobs and their chains):
 # Build App
 #   └─ Deploy App [→success] (agent:ops)
 #   └─ Build Alert [→failure]
@@ -1198,6 +1199,10 @@ openclaw-scheduler agents register <id> [name]
 | `task_tracker_agents` | Per-agent status within a task group |
 | `idempotency_ledger` | Dispatch deduplication and at-least-once tracking |
 | `delivery_aliases` | Named delivery targets (channel + target pairs) |
+| `job_dispatch_queue` | Pending and delivered dispatch entries per job |
+| `message_receipts` | Delivery receipt tracking for messages |
+| `team_tasks` | Team-scoped task definitions and status |
+| `team_mailbox_events` | Projected events from team mailbox activity |
 | `schema_migrations` | Baseline schema version log |
 
 ### Jobs (key columns)
@@ -1233,7 +1238,7 @@ shell_stdout_bytes, shell_stderr_bytes, dispatched_at, run_timeout_ms,
 triggered_by_run, retry_of, retry_count, replay_of
 ```
 
-**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`
+**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`, `awaiting_approval`, `approved`
 
 ### Messages (key columns)
 
@@ -1256,12 +1261,13 @@ delivery_channel, delivery_to, brand_name, created_at
 
 ```bash
 # ── Jobs ──────────────────────────────────────────
-openclaw-scheduler jobs list                     # List all (shows agent, parent, trigger)
+openclaw-scheduler jobs list                     # List all (shows agent, parent, trigger; supports --type <type>)
 openclaw-scheduler jobs get <id>                 # Full details as JSON
-openclaw-scheduler jobs add '<json>'             # Create a job
-openclaw-scheduler jobs update <id> '<json>'     # Partial update
+openclaw-scheduler jobs add '<json>'             # Create a job (supports --dry-run)
+openclaw-scheduler jobs update <id> '<json>'     # Partial update (supports --dry-run)
+openclaw-scheduler jobs validate '<json>'        # Validate a job spec without creating it
 openclaw-scheduler jobs enable <id>
-openclaw-scheduler jobs disable <id>              # NOTE: disabled jobs are auto-pruned after 24h
+openclaw-scheduler jobs disable <id>              # NOTE: one-shot at-jobs with delete_after_run: true are auto-pruned after 24h (ordinary disabled cron jobs are kept indefinitely)
 openclaw-scheduler jobs delete <id>              # Cascades to runs
 openclaw-scheduler jobs tree                     # Visual chain hierarchy
 openclaw-scheduler jobs cancel <id>              # Cancel running chain
@@ -1337,6 +1343,7 @@ openclaw-scheduler schema all               # Everything
 
 # ── Status ────────────────────────────────────────
 openclaw-scheduler status
+openclaw-scheduler version                       # Print version (also: --version)
 ```
 
 All CLI commands support `--json` for machine-readable output (useful for piping into `jq` or agent toolchains).
@@ -1349,6 +1356,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 |----------|---------|-------------|
 | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
+| `OPENCLAW_GATEWAY_TOKEN_PATH` | `~/.openclaw/credentials/.gateway-token` | Path to gateway token file (used when `OPENCLAW_GATEWAY_TOKEN` is not set) |
 | `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
 | `SCHEDULER_DB` | auto (`./scheduler.db` in a writable source checkout, else `~/.openclaw/scheduler/scheduler.db`) | SQLite database path |
 | `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
@@ -1358,13 +1366,14 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
-| `SCHEDULER_BACKUP` | *(unset)* | Set to `1` to enable MinIO backups (requires `mc` CLI) |
+| `SCHEDULER_BACKUP` | *(unset)* | Set to `"1"` or `"true"` to enable MinIO backups (requires `mc` CLI) |
 | `SCHEDULER_BACKUP_MC_ALIAS` | `backupstore` | MinIO alias used by `mc` for backup snapshots |
 | `SCHEDULER_BACKUP_BUCKET` | `scheduler-backups` | MinIO bucket for snapshots |
 | `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
+| `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
 | `DISPATCH_LABELS_PATH` | *(auto)* | Override path to labels.json for dispatch session tracking |
 | `DISPATCH_INDEX_PATH` | *(auto)* | Override path to dispatch/index.mjs (used by watcher) |
@@ -1377,6 +1386,12 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `INBOX_DELIVERY_CHANNEL` | *(unset)* | Delivery channel for inbox-consumer.mjs forwarding |
 | `INBOX_DELIVERY_TO` | *(unset)* | Delivery target for inbox-consumer.mjs forwarding |
 | `INBOX_LIMIT` | `10` | Batch size for inbox-consumer.mjs |
+
+---
+
+Provider-backed identity / authorization / proof behavior, including
+`authorization_ref` fail-closed semantics, is documented in the
+[gateway contract](docs/gateway-contract.md#dispatch-time-authorization-evaluation).
 
 ---
 
@@ -1525,6 +1540,37 @@ As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (basel
 
 ---
 
+## Upgrading
+
+Already have the scheduler running and need to update? See [UPGRADING.md](UPGRADING.md) for the full guide. Short version by platform:
+
+### macOS (launchd, git-clone install)
+```bash
+cd ~/.openclaw/scheduler
+git pull && npm install
+SCHEDULER_DB=:memory: node test.js
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
+```
+
+### Linux / Windows WSL2 (systemd, git-clone install)
+```bash
+cd ~/.openclaw/scheduler
+git pull && npm install
+SCHEDULER_DB=:memory: node test.js
+systemctl --user restart openclaw-scheduler
+```
+
+### Windows native (PM2, git-clone install)
+```powershell
+cd $env:USERPROFILE\.openclaw\scheduler
+git pull
+npm install
+$env:SCHEDULER_DB=":memory:"; node test.js
+pm2 restart openclaw-scheduler
+```
+
+---
+
 ## Removing the Scheduler
 
 To stop the scheduler and restore OpenClaw's built-in cron/heartbeat, see [UNINSTALL.md](UNINSTALL.md).
@@ -1593,6 +1639,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
 ├── INSTALL-LINUX.md       # Installation guide for Linux (systemd user service)
 ├── INSTALL-WINDOWS.md     # Installation guide for Windows (WSL2 or PM2)
+├── UPGRADING.md           # Upgrade guide (all platforms)
 ├── UNINSTALL.md           # Removal guide (all platforms)
 ├── BEST-PRACTICES.md      # Job type selection, prompt writing, agent integration
 ├── QUICK-START.md         # Focused guide: install, convert crons, first workflow
@@ -1606,7 +1653,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (1037 tests, in-memory SQLite)
+# Run all tests (in-memory SQLite; expect 0 failed)
 SCHEDULER_DB=:memory: node test.js
 
 # Or via npm:

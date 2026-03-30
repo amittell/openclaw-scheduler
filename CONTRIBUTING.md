@@ -37,7 +37,7 @@ This runs, in order:
 
 1. Lint (`eslint`)
 2. TypeScript declaration smoke tests
-3. Full test suite (in-memory SQLite) -- must hit at least **1037 passed, 0 failed**
+3. Full test suite (in-memory SQLite) -- must end with **0 failed**
 4. Coverage floor checks (statement, branch, function, line)
 
 The same gate runs automatically via `prepublishOnly` before any `npm publish`.

@@ -111,6 +111,7 @@ export function getInbox(agentId, opts = {}) {
     return getDb().prepare(`
       SELECT * FROM messages
       WHERE ${whereSql}
+        AND status IN ('pending', 'delivered', 'read')
       ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
       LIMIT ?
     `).all(...whereParams, limit).map(parseMetadata);

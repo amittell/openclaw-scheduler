@@ -44,6 +44,17 @@ const PATCHABLE_COLUMNS = new Set([
   'watchdog_check_cmd', 'watchdog_timeout_min', 'watchdog_started_at',
   'watchdog_target_label', 'watchdog_alert_channel', 'watchdog_alert_target',
   'watchdog_self_destruct',
+  // v0.2 fields
+  'identity_principal', 'identity_run_as', 'identity_attestation', 'identity_ref',
+  'identity_subject_kind', 'identity_subject_principal', 'identity_trust_level',
+  'identity_delegation_mode', 'identity',
+  'authorization_proof_ref', 'authorization_proof',
+  'authorization_ref', 'authorization',
+  'evidence_ref', 'evidence',
+  'contract_required_trust_level', 'contract_trust_enforcement',
+  'contract_sandbox', 'contract_allowed_paths', 'contract_network',
+  'contract_max_cost_usd', 'contract_audit',
+  'child_credential_policy',
 ]);
 
 function applyJobPatch(jobId, patch) {
@@ -122,6 +133,17 @@ function assertEnum(name, value, allowed, { nullable = false } = {}) {
   }
 }
 
+function assertJsonBlob(name, value, maxBytes = 32768) {
+  if (value == null) return;
+  if (typeof value !== 'string') throw new Error(`${name} must be a JSON string`);
+  if (Buffer.byteLength(value, 'utf8') > maxBytes) throw new Error(`${name} exceeds ${maxBytes} byte limit`);
+  try {
+    JSON.parse(value);
+  } catch (e) {
+    throw new Error(`${name} is not valid JSON: ${e.message}`, { cause: e });
+  }
+}
+
 function validateTriggerConditionSyntax(condition) {
   if (condition == null) return;
   assertSafeString('trigger_condition', condition, { maxLength: 1024 });
@@ -175,6 +197,29 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'auth_profile',
     'delivery_opt_out_reason',
     'origin',
+    // v0.2 nullable strings
+    'identity_principal',
+    'identity_run_as',
+    'identity_attestation',
+    'identity_ref',
+    'identity_subject_kind',
+    'identity_subject_principal',
+    'identity_trust_level',
+    'identity_delegation_mode',
+    'identity',
+    'authorization_proof_ref',
+    'authorization_proof',
+    'authorization_ref',
+    'authorization',
+    'evidence_ref',
+    'evidence',
+    'contract_required_trust_level',
+    'contract_trust_enforcement',
+    'contract_sandbox',
+    'contract_allowed_paths',
+    'contract_network',
+    'contract_audit',
+    'child_credential_policy',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -347,6 +392,69 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (mode === 'create' || 'origin' in normalized) {
     assertSafeString('origin', merged.origin, { allowEmpty: false, maxLength: 256 });
   }
+
+  // --- v0.2 Identity ---
+  assertSafeString('identity_principal', merged.identity_principal, { maxLength: 512 });
+  assertSafeString('identity_run_as', merged.identity_run_as, { maxLength: 256 });
+  assertSafeString('identity_attestation', merged.identity_attestation, { maxLength: 256 });
+  assertSafeString('identity_ref', merged.identity_ref, { maxLength: 256 });
+  assertEnum('identity_subject_kind', merged.identity_subject_kind,
+    new Set(['agent', 'service', 'workload', 'user', 'composite', 'delegated-agent', 'unknown']),
+    { nullable: true });
+  assertSafeString('identity_subject_principal', merged.identity_subject_principal, { maxLength: 512 });
+  assertEnum('identity_trust_level', merged.identity_trust_level,
+    new Set(['untrusted', 'restricted', 'supervised', 'autonomous']),
+    { nullable: true });
+  assertEnum('identity_delegation_mode', merged.identity_delegation_mode,
+    new Set(['none', 'on-behalf-of', 'impersonation']),
+    { nullable: true });
+  assertJsonBlob('identity', merged.identity);
+  if (merged.identity) {
+    const identityBlob = JSON.parse(merged.identity);
+    const presentation = identityBlob && typeof identityBlob === 'object' && !Array.isArray(identityBlob)
+      ? (identityBlob.presentation || identityBlob.credential_handoff || null)
+      : null;
+    if (presentation && typeof presentation === 'object' && !Array.isArray(presentation)) {
+      const finalTarget = merged.session_target || 'isolated';
+      if (finalTarget !== 'shell') {
+        throw new Error('identity presentation / credential_handoff is only supported for session_target "shell"');
+      }
+    }
+  }
+
+  // --- v0.2 Authorization Proof ---
+  assertSafeString('authorization_proof_ref', merged.authorization_proof_ref, { maxLength: 256 });
+  assertJsonBlob('authorization_proof', merged.authorization_proof);
+
+  // --- v0.2 Authorization ---
+  assertSafeString('authorization_ref', merged.authorization_ref, { maxLength: 256 });
+  assertJsonBlob('authorization', merged.authorization);
+
+  // --- v0.2 Evidence ---
+  assertSafeString('evidence_ref', merged.evidence_ref, { maxLength: 256 });
+  assertJsonBlob('evidence', merged.evidence);
+
+  // --- v0.2 Contract ---
+  assertEnum('contract_required_trust_level', merged.contract_required_trust_level,
+    new Set(['untrusted', 'restricted', 'supervised', 'autonomous']),
+    { nullable: true });
+  assertEnum('contract_trust_enforcement', merged.contract_trust_enforcement,
+    new Set(['none', 'warn', 'block', 'advisory', 'strict']),
+    { nullable: true });
+  assertSafeString('contract_sandbox', merged.contract_sandbox, { maxLength: 128 });
+  assertJsonBlob('contract_allowed_paths', merged.contract_allowed_paths);
+  assertSafeString('contract_network', merged.contract_network, { maxLength: 128 });
+  if (merged.contract_max_cost_usd != null) {
+    if (typeof merged.contract_max_cost_usd !== 'number' || !isFinite(merged.contract_max_cost_usd) || merged.contract_max_cost_usd < 0) {
+      throw new Error('contract_max_cost_usd must be a non-negative finite number');
+    }
+  }
+  assertSafeString('contract_audit', merged.contract_audit, { maxLength: 128 });
+
+  // --- v0.2 Child Credential Policy ---
+  assertEnum('child_credential_policy', merged.child_credential_policy,
+    new Set(['none', 'inherit', 'downscope', 'independent']),
+    { nullable: true });
 
   // Watchdog-specific validations
   if (merged.job_type === 'watchdog') {
@@ -529,7 +637,17 @@ export function createJob(opts) {
       ttl_hours,
       auth_profile,
       delivery_opt_out_reason,
-      origin
+      origin,
+      identity_principal, identity_run_as, identity_attestation, identity_ref,
+      identity_subject_kind, identity_subject_principal, identity_trust_level,
+      identity_delegation_mode, identity,
+      authorization_proof_ref, authorization_proof,
+      authorization_ref, authorization,
+      evidence_ref, evidence,
+      contract_required_trust_level, contract_trust_enforcement,
+      contract_sandbox, contract_allowed_paths, contract_network,
+      contract_max_cost_usd, contract_audit,
+      child_credential_policy
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -550,6 +668,16 @@ export function createJob(opts) {
       ?,
       ?,
       ?,
+      ?,
+      ?, ?, ?, ?,
+      ?, ?, ?,
+      ?, ?,
+      ?, ?,
+      ?, ?,
+      ?, ?,
+      ?, ?,
+      ?, ?, ?,
+      ?, ?,
       ?
     )
   `);
@@ -611,7 +739,30 @@ export function createJob(opts) {
     normalized.ttl_hours || null,
     normalized.auth_profile || null,
     normalized.delivery_opt_out_reason || null,
-    normalized.origin || null
+    normalized.origin || null,
+    normalized.identity_principal || null,
+    normalized.identity_run_as || null,
+    normalized.identity_attestation || null,
+    normalized.identity_ref || null,
+    normalized.identity_subject_kind || null,
+    normalized.identity_subject_principal || null,
+    normalized.identity_trust_level || null,
+    normalized.identity_delegation_mode || null,
+    normalized.identity || null,
+    normalized.authorization_proof_ref || null,
+    normalized.authorization_proof || null,
+    normalized.authorization_ref || null,
+    normalized.authorization || null,
+    normalized.evidence_ref || null,
+    normalized.evidence || null,
+    normalized.contract_required_trust_level || null,
+    normalized.contract_trust_enforcement || null,
+    normalized.contract_sandbox || null,
+    normalized.contract_allowed_paths || null,
+    normalized.contract_network || null,
+    normalized.contract_max_cost_usd ?? null,
+    normalized.contract_audit || null,
+    normalized.child_credential_policy || null
   );
 
   return getJob(id);
@@ -664,7 +815,18 @@ export function updateJob(id, patch) {
     'ttl_hours',
     'auth_profile',
     'delivery_opt_out_reason',
-    'origin'
+    'origin',
+    // v0.2 fields
+    'identity_principal', 'identity_run_as', 'identity_attestation', 'identity_ref',
+    'identity_subject_kind', 'identity_subject_principal', 'identity_trust_level',
+    'identity_delegation_mode', 'identity',
+    'authorization_proof_ref', 'authorization_proof',
+    'authorization_ref', 'authorization',
+    'evidence_ref', 'evidence',
+    'contract_required_trust_level', 'contract_trust_enforcement',
+    'contract_sandbox', 'contract_allowed_paths', 'contract_network',
+    'contract_max_cost_usd', 'contract_audit',
+    'child_credential_policy',
   ];
 
   // Cycle detection if parent_id is being changed
@@ -942,6 +1104,7 @@ export function getChainDepth(jobId) {
  * Check if a failed run should be retried. Returns true if retry was scheduled.
  */
 export function shouldRetry(job, runId) {
+  if (!job.enabled) return false;
   if (!job.max_retries || job.max_retries <= 0) return false;
   const db = getDb();
   // Count retries for this job's most recent failure chain
@@ -954,16 +1117,15 @@ export function shouldRetry(job, runId) {
 /**
  * Schedule a retry for a failed run. Returns the new retry run's next_run_at or null.
  */
-export function scheduleRetry(job, failedRunId) {
+export function scheduleRetry(job, failedRunId, opts = {}) {
   const db = getDb();
   const failedRun = db.prepare('SELECT retry_count FROM runs WHERE id = ?').get(failedRunId);
   const retryCount = (failedRun?.retry_count || 0) + 1;
   // Exponential backoff: 30s, 60s, 120s, etc.
   const delaySec = 30 * Math.pow(2, retryCount - 1);
   const retryPatch = {
-    consecutive_errors: 0,
     last_run_at: sqliteNow(),
-    last_status: 'error',
+    last_status: opts.lastStatus || 'error',
   };
   if (!job.parent_id && job.schedule_kind !== 'at' && job.schedule_cron) {
     retryPatch.next_run_at = nextRunFromCron(job.schedule_cron, job.schedule_tz);

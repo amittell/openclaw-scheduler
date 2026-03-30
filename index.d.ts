@@ -107,6 +107,39 @@ export interface JobSpec {
   // Convenience flag (create-time only)
   run_now?: boolean;
 
+  // v0.2 Identity
+  identity_principal?: string | null;
+  identity_run_as?: string | null;
+  identity_attestation?: string | null;
+  identity_ref?: string | null;
+  identity_subject_kind?: 'agent' | 'service' | 'workload' | 'user' | 'composite' | 'delegated-agent' | 'unknown' | null;
+  identity_subject_principal?: string | null;
+  identity_trust_level?: 'untrusted' | 'restricted' | 'supervised' | 'autonomous' | null;
+  identity_delegation_mode?: 'none' | 'on-behalf-of' | 'impersonation' | null;
+  identity?: string | null;
+
+  // v0.2 Authorization Proof
+  authorization_proof_ref?: string | null;
+  authorization_proof?: string | null;
+
+  // v0.2 Authorization
+  authorization_ref?: string | null;
+  authorization?: string | null;
+
+  // v0.2 Evidence
+  evidence_ref?: string | null;
+  evidence?: string | null;
+
+  // v0.2 Contract
+  contract_required_trust_level?: 'untrusted' | 'restricted' | 'supervised' | 'autonomous' | null;
+  contract_trust_enforcement?: 'none' | 'warn' | 'block' | 'advisory' | 'strict' | null;
+  contract_sandbox?: string | null;
+  contract_allowed_paths?: string | null;
+  contract_network?: string | null;
+  contract_max_cost_usd?: number | null;
+  contract_audit?: string | null;
+  child_credential_policy?: 'none' | 'inherit' | 'downscope' | 'independent' | null;
+
   [key: string]: unknown;
 }
 
@@ -179,6 +212,14 @@ export interface RunRecord {
 
   // Idempotency
   idempotency_key?: string | null;
+
+  // v0.2 Outcomes
+  identity_resolved?: string | null;
+  trust_evaluation?: string | null;
+  authorization_decision?: string | null;
+  authorization_proof_verification?: string | null;
+  evidence_record?: string | null;
+  credential_handoff_summary?: string | null;
 
   [key: string]: unknown;
 }
@@ -351,6 +392,14 @@ export interface FinishRunOpts {
   shell_stderr_path?: string | null;
   shell_stdout_bytes?: number | null;
   shell_stderr_bytes?: number | null;
+
+  // v0.2 Outcomes
+  identity_resolved?: string | object | null;
+  trust_evaluation?: string | object | null;
+  authorization_decision?: string | object | null;
+  authorization_proof_verification?: string | object | null;
+  evidence_record?: string | object | null;
+  credential_handoff_summary?: string | object | null;
 }
 
 export interface NormalizeShellOpts {
@@ -748,4 +797,68 @@ export const SCHEDULER_SCHEMAS: {
     kinds: string[];
     statuses: string[];
   };
+};
+
+// -- v0.2 Runtime result interfaces --
+
+export interface ResolvedIdentity {
+  provider?: string;
+  session?: Record<string, unknown> | null;
+  source?: 'provider' | 'provider-error';
+  subject_kind: string;
+  principal: string | null;
+  trust_level: string | null;
+  delegation_mode: string | null;
+  raw: Record<string, unknown> | null;
+  transient?: boolean;
+  error?: string;
+}
+
+export interface TrustEvaluation {
+  effective_level: string | null;
+  required_level: string | null;
+  decision: 'permit' | 'deny' | 'warn';
+  reason: string;
+}
+
+export interface AuthorizationProofResult {
+  verified: boolean;
+  method: string | null;
+  ref: string | null;
+  source?: 'provider' | 'provider-error';
+  provider?: string;
+  error?: string;
+}
+
+export interface AuthorizationResult {
+  decision: 'permit' | 'deny' | 'escalate';
+  reason: string;
+  ref: string | null;
+  source?: 'provider' | 'provider-error';
+  provider?: string;
+}
+
+export interface EvidenceResult {
+  evidence_ref: string | null;
+  created_at: string;
+  hash: string | null;
+  integrity: 'none';
+  payload_summary: Record<string, unknown>;
+}
+
+export interface CredentialHandoffSummary {
+  mode: string | null;
+  bindings_count: number;
+  cleanup_required: boolean;
+}
+
+export const v02Runtime: {
+  TRUST_LEVELS: readonly string[];
+  compareTrustLevels(a: string | null | undefined, b: string | null | undefined): -1 | 0 | 1;
+  resolveIdentity(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<ResolvedIdentity | null>;
+  evaluateTrust(job: Record<string, unknown>, resolvedIdentity: ResolvedIdentity | null): TrustEvaluation;
+  verifyAuthorizationProof(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<AuthorizationProofResult | null>;
+  evaluateAuthorization(job: Record<string, unknown>, identityResult: ResolvedIdentity | null, trustResult: TrustEvaluation | null, ctx?: Record<string, unknown>): Promise<AuthorizationResult | null>;
+  generateEvidence(job: Record<string, unknown>, runResult: Record<string, unknown> | null, outcomes: Record<string, unknown> | null): EvidenceResult | null;
+  summarizeCredentialHandoff(job: Record<string, unknown>): CredentialHandoffSummary | null;
 };

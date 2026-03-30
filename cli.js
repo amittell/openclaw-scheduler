@@ -111,6 +111,9 @@ Status:
 
 Schema:
   schema [jobs|runs|messages|approvals|dispatches|all]
+
+Capabilities:
+  capabilities                       Report v0.2 feature support
 `);
 }
 
@@ -288,6 +291,7 @@ switch (command) {
       case 'cancel': {
         const noCascade = args.includes('--no-cascade');
         const id = args.find(a => !a.startsWith('--'));
+        if (!id) fail('Usage: jobs cancel <id> [--no-cascade]');
         const cancelled = cancelJob(id, { cascade: !noCascade });
         emit({ ok: true, cancelled }, `Cancelled ${cancelled.length} job(s): ${cancelled.map(c => c.slice(0, 8) + '…').join(', ')}`);
         break;
@@ -1002,6 +1006,37 @@ switch (command) {
     const resolved = singularMap[key] || key;
     if (!SCHEDULER_SCHEMAS[resolved]) fail(`Unknown schema target: ${sub}`);
     emit(SCHEDULER_SCHEMAS[resolved]);
+    break;
+  }
+
+  // ── Capabilities ────────────────────────────────────────
+  case 'capabilities': {
+    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    const schemaVersion = getDb().prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;
+    const capabilities = {
+      scheduler_version: pkg.version,
+      schema_version: schemaVersion,
+      handoff_version: '2',
+      features: {
+        approvals: 'runtime',
+        model_policy: 'model+thinking',
+        execution_intent: 'runtime',
+        output_hints: 'runtime',
+        timeout_support: 'runtime',
+        context_retrieval: 'runtime',
+        runtime_execution: true,
+        identity_declaration: true,
+        runtime_identity_resolution: true,
+        trust_evaluation: true,
+        authorization_proof_verification: true,
+        authorization_hook: true,
+        evidence_generation: true,
+        delegation_validation: false,
+        credential_handoff: true,
+        audit_export: true,
+      },
+    };
+    emit(capabilities);
     break;
   }
 

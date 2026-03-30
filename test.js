@@ -29,6 +29,7 @@ import {
   getStaleRuns, getTimedOutRuns,
   updateHeartbeat, pruneRuns,
   getRunningRunsByPool, updateRunSession, updateContextSummary,
+  persistV02Outcomes,
 } from './runs.js';
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
@@ -44,8 +45,17 @@ import {
   matchesSentinel, detectTransientError, adaptiveDeferralMs,
   buildExecutionIntentNote, getBackoffMs, sqliteNow,
 } from './dispatcher-utils.js';
+import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
+import {
+  resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+  evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+  TRUST_LEVELS, compareTrustLevels,
+} from './v02-runtime.js';
+import { runShellCommand } from './dispatcher-shell.js';
+import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence } from './dispatcher-strategies.js';
+import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
 // ── Test harness ────────────────────────────────────────────
@@ -532,6 +542,59 @@ console.log('\nTimeout:');
 const toRun = createRun(job.id, { run_timeout_ms: 1 });
 db.prepare("UPDATE runs SET started_at = datetime('now', '-10 seconds') WHERE id = ?").run(toRun.id);
 assert(getTimedOutRuns().some(r => r.id === toRun.id), 'timeout detected');
+
+{
+  const timeoutRetryJob = createJob({
+    name: 'timeout-retry-health-check',
+    schedule_cron: '*/5 * * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo timeout retry',
+    overlap_policy: 'queue',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: 'timeout-retry-target',
+    run_timeout_ms: 1,
+    max_retries: 1,
+    origin: 'system',
+  });
+  enqueueJob(timeoutRetryJob.id);
+  const timeoutRetryRun = createRun(timeoutRetryJob.id, { run_timeout_ms: 1, status: 'running' });
+  const timeoutRetryMessages = [];
+
+  await checkRunHealth({
+    log() {},
+    getDb,
+    getRunningRuns: () => [timeoutRetryRun],
+    getStaleRuns: () => [],
+    getTimedOutRuns: () => [{ ...timeoutRetryRun, job_name: timeoutRetryJob.name, run_timeout_ms: 1 }],
+    finishRun,
+    getJob,
+    updateJobAfterRun() {},
+    async handleDelivery(_job, content) {
+      timeoutRetryMessages.push(content);
+    },
+    dequeueJob,
+    shouldRetry,
+    scheduleRetry,
+    staleThresholdSeconds: 90,
+  });
+
+  const refreshedTimeoutRetryRun = getRun(timeoutRetryRun.id);
+  const refreshedTimeoutRetryJob = getJob(timeoutRetryJob.id);
+  const retryDispatches = listDispatchesForJob(timeoutRetryJob.id, 10);
+
+  assert(refreshedTimeoutRetryRun.retry_count === 1, 'checkRunHealth timeout retry persists retry_count on the timed-out run');
+  assert(refreshedTimeoutRetryRun.status === 'timeout', 'checkRunHealth timeout retry preserves run timeout status');
+  assert(refreshedTimeoutRetryJob.last_status === 'timeout', 'checkRunHealth timeout retry records last_status as timeout');
+  assert(refreshedTimeoutRetryJob.queued_count === 0, 'checkRunHealth timeout retry drains queued overlap backlog');
+  assert(!shouldRetry(refreshedTimeoutRetryJob, timeoutRetryRun.id), 'checkRunHealth timeout retry exhausts max_retries for the timed-out run');
+  assert(retryDispatches.some(d => d.dispatch_kind === 'retry' && d.status === 'pending'), 'checkRunHealth timeout retry enqueues a retry dispatch');
+  assert(timeoutRetryMessages.length === 1 && timeoutRetryMessages[0].includes('will retry'), 'checkRunHealth timeout retry still delivers a timeout notice');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(timeoutRetryJob.id);
+  deleteJob(timeoutRetryJob.id);
+}
 
 // ── Agents ──────────────────────────────────────────────────
 console.log('\nAgents:');
@@ -2859,6 +2922,18 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
   }));
   assert(runOut.dispatch_kind === 'manual' && typeof runOut.dispatch_id === 'string', 'jobs run --json returns durable dispatch');
 
+  // Test: jobs cancel with no ID should fail
+  try {
+    execFileSync(process.execPath, [cliPath, 'jobs', 'cancel', '--json'], {
+      cwd: process.cwd(),
+      env: baseEnv,
+      encoding: 'utf8',
+    });
+    assert(false, 'jobs cancel with no ID should have thrown');
+  } catch (err) {
+    assert(err.status !== 0, 'jobs cancel with no ID exits non-zero');
+  }
+
   rmSync(tempRoot, { recursive: true, force: true });
 }
 
@@ -3813,9 +3888,57 @@ console.log('\n── Approval Timeout / Prune / Count ──');
   // ap1 was resolved recently, should still exist
   assert(getApproval(ap1.id) !== undefined, 'recent resolved approval survives prune');
 
-  finishRun(aRun1.id, 'ok');
-  finishRun(aRun2.id, 'cancelled');
+  // Cleanup: remove approvals and runs for this job to avoid leaking state
+  getDb().prepare('DELETE FROM approvals WHERE job_id = ?').run(aJob.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(aJob.id);
   deleteJob(aJob.id);
+}
+
+console.log('\n── finishRun status guard ──');
+{
+  const guardJob = createJob({ name: 'finish-guard-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const guardRun = createRun(guardJob.id, { run_timeout_ms: 300_000 });
+  finishRun(guardRun.id, 'ok', { summary: 'first finish' });
+  const afterFirst = getRun(guardRun.id);
+  assert(afterFirst.status === 'ok', 'finishRun sets ok status');
+
+  const firstDurationMs = afterFirst.duration_ms;
+
+  // Attempt to overwrite ok with error — should be a no-op (WHERE guard rejects non-matching status)
+  finishRun(guardRun.id, 'error', { summary: 'second finish', error_message: 'should not apply' });
+  const afterSecond = getRun(guardRun.id);
+  assert(afterSecond.status === 'ok', 'finishRun does not overwrite terminal status');
+  assert(afterSecond.summary === 'first finish', 'finishRun does not overwrite terminal summary');
+  assert(afterSecond.duration_ms === firstDurationMs, 'finishRun does not recalculate duration_ms on guarded no-op');
+
+  deleteJob(guardJob.id);
+}
+
+console.log('\n── resolveApproval invalid status ──');
+{
+  const { createApproval, resolveApproval } = await import('./approval.js');
+  const rvJob = createJob({ name: 'resolve-validate-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
+  const rvRun = createRun(rvJob.id, { run_timeout_ms: 300_000 });
+  const rvApproval = createApproval(rvJob.id, rvRun.id);
+
+  let threw = false;
+  try { resolveApproval(rvApproval.id, 'bogus_status', 'operator'); } catch (err) {
+    threw = true;
+    assert(err.message.includes('Invalid approval status'), `resolveApproval rejects invalid status: ${err.message}`);
+  }
+  assert(threw, 'resolveApproval throws on invalid status');
+
+  // Verify 'pending' is also not a valid resolution status
+  let threwPending = false;
+  try { resolveApproval(rvApproval.id, 'pending', 'operator'); } catch { threwPending = true; }
+  assert(threwPending, 'resolveApproval rejects pending as resolution status');
+
+  // Valid status still works
+  const resolved = resolveApproval(rvApproval.id, 'rejected', 'operator', 'test cleanup');
+  assert(resolved.status === 'rejected', 'resolveApproval still accepts valid status');
+
+  finishRun(rvRun.id, 'cancelled');
+  deleteJob(rvJob.id);
 }
 
 console.log('\n── Run Session & Context Summary ──');
@@ -6814,6 +6937,2383 @@ console.log('\n── dispatch/index.mjs --deliver-to error message ──');
 
   // Verify the old confusing message is gone
   assert(!indexSrc.includes('--origin is required for agentTurn jobs'), 'dispatch error: old confusing --origin message removed');
+}
+
+// ============================================================
+// SECTION: v0.2 Runtime Features
+// ============================================================
+
+console.log('\n── v0.2 Schema Column Verification ──');
+{
+  const liveDb = getDb();
+  const jobCols = liveDb.prepare("PRAGMA table_info(jobs)").all().map(c => c.name);
+  const v02JobCols = [
+    'identity_principal', 'identity_run_as', 'identity_attestation',
+    'identity_ref', 'identity_subject_kind', 'identity_subject_principal',
+    'identity_trust_level', 'identity_delegation_mode', 'identity',
+    'authorization_proof_ref', 'authorization_proof',
+    'authorization_ref', 'authorization',
+    'evidence_ref', 'evidence',
+    'contract_required_trust_level', 'contract_trust_enforcement',
+    'contract_sandbox', 'contract_allowed_paths', 'contract_network',
+    'contract_max_cost_usd', 'contract_audit',
+    'child_credential_policy',
+  ];
+  for (const col of v02JobCols) {
+    assert(jobCols.includes(col), `jobs table should have column ${col}`);
+  }
+
+  const runCols = liveDb.prepare("PRAGMA table_info(runs)").all().map(c => c.name);
+  const v02RunCols = [
+    'identity_resolved', 'trust_evaluation', 'authorization_decision',
+    'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary',
+  ];
+  for (const col of v02RunCols) {
+    assert(runCols.includes(col), `runs table should have column ${col}`);
+  }
+}
+
+console.log('\n── v0.2 Validation: valid fields accepted ──');
+{
+  const v02Job = createJob({
+    name: 'v02-valid-fields',
+    schedule_cron: '0 4 * * *',
+    payload_message: 'identity test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_principal: 'agent:scheduler-v2',
+    identity_run_as: 'service-account-main',
+    identity_attestation: 'self-signed',
+    identity_ref: 'urn:openclaw:identity:agent:scheduler-v2',
+    identity_subject_kind: 'agent',
+    identity_subject_principal: 'agent:scheduler-v2',
+    identity_trust_level: 'supervised',
+    identity_delegation_mode: 'none',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:scheduler-v2', trust_level: 'supervised' }),
+    authorization_proof_ref: 'urn:openclaw:proof:abc123',
+    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'abc123' }),
+    authorization_ref: 'urn:openclaw:authz:policy-1',
+    authorization: JSON.stringify({ decision: 'permit', reason: 'pre-approved' }),
+    evidence_ref: 'urn:openclaw:evidence:run-log-1',
+    evidence: JSON.stringify({ collect: ['stdout', 'stderr'], retention: '30d' }),
+    contract_required_trust_level: 'supervised',
+    contract_trust_enforcement: 'block',
+    contract_sandbox: 'docker',
+    contract_allowed_paths: JSON.stringify(['/tmp', '/data']),
+    contract_network: 'restricted',
+    contract_max_cost_usd: 1.50,
+    contract_audit: 'full',
+  });
+  assert(v02Job && v02Job.id, 'v0.2 job with all fields created successfully');
+  assert(v02Job.identity_principal === 'agent:scheduler-v2', 'v0.2 identity_principal stored');
+  assert(v02Job.identity_trust_level === 'supervised', 'v0.2 identity_trust_level stored');
+  assert(v02Job.identity_subject_kind === 'agent', 'v0.2 identity_subject_kind stored');
+  assert(v02Job.identity_delegation_mode === 'none', 'v0.2 identity_delegation_mode stored');
+  assert(v02Job.contract_required_trust_level === 'supervised', 'v0.2 contract_required_trust_level stored');
+  assert(v02Job.contract_trust_enforcement === 'block', 'v0.2 contract_trust_enforcement stored');
+  assert(v02Job.contract_max_cost_usd === 1.50, 'v0.2 contract_max_cost_usd stored');
+  assert(v02Job.contract_audit === 'full', 'v0.2 contract_audit stored');
+  assert(v02Job.contract_sandbox === 'docker', 'v0.2 contract_sandbox stored');
+  assert(v02Job.contract_network === 'restricted', 'v0.2 contract_network stored');
+}
+
+console.log('\n── v0.2 Validation: invalid enum rejected ──');
+{
+  let threwInvalidTrustLevel = false;
+  try {
+    createJob({
+      name: 'v02-bad-trust',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad trust',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_trust_level: 'invalid',
+    });
+  } catch (e) {
+    threwInvalidTrustLevel = e.message.includes('identity_trust_level');
+  }
+  assert(threwInvalidTrustLevel, 'createJob rejects invalid identity_trust_level enum');
+
+  let threwInvalidSubjectKind = false;
+  try {
+    createJob({
+      name: 'v02-bad-subject-kind',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad subject kind',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_subject_kind: 'bogus',
+    });
+  } catch (e) {
+    threwInvalidSubjectKind = e.message.includes('identity_subject_kind');
+  }
+  assert(threwInvalidSubjectKind, 'createJob rejects invalid identity_subject_kind enum');
+
+  let threwInvalidDelegation = false;
+  try {
+    createJob({
+      name: 'v02-bad-delegation',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad delegation',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity_delegation_mode: 'nope',
+    });
+  } catch (e) {
+    threwInvalidDelegation = e.message.includes('identity_delegation_mode');
+  }
+  assert(threwInvalidDelegation, 'createJob rejects invalid identity_delegation_mode enum');
+
+  let threwInvalidContractTrust = false;
+  try {
+    createJob({
+      name: 'v02-bad-contract-trust',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad contract trust',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_required_trust_level: 'ultra',
+    });
+  } catch (e) {
+    threwInvalidContractTrust = e.message.includes('contract_required_trust_level');
+  }
+  assert(threwInvalidContractTrust, 'createJob rejects invalid contract_required_trust_level enum');
+
+  let threwInvalidEnforcement = false;
+  try {
+    createJob({
+      name: 'v02-bad-enforcement',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad enforcement',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_trust_enforcement: 'punish',
+    });
+  } catch (e) {
+    threwInvalidEnforcement = e.message.includes('contract_trust_enforcement');
+  }
+  assert(threwInvalidEnforcement, 'createJob rejects invalid contract_trust_enforcement enum');
+}
+
+console.log('\n── v0.2 Validation: credential handoff target guard ──');
+{
+  let threwNonShellPresentation = false;
+  try {
+    createJob({
+      name: 'v02-handoff-isolated',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad target',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: JSON.stringify({
+        provider: 'mock-provider',
+        presentation: { mode: 'inject-env' },
+      }),
+    });
+  } catch (e) {
+    threwNonShellPresentation = e.message.includes('session_target "shell"');
+  }
+  assert(threwNonShellPresentation, 'createJob rejects credential handoff on non-shell jobs');
+
+  const shellHandoffJob = createJob({
+    name: 'v02-handoff-shell',
+    schedule_cron: '0 5 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo handoff',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mock-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  assert(shellHandoffJob.session_target === 'shell', 'createJob allows credential handoff on shell jobs');
+  deleteJob(shellHandoffJob.id);
+}
+
+console.log('\n── v0.2 Validation: invalid JSON blob rejected ──');
+{
+  let threwBadIdentityJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-identity-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad json',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: 'not-json',
+    });
+  } catch (e) {
+    threwBadIdentityJson = e.message.includes('identity') && e.message.includes('JSON');
+  }
+  assert(threwBadIdentityJson, 'createJob rejects non-JSON identity blob');
+
+  let threwBadAuthProofJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-auth-proof-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad auth proof',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      authorization_proof: '{broken',
+    });
+  } catch (e) {
+    threwBadAuthProofJson = e.message.includes('authorization_proof') && e.message.includes('JSON');
+  }
+  assert(threwBadAuthProofJson, 'createJob rejects non-JSON authorization_proof blob');
+
+  let threwBadAuthJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-auth-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad authorization',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      authorization: 'not{valid',
+    });
+  } catch (e) {
+    threwBadAuthJson = e.message.includes('authorization') && e.message.includes('JSON');
+  }
+  assert(threwBadAuthJson, 'createJob rejects non-JSON authorization blob');
+
+  let threwBadEvidenceJson = false;
+  try {
+    createJob({
+      name: 'v02-bad-evidence-json',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad evidence',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      evidence: 'nope[',
+    });
+  } catch (e) {
+    threwBadEvidenceJson = e.message.includes('evidence') && e.message.includes('JSON');
+  }
+  assert(threwBadEvidenceJson, 'createJob rejects non-JSON evidence blob');
+
+  let threwBadAllowedPaths = false;
+  try {
+    createJob({
+      name: 'v02-bad-allowed-paths',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad paths',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_allowed_paths: 'just-a-string',
+    });
+  } catch (e) {
+    threwBadAllowedPaths = e.message.includes('contract_allowed_paths') && e.message.includes('JSON');
+  }
+  assert(threwBadAllowedPaths, 'createJob rejects non-JSON contract_allowed_paths blob');
+}
+
+console.log('\n── v0.2 Validation: null values accepted (all optional) ──');
+{
+  const minimalJob = createJob({
+    name: 'v02-no-v02-fields',
+    schedule_cron: '0 6 * * *',
+    payload_message: 'minimal job',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  assert(minimalJob && minimalJob.id, 'job with no v0.2 fields created successfully');
+  assert(minimalJob.identity_principal === null, 'identity_principal defaults to null');
+  assert(minimalJob.identity_trust_level === null, 'identity_trust_level defaults to null');
+  assert(minimalJob.identity === null, 'identity defaults to null');
+  assert(minimalJob.authorization === null, 'authorization defaults to null');
+  assert(minimalJob.evidence === null, 'evidence defaults to null');
+  assert(minimalJob.contract_required_trust_level === null, 'contract_required_trust_level defaults to null');
+  assert(minimalJob.contract_max_cost_usd === null, 'contract_max_cost_usd defaults to null');
+}
+
+console.log('\n── v0.2 Validation: contract_max_cost_usd ──');
+{
+  let threwNegativeCost = false;
+  try {
+    createJob({
+      name: 'v02-negative-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'negative cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: -1.0,
+    });
+  } catch (e) {
+    threwNegativeCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwNegativeCost, 'createJob rejects negative contract_max_cost_usd');
+
+  let threwInfiniteCost = false;
+  try {
+    createJob({
+      name: 'v02-infinite-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'infinite cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: Infinity,
+    });
+  } catch (e) {
+    threwInfiniteCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwInfiniteCost, 'createJob rejects Infinity contract_max_cost_usd');
+
+  let threwStringCost = false;
+  try {
+    createJob({
+      name: 'v02-string-cost',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'string cost',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      contract_max_cost_usd: 'five',
+    });
+  } catch (e) {
+    threwStringCost = e.message.includes('contract_max_cost_usd');
+  }
+  assert(threwStringCost, 'createJob rejects non-numeric contract_max_cost_usd');
+
+  const zeroCostJob = createJob({
+    name: 'v02-zero-cost',
+    schedule_cron: '0 5 * * *',
+    payload_message: 'zero cost',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    contract_max_cost_usd: 0,
+  });
+  assert(zeroCostJob.contract_max_cost_usd === 0, 'createJob accepts zero contract_max_cost_usd');
+
+  const validCostJob = createJob({
+    name: 'v02-valid-cost',
+    schedule_cron: '0 5 * * *',
+    payload_message: 'valid cost',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    contract_max_cost_usd: 99.99,
+  });
+  assert(validCostJob.contract_max_cost_usd === 99.99, 'createJob stores valid contract_max_cost_usd');
+}
+
+console.log('\n── v0.2 Storage Round-Trip ──');
+{
+  const identityBlob = JSON.stringify({
+    subject_kind: 'service',
+    principal: 'svc:data-pipeline',
+    trust_level: 'autonomous',
+    delegation_mode: 'on-behalf-of',
+    presentation: {
+      mode: 'inject-env',
+      bindings: [
+        { env: 'SVC_TOKEN', source: 'vault:secret/svc/token', cleanup: true },
+        { env: 'SVC_CERT', source: 'vault:secret/svc/cert' },
+      ],
+      cleanup_required: false,
+    },
+  });
+  const authProofBlob = JSON.stringify({ method: 'hmac', ref: 'proof-ref-456', payload: 'base64data' });
+  const authBlob = JSON.stringify({ decision: 'permit', reason: 'approved by policy engine', depends_on_trust: true });
+  const evidenceBlob = JSON.stringify({ collect: ['stdout', 'exit_code'], retention: '90d', format: 'json' });
+  const allowedPathsBlob = JSON.stringify(['/opt/data', '/var/log']);
+
+  const rtJob = createJob({
+    name: 'v02-roundtrip',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'roundtrip test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_principal: 'svc:data-pipeline',
+    identity_run_as: 'data-runner',
+    identity_attestation: 'oidc',
+    identity_ref: 'urn:openclaw:identity:svc:data-pipeline',
+    identity_subject_kind: 'service',
+    identity_subject_principal: 'svc:data-pipeline',
+    identity_trust_level: 'autonomous',
+    identity_delegation_mode: 'on-behalf-of',
+    identity: identityBlob,
+    authorization_proof_ref: 'urn:openclaw:proof:456',
+    authorization_proof: authProofBlob,
+    authorization_ref: 'urn:openclaw:authz:policy-2',
+    authorization: authBlob,
+    evidence_ref: 'urn:openclaw:evidence:log-2',
+    evidence: evidenceBlob,
+    contract_required_trust_level: 'autonomous',
+    contract_trust_enforcement: 'warn',
+    contract_sandbox: 'nsjail',
+    contract_allowed_paths: allowedPathsBlob,
+    contract_network: 'egress-only',
+    contract_max_cost_usd: 25.00,
+    contract_audit: 'minimal',
+  });
+
+  const fetched = getJob(rtJob.id);
+  assert(fetched.identity_principal === 'svc:data-pipeline', 'roundtrip: identity_principal');
+  assert(fetched.identity_run_as === 'data-runner', 'roundtrip: identity_run_as');
+  assert(fetched.identity_attestation === 'oidc', 'roundtrip: identity_attestation');
+  assert(fetched.identity_ref === 'urn:openclaw:identity:svc:data-pipeline', 'roundtrip: identity_ref');
+  assert(fetched.identity_subject_kind === 'service', 'roundtrip: identity_subject_kind');
+  assert(fetched.identity_subject_principal === 'svc:data-pipeline', 'roundtrip: identity_subject_principal');
+  assert(fetched.identity_trust_level === 'autonomous', 'roundtrip: identity_trust_level');
+  assert(fetched.identity_delegation_mode === 'on-behalf-of', 'roundtrip: identity_delegation_mode');
+  assert(fetched.identity === identityBlob, 'roundtrip: identity JSON blob');
+  assert(fetched.authorization_proof_ref === 'urn:openclaw:proof:456', 'roundtrip: authorization_proof_ref');
+  assert(fetched.authorization_proof === authProofBlob, 'roundtrip: authorization_proof JSON blob');
+  assert(fetched.authorization_ref === 'urn:openclaw:authz:policy-2', 'roundtrip: authorization_ref');
+  assert(fetched.authorization === authBlob, 'roundtrip: authorization JSON blob');
+  assert(fetched.evidence_ref === 'urn:openclaw:evidence:log-2', 'roundtrip: evidence_ref');
+  assert(fetched.evidence === evidenceBlob, 'roundtrip: evidence JSON blob');
+  assert(fetched.contract_required_trust_level === 'autonomous', 'roundtrip: contract_required_trust_level');
+  assert(fetched.contract_trust_enforcement === 'warn', 'roundtrip: contract_trust_enforcement');
+  assert(fetched.contract_sandbox === 'nsjail', 'roundtrip: contract_sandbox');
+  assert(fetched.contract_allowed_paths === allowedPathsBlob, 'roundtrip: contract_allowed_paths');
+  assert(fetched.contract_network === 'egress-only', 'roundtrip: contract_network');
+  assert(fetched.contract_max_cost_usd === 25.00, 'roundtrip: contract_max_cost_usd');
+  assert(fetched.contract_audit === 'minimal', 'roundtrip: contract_audit');
+
+  // Update a v0.2 field and verify
+  updateJob(rtJob.id, { contract_max_cost_usd: 50.00 });
+  const updated = getJob(rtJob.id);
+  assert(updated.contract_max_cost_usd === 50.00, 'roundtrip: updateJob changes contract_max_cost_usd');
+  assert(updated.identity_principal === 'svc:data-pipeline', 'roundtrip: updateJob preserves untouched v0.2 fields');
+
+  updateJob(rtJob.id, { identity_trust_level: 'restricted' });
+  const updated2 = getJob(rtJob.id);
+  assert(updated2.identity_trust_level === 'restricted', 'roundtrip: updateJob changes identity_trust_level');
+}
+
+console.log('\n── v0.2 resolveIdentity ──');
+{
+  // With identity JSON blob
+  const blobResult = await resolveIdentity({
+    identity: JSON.stringify({
+      subject_kind: 'agent',
+      principal: 'agent:test-1',
+      trust_level: 'supervised',
+      delegation_mode: 'none',
+    }),
+  });
+  assert(blobResult !== null, 'resolveIdentity: blob returns non-null');
+  assert(blobResult.subject_kind === 'agent', 'resolveIdentity: blob subject_kind');
+  assert(blobResult.principal === 'agent:test-1', 'resolveIdentity: blob principal');
+  assert(blobResult.trust_level === 'supervised', 'resolveIdentity: blob trust_level');
+  assert(blobResult.delegation_mode === 'none', 'resolveIdentity: blob delegation_mode');
+  assert(blobResult.raw !== null && typeof blobResult.raw === 'object', 'resolveIdentity: blob raw is parsed object');
+
+  // With scalar fields only (no blob)
+  const scalarResult = await resolveIdentity({
+    identity_principal: 'user:alex',
+    identity_subject_kind: 'user',
+    identity_trust_level: 'autonomous',
+    identity_delegation_mode: 'on-behalf-of',
+  });
+  assert(scalarResult !== null, 'resolveIdentity: scalars returns non-null');
+  assert(scalarResult.subject_kind === 'user', 'resolveIdentity: scalar subject_kind');
+  assert(scalarResult.principal === 'user:alex', 'resolveIdentity: scalar principal');
+  assert(scalarResult.trust_level === 'autonomous', 'resolveIdentity: scalar trust_level');
+  assert(scalarResult.raw === null, 'resolveIdentity: scalar raw is null');
+
+  // With no identity at all
+  const nullResult = await resolveIdentity({});
+  assert(nullResult === null, 'resolveIdentity: empty job returns null');
+
+  const nullJobResult = await resolveIdentity(null);
+  assert(nullJobResult === null, 'resolveIdentity: null job returns null');
+
+  // With malformed JSON blob and scalar fallback
+  const malformedResult = await resolveIdentity({
+    identity: 'not-valid-json',
+    identity_principal: 'fallback-principal',
+    identity_subject_kind: 'workload',
+  });
+  assert(malformedResult !== null, 'resolveIdentity: malformed blob with scalars returns non-null');
+  assert(malformedResult.principal === 'fallback-principal', 'resolveIdentity: malformed blob falls back to scalar principal');
+  assert(malformedResult.raw && malformedResult.raw.error, 'resolveIdentity: malformed blob includes error in raw');
+}
+
+console.log('\n── v0.2 evaluateTrust ──');
+{
+  // Sufficient trust + block enforcement -> permit
+  const permitResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    { trust_level: 'autonomous' }
+  );
+  assert(permitResult.decision === 'permit', 'evaluateTrust: sufficient trust with block -> permit');
+  assert(permitResult.effective_level === 'autonomous', 'evaluateTrust: effective level from identity');
+  assert(permitResult.required_level === 'supervised', 'evaluateTrust: required level from contract');
+
+  // Exact match -> permit
+  const exactResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    { trust_level: 'supervised' }
+  );
+  assert(exactResult.decision === 'permit', 'evaluateTrust: exact trust match -> permit');
+
+  // Insufficient trust + block -> deny
+  const denyResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'block' },
+    { trust_level: 'restricted' }
+  );
+  assert(denyResult.decision === 'deny', 'evaluateTrust: insufficient trust with block -> deny');
+  assert(denyResult.reason.includes('restricted'), 'evaluateTrust: deny reason includes effective level');
+
+  // Insufficient trust + warn -> warn
+  const warnResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'warn' },
+    { trust_level: 'supervised' }
+  );
+  assert(warnResult.decision === 'warn', 'evaluateTrust: insufficient trust with warn -> warn');
+
+  // Insufficient trust + none -> permit
+  const noneEnforcementResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'none' },
+    { trust_level: 'restricted' }
+  );
+  assert(noneEnforcementResult.decision === 'permit', 'evaluateTrust: insufficient trust with none enforcement -> permit');
+
+  // No required trust level -> permit
+  const noReqResult = evaluateTrust({}, { trust_level: 'supervised' });
+  assert(noReqResult.decision === 'permit', 'evaluateTrust: no required trust -> permit');
+  assert(noReqResult.reason.includes('no trust requirement'), 'evaluateTrust: no requirement reason');
+
+  // No enforcement -> permit
+  const noEnforcementResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous' },
+    { trust_level: 'restricted' }
+  );
+  assert(noEnforcementResult.decision === 'permit', 'evaluateTrust: no enforcement defaults to none -> permit');
+
+  // No effective trust level + block -> deny
+  const noEffectiveBlockResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'block' },
+    null
+  );
+  assert(noEffectiveBlockResult.decision === 'deny', 'evaluateTrust: no effective trust + block -> deny');
+
+  // No effective trust level + warn -> warn
+  const noEffectiveWarnResult = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'warn' },
+    null
+  );
+  assert(noEffectiveWarnResult.decision === 'warn', 'evaluateTrust: no effective trust + warn -> warn');
+
+  // Null job -> permit
+  const nullJobTrust = evaluateTrust(null, null);
+  assert(nullJobTrust.decision === 'permit', 'evaluateTrust: null job -> permit');
+
+  // Trust level ordering
+  assert(TRUST_LEVELS.indexOf('untrusted') < TRUST_LEVELS.indexOf('restricted'), 'TRUST_LEVELS: untrusted < restricted');
+  assert(TRUST_LEVELS.indexOf('restricted') < TRUST_LEVELS.indexOf('supervised'), 'TRUST_LEVELS: restricted < supervised');
+  assert(TRUST_LEVELS.indexOf('supervised') < TRUST_LEVELS.indexOf('autonomous'), 'TRUST_LEVELS: supervised < autonomous');
+}
+
+console.log('\n── v0.2 evaluateTrust enforcement normalization ──');
+{
+  // advisory normalizes to warn
+  const advisoryResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'advisory' },
+    { trust_level: 'supervised' }
+  );
+  assert(advisoryResult.decision === 'warn', 'evaluateTrust: advisory normalizes to warn');
+
+  // strict normalizes to block
+  const strictResult = evaluateTrust(
+    { contract_required_trust_level: 'autonomous', contract_trust_enforcement: 'strict' },
+    { trust_level: 'restricted' }
+  );
+  assert(strictResult.decision === 'deny', 'evaluateTrust: strict normalizes to block (deny)');
+
+  // advisory with no effective trust -> warn
+  const advisoryNoTrust = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'advisory' },
+    null
+  );
+  assert(advisoryNoTrust.decision === 'warn', 'evaluateTrust: advisory + no effective trust -> warn');
+
+  // strict with sufficient trust -> permit
+  const strictSufficient = evaluateTrust(
+    { contract_required_trust_level: 'supervised', contract_trust_enforcement: 'strict' },
+    { trust_level: 'autonomous' }
+  );
+  assert(strictSufficient.decision === 'permit', 'evaluateTrust: strict + sufficient trust -> permit');
+}
+
+console.log('\n── v0.2 verifyAuthorizationProof ──');
+{
+  // Valid proof structure -> verified:true
+  const validProof = await verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'jwt-ref-1' }),
+    authorization_proof_ref: 'urn:proof:1',
+  });
+  assert(validProof !== null, 'verifyAuthorizationProof: valid proof returns non-null');
+  assert(validProof.verified === true, 'verifyAuthorizationProof: valid proof verified is true');
+  assert(validProof.method === 'signed-jwt', 'verifyAuthorizationProof: method extracted');
+  assert(validProof.ref === 'jwt-ref-1', 'verifyAuthorizationProof: ref from blob');
+
+  // All known methods accepted
+  for (const method of ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 'oidc', 'saml', 'custom']) {
+    const r = await verifyAuthorizationProof({
+      authorization_proof: JSON.stringify({ method }),
+    });
+    assert(r.verified === true, `verifyAuthorizationProof: method ${method} accepted`);
+  }
+
+  // No proof -> null
+  const noProof = await verifyAuthorizationProof({});
+  assert(noProof === null, 'verifyAuthorizationProof: no proof -> null');
+  assert(await verifyAuthorizationProof(null) === null, 'verifyAuthorizationProof: null job -> null');
+
+  // Only ref, no inline proof -> verified:false with error
+  const refOnly = await verifyAuthorizationProof({
+    authorization_proof_ref: 'urn:proof:orphan',
+  });
+  assert(refOnly !== null, 'verifyAuthorizationProof: ref-only returns non-null');
+  assert(refOnly.verified === false, 'verifyAuthorizationProof: ref-only verified is false');
+  assert(refOnly.error && refOnly.error.includes('empty'), 'verifyAuthorizationProof: ref-only error mentions empty');
+
+  // Invalid JSON -> verified:false
+  const badJson = await verifyAuthorizationProof({
+    authorization_proof: 'not-json',
+  });
+  assert(badJson.verified === false, 'verifyAuthorizationProof: invalid JSON verified is false');
+  assert(badJson.error.includes('parse failed'), 'verifyAuthorizationProof: invalid JSON error message');
+
+  // Missing method field -> verified:false
+  const noMethod = await verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ ref: 'some-ref' }),
+  });
+  assert(noMethod.verified === false, 'verifyAuthorizationProof: missing method verified is false');
+  assert(noMethod.error.includes('method'), 'verifyAuthorizationProof: missing method error message');
+
+  // Unrecognized method -> verified:false
+  const unknownMethod = await verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ method: 'telepathy' }),
+  });
+  assert(unknownMethod.verified === false, 'verifyAuthorizationProof: unknown method verified is false');
+  assert(unknownMethod.error.includes('unrecognized'), 'verifyAuthorizationProof: unknown method error message');
+
+  // Explicit verifier with no loaded plugin -> fail closed
+  const missingVerifier = await verifyAuthorizationProof({
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+  }, {});
+  assert(missingVerifier.verified === false, 'verifyAuthorizationProof: missing explicit verifier fails closed');
+  assert(missingVerifier.source === 'provider-error', 'verifyAuthorizationProof: missing explicit verifier reports provider-error');
+  assert(missingVerifier.error.includes('not loaded'), 'verifyAuthorizationProof: missing explicit verifier error mentions not loaded');
+}
+
+console.log('\n── v0.2 evaluateAuthorization ──');
+{
+  // No authorization -> null
+  assert(await evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
+  assert(await evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
+
+  // Ref only -> deny (external policy resolution not implemented, fail closed)
+  const refOnlyAuth = await evaluateAuthorization(
+    { authorization_ref: 'urn:authz:1' }, null, null
+  );
+  assert(refOnlyAuth.decision === 'deny', 'evaluateAuthorization: ref-only -> deny (fail closed)');
+  assert(refOnlyAuth.ref === 'urn:authz:1', 'evaluateAuthorization: ref-only ref');
+  assert(refOnlyAuth.reason.includes('not yet implemented'), 'evaluateAuthorization: ref-only reason explains why');
+
+  // Explicit deny in policy
+  const explicitDeny = await evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'deny', reason: 'test deny' }) },
+    null, null
+  );
+  assert(explicitDeny.decision === 'deny', 'evaluateAuthorization: explicit deny in policy');
+  assert(explicitDeny.reason === 'test deny', 'evaluateAuthorization: explicit deny reason');
+
+  // Explicit escalate in policy
+  const explicitEscalate = await evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'escalate', reason: 'needs review' }) },
+    null, null
+  );
+  assert(explicitEscalate.decision === 'escalate', 'evaluateAuthorization: explicit escalate in policy');
+
+  // Trust deny propagation (depends_on_trust default true)
+  const trustDenyPropagation = await evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'permit' }) },
+    { trust_level: 'restricted' },
+    { decision: 'deny', reason: 'trust too low' }
+  );
+  assert(trustDenyPropagation.decision === 'deny', 'evaluateAuthorization: trust deny propagation -> deny');
+  assert(trustDenyPropagation.reason.includes('trust evaluation denied'), 'evaluateAuthorization: trust deny reason propagated');
+
+  // Trust deny with depends_on_trust: false -> no propagation
+  const noTrustDep = await evaluateAuthorization(
+    { authorization: JSON.stringify({ decision: 'permit', depends_on_trust: false }) },
+    null,
+    { decision: 'deny', reason: 'trust too low' }
+  );
+  assert(noTrustDep.decision === 'permit', 'evaluateAuthorization: depends_on_trust=false ignores trust deny');
+
+  // Requires identity but none resolved -> deny
+  const reqIdentity = await evaluateAuthorization(
+    { authorization: JSON.stringify({ requires_identity: true }) },
+    null, null
+  );
+  assert(reqIdentity.decision === 'deny', 'evaluateAuthorization: requires_identity without identity -> deny');
+
+  // Requires identity with identity -> permit
+  const withIdentity = await evaluateAuthorization(
+    { authorization: JSON.stringify({ requires_identity: true }) },
+    { principal: 'agent:test' },
+    null
+  );
+  assert(withIdentity.decision === 'permit', 'evaluateAuthorization: requires_identity with identity -> permit');
+
+  // Invalid JSON -> deny
+  const badAuthJson = await evaluateAuthorization(
+    { authorization: 'not-json' }, null, null
+  );
+  assert(badAuthJson.decision === 'deny', 'evaluateAuthorization: invalid JSON -> deny');
+
+  // Explicit provider with no loaded plugin -> fail closed
+  const missingAuthProvider = await evaluateAuthorization(
+    { authorization: JSON.stringify({ provider: 'missing-authz-provider' }) },
+    { principal: 'agent:test' },
+    { decision: 'permit', reason: 'trust ok' },
+    {}
+  );
+  assert(missingAuthProvider.decision === 'deny', 'evaluateAuthorization: missing explicit provider fails closed');
+  assert(missingAuthProvider.source === 'provider-error', 'evaluateAuthorization: missing explicit provider reports provider-error');
+  assert(missingAuthProvider.reason.includes('not loaded'), 'evaluateAuthorization: missing explicit provider error mentions not loaded');
+
+  // Provider that returns an unsupported decision -> fail closed
+  const weirdAuthProvider = {
+    authorize() {
+      return { decision: 'allow', reason: 'provider typo' };
+    },
+  };
+  const weirdAuthDecision = await evaluateAuthorization(
+    { authorization: JSON.stringify({ provider: 'weird-authz-provider' }) },
+    { principal: 'agent:test' },
+    { decision: 'permit', reason: 'trust ok' },
+    {
+      getAuthorizationProvider: (name) => name === 'weird-authz-provider' ? weirdAuthProvider : null,
+    }
+  );
+  assert(weirdAuthDecision.decision === 'deny', 'evaluateAuthorization: unsupported provider decision fails closed');
+  assert(weirdAuthDecision.reason.includes('unsupported decision'), 'evaluateAuthorization: unsupported provider decision explains denial');
+}
+
+console.log('\n── v0.2 generateEvidence ──');
+{
+  // With evidence declaration
+  const evidenceResult = generateEvidence(
+    {
+      evidence: JSON.stringify({ collect: ['stdout'], retention: '30d', format: 'json' }),
+      evidence_ref: 'urn:evidence:1',
+    },
+    { id: 'run-1', status: 'ok' },
+    { identity_resolved: { principal: 'agent:test' }, trust_evaluation: { decision: 'permit' } }
+  );
+  assert(evidenceResult !== null, 'generateEvidence: returns non-null for evidence declaration');
+  assert(evidenceResult.evidence_ref === 'urn:evidence:1', 'generateEvidence: evidence_ref');
+  assert(typeof evidenceResult.created_at === 'string', 'generateEvidence: created_at is string');
+  assert(evidenceResult.payload_summary.collect[0] === 'stdout', 'generateEvidence: collect from blob');
+  assert(evidenceResult.payload_summary.retention === '30d', 'generateEvidence: retention from blob');
+  assert(evidenceResult.payload_summary.format === 'json', 'generateEvidence: format from blob');
+  assert(evidenceResult.payload_summary.run_id === 'run-1', 'generateEvidence: run_id in summary');
+  assert(evidenceResult.payload_summary.run_status === 'ok', 'generateEvidence: run_status in summary');
+  assert(Array.isArray(evidenceResult.payload_summary.outcome_fields_present), 'generateEvidence: outcome fields listed');
+  assert(evidenceResult.payload_summary.outcome_fields_present.includes('identity_resolved'), 'generateEvidence: identity_resolved in outcome fields');
+
+  // No evidence -> null
+  assert(generateEvidence({}, null, null) === null, 'generateEvidence: no evidence -> null');
+  assert(generateEvidence(null, null, null) === null, 'generateEvidence: null job -> null');
+
+  // Ref only (no inline evidence blob)
+  const refOnlyEvidence = generateEvidence(
+    { evidence_ref: 'urn:evidence:2' }, null, null
+  );
+  assert(refOnlyEvidence !== null, 'generateEvidence: ref-only returns non-null');
+  assert(refOnlyEvidence.evidence_ref === 'urn:evidence:2', 'generateEvidence: ref-only evidence_ref');
+
+  // Invalid evidence JSON -> returns with error in payload_summary
+  const badEvidence = generateEvidence(
+    { evidence: 'broken{json', evidence_ref: 'urn:evidence:3' }, null, null
+  );
+  assert(badEvidence !== null, 'generateEvidence: bad JSON returns non-null');
+  assert(badEvidence.payload_summary.error && badEvidence.payload_summary.error.includes('parse failed'), 'generateEvidence: bad JSON error in payload_summary');
+}
+
+console.log('\n── v0.2 summarizeCredentialHandoff ──');
+{
+  // With presentation bindings
+  const handoffResult = summarizeCredentialHandoff({
+    identity: JSON.stringify({
+      presentation: {
+        mode: 'inject-env',
+        bindings: [
+          { env: 'TOKEN', source: 'vault:secret/token', cleanup: true },
+          { env: 'CERT', source: 'vault:secret/cert' },
+        ],
+      },
+    }),
+  });
+  assert(handoffResult !== null, 'summarizeCredentialHandoff: returns non-null for presentation');
+  assert(handoffResult.mode === 'inject-env', 'summarizeCredentialHandoff: mode');
+  assert(handoffResult.bindings_count === 2, 'summarizeCredentialHandoff: bindings_count');
+  assert(handoffResult.cleanup_required === true, 'summarizeCredentialHandoff: cleanup_required from binding');
+
+  // With credential_handoff alias
+  const aliasResult = summarizeCredentialHandoff({
+    identity: JSON.stringify({
+      credential_handoff: {
+        mode: 'file-mount',
+        bindings: [{ path: '/run/secrets/key' }],
+        cleanup_required: true,
+      },
+    }),
+  });
+  assert(aliasResult !== null, 'summarizeCredentialHandoff: credential_handoff alias works');
+  assert(aliasResult.mode === 'file-mount', 'summarizeCredentialHandoff: alias mode');
+  assert(aliasResult.cleanup_required === true, 'summarizeCredentialHandoff: alias cleanup_required');
+
+  // No presentation -> null
+  assert(summarizeCredentialHandoff({}) === null, 'summarizeCredentialHandoff: no identity -> null');
+  assert(summarizeCredentialHandoff(null) === null, 'summarizeCredentialHandoff: null job -> null');
+  assert(summarizeCredentialHandoff({ identity: JSON.stringify({ subject_kind: 'agent' }) }) === null, 'summarizeCredentialHandoff: identity without presentation -> null');
+
+  // Malformed identity JSON -> error
+  const malformedHandoff = summarizeCredentialHandoff({ identity: 'not-json' });
+  assert(malformedHandoff !== null, 'summarizeCredentialHandoff: malformed JSON returns non-null');
+  assert(malformedHandoff.error && malformedHandoff.error.includes('parse failed'), 'summarizeCredentialHandoff: malformed JSON error');
+  assert(malformedHandoff.bindings_count === 0, 'summarizeCredentialHandoff: malformed JSON bindings_count is 0');
+}
+
+console.log('\n── v0.2 persistV02Outcomes ──');
+{
+  const outcomeJob = createJob({
+    name: 'v02-persist-outcomes',
+    schedule_cron: '0 8 * * *',
+    payload_message: 'outcome test',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const outcomeRun = createRun(outcomeJob.id, { run_timeout_ms: 60000 });
+
+  const identityResolved = { subject_kind: 'agent', principal: 'agent:test', trust_level: 'supervised' };
+  const trustEvaluation = { effective_level: 'supervised', required_level: 'supervised', decision: 'permit', reason: 'meets requirement' };
+  const authDecision = { decision: 'permit', reason: 'pre-approved', ref: 'urn:authz:1' };
+  const proofVerification = { verified: true, method: 'signed-jwt', ref: 'jwt-ref' };
+  const evidenceRecord = { evidence_ref: 'urn:evidence:1', created_at: '2026-03-28T00:00:00Z', hash: null, payload_summary: {} };
+  const handoffSummary = { mode: 'inject-env', bindings_count: 2, cleanup_required: true };
+
+  persistV02Outcomes(outcomeRun.id, {
+    identity_resolved: identityResolved,
+    trust_evaluation: trustEvaluation,
+    authorization_decision: authDecision,
+    authorization_proof_verification: proofVerification,
+    evidence_record: evidenceRecord,
+    credential_handoff_summary: handoffSummary,
+  });
+
+  const fetchedRun = getRun(outcomeRun.id);
+  assert(fetchedRun.identity_resolved !== null, 'persistV02Outcomes: identity_resolved stored');
+  assert(fetchedRun.trust_evaluation !== null, 'persistV02Outcomes: trust_evaluation stored');
+  assert(fetchedRun.authorization_decision !== null, 'persistV02Outcomes: authorization_decision stored');
+  assert(fetchedRun.authorization_proof_verification !== null, 'persistV02Outcomes: authorization_proof_verification stored');
+  assert(fetchedRun.evidence_record !== null, 'persistV02Outcomes: evidence_record stored');
+  assert(fetchedRun.credential_handoff_summary !== null, 'persistV02Outcomes: credential_handoff_summary stored');
+
+  // Verify JSON serialization round-trip
+  const parsedIdentity = JSON.parse(fetchedRun.identity_resolved);
+  assert(parsedIdentity.principal === 'agent:test', 'persistV02Outcomes: identity_resolved JSON roundtrip principal');
+  assert(parsedIdentity.trust_level === 'supervised', 'persistV02Outcomes: identity_resolved JSON roundtrip trust_level');
+
+  const parsedTrust = JSON.parse(fetchedRun.trust_evaluation);
+  assert(parsedTrust.decision === 'permit', 'persistV02Outcomes: trust_evaluation JSON roundtrip decision');
+
+  const parsedAuth = JSON.parse(fetchedRun.authorization_decision);
+  assert(parsedAuth.decision === 'permit', 'persistV02Outcomes: authorization_decision JSON roundtrip decision');
+  assert(parsedAuth.ref === 'urn:authz:1', 'persistV02Outcomes: authorization_decision JSON roundtrip ref');
+
+  const parsedProof = JSON.parse(fetchedRun.authorization_proof_verification);
+  assert(parsedProof.verified === true, 'persistV02Outcomes: authorization_proof_verification JSON roundtrip verified');
+  assert(parsedProof.method === 'signed-jwt', 'persistV02Outcomes: authorization_proof_verification JSON roundtrip method');
+
+  const parsedEvidence = JSON.parse(fetchedRun.evidence_record);
+  assert(parsedEvidence.evidence_ref === 'urn:evidence:1', 'persistV02Outcomes: evidence_record JSON roundtrip ref');
+
+  const parsedHandoff = JSON.parse(fetchedRun.credential_handoff_summary);
+  assert(parsedHandoff.mode === 'inject-env', 'persistV02Outcomes: credential_handoff_summary JSON roundtrip mode');
+  assert(parsedHandoff.bindings_count === 2, 'persistV02Outcomes: credential_handoff_summary JSON roundtrip bindings_count');
+
+  // Verify null/undefined outcomes are safely ignored
+  persistV02Outcomes(outcomeRun.id, { identity_resolved: undefined });
+  const unchanged = getRun(outcomeRun.id);
+  assert(unchanged.identity_resolved === fetchedRun.identity_resolved, 'persistV02Outcomes: undefined value does not overwrite');
+
+  // Verify unknown columns are ignored
+  persistV02Outcomes(outcomeRun.id, { nonexistent_field: 'should be ignored' });
+  const stillOk = getRun(outcomeRun.id);
+  assert(stillOk.identity_resolved === fetchedRun.identity_resolved, 'persistV02Outcomes: unknown columns ignored');
+
+  // Verify null input is safely handled
+  persistV02Outcomes(outcomeRun.id, null);
+  persistV02Outcomes(outcomeRun.id, undefined);
+  // If we got here without throwing, the safety check passed
+  assert(true, 'persistV02Outcomes: null/undefined outcomes handled gracefully');
+
+  // Verify string values are stored as-is (not double-serialized)
+  persistV02Outcomes(outcomeRun.id, { identity_resolved: '{"raw":"string"}' });
+  const stringStored = getRun(outcomeRun.id);
+  assert(stringStored.identity_resolved === '{"raw":"string"}', 'persistV02Outcomes: string values stored as-is');
+}
+
+console.log('\n── v0.2 Capabilities CLI ──');
+{
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
+  const capsOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'capabilities', '--json'], {
+    cwd: process.cwd(),
+    env: { ...process.env, SCHEDULER_DB: ':memory:' },
+    encoding: 'utf8',
+  }));
+  assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
+  assert(capsOut.schema_version === 23, 'capabilities: schema_version is 23');
+  assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
+  assert(capsOut.features, 'capabilities: features object present');
+  assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');
+  assert(capsOut.features.runtime_identity_resolution === true, 'capabilities: runtime_identity_resolution enabled');
+  assert(capsOut.features.trust_evaluation === true, 'capabilities: trust_evaluation enabled');
+  assert(capsOut.features.authorization_proof_verification === true, 'capabilities: authorization_proof_verification enabled');
+  assert(capsOut.features.authorization_hook === true, 'capabilities: authorization_hook enabled');
+  assert(capsOut.features.evidence_generation === true, 'capabilities: evidence_generation enabled');
+  assert(capsOut.features.credential_handoff === true, 'capabilities: credential_handoff enabled');
+  assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
+  assert(capsOut.features.delegation_validation === false, 'capabilities: delegation_validation not yet enabled');
+  assert(capsOut.features.runtime_execution === true, 'capabilities: runtime_execution enabled');
+}
+
+// ═══════════════════════════════════════════════════════════
+// v0.2 resolveIdentity with mock provider
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── v0.2 resolveIdentity with provider ──');
+{
+  // resolveIdentity with provider in ctx resolves via provider
+  const providerJob = {
+    id: 'test-provider-resolve',
+    identity: JSON.stringify({
+      provider: 'test-provider',
+      scope: 'full',
+      trust: { level: 'supervised' },
+    }),
+  };
+
+  const mockProvider = {
+    name: 'test-provider',
+    type: 'identity',
+    resolveSession(_request, _ctx) {
+      return {
+        ok: true,
+        session: {
+          subject: { kind: 'service', principal: 'test:mock' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+  };
+
+  const ctx = {
+    getIdentityProvider: (name) => name === 'test-provider' ? mockProvider : null,
+  };
+
+  const provResult = await resolveIdentity(providerJob, ctx);
+  assert(provResult !== null, 'resolveIdentity with provider: returns non-null');
+  assert(provResult.source === 'provider', 'resolveIdentity with provider: source is provider');
+  assert(provResult.session !== null && typeof provResult.session === 'object', 'resolveIdentity with provider: session present');
+  assert(provResult.session.subject.kind === 'service', 'resolveIdentity with provider: session subject kind');
+  assert(provResult.session.subject.principal === 'test:mock', 'resolveIdentity with provider: session subject principal');
+
+  // resolveIdentity without ctx falls back to structural
+  const noCtxJob = {
+    id: 'test-no-ctx',
+    identity: JSON.stringify({
+      subject_kind: 'agent',
+      principal: 'agent:structural',
+      trust_level: 'restricted',
+    }),
+  };
+  const structuralResult = await resolveIdentity(noCtxJob);
+  assert(structuralResult !== null, 'resolveIdentity without ctx: returns non-null');
+  assert(structuralResult.source === undefined || structuralResult.source !== 'provider', 'resolveIdentity without ctx: not from provider');
+  assert(structuralResult.subject_kind === 'agent', 'resolveIdentity without ctx: structural subject_kind');
+  assert(structuralResult.principal === 'agent:structural', 'resolveIdentity without ctx: structural principal');
+
+  // resolveIdentity with empty ctx also falls back to structural
+  const emptyCtxResult = await resolveIdentity(noCtxJob, {});
+  assert(emptyCtxResult !== null, 'resolveIdentity with empty ctx: returns non-null');
+  assert(emptyCtxResult.subject_kind === 'agent', 'resolveIdentity with empty ctx: structural subject_kind');
+
+  // resolveIdentity with provider error returns transient error
+  const errorProvider = {
+    name: 'error-provider',
+    type: 'identity',
+    resolveSession(_request, _ctx) {
+      return { ok: false, transient: true, error: 'Vault timeout' };
+    },
+  };
+
+  const errorJob = {
+    id: 'test-provider-error',
+    identity: JSON.stringify({
+      provider: 'error-provider',
+      scope: 'full',
+    }),
+  };
+
+  const errorCtx = {
+    getIdentityProvider: (name) => name === 'error-provider' ? errorProvider : null,
+  };
+
+  const errorResult = await resolveIdentity(errorJob, errorCtx);
+  assert(errorResult !== null, 'resolveIdentity with provider error: returns non-null');
+  assert(errorResult.source === 'provider-error', 'resolveIdentity with provider error: source is provider-error');
+  assert(errorResult.transient === true, 'resolveIdentity with provider error: transient is true');
+  assert(errorResult.error === 'Vault timeout', 'resolveIdentity with provider error: error message matches');
+
+  const missingProviderResult = await resolveIdentity({
+    id: 'test-provider-missing',
+    identity: JSON.stringify({ provider: 'missing-provider', scope: 'full' }),
+  }, {});
+  assert(missingProviderResult !== null, 'resolveIdentity with missing provider: returns non-null');
+  assert(missingProviderResult.source === 'provider-error', 'resolveIdentity with missing provider: source is provider-error');
+  assert(missingProviderResult.transient === false, 'resolveIdentity with missing provider: transient is false');
+  assert(missingProviderResult.error.includes('not loaded'), 'resolveIdentity with missing provider: error mentions not loaded');
+}
+
+// ═══════════════════════════════════════════════════════════
+// Provider Registry
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Provider Registry ──');
+{
+  // loadProviders loads mock-stripe from test-providers directory
+  resetProviderRegistry();
+  const testProvidersDir = join(dirname(fileURLToPath(import.meta.url)), 'test-providers');
+  await loadProviders(testProvidersDir);
+  const mockStripe = getIdentityProvider('mock-stripe');
+  assert(mockStripe !== null, 'loadProviders: mock-stripe loaded');
+  assert(mockStripe.type === 'identity', 'loadProviders: mock-stripe type is identity');
+  assert(mockStripe.name === 'mock-stripe', 'loadProviders: mock-stripe name matches');
+
+  // getIdentityProvider returns null for unknown provider
+  const unknown = getIdentityProvider('nonexistent');
+  assert(unknown === null, 'getIdentityProvider: returns null for unknown provider');
+
+  // Clean up registry state
+  resetProviderRegistry();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Shell env var injection
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Shell env var injection ──');
+{
+  const shellResult = await runShellCommand('echo $TEST_INJECT_VAR', 5000, { TEST_INJECT_VAR: 'hello_from_test' });
+  assert(shellResult.stdout.includes('hello_from_test'), 'runShellCommand: env vars passed to subprocess');
+}
+
+function buildPrepareDispatchDeps(overrides = {}) {
+    return {
+      claimDispatch: () => true,
+      releaseDispatch() {},
+      setDispatchStatus() {},
+      countPendingApprovalsForJob: () => 0,
+      getPendingApproval: () => null,
+      createApproval() { throw new Error('createApproval should not be called in prepareDispatch unit tests'); },
+      createRun,
+      getRun,
+      hasRunningRunForPool: () => false,
+      hasRunningRun: () => false,
+      enqueueJob: () => ({ queued: false, queued_count: 0, limited: false }),
+      getDispatchBacklogCount: () => 0,
+      generateIdempotencyKey: () => 'idem-key',
+      generateChainIdempotencyKey: () => 'chain-key',
+      generateRunNowIdempotencyKey: () => 'run-now-key',
+      claimIdempotencyKey: () => true,
+      finishRun,
+      getDb,
+      sqliteNow,
+      adaptiveDeferralMs,
+      handleDelivery() {},
+      advanceNextRun() {},
+      TICK_INTERVAL_MS: 100,
+      log() {},
+      resolveIdentity,
+      evaluateTrust,
+      verifyAuthorizationProof,
+      evaluateAuthorization,
+      summarizeCredentialHandoff,
+      persistV02Outcomes,
+      releaseIdempotencyKey() {},
+      updateJobAfterRun() {},
+      handleTriggeredChildren() {},
+      dequeueJob: () => false,
+      compareTrustLevels,
+      getIdentityProvider: () => null,
+      getAuthorizationProvider: () => null,
+      getProofVerifier: () => null,
+      ...overrides,
+    };
+}
+
+console.log('\n── prepareDispatch v0.2 gating ──');
+{
+  const scalarIdentityJob = createJob({
+    name: 'prepare-dispatch-scalar-identity',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo scalar identity',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:scalar-only',
+    identity_trust_level: 'supervised',
+    authorization: JSON.stringify({ requires_identity: true }),
+  });
+  const scalarCtx = await prepareDispatch(
+    getJob(scalarIdentityJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(scalarCtx !== null, 'prepareDispatch: scalar identity fields trigger identity resolution');
+  assert(scalarCtx?.v02Outcomes?.identity_resolved?.principal === 'agent:scalar-only', 'prepareDispatch: scalar identity principal is preserved');
+  if (scalarCtx) finishRun(scalarCtx.run.id, 'cancelled', { summary: 'test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(scalarIdentityJob.id);
+  deleteJob(scalarIdentityJob.id);
+
+  const providerErrorJob = createJob({
+    name: 'prepare-dispatch-provider-error',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo provider error',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'error-provider', scope: 'full' }),
+    authorization: JSON.stringify({ requires_identity: true }),
+  });
+  let providerErrorUpdates = 0;
+  const providerErrorCtx = await prepareDispatch(
+    getJob(providerErrorJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'error-provider'
+        ? {
+            name: 'error-provider',
+            type: 'identity',
+            resolveSession() {
+              return { ok: false, transient: true, error: 'Vault timeout' };
+            },
+          }
+        : null,
+      updateJobAfterRun(_job, status) {
+        if (status === 'error') providerErrorUpdates++;
+      },
+    }),
+  );
+  assert(providerErrorCtx === null, 'prepareDispatch: provider identity resolution failures fail closed');
+  const providerErrorRun = getRunsForJob(providerErrorJob.id, 1)[0];
+  assert(providerErrorRun.status === 'error', 'prepareDispatch: provider identity resolution failure finishes run as error');
+  assert(providerErrorRun.error_message.includes('Identity resolution failed: Vault timeout'), 'prepareDispatch: provider identity resolution failure stores reason');
+  const providerErrorIdentity = JSON.parse(getRun(providerErrorRun.id).identity_resolved);
+  assert(providerErrorIdentity.source === 'provider-error', 'prepareDispatch: provider identity resolution failure persists provider-error outcome');
+  assert(providerErrorUpdates === 1, 'prepareDispatch: provider identity resolution failure updates job state');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(providerErrorJob.id);
+  deleteJob(providerErrorJob.id);
+
+  const missingVerifierJob = createJob({
+    name: 'prepare-dispatch-missing-verifier',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo missing verifier',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+  });
+  const missingVerifierCtx = await prepareDispatch(
+    getJob(missingVerifierJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(missingVerifierCtx === null, 'prepareDispatch: missing proof verifier fails closed');
+  const missingVerifierRun = getRunsForJob(missingVerifierJob.id, 1)[0];
+  assert(missingVerifierRun.status === 'error', 'prepareDispatch: missing proof verifier finishes run as error');
+  assert(missingVerifierRun.error_message.includes('proof verifier not loaded'), 'prepareDispatch: missing proof verifier stores reason');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(missingVerifierJob.id);
+  deleteJob(missingVerifierJob.id);
+
+  const missingAuthzProviderJob = createJob({
+    name: 'prepare-dispatch-missing-authz-provider',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo missing authz provider',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:missing-authz',
+    authorization: JSON.stringify({ provider: 'missing-authz-provider' }),
+  });
+  const missingAuthzProviderCtx = await prepareDispatch(
+    getJob(missingAuthzProviderJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(missingAuthzProviderCtx === null, 'prepareDispatch: missing authorization provider fails closed');
+  const missingAuthzProviderRun = getRunsForJob(missingAuthzProviderJob.id, 1)[0];
+  assert(missingAuthzProviderRun.status === 'error', 'prepareDispatch: missing authorization provider finishes run as error');
+  assert(missingAuthzProviderRun.error_message.includes('authorization provider not loaded'), 'prepareDispatch: missing authorization provider stores reason');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(missingAuthzProviderJob.id);
+  deleteJob(missingAuthzProviderJob.id);
+
+  const parentForNone = createJob({
+    name: 'prepare-dispatch-parent-none',
+    schedule_cron: '0 8 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent none',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const nonePolicyChild = createJob({
+    name: 'prepare-dispatch-child-none',
+    parent_id: parentForNone.id,
+    trigger_on: 'failure',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child none',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ subject_kind: 'service', principal: 'svc:none', trust_level: 'supervised' }),
+    authorization: JSON.stringify({ requires_identity: true }),
+    child_credential_policy: 'none',
+  });
+  const nonePolicyCtx = await prepareDispatch(
+    getJob(nonePolicyChild.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(nonePolicyCtx === null, 'prepareDispatch: child_credential_policy=none re-evaluates authorization against cleared identity');
+  const nonePolicyRun = getRunsForJob(nonePolicyChild.id, 1)[0];
+  assert(nonePolicyRun.error_message.includes('requires identity'), 'prepareDispatch: none policy stores authorization deny reason');
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentForNone.id, nonePolicyChild.id);
+  deleteJob(nonePolicyChild.id);
+  deleteJob(parentForNone.id);
+
+  const handoffProvider = {
+    name: 'handoff-provider',
+    type: 'identity',
+    resolveSession(request) {
+      const scope = request.scope || request.profile?.scope || 'full';
+      return {
+        ok: true,
+        session: {
+          provider: 'handoff-provider',
+          subject: { kind: 'service', principal: `svc:${scope}` },
+          trust: { effective_level: 'autonomous' },
+          credentials: {},
+        },
+      };
+    },
+    prepareHandoff(parentSession) {
+      return {
+        prepared: true,
+        session: {
+          ...parentSession,
+          subject: { kind: 'service', principal: 'svc:downscoped' },
+          trust: { effective_level: 'restricted' },
+        },
+      };
+    },
+  };
+
+  const parentForDownscope = createJob({
+    name: 'prepare-dispatch-parent-downscope',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent downscope',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'handoff-provider', scope: 'full' }),
+  });
+  const downscopeChild = createJob({
+    name: 'prepare-dispatch-child-downscope',
+    parent_id: parentForDownscope.id,
+    trigger_on: 'failure',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child downscope',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ provider: 'handoff-provider', scope: 'payments' }),
+    contract_required_trust_level: 'supervised',
+    contract_trust_enforcement: 'block',
+    child_credential_policy: 'downscope',
+  });
+  let downscopeUpdateCalls = 0;
+  const downscopeTriggered = [];
+  const downscopeCtx = await prepareDispatch(
+    getJob(downscopeChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'handoff-provider' ? handoffProvider : null,
+      updateJobAfterRun(_job, status) {
+        if (status === 'error') downscopeUpdateCalls++;
+      },
+      handleTriggeredChildren(...args) {
+        downscopeTriggered.push(args);
+      },
+    }),
+  );
+  assert(downscopeCtx === null, 'prepareDispatch: downscope re-evaluates trust using handoff session');
+  const downscopeRun = getRunsForJob(downscopeChild.id, 1)[0];
+  const downscopeTrust = JSON.parse(getRun(downscopeRun.id).trust_evaluation);
+  assert(downscopeRun.status === 'error', 'prepareDispatch: downscope trust failure finishes run as error');
+  assert(downscopeTrust.effective_level === 'restricted', 'prepareDispatch: persisted trust evaluation reflects downscoped identity');
+  assert(downscopeUpdateCalls === 1, 'prepareDispatch: early trust deny still updates job state');
+  assert(downscopeTriggered.length === 0, 'prepareDispatch: security abort (trust deny) does not fire triggered children');
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentForDownscope.id, downscopeChild.id);
+  deleteJob(downscopeChild.id);
+  deleteJob(parentForDownscope.id);
+
+  const cleanupCalls = [];
+  const asyncProviderJob = createJob({
+    name: 'prepare-dispatch-async-materialize',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo async materialize',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'async-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  const asyncProvider = {
+    name: 'async-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'async-provider',
+          subject: { kind: 'service', principal: 'svc:async' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    async materialize(_session, _presentation) {
+      await Promise.resolve();
+      return {
+        materialized: true,
+        env_vars: { ASYNC_PROVIDER_TOKEN: 'token-123' },
+        cleanup_required: true,
+        cleanup_token: 'cleanup-123',
+        temp_path: '/tmp/async-provider-token',
+      };
+    },
+    async cleanup(state) {
+      cleanupCalls.push(state);
+      return { cleaned: true };
+    },
+  };
+  const asyncProviderCtx = await prepareDispatch(
+    getJob(asyncProviderJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
+    }),
+  );
+  assert(asyncProviderCtx !== null, 'prepareDispatch: async provider materialization returns dispatch context');
+  assert(asyncProviderCtx?.materializedEnv?.ASYNC_PROVIDER_TOKEN === 'token-123', 'prepareDispatch: async provider materialization awaits env vars');
+  await finalizeDispatch(
+    getJob(asyncProviderJob.id),
+    asyncProviderCtx,
+    {
+      status: 'ok',
+      summary: 'async materialize test',
+      content: '',
+      errorMessage: null,
+      runFinishFields: {},
+      deliveryOverride: null,
+      skipDelivery: true,
+      skipJobUpdate: true,
+      skipChildren: true,
+      skipDequeue: true,
+      skipAgentCleanup: true,
+      idemAction: 'noop',
+      retryFiresChildren: false,
+      earlyReturn: false,
+    },
+    {
+      finishRun,
+      updateIdempotencyResultHash() {},
+      releaseIdempotencyKey() {},
+      setAgentStatus() {},
+      handleDelivery() {},
+      shouldRetry: () => false,
+      scheduleRetry() {
+        throw new Error('scheduleRetry should not be called in async materialize test');
+      },
+      getDb,
+      updateJobAfterRun() {},
+      setDispatchStatus() {},
+      handleTriggeredChildren() {},
+      dequeueJob: () => false,
+      log() {},
+      generateEvidence,
+      persistV02Outcomes,
+    },
+  );
+  assert(cleanupCalls.length === 1, 'finalizeDispatch: async provider cleanup is invoked once');
+  assert(cleanupCalls[0].cleanup_token === 'cleanup-123', 'finalizeDispatch: provider cleanup receives materialization metadata');
+  assert(cleanupCalls[0].temp_path === '/tmp/async-provider-token', 'finalizeDispatch: provider cleanup receives cleanup path');
+  assert(cleanupCalls[0].session.subject.principal === 'svc:async', 'finalizeDispatch: provider cleanup retains session details');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(asyncProviderJob.id);
+  deleteJob(asyncProviderJob.id);
+
+  const legacyNonShellHandoffJob = createJob({
+    name: 'prepare-dispatch-legacy-nonshell-handoff',
+    schedule_cron: '0 11 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo invalid legacy handoff',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'async-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  getDb().prepare('UPDATE jobs SET session_target = ?, payload_kind = ? WHERE id = ?')
+    .run('isolated', 'agentTurn', legacyNonShellHandoffJob.id);
+  const legacyNonShellHandoffCtx = await prepareDispatch(
+    getJob(legacyNonShellHandoffJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
+    }),
+  );
+  assert(legacyNonShellHandoffCtx === null, 'prepareDispatch: non-shell credential handoff fails closed');
+  const legacyNonShellHandoffRun = getRunsForJob(legacyNonShellHandoffJob.id, 1)[0];
+  const legacyNonShellStored = getRun(legacyNonShellHandoffRun.id);
+  assert(legacyNonShellStored.status === 'error', 'prepareDispatch: non-shell credential handoff finishes run as error');
+  assert(legacyNonShellStored.error_message.includes('shell jobs'), 'prepareDispatch: non-shell credential handoff stores clear error');
+  assert(legacyNonShellStored.credential_handoff_summary !== null, 'prepareDispatch: non-shell credential handoff still persists summary');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(legacyNonShellHandoffJob.id);
+  deleteJob(legacyNonShellHandoffJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// child_credential_policy validation
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── child_credential_policy validation ──');
+{
+  // validateJobSpec accepts valid child_credential_policy values
+  const validPolicies = ['downscope', 'inherit', 'none', 'independent'];
+  for (const policy of validPolicies) {
+    let threw = false;
+    try {
+      validateJobSpec({
+        id: `test-ccp-valid-${policy}`,
+        name: `ccp valid ${policy}`,
+        schedule_cron: '0 9 * * *',
+        schedule_tz: 'UTC',
+        session_target: 'shell',
+        payload_kind: 'shellCommand',
+        payload_message: 'echo test',
+        run_timeout_ms: 30000,
+        delivery_mode: 'none',
+        origin: 'test',
+        child_credential_policy: policy,
+      }, null, 'create');
+    } catch {
+      threw = true;
+    }
+    assert(!threw, `validateJobSpec accepts child_credential_policy: '${policy}'`);
+  }
+
+  // validateJobSpec rejects invalid child_credential_policy
+  let invalidThrew = false;
+  try {
+    validateJobSpec({
+      id: 'test-ccp-invalid',
+      name: 'ccp invalid',
+      schedule_cron: '0 9 * * *',
+      schedule_tz: 'UTC',
+      session_target: 'shell',
+      payload_kind: 'shellCommand',
+      payload_message: 'echo test',
+      run_timeout_ms: 30000,
+      delivery_mode: 'none',
+      origin: 'test',
+      child_credential_policy: 'invalid',
+    }, null, 'create');
+  } catch {
+    invalidThrew = true;
+  }
+  assert(invalidThrew, 'validateJobSpec rejects invalid child_credential_policy');
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: materialization failure aborts dispatch
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Materialization failure abort ──');
+{
+  const matFailJob = createJob({
+    name: 'prepare-dispatch-mat-fail',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not run',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mat-fail-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+
+  // Provider that resolves identity ok but materialize() throws
+  const matFailProvider = {
+    name: 'mat-fail-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'mat-fail-provider',
+          subject: { kind: 'service', principal: 'svc:mat-fail' },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'secret-123' } },
+        },
+      };
+    },
+    async materialize() {
+      throw new Error('materialization exploded');
+    },
+  };
+
+  const matFailCtx = await prepareDispatch(
+    getJob(matFailJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'mat-fail-provider' ? matFailProvider : null,
+      generateIdempotencyKey: () => 'idem-mat-fail',
+    }),
+  );
+  assert(matFailCtx === null, 'prepareDispatch: materialization throw aborts dispatch when presentation declared');
+  const matFailRun = getRunsForJob(matFailJob.id, 1)[0];
+  assert(matFailRun.status === 'error', 'prepareDispatch: materialization failure run status is error');
+  assert(matFailRun.error_message.includes('materialization exploded'), 'prepareDispatch: materialization failure error message preserved');
+
+  // Provider that returns materialized=false
+  const matFalseProvider = {
+    name: 'mat-false-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'mat-false-provider',
+          subject: { kind: 'service', principal: 'svc:mat-false' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    materialize() {
+      return { materialized: false };
+    },
+  };
+
+  const matFalseJob = createJob({
+    name: 'prepare-dispatch-mat-false',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not run either',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mat-false-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+
+  const matFalseCtx = await prepareDispatch(
+    getJob(matFalseJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'mat-false-provider' ? matFalseProvider : null,
+      generateIdempotencyKey: () => 'idem-mat-false',
+    }),
+  );
+  assert(matFalseCtx === null, 'prepareDispatch: materialized=false aborts dispatch when presentation declared');
+  const matFalseRun = getRunsForJob(matFalseJob.id, 1)[0];
+  assert(matFalseRun.status === 'error', 'prepareDispatch: materialized=false run status is error');
+  assert(matFalseRun.error_message.includes('materialized=false'), 'prepareDispatch: materialized=false error message preserved');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(matFailJob.id, matFalseJob.id);
+  deleteJob(matFailJob.id);
+  deleteJob(matFalseJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: downscope happy path with real parent run
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Downscope happy path ──');
+{
+  const dsHappyProvider = {
+    name: 'ds-happy-provider',
+    type: 'identity',
+    resolveSession(request) {
+      const scope = request.scope || 'full';
+      return {
+        ok: true,
+        session: {
+          provider: 'ds-happy-provider',
+          subject: { kind: 'service', principal: `svc:${scope}` },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'secret' } },
+        },
+      };
+    },
+    prepareHandoff(parentSession, handoff) {
+      return {
+        prepared: true,
+        session: {
+          ...parentSession,
+          subject: { kind: 'service', principal: `svc:downscoped-${handoff.target_scope}` },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'downscoped-secret' } },
+        },
+      };
+    },
+    describeSession(session) {
+      const copy = JSON.parse(JSON.stringify(session));
+      if (copy.credentials?.token?.value) copy.credentials.token.value = '[REDACTED]';
+      return copy;
+    },
+  };
+
+  // Create parent with a completed run that has identity_resolved
+  const dsParent = createJob({
+    name: 'ds-happy-parent',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'ds-happy-provider', scope: 'full' }),
+  });
+  const parentRun = createRun(dsParent.id, { run_timeout_ms: 300_000 });
+  finishRun(parentRun.id, 'ok', { summary: 'parent completed' });
+  // Persist identity_resolved on the parent run (simulating what dispatch would do)
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: {
+      provider: 'ds-happy-provider',
+      session: {
+        provider: 'ds-happy-provider',
+        subject: { kind: 'service', principal: 'svc:full' },
+        trust: { effective_level: 'supervised' },
+        credentials: { token: { value: 'parent-secret' } },
+      },
+      source: 'provider',
+    },
+  });
+
+  const dsChild = createJob({
+    name: 'ds-happy-child',
+    parent_id: dsParent.id,
+    trigger_on: 'success',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ provider: 'ds-happy-provider', scope: 'payments' }),
+    child_credential_policy: 'downscope',
+  });
+
+  const dsCtx = await prepareDispatch(
+    getJob(dsChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'ds-happy-provider' ? dsHappyProvider : null,
+      generateIdempotencyKey: () => 'idem-ds-happy',
+    }),
+  );
+  assert(dsCtx !== null, 'prepareDispatch: downscope happy path succeeds');
+  assert(dsCtx.v02Outcomes.identity_resolved.principal === 'svc:downscoped-payments', 'prepareDispatch: downscope overrides identity with handoff session');
+  assert(dsCtx.v02Outcomes.identity_resolved.source === 'provider', 'prepareDispatch: downscope identity source is provider');
+
+  // Verify credentials are redacted in persisted outcomes
+  const dsRun = dsCtx.run;
+  persistV02Outcomes(dsRun.id, redactOutcomesForPersistence(dsCtx.v02Outcomes, {
+    getIdentityProvider: (name) => name === 'ds-happy-provider' ? dsHappyProvider : null,
+  }));
+  const persistedRun = getRun(dsRun.id);
+  const persistedIdentity = JSON.parse(persistedRun.identity_resolved);
+  assert(persistedIdentity.session.credentials.token.value === '[REDACTED]', 'prepareDispatch: downscope persisted credentials are redacted');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(dsParent.id, dsChild.id);
+  deleteJob(dsChild.id);
+  deleteJob(dsParent.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: downscope fails closed when parent session unavailable
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Downscope fail-closed ──');
+{
+  const dsFailProvider = {
+    name: 'ds-fail-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'ds-fail-provider',
+          subject: { kind: 'service', principal: 'svc:ds-fail' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    prepareHandoff() {
+      return { prepared: false, error: 'no parent session available' };
+    },
+  };
+
+  const dsFailParent = createJob({
+    name: 'ds-fail-parent',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'ds-fail-provider', scope: 'full' }),
+  });
+  // No parent run created -- parent session is unavailable
+
+  const dsFailChild = createJob({
+    name: 'ds-fail-child',
+    parent_id: dsFailParent.id,
+    trigger_on: 'success',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ provider: 'ds-fail-provider', scope: 'payments' }),
+    child_credential_policy: 'downscope',
+  });
+
+  const dsFailCtx = await prepareDispatch(
+    getJob(dsFailChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'ds-fail-provider' ? dsFailProvider : null,
+      generateIdempotencyKey: () => 'idem-ds-fail',
+    }),
+  );
+  assert(dsFailCtx === null, 'prepareDispatch: downscope fails closed when parent session unavailable');
+  const dsFailRun = getRunsForJob(dsFailChild.id, 1)[0];
+  assert(dsFailRun.status === 'error', 'prepareDispatch: downscope fail-closed run status is error');
+  assert(dsFailRun.error_message.includes('Downscope credential policy failed'), 'prepareDispatch: downscope fail-closed error message');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(dsFailParent.id, dsFailChild.id);
+  deleteJob(dsFailChild.id);
+  deleteJob(dsFailParent.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: escalate decision aborts dispatch
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Authorization escalate abort ──');
+{
+  const escalateJob = createJob({
+    name: 'prepare-dispatch-escalate',
+    schedule_cron: '0 11 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo escalate',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:escalate-test', trust_level: 'supervised' }),
+    authorization: JSON.stringify({ decision: 'escalate', reason: 'human review required' }),
+  });
+
+  const escalateCtx = await prepareDispatch(
+    getJob(escalateJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      generateIdempotencyKey: () => 'idem-escalate',
+    }),
+  );
+  assert(escalateCtx === null, 'prepareDispatch: escalate decision aborts dispatch');
+  const escalateRun = getRunsForJob(escalateJob.id, 1)[0];
+  assert(escalateRun.status === 'error', 'prepareDispatch: escalate run status is error');
+  assert(escalateRun.error_message.includes('escalation'), 'prepareDispatch: escalate error mentions escalation');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(escalateJob.id);
+  deleteJob(escalateJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: credential redaction in persisted outcomes
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Credential redaction ──');
+{
+  const redactJob = createJob({
+    name: 'prepare-dispatch-redact',
+    schedule_cron: '0 12 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo redact',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'redact-provider', scope: 'full' }),
+  });
+
+  const redactProvider = {
+    name: 'redact-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'redact-provider',
+          subject: { kind: 'service', principal: 'svc:redact' },
+          trust: { effective_level: 'supervised' },
+          credentials: { api_key: { kind: 'bearer', value: 'sk_live_SHOULD_NOT_PERSIST' } },
+        },
+      };
+    },
+    describeSession(session) {
+      const copy = JSON.parse(JSON.stringify(session));
+      if (copy.credentials?.api_key?.value) copy.credentials.api_key.value = '[REDACTED]';
+      return copy;
+    },
+  };
+
+  const redactCtx = await prepareDispatch(
+    getJob(redactJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'redact-provider' ? redactProvider : null,
+      generateIdempotencyKey: () => 'idem-redact',
+    }),
+  );
+  assert(redactCtx !== null, 'prepareDispatch: redact test context created');
+
+  // Simulate what finalizeDispatch does: redact then persist
+  const redactedOutcomes = redactOutcomesForPersistence(redactCtx.v02Outcomes, {
+    getIdentityProvider: (name) => name === 'redact-provider' ? redactProvider : null,
+  });
+  persistV02Outcomes(redactCtx.run.id, redactedOutcomes);
+
+  const persistedRedactRun = getRun(redactCtx.run.id);
+  const persistedRedactIdentity = JSON.parse(persistedRedactRun.identity_resolved);
+  assert(persistedRedactIdentity.session.credentials.api_key.value === '[REDACTED]', 'credential redaction: live token replaced with [REDACTED]');
+  assert(!JSON.stringify(persistedRedactIdentity).includes('sk_live_SHOULD_NOT_PERSIST'), 'credential redaction: raw token not present in persisted data');
+
+  // Also test redaction without describeSession (falls back to credential stripping)
+  const noDescribeProvider = {
+    name: 'no-describe-provider',
+    type: 'identity',
+  };
+  const outcomesWithCreds = {
+    identity_resolved: {
+      provider: 'no-describe-provider',
+      session: {
+        credentials: { secret: { value: 'raw-secret' } },
+      },
+      source: 'provider',
+    },
+  };
+  const strippedOutcomes = redactOutcomesForPersistence(outcomesWithCreds, {
+    getIdentityProvider: (name) => name === 'no-describe-provider' ? noDescribeProvider : null,
+  });
+  assert(strippedOutcomes.identity_resolved.session.credentials === undefined, 'credential redaction: fallback strips credentials key when no describeSession');
+
+  const throwsDescribeProvider = {
+    name: 'throws-describe-provider',
+    type: 'identity',
+    describeSession() {
+      throw new Error('redaction exploded');
+    },
+  };
+  const fallbackAfterThrow = redactOutcomesForPersistence({
+    identity_resolved: {
+      provider: 'throws-describe-provider',
+      session: {
+        credentials: { secret: { value: 'raw-secret' } },
+      },
+      source: 'provider',
+    },
+  }, {
+    getIdentityProvider: (name) => name === 'throws-describe-provider' ? throwsDescribeProvider : null,
+  });
+  assert(fallbackAfterThrow.identity_resolved.session.credentials === undefined, 'credential redaction: describeSession throw falls back to stripping credentials');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(redactJob.id);
+  deleteJob(redactJob.id);
+}
+
+// ── compareTrustLevels ──
+
+console.log('\n── compareTrustLevels ──');
+{
+  assert(compareTrustLevels('untrusted', 'autonomous') === -1, 'compareTrustLevels: untrusted < autonomous');
+  assert(compareTrustLevels('autonomous', 'untrusted') === 1, 'compareTrustLevels: autonomous > untrusted');
+  assert(compareTrustLevels('supervised', 'supervised') === 0, 'compareTrustLevels: equal levels return 0');
+  assert(compareTrustLevels(null, null) === 0, 'compareTrustLevels: both null returns 0');
+  assert(compareTrustLevels('restricted', 'supervised') === -1, 'compareTrustLevels: restricted < supervised');
+  assert(compareTrustLevels('unknown', 'untrusted') === -1, 'compareTrustLevels: unrecognized < known');
+}
+
+// ── authorization_ref-only denial ──
+
+console.log('\n── authorization_ref-only denial ──');
+{
+  const refOnlyResult = await evaluateAuthorization(
+    { authorization: null, authorization_ref: 'arn:aws:iam::123456789012:policy/Deny' },
+    null,
+    null,
+    {},
+  );
+  assert(refOnlyResult.decision === 'deny', 'authorization_ref-only: decision is deny');
+  assert(refOnlyResult.reason.includes('not yet implemented'), 'authorization_ref-only: reason mentions not implemented');
+}
+
+// ── independent child trust cap ──
+
+console.log('\n── independent child trust cap ──');
+{
+  const parentJob = createJob({
+    name: 'trust-cap-parent',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'test-provider' }),
+    child_credential_policy: 'independent',
+  });
+  const parentRun = createRun(parentJob.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: {
+      provider: 'test-provider',
+      session: {
+        subject: { kind: 'agent', principal: 'agent:parent' },
+        trust: { effective_level: 'supervised' },
+        credentials: {},
+      },
+      source: 'provider',
+    },
+  });
+  finishRun(parentRun.id, 'ok', { summary: 'parent ok' });
+
+  const childJob = createJob({
+    name: 'trust-cap-child',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: parentJob.id,
+    trigger_on: 'success',
+    child_credential_policy: 'independent',
+    identity_trust_level: 'autonomous',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:escalating-child',
+  });
+
+  const childCtx = await prepareDispatch(
+    getJob(childJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(childCtx === null, 'independent trust cap: child with higher trust than parent is aborted');
+  const childRun = getRunsForJob(childJob.id, 1)[0];
+  assert(childRun.status === 'error', 'independent trust cap: run finishes as error');
+  assert(childRun.error_message.includes('exceeds parent trust level'), 'independent trust cap: error mentions trust escalation');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentJob.id, childJob.id);
+  deleteJob(childJob.id);
+  deleteJob(parentJob.id);
+}
+
+// ── independent child within trust cap passes ──
+
+console.log('\n── independent child within trust cap passes ──');
+{
+  const parentJobOk = createJob({
+    name: 'trust-cap-parent-ok',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'test-provider' }),
+    child_credential_policy: 'independent',
+  });
+  const parentRunOk = createRun(parentJobOk.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRunOk.id, {
+    identity_resolved: {
+      provider: 'test-provider',
+      session: {
+        subject: { kind: 'agent', principal: 'agent:parent-ok' },
+        trust: { effective_level: 'autonomous' },
+        credentials: {},
+      },
+      source: 'provider',
+    },
+  });
+  finishRun(parentRunOk.id, 'ok', { summary: 'parent ok' });
+
+  const childJobOk = createJob({
+    name: 'trust-cap-child-ok',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child ok',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: parentJobOk.id,
+    trigger_on: 'success',
+    child_credential_policy: 'independent',
+    identity_trust_level: 'supervised',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:ok-child',
+  });
+
+  const childCtxOk = await prepareDispatch(
+    getJob(childJobOk.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(childCtxOk !== null, 'independent trust cap: child within parent trust level proceeds');
+  if (childCtxOk) finishRun(childCtxOk.run.id, 'cancelled', { summary: 'test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentJobOk.id, childJobOk.id);
+  deleteJob(childJobOk.id);
+  deleteJob(parentJobOk.id);
+}
+
+// ── downscope trust elevation detection ──
+
+console.log('\n── downscope trust elevation detection ──');
+{
+  // Create a provider that returns a session with HIGHER trust than parent
+  const elevatingProvider = {
+    name: 'elevating-provider',
+    type: 'identity',
+    resolveSession() {
+      return { ok: true, session: { subject: { kind: 'agent', principal: 'agent:child' }, trust: { effective_level: 'supervised' }, credentials: {} } };
+    },
+    prepareHandoff(_parentSession, _opts) {
+      // Return a session that elevates trust from supervised to autonomous
+      return {
+        prepared: true,
+        session: {
+          subject: { kind: 'agent', principal: 'agent:elevated' },
+          trust: { effective_level: 'autonomous' },
+          credentials: {},
+        },
+      };
+    },
+  };
+
+  const dsParent = createJob({
+    name: 'ds-elevate-parent',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'elevating-provider' }),
+    child_credential_policy: 'downscope',
+  });
+
+  // Create a parent run with an identity_resolved so downscope can read it
+  const parentRun = createRun(dsParent.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: JSON.stringify({
+      provider: 'elevating-provider',
+      session: { subject: { kind: 'agent', principal: 'agent:parent' }, trust: { effective_level: 'supervised' }, credentials: {} },
+      source: 'provider',
+    }),
+  });
+  finishRun(parentRun.id, 'ok', { summary: 'parent ok' });
+
+  const dsChild = createJob({
+    name: 'ds-elevate-child',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: dsParent.id,
+    trigger_on: 'success',
+    child_credential_policy: 'downscope',
+    identity: JSON.stringify({ provider: 'elevating-provider', scope: 'narrow' }),
+  });
+
+  const dsChildCtx = await prepareDispatch(
+    getJob(dsChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'elevating-provider' ? elevatingProvider : null,
+    }),
+  );
+  assert(dsChildCtx === null, 'downscope elevation: child with elevated trust from handoff is aborted');
+  const dsChildRun = getRunsForJob(dsChild.id, 1)[0];
+  assert(dsChildRun.status === 'error', 'downscope elevation: run finishes as error');
+  assert(dsChildRun.error_message.includes('Downscope credential policy failed'), 'downscope elevation: error mentions downscope failure');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(dsChild.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(dsParent.id);
+  deleteJob(dsChild.id);
+  deleteJob(dsParent.id);
+}
+
+// ── malformed identity JSON on non-shell job does not masquerade as handoff ──
+
+console.log('\n── malformed identity JSON on non-shell job ──');
+{
+  const malformedIdentityJob = createJob({
+    name: 'malformed-identity-nonshell',
+    schedule_cron: '0 8 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo malformed identity',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:test' }),
+  });
+  getDb().prepare('UPDATE jobs SET session_target = ?, payload_kind = ?, identity = ? WHERE id = ?')
+    .run('isolated', 'agentTurn', 'not-json', malformedIdentityJob.id);
+
+  const malformedIdentityCtx = await prepareDispatch(
+    getJob(malformedIdentityJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(malformedIdentityCtx !== null, 'prepareDispatch: malformed identity JSON on non-shell job no longer triggers handoff-only abort');
+  assert(malformedIdentityCtx.v02Outcomes.credential_handoff_summary.error.includes('parse failed'), 'prepareDispatch: malformed identity JSON preserves handoff parse error details');
+
+  if (malformedIdentityCtx) finishRun(malformedIdentityCtx.run.id, 'cancelled', { summary: 'test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(malformedIdentityJob.id);
+  deleteJob(malformedIdentityJob.id);
+}
+
+// ── security abort skips triggered children ──
+
+console.log('\n── security abort skips triggered children ──');
+{
+  let childrenFired = false;
+  const secAbortJob = createJob({
+    name: 'sec-abort-no-children',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not dispatch',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'missing-sec-provider', scope: 'full' }),
+    authorization: JSON.stringify({ requires_identity: true }),
+  });
+
+  await prepareDispatch(
+    getJob(secAbortJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      handleTriggeredChildren() { childrenFired = true; },
+    }),
+  );
+  assert(!childrenFired, 'security abort: handleTriggeredChildren not called on identity resolution failure');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(secAbortJob.id);
+  deleteJob(secAbortJob.id);
+}
+
+// ── evidence integrity field ──
+
+console.log('\n── evidence integrity field ──');
+{
+  const evidence = generateEvidence(
+    { evidence: JSON.stringify({ collect: 'all' }) },
+    { id: 'run-123', status: 'ok' },
+    { identity_resolved: { principal: 'test' } },
+  );
+  assert(evidence !== null, 'evidence: generated from valid job');
+  assert(evidence.integrity === 'none', 'evidence: integrity field is "none"');
+  assert(evidence.hash === null, 'evidence: hash is null');
+}
+
+// ── persistV02Outcomes guards ──
+
+console.log('\n── persistV02Outcomes guards ──');
+{
+  // Null runId should no-op
+  persistV02Outcomes(null, { identity_resolved: 'test' });
+  persistV02Outcomes('', { identity_resolved: 'test' });
+  persistV02Outcomes(undefined, { identity_resolved: 'test' });
+  // If we got here without throwing, the guard works
+  assert(true, 'persistV02Outcomes: null/empty/undefined runId no-ops safely');
+}
+
+// ── getStaleRuns type guard ──
+
+console.log('\n── getStaleRuns type guard ──');
+{
+  let threwOnString = false;
+  try {
+    getStaleRuns('not-a-number');
+  } catch (e) {
+    threwOnString = e.message.includes('non-negative integer');
+  }
+  assert(threwOnString, 'getStaleRuns: rejects non-integer string');
+
+  let threwOnNegative = false;
+  try {
+    getStaleRuns(-1);
+  } catch (e) {
+    threwOnNegative = e.message.includes('non-negative integer');
+  }
+  assert(threwOnNegative, 'getStaleRuns: rejects negative integer');
+
+  let threwOnFloat = false;
+  try {
+    getStaleRuns(1.5);
+  } catch (e) {
+    threwOnFloat = e.message.includes('non-negative integer');
+  }
+  assert(threwOnFloat, 'getStaleRuns: rejects non-integer float');
+
+  // Valid call should not throw
+  const staleRuns = getStaleRuns(90);
+  assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
 }
 
 closeDb();

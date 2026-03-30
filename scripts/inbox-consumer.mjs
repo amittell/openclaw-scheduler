@@ -183,7 +183,11 @@ try {
   }
 
   process.stdout.write(`[inbox-consumer] watching ${join(watchDir, walFile)}\n`);
-  await drainOnce(db, { to: deliveryTo, channel, agentId, limit });
+  try {
+    await drainOnce(db, { to: deliveryTo, channel, agentId, limit });
+  } catch (err) {
+    process.stderr.write(`[inbox-consumer] initial drain error: ${err.message}\n`);
+  }
 
   let timer = null;
   let draining = false;

@@ -4,7 +4,7 @@
 import {
   db, jobs, runs, messages, approvals, agents, dispatchQueue, gateway,
   paths, promptContext, retrieval, shellResults, idempotency, taskTracker, teamAdapter,
-  SCHEDULER_SCHEMAS,
+  SCHEDULER_SCHEMAS, v02Runtime,
   type JobSpec, type JobRecord, type RunRecord, type MessageRecord,
   type ApprovalRecord, type AgentRecord, type DispatchRecord,
   type ShellResult, type PartialShellResult,
@@ -15,6 +15,8 @@ import {
   type AgentTurnResult, type DeliveryResult, type SqliteRunResult,
   type TaskGroupOpts, type TaskGroupResult, type TaskGroupStatus,
   type TeamTaskGateOpts,
+  type ResolvedIdentity, type TrustEvaluation, type AuthorizationProofResult,
+  type AuthorizationResult, type EvidenceResult, type CredentialHandoffSummary,
 } from './index.js';
 
 // ---- db ----
@@ -328,6 +330,90 @@ void gate.team_id; void gate.task_id; void gate.gate_status; void gate.tracker_i
 const gatesResult = teamAdapter.checkTeamTaskGates(10);
 void gatesResult.passed; void gatesResult.failed; void gatesResult.pending;
 const ackResult: Record<string, unknown> | null = teamAdapter.ackTeamMessage('msg-1', 'operator', 'ok');
+
+// ---- v0.2 Identity fields on JobSpec ----
+const v02Spec: JobSpec = {
+  name: 'v02 smoke',
+  payload_message: 'echo v02',
+  run_timeout_ms: 300000,
+  identity_principal: 'agent:ops-runner',
+  identity_run_as: 'service:deployer',
+  identity_subject_kind: 'agent',
+  identity_trust_level: 'supervised',
+  identity_delegation_mode: 'on-behalf-of',
+  identity: '{"subject_kind":"agent","principal":"agent:ops-runner"}',
+  authorization_proof_ref: 'proof-ref-1',
+  authorization_proof: '{"method":"signed-jwt","token":"..."}',
+  authorization_ref: 'authz-ref-1',
+  authorization: '{"decision":"permit"}',
+  evidence_ref: 'ev-ref-1',
+  evidence: '{"collect":["logs","metrics"]}',
+  contract_required_trust_level: 'supervised',
+  contract_trust_enforcement: 'advisory',
+  contract_sandbox: '{"isolation":"container"}',
+  contract_allowed_paths: '["/tmp"]',
+  contract_network: '{"egress":"deny"}',
+  contract_max_cost_usd: 1.50,
+  contract_audit: '{"level":"full"}',
+  child_credential_policy: 'downscope',
+};
+void v02Spec;
+
+// ---- v0.2 Outcome fields on RunRecord ----
+const v02Run: Partial<RunRecord> = {
+  identity_resolved: '{"subject_kind":"agent"}',
+  trust_evaluation: '{"decision":"permit"}',
+  authorization_decision: '{"decision":"permit"}',
+  authorization_proof_verification: '{"verified":true}',
+  evidence_record: '{"evidence_ref":"ev-1"}',
+  credential_handoff_summary: '{"mode":"inject"}',
+};
+void v02Run;
+
+// ---- v0.2 Outcome fields on FinishRunOpts ----
+const v02Finish: FinishRunOpts = {
+  summary: 'done',
+  identity_resolved: { subject_kind: 'agent' },
+  trust_evaluation: '{"decision":"permit"}',
+  authorization_decision: { decision: 'permit' },
+  authorization_proof_verification: null,
+  evidence_record: '{"evidence_ref":"ev-1"}',
+  credential_handoff_summary: { mode: 'inject', bindings_count: 2, cleanup_required: false },
+};
+void v02Finish;
+
+// ---- v0.2 Runtime module ----
+void v02Runtime.TRUST_LEVELS;
+const identityP: Promise<ResolvedIdentity | null> = v02Runtime.resolveIdentity({ identity_principal: 'test' });
+const identity: ResolvedIdentity | null = null as unknown as Awaited<typeof identityP>;
+if (identity) {
+  void identity.provider;
+  void identity.session;
+  void identity.source;
+  void identity.subject_kind;
+  void identity.principal;
+  void identity.trust_level;
+  void identity.delegation_mode;
+  void identity.raw;
+  void identity.transient;
+  void identity.error;
+}
+const trust: TrustEvaluation = v02Runtime.evaluateTrust({}, identity);
+void trust.effective_level; void trust.required_level; void trust.decision; void trust.reason;
+
+const proofResultP: Promise<AuthorizationProofResult | null> = v02Runtime.verifyAuthorizationProof({});
+const proofResult: AuthorizationProofResult | null = null as unknown as Awaited<typeof proofResultP>;
+if (proofResult) { void proofResult.verified; void proofResult.method; void proofResult.ref; void proofResult.source; void proofResult.provider; }
+
+const authResultP: Promise<AuthorizationResult | null> = v02Runtime.evaluateAuthorization({}, identity, trust);
+const authResult: AuthorizationResult | null = null as unknown as Awaited<typeof authResultP>;
+if (authResult) { void authResult.decision; void authResult.reason; void authResult.ref; void authResult.source; void authResult.provider; }
+
+const evidenceResult: EvidenceResult | null = v02Runtime.generateEvidence({}, null, null);
+if (evidenceResult) { void evidenceResult.evidence_ref; void evidenceResult.created_at; void evidenceResult.hash; void evidenceResult.payload_summary; }
+
+const handoff: CredentialHandoffSummary | null = v02Runtime.summarizeCredentialHandoff({});
+if (handoff) { void handoff.mode; void handoff.bindings_count; void handoff.cleanup_required; }
 
 // Suppress unused variable warnings
 void created; void fetched; void listed; void updated;
