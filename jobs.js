@@ -409,6 +409,18 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     new Set(['none', 'on-behalf-of', 'impersonation']),
     { nullable: true });
   assertJsonBlob('identity', merged.identity);
+  if (merged.identity) {
+    const identityBlob = JSON.parse(merged.identity);
+    const presentation = identityBlob && typeof identityBlob === 'object' && !Array.isArray(identityBlob)
+      ? (identityBlob.presentation || identityBlob.credential_handoff || null)
+      : null;
+    if (presentation && typeof presentation === 'object' && !Array.isArray(presentation)) {
+      const finalTarget = merged.session_target || 'isolated';
+      if (finalTarget !== 'shell') {
+        throw new Error('identity presentation / credential_handoff is only supported for session_target "shell"');
+      }
+    }
+  }
 
   // --- v0.2 Authorization Proof ---
   assertSafeString('authorization_proof_ref', merged.authorization_proof_ref, { maxLength: 256 });

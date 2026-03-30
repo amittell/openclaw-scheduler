@@ -7107,6 +7107,47 @@ console.log('\n── v0.2 Validation: invalid enum rejected ──');
   assert(threwInvalidEnforcement, 'createJob rejects invalid contract_trust_enforcement enum');
 }
 
+console.log('\n── v0.2 Validation: credential handoff target guard ──');
+{
+  let threwNonShellPresentation = false;
+  try {
+    createJob({
+      name: 'v02-handoff-isolated',
+      schedule_cron: '0 5 * * *',
+      payload_message: 'bad target',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: JSON.stringify({
+        provider: 'mock-provider',
+        presentation: { mode: 'inject-env' },
+      }),
+    });
+  } catch (e) {
+    threwNonShellPresentation = e.message.includes('session_target "shell"');
+  }
+  assert(threwNonShellPresentation, 'createJob rejects credential handoff on non-shell jobs');
+
+  const shellHandoffJob = createJob({
+    name: 'v02-handoff-shell',
+    schedule_cron: '0 5 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo handoff',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mock-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  assert(shellHandoffJob.session_target === 'shell', 'createJob allows credential handoff on shell jobs');
+  deleteJob(shellHandoffJob.id);
+}
+
 console.log('\n── v0.2 Validation: invalid JSON blob rejected ──');
 {
   let threwBadIdentityJson = false;
@@ -7318,6 +7359,8 @@ console.log('\n── v0.2 Storage Round-Trip ──');
   const rtJob = createJob({
     name: 'v02-roundtrip',
     schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
     payload_message: 'roundtrip test',
     delivery_mode: 'none',
     delivery_opt_out_reason: 'test',
@@ -8383,6 +8426,39 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   assert(cleanupCalls[0].session.subject.principal === 'svc:async', 'finalizeDispatch: provider cleanup retains session details');
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(asyncProviderJob.id);
   deleteJob(asyncProviderJob.id);
+
+  const legacyNonShellHandoffJob = createJob({
+    name: 'prepare-dispatch-legacy-nonshell-handoff',
+    schedule_cron: '0 11 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo invalid legacy handoff',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'async-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  getDb().prepare('UPDATE jobs SET session_target = ?, payload_kind = ? WHERE id = ?')
+    .run('isolated', 'agentTurn', legacyNonShellHandoffJob.id);
+  const legacyNonShellHandoffCtx = await prepareDispatch(
+    getJob(legacyNonShellHandoffJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
+    }),
+  );
+  assert(legacyNonShellHandoffCtx === null, 'prepareDispatch: non-shell credential handoff fails closed');
+  const legacyNonShellHandoffRun = getRunsForJob(legacyNonShellHandoffJob.id, 1)[0];
+  const legacyNonShellStored = getRun(legacyNonShellHandoffRun.id);
+  assert(legacyNonShellStored.status === 'error', 'prepareDispatch: non-shell credential handoff finishes run as error');
+  assert(legacyNonShellStored.error_message.includes('shell jobs'), 'prepareDispatch: non-shell credential handoff stores clear error');
+  assert(legacyNonShellStored.credential_handoff_summary !== null, 'prepareDispatch: non-shell credential handoff still persists summary');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(legacyNonShellHandoffJob.id);
+  deleteJob(legacyNonShellHandoffJob.id);
 }
 
 // ═══════════════════════════════════════════════════════════

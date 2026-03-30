@@ -447,6 +447,17 @@ export async function prepareDispatch(job, opts, deps) {
     if (handoff) v02Outcomes.credential_handoff_summary = handoff;
   }
 
+  if (v02Outcomes.credential_handoff_summary && job.session_target !== 'shell') {
+    return abortPreparedRun(
+      job,
+      run,
+      'Credential handoff presentation is only supported for shell jobs',
+      v02Outcomes,
+      { dispatchRecord, idemKey },
+      deps,
+    );
+  }
+
   // Child credential policy enforcement.
   // Apply this BEFORE trust/auth evaluation so later gates see the effective
   // identity that will actually be materialized for the run. The policy can
