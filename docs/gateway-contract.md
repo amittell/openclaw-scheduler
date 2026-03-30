@@ -543,6 +543,27 @@ directly as the `x-openclaw-auth-profile` header value without resolution.
 
 ---
 
+## Trust Architecture
+
+For the full trust architecture -- including what the scheduler/child
+boundary guarantees vs. what it does not, the credential flow from operator
+to child, and the distinction between security boundaries and operational
+boundaries -- see `docs/trust-architecture.md`.
+
+The gateway contract intersects with the trust architecture at these points:
+
+- **Session isolation:** isolated sessions cannot access the main session's
+  memory or history. This provides context isolation between parent and child
+  tasks.
+- **Auth-profile forwarding:** the scheduler can direct the gateway to use a
+  specific credential profile for agent tasks (see "Auth-Profile Forwarding"
+  above).
+- **Credential materialization:** for shell tasks, credentials are injected as
+  environment variables by the identity provider. For agent tasks, credential
+  scoping currently depends on the gateway having a matching auth profile.
+
+---
+
 ## Local Provider Plugins
 
 ### Dispatch-Time Authorization Evaluation
@@ -574,6 +595,9 @@ This is a high-trust boundary:
   `identity.presentation` or `credential_handoff` must use
   `session_target: "shell"`; non-shell jobs fail closed at validation/dispatch
   time.
+
+For the broader trust architecture that frames this provider trust boundary
+within the scheduler/child execution model, see `docs/trust-architecture.md`.
 
 Reference:
 - `dispatcher.js` lines 818-819
