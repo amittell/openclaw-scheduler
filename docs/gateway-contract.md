@@ -556,6 +556,10 @@ This is a high-trust boundary:
 - If a job explicitly references a provider or verifier and that plugin is not
   loaded, the v0.2 runtime fails closed instead of falling back to structural
   checks.
+- Credential handoff materialization is currently shell-only. Jobs that declare
+  `identity.presentation` or `credential_handoff` must use
+  `session_target: "shell"`; non-shell jobs fail closed at validation/dispatch
+  time.
 
 Reference:
 - `dispatcher.js` lines 818-819
