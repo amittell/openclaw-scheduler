@@ -592,6 +592,9 @@ async function cmdEnqueue(flags) {
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
 
+  // ── Verify command flag ───────────────────────────────────
+  const verifyCmd       = flags['verify-cmd'] || null;
+
   // ── Watchdog monitoring flags ─────────────────────────────
   const noMonitorRaw    = flags['no-monitor'];
   const noMonitor       = !!noMonitorRaw;
@@ -760,6 +763,7 @@ async function cmdEnqueue(flags) {
       deliverTo:      deliverTo || null,
       deliverChannel: deliverChannel || null,
       deliveryMode:   deliverMode || null,
+      verifyCmd:      verifyCmd || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
       // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.
@@ -1753,6 +1757,7 @@ Subcommands:
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
            (--deliver-to defaults to origin chat ID when --origin is "telegram:<id>")
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
+           [--verify-cmd <shell_cmd>]
 
   status   --label <l>
 
