@@ -38,7 +38,13 @@ import {
   ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
-import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH, buildEnvInjectHeader } from './gateway.js';
+import {
+  splitMessageForChannel,
+  TELEGRAM_MAX_MESSAGE_LENGTH,
+  buildEnvInjectHeader,
+  runAgentTurn,
+  runAgentTurnWithActivityTimeout,
+} from './gateway.js';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
 import {
@@ -9349,6 +9355,77 @@ console.log('\n── buildEnvInjectHeader ──');
   // Non-plain object (prototype not Object.prototype) -> no header
   const dateInput = buildEnvInjectHeader(new Date());
   assert(Object.keys(dateInput).length === 0, 'buildEnvInjectHeader: Date instance returns no header');
+
+  // Hidden toJSON hooks should not alter the serialized payload
+  const hiddenToJson = { STRIPE_KEY: 'sk_clean' };
+  Object.defineProperty(hiddenToJson, 'toJSON', {
+    value: () => ({ STRIPE_KEY: 'sk_mutated', EXTRA: 'should-not-appear' }),
+  });
+  const hiddenSerialized = buildEnvInjectHeader(hiddenToJson);
+  const hiddenParsed = JSON.parse(hiddenSerialized['x-openclaw-env-inject']);
+  assert(hiddenParsed.STRIPE_KEY === 'sk_clean', 'buildEnvInjectHeader: ignores hidden toJSON overrides');
+  assert(hiddenParsed.EXTRA === undefined, 'buildEnvInjectHeader: serializes only validated env entries');
+}
+
+// ── Gateway env-inject request path ──
+
+console.log('\n── Gateway env-inject request path ──');
+{
+  const originalFetch = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    captured.push({ url, opts });
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ok' } }],
+        usage: { total_tokens: 1 },
+      }),
+      headers: new Headers({ 'x-openclaw-session-key': 'session-from-gateway' }),
+    };
+  };
+
+  try {
+    await runAgentTurn({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-1',
+      materializedEnv: { STRIPE_KEY: 'sk_test_123' },
+      timeoutMs: 1000,
+    });
+    assert(
+      captured[0]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ STRIPE_KEY: 'sk_test_123' }),
+      'runAgentTurn: forwards x-openclaw-env-inject for valid env maps',
+    );
+
+    await runAgentTurn({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-2',
+      materializedEnv: {},
+      timeoutMs: 1000,
+    });
+    assert(
+      captured[1]?.opts?.headers?.['x-openclaw-env-inject'] === undefined,
+      'runAgentTurn: omits x-openclaw-env-inject for empty env maps',
+    );
+
+    await runAgentTurnWithActivityTimeout({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-3',
+      materializedEnv: { NODE_ENV: 'production' },
+      pollIntervalMs: 60_000,
+      idleTimeoutMs: 60_000,
+      absoluteTimeoutMs: 1_000,
+    });
+    assert(
+      captured[2]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ NODE_ENV: 'production' }),
+      'runAgentTurnWithActivityTimeout: forwards x-openclaw-env-inject for valid env maps',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 closeDb();

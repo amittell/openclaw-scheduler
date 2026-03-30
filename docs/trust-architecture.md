@@ -179,9 +179,12 @@ would exceed the parent's, dispatch is aborted.
 ### 5. Child receives scoped credentials
 
 For shell tasks, credentials are injected as environment variables via
-`provider.materialize()`. For agent tasks, auth-profile forwarding
-directs the gateway to use the appropriate profile. The child never sees
-the master key.
+`provider.materialize()`. For agent tasks, the scheduler either forwards a
+resolved auth profile or, when materialization yields env vars, sends an
+`x-openclaw-env-inject` header that the gateway can apply to the child
+session. Gateway receiver support is still required for env injection, so
+profile forwarding remains the compatibility path until that support is
+present. The child never sees the master key.
 
 ### 6. Cleanup
 
