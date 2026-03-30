@@ -60,9 +60,18 @@ export function buildEnvInjectHeader(materializedEnv) {
 /**
  * Run an agent turn via the OpenAI-compatible chat completions endpoint.
  * Returns the full response including the assistant message.
- * 
+ *
  * This is the primary dispatch mechanism for isolated jobs.
  * Each call gets its own session (or use sessionKey for continuity).
+ *
+ * @param {object} opts
+ * @param {string} opts.message - The user message to send.
+ * @param {string} [opts.agentId='main'] - Agent ID.
+ * @param {string} [opts.sessionKey] - Session key for continuity.
+ * @param {string} [opts.model] - Model override.
+ * @param {string|null} [opts.authProfile] - Auth profile header value.
+ * @param {Record<string,string>|null} [opts.materializedEnv] - Env vars to forward via x-openclaw-env-inject header.
+ * @param {number} [opts.timeoutMs=300000] - Request timeout in milliseconds.
  */
 export async function runAgentTurn(opts) {
   const {

@@ -446,6 +446,7 @@ export interface AgentTurnOpts {
   sessionKey?: string;
   model?: string;
   authProfile?: string | null;
+  materializedEnv?: Record<string, string> | null;
   timeoutMs?: number;
 }
 
@@ -455,6 +456,7 @@ export interface AgentTurnWithTimeoutOpts {
   sessionKey?: string;
   model?: string;
   authProfile?: string | null;
+  materializedEnv?: Record<string, string> | null;
   idleTimeoutMs?: number;
   pollIntervalMs?: number;
   absoluteTimeoutMs?: number;
@@ -613,6 +615,7 @@ export const dispatchQueue: {
 
 export const gateway: {
   TELEGRAM_MAX_MESSAGE_LENGTH: number;
+  buildEnvInjectHeader(materializedEnv: unknown): Record<string, string>;
   runAgentTurn(opts: AgentTurnOpts): Promise<AgentTurnResult>;
   runAgentTurnWithActivityTimeout(opts: AgentTurnWithTimeoutOpts): Promise<AgentTurnResult>;
   sendSystemEvent(text: string, mode?: string): Promise<Record<string, unknown>>;
