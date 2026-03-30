@@ -42,6 +42,8 @@ import {
   splitMessageForChannel,
   TELEGRAM_MAX_MESSAGE_LENGTH,
   buildEnvInjectHeader,
+  checkGatewayHealth,
+  invokeGatewayTool,
   runAgentTurn,
   runAgentTurnWithActivityTimeout,
 } from './gateway.js';
@@ -9372,6 +9374,8 @@ console.log('\n── buildEnvInjectHeader ──');
 console.log('\n── Gateway env-inject request path ──');
 {
   const originalFetch = globalThis.fetch;
+  const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  process.env.OPENCLAW_GATEWAY_TOKEN = 'test-gateway-token';
   const captured = [];
   globalThis.fetch = async (url, opts = {}) => {
     captured.push({ url, opts });
@@ -9397,6 +9401,10 @@ console.log('\n── Gateway env-inject request path ──');
       captured[0]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ STRIPE_KEY: 'sk_test_123' }),
       'runAgentTurn: forwards x-openclaw-env-inject for valid env maps',
     );
+    assert(
+      captured[0]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      'runAgentTurn: sends operator.write scope for chat completions',
+    );
 
     await runAgentTurn({
       message: 'hello',
@@ -9408,6 +9416,10 @@ console.log('\n── Gateway env-inject request path ──');
     assert(
       captured[1]?.opts?.headers?.['x-openclaw-env-inject'] === undefined,
       'runAgentTurn: omits x-openclaw-env-inject for empty env maps',
+    );
+    assert(
+      captured[1]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      'runAgentTurn: keeps operator.write scope on chat completions without env inject',
     );
 
     await runAgentTurnWithActivityTimeout({
@@ -9423,8 +9435,27 @@ console.log('\n── Gateway env-inject request path ──');
       captured[2]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ NODE_ENV: 'production' }),
       'runAgentTurnWithActivityTimeout: forwards x-openclaw-env-inject for valid env maps',
     );
+    assert(
+      captured[2]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      'runAgentTurnWithActivityTimeout: sends operator.write scope for chat completions',
+    );
+
+    await invokeGatewayTool('sessions_list', { limit: 1 });
+    assert(
+      captured[3]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      'invokeGatewayTool: does not send chat-completions scope header',
+    );
+
+    const healthOk = await checkGatewayHealth();
+    assert(healthOk === true, 'checkGatewayHealth: returns true for ok responses');
+    assert(
+      captured[4]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      'checkGatewayHealth: does not send chat-completions scope header',
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalGatewayToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
   }
 }
 
