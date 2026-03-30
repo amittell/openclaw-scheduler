@@ -26,7 +26,7 @@
  *   2 — argument error
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
@@ -689,8 +689,44 @@ function markLabelError(label, errorSummary) {
 /**
  * Format and output the delivery message, then exit 0.
  * Also marks the label as done in labels.json before exiting.
+ *
+ * If the label has a verifyCmd stored, it is run first.
+ * If the verify command exits non-zero, the job is marked as error and
+ * an alert is written to stdout (delivery target receives the failure notice).
  */
 function deliverResult(label, lastReply, fallbackSummary) {
+  // ── verify-cmd check ─────────────────────────────────────────────────────
+  // Run the stored verify-cmd (if any) before declaring the job done.
+  // A non-zero exit flips the job to error state and sends an alert instead.
+  try {
+    const labels = loadLabels();
+    const entry = labels[label];
+    if (entry?.verifyCmd) {
+      process.stderr.write(`[watcher] running verify-cmd for ${label}: ${entry.verifyCmd}\n`);
+      try {
+        execSync(entry.verifyCmd, { stdio: 'pipe', timeout: 60000, shell: true });
+        process.stderr.write(`[watcher] verify-cmd passed for ${label}\n`);
+      } catch (verifyErr) {
+        const stderr = verifyErr.stderr ? verifyErr.stderr.toString().trim() : verifyErr.message;
+        const errMsg = `verify-cmd failed: ${stderr || 'exit code ' + (verifyErr.status ?? 1)}`;
+        process.stderr.write(`[watcher] ${errMsg}\n`);
+        markLabelError(label, errMsg);
+        // Output failure notice — scheduler delivers this to the delivery target
+        process.stdout.write(
+          `🌶️ *dispatch* [${label}] ⚠️ VERIFICATION FAILED\n\n` +
+          `The agent session completed but the post-completion verify-cmd exited non-zero.\n\n` +
+          `**Verify command:** \`${entry.verifyCmd}\`\n` +
+          `**Error:** ${stderr || 'non-zero exit'}\n\n` +
+          `Job marked as \`error\`. The agent may have reported done without completing the actual work.\n`
+        );
+        process.exit(1);
+      }
+    }
+  } catch (loadErr) {
+    // Non-fatal — if labels can't be read, skip verify check and proceed normally
+    process.stderr.write(`[watcher] verify-cmd check skipped (labels load error): ${loadErr.message}\n`);
+  }
+
   // Update labels.json before exiting — prevents stuck detector false positives
   const summary = fallbackSummary || (lastReply ? lastReply.slice(0, 500) : null);
   markLabelDone(label, summary);
