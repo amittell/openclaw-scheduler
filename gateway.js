@@ -30,7 +30,7 @@ function getGatewayToken() {
 
 function authHeaders() {
   const token = getGatewayToken();
-  return token ? { 'Authorization': `Bearer ${token}` } : {};
+  return token ? { 'Authorization': `Bearer ${token}`, 'x-openclaw-scopes': 'operator.write' } : {};
 }
 
 // ── Chat Completions (independent dispatch) ─────────────────
