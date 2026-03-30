@@ -33,6 +33,27 @@ function authHeaders() {
   return token ? { 'Authorization': `Bearer ${token}` } : {};
 }
 
+/**
+ * Build the x-openclaw-env-inject header from a materialized env map.
+ * Returns an object with the header if the input is a non-empty plain object
+ * with string keys and string values, or an empty object otherwise.
+ */
+export function buildEnvInjectHeader(materializedEnv) {
+  if (
+    materializedEnv === null
+    || materializedEnv === undefined
+    || typeof materializedEnv !== 'object'
+    || Array.isArray(materializedEnv)
+    || Object.getPrototypeOf(materializedEnv) !== Object.prototype
+  ) {
+    return {};
+  }
+  const entries = Object.entries(materializedEnv);
+  if (entries.length === 0) return {};
+  if (!entries.every(([k, v]) => typeof k === 'string' && typeof v === 'string')) return {};
+  return { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) };
+}
+
 // ── Chat Completions (independent dispatch) ─────────────────
 
 /**
@@ -57,10 +78,7 @@ export async function runAgentTurn(opts) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const envInjectHeader = materializedEnv && typeof materializedEnv === 'object'
-      && Object.keys(materializedEnv).length > 0
-      ? { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) }
-      : {};
+    const envInjectHeader = buildEnvInjectHeader(materializedEnv);
 
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
       method: 'POST',
@@ -188,10 +206,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   // Start polling after the first interval (gives session time to initialise)
   const pollTimer = setInterval(checkActivity, pollIntervalMs);
 
-  const envInjectHeader = materializedEnv && typeof materializedEnv === 'object'
-    && Object.keys(materializedEnv).length > 0
-    ? { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) }
-    : {};
+  const envInjectHeader = buildEnvInjectHeader(materializedEnv);
 
   try {
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
