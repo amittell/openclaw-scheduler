@@ -95,7 +95,12 @@ export function redactOutcomesForPersistence(outcomes, deps) {
   const providerName = ir.provider;
   const provider = providerName && deps?.getIdentityProvider?.(providerName);
   if (provider && typeof provider.describeSession === 'function') {
-    ir.session = provider.describeSession(session);
+    try {
+      ir.session = provider.describeSession(session);
+    } catch (_err) {
+      delete session.credentials;
+      ir.session = session;
+    }
   } else {
     delete session.credentials;
     ir.session = session;
@@ -494,7 +499,10 @@ export async function prepareDispatch(job, opts, deps) {
     if (handoff) v02Outcomes.credential_handoff_summary = handoff;
   }
 
-  if (v02Outcomes.credential_handoff_summary && job.session_target !== 'shell') {
+  const hasDeclaredCredentialHandoff = v02Outcomes.credential_handoff_summary
+    && (v02Outcomes.credential_handoff_summary.mode != null
+      || v02Outcomes.credential_handoff_summary.bindings_count > 0);
+  if (hasDeclaredCredentialHandoff && job.session_target !== 'shell') {
     return abortPreparedRun(
       job,
       run,

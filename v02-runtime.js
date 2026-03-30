@@ -424,9 +424,18 @@ export async function evaluateAuthorization(job, identityResult, trustResult, ct
         { policy: blob, identity: identityResult, trust: trustResult, ref: blobRef, jobId: job.id },
         { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
       );
+      const rawDecision = typeof result?.decision === 'string' ? result.decision : null;
+      const decision = rawDecision === 'permit' || rawDecision === 'deny' || rawDecision === 'escalate'
+        ? rawDecision
+        : 'deny';
+      const reason = decision === 'deny' && rawDecision !== 'deny' && rawDecision !== null
+        ? `authorization provider ${providerName} returned unsupported decision "${rawDecision}"`
+        : decision === 'deny' && rawDecision == null
+          ? `authorization provider ${providerName} returned no decision`
+          : result?.reason || `provider ${providerName} returned ${decision}`;
       return {
-        decision: result.decision || 'deny',
-        reason: result.reason || `provider ${providerName} returned ${result.decision}`,
+        decision,
+        reason,
         ref: blobRef,
         source: 'provider',
         provider: providerName,

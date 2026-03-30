@@ -7721,6 +7721,23 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(missingAuthProvider.decision === 'deny', 'evaluateAuthorization: missing explicit provider fails closed');
   assert(missingAuthProvider.source === 'provider-error', 'evaluateAuthorization: missing explicit provider reports provider-error');
   assert(missingAuthProvider.reason.includes('not loaded'), 'evaluateAuthorization: missing explicit provider error mentions not loaded');
+
+  // Provider that returns an unsupported decision -> fail closed
+  const weirdAuthProvider = {
+    authorize() {
+      return { decision: 'allow', reason: 'provider typo' };
+    },
+  };
+  const weirdAuthDecision = await evaluateAuthorization(
+    { authorization: JSON.stringify({ provider: 'weird-authz-provider' }) },
+    { principal: 'agent:test' },
+    { decision: 'permit', reason: 'trust ok' },
+    {
+      getAuthorizationProvider: (name) => name === 'weird-authz-provider' ? weirdAuthProvider : null,
+    }
+  );
+  assert(weirdAuthDecision.decision === 'deny', 'evaluateAuthorization: unsupported provider decision fails closed');
+  assert(weirdAuthDecision.reason.includes('unsupported decision'), 'evaluateAuthorization: unsupported provider decision explains denial');
 }
 
 console.log('\n── v0.2 generateEvidence ──');
@@ -8921,6 +8938,26 @@ console.log('\n── Credential redaction ──');
   });
   assert(strippedOutcomes.identity_resolved.session.credentials === undefined, 'credential redaction: fallback strips credentials key when no describeSession');
 
+  const throwsDescribeProvider = {
+    name: 'throws-describe-provider',
+    type: 'identity',
+    describeSession() {
+      throw new Error('redaction exploded');
+    },
+  };
+  const fallbackAfterThrow = redactOutcomesForPersistence({
+    identity_resolved: {
+      provider: 'throws-describe-provider',
+      session: {
+        credentials: { secret: { value: 'raw-secret' } },
+      },
+      source: 'provider',
+    },
+  }, {
+    getIdentityProvider: (name) => name === 'throws-describe-provider' ? throwsDescribeProvider : null,
+  });
+  assert(fallbackAfterThrow.identity_resolved.session.credentials === undefined, 'credential redaction: describeSession throw falls back to stripping credentials');
+
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(redactJob.id);
   deleteJob(redactJob.id);
 }
@@ -9154,6 +9191,38 @@ console.log('\n── downscope trust elevation detection ──');
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(dsParent.id);
   deleteJob(dsChild.id);
   deleteJob(dsParent.id);
+}
+
+// ── malformed identity JSON on non-shell job does not masquerade as handoff ──
+
+console.log('\n── malformed identity JSON on non-shell job ──');
+{
+  const malformedIdentityJob = createJob({
+    name: 'malformed-identity-nonshell',
+    schedule_cron: '0 8 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo malformed identity',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:test' }),
+  });
+  getDb().prepare('UPDATE jobs SET session_target = ?, payload_kind = ?, identity = ? WHERE id = ?')
+    .run('isolated', 'agentTurn', 'not-json', malformedIdentityJob.id);
+
+  const malformedIdentityCtx = await prepareDispatch(
+    getJob(malformedIdentityJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(malformedIdentityCtx !== null, 'prepareDispatch: malformed identity JSON on non-shell job no longer triggers handoff-only abort');
+  assert(malformedIdentityCtx.v02Outcomes.credential_handoff_summary.error.includes('parse failed'), 'prepareDispatch: malformed identity JSON preserves handoff parse error details');
+
+  if (malformedIdentityCtx) finishRun(malformedIdentityCtx.run.id, 'cancelled', { summary: 'test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(malformedIdentityJob.id);
+  deleteJob(malformedIdentityJob.id);
 }
 
 // ── security abort skips triggered children ──
