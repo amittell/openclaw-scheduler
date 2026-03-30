@@ -38,7 +38,7 @@ import {
   ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
-import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH } from './gateway.js';
+import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH, buildEnvInjectHeader } from './gateway.js';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
 import {
@@ -9314,6 +9314,41 @@ console.log('\n── getStaleRuns type guard ──');
   // Valid call should not throw
   const staleRuns = getStaleRuns(90);
   assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
+}
+
+// ── buildEnvInjectHeader ──
+
+console.log('\n── buildEnvInjectHeader ──');
+{
+  // Valid plain object with string values -> header present
+  const valid = buildEnvInjectHeader({ STRIPE_KEY: 'sk_test_123', NODE_ENV: 'production' });
+  assert(valid['x-openclaw-env-inject'] !== undefined, 'buildEnvInjectHeader: returns header for valid env map');
+  const parsed = JSON.parse(valid['x-openclaw-env-inject']);
+  assert(parsed.STRIPE_KEY === 'sk_test_123', 'buildEnvInjectHeader: header value is correctly JSON-encoded');
+
+  // Empty object -> no header
+  const empty = buildEnvInjectHeader({});
+  assert(Object.keys(empty).length === 0, 'buildEnvInjectHeader: empty object returns no header');
+
+  // null -> no header
+  const nullInput = buildEnvInjectHeader(null);
+  assert(Object.keys(nullInput).length === 0, 'buildEnvInjectHeader: null returns no header');
+
+  // undefined -> no header
+  const undefinedInput = buildEnvInjectHeader(undefined);
+  assert(Object.keys(undefinedInput).length === 0, 'buildEnvInjectHeader: undefined returns no header');
+
+  // Array -> no header (not a plain object)
+  const arrayInput = buildEnvInjectHeader(['not', 'an', 'object']);
+  assert(Object.keys(arrayInput).length === 0, 'buildEnvInjectHeader: array returns no header');
+
+  // Non-string values -> no header
+  const nonStringVals = buildEnvInjectHeader({ key: 123 });
+  assert(Object.keys(nonStringVals).length === 0, 'buildEnvInjectHeader: non-string values returns no header');
+
+  // Non-plain object (prototype not Object.prototype) -> no header
+  const dateInput = buildEnvInjectHeader(new Date());
+  assert(Object.keys(dateInput).length === 0, 'buildEnvInjectHeader: Date instance returns no header');
 }
 
 closeDb();
