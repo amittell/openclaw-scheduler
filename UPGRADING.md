@@ -378,6 +378,16 @@ pm2 restart openclaw-scheduler
 
 ---
 
+## Provider plugins (v0.2)
+
+If you use provider-backed identity, authorization, or proof verification, set
+`SCHEDULER_PROVIDER_PATH` to a directory containing your provider `*.js` files.
+This is a high-trust boundary: every file in that directory is dynamically imported
+at scheduler startup. The directory must not be world-writable. See
+`docs/gateway-contract.md` for the full provider plugin contract.
+
+---
+
 ## Troubleshooting
 
 ### Tests fail after update

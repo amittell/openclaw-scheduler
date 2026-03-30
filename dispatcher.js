@@ -38,6 +38,7 @@ import {
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+  compareTrustLevels,
 } from './v02-runtime.js';
 import {
   getInbox, markDelivered,
@@ -316,6 +317,7 @@ function buildDispatchDeps() {
     // v0.2 runtime
     resolveIdentity, evaluateTrust, verifyAuthorizationProof,
     evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+    compareTrustLevels,
     persistV02Outcomes,
     // Provider registry
     getIdentityProvider,

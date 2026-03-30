@@ -842,6 +842,7 @@ export interface EvidenceResult {
   evidence_ref: string | null;
   created_at: string;
   hash: string | null;
+  integrity: 'none';
   payload_summary: Record<string, unknown>;
 }
 
@@ -853,6 +854,7 @@ export interface CredentialHandoffSummary {
 
 export const v02Runtime: {
   TRUST_LEVELS: readonly string[];
+  compareTrustLevels(a: string | null | undefined, b: string | null | undefined): -1 | 0 | 1;
   resolveIdentity(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<ResolvedIdentity | null>;
   evaluateTrust(job: Record<string, unknown>, resolvedIdentity: ResolvedIdentity | null): TrustEvaluation;
   verifyAuthorizationProof(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<AuthorizationProofResult | null>;

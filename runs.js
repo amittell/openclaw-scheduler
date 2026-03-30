@@ -134,6 +134,9 @@ export function updateRunSession(id, sessionKey, sessionId) {
  * Default threshold: 90 seconds (3 missed 30s heartbeats) for agent jobs.
  */
 export function getStaleRuns(thresholdSeconds = 90) {
+  if (!Number.isInteger(thresholdSeconds) || thresholdSeconds < 0) {
+    throw new Error(`getStaleRuns: thresholdSeconds must be a non-negative integer, got ${thresholdSeconds}`);
+  }
   return getDb().prepare(`
     SELECT r.*, j.name as job_name, j.run_timeout_ms as job_timeout_ms
     FROM runs r
@@ -249,12 +252,14 @@ const V02_OUTCOME_COLUMNS = new Set([
 
 export function persistV02Outcomes(runId, outcomes) {
   if (!outcomes || typeof outcomes !== 'object') return;
+  if (!runId) return;
   const db = getDb();
   const fields = [];
   const values = [];
   for (const [key, value] of Object.entries(outcomes)) {
     if (value === undefined) continue;
     if (!V02_OUTCOME_COLUMNS.has(key)) continue;
+    if (!/^[a-z_]+$/.test(key)) throw new Error(`persistV02Outcomes: invalid column name "${key}"`);
     fields.push(`${key} = ?`);
     values.push(value != null && typeof value === 'object' ? JSON.stringify(value) : value);
   }

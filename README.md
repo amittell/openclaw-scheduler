@@ -1373,6 +1373,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
+| `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
 | `DISPATCH_LABELS_PATH` | *(auto)* | Override path to labels.json for dispatch session tracking |
 | `DISPATCH_INDEX_PATH` | *(auto)* | Override path to dispatch/index.mjs (used by watcher) |
