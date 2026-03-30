@@ -543,6 +543,29 @@ directly as the `x-openclaw-auth-profile` header value without resolution.
 
 ---
 
+## Env-Inject Forwarding
+
+When credential materialization for an agent task produces a non-empty plain
+object of string environment variables, the scheduler JSON-encodes that map
+and sends it as the `x-openclaw-env-inject` header on
+`POST /v1/chat/completions`.
+
+Validation rules:
+
+- Arrays, non-plain objects, and null/undefined values are rejected.
+- Empty objects are omitted.
+- All values must be strings.
+
+This path requires matching receiver-side support in the gateway. Until that
+support is available, `auth_profile` forwarding remains the compatibility path
+for agent-side credential selection.
+
+Reference: `gateway.js` (`buildEnvInjectHeader()`, `runAgentTurn()`,
+`runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
+(`executeAgent()`).
+
+---
+
 ## Trust Architecture
 
 For the full trust architecture -- including what the scheduler/child
@@ -559,8 +582,10 @@ The gateway contract intersects with the trust architecture at these points:
   specific credential profile for agent tasks (see "Auth-Profile Forwarding"
   above).
 - **Credential materialization:** for shell tasks, credentials are injected as
-  environment variables by the identity provider. For agent tasks, credential
-  scoping currently depends on the gateway having a matching auth profile.
+  environment variables by the identity provider. For agent tasks, the
+  scheduler can now forward a materialized env map via
+  `x-openclaw-env-inject`; `auth_profile` forwarding remains the profile-based
+  compatibility path when the gateway does not yet apply env injection.
 
 ---
 

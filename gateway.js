@@ -51,7 +51,8 @@ export function buildEnvInjectHeader(materializedEnv) {
   const entries = Object.entries(materializedEnv);
   if (entries.length === 0) return {};
   if (!entries.every(([k, v]) => typeof k === 'string' && typeof v === 'string')) return {};
-  return { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) };
+  const sanitizedEnv = Object.fromEntries(entries);
+  return { 'x-openclaw-env-inject': JSON.stringify(sanitizedEnv) };
 }
 
 // ── Chat Completions (independent dispatch) ─────────────────
