@@ -79,6 +79,7 @@
     "shell-result.js",
     "task-tracker.js",
     "team-adapter.js",
+    "v02-runtime.js",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -87,6 +88,7 @@
     "CODE_OF_CONDUCT.md",
     "INSTALL*.md",
     "UNINSTALL.md",
+    "UPGRADING.md",
     "BEST-PRACTICES.md",
     "QUICK-START.md"
   ],

@@ -202,6 +202,8 @@ const job = createJob({
   payload_message: 'Reply with exactly: SCHEDULER_OK',
   delivery_mode: 'none',
   delete_after_run: true,
+  origin: 'system',
+  run_timeout_ms: 300000,
 });
 getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
 console.log('Created smoke test:', job.id);
@@ -294,6 +296,12 @@ openclaw gateway restart
 ```
 
 For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
+
+---
+
+## Upgrading
+
+Already have the scheduler installed and need to update to a newer version? See [UPGRADING.md](UPGRADING.md).
 
 ---
 

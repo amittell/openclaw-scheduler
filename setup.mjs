@@ -565,7 +565,7 @@ After=network.target
 Type=simple
 WorkingDirectory=${schedulerPath}
 ExecStart=${nodePath} --no-warnings ${indexPath}
-Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}${gatewayToken ? `\nEnvironment=OPENCLAW_GATEWAY_TOKEN=${gatewayToken}` : ''}
+Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}${gatewayToken ? `\nEnvironment="OPENCLAW_GATEWAY_TOKEN=${gatewayToken.replace(/"/g, '\\"')}"` : ''}
 Environment=SCHEDULER_DB=${schedulerDbPath}
 Restart=always
 RestartSec=5

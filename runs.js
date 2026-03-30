@@ -82,7 +82,7 @@ export function finishRun(id, status, opts = {}) {
       shell_stderr_path = COALESCE(?, shell_stderr_path),
       shell_stdout_bytes = COALESCE(?, shell_stdout_bytes),
       shell_stderr_bytes = COALESCE(?, shell_stderr_bytes)
-    WHERE id = ?
+    WHERE id = ? AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
   `).run(
     status,
     durationMs,
@@ -134,6 +134,9 @@ export function updateRunSession(id, sessionKey, sessionId) {
  * Default threshold: 90 seconds (3 missed 30s heartbeats) for agent jobs.
  */
 export function getStaleRuns(thresholdSeconds = 90) {
+  if (!Number.isInteger(thresholdSeconds) || thresholdSeconds < 0) {
+    throw new Error(`getStaleRuns: thresholdSeconds must be a non-negative integer, got ${thresholdSeconds}`);
+  }
   return getDb().prepare(`
     SELECT r.*, j.name as job_name, j.run_timeout_ms as job_timeout_ms
     FROM runs r
@@ -227,4 +230,40 @@ export function updateContextSummary(runId, summaryObj) {
     UPDATE runs SET context_summary = ? WHERE id = ?
   `).run(json, runId);
   return getRun(runId);
+}
+
+/**
+ * Persist v0.2 runtime outcomes on a run record.
+ *
+ * Only updates columns present in the outcomes object. Values that are objects
+ * are JSON-stringified before storage.
+ *
+ * Valid columns: identity_resolved, trust_evaluation, authorization_decision,
+ * authorization_proof_verification, evidence_record, credential_handoff_summary.
+ */
+const V02_OUTCOME_COLUMNS = new Set([
+  'identity_resolved',
+  'trust_evaluation',
+  'authorization_decision',
+  'authorization_proof_verification',
+  'evidence_record',
+  'credential_handoff_summary',
+]);
+
+export function persistV02Outcomes(runId, outcomes) {
+  if (!outcomes || typeof outcomes !== 'object') return;
+  if (!runId) return;
+  const db = getDb();
+  const fields = [];
+  const values = [];
+  for (const [key, value] of Object.entries(outcomes)) {
+    if (value === undefined) continue;
+    if (!V02_OUTCOME_COLUMNS.has(key)) continue;
+    if (!/^[a-z_]+$/.test(key)) throw new Error(`persistV02Outcomes: invalid column name "${key}"`);
+    fields.push(`${key} = ?`);
+    values.push(value != null && typeof value === 'object' ? JSON.stringify(value) : value);
+  }
+  if (fields.length === 0) return;
+  values.push(runId);
+  db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
 }

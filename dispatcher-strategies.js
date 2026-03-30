@@ -40,6 +40,102 @@ export function makeDefaultResult() {
   };
 }
 
+/** Safely parse a JSON string. Returns parsed value or null on failure. */
+function safeParse(str) {
+  if (str == null || str === '') return null;
+  try {
+    return JSON.parse(str);
+  } catch (_e) {
+    return null;
+  }
+}
+
+function getIdentityTrustLevel(identity) {
+  if (!identity || typeof identity !== 'object') return null;
+  return identity.trust_level
+    || identity.trust?.effective_level
+    || identity.trust?.level
+    || identity.session?.trust?.effective_level
+    || identity.session?.trust?.level
+    || identity.raw?.trust_level
+    || identity.raw?.trust?.effective_level
+    || identity.raw?.trust?.level
+    || null;
+}
+
+function getJobTrustLevel(job, parsedIdentity = null) {
+  const identityBlob = parsedIdentity || safeParse(job?.identity);
+  return getIdentityTrustLevel(identityBlob) || job?.identity_trust_level || null;
+}
+
+function hasIdentityDeclaration(job) {
+  if (!job) return false;
+  return job.identity != null
+    || job.identity_ref != null
+    || job.identity_principal != null
+    || job.identity_run_as != null
+    || job.identity_attestation != null
+    || job.identity_subject_kind != null
+    || job.identity_subject_principal != null
+    || job.identity_trust_level != null
+    || job.identity_delegation_mode != null;
+}
+
+/**
+ * Redact session credentials from v02Outcomes before DB persistence.
+ * Uses the provider's describeSession() for redaction when available,
+ * otherwise strips the credentials key directly.
+ */
+export function redactOutcomesForPersistence(outcomes, deps) {
+  if (!outcomes?.identity_resolved?.session?.credentials) return outcomes;
+  const redacted = { ...outcomes };
+  const ir = { ...redacted.identity_resolved };
+  const session = { ...ir.session };
+
+  const providerName = ir.provider;
+  const provider = providerName && deps?.getIdentityProvider?.(providerName);
+  if (provider && typeof provider.describeSession === 'function') {
+    try {
+      ir.session = provider.describeSession(session);
+    } catch (_err) {
+      delete session.credentials;
+      ir.session = session;
+    }
+  } else {
+    delete session.credentials;
+    ir.session = session;
+  }
+
+  redacted.identity_resolved = ir;
+  return redacted;
+}
+
+function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
+  const {
+    finishRun, persistV02Outcomes, releaseIdempotencyKey, updateJobAfterRun,
+    setDispatchStatus, handleTriggeredChildren, dequeueJob, log,
+  } = deps;
+
+  finishRun(run.id, 'error', {
+    summary,
+    error_message: summary,
+  });
+  persistV02Outcomes(run.id, redactOutcomesForPersistence(outcomes, deps));
+  if (state.idemKey) releaseIdempotencyKey(state.idemKey);
+  updateJobAfterRun(job, 'error');
+  if (state.dispatchRecord) setDispatchStatus(state.dispatchRecord.id, 'done');
+  // Security-related aborts (identity/trust/auth/proof/credential failures)
+  // should not fire child jobs -- a parent that failed a security gate must
+  // not trigger downstream work that may have weaker security requirements.
+  if (!opts.skipChildren) {
+    handleTriggeredChildren(job.id, 'error', summary, run.id);
+  }
+  if (dequeueJob(job.id)) {
+    log('info', `Dequeued pending dispatch for ${job.name}`);
+  }
+  return null;
+}
+
 /**
  * Uniform post-execution ceremony. Processes the DispatchResult from any strategy.
  *
@@ -64,6 +160,29 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     error_message: result.errorMessage,
     ...result.runFinishFields,
   });
+
+  // 1b. v0.2 evidence and outcome persistence
+  if (ctx.v02Outcomes) {
+    const { generateEvidence, persistV02Outcomes } = deps;
+    if (job.evidence || job.evidence_ref) {
+      const runMetadata = { id: ctx.run.id, status: result.status };
+      const evidence = generateEvidence(job, runMetadata, ctx.v02Outcomes);
+      if (evidence) ctx.v02Outcomes.evidence_record = evidence;
+    }
+    persistV02Outcomes(ctx.run.id, redactOutcomesForPersistence(ctx.v02Outcomes, deps));
+  }
+
+  // 1c. Provider cleanup
+  if (ctx.materializationCleanup) {
+    try {
+      const { provider, cleanupState } = ctx.materializationCleanup;
+      if (typeof provider.cleanup === 'function') {
+        await provider.cleanup(cleanupState, { env: process.env, cwd: process.cwd() });
+      }
+    } catch (err) {
+      log('warn', `Provider cleanup failed for ${job.name}: ${err.message}`, { jobId: job.id });
+    }
+  }
 
   // 2. Idempotency key management
   if (ctx.idemKey) {
@@ -350,7 +469,352 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
-  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch };
+  // v0.2 runtime evaluation
+  const {
+    resolveIdentity, evaluateTrust, verifyAuthorizationProof,
+    evaluateAuthorization, summarizeCredentialHandoff,
+  } = deps;
+
+  // Build provider context for v0.2 runtime calls
+  const providerCtx = {
+    getIdentityProvider: deps.getIdentityProvider,
+    getAuthorizationProvider: deps.getAuthorizationProvider,
+    getProofVerifier: deps.getProofVerifier,
+    env: process.env,
+    cwd: process.cwd(),
+  };
+
+  const v02Outcomes = {};
+  const hasV02Identity = hasIdentityDeclaration(job);
+  const hasV02Contract = job.contract_required_trust_level;
+  const needsAuthorization = job.authorization || job.authorization_ref;
+  const shouldResolveIdentity = hasV02Identity || hasV02Contract || needsAuthorization;
+
+  if (shouldResolveIdentity) {
+    v02Outcomes.identity_resolved = await resolveIdentity(job, providerCtx);
+  }
+
+  if (hasV02Identity) {
+    const handoff = summarizeCredentialHandoff(job);
+    if (handoff) v02Outcomes.credential_handoff_summary = handoff;
+  }
+
+  const hasDeclaredCredentialHandoff = v02Outcomes.credential_handoff_summary
+    && (v02Outcomes.credential_handoff_summary.mode != null
+      || v02Outcomes.credential_handoff_summary.bindings_count > 0);
+  if (hasDeclaredCredentialHandoff && job.session_target !== 'shell') {
+    return abortPreparedRun(
+      job,
+      run,
+      'Credential handoff presentation is only supported for shell jobs',
+      v02Outcomes,
+      { dispatchRecord, idemKey },
+      deps,
+      { skipChildren: true },
+    );
+  }
+
+  // Child credential policy enforcement.
+  // Apply this BEFORE trust/auth evaluation so later gates see the effective
+  // identity that will actually be materialized for the run. The policy can
+  // narrow (downscope) or remove (none) credentials, and it may also inherit
+  // the parent's auth_profile for downstream gateway calls.
+  if (job.parent_id) {
+    const { getDb: getDatabase } = deps;
+    const parentJob = getDatabase().prepare(
+      'SELECT id, child_credential_policy, identity, identity_trust_level, auth_profile FROM jobs WHERE id = ?'
+    ).get(job.parent_id);
+
+    if (parentJob) {
+      const effectivePolicy = job.child_credential_policy
+        || parentJob.child_credential_policy
+        || 'none';
+      const parentIdentityBlob = safeParse(parentJob.identity);
+      const lastSuccessfulParentRun = (effectivePolicy === 'downscope' || effectivePolicy === 'independent')
+        ? getDatabase().prepare(
+          'SELECT identity_resolved FROM runs WHERE job_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1'
+        ).get(parentJob.id, 'ok')
+        : null;
+      const parentResolvedIdentity = lastSuccessfulParentRun?.identity_resolved
+        ? safeParse(lastSuccessfulParentRun.identity_resolved)
+        : null;
+
+      if (effectivePolicy === 'none') {
+        // No credentials from parent; suppress any identity the child resolved on its own
+        v02Outcomes.identity_resolved = null;
+      } else if (effectivePolicy === 'inherit' && parentJob.auth_profile) {
+        // Inherit parent's auth profile. Store in v02Outcomes rather than
+        // mutating the job DB record, which could leak to downstream writes.
+        v02Outcomes.effective_auth_profile = parentJob.auth_profile;
+      } else if (effectivePolicy === 'downscope') {
+        // Downscope: resolve narrower credentials via provider.
+        // Fail closed on every path -- if downscope is declared, we must
+        // either produce a downscoped session or abort dispatch.
+        const providerName = parentIdentityBlob?.provider || parentIdentityBlob?.auth?.provider;
+        const provider = deps.getIdentityProvider?.(providerName);
+        let downscopeApplied = false;
+
+        if (provider && typeof provider.prepareHandoff === 'function') {
+          // Get parent session from last run or re-resolve
+          let parentSession = parentResolvedIdentity?.session || null;
+
+          if (!parentSession && provider.resolveSession) {
+            // Fallback: re-resolve parent identity
+            try {
+              const parentScope = parentIdentityBlob?.scope || parentIdentityBlob?.auth?.scopes?.[0] || null;
+              const reResolved = await provider.resolveSession(
+                { profile: parentIdentityBlob, instanceId: parentJob.id, scope: parentScope },
+                { env: process.env, cwd: process.cwd() }
+              );
+              if (reResolved.ok) parentSession = reResolved.session;
+            } catch (resolveErr) {
+              log('warn', `Downscope parent re-resolve failed for ${job.name}: ${resolveErr.message}`, { jobId: job.id });
+            }
+          }
+
+          if (parentSession) {
+            const childIdentityBlob = safeParse(job.identity) || {};
+            const childScope = childIdentityBlob?.scope || childIdentityBlob?.auth?.scopes?.[0] || null;
+
+            try {
+              const handoffResult = await provider.prepareHandoff(
+                parentSession,
+                { target_scope: childScope, parent_profile: parentIdentityBlob },
+                { env: process.env, cwd: process.cwd() }
+              );
+
+              if (handoffResult.prepared) {
+                // Verify handoff actually downscoped: child trust must not
+                // exceed parent. A provider that returns an elevated session
+                // violates the downscope contract.
+                const parentTrustLevel = getIdentityTrustLevel(parentResolvedIdentity)
+                  || getIdentityTrustLevel({ session: parentSession })
+                  || getJobTrustLevel(parentJob, parentIdentityBlob);
+                const childTrustLevel = getIdentityTrustLevel({ session: handoffResult.session });
+                const { compareTrustLevels } = deps;
+                if (parentTrustLevel && childTrustLevel && compareTrustLevels(childTrustLevel, parentTrustLevel) > 0) {
+                  log('warn', `Downscope handoff elevated trust from "${parentTrustLevel}" to "${childTrustLevel}" for ${job.name}`, { jobId: job.id });
+                  // Do not set downscopeApplied -- will abort below
+                } else {
+                  // Override the identity resolution with the handoff session
+                  v02Outcomes.identity_resolved = {
+                    provider: providerName,
+                    session: handoffResult.session,
+                    source: 'provider',
+                    subject_kind: handoffResult.session?.subject?.kind || 'unknown',
+                    principal: handoffResult.session?.subject?.principal || null,
+                    trust_level: childTrustLevel,
+                    delegation_mode: null,
+                    raw: childIdentityBlob,
+                  };
+                  downscopeApplied = true;
+                }
+              }
+            } catch (err) {
+              log('warn', `Downscope handoff error for ${job.name}: ${err.message}`, { jobId: job.id });
+            }
+          }
+        }
+
+        if (!downscopeApplied) {
+          const reason = !provider
+            ? `identity provider ${providerName || '(none)'} not loaded`
+            : typeof provider.prepareHandoff !== 'function'
+              ? `provider ${providerName} does not support prepareHandoff`
+              : 'parent session unavailable or handoff did not produce a downscoped session';
+          return abortPreparedRun(
+            job,
+            run,
+            `Downscope credential policy failed: ${reason}`,
+            v02Outcomes,
+            { dispatchRecord, idemKey },
+            deps,
+            { skipChildren: true },
+          );
+        }
+      } else if (effectivePolicy === 'independent') {
+        // Child uses its own resolved identity, but cannot exceed the parent's
+        // trust level. Without this cap, a child could declare a higher trust
+        // level than the parent and bypass the parent's authorization scope.
+        const parentTrustLevel = getIdentityTrustLevel(parentResolvedIdentity)
+          || getJobTrustLevel(parentJob, parentIdentityBlob);
+        const childTrustLevel = v02Outcomes.identity_resolved?.trust_level || null;
+        if (parentTrustLevel && childTrustLevel) {
+          const { compareTrustLevels } = deps;
+          if (compareTrustLevels(childTrustLevel, parentTrustLevel) > 0) {
+            return abortPreparedRun(
+              job,
+              run,
+              `Independent child trust level "${childTrustLevel}" exceeds parent trust level "${parentTrustLevel}"`,
+              v02Outcomes,
+              { dispatchRecord, idemKey },
+              deps,
+              { skipChildren: true },
+            );
+          }
+        }
+      }
+    }
+  }
+
+  if (v02Outcomes.identity_resolved?.source === 'provider-error') {
+    return abortPreparedRun(
+      job,
+      run,
+      'Identity resolution failed: ' + (v02Outcomes.identity_resolved.error || 'provider error'),
+      v02Outcomes,
+      { dispatchRecord, idemKey },
+      deps,
+      { skipChildren: true },
+    );
+  }
+
+  if (hasV02Identity || hasV02Contract || v02Outcomes.identity_resolved != null) {
+    v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
+    if (v02Outcomes.trust_evaluation?.decision === 'warn') {
+      log('warn', `Trust evaluation warning for ${job.name}: ${v02Outcomes.trust_evaluation.reason}`, {
+        jobId: job.id,
+        runId: run.id,
+      });
+    }
+    if (v02Outcomes.trust_evaluation?.decision === 'deny') {
+      return abortPreparedRun(
+        job,
+        run,
+        'Trust enforcement blocked dispatch: ' + v02Outcomes.trust_evaluation.reason,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true },
+      );
+    }
+  }
+
+  if (job.authorization_proof || job.authorization_proof_ref) {
+    v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
+    if (v02Outcomes.authorization_proof_verification?.verified === false) {
+      const proofError = v02Outcomes.authorization_proof_verification.error || 'verification returned false';
+      // Proof verification failure is blocking: the job declared a proof
+      // requirement, so proceeding without a valid proof violates policy.
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization proof verification failed: ' + proofError,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true },
+      );
+    }
+  }
+
+  if (needsAuthorization) {
+    v02Outcomes.authorization_decision = await evaluateAuthorization(
+      job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation, providerCtx
+    );
+
+    if (v02Outcomes.authorization_decision?.decision === 'deny') {
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization denied: ' + v02Outcomes.authorization_decision.reason,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true },
+      );
+    }
+    if (v02Outcomes.authorization_decision?.decision === 'escalate') {
+      // Escalation means the authorization provider wants a human decision.
+      // Abort the dispatch so the approval system (or operator) can intervene.
+      return abortPreparedRun(
+        job,
+        run,
+        'Authorization requires escalation: ' + (v02Outcomes.authorization_decision.reason || 'provider requested escalation'),
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true },
+      );
+    }
+    if (v02Outcomes.authorization_decision?.advisory) {
+      log('warn', `Authorization advisory for ${job.name}: ${v02Outcomes.authorization_decision.reason}`, { jobId: job.id });
+    }
+  }
+
+  // Materialization phase
+  let materializedEnv = null;
+  let materializationCleanup = null;
+
+  if (v02Outcomes.identity_resolved?.source === 'provider' && v02Outcomes.identity_resolved.session) {
+    const providerName = v02Outcomes.identity_resolved.provider;
+    const provider = deps.getIdentityProvider?.(providerName);
+    const identityBlob = safeParse(job.identity) || {};
+    const presentation = identityBlob.presentation || {};
+    const hasPresentation = presentation && Object.keys(presentation).length > 0;
+
+    if (provider && typeof provider.materialize === 'function') {
+      try {
+        const matResult = await provider.materialize(
+          v02Outcomes.identity_resolved.session,
+          presentation,
+          { env: process.env, cwd: process.cwd() }
+        );
+        if (matResult?.materialized) {
+          materializedEnv = matResult.env_vars || null;
+          if (matResult.cleanup_required) {
+            materializationCleanup = {
+              provider,
+              cleanupState: {
+                session: v02Outcomes.identity_resolved.session,
+                ...matResult,
+              },
+            };
+          }
+        } else if (hasPresentation) {
+          // Materialization returned false but credentials were declared required
+          return abortPreparedRun(
+            job,
+            run,
+            `Credential materialization failed for provider ${providerName}: provider returned materialized=false`,
+            v02Outcomes,
+            { dispatchRecord, idemKey },
+            deps,
+            { skipChildren: true },
+          );
+        }
+      } catch (err) {
+        if (hasPresentation) {
+          return abortPreparedRun(
+            job,
+            run,
+            `Credential materialization error for provider ${providerName}: ${err.message}`,
+            v02Outcomes,
+            { dispatchRecord, idemKey },
+            deps,
+            { skipChildren: true },
+          );
+        }
+        // No presentation declared: provider materializes opportunistically.
+        // Warn and continue -- the shell job can still run without injected
+        // credentials when the identity blob has no presentation block.
+        log('warn', `Materialization failed for ${job.name}: ${err.message}`, { jobId: job.id });
+      }
+    } else if (hasPresentation) {
+      // Job declared credential presentation but provider has no materialize method
+      return abortPreparedRun(
+        job,
+        run,
+        `Job declares credential presentation but provider ${providerName || '(none)'} does not support materialization`,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true },
+      );
+    }
+  }
+
+  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes, materializedEnv, materializationCleanup };
 }
 
 // ── Strategy: Watchdog ──────────────────────────────────────
@@ -487,7 +951,7 @@ export async function executeShell(job, ctx, deps) {
   const { runShellCommand, normalizeShellResult, log } = deps;
   const result = makeDefaultResult();
 
-  const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms);
+  const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms, ctx.materializedEnv || null);
   const shellResult = normalizeShellResult(shellExec, {
     runId: ctx.run.id,
     timeoutMs: job.run_timeout_ms,
@@ -575,8 +1039,9 @@ export async function executeAgent(job, ctx, deps) {
   const { prompt, contextMeta } = buildJobPrompt(job, ctx.run);
   try { updateContextSummary(ctx.run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
 
-  // Resolve auth_profile: 'inherit' -> main session's active profile, specific string -> pass directly
-  let resolvedAuthProfile = job.auth_profile || undefined;
+  // Resolve auth_profile: use effective profile from child credential policy
+  // if available (set by 'inherit' policy), otherwise fall back to the job's own.
+  let resolvedAuthProfile = ctx.v02Outcomes?.effective_auth_profile || job.auth_profile || undefined;
   if (resolvedAuthProfile === 'inherit') {
     try {
       const sessions = await listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 });

@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js — Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v21).
+ * Brings any DB from any prior version up to the current schema (v23).
  * Fresh installs get everything from schema.sql directly — this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -62,6 +62,16 @@ export default function migrateConsolidate() {
       'delivery_opt_out_reason', 'origin', 'parent_id', 'created_at',
       'updated_at', 'delete_after_run', 'next_run_at', 'last_run_at',
       'last_status', 'consecutive_errors',
+      'identity_principal', 'identity_run_as', 'identity_attestation',
+      'identity_ref', 'identity_subject_kind', 'identity_subject_principal',
+      'identity_trust_level', 'identity_delegation_mode', 'identity',
+      'authorization_proof_ref', 'authorization_proof',
+      'authorization_ref', 'authorization',
+      'evidence_ref', 'evidence',
+      'contract_required_trust_level', 'contract_trust_enforcement',
+      'contract_sandbox', 'contract_allowed_paths', 'contract_network',
+      'contract_max_cost_usd', 'contract_audit',
+      'child_credential_policy',
     ])
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
@@ -69,6 +79,9 @@ export default function migrateConsolidate() {
       'shell_stdout_bytes', 'shell_stderr_bytes', 'idempotency_key',
       'summary', 'error_message', 'session_key', 'session_id',
       'dispatched_at', 'last_heartbeat',
+      'identity_resolved', 'trust_evaluation', 'authorization_decision',
+      'authorization_proof_verification', 'evidence_record',
+      'credential_handoff_summary',
     ])
     && hasColumns(agentColumns, ['delivery_channel', 'delivery_to', 'brand_name'])
     && hasColumns(msgColumns, [
@@ -124,7 +137,7 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 21
+    current >= 23
     && hasLatestColumns
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
@@ -296,11 +309,58 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN origin TEXT DEFAULT NULL`,
     // v21: per-message delivery routing
     `ALTER TABLE messages ADD COLUMN delivery_to TEXT`,
+    // v22: v0.2 identity
+    `ALTER TABLE jobs ADD COLUMN identity_principal TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_run_as TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_attestation TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_ref TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_subject_kind TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_subject_principal TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_trust_level TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity_delegation_mode TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN identity TEXT DEFAULT NULL`,
+    // v22: v0.2 authorization proof
+    `ALTER TABLE jobs ADD COLUMN authorization_proof_ref TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN authorization_proof TEXT DEFAULT NULL`,
+    // v22: v0.2 authorization
+    `ALTER TABLE jobs ADD COLUMN authorization_ref TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN authorization TEXT DEFAULT NULL`,
+    // v22: v0.2 evidence
+    `ALTER TABLE jobs ADD COLUMN evidence_ref TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN evidence TEXT DEFAULT NULL`,
+    // v22: v0.2 contract
+    `ALTER TABLE jobs ADD COLUMN contract_required_trust_level TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_trust_enforcement TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_sandbox TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_allowed_paths TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_network TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_max_cost_usd REAL DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN contract_audit TEXT DEFAULT NULL`,
+    // v22: v0.2 outcomes (runs table)
+    `ALTER TABLE runs ADD COLUMN identity_resolved TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN trust_evaluation TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN authorization_decision TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN authorization_proof_verification TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN evidence_record TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN credential_handoff_summary TEXT DEFAULT NULL`,
+    // v23: child credential policy
+    `ALTER TABLE jobs ADD COLUMN child_credential_policy TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
-    try { db.exec(sql); } catch { /* column already exists — ignore */ }
+    try {
+      db.exec(sql);
+    } catch (err) {
+      const msg = err.message || '';
+      if (msg.includes('duplicate column name') || msg.includes('no such table')) continue;
+      throw err;
+    }
   }
+
+  // Wrap all backfill statements, table creation, index creation, and version
+  // inserts in a single transaction so that partial backfill cannot occur.
+  // ALTER TABLE stays outside because some SQLite builds reject DDL in transactions.
+  db.transaction(() => {
 
   // Normalize legacy ISO schedule_at / next_run_at values for at-jobs so due checks
   // use a consistent SQLite UTC datetime format after upgrades.
@@ -615,9 +675,11 @@ export default function migrateConsolidate() {
   // ── Record all versions ───────────────────────────────────────────────
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]) {
     stmt.run(v);
   }
+
+  })(); // end backfill + version-insert transaction
 
   return true;
 }
@@ -626,7 +688,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied — DB is now at schema v21'
-    : 'DB already at v21 — nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v23'
+    : 'DB already at v23 -- nothing to do'
   );
 }
