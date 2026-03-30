@@ -545,6 +545,20 @@ directly as the `x-openclaw-auth-profile` header value without resolution.
 
 ## Local Provider Plugins
 
+### Dispatch-Time Authorization Evaluation
+
+The scheduler evaluates **inline** `authorization` JSON at dispatch time. When
+the authorization blob names a provider (`authorization.provider` or
+`authorization.authorization_provider`), that provider is invoked and must
+return one of `permit`, `deny`, or `escalate`; unsupported or missing decisions
+fail closed as `deny`.
+
+`authorization_ref` by itself is **not** an external-policy lookup mechanism
+today. If `authorization_ref` is set and `authorization` is empty, dispatch-time
+evaluation fails closed with `deny` because external policy resolution is not
+implemented yet. Jobs that need a dispatch-time authorization gate must provide
+an inline authorization blob (optionally provider-backed), or remove the ref.
+
 The scheduler can load local identity, authorization, and proof-verifier
 plugins from `SCHEDULER_PROVIDER_PATH` at startup. Every `*.js` file in that
 directory is imported and registered by `provider-registry.js`.

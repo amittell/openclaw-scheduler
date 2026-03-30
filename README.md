@@ -1389,6 +1389,12 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 
 ---
 
+Provider-backed identity / authorization / proof behavior, including
+`authorization_ref` fail-closed semantics, is documented in the
+[gateway contract](docs/gateway-contract.md#dispatch-time-authorization-evaluation).
+
+---
+
 ## Service Management
 
 > **Platform note:** The commands below are for macOS (launchd). For Linux, see [INSTALL-LINUX.md](INSTALL-LINUX.md). For Windows, see [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
