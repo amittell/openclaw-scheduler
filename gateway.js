@@ -49,6 +49,7 @@ export async function runAgentTurn(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     timeoutMs = 300000,
   } = opts;
 
@@ -56,6 +57,11 @@ export async function runAgentTurn(opts) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
+    const envInjectHeader = materializedEnv && typeof materializedEnv === 'object'
+      && Object.keys(materializedEnv).length > 0
+      ? { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) }
+      : {};
+
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -64,6 +70,7 @@ export async function runAgentTurn(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjectHeader,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
@@ -115,6 +122,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
+ * @param {Object} opts.materializedEnv  - Key-value env vars from credential materialization (optional)
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
   const {
@@ -123,6 +131,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
@@ -179,6 +188,11 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   // Start polling after the first interval (gives session time to initialise)
   const pollTimer = setInterval(checkActivity, pollIntervalMs);
 
+  const envInjectHeader = materializedEnv && typeof materializedEnv === 'object'
+    && Object.keys(materializedEnv).length > 0
+    ? { 'x-openclaw-env-inject': JSON.stringify(materializedEnv) }
+    : {};
+
   try {
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
       method: 'POST',
@@ -188,6 +202,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjectHeader,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,

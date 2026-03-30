@@ -1071,6 +1071,7 @@ export async function executeAgent(job, ctx, deps) {
     sessionKey,
     model: job.payload_model || undefined,
     authProfile: resolvedAuthProfile,
+    materializedEnv: ctx.materializedEnv || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
     pollIntervalMs: 60000,
     absoluteTimeoutMs: job.run_timeout_ms || 300000,
