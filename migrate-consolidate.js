@@ -357,6 +357,11 @@ export default function migrateConsolidate() {
     }
   }
 
+  // Wrap all backfill statements, table creation, index creation, and version
+  // inserts in a single transaction so that partial backfill cannot occur.
+  // ALTER TABLE stays outside because some SQLite builds reject DDL in transactions.
+  db.transaction(() => {
+
   // Normalize legacy ISO schedule_at / next_run_at values for at-jobs so due checks
   // use a consistent SQLite UTC datetime format after upgrades.
   try {
@@ -673,6 +678,8 @@ export default function migrateConsolidate() {
   for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]) {
     stmt.run(v);
   }
+
+  })(); // end backfill + version-insert transaction
 
   return true;
 }

@@ -41,6 +41,22 @@ function trustIndex(level) {
   return TRUST_LEVELS.indexOf(level);
 }
 
+/**
+ * Compare two trust levels. Returns:
+ *  -1 if a < b (a is lower trust)
+ *   0 if a === b
+ *   1 if a > b (a is higher trust)
+ *
+ * Unrecognized levels compare as lower than any known level.
+ * Both null/undefined returns 0 (both unknown = equal).
+ */
+export function compareTrustLevels(a, b) {
+  const ai = trustIndex(a);
+  const bi = trustIndex(b);
+  if (ai === bi) return 0;
+  return ai < bi ? -1 : 1;
+}
+
 // ---------------------------------------------------------------------------
 // resolveIdentity
 // ---------------------------------------------------------------------------
@@ -83,40 +99,38 @@ export async function resolveIdentity(job, ctx = {}) {
         source: 'provider-error',
       };
     }
-    if (provider) {
-      try {
-        const scope = blob?.scope || blob?.auth?.scopes?.[0] || null;
-        const result = await provider.resolveSession(
-          { profile: blob, instanceId: job.id, scope },
-          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
-        );
-        if (!result.ok) {
-          return {
-            provider: providerName,
-            error: result.error,
-            transient: result.transient ?? true,
-            source: 'provider-error',
-          };
-        }
+    try {
+      const scope = blob?.scope || blob?.auth?.scopes?.[0] || null;
+      const result = await provider.resolveSession(
+        { profile: blob, instanceId: job.id, scope },
+        { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+      );
+      if (!result.ok) {
         return {
           provider: providerName,
-          session: result.session,
-          source: 'provider',
-          // Include structural fields for backward compat
-          subject_kind: result.session?.subject?.kind || 'unknown',
-          principal: result.session?.subject?.principal || null,
-          trust_level: result.session?.trust?.effective_level || blob?.trust?.level || null,
-          delegation_mode: blob?.subject?.delegation_mode || null,
-          raw: blob,
-        };
-      } catch (err) {
-        return {
-          provider: providerName,
-          error: err.message,
-          transient: true,
+          error: result.error,
+          transient: result.transient ?? true,
           source: 'provider-error',
         };
       }
+      return {
+        provider: providerName,
+        session: result.session,
+        source: 'provider',
+        // Include structural fields for backward compat
+        subject_kind: result.session?.subject?.kind || 'unknown',
+        principal: result.session?.subject?.principal || null,
+        trust_level: result.session?.trust?.effective_level || blob?.trust?.level || null,
+        delegation_mode: blob?.subject?.delegation_mode || null,
+        raw: blob,
+      };
+    } catch (err) {
+      return {
+        provider: providerName,
+        error: err.message,
+        transient: true,
+        source: 'provider-error',
+      };
     }
   }
 
@@ -307,30 +321,28 @@ export async function verifyAuthorizationProof(job, ctx = {}) {
         provider: verifierName,
       };
     }
-    if (verifier) {
-      try {
-        const result = await verifier.verifyProof(
-          { proof: blob, ref: blobRef, jobId: job.id },
-          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
-        );
-        return {
-          verified: !!result.verified,
-          method,
-          ref: blobRef,
-          source: 'provider',
-          provider: verifierName,
-          ...(result.error ? { error: result.error } : {}),
-        };
-      } catch (err) {
-        return {
-          verified: false,
-          method,
-          ref: blobRef,
-          error: err.message,
-          source: 'provider-error',
-          provider: verifierName,
-        };
-      }
+    try {
+      const result = await verifier.verifyProof(
+        { proof: blob, ref: blobRef, jobId: job.id },
+        { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+      );
+      return {
+        verified: !!result.verified,
+        method,
+        ref: blobRef,
+        source: 'provider',
+        provider: verifierName,
+        ...(result.error ? { error: result.error } : {}),
+      };
+    } catch (err) {
+      return {
+        verified: false,
+        method,
+        ref: blobRef,
+        error: err.message,
+        source: 'provider-error',
+        provider: verifierName,
+      };
     }
   }
 
@@ -374,8 +386,11 @@ export async function evaluateAuthorization(job, identityResult, trustResult, ct
   if (authStr == null && authRef == null) return null;
 
   if (authStr == null || authStr === '') {
-    // Only a ref, no inline authorization policy.
-    return { decision: 'permit', reason: 'authorization ref only; no inline policy to evaluate', ref: authRef };
+    // Only a ref, no inline authorization policy. External policy resolution
+    // is not yet implemented. Fail closed: a job that declares authorization_ref
+    // without an inline authorization blob intends an external policy gate.
+    // Permitting would silently bypass that intent.
+    return { decision: 'deny', reason: 'authorization_ref present but external policy resolution is not yet implemented; provide an inline authorization blob or remove authorization_ref', ref: authRef };
   }
 
   const parseErr = {};
@@ -404,28 +419,26 @@ export async function evaluateAuthorization(job, identityResult, trustResult, ct
         provider: providerName,
       };
     }
-    if (provider) {
-      try {
-        const result = await provider.authorize(
-          { policy: blob, identity: identityResult, trust: trustResult, ref: blobRef, jobId: job.id },
-          { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
-        );
-        return {
-          decision: result.decision || 'deny',
-          reason: result.reason || `provider ${providerName} returned ${result.decision}`,
-          ref: blobRef,
-          source: 'provider',
-          provider: providerName,
-        };
-      } catch (err) {
-        return {
-          decision: 'deny',
-          reason: `authorization provider error: ${err.message}`,
-          ref: blobRef,
-          source: 'provider-error',
-          provider: providerName,
-        };
-      }
+    try {
+      const result = await provider.authorize(
+        { policy: blob, identity: identityResult, trust: trustResult, ref: blobRef, jobId: job.id },
+        { env: ctx.env || process.env, cwd: ctx.cwd || process.cwd() },
+      );
+      return {
+        decision: result.decision || 'deny',
+        reason: result.reason || `provider ${providerName} returned ${result.decision}`,
+        ref: blobRef,
+        source: 'provider',
+        provider: providerName,
+      };
+    } catch (err) {
+      return {
+        decision: 'deny',
+        reason: `authorization provider error: ${err.message}`,
+        ref: blobRef,
+        source: 'provider-error',
+        provider: providerName,
+      };
     }
   }
 
@@ -511,10 +524,15 @@ export function generateEvidence(job, runResult, outcomes) {
     payloadSummary.outcome_fields_present = outcomeKeys;
   }
 
+  // Evidence records are currently metadata envelopes only. There is no
+  // cryptographic hash binding evidence to run output. The `integrity` field
+  // makes this explicit so consumers do not assume tamper-evidence guarantees.
+  // Content-addressable hashing is planned but not yet implemented.
   return {
     evidence_ref: effectiveRef,
     created_at: new Date().toISOString(),
-    hash: null, // actual content-addressable hashing is future work
+    hash: null,
+    integrity: 'none',
     payload_summary: payloadSummary,
   };
 }

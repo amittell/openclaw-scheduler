@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { readdir, stat as fsStat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -6,9 +6,32 @@ const identityProviders = new Map();
 const authorizationProviders = new Map();
 const proofVerifiers = new Map();
 
+/**
+ * Load provider plugins from a directory. Every *.js file is imported and
+ * its default export registered by type (identity / authorization / proof-verifier).
+ *
+ * TRUST BOUNDARY: This directory is dynamically imported at startup. Only
+ * point SCHEDULER_PROVIDER_PATH at operator-controlled directories. The loader
+ * refuses world-writable directories as a minimal safety net, but the
+ * primary defense is correct deployment configuration.
+ */
 export async function loadProviders(dirPath) {
   if (!dirPath) return;
   const absPath = resolve(dirPath);
+
+  // Trust boundary: provider plugins run arbitrary code in the scheduler process.
+  // Refuse to load from world-writable directories to prevent code injection.
+  try {
+    const dirStat = await fsStat(absPath);
+    if ((dirStat.mode & 0o002) !== 0) {
+      console.error(`[provider-registry] REFUSING to load providers: ${absPath} is world-writable (mode 0${(dirStat.mode & 0o777).toString(8)}). Fix permissions or use a trusted directory.`);
+      return;
+    }
+  } catch (err) {
+    console.error(`[provider-registry] Cannot stat provider directory ${absPath}: ${err.message}`);
+    return;
+  }
+
   const files = await readdir(absPath);
   const jsFiles = files.filter(f => f.endsWith('.js'));
 

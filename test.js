@@ -51,10 +51,10 @@ import { normalizeShellResult, extractShellResultFromRun } from './shell-result.
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
-  TRUST_LEVELS,
+  TRUST_LEVELS, compareTrustLevels,
 } from './v02-runtime.js';
 import { runShellCommand } from './dispatcher-shell.js';
-import { prepareDispatch, finalizeDispatch } from './dispatcher-strategies.js';
+import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence } from './dispatcher-strategies.js';
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
@@ -7650,12 +7650,13 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(await evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
   assert(await evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
 
-  // Ref only -> permit
+  // Ref only -> deny (external policy resolution not implemented, fail closed)
   const refOnlyAuth = await evaluateAuthorization(
     { authorization_ref: 'urn:authz:1' }, null, null
   );
-  assert(refOnlyAuth.decision === 'permit', 'evaluateAuthorization: ref-only -> permit');
+  assert(refOnlyAuth.decision === 'deny', 'evaluateAuthorization: ref-only -> deny (fail closed)');
   assert(refOnlyAuth.ref === 'urn:authz:1', 'evaluateAuthorization: ref-only ref');
+  assert(refOnlyAuth.reason.includes('not yet implemented'), 'evaluateAuthorization: ref-only reason explains why');
 
   // Explicit deny in policy
   const explicitDeny = await evaluateAuthorization(
@@ -8046,9 +8047,7 @@ console.log('\n── Shell env var injection ──');
   assert(shellResult.stdout.includes('hello_from_test'), 'runShellCommand: env vars passed to subprocess');
 }
 
-console.log('\n── prepareDispatch v0.2 gating ──');
-{
-  function buildPrepareDispatchDeps(overrides = {}) {
+function buildPrepareDispatchDeps(overrides = {}) {
     return {
       claimDispatch: () => true,
       releaseDispatch() {},
@@ -8084,13 +8083,16 @@ console.log('\n── prepareDispatch v0.2 gating ──');
       updateJobAfterRun() {},
       handleTriggeredChildren() {},
       dequeueJob: () => false,
+      compareTrustLevels,
       getIdentityProvider: () => null,
       getAuthorizationProvider: () => null,
       getProofVerifier: () => null,
       ...overrides,
     };
-  }
+}
 
+console.log('\n── prepareDispatch v0.2 gating ──');
+{
   const scalarIdentityJob = createJob({
     name: 'prepare-dispatch-scalar-identity',
     schedule_cron: '0 7 * * *',
@@ -8321,7 +8323,7 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   assert(downscopeRun.status === 'error', 'prepareDispatch: downscope trust failure finishes run as error');
   assert(downscopeTrust.effective_level === 'restricted', 'prepareDispatch: persisted trust evaluation reflects downscoped identity');
   assert(downscopeUpdateCalls === 1, 'prepareDispatch: early trust deny still updates job state');
-  assert(downscopeTriggered.length === 1 && downscopeTriggered[0][1] === 'error' && downscopeTriggered[0][3] === downscopeRun.id, 'prepareDispatch: early trust deny still triggers downstream failure hooks');
+  assert(downscopeTriggered.length === 0, 'prepareDispatch: security abort (trust deny) does not fire triggered children');
   getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(parentForDownscope.id, downscopeChild.id);
   deleteJob(downscopeChild.id);
   deleteJob(parentForDownscope.id);
@@ -8511,6 +8513,712 @@ console.log('\n── child_credential_policy validation ──');
     invalidThrew = true;
   }
   assert(invalidThrew, 'validateJobSpec rejects invalid child_credential_policy');
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: materialization failure aborts dispatch
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Materialization failure abort ──');
+{
+  const matFailJob = createJob({
+    name: 'prepare-dispatch-mat-fail',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not run',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mat-fail-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+
+  // Provider that resolves identity ok but materialize() throws
+  const matFailProvider = {
+    name: 'mat-fail-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'mat-fail-provider',
+          subject: { kind: 'service', principal: 'svc:mat-fail' },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'secret-123' } },
+        },
+      };
+    },
+    async materialize() {
+      throw new Error('materialization exploded');
+    },
+  };
+
+  const matFailCtx = await prepareDispatch(
+    getJob(matFailJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'mat-fail-provider' ? matFailProvider : null,
+      generateIdempotencyKey: () => 'idem-mat-fail',
+    }),
+  );
+  assert(matFailCtx === null, 'prepareDispatch: materialization throw aborts dispatch when presentation declared');
+  const matFailRun = getRunsForJob(matFailJob.id, 1)[0];
+  assert(matFailRun.status === 'error', 'prepareDispatch: materialization failure run status is error');
+  assert(matFailRun.error_message.includes('materialization exploded'), 'prepareDispatch: materialization failure error message preserved');
+
+  // Provider that returns materialized=false
+  const matFalseProvider = {
+    name: 'mat-false-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'mat-false-provider',
+          subject: { kind: 'service', principal: 'svc:mat-false' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    materialize() {
+      return { materialized: false };
+    },
+  };
+
+  const matFalseJob = createJob({
+    name: 'prepare-dispatch-mat-false',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not run either',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mat-false-provider',
+      scope: 'full',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+
+  const matFalseCtx = await prepareDispatch(
+    getJob(matFalseJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'mat-false-provider' ? matFalseProvider : null,
+      generateIdempotencyKey: () => 'idem-mat-false',
+    }),
+  );
+  assert(matFalseCtx === null, 'prepareDispatch: materialized=false aborts dispatch when presentation declared');
+  const matFalseRun = getRunsForJob(matFalseJob.id, 1)[0];
+  assert(matFalseRun.status === 'error', 'prepareDispatch: materialized=false run status is error');
+  assert(matFalseRun.error_message.includes('materialized=false'), 'prepareDispatch: materialized=false error message preserved');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(matFailJob.id, matFalseJob.id);
+  deleteJob(matFailJob.id);
+  deleteJob(matFalseJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: downscope happy path with real parent run
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Downscope happy path ──');
+{
+  const dsHappyProvider = {
+    name: 'ds-happy-provider',
+    type: 'identity',
+    resolveSession(request) {
+      const scope = request.scope || 'full';
+      return {
+        ok: true,
+        session: {
+          provider: 'ds-happy-provider',
+          subject: { kind: 'service', principal: `svc:${scope}` },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'secret' } },
+        },
+      };
+    },
+    prepareHandoff(parentSession, handoff) {
+      return {
+        prepared: true,
+        session: {
+          ...parentSession,
+          subject: { kind: 'service', principal: `svc:downscoped-${handoff.target_scope}` },
+          trust: { effective_level: 'supervised' },
+          credentials: { token: { value: 'downscoped-secret' } },
+        },
+      };
+    },
+    describeSession(session) {
+      const copy = JSON.parse(JSON.stringify(session));
+      if (copy.credentials?.token?.value) copy.credentials.token.value = '[REDACTED]';
+      return copy;
+    },
+  };
+
+  // Create parent with a completed run that has identity_resolved
+  const dsParent = createJob({
+    name: 'ds-happy-parent',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'ds-happy-provider', scope: 'full' }),
+  });
+  const parentRun = createRun(dsParent.id, { run_timeout_ms: 300_000 });
+  finishRun(parentRun.id, 'ok', { summary: 'parent completed' });
+  // Persist identity_resolved on the parent run (simulating what dispatch would do)
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: {
+      provider: 'ds-happy-provider',
+      session: {
+        provider: 'ds-happy-provider',
+        subject: { kind: 'service', principal: 'svc:full' },
+        trust: { effective_level: 'supervised' },
+        credentials: { token: { value: 'parent-secret' } },
+      },
+      source: 'provider',
+    },
+  });
+
+  const dsChild = createJob({
+    name: 'ds-happy-child',
+    parent_id: dsParent.id,
+    trigger_on: 'success',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ provider: 'ds-happy-provider', scope: 'payments' }),
+    child_credential_policy: 'downscope',
+  });
+
+  const dsCtx = await prepareDispatch(
+    getJob(dsChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'ds-happy-provider' ? dsHappyProvider : null,
+      generateIdempotencyKey: () => 'idem-ds-happy',
+    }),
+  );
+  assert(dsCtx !== null, 'prepareDispatch: downscope happy path succeeds');
+  assert(dsCtx.v02Outcomes.identity_resolved.principal === 'svc:downscoped-payments', 'prepareDispatch: downscope overrides identity with handoff session');
+  assert(dsCtx.v02Outcomes.identity_resolved.source === 'provider', 'prepareDispatch: downscope identity source is provider');
+
+  // Verify credentials are redacted in persisted outcomes
+  const dsRun = dsCtx.run;
+  persistV02Outcomes(dsRun.id, redactOutcomesForPersistence(dsCtx.v02Outcomes, {
+    getIdentityProvider: (name) => name === 'ds-happy-provider' ? dsHappyProvider : null,
+  }));
+  const persistedRun = getRun(dsRun.id);
+  const persistedIdentity = JSON.parse(persistedRun.identity_resolved);
+  assert(persistedIdentity.session.credentials.token.value === '[REDACTED]', 'prepareDispatch: downscope persisted credentials are redacted');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(dsParent.id, dsChild.id);
+  deleteJob(dsChild.id);
+  deleteJob(dsParent.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: downscope fails closed when parent session unavailable
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Downscope fail-closed ──');
+{
+  const dsFailProvider = {
+    name: 'ds-fail-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'ds-fail-provider',
+          subject: { kind: 'service', principal: 'svc:ds-fail' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    prepareHandoff() {
+      return { prepared: false, error: 'no parent session available' };
+    },
+  };
+
+  const dsFailParent = createJob({
+    name: 'ds-fail-parent',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'ds-fail-provider', scope: 'full' }),
+  });
+  // No parent run created -- parent session is unavailable
+
+  const dsFailChild = createJob({
+    name: 'ds-fail-child',
+    parent_id: dsFailParent.id,
+    trigger_on: 'success',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    identity: JSON.stringify({ provider: 'ds-fail-provider', scope: 'payments' }),
+    child_credential_policy: 'downscope',
+  });
+
+  const dsFailCtx = await prepareDispatch(
+    getJob(dsFailChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'ds-fail-provider' ? dsFailProvider : null,
+      generateIdempotencyKey: () => 'idem-ds-fail',
+    }),
+  );
+  assert(dsFailCtx === null, 'prepareDispatch: downscope fails closed when parent session unavailable');
+  const dsFailRun = getRunsForJob(dsFailChild.id, 1)[0];
+  assert(dsFailRun.status === 'error', 'prepareDispatch: downscope fail-closed run status is error');
+  assert(dsFailRun.error_message.includes('Downscope credential policy failed'), 'prepareDispatch: downscope fail-closed error message');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(dsFailParent.id, dsFailChild.id);
+  deleteJob(dsFailChild.id);
+  deleteJob(dsFailParent.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: escalate decision aborts dispatch
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Authorization escalate abort ──');
+{
+  const escalateJob = createJob({
+    name: 'prepare-dispatch-escalate',
+    schedule_cron: '0 11 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo escalate',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:escalate-test', trust_level: 'supervised' }),
+    authorization: JSON.stringify({ decision: 'escalate', reason: 'human review required' }),
+  });
+
+  const escalateCtx = await prepareDispatch(
+    getJob(escalateJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      generateIdempotencyKey: () => 'idem-escalate',
+    }),
+  );
+  assert(escalateCtx === null, 'prepareDispatch: escalate decision aborts dispatch');
+  const escalateRun = getRunsForJob(escalateJob.id, 1)[0];
+  assert(escalateRun.status === 'error', 'prepareDispatch: escalate run status is error');
+  assert(escalateRun.error_message.includes('escalation'), 'prepareDispatch: escalate error mentions escalation');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(escalateJob.id);
+  deleteJob(escalateJob.id);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Regression: credential redaction in persisted outcomes
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n── Credential redaction ──');
+{
+  const redactJob = createJob({
+    name: 'prepare-dispatch-redact',
+    schedule_cron: '0 12 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo redact',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'redact-provider', scope: 'full' }),
+  });
+
+  const redactProvider = {
+    name: 'redact-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'redact-provider',
+          subject: { kind: 'service', principal: 'svc:redact' },
+          trust: { effective_level: 'supervised' },
+          credentials: { api_key: { kind: 'bearer', value: 'sk_live_SHOULD_NOT_PERSIST' } },
+        },
+      };
+    },
+    describeSession(session) {
+      const copy = JSON.parse(JSON.stringify(session));
+      if (copy.credentials?.api_key?.value) copy.credentials.api_key.value = '[REDACTED]';
+      return copy;
+    },
+  };
+
+  const redactCtx = await prepareDispatch(
+    getJob(redactJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'redact-provider' ? redactProvider : null,
+      generateIdempotencyKey: () => 'idem-redact',
+    }),
+  );
+  assert(redactCtx !== null, 'prepareDispatch: redact test context created');
+
+  // Simulate what finalizeDispatch does: redact then persist
+  const redactedOutcomes = redactOutcomesForPersistence(redactCtx.v02Outcomes, {
+    getIdentityProvider: (name) => name === 'redact-provider' ? redactProvider : null,
+  });
+  persistV02Outcomes(redactCtx.run.id, redactedOutcomes);
+
+  const persistedRedactRun = getRun(redactCtx.run.id);
+  const persistedRedactIdentity = JSON.parse(persistedRedactRun.identity_resolved);
+  assert(persistedRedactIdentity.session.credentials.api_key.value === '[REDACTED]', 'credential redaction: live token replaced with [REDACTED]');
+  assert(!JSON.stringify(persistedRedactIdentity).includes('sk_live_SHOULD_NOT_PERSIST'), 'credential redaction: raw token not present in persisted data');
+
+  // Also test redaction without describeSession (falls back to credential stripping)
+  const noDescribeProvider = {
+    name: 'no-describe-provider',
+    type: 'identity',
+  };
+  const outcomesWithCreds = {
+    identity_resolved: {
+      provider: 'no-describe-provider',
+      session: {
+        credentials: { secret: { value: 'raw-secret' } },
+      },
+      source: 'provider',
+    },
+  };
+  const strippedOutcomes = redactOutcomesForPersistence(outcomesWithCreds, {
+    getIdentityProvider: (name) => name === 'no-describe-provider' ? noDescribeProvider : null,
+  });
+  assert(strippedOutcomes.identity_resolved.session.credentials === undefined, 'credential redaction: fallback strips credentials key when no describeSession');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(redactJob.id);
+  deleteJob(redactJob.id);
+}
+
+// ── compareTrustLevels ──
+
+console.log('\n── compareTrustLevels ──');
+{
+  assert(compareTrustLevels('untrusted', 'autonomous') === -1, 'compareTrustLevels: untrusted < autonomous');
+  assert(compareTrustLevels('autonomous', 'untrusted') === 1, 'compareTrustLevels: autonomous > untrusted');
+  assert(compareTrustLevels('supervised', 'supervised') === 0, 'compareTrustLevels: equal levels return 0');
+  assert(compareTrustLevels(null, null) === 0, 'compareTrustLevels: both null returns 0');
+  assert(compareTrustLevels('restricted', 'supervised') === -1, 'compareTrustLevels: restricted < supervised');
+  assert(compareTrustLevels('unknown', 'untrusted') === -1, 'compareTrustLevels: unrecognized < known');
+}
+
+// ── authorization_ref-only denial ──
+
+console.log('\n── authorization_ref-only denial ──');
+{
+  const refOnlyResult = await evaluateAuthorization(
+    { authorization: null, authorization_ref: 'arn:aws:iam::123456789012:policy/Deny' },
+    null,
+    null,
+    {},
+  );
+  assert(refOnlyResult.decision === 'deny', 'authorization_ref-only: decision is deny');
+  assert(refOnlyResult.reason.includes('not yet implemented'), 'authorization_ref-only: reason mentions not implemented');
+}
+
+// ── independent child trust cap ──
+
+console.log('\n── independent child trust cap ──');
+{
+  const parentJob = createJob({
+    name: 'trust-cap-parent',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'test-provider', trust_level: 'supervised' }),
+    child_credential_policy: 'independent',
+  });
+
+  const childJob = createJob({
+    name: 'trust-cap-child',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: parentJob.id,
+    trigger_on: 'success',
+    child_credential_policy: 'independent',
+    identity_trust_level: 'autonomous',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:escalating-child',
+  });
+
+  const childCtx = await prepareDispatch(
+    getJob(childJob.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(childCtx === null, 'independent trust cap: child with higher trust than parent is aborted');
+  const childRun = getRunsForJob(childJob.id, 1)[0];
+  assert(childRun.status === 'error', 'independent trust cap: run finishes as error');
+  assert(childRun.error_message.includes('exceeds parent trust level'), 'independent trust cap: error mentions trust escalation');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(childJob.id);
+  deleteJob(childJob.id);
+  deleteJob(parentJob.id);
+}
+
+// ── independent child within trust cap passes ──
+
+console.log('\n── independent child within trust cap passes ──');
+{
+  const parentJobOk = createJob({
+    name: 'trust-cap-parent-ok',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'test-provider', trust_level: 'autonomous' }),
+    child_credential_policy: 'independent',
+  });
+
+  const childJobOk = createJob({
+    name: 'trust-cap-child-ok',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child ok',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: parentJobOk.id,
+    trigger_on: 'success',
+    child_credential_policy: 'independent',
+    identity_trust_level: 'supervised',
+    identity_subject_kind: 'agent',
+    identity_principal: 'agent:ok-child',
+  });
+
+  const childCtxOk = await prepareDispatch(
+    getJob(childJobOk.id),
+    {},
+    buildPrepareDispatchDeps(),
+  );
+  assert(childCtxOk !== null, 'independent trust cap: child within parent trust level proceeds');
+  if (childCtxOk) finishRun(childCtxOk.run.id, 'cancelled', { summary: 'test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(childJobOk.id);
+  deleteJob(childJobOk.id);
+  deleteJob(parentJobOk.id);
+}
+
+// ── downscope trust elevation detection ──
+
+console.log('\n── downscope trust elevation detection ──');
+{
+  // Create a provider that returns a session with HIGHER trust than parent
+  const elevatingProvider = {
+    name: 'elevating-provider',
+    type: 'identity',
+    resolveSession() {
+      return { ok: true, session: { subject: { kind: 'agent', principal: 'agent:child' }, trust: { effective_level: 'supervised' }, credentials: {} } };
+    },
+    prepareHandoff(_parentSession, _opts) {
+      // Return a session that elevates trust from supervised to autonomous
+      return {
+        prepared: true,
+        session: {
+          subject: { kind: 'agent', principal: 'agent:elevated' },
+          trust: { effective_level: 'autonomous' },
+          credentials: {},
+        },
+      };
+    },
+  };
+
+  const dsParent = createJob({
+    name: 'ds-elevate-parent',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo parent',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'elevating-provider', trust_level: 'supervised' }),
+    child_credential_policy: 'downscope',
+  });
+
+  // Create a parent run with an identity_resolved so downscope can read it
+  const parentRun = createRun(dsParent.id, { run_timeout_ms: 300_000 });
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: JSON.stringify({
+      provider: 'elevating-provider',
+      session: { subject: { kind: 'agent', principal: 'agent:parent' }, trust: { effective_level: 'supervised' }, credentials: {} },
+      source: 'provider',
+    }),
+  });
+  finishRun(parentRun.id, 'ok', { summary: 'parent ok' });
+
+  const dsChild = createJob({
+    name: 'ds-elevate-child',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo child',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    parent_id: dsParent.id,
+    trigger_on: 'success',
+    child_credential_policy: 'downscope',
+    identity: JSON.stringify({ provider: 'elevating-provider', scope: 'narrow' }),
+  });
+
+  const dsChildCtx = await prepareDispatch(
+    getJob(dsChild.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: (name) => name === 'elevating-provider' ? elevatingProvider : null,
+    }),
+  );
+  assert(dsChildCtx === null, 'downscope elevation: child with elevated trust from handoff is aborted');
+  const dsChildRun = getRunsForJob(dsChild.id, 1)[0];
+  assert(dsChildRun.status === 'error', 'downscope elevation: run finishes as error');
+  assert(dsChildRun.error_message.includes('Downscope credential policy failed'), 'downscope elevation: error mentions downscope failure');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(dsChild.id);
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(dsParent.id);
+  deleteJob(dsChild.id);
+  deleteJob(dsParent.id);
+}
+
+// ── security abort skips triggered children ──
+
+console.log('\n── security abort skips triggered children ──');
+{
+  let childrenFired = false;
+  const secAbortJob = createJob({
+    name: 'sec-abort-no-children',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo should not dispatch',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({ provider: 'missing-sec-provider', scope: 'full' }),
+    authorization: JSON.stringify({ requires_identity: true }),
+  });
+
+  await prepareDispatch(
+    getJob(secAbortJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      handleTriggeredChildren() { childrenFired = true; },
+    }),
+  );
+  assert(!childrenFired, 'security abort: handleTriggeredChildren not called on identity resolution failure');
+
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(secAbortJob.id);
+  deleteJob(secAbortJob.id);
+}
+
+// ── evidence integrity field ──
+
+console.log('\n── evidence integrity field ──');
+{
+  const evidence = generateEvidence(
+    { evidence: JSON.stringify({ collect: 'all' }) },
+    { id: 'run-123', status: 'ok' },
+    { identity_resolved: { principal: 'test' } },
+  );
+  assert(evidence !== null, 'evidence: generated from valid job');
+  assert(evidence.integrity === 'none', 'evidence: integrity field is "none"');
+  assert(evidence.hash === null, 'evidence: hash is null');
+}
+
+// ── persistV02Outcomes guards ──
+
+console.log('\n── persistV02Outcomes guards ──');
+{
+  // Null runId should no-op
+  persistV02Outcomes(null, { identity_resolved: 'test' });
+  persistV02Outcomes('', { identity_resolved: 'test' });
+  persistV02Outcomes(undefined, { identity_resolved: 'test' });
+  // If we got here without throwing, the guard works
+  assert(true, 'persistV02Outcomes: null/empty/undefined runId no-ops safely');
+}
+
+// ── getStaleRuns type guard ──
+
+console.log('\n── getStaleRuns type guard ──');
+{
+  let threwOnString = false;
+  try {
+    getStaleRuns('not-a-number');
+  } catch (e) {
+    threwOnString = e.message.includes('non-negative integer');
+  }
+  assert(threwOnString, 'getStaleRuns: rejects non-integer string');
+
+  let threwOnNegative = false;
+  try {
+    getStaleRuns(-1);
+  } catch (e) {
+    threwOnNegative = e.message.includes('non-negative integer');
+  }
+  assert(threwOnNegative, 'getStaleRuns: rejects negative integer');
+
+  let threwOnFloat = false;
+  try {
+    getStaleRuns(1.5);
+  } catch (e) {
+    threwOnFloat = e.message.includes('non-negative integer');
+  }
+  assert(threwOnFloat, 'getStaleRuns: rejects non-integer float');
+
+  // Valid call should not throw
+  const staleRuns = getStaleRuns(90);
+  assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
 }
 
 closeDb();
