@@ -687,8 +687,12 @@ async function cmdEnqueue(flags) {
   // that will be delivered to the inbox consumer (and ultimately Telegram).
   const schedulerCliPath = join(__dirname, '..', 'cli.js');
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
-  // NOTE: CHECKPOINT_NOTIFY_CMD env-var injection into child process is not yet
-  // wired. The command is currently injected into the prompt text (line ~714).
+  // TODO: Inject CHECKPOINT_NOTIFY_CMD as an env var into the agent session so
+  // agents can discover the checkpoint command programmatically (not just from
+  // the prompt text at line ~714). Depends on the gateway implementing the
+  // x-openclaw-env-inject receiver (PR #5 sends the header, gateway ignores it
+  // until receiver support lands). Once available, pass it alongside materialized
+  // credentials via the env-inject header in the gatewayCall('agent', ...) below.
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
