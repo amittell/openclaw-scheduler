@@ -37,3 +37,8 @@ jobs:
 
       - name: Smoke verification
         run: npm run verify:smoke
+
+      - name: Test suite
+        run: node test.js
+        env:
+          SCHEDULER_DB: ':memory:'

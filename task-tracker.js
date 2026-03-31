@@ -1,8 +1,8 @@
-// Task Tracker — dead-man's-switch monitoring for sub-agent teams
+// Task Tracker -- dead-man's-switch monitoring for sub-agent teams
 import { getDb } from './db.js';
 import { randomUUID } from 'crypto';
 
-// ── Helpers ─────────────────────────────────────────────────
+// -- Helpers -------------------------------------------------
 function sqliteNow() {
   return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
 }
@@ -13,7 +13,7 @@ function parseSqliteDate(s) {
   return new Date(normalized.endsWith('Z') ? normalized : normalized + 'Z');
 }
 
-// ── Create a new tracked task group ─────────────────────────
+// -- Create a new tracked task group -------------------------
 /**
  * @param {object} opts
  * @param {string} opts.name - Human label e.g. "v5-agent-team"
@@ -52,7 +52,7 @@ export function createTaskGroup({ name, expectedAgents, timeoutS = 600, createdB
   return { id, name, status: 'active', created_at: now, created_by: createdBy, agents };
 }
 
-// ── Get task group by id ────────────────────────────────────
+// -- Get task group by id ------------------------------------
 /**
  * @param {string} id
  * @returns {object|undefined}
@@ -62,7 +62,7 @@ export function getTaskGroup(id) {
   return db.prepare('SELECT * FROM task_tracker WHERE id = ?').get(id);
 }
 
-// ── List active task groups ─────────────────────────────────
+// -- List active task groups ---------------------------------
 /**
  * @returns {object[]}
  */
@@ -71,7 +71,7 @@ export function listActiveTaskGroups() {
   return db.prepare("SELECT * FROM task_tracker WHERE status = 'active' ORDER BY created_at DESC").all();
 }
 
-// ── Agent reports it started ────────────────────────────────
+// -- Agent reports it started --------------------------------
 /**
  * @param {string} trackerId
  * @param {string} agentLabel
@@ -87,10 +87,10 @@ export function agentStarted(trackerId, agentLabel, sessionKey) {
   `).run(now, now, sessionKey || null, trackerId, agentLabel);
 }
 
-// ── Register session key (orchestrator sets this after spawning) ──
+// -- Register session key (orchestrator sets this after spawning) --
 /**
  * Link an OpenClaw session key to a tracker agent.
- * The dispatcher uses this for auto-correlation — sub-agents don't
+ * The dispatcher uses this for auto-correlation -- sub-agents don't
  * need to actively heartbeat; the dispatcher detects them via sessions_list.
  * @param {string} trackerId
  * @param {string} agentLabel
@@ -108,7 +108,7 @@ export function registerAgentSession(trackerId, agentLabel, sessionKey) {
   `).run(sessionKey, now, now, trackerId, agentLabel);
 }
 
-// ── Touch heartbeat (called by auto-correlation) ────────────
+// -- Touch heartbeat (called by auto-correlation) ------------
 /**
  * @param {string} trackerId
  * @param {string} agentLabel
@@ -125,7 +125,7 @@ export function touchAgentHeartbeat(trackerId, agentLabel) {
   `).run(now, now, trackerId, agentLabel);
 }
 
-// ── Agent reports completion ────────────────────────────────
+// -- Agent reports completion --------------------------------
 /**
  * @param {string} trackerId
  * @param {string} agentLabel
@@ -141,7 +141,7 @@ export function agentCompleted(trackerId, agentLabel, exitMessage) {
   `).run(now, exitMessage || null, trackerId, agentLabel);
 }
 
-// ── Agent reports failure ───────────────────────────────────
+// -- Agent reports failure -----------------------------------
 /**
  * @param {string} trackerId
  * @param {string} agentLabel
@@ -157,7 +157,7 @@ export function agentFailed(trackerId, agentLabel, error) {
   `).run(now, error || null, trackerId, agentLabel);
 }
 
-// ── Check for dead agents (timeout exceeded) ────────────────
+// -- Check for dead agents (timeout exceeded) ----------------
 /**
  * Find agents with status IN ('pending','running') whose tracker has timed out.
  * An agent is NOT dead if it sent a heartbeat within the last 5 minutes
@@ -169,7 +169,7 @@ export function checkDeadAgents() {
   const now = sqliteNow();
 
   // Find agents in active trackers that have exceeded timeout
-  // BUT: spare agents with a recent heartbeat (within 5 min) — they're still alive
+  // BUT: spare agents with a recent heartbeat (within 5 min) -- they're still alive
   const deadAgents = db.prepare(`
     SELECT a.id as agent_id, a.tracker_id, a.agent_label, a.status as agent_status,
            t.timeout_s, t.created_at as tracker_created_at
@@ -202,7 +202,7 @@ export function checkDeadAgents() {
   return deadAgents;
 }
 
-// ── Check if all agents in a group are done ─────────────────
+// -- Check if all agents in a group are done -----------------
 /**
  * If all agents are in terminal state (completed/failed/dead), mark the tracker.
  * Status = 'completed' if all succeeded, 'failed' if any failed/dead.
@@ -246,7 +246,7 @@ export function checkGroupCompletion(trackerId) {
   return { ...tracker, status: groupStatus, completed_at: now, summary };
 }
 
-// ── Get status summary for a task group ─────────────────────
+// -- Get status summary for a task group ---------------------
 /**
  * @param {string} trackerId
  * @returns {{ name: string, status: string, agents: Array<{label: string, status: string, duration: number|null, exit_message?: string, error?: string}>, elapsed: number, remaining_timeout: number }}

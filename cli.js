@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Scheduler CLI — manage jobs, runs, messages, agents
+// Scheduler CLI -- manage jobs, runs, messages, agents
 import { readFileSync } from 'fs';
 import { initDb, getDb } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
@@ -30,7 +30,7 @@ Jobs:
   jobs get <id>                      Get job details
   jobs add <json> [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
                                      Add a job (--watchdog sets defaults for watchdog type)
-                                     run_timeout_ms is REQUIRED (no default — prevents indefinite runs)
+                                     run_timeout_ms is REQUIRED (no default -- prevents indefinite runs)
                                      --at: one-shot schedule, e.g. '2026-03-10T16:47:00-04:00'
                                      --in: one-shot sugar, e.g. '15m', '2h', '30s', '1d'
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')
@@ -147,7 +147,7 @@ function fail(message, code = 1) {
 }
 
 switch (command) {
-  // ── Jobs ────────────────────────────────────────────────
+  // -- Jobs ------------------------------------------------
   case 'jobs':
     switch (sub) {
       case 'list': {
@@ -159,7 +159,7 @@ switch (command) {
           jobs = jobs.filter(j => (j.job_type || 'standard') === typeFilter);
         }
         const rows = jobs.map(j => ({
-          id: j.id.slice(0, 8) + '…',
+          id: j.id.slice(0, 8) + '..',
           name: j.name,
           type: j.job_type || 'standard',
           kind: j.schedule_kind || 'cron',
@@ -168,7 +168,7 @@ switch (command) {
           agent: j.agent_id || 'main',
           target: j.session_target,
           guarantee: j.delivery_guarantee || 'at-most-once',
-          parent: j.parent_id ? j.parent_id.slice(0, 8) + '…' : '-',
+          parent: j.parent_id ? j.parent_id.slice(0, 8) + '..' : '-',
           trigger: j.trigger_on || '-',
           ...(j.job_type === 'watchdog' ? { watchdog: j.watchdog_target_label || '-' } : {}),
           nextRun: j.next_run_at,
@@ -200,13 +200,13 @@ switch (command) {
           };
         }
         function printTree(job, indent = '') {
-          const status = job.enabled ? '✅' : '⬚';
+          const status = job.enabled ? '[on]' : '[ ]';
           const trigger = job.trigger_on ? ` [on:${job.trigger_on}]` : '';
           const delay = job.trigger_delay_s ? ` (+${job.trigger_delay_s}s)` : '';
           console.log(`${indent}${status} ${job.name} (${job.agent_id || 'main'})${trigger}${delay}`);
           const children = childMap[job.id] || [];
           for (const child of children) {
-            printTree(child, indent + '  ├─ ');
+            printTree(child, indent + '  |- ');
           }
         }
         emit(roots.map(treeNode), () => {
@@ -293,7 +293,7 @@ switch (command) {
         const id = args.find(a => !a.startsWith('--'));
         if (!id) fail('Usage: jobs cancel <id> [--no-cascade]');
         const cancelled = cancelJob(id, { cascade: !noCascade });
-        emit({ ok: true, cancelled }, `Cancelled ${cancelled.length} job(s): ${cancelled.map(c => c.slice(0, 8) + '…').join(', ')}`);
+        emit({ ok: true, cancelled }, `Cancelled ${cancelled.length} job(s): ${cancelled.map(c => c.slice(0, 8) + '..').join(', ')}`);
         break;
       }
       case 'update': {
@@ -347,7 +347,7 @@ switch (command) {
         }
         emit(
           { ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'rejected', reason },
-          `Rejected: ${approval.job_id}${reason ? ' — ' + reason : ''}`
+          `Rejected: ${approval.job_id}${reason ? ' -- ' + reason : ''}`
         );
         break;
       }
@@ -355,7 +355,7 @@ switch (command) {
     }
     break;
 
-  // ── Runs ────────────────────────────────────────────────
+  // -- Runs ------------------------------------------------
   case 'runs':
     switch (sub) {
       case 'list': {
@@ -429,7 +429,7 @@ switch (command) {
     }
     break;
 
-  // ── Messages ────────────────────────────────────────────
+  // -- Messages --------------------------------------------
   case 'msg':
     switch (sub) {
       case 'send': {
@@ -497,7 +497,7 @@ switch (command) {
         const msgs = getThread(args[0]);
         emit(msgs, () => {
           for (const m of msgs) {
-            console.log(`[${m.from_agent} → ${m.to_agent}] (${m.status}) ${m.created_at}`);
+            console.log(`[${m.from_agent} -> ${m.to_agent}] (${m.status}) ${m.created_at}`);
             console.log(`  ${(m.body || '').slice(0, 200)}`);
             console.log();
           }
@@ -538,7 +538,7 @@ switch (command) {
     }
     break;
 
-  // ── Queue ────────────────────────────────────────────────
+  // -- Queue ------------------------------------------------
   case 'queue':
     switch (sub) {
       case 'list':
@@ -578,7 +578,7 @@ switch (command) {
     }
     break;
 
-  // ── Agents ──────────────────────────────────────────────
+  // -- Agents ----------------------------------------------
   case 'agents':
     switch (sub) {
       case 'list': {
@@ -604,7 +604,7 @@ switch (command) {
     }
     break;
 
-  // ── Tasks ────────────────────────────────────────────────
+  // -- Tasks ------------------------------------------------
   case 'tasks':
     switch (sub) {
       case 'list': {
@@ -620,7 +620,7 @@ switch (command) {
             agents = [];
           }
           return {
-            id: g.id.slice(0, 8) + '…',
+            id: g.id.slice(0, 8) + '..',
             name: g.name,
             agents: `${status.agents.filter(a => a.status === 'completed').length}/${agents.length}`,
             status: g.status,
@@ -641,10 +641,10 @@ switch (command) {
           console.log(`Elapsed:    ${status.elapsed}s / ${status.remaining_timeout + status.elapsed}s timeout`);
           console.log(`\nAgents:`);
           for (const a of status.agents) {
-            const icon = a.status === 'completed' ? '✅' : a.status === 'failed' ? '❌' : a.status === 'dead' ? '💀' : a.status === 'running' ? '🔄' : '⬜';
+            const icon = a.status === 'completed' ? '[ok]' : a.status === 'failed' ? '[FAIL]' : a.status === 'dead' ? '[DEAD]' : a.status === 'running' ? '[..]' : '[ ]';
             const dur = a.duration != null ? ` (${a.duration}s)` : '';
             const detail = a.exit_message || a.error || '';
-            console.log(`  ${icon} ${a.label}: ${a.status}${dur}${detail ? ' — ' + detail : ''}`);
+            console.log(`  ${icon} ${a.label}: ${a.status}${dur}${detail ? ' -- ' + detail : ''}`);
           }
           if (status.summary) {
             console.log(`\nSummary:\n${status.summary}`);
@@ -667,7 +667,7 @@ switch (command) {
         ).all(limit);
         if (groups.length === 0) { emit([], 'No completed task groups'); break; }
         const rows = groups.map(g => ({
-          id: g.id.slice(0, 8) + '…',
+          id: g.id.slice(0, 8) + '..',
           name: g.name,
           status: g.status,
           completed: g.completed_at,
@@ -677,7 +677,7 @@ switch (command) {
         break;
       }
 
-      // ── tasks heartbeat ──────────────────────────────────
+      // -- tasks heartbeat ----------------------------------
       // Called BY sub-agents during execution to report status.
       // Usage: tasks heartbeat <trackerId> <agentLabel> running|completed|failed [message]
       case 'heartbeat': {
@@ -704,7 +704,7 @@ switch (command) {
         break;
       }
 
-      // ── tasks register-session ────────────────────────────
+      // -- tasks register-session ----------------------------
       // Called BY the orchestrator after spawning a sub-agent.
       // Links the sub-agent's OC session key to the tracker agent so
       // the dispatcher can auto-detect heartbeats without CLI calls.
@@ -724,7 +724,7 @@ switch (command) {
     }
     break;
 
-  // ── Approvals ──────────────────────────────────────────────
+  // -- Approvals ----------------------------------------------
   case 'approvals':
     switch (sub) {
       case 'list':
@@ -747,7 +747,7 @@ switch (command) {
     }
     break;
 
-  // ── Idempotency ────────────────────────────────────────
+  // -- Idempotency ----------------------------------------
   case 'idem': {
     const { listIdempotencyForJob, getIdempotencyEntry, releaseIdempotencyKey, forcePruneIdempotency } = await import('./idempotency.js');
     switch (sub) {
@@ -756,8 +756,8 @@ switch (command) {
         const entries = listIdempotencyForJob(args[0]);
         if (entries.length === 0) { emit([], 'No idempotency entries for this job'); break; }
         const rows = entries.map(e => ({
-          key: e.key.slice(0, 12) + '…',
-          run: (e.run_id?.slice(0, 8) || '-') + '…',
+          key: e.key.slice(0, 12) + '..',
+          run: (e.run_id?.slice(0, 8) || '-') + '..',
           status: e.status,
           claimed: e.claimed_at,
           released: e.released_at || '-',
@@ -780,7 +780,7 @@ switch (command) {
         if (!before) fail('Key not found in ledger');
         if (before.status === 'released') { emit({ ok: true, key: args[0], already_released: true }, 'Key already released'); break; }
         releaseIdempotencyKey(args[0]);
-        emit({ ok: true, key: args[0], released: true }, `Released idempotency key: ${args[0].slice(0, 12)}…`);
+        emit({ ok: true, key: args[0], released: true }, `Released idempotency key: ${args[0].slice(0, 12)}..`);
         break;
       }
       case 'prune': {
@@ -793,7 +793,7 @@ switch (command) {
     break;
   }
 
-  // ── Team Adapter ───────────────────────────────────────
+  // -- Team Adapter ---------------------------------------
   case 'team': {
     const {
       mapTeamMessages, listTeamTasks, listTeamMailboxEvents,
@@ -815,7 +815,7 @@ switch (command) {
           task: t.id,
           member: t.member_id || '-',
           status: t.status,
-          gateTracker: t.gate_tracker_id ? t.gate_tracker_id.slice(0, 8) + '…' : '-',
+          gateTracker: t.gate_tracker_id ? t.gate_tracker_id.slice(0, 8) + '..' : '-',
           gateStatus: t.gate_status || '-',
           updated: t.updated_at,
           completed: t.completed_at || '-',
@@ -877,7 +877,7 @@ switch (command) {
     break;
   }
 
-  // ── Aliases ─────────────────────────────────────────────
+  // -- Aliases ---------------------------------------------
   case 'alias': {
     const db = getDb();
     switch (sub) {
@@ -901,7 +901,7 @@ switch (command) {
         const description = descParts.length > 0 ? descParts.join(' ') : null;
         db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
           .run(name, channel, target, description);
-        emit({ ok: true, alias: name, channel, target, description }, `Added alias: ${name} → ${channel}/${target}`);
+        emit({ ok: true, alias: name, channel, target, description }, `Added alias: ${name} -> ${channel}/${target}`);
         break;
       }
       case 'remove': {
@@ -916,7 +916,7 @@ switch (command) {
     break;
   }
 
-  // ── Status ──────────────────────────────────────────────
+  // -- Status ----------------------------------------------
   case 'status': {
     const db = getDb();
     const jobs = listJobs();
@@ -1009,7 +1009,7 @@ switch (command) {
     break;
   }
 
-  // ── Capabilities ────────────────────────────────────────
+  // -- Capabilities ----------------------------------------
   case 'capabilities': {
     const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
     const schemaVersion = getDb().prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;

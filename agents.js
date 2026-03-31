@@ -1,4 +1,4 @@
-// Agent registry — track agent status and capabilities
+// Agent registry -- track agent status and capabilities
 import { getDb } from './db.js';
 
 /**

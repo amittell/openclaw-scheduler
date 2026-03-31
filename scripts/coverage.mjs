@@ -59,7 +59,7 @@ const lcovPath = resolve(reportsDir, 'lcov.info');
 const GLOBAL_THRESHOLDS = {
   statements: 42,
   branches: 63,   // dispatch/ watcher + index watchdog paths are only partly integration-tested
-  functions: 73,  // _gatewayToolInvoke and several watcher internals are untested — raise as coverage grows
+  functions: 73,  // _gatewayToolInvoke and several watcher internals are untested -- raise as coverage grows
   lines: 42,
 };
 const CRITICAL_THRESHOLDS = {

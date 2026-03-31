@@ -1,4 +1,4 @@
-// Gateway API client — independent dispatch via chat completions + system events
+// Gateway API client -- independent dispatch via chat completions + system events
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { homedir } from 'os';
@@ -38,7 +38,7 @@ function authHeaders(scopes = null) {
     : {};
 }
 
-// ── Chat Completions (independent dispatch) ─────────────────
+// -- Chat Completions (independent dispatch) -----------------
 
 /**
  * Run an agent turn via the OpenAI-compatible chat completions endpoint.
@@ -144,13 +144,13 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const controller = new AbortController();
   let abortReason = null;
 
-  // Hard absolute ceiling — always fires regardless of activity
+  // Hard absolute ceiling -- always fires regardless of activity
   const absoluteTimer = setTimeout(() => {
     abortReason = 'absolute_timeout';
     controller.abort();
   }, absoluteTimeoutMs);
 
-  // Track last known activity time (initialised to now — grace period for startup)
+  // Track last known activity time (initialised to now -- grace period for startup)
   let lastSeenActivity = Date.now();
 
   const checkActivity = async () => {
@@ -173,19 +173,19 @@ export async function runAgentTurnWithActivityTimeout(opts) {
           ? matched.updatedAt
           : new Date(matched.updatedAt).getTime();
         if (ts > lastSeenActivity) {
-          lastSeenActivity = ts;           // activity advanced → reset
+          lastSeenActivity = ts;           // activity advanced -> reset
         }
       }
 
       // Check total continuous idle time
       const idleDuration = Date.now() - lastSeenActivity;
       if (idleDuration >= idleTimeoutMs * 2) {
-        // Two full idle windows elapsed — session is truly idle
+        // Two full idle windows elapsed -- session is truly idle
         abortReason = 'idle_timeout';
         controller.abort();
       }
     } catch {
-      // Monitoring failure — don't abort on transient errors
+      // Monitoring failure -- don't abort on transient errors
     }
   };
 
@@ -228,7 +228,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       if (abortReason === 'idle_timeout') {
         throw new Error(
-          `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s — aborted (activity-based timeout)`,
+          `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s -- aborted (activity-based timeout)`,
           { cause: err }
         );
       }
@@ -246,7 +246,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   }
 }
 
-// ── System Events (main session) ────────────────────────────
+// -- System Events (main session) ----------------------------
 
 /**
  * Send a system event to the main session.
@@ -271,7 +271,7 @@ export async function sendSystemEvent(text, mode = 'now') {
   }
 }
 
-// ── Tools Invoke (for session listing, messages) ────────────
+// -- Tools Invoke (for session listing, messages) ------------
 
 /**
  * Invoke a tool via the Gateway's /tools/invoke endpoint.
@@ -306,19 +306,19 @@ export async function listSessions(opts = {}) {
     ...(opts.activeMinutes ? { activeMinutes: opts.activeMinutes } : {}),
     ...(opts.limit       ? { limit: opts.limit }       : {}),
     ...(opts.kinds       ? { kinds: opts.kinds }       : {}),
-    messageLimit: 0,   // don't fetch message history — we only need session metadata
+    messageLimit: 0,   // don't fetch message history -- we only need session metadata
   });
 }
 
 /**
  * Fetch ALL active sub-agent sessions across every requester.
- * Uses the gateway token's admin view — not scoped to a single session.
+ * Uses the gateway token's admin view -- not scoped to a single session.
  * Returns an array of session objects (keys like "agent:*:subagent:*").
  */
 export async function getAllSubAgentSessions(activeMinutes = 10) {
   try {
     const result = await listSessions({ kinds: ['subagent'], activeMinutes, limit: 200 });
-    // Gateway returns { sessions: [...] } or similar — normalise to array
+    // Gateway returns { sessions: [...] } or similar -- normalise to array
     const raw = result?.sessions || result?.result?.sessions || result || [];
     return Array.isArray(raw) ? raw : [];
   } catch {
@@ -427,7 +427,7 @@ export async function checkGatewayHealth() {
 /**
  * Wait for the gateway to become reachable, polling at intervals.
  * Returns true if the gateway responded within the timeout, false otherwise.
- * Any HTTP response (even non-200) counts as "up" — we just need TCP connectivity.
+ * Any HTTP response (even non-200) counts as "up" -- we just need TCP connectivity.
  *
  * @param {number} timeoutMs  - Maximum time to wait (default 30s)
  * @param {number} intervalMs - Polling interval (default 2s)
@@ -444,7 +444,7 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
       try { await resp.body?.cancel(); } catch {}
       return true; // Any response means gateway is up
     } catch {
-      // Not up yet — wait and retry
+      // Not up yet -- wait and retry
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       await new Promise(r => setTimeout(r, Math.min(intervalMs, remaining)));

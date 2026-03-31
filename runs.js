@@ -126,10 +126,10 @@ export function updateRunSession(id, sessionKey, sessionId) {
  * Find stale runs: treats shell jobs and session-based jobs differently.
  *
  * - Session-based jobs (session_target != 'shell'): stale if last_heartbeat older than thresholdSeconds.
- *   These jobs emit heartbeats via gateway/session activity — silence means stuck.
+ *   These jobs emit heartbeats via gateway/session activity -- silence means stuck.
  * - Shell jobs (session_target = 'shell'): stale only if elapsed time > run_timeout_ms.
  *   Shell jobs have no heartbeat mechanism; they run until exit. Use timeout as the upper bound.
- *   Shell jobs with run_timeout_ms IS NULL are NOT flagged — that's getTimedOutRuns' concern.
+ *   Shell jobs with run_timeout_ms IS NULL are NOT flagged -- that's getTimedOutRuns' concern.
  *
  * Default threshold: 90 seconds (3 missed 30s heartbeats) for agent jobs.
  */

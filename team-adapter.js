@@ -1,4 +1,4 @@
-// Team adapter — map scheduler queue messages to team mailbox/task events.
+// Team adapter -- map scheduler queue messages to team mailbox/task events.
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { ackMessage } from './messages.js';
