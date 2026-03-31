@@ -206,6 +206,8 @@ const jobDispatches: DispatchRecord[] = dispatchQueue.listDispatchesForJob('job-
 
 // ---- gateway ----
 void gateway.TELEGRAM_MAX_MESSAGE_LENGTH;
+const envHeader: Record<string, string> = gateway.buildEnvInjectHeader({ API_TOKEN: 'token' });
+void envHeader['x-openclaw-env-inject'];
 const parts: string[] = gateway.splitMessageForChannel('telegram', 'hello');
 const alias = gateway.resolveDeliveryAlias('@owner_dm');
 if (alias) { void alias.channel; void alias.target; }
@@ -214,11 +216,17 @@ const waited: Promise<boolean> = gateway.waitForGateway(5000, 1000);
 
 // Async gateway functions (type-check only, not called)
 async function _gatewaySmoke() {
-  const turnResult: AgentTurnResult = await gateway.runAgentTurn({ message: 'hi' });
+  const turnResult: AgentTurnResult = await gateway.runAgentTurn({
+    message: 'hi',
+    materializedEnv: { API_TOKEN: 'token' },
+  });
   void turnResult.ok; void turnResult.content; void turnResult.usage; void turnResult.sessionKey;
 
   const activityResult: AgentTurnResult = await gateway.runAgentTurnWithActivityTimeout({
-    message: 'hi', idleTimeoutMs: 60000, absoluteTimeoutMs: 300000,
+    message: 'hi',
+    materializedEnv: { API_TOKEN: 'token' },
+    idleTimeoutMs: 60000,
+    absoluteTimeoutMs: 300000,
   });
   void activityResult.content;
 
