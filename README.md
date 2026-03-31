@@ -1835,9 +1835,12 @@ for the scheduler. It provides manifest authoring, validation, local execution,
 identity binding, and capability negotiation. The scheduler provides the durable
 runtime: scheduling, retries, approvals, delivery, and persistent state.
 
-You can use the scheduler without agentcli (create jobs directly via CLI), but
-using them together gives you declarative workflow manifests, stable job IDs,
-v0.2 identity/authorization/evidence support, and repeatable applies.
+The scheduler works without agentcli -- most jobs are created by the OpenClaw
+agent itself when a user requests a scheduled task via Telegram or another
+messaging channel, and operators can also create jobs directly via the CLI.
+Adding agentcli on top gives you declarative workflow manifests, stable job IDs,
+v0.2 identity/authorization/evidence support, and repeatable applies for
+workflows that outgrow ad-hoc job creation.
 
 ### Installing agentcli
 
