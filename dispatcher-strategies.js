@@ -1072,7 +1072,11 @@ export async function executeAgent(job, ctx, deps) {
     return result;
   }
 
-  const sessionKey = job.preferred_session_key || `scheduler:${job.id}:${ctx.run.id}`;
+  // Use a stable session key per job (not per run) so subsequent runs reuse
+  // the warm session. This avoids full agent bootstrap on every dispatch --
+  // memory search, plugin init, and context loading only happen on the first
+  // run. Later runs get a pre-warmed session with context already loaded.
+  const sessionKey = job.preferred_session_key || `scheduler:${job.id}`;
   updateRunSession(ctx.run.id, sessionKey, null);
 
   // Mark agent as busy
