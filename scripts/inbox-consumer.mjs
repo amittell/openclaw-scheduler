@@ -182,6 +182,8 @@ async function drainOnce(db, { to, channel, agentId, limit, brand }) {
     }
 
     try {
+      // Small delay between deliveries to avoid gateway rate/concurrency issues
+      if (delivered > 0) await new Promise(r => setTimeout(r, 1500));
       await deliverMessage(msgChannel, msgTarget, text);
       recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
       ackMessage(msg.id, 'inbox-consumer', `Delivered to ${msgChannel}:${msgTarget}`);
