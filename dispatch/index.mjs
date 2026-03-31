@@ -565,6 +565,13 @@ async function cmdEnqueue(flags) {
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   if (!Number.isFinite(timeoutS) || timeoutS <= 0) die('--timeout must be a positive integer', 2);
+  // Warn loudly when --timeout falls back to default — silent fallback caused hard-to-debug
+  // watcher kills: the flag parser silently drops flags that appear after a multiline --message
+  // value in shell heredocs. Operator should always pass --timeout explicitly.
+  if (!flags.timeout) {
+    process.stderr.write(`[${BRAND}] WARNING: --timeout not specified, defaulting to 300s. ` +
+      `Pass --timeout explicitly (≥1200 for thinking=high tasks) to avoid premature watcher kills.\n`);
+  }
   let origin = flags.origin || null;
 
   // Auto-detect origin from active sessions if not explicitly provided
@@ -821,6 +828,7 @@ async function cmdEnqueue(flags) {
         const watcherTimeoutS = timeoutS + 120;
         const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
+
         const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -835,7 +843,14 @@ async function cmdEnqueue(flags) {
           delivery_guarantee:       'at-least-once',
           ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
-          run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
+          // Shell job ceiling must cover the watcher's full legitimate runtime:
+          //   watcherTimeoutS (main poll deadline)
+          //   + FLAT_WINDOW_S (3min post-deadline activity window in watcher.mjs)
+          //   + FLAT_WINDOW_S (one mid-turn extension if getJsonlMidTurnReason fires)
+          //   + 60s (slop for scheduling jitter and process startup)
+          // Previous value of (watcherTimeoutS + 60) was structurally too small —
+          // it killed the watcher during the flat window before JSONL/token checks ran.
+          run_timeout_ms:           (watcherTimeoutS + 180 + 180 + 60) * 1000,
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
