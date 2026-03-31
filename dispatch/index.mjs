@@ -565,6 +565,13 @@ async function cmdEnqueue(flags) {
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   if (!Number.isFinite(timeoutS) || timeoutS <= 0) die('--timeout must be a positive integer', 2);
+  // Warn loudly when --timeout falls back to default -- silent fallback caused hard-to-debug
+  // watcher kills: the flag parser silently drops flags that appear after a multiline --message
+  // value in shell heredocs. Operator should always pass --timeout explicitly.
+  if (!flags.timeout) {
+    process.stderr.write(`[${BRAND}] WARNING: --timeout not specified, defaulting to 300s. ` +
+      `Pass --timeout explicitly (≥1200 for thinking=high tasks) to avoid premature watcher kills.\n`);
+  }
   let origin = flags.origin || null;
 
   // Auto-detect origin from active sessions if not explicitly provided
@@ -821,6 +828,7 @@ async function cmdEnqueue(flags) {
         const watcherTimeoutS = timeoutS + 120;
         const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
+
         const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -835,7 +843,15 @@ async function cmdEnqueue(flags) {
           delivery_guarantee:       'at-least-once',
           ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
-          run_timeout_ms:           (watcherTimeoutS + 60) * 1000,  // shell job timeout > watcher timeout
+          // Shell job ceiling must cover the watcher's maximum legitimate runtime.
+          // Two competing ceilings:
+          //   1. Initial: watcherTimeoutS + 2*FLAT_WINDOW + slop (sessions that don't extend)
+          //   2. Rolling: MAX_DEADLINE_EXTENSION + 2*FLAT_WINDOW + slop (sessions that extend via activity)
+          // The watcher can roll its deadline up to MAX_DEADLINE_EXTENSION (4h) when
+          // it detects activity (token growth or JSONL mtime advance). The scheduler
+          // must not SIGTERM the watcher before that cap is reached.
+          // Watcher constants (watcher.mjs): FLAT_WINDOW_MS=180_000, MAX_DEADLINE_EXTENSION=4h.
+          run_timeout_ms:           Math.max(watcherTimeoutS + 420, 4 * 3600 + 420) * 1000,
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
