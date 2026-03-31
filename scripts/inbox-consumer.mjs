@@ -70,10 +70,35 @@ function timeAgo(dateStr) {
 const DELIVERY_SENTINELS = ['HEARTBEAT_OK', 'NO_FLUSH', 'IDEMPOTENT_SKIP'];
 
 /**
- * Format a single message for user-facing delivery.
- * Strips debug metadata, sentinel tokens, and keeps it clean.
+ * Strip common shell output noise from delivery content:
+ * - "stdout:\n" prefix added by the shell strategy
+ * - Timestamped INFO log lines like "[2026-03-31 00:21:03] INFO ..."
+ * Keep lines that look like actual results.
  */
-function formatMessageForDelivery(msg) {
+function cleanShellOutput(text) {
+  let cleaned = text;
+  // Strip leading "stdout:" or "stderr:" prefix
+  cleaned = cleaned.replace(/^stdout:\s*/i, '').replace(/^stderr:\s*/i, '');
+  // Remove timestamped log lines (keep everything else)
+  const lines = cleaned.split('\n');
+  const meaningful = lines.filter(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    // Skip lines like "[2026-03-31 00:21:03] INFO === Auto-Settle starting ==="
+    if (/^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s+(INFO|DEBUG|WARN)\s/.test(trimmed)) return false;
+    return true;
+  });
+  return meaningful.join('\n').trim();
+}
+
+/**
+ * Format a single message for user-facing delivery.
+ * Strips debug metadata, sentinel tokens, shell noise, and adds a branded header.
+ *
+ * Env config:
+ *   INBOX_BRAND: display name for the header (default: "Scheduler")
+ */
+function formatMessageForDelivery(msg, { brand = 'Scheduler' } = {}) {
   let body = (msg.body || '').trim();
 
   // Strip sentinel tokens from the end of the body
@@ -83,14 +108,17 @@ function formatMessageForDelivery(msg) {
     }
   }
 
+  // Clean shell output noise
+  body = cleanShellOutput(body);
+
   if (!body) return null;
 
-  // Prefix with subject if present and not already in the body
-  if (msg.subject && !body.startsWith(msg.subject)) {
-    return `${msg.subject}\n\n${body}`.slice(0, 4000);
-  }
+  // Header: brand + subject + age
+  const age = timeAgo(msg.created_at);
+  const subject = msg.subject || 'Notification';
+  const header = `${brand} | ${subject} | ${age}`;
 
-  return body.slice(0, 4000);
+  return `${header}\n\n${body}`.slice(0, 4000);
 }
 
 /**
@@ -130,7 +158,7 @@ function selectPendingMessages(db, agentId, limit) {
   `).all(agentId, limit);
 }
 
-async function drainOnce(db, { to, channel, agentId, limit }) {
+async function drainOnce(db, { to, channel, agentId, limit, brand }) {
   const msgs = selectPendingMessages(db, agentId, limit);
   if (msgs.length === 0) {
     return 0;
@@ -144,7 +172,7 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
   for (const msg of msgs) {
     const msgTarget = msg.delivery_to || to;
     const msgChannel = msg.channel || channel;
-    const text = formatMessageForDelivery(msg);
+    const text = formatMessageForDelivery(msg, { brand });
 
     if (!text) {
       // Empty after stripping sentinels -- ack without delivering
@@ -182,6 +210,17 @@ const deliveryTo = args.to || process.env.INBOX_DELIVERY_TO || '';
 const channel = args.channel || process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
 const agentId = args.agent || process.env.INBOX_AGENT || 'main';
 const limit = parsePositiveInt(args.limit || process.env.INBOX_LIMIT, 50);
+// Brand resolution: --brand flag > INBOX_BRAND env > dispatch config brand > "Scheduler"
+let brand = args.brand || process.env.INBOX_BRAND || '';
+if (!brand) {
+  try {
+    const configDir = process.env.DISPATCH_CONFIG_DIR || join(resolve(resolveSchedulerDbPath({ env: process.env }), '..'), 'dispatch');
+    const { readFileSync } = await import('node:fs');
+    const config = JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'));
+    brand = config.brand || config.name || '';
+  } catch (_e) { /* no dispatch config -- use default */ }
+}
+if (!brand) brand = 'Scheduler';
 const watchMode = Boolean(args.watch);
 
 if (!deliveryTo) {
@@ -197,13 +236,13 @@ try {
   const db = getDb();
 
   if (!watchMode) {
-    await drainOnce(db, { to: deliveryTo, channel, agentId, limit });
+    await drainOnce(db, { to: deliveryTo, channel, agentId, limit, brand });
     process.exit(0);
   }
 
   process.stdout.write(`[inbox-consumer] watching ${join(watchDir, walFile)}\n`);
   try {
-    await drainOnce(db, { to: deliveryTo, channel, agentId, limit });
+    await drainOnce(db, { to: deliveryTo, channel, agentId, limit, brand });
   } catch (err) {
     process.stderr.write(`[inbox-consumer] initial drain error: ${err.message}\n`);
   }
@@ -215,7 +254,7 @@ try {
     if (draining) return;
     draining = true;
     try {
-      await drainOnce(db, { to: deliveryTo, channel, agentId, limit });
+      await drainOnce(db, { to: deliveryTo, channel, agentId, limit, brand });
     } catch (err) {
       process.stderr.write(`[inbox-consumer] drain error: ${err.message}\n`);
     } finally {
