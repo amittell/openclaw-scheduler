@@ -383,7 +383,7 @@ export async function deliverMessage(channel, target, message) {
   let resolvedChannel = channel;
   let resolvedTarget = target;
 
-  // Strip channel prefix from target if present (e.g., "telegram/484946046" -> "484946046")
+  // Strip channel prefix from target if present (e.g., "telegram/123456789" -> "123456789")
   // Some jobs store the channel in the delivery_to field as "channel/id".
   if (resolvedTarget && resolvedChannel && resolvedTarget.startsWith(resolvedChannel + '/')) {
     resolvedTarget = resolvedTarget.slice(resolvedChannel.length + 1);

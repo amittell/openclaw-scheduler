@@ -74,7 +74,7 @@ node dispatch/index.mjs enqueue \
 | `--model` | — | Model override (e.g. `anthropic/claude-sonnet-4-6`) |
 | `--thinking` | — | Reasoning level: `low`, `high`, `xhigh` |
 | `--timeout` | `300` | Seconds before run times out |
-| `--deliver-to` | — | Delivery target (e.g. Telegram chat ID). Enables `deliver:true` on the gateway call |
+| `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call |
 | `--deliver-channel` | `telegram` | Delivery channel for `--deliver-to` (telegram, slack, etc.) |
 | `--delivery-mode` | `announce` | `announce`, `announce-always`, `none` |
 
