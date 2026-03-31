@@ -834,6 +834,7 @@ process.on('SIGTERM', () => {
 // -- Rolling deadline vars ------------------------------------
 let lastTokens = null;
 let preDeadlineJsonlMtime = null;  // JSONL mtime tracked in pre-deadline loop for activity signal
+let preDeadlineSessionId = null;   // session ID being tracked (reset on respawn to avoid cross-session comparison)
 const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
 const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
 
@@ -878,13 +879,18 @@ while (Date.now() < deadline) {
   // -- Rolling deadline: extend on JSONL mtime advance (subagent sessions) --
   // Subagent sessions never populate totalTokens in sessions.json, so the token
   // signal above is always null for them. The JSONL file IS written continuously
-  // during active turns — use its mtime as the activity signal instead.
+  // during active turns -- use its mtime as the activity signal instead.
   // This ensures working subagent sessions are never killed mid-task.
   if (status.sessionKey) {
-    const sessionAgent = status.sessionKey.split(':')[1] || 'main';
-    const storeEntry = readSessionsStore(sessionAgent)?.[status.sessionKey];
+    const storeEntry = getSessionStoreEntry(status.sessionKey);
     const sessionId = storeEntry?.sessionId || null;
     if (sessionId) {
+      const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+      // Reset baseline when the tracked session changes (e.g. after respawn)
+      if (preDeadlineSessionId !== null && preDeadlineSessionId !== sessionId) {
+        preDeadlineJsonlMtime = null;
+      }
+      preDeadlineSessionId = sessionId;
       const curMtime = getSessionJsonlMtime(sessionId, sessionAgent);
       if (curMtime !== null) {
         if (preDeadlineJsonlMtime !== null && curMtime > preDeadlineJsonlMtime + 1000) {

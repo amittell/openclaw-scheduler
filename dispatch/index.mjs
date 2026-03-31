@@ -565,7 +565,7 @@ async function cmdEnqueue(flags) {
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   if (!Number.isFinite(timeoutS) || timeoutS <= 0) die('--timeout must be a positive integer', 2);
-  // Warn loudly when --timeout falls back to default — silent fallback caused hard-to-debug
+  // Warn loudly when --timeout falls back to default -- silent fallback caused hard-to-debug
   // watcher kills: the flag parser silently drops flags that appear after a multiline --message
   // value in shell heredocs. Operator should always pass --timeout explicitly.
   if (!flags.timeout) {
@@ -845,11 +845,12 @@ async function cmdEnqueue(flags) {
           overlap_policy:           'skip',
           // Shell job ceiling must cover the watcher's full legitimate runtime:
           //   watcherTimeoutS (main poll deadline)
-          //   + FLAT_WINDOW_S (3min post-deadline activity window in watcher.mjs)
-          //   + FLAT_WINDOW_S (one mid-turn extension if getJsonlMidTurnReason fires)
-          //   + 60s (slop for scheduling jitter and process startup)
-          // Previous value of (watcherTimeoutS + 60) was structurally too small —
+          //   + FLAT_WINDOW_MS/1000 (3min post-deadline activity window in watcher.mjs)
+          //   + FLAT_WINDOW_MS/1000 (one mid-turn extension if getJsonlMidTurnReason fires)
+          //   + 60s slop for scheduling jitter and process startup
+          // Previous value of (watcherTimeoutS + 60) was structurally too small --
           // it killed the watcher during the flat window before JSONL/token checks ran.
+          // Watcher constants: FLAT_WINDOW_MS = 180_000 (3min), see watcher.mjs line 48.
           run_timeout_ms:           (watcherTimeoutS + 180 + 180 + 60) * 1000,
           origin:                   origin || 'system',
         });
