@@ -233,8 +233,10 @@ const indexSection = `### Scheduler & Dispatch
 | \`${schedulerPath}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
 | \`${schedulerPath}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
 
-// Try inserting before a common section header, fall back to append
-const idxAnchors = ['### Automation', '### Memory', '## 🔗', '---\n\n## 🔗'];
+// Try inserting before a common section header, fall back to append.
+// NOTE: the link emoji anchors must match the actual markdown heading in
+// workspace index files -- do not replace with ASCII.
+const idxAnchors = ['### Automation', '### Memory', '## \u{1F517}', '---\n\n## \u{1F517}'];
 let idxResult = false;
 if (fs.existsSync(workspaceIndex)) {
   const existing = fs.readFileSync(workspaceIndex, 'utf8');

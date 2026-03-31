@@ -4664,7 +4664,7 @@ if (sub === 'status') {
 
   // 3b. Interrupted: status auto-resolved as 'interrupted' (session went idle without calling done).
   //     Mock always returns status=interrupted with the auto-resolve summary.
-  //     Watcher must: exit non-zero (exit 1), write ⚠️ warning to stdout,
+  //     Watcher must: exit non-zero (exit 1), write warning emoji to stdout,
   //     and NOT deliver as a successful result.
   {
     const intTempDir = mkdtempSync(join(tmpdir(), 'watcher-intr-'));
@@ -6757,7 +6757,7 @@ console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to mes
     delivery_channel: 'telegram',
     delivery_to: '1234567890',
   };
-  await handleDelivery(announceJob, '✅ shell job done -- all tests passed');
+  await handleDelivery(announceJob, 'shell job done -- all tests passed');
 
   const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
   assert(after.cnt === before.cnt + 1, 'handleDelivery(announce): enqueues one message');
