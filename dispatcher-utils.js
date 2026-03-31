@@ -41,7 +41,7 @@ export function adaptiveDeferralMs(backlogDepth, baseMs = 10000) {
 export function buildExecutionIntentNote(job) {
   if (job.execution_intent !== 'plan' && !job.execution_read_only) return '';
   const lines = [
-    '[SYSTEM NOTE — execution boundary]',
+    '[SYSTEM NOTE -- execution boundary]',
     job.execution_intent === 'plan'
       ? 'This run is planning-only. Analyze, reason, and propose actions, but do not execute external side effects.'
       : 'This run is read-only. Inspect and summarize state, but do not execute external side effects.',

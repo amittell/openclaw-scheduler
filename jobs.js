@@ -246,7 +246,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   const isAtJob = merged.schedule_kind === 'at';
   if (isChild && isAtJob) {
-    throw new Error('child jobs cannot use schedule_kind "at" — use trigger_delay_s for delayed chain execution');
+    throw new Error('child jobs cannot use schedule_kind "at" -- use trigger_delay_s for delayed chain execution');
   }
   const triggerFieldsTouched = mode === 'create'
     || 'parent_id' in normalized
@@ -385,7 +385,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     && !isChild;
   if ((mode === 'create' || promotedToRoot) && !isChild && !merged.origin) {
     throw new Error(
-      'origin is required on job creation — pass the chat_id or channel identifier where the job was requested from ' +
+      'origin is required on job creation -- pass the chat_id or channel identifier where the job was requested from ' +
       '(e.g. "telegram:<your-user-id>", "telegram:<your-group-id>", "system" for automated/cron jobs).'
     );
   }
@@ -503,7 +503,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
 
   if (mode === 'create' && (merged.run_timeout_ms == null || merged.run_timeout_ms === 0)) {
     throw new Error(
-      'run_timeout_ms is required and must be > 0 — this prevents jobs from running indefinitely.'
+      'run_timeout_ms is required and must be > 0 -- this prevents jobs from running indefinitely.'
     );
   }
 
@@ -899,7 +899,7 @@ export function runJobNow(id) {
 
 /**
  * Get cron jobs that are due to run (next_run_at <= now, enabled).
- * At-jobs are excluded — use getDueAtJobs() for one-shot scheduling.
+ * At-jobs are excluded -- use getDueAtJobs() for one-shot scheduling.
  */
 export function getDueJobs() {
   return getDb().prepare(`
@@ -986,9 +986,9 @@ export function getChildJobs(parentId) {
 /**
  * Evaluate a trigger_condition pattern against parent run output content.
  * Supports:
- *   - null / undefined → always matches (no condition)
- *   - "contains:<substr>" → substring match (case-sensitive)
- *   - "regex:<pattern>" → regex match
+ *   - null / undefined -> always matches (no condition)
+ *   - "contains:<substr>" -> substring match (case-sensitive)
+ *   - "regex:<pattern>" -> regex match
  * Returns true if the condition matches (or is absent).
  */
 export function evalTriggerCondition(condition, content) {
@@ -1006,7 +1006,7 @@ export function evalTriggerCondition(condition, content) {
       return false; // Invalid regex never matches
     }
   }
-  // Unknown prefix — unreachable: validateTriggerConditionSyntax rejects these at write time
+  // Unknown prefix -- unreachable: validateTriggerConditionSyntax rejects these at write time
   return false;
 }
 
@@ -1067,7 +1067,7 @@ export function dequeueJob(jobId) {
 }
 
 /**
- * Detect cycles in the parent chain. Throws if adding childId → parentId would create a loop.
+ * Detect cycles in the parent chain. Throws if adding childId -> parentId would create a loop.
  */
 export function detectCycle(childId, parentId) {
   const db = getDb();
@@ -1075,7 +1075,7 @@ export function detectCycle(childId, parentId) {
   let current = parentId;
   while (current) {
     if (visited.has(current)) {
-      throw new Error(`Cycle detected: job ${childId} → ${parentId} would create a loop`);
+      throw new Error(`Cycle detected: job ${childId} -> ${parentId} would create a loop`);
     }
     visited.add(current);
     const job = db.prepare('SELECT parent_id FROM jobs WHERE id = ?').get(current);

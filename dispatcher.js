@@ -6,7 +6,7 @@
 //
 // Tick loop:
 //   1. Check gateway health
-//   2. Find due jobs → dispatch via chat completions / system event
+//   2. Find due jobs -> dispatch via chat completions / system event
 //   3. Check running runs for staleness (implicit heartbeat)
 //   4. Deliver pending messages
 //   5. Expire old messages
@@ -92,7 +92,7 @@ import {
   loadProviders, getIdentityProvider, getAuthorizationProvider, getProofVerifier,
 } from './provider-registry.js';
 
-// ── Idempotency Key Wrappers ────────────────────────────────
+// -- Idempotency Key Wrappers --------------------------------
 // The shared module (idempotency.js) uses jobId strings; dispatcher wraps with job objects.
 function generateIdempotencyKey(job, scheduledTime) {
   if (job.parent_id && !scheduledTime) return null;
@@ -105,7 +105,7 @@ const releaseIdempotencyKey = _releaseIdemKey;
 const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
-// ── Config ──────────────────────────────────────────────────
+// -- Config --------------------------------------------------
 const TICK_INTERVAL_MS = Math.max(1000, parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10));
 const STALE_THRESHOLD_S = Math.max(10, parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '90', 10));
 const HEARTBEAT_CHECK_MS = Math.max(5000, parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || '30000', 10));
@@ -115,7 +115,7 @@ const BACKUP_INTERVAL_MS = Math.max(60000, parseInt(process.env.SCHEDULER_BACKUP
 let backupEnabled = process.env.SCHEDULER_BACKUP === '1' || process.env.SCHEDULER_BACKUP === 'true';
 const LOG_PREFIX = '[scheduler]';
 
-// ── State ───────────────────────────────────────────────────
+// -- State ---------------------------------------------------
 let running = true;
 let lastHeartbeatCheck = 0;
 let lastMessageDelivery = 0;
@@ -125,7 +125,7 @@ let lastGatewayCheck = 0;
 let gatewayHealthy = true;
 let lastRollupBackup = 0;
 
-// ── Logging ─────────────────────────────────────────────────
+// -- Logging -------------------------------------------------
 function log(level, msg, meta) {
   if (level === 'debug' && !process.env.SCHEDULER_DEBUG) return;
   const ts = new Date().toISOString();
@@ -139,7 +139,7 @@ const { handleDelivery } = createDeliveryHelpers({
   resolveDeliveryAlias,
 });
 
-// ── Replay orphaned runs on startup ─────────────────────────
+// -- Replay orphaned runs on startup -------------------------
 async function replayOrphanedRuns() {
   const db = getDb();
   const orphaned = db.prepare(`
@@ -262,7 +262,7 @@ function reconcileQueuedRetrySchedules() {
   }
 }
 
-// ── Triggered Children Helper ───────────────────────────────
+// -- Triggered Children Helper -------------------------------
 /**
  * Fire triggered children for a completed run and track chain idempotency keys.
  * Extracts the duplicated fireTriggeredChildren + pendingChainKeys pattern.
@@ -279,7 +279,7 @@ function handleTriggeredChildren(jobId, status, content, runId, logSuffix = '') 
 }
 
 
-// ── Build dispatch dependencies bag ─────────────────────────
+// -- Build dispatch dependencies bag -------------------------
 function buildDispatchDeps() {
   return {
     // Guards + dispatch queue
@@ -326,7 +326,7 @@ function buildDispatchDeps() {
   };
 }
 
-// ── Dispatch a single job ───────────────────────────────────
+// -- Dispatch a single job -----------------------------------
 async function dispatchJob(job, opts = {}) {
   const deps = buildDispatchDeps();
   const ctx = await prepareDispatch(job, opts, deps);
@@ -336,7 +336,7 @@ async function dispatchJob(job, opts = {}) {
 }
 
 
-// ── Build the prompt sent to the agent ──────────────────────
+// -- Build the prompt sent to the agent ----------------------
 /**
  * Build the prompt sent to the agent for a given job and run.
  *
@@ -349,7 +349,7 @@ function buildJobPrompt(job, run) {
   if (executionNote) parts.push(`\n${executionNote}`);
   if (job.payload_thinking) {
     parts.push(
-      '\n[SYSTEM NOTE — model policy]',
+      '\n[SYSTEM NOTE -- model policy]',
       `Prefer reasoning depth: ${job.payload_thinking}.`,
       '[END SYSTEM NOTE]',
     );
@@ -366,14 +366,14 @@ function buildJobPrompt(job, run) {
   // Global sub-agent scope: instruct the agent to query across all sessions
   if (job.payload_scope === 'global') {
     parts.push(
-      '\n[SYSTEM NOTE — scope=global]',
+      '\n[SYSTEM NOTE -- scope=global]',
       'This job has cross-session sub-agent visibility enabled.',
       'When you need to list or inspect sub-agents, do NOT use `subagents list`',
       '(which only shows sub-agents spawned by the current session).',
       'Instead, call `sessions_list` with no session filter to enumerate ALL active',
       'sessions across every requester, then filter by session key prefix or agent id.',
       'This lets you observe sub-agents spawned from the main Telegram session or any',
-      'other session — not just this isolated scheduler session.',
+      'other session -- not just this isolated scheduler session.',
       '[END SYSTEM NOTE]',
     );
   }
@@ -445,13 +445,13 @@ function buildJobPrompt(job, run) {
   return { prompt: parts.join('\n'), contextMeta };
 }
 
-// ── Advance next_run_at ─────────────────────────────────────
+// -- Advance next_run_at -------------------------------------
 function advanceNextRun(job) {
   const nextRun = nextRunFromCron(job.schedule_cron, job.schedule_tz);
   updateJob(job.id, { next_run_at: nextRun });
 }
 
-// ── Update job state after run ──────────────────────────────
+// -- Update job state after run ------------------------------
 function updateJobAfterRun(job, status) {
   // Re-read from DB to get current state (avoids stale consecutive_errors during retries)
   const freshJob = getJob(job.id);
@@ -465,7 +465,7 @@ function updateJobAfterRun(job, status) {
     patch.consecutive_errors = 0;
   }
 
-  // At-jobs (one-shot): don't advance cron schedule — delete or disable
+  // At-jobs (one-shot): don't advance cron schedule -- delete or disable
   if (freshJob.schedule_kind === 'at') {
     if (freshJob.delete_after_run) {
       updateJob(job.id, patch);
@@ -499,7 +499,7 @@ function updateJobAfterRun(job, status) {
   }
 }
 
-// ── Main tick ───────────────────────────────────────────────
+// -- Main tick -----------------------------------------------
 async function tick() {
   const now = Date.now();
 
@@ -508,7 +508,7 @@ async function tick() {
     lastGatewayCheck = now;
     gatewayHealthy = await checkGatewayHealth();
     if (!gatewayHealthy) {
-      log('warn', 'Gateway unreachable — isolated jobs will be deferred; shell/main jobs continue');
+      log('warn', 'Gateway unreachable -- isolated jobs will be deferred; shell/main jobs continue');
     }
   }
 
@@ -603,7 +603,7 @@ async function tick() {
   // 3. Message delivery + spawn handling (every MESSAGE_DELIVERY_MS)
   if (now - lastMessageDelivery >= MESSAGE_DELIVERY_MS) {
     lastMessageDelivery = now;
-    // Handle spawn messages — running jobs can request child job creation
+    // Handle spawn messages -- running jobs can request child job creation
     try {
       const spawnMsgs = getDb().prepare(`
         SELECT * FROM messages WHERE kind = 'spawn' AND delivered_at IS NULL
@@ -722,7 +722,7 @@ async function tick() {
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
       // Ensure inbox consumer jobs exist for agents with delivery config
       ensureAgentInboxJobs({ log, getDb, createJob });
-      // Checkpoint WAL to disk — reduces data loss window on crash/SIGKILL
+      // Checkpoint WAL to disk -- reduces data loss window on crash/SIGKILL
       const cpResult = checkpointWal();
       if (cpResult) {
         log('debug', `WAL checkpoint: log=${cpResult.log}, checkpointed=${cpResult.checkpointed}, busy=${cpResult.busy}`);
@@ -760,7 +760,7 @@ async function tick() {
   }
 }
 
-// ── Lifecycle ───────────────────────────────────────────────
+// -- Lifecycle -----------------------------------------------
 function shutdown(signal) {
   log('info', `Shutting down (${signal})`);
   running = false;
@@ -778,7 +778,7 @@ function shutdown(signal) {
   process.exit(0);
 }
 
-// ── Startup repair ─────────────────────────────────────────
+// -- Startup repair -----------------------------------------
 /**
  * Find enabled root cron jobs with NULL next_run_at and recompute their schedule.
  * Guards against insertion bugs (e.g. via direct DB write or a CLI code-path that
@@ -803,7 +803,7 @@ function repairNullNextRunAt() {
     const next = nextRunFromCron(job.schedule_cron, job.schedule_tz || 'UTC');
     if (next) {
       fix.run(next, job.id);
-      log('warn', `Repaired null next_run_at for job "${job.name}" → ${next}`);
+      log('warn', `Repaired null next_run_at for job "${job.name}" -> ${next}`);
     }
   }
 }

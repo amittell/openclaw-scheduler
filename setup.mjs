@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * OpenClaw Scheduler — Interactive Setup Wizard
+ * OpenClaw Scheduler -- Interactive Setup Wizard
  *
  * Run from the scheduler directory:
  *   node setup.mjs
@@ -92,7 +92,7 @@ if (setupOptions.help) {
   process.exit(0);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// --- Helpers ------------------------------------------------------------------
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q, def) => new Promise(resolve => {
@@ -104,9 +104,9 @@ const confirm = async (q) => {
   return /^y(es)?$/i.test(ans);
 };
 const print = (msg = '') => console.log(msg);
-const ok   = (msg) => console.log(`  ✅ ${msg}`);
-const warn = (msg) => console.log(`  ⚠️  ${msg}`);
-const skip = (msg) => console.log(`  ⏭️  ${msg}`);
+const ok   = (msg) => console.log(`  [ok] ${msg}`);
+const warn = (msg) => console.log(`  [WARN] ${msg}`);
+const skip = (msg) => console.log(`  [skip] ${msg}`);
 
 function appendIfMissing(filePath, anchor, content) {
   if (!fs.existsSync(filePath)) return false;
@@ -135,23 +135,23 @@ function getGatewayToken(homeDir) {
   }
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// --- Main ---------------------------------------------------------------------
 
 print();
-print('╔══════════════════════════════════════════════════════╗');
-print('║     OpenClaw Scheduler — Setup Wizard  🌶️             ║');
-print('╚══════════════════════════════════════════════════════╝');
+print('+======================================================+');
+print('|     OpenClaw Scheduler -- Setup Wizard               |');
+print('+======================================================+');
 print();
 print('This wizard will:');
-print('  • Run DB migrations');
-print('  • Add scheduler queue + consumer notes to agent memory files');
-print('  • Create Inbox Consumer + Stuck Run Detector jobs');
-print('  • Install a macOS LaunchAgent or LaunchDaemon (optional)');
+print('  * Run DB migrations');
+print('  * Add scheduler queue + consumer notes to agent memory files');
+print('  * Create Inbox Consumer + Stuck Run Detector jobs');
+print('  * Install a macOS LaunchAgent or LaunchDaemon (optional)');
 print();
 
-// ─── Step 1: Paths ────────────────────────────────────────────────────────────
+// --- Step 1: Paths ------------------------------------------------------------
 
-print('── Step 1: Paths ───────────────────────────────────────');
+print('-- Step 1: Paths ---------------------------------------');
 const schedulerPath = __dirname;
 const defaultWorkspace = path.join(os.homedir(), '.openclaw', 'workspace');
 const workspacePath = await ask('Workspace path', defaultWorkspace);
@@ -165,12 +165,12 @@ print();
 print(`  Scheduler:  ${schedulerPath}`);
 print(`  Workspace:  ${workspacePath}`);
 print(`  Gateway:    ${gatewayUrl}`);
-print(`  Deliver to: ${deliverTo || '(none — skipping job creation)'}`);
+print(`  Deliver to: ${deliverTo || '(none -- skipping job creation)'}`);
 print();
 
-// ─── Preflight: npm install behavior ─────────────────────────────────────────
+// --- Preflight: npm install behavior -----------------------------------------
 
-print('── Preflight: npm install behavior ───────────────────');
+print('-- Preflight: npm install behavior -------------------');
 const ignoreScripts = getNpmConfigValue('ignore-scripts').toLowerCase();
 if (ignoreScripts === 'true') {
   warn('Detected npm config: ignore-scripts=true');
@@ -189,28 +189,28 @@ if (ignoreScripts === 'true') {
 }
 print();
 
-// ─── Step 2: DB migrations ────────────────────────────────────────────────────
+// --- Step 2: DB migrations ----------------------------------------------------
 
-print('── Step 2: Database migrations ─────────────────────────');
+print('-- Step 2: Database migrations -------------------------');
 try {
   const { setDbPath } = await import(path.join(schedulerPath, 'db.js'));
   setDbPath(schedulerDbPath);
   const migrate = (await import(path.join(schedulerPath, 'migrate-consolidate.js'))).default;
   const ran = migrate();
   if (ran) {
-    ok(`Migrations applied → ${schedulerDbPath}`);
+    ok(`Migrations applied -> ${schedulerDbPath}`);
   } else {
-    ok(`DB already up to date → ${schedulerDbPath}`);
+    ok(`DB already up to date -> ${schedulerDbPath}`);
   }
 } catch (err) {
   warn(`Migration failed: ${err.message}`);
-  warn('Continuing — you can run migrations manually: node migrate-consolidate.js');
+  warn('Continuing -- you can run migrations manually: node migrate-consolidate.js');
 }
 print();
 
-// ─── Step 3: Memory files ────────────────────────────────────────────────────
+// --- Step 3: Memory files ----------------------------------------------------
 
-print('── Step 3: Agent memory files ──────────────────────────');
+print('-- Step 3: Agent memory files --------------------------');
 
 const memoryMd = path.join(workspacePath, 'MEMORY.md');
 const memoryEntry = `- **Scheduler Queue Pattern:** Use \`node ${schedulerPath}/cli.js msg send <from> <to> "body"\` for signal-only queue entries.
@@ -218,9 +218,9 @@ const memoryEntry = `- **Scheduler Queue Pattern:** Use \`node ${schedulerPath}/
   Stuck Run Detector (\`${schedulerPath}/scripts/stuck-run-detector.mjs\`) alerts on stale \`running\` runs.`;
 
 const memResult = appendIfMissing(memoryMd, 'Scheduler Queue Pattern', memoryEntry);
-if (memResult === true)       ok('Appended scheduler queue entry → MEMORY.md');
+if (memResult === true)       ok('Appended scheduler queue entry -> MEMORY.md');
 else if (memResult === 'exists') skip('Scheduler queue entry already in MEMORY.md');
-else                          warn(`MEMORY.md not found at ${memoryMd} — skipping`);
+else                          warn(`MEMORY.md not found at ${memoryMd} -- skipping`);
 
 const workspaceIndex = path.join(workspacePath, 'memory', 'workspace-index.md');
 const indexSection = `### Scheduler & Dispatch
@@ -255,18 +255,18 @@ if (fs.existsSync(workspaceIndex)) {
   }
 }
 
-if (idxResult === true)        ok(`Added Scheduler & Dispatch section → workspace-index.md`);
+if (idxResult === true)        ok(`Added Scheduler & Dispatch section -> workspace-index.md`);
 else if (idxResult === 'exists') skip('Scheduler section already in workspace-index.md');
-else                           warn(`workspace-index.md not found at ${workspaceIndex} — skipping`);
+else                           warn(`workspace-index.md not found at ${workspaceIndex} -- skipping`);
 
 print();
 
-// ─── Step 4: Scheduler jobs ──────────────────────────────────────────────────
+// --- Step 4: Scheduler jobs --------------------------------------------------
 
-print('── Step 4: Scheduler jobs ──────────────────────────────');
+print('-- Step 4: Scheduler jobs ------------------------------');
 
 if (!deliverTo) {
-  skip('No delivery ID provided — skipping job creation');
+  skip('No delivery ID provided -- skipping job creation');
   skip('You can add jobs manually with: node cli.js jobs add \'{ ... }\'');
 } else {
   try {
@@ -332,7 +332,7 @@ if (!deliverTo) {
 
 print();
 
-// ─── Step 5: Service / auto-start ────────────────────────────────────────────
+// --- Step 5: Service / auto-start --------------------------------------------
 
 const platform = process.platform;
 const nodePath  = process.execPath;
@@ -353,9 +353,9 @@ const wslVersion = isWSL && (() => {
 })();
 let macServiceSummary = null;
 
-// ── macOS ──────────────────────────────────────────────────────────────────
+// -- macOS ------------------------------------------------------------------
 if (platform === 'darwin') {
-  print('── Step 5: Service (macOS launchd) ─────────────────────');
+  print('-- Step 5: Service (macOS launchd) ---------------------');
   const serviceUser = os.userInfo().username;
   const serviceUid = typeof process.getuid === 'function' ? process.getuid() : null;
   const gatewayToken = getGatewayToken(os.homedir());
@@ -386,9 +386,9 @@ if (platform === 'darwin') {
   let selectedServiceMode = setupOptions.serviceMode;
   if (!selectedServiceMode) {
     print('  Choose how the scheduler should start on macOS:');
-    print('  • agent  = user LaunchAgent (best for personal Macs with auto-login)');
-    print('  • daemon = system LaunchDaemon (best for headless or pre-login startup)');
-    print('  • skip   = do not install a service right now');
+    print('  * agent  = user LaunchAgent (best for personal Macs with auto-login)');
+    print('  * daemon = system LaunchDaemon (best for headless or pre-login startup)');
+    print('  * skip   = do not install a service right now');
     selectedServiceMode = (await ask('Service mode', 'agent')).toLowerCase();
     while (!VALID_MAC_SERVICE_MODES.has(selectedServiceMode)) {
       warn('Choose agent, daemon, or skip.');
@@ -406,7 +406,7 @@ if (platform === 'darwin') {
     if (otherModes.length) {
       warn(`Detected existing ${otherModes.map(cfg => cfg.title).join(' + ')} install(s):`);
       for (const cfg of otherModes) {
-        print(`  • ${cfg.title}: ${cfg.plistPath}`);
+        print(`  * ${cfg.title}: ${cfg.plistPath}`);
       }
       const continueWithDuplicate = await confirm(`Install ${service.title} anyway? (This can run two schedulers if you leave both enabled)`);
       if (!continueWithDuplicate) {
@@ -501,32 +501,32 @@ ${tokenXml}  </dict>
             execSync(`launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
             ok(`${service.title} installed and bootstrapped`);
           } catch (err) {
-            ok(`${service.title} plist written → ${service.plistPath}`);
+            ok(`${service.title} plist written -> ${service.plistPath}`);
             warn(`Auto-bootstrap failed: ${err.message.trim()}`);
             warn(`Run manually: launchctl bootstrap ${service.domain} "${service.plistPath}"`);
           }
         }
         print(`  Logs: ${logPath}`);
       } else {
-        skip(`Skipped ${service.title} install — run again to install later`);
+        skip(`Skipped ${service.title} install -- run again to install later`);
         macServiceSummary = null;
       }
     }
   }
 
-// ── Linux ──────────────────────────────────────────────────────────────────
+// -- Linux ------------------------------------------------------------------
 } else if (platform === 'linux') {
   if (isWSL) {
     const wslLabel = wslVersion ? `WSL${wslVersion}` : 'WSL';
-    print(`── Step 5: Service (${wslLabel}) ──────────────────────────────`);
+    print(`-- Step 5: Service (${wslLabel}) ------------------------------`);
     if (wslVersion === 1) {
-      print('  WSL1 detected — systemd not supported. Using PM2.');
+      print('  WSL1 detected -- systemd not supported. Using PM2.');
     } else {
       print('  WSL2 detected. Systemd is supported if enabled in /etc/wsl.conf.');
       print('  If not enabled: add [boot] systemd=true to /etc/wsl.conf, then wsl --shutdown.');
     }
   } else {
-    print('── Step 5: Service (Linux) ─────────────────────────────');
+    print('-- Step 5: Service (Linux) -----------------------------');
   }
 
   const gatewayToken = getGatewayToken(os.homedir());
@@ -582,7 +582,7 @@ WantedBy=default.target
           execSync('systemctl --user enable --now openclaw-scheduler');
           ok('systemd user service installed and started');
         } catch (err) {
-          ok(`Unit file written → ${unitPath}`);
+          ok(`Unit file written -> ${unitPath}`);
           warn(`Auto-start failed: ${err.message.trim()}`);
           warn('Run manually:');
           warn('  systemctl --user daemon-reload');
@@ -590,11 +590,11 @@ WantedBy=default.target
         }
         print(`  Logs: ${logPath}  (or: journalctl --user -u openclaw-scheduler -f)`);
       } else {
-        skip('Skipped — run again to install later');
+        skip('Skipped -- run again to install later');
       }
     }
   } else if (hasPm2) {
-    print('  systemd user session not available — using PM2');
+    print('  systemd user session not available -- using PM2');
     const pm2Name = 'openclaw-scheduler';
     let pm2Running = false;
     try {
@@ -628,20 +628,20 @@ WantedBy=default.target
           warn(`PM2 start failed: ${err.message.trim()}`);
         }
       } else {
-        skip('Skipped — run again to install later');
+        skip('Skipped -- run again to install later');
       }
     }
   } else {
     warn('Neither systemd user session nor PM2 found');
     print('  Options:');
-    print('  • Install PM2:  npm install -g pm2');
-    print('  • Or run manually:  node dispatcher.js &');
-    print('  • See INSTALL-LINUX.md for systemd setup without a user session');
+    print('  * Install PM2:  npm install -g pm2');
+    print('  * Or run manually:  node dispatcher.js &');
+    print('  * See INSTALL-LINUX.md for systemd setup without a user session');
   }
 
-// ── Windows (native) ───────────────────────────────────────────────────────
+// -- Windows (native) -------------------------------------------------------
 } else if (platform === 'win32') {
-  print('── Step 5: Service (Windows) ───────────────────────────');
+  print('-- Step 5: Service (Windows) ---------------------------');
   print();
   warn('Native Windows detected.');
   print('  OpenClaw Scheduler is designed to run inside WSL (Windows Subsystem for Linux).');
@@ -656,7 +656,7 @@ WantedBy=default.target
   print('  WSL2 with systemd enabled gives the best experience (auto-start on login).');
   print('  See INSTALL-WINDOWS.md for the full WSL2 + systemd setup guide.');
 
-// ── Unknown ────────────────────────────────────────────────────────────────
+// -- Unknown ----------------------------------------------------------------
 } else {
   skip(`Unsupported platform: ${platform}`);
   print('  Start manually: node dispatcher.js');
@@ -664,42 +664,42 @@ WantedBy=default.target
 
 print();
 
-// ─── Done ─────────────────────────────────────────────────────────────────────
+// --- Done ---------------------------------------------------------------------
 
-print('── Done! ───────────────────────────────────────────────');
+print('-- Done! -----------------------------------------------');
 print();
 print('Next steps:');
 
 if (platform === 'darwin') {
   if (macServiceSummary?.domain) {
     const prefix = macServiceSummary.mode === 'daemon' ? 'sudo ' : '';
-    print(`  • Service mode:   ${macServiceSummary.title}`);
-    print(`  • Check service:  ${prefix}launchctl print ${macServiceSummary.domain}/${macServiceSummary.label}`);
-    print(`  • Restart:        ${prefix}launchctl kickstart -k ${macServiceSummary.domain}/${macServiceSummary.label}`);
+    print(`  * Service mode:   ${macServiceSummary.title}`);
+    print(`  * Check service:  ${prefix}launchctl print ${macServiceSummary.domain}/${macServiceSummary.label}`);
+    print(`  * Restart:        ${prefix}launchctl kickstart -k ${macServiceSummary.domain}/${macServiceSummary.label}`);
   } else {
-    print('  • Install later:  node setup.mjs --service-mode agent');
+    print('  * Install later:  node setup.mjs --service-mode agent');
     print('                    node setup.mjs --service-mode daemon');
   }
 } else if (platform === 'linux') {
   if (isWSL) {
-    print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
-    print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
-    print('  • Note: if WSL session closes, restart with: systemctl --user start openclaw-scheduler');
+    print('  * Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
+    print('  * Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+    print('  * Note: if WSL session closes, restart with: systemctl --user start openclaw-scheduler');
   } else {
-    print('  • Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
-    print('  • Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
+    print('  * Check service:  systemctl --user status openclaw-scheduler  (or: pm2 status)');
+    print('  * Logs:           journalctl --user -u openclaw-scheduler -f   (or: pm2 logs)');
   }
 } else if (platform === 'win32') {
-  print('  • Run setup inside WSL — see instructions above');
+  print('  * Run setup inside WSL -- see instructions above');
 }
 
-print('  • Scheduler CLI:  node cli.js status');
-print('  • List jobs:      node cli.js jobs list');
-print('  • Queue test:     node cli.js msg send system main "setup smoke test"');
-print(`  • Logs:           ${logPath}`);
-print('  • Docs:           README.md');
+print('  * Scheduler CLI:  node cli.js status');
+print('  * List jobs:      node cli.js jobs list');
+print('  * Queue test:     node cli.js msg send system main "setup smoke test"');
+print(`  * Logs:           ${logPath}`);
+print('  * Docs:           README.md');
 print();
-print('── ⚠️  Important: activate memory changes ───────────────');
+print('-- [WARN] Important: activate memory changes -------------');
 print();
 print('  Memory file changes (MEMORY.md, workspace-index.md) only take');
 print('  effect in NEW sessions. Your agent\'s current session won\'t see');
@@ -709,10 +709,10 @@ print('  Tell your agent now:');
 print();
 if (workspacePath) {
   print(`    "Read ${path.join(workspacePath, 'MEMORY.md')} and`);
-  print(`     ${path.join(workspacePath, 'memory', 'workspace-index.md')} —`);
+  print(`     ${path.join(workspacePath, 'memory', 'workspace-index.md')} --`);
   print('     scheduler queue pattern notes were added. Load them into your context."');
 } else {
-  print('    "Read your MEMORY.md and memory/workspace-index.md —');
+  print('    "Read your MEMORY.md and memory/workspace-index.md --');
   print('     scheduler queue pattern notes were added. Load them into your context."');
 }
 print();

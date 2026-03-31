@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Scheduler DB Backup — Ship SQLite snapshots to MinIO
+ * Scheduler DB Backup -- Ship SQLite snapshots to MinIO
  * 
  * Modes:
- *   snapshot  — Full DB copy to MinIO (5-min granularity)
- *   rollup    — Tagged hourly snapshot + prune old 5-min snapshots
- *   restore   — Pull latest snapshot from MinIO and restore
- *   status    — Show backup status (latest snapshot, count, size)
- *   prune     — Remove snapshots older than retention policy
+ *   snapshot  -- Full DB copy to MinIO (5-min granularity)
+ *   rollup    -- Tagged hourly snapshot + prune old 5-min snapshots
+ *   restore   -- Pull latest snapshot from MinIO and restore
+ *   status    -- Show backup status (latest snapshot, count, size)
+ *   prune     -- Remove snapshots older than retention policy
  * 
  * Storage layout on MinIO:
  *   scheduler-backups/scheduler/snapshots/YYYY-MM-DD/HH-MM.db
@@ -40,7 +40,7 @@ const MC_ALIAS = process.env.SCHEDULER_BACKUP_MC_ALIAS || 'backupstore';
 const BUCKET = process.env.SCHEDULER_BACKUP_BUCKET || 'scheduler-backups';
 const PREFIX = process.env.SCHEDULER_BACKUP_PREFIX || 'scheduler';
 
-// Find mc binary — may be in ~/bin on some hosts
+// Find mc binary -- may be in ~/bin on some hosts
 const MC_BIN = existsSync(join(homedir(), 'bin', 'mc'))
   ? join(homedir(), 'bin', 'mc')
   : 'mc';
@@ -114,7 +114,7 @@ function runMc(args, opts = {}) {
   return runFile(MC_BIN, args, opts);
 }
 
-// ── Snapshot (5-min) ────────────────────────────────────────
+// -- Snapshot (5-min) ----------------------------------------
 function snapshot() {
   if (!existsSync(DB_PATH)) {
     log('error', `DB not found: ${DB_PATH}`);
@@ -150,7 +150,7 @@ function snapshot() {
   return { remotePath, size };
 }
 
-// ── Rollup (hourly) ─────────────────────────────────────────
+// -- Rollup (hourly) -----------------------------------------
 function rollup() {
   // First, take a snapshot and save it as a rollup
   if (!existsSync(DB_PATH)) {
@@ -188,7 +188,7 @@ function rollup() {
   }
 }
 
-// ── Prune ───────────────────────────────────────────────────
+// -- Prune ---------------------------------------------------
 function pruneSnapshots() {
   const cutoff = new Date(Date.now() - SNAPSHOT_RETENTION_HOURS * 3600 * 1000);
   const cutoffDate = cutoff.toISOString().slice(0, 10);
@@ -234,7 +234,7 @@ function pruneRollups() {
   if (pruned > 0) log('info', `Pruned ${pruned} old rollup dir(s)`);
 }
 
-// ── Restore ─────────────────────────────────────────────────
+// -- Restore -------------------------------------------------
 function restore() {
   // Find latest rollup first, then latest snapshot
   let latest = null;
@@ -329,7 +329,7 @@ function restore() {
   console.log(`Restored ${verify} jobs from ${latest.path}`);
 }
 
-// ── Status ──────────────────────────────────────────────────
+// -- Status --------------------------------------------------
 function status() {
   console.log('=== Scheduler Backup Status ===\n');
 
@@ -368,10 +368,10 @@ function status() {
   if (du) console.log(`\nTotal backup size: ${du}`);
 }
 
-// ── Exports for programmatic consumers ───────────────────────
+// -- Exports for programmatic consumers -----------------------
 export { snapshot, rollup, restore, status, pruneSnapshots, pruneRollups };
 
-// ── Main (only runs when executed directly, not when imported) ──
+// -- Main (only runs when executed directly, not when imported) --
 import { fileURLToPath } from 'url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const command = process.argv[2] || 'status';
