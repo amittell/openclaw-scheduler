@@ -924,6 +924,33 @@ export async function executeWatchdog(job, ctx, deps) {
 // -- Strategy: Main session ----------------------------------
 
 export async function executeMain(job, ctx, deps) {
+  // Main session dispatch mode:
+  // - execution_intent 'background' or missing: use executeAgent (sync, waits
+  //   for response, captures content for delivery). Best for quick tasks where
+  //   a few seconds of session latency is acceptable.
+  // - execution_intent 'fire-and-forget': inject a system event and return
+  //   immediately. The agent processes asynchronously and the session stays
+  //   unblocked for interactive DMs. No response capture -- if delivery is
+  //   configured, the prompt includes a reply-to instruction so the agent
+  //   can send results via the message tool when done.
+  //
+  // Choose based on expected duration:
+  //   Quick tasks (< 10s): sync is simpler and captures output
+  //   Long tasks (> 30s): fire-and-forget avoids blocking interactive chat
+
+  const isFireAndForget = job.execution_intent === 'fire-and-forget';
+
+  if (!isFireAndForget) {
+    // Sync path: reuse executeAgent with the main session key.
+    // The job's preferred_session_key defaults to 'main' for main-session jobs.
+    const originalSessionKey = job.preferred_session_key;
+    job.preferred_session_key = job.preferred_session_key || 'main';
+    const agentResult = await executeAgent(job, ctx, deps);
+    job.preferred_session_key = originalSessionKey;
+    return agentResult;
+  }
+
+  // Fire-and-forget path: inject system event, return immediately.
   const { sendSystemEvent, buildExecutionIntentNote, log } = deps;
   const result = makeDefaultResult();
 
@@ -950,13 +977,13 @@ export async function executeMain(job, ctx, deps) {
   const prompt = `${executionNote ? `${executionNote}\n\n` : ''}${modelNote}${deliveryInstruction}${job.payload_message}`;
   await sendSystemEvent(prompt, 'now');
 
-  result.summary = 'System event dispatched (async)';
+  result.summary = 'System event dispatched (fire-and-forget)';
   result.content = job.payload_message;
   result.skipDelivery = true; // Agent handles delivery via message tool
   result.skipChildren = true;
   result.skipDequeue = true;
 
-  log('info', `Dispatched (main/async): ${job.name}`, { runId: ctx.run.id });
+  log('info', `Dispatched (main/fire-and-forget): ${job.name}`, { runId: ctx.run.id });
 
   return result;
 }
