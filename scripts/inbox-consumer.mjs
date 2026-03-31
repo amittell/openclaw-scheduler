@@ -205,7 +205,7 @@ try {
   };
 
   const watcher = watch(watchDir, (_eventType, filename) => {
-    if (filename !== walFile) return;
+    if (filename !== null && filename !== walFile) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
