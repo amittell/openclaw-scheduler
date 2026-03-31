@@ -66,7 +66,37 @@ function timeAgo(dateStr) {
   return `${Math.floor(hr / 24)}d ago`;
 }
 
-function formatMessages(msgs, agentId) {
+/** Sentinel tokens that should never appear in user-facing delivery. */
+const DELIVERY_SENTINELS = ['HEARTBEAT_OK', 'NO_FLUSH', 'IDEMPOTENT_SKIP'];
+
+/**
+ * Format a single message for user-facing delivery.
+ * Strips debug metadata, sentinel tokens, and keeps it clean.
+ */
+function formatMessageForDelivery(msg) {
+  let body = (msg.body || '').trim();
+
+  // Strip sentinel tokens from the end of the body
+  for (const sentinel of DELIVERY_SENTINELS) {
+    if (body.endsWith(sentinel)) {
+      body = body.slice(0, -sentinel.length).trim();
+    }
+  }
+
+  if (!body) return null;
+
+  // Prefix with subject if present and not already in the body
+  if (msg.subject && !body.startsWith(msg.subject)) {
+    return `${msg.subject}\n\n${body}`.slice(0, 4000);
+  }
+
+  return body.slice(0, 4000);
+}
+
+/**
+ * Legacy debug format for --verbose mode.
+ */
+function _formatMessagesDebug(msgs, agentId) {
   const lines = [`Inbox for ${agentId}: ${msgs.length} message(s)`];
   for (const msg of msgs) {
     lines.push('');
@@ -106,54 +136,43 @@ async function drainOnce(db, { to, channel, agentId, limit }) {
     return 0;
   }
 
-  // Group messages by kind for independent delivery attempts
-  const groups = new Map();
-  for (const msg of msgs) {
-    const target = msg.delivery_to || to || '_default_target';
-    const ch = msg.channel || channel || '_default_channel';
-    const key = `${msg.kind || '_default'}:${ch}:${target}`;
-    if (!groups.has(key)) groups.set(key, { msgs: [] });
-    groups.get(key).msgs.push(msg);
-  }
-
   let delivered = 0;
-  const groupErrors = [];
-  for (const [, group] of groups) {
-    // Determine routing: use per-message delivery_to/channel when present,
-    // fall back to the default --to / --channel args.
-    // All messages in a group share the same kind, but may have different targets
-    // if they were enqueued with explicit delivery_to. To keep grouping meaningful,
-    // we use the first message's delivery_to as the representative for the group.
-    const firstMsg = group.msgs[0];
-    const msgTarget = firstMsg.delivery_to || to;
-    const msgChannel = firstMsg.channel || channel;
+  const deliveryErrors = [];
+
+  // Deliver each message individually with clean user-facing formatting.
+  // Messages are sent one at a time so a failure on one doesn't block others.
+  for (const msg of msgs) {
+    const msgTarget = msg.delivery_to || to;
+    const msgChannel = msg.channel || channel;
+    const text = formatMessageForDelivery(msg);
+
+    if (!text) {
+      // Empty after stripping sentinels -- ack without delivering
+      ackMessage(msg.id, 'inbox-consumer', 'Suppressed (empty after sentinel strip)');
+      delivered += 1;
+      continue;
+    }
 
     try {
-      const text = formatMessages(group.msgs, agentId);
       await deliverMessage(msgChannel, msgTarget, text);
-      for (const msg of group.msgs) {
-        recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
-        ackMessage(msg.id, 'inbox-consumer', `Delivered to ${msgChannel}:${msgTarget}`);
-      }
-      delivered += group.msgs.length;
+      recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
+      ackMessage(msg.id, 'inbox-consumer', `Delivered to ${msgChannel}:${msgTarget}`);
+      delivered += 1;
     } catch (err) {
-      for (const msg of group.msgs) {
-        recordMessageAttempt(msg.id, {
-          ok: false,
-          actor: 'inbox-consumer',
-          error: err.message || 'delivery failed',
-        });
-      }
-      groupErrors.push(err);
-      // continue to next group instead of throwing
+      recordMessageAttempt(msg.id, {
+        ok: false,
+        actor: 'inbox-consumer',
+        error: err.message || 'delivery failed',
+      });
+      deliveryErrors.push(err);
     }
   }
 
   if (delivered > 0) {
     process.stdout.write(`[inbox-consumer] delivered ${delivered} message(s)\n`);
   }
-  if (groupErrors.length > 0) {
-    throw new Error(`Delivery failed for ${groupErrors.length} group(s): ${groupErrors.map(e => e.message).join('; ')}`);
+  if (deliveryErrors.length > 0) {
+    throw new Error(`Delivery failed for ${deliveryErrors.length} message(s): ${deliveryErrors.map(e => e.message).join('; ')}`);
   }
   return delivered;
 }
