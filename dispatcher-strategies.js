@@ -924,23 +924,89 @@ export async function executeWatchdog(job, ctx, deps) {
 // -- Strategy: Main session ----------------------------------
 
 export async function executeMain(job, ctx, deps) {
-  const { sendSystemEvent, buildExecutionIntentNote } = deps;
+  const {
+    waitForGateway, updateRunSession, buildJobPrompt,
+    runAgentTurnWithActivityTimeout, updateContextSummary,
+    releaseDispatch, releaseIdempotencyKey, updateJob,
+    matchesSentinel, detectTransientError,
+    sqliteNow, log,
+  } = deps;
   const result = makeDefaultResult();
-  result.skipChildren = true;
-  result.skipDequeue = true;
 
-  const executionNote = buildExecutionIntentNote(job);
-  const modelNote = job.payload_thinking
-    ? `[SYSTEM NOTE \u2014 model policy]\nPrefer reasoning depth: ${job.payload_thinking}.\n[END SYSTEM NOTE]\n\n`
-    : '';
-  await sendSystemEvent(`${executionNote ? `${executionNote}\n\n` : ''}${modelNote}${job.payload_message}`, 'now');
-  result.summary = 'System event dispatched';
-  result.content = job.payload_message;
+  // Gateway health check
+  const gatewayReady = await waitForGateway(30000, 2000);
+  if (!gatewayReady) {
+    log('warn', `Gateway unavailable after 30s -- deferring: ${job.name}`, { jobId: job.id });
+    deps.finishRun(ctx.run.id, 'error', { error_message: 'Gateway unavailable -- deferred' });
+    if (ctx.idemKey) releaseIdempotencyKey(ctx.idemKey);
+    const deferredAt = sqliteNow(60000);
+    if (ctx.dispatchRecord) {
+      releaseDispatch(ctx.dispatchRecord.id, deferredAt);
+    } else {
+      updateJob(job.id, { next_run_at: deferredAt });
+    }
+    result.earlyReturn = true;
+    return result;
+  }
 
-  // Main session only delivers on announce-always (not on error)
-  if (job.delivery_mode !== 'announce-always') {
+  // Main session uses a stable session key so the agent has conversation
+  // continuity across scheduled runs. Unlike isolated sessions (which get
+  // a fresh key per run), the main session accumulates context over time.
+  const sessionKey = job.preferred_session_key || 'main';
+  updateRunSession(ctx.run.id, sessionKey, null);
+
+  const { prompt, contextMeta } = buildJobPrompt(job, ctx.run);
+  try { updateContextSummary(ctx.run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
+
+  const turnResult = await runAgentTurnWithActivityTimeout({
+    message: prompt,
+    agentId: job.agent_id || 'main',
+    sessionKey,
+    model: job.payload_model || undefined,
+    idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
+    pollIntervalMs: 60000,
+    absoluteTimeoutMs: job.run_timeout_ms || 300000,
+  });
+
+  const content = turnResult.content || '';
+  const trimmed = content.trim();
+
+  const isHeartbeatOk = matchesSentinel(trimmed, 'HEARTBEAT_OK');
+  const isNoFlush = matchesSentinel(trimmed, 'NO_FLUSH');
+  const isIdempotentSkip = matchesSentinel(trimmed, 'IDEMPOTENT_SKIP');
+  const isTaskFailed = matchesSentinel(trimmed, 'TASK_FAILED');
+  const isTransientError = detectTransientError(content);
+
+  if (isTaskFailed) log('warn', `Agent signalled TASK_FAILED: ${job.name}`, { runId: ctx.run.id });
+  if (isTransientError) log('warn', `Transient error detected in agent reply: ${job.name}`, { runId: ctx.run.id, snippet: content.slice(0, 200) });
+
+  const effectiveStatus = (isTaskFailed || isTransientError) ? 'error' : 'ok';
+
+  result.status = effectiveStatus;
+  result.summary = content.slice(0, 5000);
+  result.content = content;
+  result.errorMessage = effectiveStatus === 'error'
+    ? (isTaskFailed ? 'Agent signalled TASK_FAILED' : 'Transient error in agent reply')
+    : null;
+  result.idemAction = effectiveStatus === 'ok' ? 'keep' : 'release';
+  result.retryFiresChildren = true;
+
+  // Suppress delivery for sentinel responses
+  if (isHeartbeatOk || isNoFlush || isIdempotentSkip) {
     result.skipDelivery = true;
   }
+
+  // Announce mode: only deliver on error (consistent with shell/isolated behavior)
+  if (job.delivery_mode === 'announce' && effectiveStatus === 'ok') {
+    result.skipDelivery = true;
+  }
+
+  log('info', `Completed (main): ${job.name} (${turnResult.usage?.total_tokens || '?'} tokens)`, {
+    runId: ctx.run.id,
+    durationMs: ctx.run.started_at
+      ? Date.now() - new Date(ctx.run.started_at.replace(' ', 'T') + (ctx.run.started_at.endsWith('Z') ? '' : 'Z')).getTime()
+      : null,
+  });
 
   return result;
 }
