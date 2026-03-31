@@ -59,7 +59,9 @@ Queue:
   queue prune                        Prune old messages now
 
 Messages:
-  msg send <from> <to> <body>        Send a message
+  messages send --from <label> [--to <agent>] [--kind <kind>] --body "<text>"
+                                     Send a checkpoint/status message (kind defaults to 'status', to defaults to 'main')
+  msg send <from> <to> <body>        Send a message (positional form)
   msg inbox <agent-id> [limit]       Get inbox (unread)
   msg team-inbox <team-id> [limit] [member-id] [task-id]  Get team mailbox
   msg outbox <agent-id> [limit]      Get outbox
@@ -534,6 +536,38 @@ switch (command) {
       case 'read': { if (!args[0]) fail('Usage: msg read <message-id>'); markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break; }
       case 'readall': { if (!args[0]) fail('Usage: msg readall <agent-id>'); const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
       case 'unread': { if (!args[0]) fail('Usage: msg unread <agent-id>'); const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
+      default: usage();
+    }
+    break;
+
+  // -- Messages (named-flag interface) --------------------------
+  case 'messages':
+    switch (sub) {
+      case 'send': {
+        // Parse named flags from args: --from, --to, --kind, --body
+        const mFlags = {};
+        for (let i = 0; i < args.length; i++) {
+          if (args[i].startsWith('--')) {
+            const key = args[i].slice(2);
+            if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+              mFlags[key] = args[i + 1];
+              i++;
+            } else {
+              mFlags[key] = true;
+            }
+          }
+        }
+        const mFrom = mFlags.from;
+        const mTo   = mFlags.to   || 'main';
+        const mKind = mFlags.kind || 'status';
+        const mBody = mFlags.body;
+        if (!mFrom || !mBody) {
+          fail('Usage: messages send --from <label> [--to <agent>] [--kind <kind>] --body "<text>"');
+        }
+        const msg = sendMessage({ from_agent: mFrom, to_agent: mTo, kind: mKind, body: mBody });
+        emit({ ok: true, message: msg }, `Sent: ${fmt(msg)}`);
+        break;
+      }
       default: usage();
     }
     break;

@@ -682,6 +682,13 @@ async function cmdEnqueue(flags) {
     ``,
   ];
 
+  // -- Checkpoint notify command (mid-run status messages) -----
+  // Agents can call this command at logical checkpoints to send status updates
+  // that will be delivered to the inbox consumer (and ultimately Telegram).
+  const schedulerCliPath = join(__dirname, '..', 'cli.js');
+  const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
+  const CHECKPOINT_NOTIFY_ENV = `CHECKPOINT_NOTIFY_CMD=${checkpointNotifyCmd}`;
+
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
     parts.push(`---`);
@@ -699,6 +706,17 @@ async function cmdEnqueue(flags) {
   }
 
   parts.push(`[Subagent Task]: ${message}`);
+
+  // -- Checkpoint notify instructions ---------------------------
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(`CHECKPOINT MESSAGING: You can send mid-run status updates using this command:`);
+  parts.push(`  ${checkpointNotifyCmd} "<message>"`);
+  parts.push(`Call this at logical checkpoints: start of a major step, on conflict/error, before completing.`);
+  parts.push(`Example: ${checkpointNotifyCmd} "Starting step 2: running tests"`);
+  parts.push(`(Environment variable CHECKPOINT_NOTIFY_CMD is set to: ${checkpointNotifyCmd})`);
+  parts.push(`---`);
+  parts.push(``);
 
   // Append agent-side done signal instructions (Fix 2 -- push-based completion)
   // Always point to dispatch/index.mjs (__dirname) -- the canonical done handler.
