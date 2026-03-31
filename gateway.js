@@ -28,9 +28,14 @@ function getGatewayToken() {
   return _cachedToken;
 }
 
-function authHeaders() {
+function authHeaders(scopes = null) {
   const token = getGatewayToken();
-  return token ? { 'Authorization': `Bearer ${token}`, 'x-openclaw-scopes': 'operator.write' } : {};
+  return token
+    ? {
+      'Authorization': `Bearer ${token}`,
+      ...(scopes ? { 'x-openclaw-scopes': scopes } : {}),
+    }
+    : {};
 }
 
 // ── Chat Completions (independent dispatch) ─────────────────
@@ -38,9 +43,17 @@ function authHeaders() {
 /**
  * Run an agent turn via the OpenAI-compatible chat completions endpoint.
  * Returns the full response including the assistant message.
- * 
+ *
  * This is the primary dispatch mechanism for isolated jobs.
  * Each call gets its own session (or use sessionKey for continuity).
+ *
+ * @param {object} opts
+ * @param {string} opts.message - The user message to send.
+ * @param {string} [opts.agentId='main'] - Agent ID.
+ * @param {string} [opts.sessionKey] - Session key for continuity.
+ * @param {string} [opts.model] - Model override.
+ * @param {string|null} [opts.authProfile] - Auth profile header value.
+ * @param {number} [opts.timeoutMs=300000] - Request timeout in milliseconds.
  */
 export async function runAgentTurn(opts) {
   const {
@@ -60,7 +73,7 @@ export async function runAgentTurn(opts) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders('operator.write'),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
@@ -184,7 +197,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
+        ...authHeaders('operator.write'),
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),

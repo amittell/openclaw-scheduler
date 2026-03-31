@@ -1071,6 +1071,9 @@ export async function executeAgent(job, ctx, deps) {
     sessionKey,
     model: job.payload_model || undefined,
     authProfile: resolvedAuthProfile,
+    // materializedEnv deferred: the x-openclaw-env-inject header is not sent
+    // until the OpenClaw gateway implements the receiver side. See
+    // openclaw/docs/env-inject-proposal.md for the gateway spec.
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
     pollIntervalMs: 60000,
     absoluteTimeoutMs: job.run_timeout_ms || 300000,

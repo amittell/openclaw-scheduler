@@ -38,7 +38,14 @@ import {
   ackMessage, listMessageReceipts, recordMessageAttempt, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from './agents.js';
-import { splitMessageForChannel, TELEGRAM_MAX_MESSAGE_LENGTH } from './gateway.js';
+import {
+  splitMessageForChannel,
+  TELEGRAM_MAX_MESSAGE_LENGTH,
+  checkGatewayHealth,
+  invokeGatewayTool,
+  runAgentTurn,
+  runAgentTurnWithActivityTimeout,
+} from './gateway.js';
 import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
 import {
@@ -9314,6 +9321,70 @@ console.log('\n── getStaleRuns type guard ──');
   // Valid call should not throw
   const staleRuns = getStaleRuns(90);
   assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
+}
+
+// ── Gateway scope header ──
+
+console.log('\n── Gateway scope header ──');
+{
+  const originalFetch = globalThis.fetch;
+  const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  process.env.OPENCLAW_GATEWAY_TOKEN = 'test-gateway-token';
+  const captured = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    captured.push({ url, opts });
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: 'ok' } }],
+        usage: { total_tokens: 1 },
+      }),
+      headers: new Headers({ 'x-openclaw-session-key': 'session-from-gateway' }),
+    };
+  };
+
+  try {
+    await runAgentTurn({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-1',
+      timeoutMs: 1000,
+    });
+    assert(
+      captured[0]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      'runAgentTurn: sends operator.write scope for chat completions',
+    );
+
+    await runAgentTurnWithActivityTimeout({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-2',
+      pollIntervalMs: 60_000,
+      idleTimeoutMs: 60_000,
+      absoluteTimeoutMs: 1_000,
+    });
+    assert(
+      captured[1]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      'runAgentTurnWithActivityTimeout: sends operator.write scope for chat completions',
+    );
+
+    await invokeGatewayTool('sessions_list', { limit: 1 });
+    assert(
+      captured[2]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      'invokeGatewayTool: does not send chat-completions scope header',
+    );
+
+    const healthOk = await checkGatewayHealth();
+    assert(healthOk === true, 'checkGatewayHealth: returns true for ok responses');
+    assert(
+      captured[3]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      'checkGatewayHealth: does not send chat-completions scope header',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
+  }
 }
 
 closeDb();

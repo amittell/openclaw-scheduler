@@ -214,11 +214,15 @@ const waited: Promise<boolean> = gateway.waitForGateway(5000, 1000);
 
 // Async gateway functions (type-check only, not called)
 async function _gatewaySmoke() {
-  const turnResult: AgentTurnResult = await gateway.runAgentTurn({ message: 'hi' });
+  const turnResult: AgentTurnResult = await gateway.runAgentTurn({
+    message: 'hi',
+  });
   void turnResult.ok; void turnResult.content; void turnResult.usage; void turnResult.sessionKey;
 
   const activityResult: AgentTurnResult = await gateway.runAgentTurnWithActivityTimeout({
-    message: 'hi', idleTimeoutMs: 60000, absoluteTimeoutMs: 300000,
+    message: 'hi',
+    idleTimeoutMs: 60000,
+    absoluteTimeoutMs: 300000,
   });
   void activityResult.content;
 

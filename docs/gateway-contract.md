@@ -29,6 +29,10 @@ Authorization: Bearer <token>
 If neither source provides a token, requests are sent without an
 `Authorization` header.
 
+Scope headers are endpoint-specific. When the scheduler needs a scoped gateway
+operation, the per-endpoint contract below defines the additional
+`x-openclaw-scopes` header.
+
 **dispatch/index.mjs** uses a slightly different resolution path for the CLI
 context: it checks `OPENCLAW_GATEWAY_TOKEN` first, then falls back to reading
 `~/.openclaw/openclaw.json` at `gateway.auth.token`.
@@ -66,6 +70,7 @@ single user message to an agent and receives the complete assistant response.
 |---|---|---|
 | `Content-Type` | Yes | Always `application/json` |
 | `Authorization` | Conditional | `Bearer <token>` when token is available |
+| `x-openclaw-scopes` | Conditional | `operator.write` when a bearer token is sent. This scope header is specific to chat-completions dispatch. |
 | `x-openclaw-agent-id` | Conditional | Agent ID string (e.g. `main`). Omitted when falsy. |
 | `x-openclaw-session-key` | Conditional | Session key for continuity. Omitted when not provided. |
 | `x-openclaw-auth-profile` | Conditional | Auth profile override. Omitted when null. See "Auth-Profile Forwarding" below. |
@@ -486,6 +491,112 @@ after completion. Label status is updated in labels.json to `done`,
 
 ---
 
+## Multi-Agent Gateway Routing
+
+A single OpenClaw gateway instance serves multiple agents. The scheduler
+dispatches to specific agents by setting the `x-openclaw-agent-id` header
+(or encoding the agent ID in the model string as `openclaw:<agentId>`).
+No pre-registration step is required -- the gateway creates agent-scoped
+state on first request.
+
+### Agent ID resolution
+
+The gateway resolves the target agent ID from each inbound request using
+two sources, in priority order:
+
+1. **Header**: `x-openclaw-agent-id` (or `x-openclaw-agent`). Highest
+   priority. This is what the scheduler sets.
+2. **Model string**: `openclaw:<agentId>` or `agent:<agentId>` patterns
+   parsed from the `model` field in the request body.
+
+If neither is present, the gateway defaults to `"main"`. Agent IDs are
+normalized to lowercase and must match `[a-z0-9][a-z0-9_-]{0,63}`.
+
+Reference: `openclaw/src/gateway/http-utils.ts`
+(`resolveAgentIdFromHeader`, `resolveAgentIdFromModel`,
+`resolveAgentIdForRequest`).
+
+### Agent-scoped session keys
+
+Sessions are namespaced by agent ID. The session key format is:
+
+```
+agent:<agentId>:<prefix>:<identifier>
+```
+
+Examples:
+- `agent:main:subagent:a1b2c3d4-...` -- main agent, scheduler-dispatched
+  isolated session
+- `agent:beta:openai:e5f6g7h8-...` -- beta, OpenAI-compat chat session
+- `agent:main:telegram:webhook:484946046` -- main agent, Telegram peer
+
+This namespacing provides session isolation between agents. Agent beta's
+sessions cannot read main's conversation history or tool state, and
+vice versa, even though both run on the same gateway.
+
+Reference: `openclaw/src/routing/session-key.ts`
+(`buildAgentMainSessionKey`, `DEFAULT_AGENT_ID`).
+
+### Per-agent configuration
+
+Each agent has its own configuration directory at
+`~/.openclaw/agents/<agentId>/agent/`, containing:
+
+- `models.json` -- provider endpoints and model definitions for this
+  agent. Different agents can use different model providers (e.g. main
+  uses Anthropic, beta uses OpenAI Codex via a different base URL).
+- `auth-profiles.json` -- credential profiles scoped to this agent.
+  Each agent can have independent API keys, OAuth tokens, and provider
+  configurations.
+- `sessions/` -- per-agent session store (sessions.json + JSONL files).
+
+The gateway reads from the correct agent directory based on the resolved
+agent ID. This means agents on the same gateway can have completely
+independent credential surfaces.
+
+### Scheduler dispatch to non-default agents
+
+The scheduler targets a specific agent by setting `agent_id` on the job:
+
+```json
+{
+  "name": "Beta Agent Daily Task",
+  "agent_id": "beta",
+  "session_target": "isolated",
+  "payload_kind": "agentTurn",
+  "payload_message": "perform daily check"
+}
+```
+
+At dispatch time, `gateway.js` sets `x-openclaw-agent-id: beta` on the
+outbound `/v1/chat/completions` request. The gateway routes the request
+to beta's agent scope, creates a session under `agent:beta:...`, and
+uses beta's model and auth profile configuration.
+
+Jobs without an explicit `agent_id` default to `"main"`.
+
+### Multi-agent trust considerations
+
+When multiple agents share a gateway, each agent is a separate execution
+principal with its own credential surface:
+
+- Auth profiles are per-agent (`~/.openclaw/agents/<id>/agent/auth-profiles.json`).
+  A job dispatched to beta uses beta's profiles, not main's.
+- The scheduler's `child_credential_policy` applies within a single
+  agent's dispatch chain. Cross-agent credential scoping (e.g. a main
+  job triggering a beta child with downscoped credentials) is not
+  currently supported -- each agent resolves credentials from its own
+  profile store.
+- The `x-openclaw-env-inject` header is agent-agnostic: materialized
+  env vars are forwarded to whichever agent the job targets.
+- Session isolation between agents is enforced by the session key
+  namespace. Agent A cannot access agent B's sessions or conversation
+  history through the gateway.
+
+For the broader trust architecture, see `docs/trust-architecture.md`.
+
+---
+
 ## Activity Timeout Pattern
 
 `runAgentTurnWithActivityTimeout()` in `gateway.js` (line 119) implements a
@@ -543,6 +654,89 @@ directly as the `x-openclaw-auth-profile` header value without resolution.
 
 ---
 
+## Env-Inject Forwarding
+
+When credential materialization for an agent task produces a non-empty plain
+object of string environment variables, the scheduler JSON-encodes that map
+and sends it as the `x-openclaw-env-inject` header on
+`POST /v1/chat/completions`.
+
+Validation rules:
+
+- Arrays, non-plain objects, and null/undefined values are rejected.
+- Empty objects are omitted.
+- All values must be strings.
+- Serialization uses `Object.fromEntries` on validated entries so hidden
+  `toJSON` hooks on the original object cannot alter the payload.
+
+### Precedence when both headers are present
+
+A request may include both `x-openclaw-auth-profile` and
+`x-openclaw-env-inject`. These are complementary, not competing:
+
+- `x-openclaw-auth-profile` selects which credential profile the gateway
+  uses for upstream API calls (model provider routing).
+- `x-openclaw-env-inject` injects task-scoped environment variables into
+  the child session's process environment (credential materialization).
+
+If the gateway receives both, it should apply both: select the auth profile
+for provider routing, and merge the env vars into the child environment.
+Neither header overrides the other.
+
+### Header size limits
+
+Materialized env maps should be kept small (a handful of API keys and
+scope tokens). The scheduler does not enforce a size limit, but HTTP
+proxies and gateways typically cap individual header values at 8 KB.
+Gateway implementations should reject `x-openclaw-env-inject` values
+that exceed a reasonable threshold (suggested: 8192 bytes) and return
+`431 Request Header Fields Too Large`.
+
+### Receiver-side implementation notes
+
+When the gateway parses `x-openclaw-env-inject`, it must use a safe
+merge strategy. Specifically:
+
+- Parse the header value with `JSON.parse`.
+- Validate the result is a plain object (not an array, not a prototype
+  chain exploit).
+- Merge only string-valued entries into the child process environment.
+- Do not use recursive merge or spread into `Object.prototype` --
+  naive merge enables prototype pollution.
+
+This path requires matching receiver-side support in the gateway. Until that
+support is available, `auth_profile` forwarding remains the compatibility path
+for agent-side credential selection.
+
+Reference: `gateway.js` (`buildEnvInjectHeader()`, `runAgentTurn()`,
+`runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
+(`executeAgent()`).
+
+---
+
+## Trust Architecture
+
+For the full trust architecture -- including what the scheduler/child
+boundary guarantees vs. what it does not, the credential flow from operator
+to child, and the distinction between security boundaries and operational
+boundaries -- see `docs/trust-architecture.md`.
+
+The gateway contract intersects with the trust architecture at these points:
+
+- **Session isolation:** isolated sessions cannot access the main session's
+  memory or history. This provides context isolation between parent and child
+  tasks.
+- **Auth-profile forwarding:** the scheduler can direct the gateway to use a
+  specific credential profile for agent tasks (see "Auth-Profile Forwarding"
+  above).
+- **Credential materialization:** for shell tasks, credentials are injected as
+  environment variables by the identity provider. For agent tasks, the
+  scheduler can now forward a materialized env map via
+  `x-openclaw-env-inject`; `auth_profile` forwarding remains the profile-based
+  compatibility path when the gateway does not yet apply env injection.
+
+---
+
 ## Local Provider Plugins
 
 ### Dispatch-Time Authorization Evaluation
@@ -574,6 +768,9 @@ This is a high-trust boundary:
   `identity.presentation` or `credential_handoff` must use
   `session_target: "shell"`; non-shell jobs fail closed at validation/dispatch
   time.
+
+For the broader trust architecture that frames this provider trust boundary
+within the scheduler/child execution model, see `docs/trust-architecture.md`.
 
 Reference:
 - `dispatcher.js` lines 818-819
