@@ -302,6 +302,10 @@ function setGwRestartRetryCount(label, count) {
  * Send a notification via the scheduler messages table.
  */
 function notify(message) {
+  if (process.env.OPENCLAW_SCHEDULER_NOTIFY_DISABLED === '1') {
+    process.stderr.write(`[watcher] notify suppressed (test mode): ${message}\n`);
+    return;
+  }
   try {
     sendMessage({
       from_agent: 'dispatch',
