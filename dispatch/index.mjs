@@ -843,15 +843,15 @@ async function cmdEnqueue(flags) {
           delivery_guarantee:       'at-least-once',
           ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
-          // Shell job ceiling must cover the watcher's full legitimate runtime:
-          //   watcherTimeoutS (main poll deadline)
-          //   + FLAT_WINDOW_MS/1000 (3min post-deadline activity window in watcher.mjs)
-          //   + FLAT_WINDOW_MS/1000 (one mid-turn extension if getJsonlMidTurnReason fires)
-          //   + 60s slop for scheduling jitter and process startup
-          // Previous value of (watcherTimeoutS + 60) was structurally too small --
-          // it killed the watcher during the flat window before JSONL/token checks ran.
-          // Watcher constants: FLAT_WINDOW_MS = 180_000 (3min), see watcher.mjs line 48.
-          run_timeout_ms:           (watcherTimeoutS + 180 + 180 + 60) * 1000,
+          // Shell job ceiling must cover the watcher's maximum legitimate runtime.
+          // Two competing ceilings:
+          //   1. Initial: watcherTimeoutS + 2*FLAT_WINDOW + slop (sessions that don't extend)
+          //   2. Rolling: MAX_DEADLINE_EXTENSION + 2*FLAT_WINDOW + slop (sessions that extend via activity)
+          // The watcher can roll its deadline up to MAX_DEADLINE_EXTENSION (4h) when
+          // it detects activity (token growth or JSONL mtime advance). The scheduler
+          // must not SIGTERM the watcher before that cap is reached.
+          // Watcher constants (watcher.mjs): FLAT_WINDOW_MS=180_000, MAX_DEADLINE_EXTENSION=4h.
+          run_timeout_ms:           Math.max(watcherTimeoutS + 420, 4 * 3600 + 420) * 1000,
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
