@@ -1828,6 +1828,207 @@ The watchdog disarms itself automatically when the agent calls `done`, when `sta
 
 ---
 
+## Working with agentcli
+
+[agentcli](https://github.com/amittell/agentcli) is the control-plane companion
+for the scheduler. It provides manifest authoring, validation, local execution,
+identity binding, and capability negotiation. The scheduler provides the durable
+runtime: scheduling, retries, approvals, delivery, and persistent state.
+
+You can use the scheduler without agentcli (create jobs directly via CLI), but
+using them together gives you declarative workflow manifests, stable job IDs,
+v0.2 identity/authorization/evidence support, and repeatable applies.
+
+### Installing agentcli
+
+```bash
+npm install -g agentcli
+```
+
+### Starting fresh with both tools
+
+Write a manifest, validate it, then apply it to the scheduler:
+
+```bash
+# 1. Write a manifest
+cat > my-workflow.json <<'JSON'
+{
+  "version": "0.1",
+  "workflows": [{
+    "id": "daily-ops",
+    "name": "Daily Operations",
+    "tasks": [{
+      "id": "health-check",
+      "name": "Morning Health Check",
+      "prompt": "Run the daily health check and report any issues.",
+      "target": { "session_target": "isolated", "agent_id": "main" },
+      "schedule": { "cron": "0 9 * * *", "tz": "America/New_York" },
+      "runtime": { "timeout_ms": 300000 },
+      "delivery": { "mode": "announce", "channel": "telegram", "to": "YOUR_CHAT_ID" }
+    }]
+  }]
+}
+JSON
+
+# 2. Validate locally (no scheduler needed)
+agentcli validate my-workflow.json
+
+# 3. Preview what would be created (dry-run)
+agentcli apply my-workflow.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --scheduler-prefix ~/.openclaw/scheduler \
+  --dry-run
+
+# 4. Apply (creates the jobs)
+agentcli apply my-workflow.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --scheduler-prefix ~/.openclaw/scheduler
+
+# 5. Verify
+openclaw-scheduler jobs list
+```
+
+### Adopting existing scheduler jobs
+
+If you already have jobs created directly via `openclaw-scheduler jobs add` and
+want to bring them under agentcli management:
+
+1. Write a manifest with task names that match your existing job names exactly.
+
+2. Run a one-time adoption by name:
+
+```bash
+agentcli apply my-workflow.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --scheduler-prefix ~/.openclaw/scheduler \
+  --adopt-by name \
+  --dry-run          # preview first
+
+agentcli apply my-workflow.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --scheduler-prefix ~/.openclaw/scheduler \
+  --adopt-by name    # execute adoption
+```
+
+This replaces each matched job with a new one under agentcli's stable ID
+scheme (SHA256 of workflow_id:task_id). The old job is deleted after the
+new one is created.
+
+3. On subsequent applies, use the default (no `--adopt-by` flag). Jobs are
+   matched by their stable ID, so the manifest can be renamed or reorganized
+   without losing job mapping.
+
+### Workflow chains
+
+agentcli manifests support parent/child task relationships that compile to
+scheduler trigger chains:
+
+```json
+{
+  "version": "0.1",
+  "workflows": [{
+    "id": "deploy-pipeline",
+    "name": "Deploy Pipeline",
+    "tasks": [
+      {
+        "id": "build",
+        "name": "Build",
+        "shell": { "program": "sh", "args": ["-c", "npm run build"] },
+        "target": { "session_target": "shell" },
+        "schedule": { "cron": "0 2 * * *" },
+        "runtime": { "timeout_ms": 600000 }
+      },
+      {
+        "id": "deploy",
+        "name": "Deploy",
+        "shell": { "program": "sh", "args": ["-c", "fly deploy"] },
+        "target": { "session_target": "shell" },
+        "trigger": { "parent": "build", "on": "success" },
+        "runtime": { "timeout_ms": 300000 }
+      },
+      {
+        "id": "verify",
+        "name": "Post-Deploy Verify",
+        "prompt": "Verify all services are healthy after deploy.",
+        "target": { "session_target": "isolated", "agent_id": "main" },
+        "trigger": { "parent": "deploy", "on": "success" },
+        "runtime": { "timeout_ms": 300000 },
+        "delivery": { "mode": "announce-always", "channel": "telegram", "to": "YOUR_CHAT_ID" }
+      }
+    ]
+  }]
+}
+```
+
+This compiles to three scheduler jobs: Build runs on cron, Deploy triggers
+on Build success, Verify triggers on Deploy success.
+
+### v0.2 identity and authorization
+
+agentcli v0.2 manifests add identity profiles, authorization proofs, evidence
+generation, and credential handoff. These compile to the scheduler's v0.2
+runtime fields and are enforced at dispatch time:
+
+```json
+{
+  "version": "0.2",
+  "identity_profiles": [{
+    "id": "stripe-readonly",
+    "provider": "stripe",
+    "subject": { "kind": "service", "principal": "agent://payments/reader" },
+    "auth": { "mode": "service", "scopes": ["read"] },
+    "trust": { "level": "supervised" }
+  }],
+  "workflows": [{
+    "id": "payment-ops",
+    "tasks": [{
+      "id": "check-balance",
+      "name": "Check Balance",
+      "shell": { "program": "sh", "args": ["-c", "stripe balance retrieve"] },
+      "target": { "session_target": "shell" },
+      "identity": { "ref": "stripe-readonly" },
+      "contract": {
+        "required_trust_level": "supervised",
+        "trust_enforcement": "strict"
+      },
+      "schedule": { "cron": "0 9 * * *" },
+      "runtime": { "timeout_ms": 60000 }
+    }]
+  }]
+}
+```
+
+See the [agentcli examples directory](https://github.com/amittell/agentcli/tree/main/examples)
+for fully annotated manifests covering Stripe, Fly.io, Terraform, GitHub CLI,
+and more.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENTCLI_SCHEDULER_DB` | *(none)* | Path to scheduler SQLite database |
+| `AGENTCLI_SCHEDULER_PREFIX` | *(none)* | npm prefix where scheduler is installed |
+| `AGENTCLI_SCHEDULER_BIN` | *(none)* | Direct path to scheduler CLI binary |
+| `AGENTCLI_TARGET` | `standalone` | Default compilation target (`standalone` or `openclaw-scheduler`) |
+| `AGENTCLI_OUTPUT` | *(none)* | Output format (`json` or `ndjson`) |
+
+### Key commands
+
+```bash
+agentcli validate manifest.json           # Check manifest validity
+agentcli compile manifest.json \
+  --target openclaw-scheduler --explain   # Preview compiled job specs
+agentcli apply manifest.json \
+  --db path/to/scheduler.db --dry-run     # Preview changes
+agentcli apply manifest.json \
+  --db path/to/scheduler.db               # Create/update jobs
+agentcli inspect jobs                     # List managed jobs
+agentcli exec manifest.json task-id \
+  --dry-run --signer none                 # Local execution (no scheduler)
+```
+
+---
+
 ## Trust Architecture
 
 The scheduler acts as a control-plane broker for child execution principals.
