@@ -687,7 +687,8 @@ async function cmdEnqueue(flags) {
   // that will be delivered to the inbox consumer (and ultimately Telegram).
   const schedulerCliPath = join(__dirname, '..', 'cli.js');
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
-  const CHECKPOINT_NOTIFY_ENV = `CHECKPOINT_NOTIFY_CMD=${checkpointNotifyCmd}`;
+  // NOTE: CHECKPOINT_NOTIFY_CMD env-var injection into child process is not yet
+  // wired. The command is currently injected into the prompt text (line ~714).
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
@@ -846,7 +847,6 @@ async function cmdEnqueue(flags) {
         const watcherTimeoutS = timeoutS + 120;
         const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
 
-
         const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
         const jobSpec = JSON.stringify({
           name:                     `${agentBrand}-deliver:${label}`,
@@ -861,15 +861,12 @@ async function cmdEnqueue(flags) {
           delivery_guarantee:       'at-least-once',
           ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
           overlap_policy:           'skip',
-          // Shell job ceiling must cover the watcher's maximum legitimate runtime.
-          // Two competing ceilings:
-          //   1. Initial: watcherTimeoutS + 2*FLAT_WINDOW + slop (sessions that don't extend)
-          //   2. Rolling: MAX_DEADLINE_EXTENSION + 2*FLAT_WINDOW + slop (sessions that extend via activity)
-          // The watcher can roll its deadline up to MAX_DEADLINE_EXTENSION (4h) when
-          // it detects activity (token growth or JSONL mtime advance). The scheduler
-          // must not SIGTERM the watcher before that cap is reached.
-          // Watcher constants (watcher.mjs): FLAT_WINDOW_MS=180_000, MAX_DEADLINE_EXTENSION=4h.
-          run_timeout_ms:           Math.max(watcherTimeoutS + 420, 4 * 3600 + 420) * 1000,
+          // Shell ceiling = max(initial timeout, rolling extension cap) + headroom.
+          // The watcher can extend its deadline up to MAX_DEADLINE_EXTENSION (4h) on
+          // activity (token growth / JSONL mtime). Headroom covers 2*FLAT_WINDOW + slop.
+          // Watcher constants: FLAT_WINDOW_MS=180s, MAX_DEADLINE_EXTENSION=4h.
+          run_timeout_ms:           Math.max(watcherTimeoutS, 4 * 3600) * 1000
+                                    + 420 * 1000,  // +7min headroom (2*FLAT_WINDOW + 1min slop)
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');

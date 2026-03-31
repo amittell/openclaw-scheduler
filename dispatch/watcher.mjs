@@ -837,10 +837,27 @@ process.on('SIGTERM', () => {
 
 // -- Rolling deadline vars ------------------------------------
 let lastTokens = null;
-let preDeadlineJsonlMtime = null;  // JSONL mtime tracked in pre-deadline loop for activity signal
-let preDeadlineSessionId = null;   // session ID being tracked (reset on respawn to avoid cross-session comparison)
+let preDeadlineJsonlMtime = null;  // JSONL mtime sampled each poll cycle for subagent activity signal
+let preDeadlineSessionId = null;   // reset on respawn to avoid cross-session mtime comparison
 const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
 const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
+
+/**
+ * Attempt to push the watcher deadline forward by ROLLING_EXTEND_MS, capped at
+ * spawnTime + MAX_DEADLINE_EXTENSION.  Returns true if the deadline was actually moved.
+ * @param {string} reason - Human-readable reason for the log line
+ */
+function tryExtendDeadline(reason) {
+  const proposed = Date.now() + ROLLING_EXTEND_MS;
+  const cap = spawnTime + MAX_DEADLINE_EXTENSION;
+  const extension = Math.min(proposed, cap);
+  if (extension <= deadline) return false;
+  deadline = extension;
+  process.stderr.write(
+    `[watcher] [${label}] ${reason}, deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
+  );
+  return true;
+}
 
 // Track whether the session has EVER appeared in the gateway sessions list.
 // Used to distinguish spawn failures (session never appeared) from normal
@@ -868,48 +885,31 @@ while (Date.now() < deadline) {
   // -- Rolling deadline: extend when session shows token activity --
   const currentTokens = status?.liveness?.tokens ?? null;
   if (currentTokens !== null && lastTokens !== null && currentTokens > lastTokens) {
-    const proposed = Date.now() + ROLLING_EXTEND_MS;
-    const cap = spawnTime + MAX_DEADLINE_EXTENSION;
-    const extension = Math.min(proposed, cap);
-    if (extension > deadline) {
-      deadline = extension;
-      process.stderr.write(
-        `[watcher] [${label}] activity detected (${lastTokens}->${currentTokens} tokens), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
-      );
-    }
+    tryExtendDeadline(`activity detected (${lastTokens}->${currentTokens} tokens)`);
   }
   if (currentTokens !== null) lastTokens = currentTokens;
 
   // -- Rolling deadline: extend on JSONL mtime advance (subagent sessions) --
   // Subagent sessions never populate totalTokens in sessions.json, so the token
-  // signal above is always null for them. The JSONL file IS written continuously
-  // during active turns -- use its mtime as the activity signal instead.
-  // This ensures working subagent sessions are never killed mid-task.
+  // signal above is always null for them. Use JSONL file mtime as an alternative
+  // activity signal to prevent killing working subagent sessions mid-task.
   if (status.sessionKey) {
     const storeEntry = getSessionStoreEntry(status.sessionKey);
     const sessionId = storeEntry?.sessionId || null;
-    if (sessionId) {
-      const sessionAgent = status.sessionKey.split(':')[1] || 'main';
-      // Reset baseline when the tracked session changes (e.g. after respawn)
-      if (preDeadlineSessionId !== null && preDeadlineSessionId !== sessionId) {
-        preDeadlineJsonlMtime = null;
+    const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+
+    // Reset mtime baseline when the tracked session changes (e.g. after respawn)
+    if (sessionId && preDeadlineSessionId !== null && preDeadlineSessionId !== sessionId) {
+      preDeadlineJsonlMtime = null;
+    }
+    if (sessionId) preDeadlineSessionId = sessionId;
+
+    const curMtime = sessionId ? getSessionJsonlMtime(sessionId, sessionAgent) : null;
+    if (curMtime !== null) {
+      if (preDeadlineJsonlMtime !== null && curMtime > preDeadlineJsonlMtime + 1000) {
+        tryExtendDeadline('JSONL mtime advanced (subagent active)');
       }
-      preDeadlineSessionId = sessionId;
-      const curMtime = getSessionJsonlMtime(sessionId, sessionAgent);
-      if (curMtime !== null) {
-        if (preDeadlineJsonlMtime !== null && curMtime > preDeadlineJsonlMtime + 1000) {
-          const proposed = Date.now() + ROLLING_EXTEND_MS;
-          const cap = spawnTime + MAX_DEADLINE_EXTENSION;
-          const extension = Math.min(proposed, cap);
-          if (extension > deadline) {
-            deadline = extension;
-            process.stderr.write(
-              `[watcher] [${label}] JSONL mtime advanced (subagent active), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
-            );
-          }
-        }
-        preDeadlineJsonlMtime = curMtime;
-      }
+      preDeadlineJsonlMtime = curMtime;
     }
   }
 

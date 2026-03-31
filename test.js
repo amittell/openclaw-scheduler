@@ -4953,23 +4953,8 @@ console.log('\n-- Watcher pre-deadline JSONL mtime extension --');
   assert(watcherSrc.includes('ROLLING_EXTEND_MS'), 'jsonl-extend: uses ROLLING_EXTEND_MS for extension amount');
   assert(watcherSrc.includes('MAX_DEADLINE_EXTENSION'), 'jsonl-extend: caps extension at MAX_DEADLINE_EXTENSION');
   assert(watcherSrc.includes("preDeadlineSessionId !== sessionId"), 'jsonl-extend: resets baseline on session change');
-
-  // Functional: getSessionJsonlMtime returns mtime for a real file
-  const tmpDir = join(dirname(fileURLToPath(import.meta.url)), '.test-jsonl-tmp');
-  const sessionsDir = join(tmpDir, 'agents', 'main', 'sessions');
-  const { mkdirSync, writeFileSync, rmSync } = await import('node:fs');
-  mkdirSync(sessionsDir, { recursive: true });
-  const testSessionId = 'test-jsonl-mtime-check';
-  const jsonlPath = join(sessionsDir, `${testSessionId}.jsonl`);
-  writeFileSync(jsonlPath, '{"role":"assistant","content":[{"type":"text","text":"hello"}]}\n');
-
-  // Import getSessionJsonlMtime dynamically (it reads from HOME_DIR)
-  // Instead, verify the function signature exists and test via source pattern
   assert(watcherSrc.includes('function getSessionJsonlMtime(sessionId, agentDir'), 'jsonl-extend: getSessionJsonlMtime function signature present');
   assert(watcherSrc.includes('statSync(jsonlPath).mtimeMs'), 'jsonl-extend: getSessionJsonlMtime reads mtimeMs via statSync');
-
-  // Cleanup
-  rmSync(tmpDir, { recursive: true, force: true });
 }
 
 // -- Watcher run_timeout_ms covers MAX_DEADLINE_EXTENSION --
@@ -4980,7 +4965,8 @@ console.log('\n-- Watcher run_timeout_ms ceiling --');
     'utf8'
   );
   // The run_timeout_ms formula must use Math.max to cover the rolling extension cap
-  assert(indexSrc.includes('Math.max(watcherTimeoutS + 420, 4 * 3600 + 420)'), 'run_timeout_ms: uses Math.max to cover MAX_DEADLINE_EXTENSION (4h) ceiling');
+  assert(indexSrc.includes('Math.max(watcherTimeoutS, 4 * 3600)'), 'run_timeout_ms: uses Math.max to cover MAX_DEADLINE_EXTENSION (4h) ceiling');
+  assert(indexSrc.includes('420 * 1000'), 'run_timeout_ms: includes 7min headroom (2*FLAT_WINDOW + slop)');
 }
 
 // ===========================================================
