@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
 
-// Dispatch subcommands — routed to dispatch/index.mjs
+// Dispatch subcommands -- routed to dispatch/index.mjs
 const DISPATCH_SUBCOMMANDS = new Set([
   'dispatch',
   'enqueue',

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Migrate existing OpenClaw cron jobs.json → SQLite scheduler
+// Migrate existing OpenClaw cron jobs.json -> SQLite scheduler
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { initDb } from './db.js';
@@ -16,7 +16,7 @@ function cronFromSchedule(schedule) {
     return { cron: schedule.expr, tz: schedule.tz || 'UTC' };
   }
   if (schedule.kind === 'every') {
-    // Convert interval to approximate cron. everyMs → minutes
+    // Convert interval to approximate cron. everyMs -> minutes
     if (schedule.everyMs < 60000) {
       console.warn(`  WARN: ${schedule.everyMs}ms interval rounded up to 1 minute (cron minimum)`);
     }
@@ -112,7 +112,7 @@ function main() {
         origin: job.origin || 'system',
       });
 
-      console.log(`  OK: ${job.name} → cron="${cron}" tz=${tz}`);
+      console.log(`  OK: ${job.name} -> cron="${cron}" tz=${tz}`);
       imported++;
     } catch (err) {
       console.error(`  ERR: ${job.name}: ${err.message}`);

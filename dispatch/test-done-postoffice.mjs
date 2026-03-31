@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * test-done-postoffice.mjs — Unit/integration tests for the 'done' completion
+ * test-done-postoffice.mjs -- Unit/integration tests for the 'done' completion
  * signal post-office delivery path.
  *
  * Tests:
- *   1. Unregistered label → marked done, no delivery (no deliverTo in config)
- *   2. Unregistered label + config.deliverTo set → onFinished called with fallback target
- *   3. Registered label → normal done path (no spurious gateway call)
+ *   1. Unregistered label -> marked done, no delivery (no deliverTo in config)
+ *   2. Unregistered label + config.deliverTo set -> onFinished called with fallback target
+ *   3. Registered label -> normal done path (no spurious gateway call)
  *
  * Run:
  *   node dispatch/test-done-postoffice.mjs
@@ -31,10 +31,10 @@ let failed = 0;
 function assert(cond, msg) {
   if (cond) {
     passed++;
-    if (verbose) console.log(`  ✅ ${msg}`);
+    if (verbose) console.log(`  [ok] ${msg}`);
   } else {
     failed++;
-    console.error(`  ✗  ${msg}`);
+    console.error(`  [FAIL] ${msg}`);
   }
 }
 
@@ -56,10 +56,10 @@ function runDone(flags, envOverrides = {}) {
   };
 }
 
-/** Alias — spawnSync already captures both streams. */
+/** Alias -- spawnSync already captures both streams. */
 const runDoneFull = runDone;
 
-// ── Helpers ──────────────────────────────────────────────────
+// -- Helpers --------------------------------------------------
 
 function makeTempDir() {
   return mkdtempSync(join(tmpdir(), 'dispatch-test-'));
@@ -81,7 +81,7 @@ function writeConfig(dir, data = {}) {
   writeFileSync(join(dir, 'config.json'), JSON.stringify(data, null, 2));
 }
 
-// ── Mock Gateway Server ──────────────────────────────────────
+// -- Mock Gateway Server --------------------------------------
 
 /**
  * Start a lightweight mock HTTP server that records /tools/invoke requests.
@@ -112,13 +112,13 @@ async function startMockGateway() {
   });
 }
 
-// ══════════════════════════════════════════════════════════════
+// ==============================================================
 // Tests
-// ══════════════════════════════════════════════════════════════
+// ==============================================================
 
-console.log('\ndispatch done — post-office delivery tests\n');
+console.log('\ndispatch done -- post-office delivery tests\n');
 
-// ── Test 1: Unregistered label, no deliverTo in config ───────
+// -- Test 1: Unregistered label, no deliverTo in config -------
 {
   const tmpDir = makeTempDir();
   try {
@@ -149,7 +149,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
   }
 }
 
-// ── Test 2: Unregistered label + config.deliverTo set → onFinished with fallback ──
+// -- Test 2: Unregistered label + config.deliverTo set -> onFinished with fallback --
 {
   const tmpDir = makeTempDir();
   let gw = null;
@@ -198,7 +198,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
   }
 }
 
-// ── Test 3: Registered label → normal path, no spurious gateway notify ───────
+// -- Test 3: Registered label -> normal path, no spurious gateway notify -------
 {
   const tmpDir = makeTempDir();
   let gw = null;
@@ -249,7 +249,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
     // so gateway should NOT be called for delivery from the unregistered path
     await new Promise(r => setTimeout(r, 300));
     const invokeCalls = gw.calls.filter(c => c.url === '/tools/invoke');
-    // The registered path calls onFinished WITHOUT deliverTo — gateway shouldn't be called
+    // The registered path calls onFinished WITHOUT deliverTo -- gateway shouldn't be called
     assert(invokeCalls.length === 0, 'Test 3: gateway NOT called for registered label (uses watcher)');
 
     // No warn about unregistered
@@ -260,7 +260,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
   }
 }
 
-// ── Test 4: Missing label flag ────────────────────────────────
+// -- Test 4: Missing label flag --------------------------------
 {
   const tmpDir = makeTempDir();
   try {
@@ -281,7 +281,7 @@ console.log('\ndispatch done — post-office delivery tests\n');
   }
 }
 
-// ── Results ──────────────────────────────────────────────────
+// -- Results --------------------------------------------------
 console.log(`\n${'='.repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

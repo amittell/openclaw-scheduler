@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * dispatch watcher — polls a session until done, outputs the result.
+ * dispatch watcher -- polls a session until done, outputs the result.
  *
  * Used by scheduler shell jobs for async delivery with retry + audit trail.
  * The scheduler runs this as a shell job with delivery_mode='announce-always',
  * so stdout is delivered via handleDelivery (retry, alias, audit).
  *
  * Detection strategy:
- *   1. Check `status --label` — if auto-resolved to 'done', use it
+ *   1. Check `status --label` -- if auto-resolved to 'done', use it
  *   2. If status says 'running' but session is idle (no activity for >60s),
- *      also check `result --label` for a lastReply — if found, session completed
+ *      also check `result --label` for a lastReply -- if found, session completed
  *      but status hasn't caught up yet (auto-resolve has 10min threshold)
  *
  * 529/Overload auto-retry:
@@ -21,9 +21,9 @@
  * Usage: node watcher.mjs --label <label> [--timeout <seconds>] [--poll-interval <seconds>]
  *
  * Exit codes:
- *   0 — session completed, result on stdout
- *   1 — timeout or error
- *   2 — argument error
+ *   0 -- session completed, result on stdout
+ *   1 -- timeout or error
+ *   2 -- argument error
  */
 
 import { execFileSync, execSync } from 'child_process';
@@ -49,7 +49,7 @@ const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
 const ACTIVITY_POLL_MS = 30_000;
 
 /** How often the watcher writes lastPing to labels.json (heartbeat signal).
- *  The watchdog guard in index.mjs treats pings older than 3× this as stale,
+ *  The watchdog guard in index.mjs treats pings older than 3x this as stale,
  *  so PING_INTERVAL_MS must stay well below PING_STALE_MS (3 * 60_000). */
 const PING_INTERVAL_MS = 60_000; // 60 seconds
 
@@ -66,7 +66,7 @@ function getGatewayToken() {
 
 const GW_TOKEN = getGatewayToken();
 
-// ── Gateway RPC (sync, matches index.mjs pattern) ───────────
+// -- Gateway RPC (sync, matches index.mjs pattern) -----------
 
 /**
  * Sync gateway RPC call via `openclaw gateway call`.
@@ -162,7 +162,7 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ── 529/Overload Detection & Retry ──────────────────────────
+// -- 529/Overload Detection & Retry --------------------------
 
 /** Regex patterns that indicate a 529/overload error */
 const OVERLOAD_PATTERNS = [
@@ -327,7 +327,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
       entry.status = 'error';
       entry.error = `max_retries_exceeded (${retryCount}x 529): ${errorMsg}`;
     });
-    notify(`🌶️ Dispatch: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) — giving up`);
+    notify(`🌶️ Dispatch: [${label}] hit max retries (${MAX_529_RETRIES}x 529 overload) -- giving up`);
     return { retry: false };
   }
 
@@ -338,7 +338,7 @@ function attempt529Retry(label, retryCount, errorMsg) {
     `[watcher] 529 detected for [${label}] (attempt ${newRetryCount}/${MAX_529_RETRIES}). ` +
     `Waiting ${delayMs / 1000}s before retry...\n`
   );
-  notify(`🌶️ Dispatch: [${label}] hit 529 overload — retry ${newRetryCount}/${MAX_529_RETRIES} in ${delayMs / 1000}s`);
+  notify(`🌶️ Dispatch: [${label}] hit 529 overload -- retry ${newRetryCount}/${MAX_529_RETRIES} in ${delayMs / 1000}s`);
 
   // Update retryCount in labels.json BEFORE sleeping (persist intent)
   setRetryCount(label, newRetryCount);
@@ -456,7 +456,7 @@ function respawnAfterGwRestart(label) {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // enqueue sets the label to 'running' with a new sessionKey — also reset error field
+    // enqueue sets the label to 'running' with a new sessionKey -- also reset error field
     updateExistingLabel(label, (entry) => {
       entry.error = null;
     });
@@ -469,7 +469,7 @@ function respawnAfterGwRestart(label) {
   }
 }
 
-// ── Gateway Steer & Kill ─────────────────────────────────────
+// -- Gateway Steer & Kill -------------------------------------
 
 /**
  * Send a steer message into a running session via gateway API (sync).
@@ -510,7 +510,7 @@ function killSession(sessionKey) {
 
 /**
  * Read the sessions.json store for an agent directly from disk.
- * Primary ground truth for session state — sessions spawned via dispatcher
+ * Primary ground truth for session state -- sessions spawned via dispatcher
  * HTTP agent endpoint appear here but NOT in sessions_list API results.
  *
  * @param {string} agent - Agent ID (default: 'main')
@@ -534,7 +534,7 @@ function readSessionsStore(agent = 'main') {
  * activity signal when totalTokens and updatedAt are flat.
  *
  * Fix rationale: for spawned subagent sessions, OpenClaw does NOT flush
- * totalTokens or updatedAt during active turns — so sessions.json stays stale
+ * totalTokens or updatedAt during active turns -- so sessions.json stays stale
  * while the session is actively working. The JSONL mtime advances on every
  * tool call, model reply, and streaming chunk, making it a much more reliable
  * liveness signal. Without this, the watcher hits FLAT_WINDOW_MS mid-turn and
@@ -586,9 +586,9 @@ function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
  *
  * Mid-turn signals:
  *   - Last entry is role=assistant with content containing type=tool_use
- *     → assistant dispatched a tool call, tool hasn't returned yet
+ *     -> assistant dispatched a tool call, tool hasn't returned yet
  *   - Last entry is role=user with content containing type=tool_result
- *     → tool result just delivered, assistant hasn't replied yet
+ *     -> tool result just delivered, assistant hasn't replied yet
  *   - JSONL modified within FLAT_WINDOW_MS (combined with above)
  *
  * Safe signals (return null):
@@ -607,7 +607,7 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
   try {
     mtimeMs = statSync(jsonlPath).mtimeMs;
   } catch {
-    return null; // File doesn't exist — session is genuinely gone, safe to proceed
+    return null; // File doesn't exist -- session is genuinely gone, safe to proceed
   }
 
   // If JSONL hasn't been modified in >FLAT_WINDOW_MS, session isn't actively running
@@ -627,11 +627,11 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
     const hasToolUse = content.some(c => c?.type === 'tool_use');
     if (hasToolUse) {
       const toolName = content.find(c => c?.type === 'tool_use')?.name || 'unknown';
-      return `last assistant entry has tool_use (${toolName}) — awaiting tool result`;
+      return `last assistant entry has tool_use (${toolName}) -- awaiting tool result`;
     }
     // Top-level type=tool_use (non-array content format)
     if (last.type === 'tool_use') {
-      return `last entry is tool_use (${last.name || 'unknown'}) — awaiting tool result`;
+      return `last entry is tool_use (${last.name || 'unknown'}) -- awaiting tool result`;
     }
   }
 
@@ -649,7 +649,7 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
     return 'last entry is tool_result (tool executed, awaiting assistant reply)';
   }
 
-  return null; // Last assistant entry appears to be a complete text reply — safe to proceed
+  return null; // Last assistant entry appears to be a complete text reply -- safe to proceed
 }
 
 /**
@@ -695,7 +695,7 @@ function markLabelError(label, errorSummary) {
  * an alert is written to stdout (delivery target receives the failure notice).
  */
 function deliverResult(label, lastReply, fallbackSummary) {
-  // ── verify-cmd check ─────────────────────────────────────────────────────
+  // -- verify-cmd check -----------------------------------------------------
   // Run the stored verify-cmd (if any) before declaring the job done.
   // A non-zero exit flips the job to error state and sends an alert instead.
   try {
@@ -711,7 +711,7 @@ function deliverResult(label, lastReply, fallbackSummary) {
         const errMsg = `verify-cmd failed: ${stderr || 'exit code ' + (verifyErr.status ?? 1)}`;
         process.stderr.write(`[watcher] ${errMsg}\n`);
         markLabelError(label, errMsg);
-        // Output failure notice — scheduler delivers this to the delivery target
+        // Output failure notice -- scheduler delivers this to the delivery target
         process.stdout.write(
           `🌶️ *dispatch* [${label}] ⚠️ VERIFICATION FAILED\n\n` +
           `The agent session completed but the post-completion verify-cmd exited non-zero.\n\n` +
@@ -723,18 +723,18 @@ function deliverResult(label, lastReply, fallbackSummary) {
       }
     }
   } catch (loadErr) {
-    // Non-fatal — if labels can't be read, skip verify check and proceed normally
+    // Non-fatal -- if labels can't be read, skip verify check and proceed normally
     process.stderr.write(`[watcher] verify-cmd check skipped (labels load error): ${loadErr.message}\n`);
   }
 
-  // Update labels.json before exiting — prevents stuck detector false positives
+  // Update labels.json before exiting -- prevents stuck detector false positives
   const summary = fallbackSummary || (lastReply ? lastReply.slice(0, 500) : null);
   markLabelDone(label, summary);
 
   if (lastReply) {
     const maxLen = 3500;
     const reply = lastReply.length > maxLen
-      ? lastReply.slice(0, maxLen) + '\n\n…[truncated]'
+      ? lastReply.slice(0, maxLen) + '\n\n..[truncated]'
       : lastReply;
     process.stdout.write(`🌶️ *dispatch* [${label}] completed:\n\n${reply}\n`);
   } else {
@@ -746,13 +746,13 @@ function deliverResult(label, lastReply, fallbackSummary) {
   process.exit(0);
 }
 
-// ── Watcher heartbeat interval ref ──────────────────────────────────────
+// -- Watcher heartbeat interval ref --------------------------------------
 // Populated after label is validated (in main body). Cleared on exit.
 // The interval writes lastPing to labels.json so the watchdog guard in
 // index.mjs knows this watcher process is alive and actively monitoring.
 let _pingInterval = null;
 
-// ── Sync on Exit ────────────────────────────────────────────
+// -- Sync on Exit --------------------------------------------
 // Best-effort sync of labels.json with gateway state on every watcher exit.
 // Ensures stale 'running' entries are reconciled promptly, preventing
 // false positives from the stuck detector.
@@ -768,11 +768,11 @@ process.on('exit', () => {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
   } catch {
-    // Best-effort — never block exit
+    // Best-effort -- never block exit
   }
 });
 
-// ── Main ────────────────────────────────────────────────────
+// -- Main ----------------------------------------------------
 
 const flags = parseFlags(process.argv.slice(2));
 const label       = flags.label;
@@ -787,10 +787,10 @@ if (!label) {
   process.exit(2);
 }
 
-// ── Start heartbeat ─────────────────────────────────────────────────────
+// -- Start heartbeat -----------------------------------------------------
 // Write lastPing to labels.json every PING_INTERVAL_MS while the session is
 // still running. The watchdog guard in index.mjs reads lastPing to know this
-// watcher process is alive — preventing premature auto-resolve during slow
+// watcher process is alive -- preventing premature auto-resolve during slow
 // tool calls, docker builds, long pytest runs, etc.
 // Cleared automatically by the process.on('exit') handler above.
 //
@@ -804,7 +804,7 @@ _pingInterval = setInterval(() => {
       entry.lastPing = new Date().toISOString();
     });
   } catch {
-    // Best-effort — never crash the watcher over a ping failure
+    // Best-effort -- never crash the watcher over a ping failure
   }
 }, PING_INTERVAL_MS);
 _pingInterval.unref(); // don't prevent Node.js from exiting naturally
@@ -818,10 +818,10 @@ let recoverySessionKey = null;  // captured during polling for steer/kill
 // Module-level state accessible by SIGTERM handler
 let lastKnownReply = null;
 
-// ── SIGTERM handler (scheduler kills watcher with SIGTERM before SIGKILL) ──
+// -- SIGTERM handler (scheduler kills watcher with SIGTERM before SIGKILL) --
 // Ensures labels.json is updated and a delivery attempt is made even when killed.
 process.on('SIGTERM', () => {
-  process.stderr.write(`[watcher] SIGTERM received for ${label} — marking as interrupted\n`);
+  process.stderr.write(`[watcher] SIGTERM received for ${label} -- marking as interrupted\n`);
   // Try to fetch the latest result before dying
   try {
     const result = dispatch('result', ['--label', label]);
@@ -831,7 +831,7 @@ process.on('SIGTERM', () => {
   deliverResult(label, lastKnownReply, 'interrupted by watcher timeout');
 });
 
-// ── Rolling deadline vars ────────────────────────────────────
+// -- Rolling deadline vars ------------------------------------
 let lastTokens = null;
 const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
 const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
@@ -859,7 +859,7 @@ while (Date.now() < deadline) {
   // Capture sessionKey for recovery steer/kill
   if (status.sessionKey) recoverySessionKey = status.sessionKey;
 
-  // ── Rolling deadline: extend when session shows token activity ──
+  // -- Rolling deadline: extend when session shows token activity --
   const currentTokens = status?.liveness?.tokens ?? null;
   if (currentTokens !== null && lastTokens !== null && currentTokens > lastTokens) {
     const proposed = Date.now() + ROLLING_EXTEND_MS;
@@ -868,13 +868,13 @@ while (Date.now() < deadline) {
     if (extension > deadline) {
       deadline = extension;
       process.stderr.write(
-        `[watcher] [${label}] activity detected (${lastTokens}→${currentTokens} tokens), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
+        `[watcher] [${label}] activity detected (${lastTokens}->${currentTokens} tokens), deadline extended to +${Math.round((deadline - Date.now()) / 60000)}min\n`
       );
     }
   }
   if (currentTokens !== null) lastTokens = currentTokens;
 
-  // Track session presence — two independent signals, either is sufficient.
+  // Track session presence -- two independent signals, either is sufficient.
   // 1. Sessions.json store (primary ground truth for dispatcher-spawned sessions)
   // 2. Liveness field from dispatch status (secondary; also built from sessions.json
   //    in production, but test mocks may provide it directly)
@@ -882,21 +882,21 @@ while (Date.now() < deadline) {
     const sessionAgent = status.agent || 'main';
     const watcherStore = readSessionsStore(sessionAgent);
     if (watcherStore !== null && status.sessionKey in watcherStore) {
-      // Found in sessions.json — authoritative
+      // Found in sessions.json -- authoritative
       sessionEverFound = true;
     } else if (status.liveness && !status.liveness.error) {
-      // Not in sessions.json (or store unavailable) but liveness signal says alive —
+      // Not in sessions.json (or store unavailable) but liveness signal says alive --
       // session may still be initializing. Trust liveness as a secondary signal.
       sessionEverFound = true;
     }
   }
 
-  // ── Path 0a: agent-side done signal (push-based) ──────────
+  // -- Path 0a: agent-side done signal (push-based) ----------
   // If the agent ran `dispatch done --label <label>`, status is 'done' immediately.
-  // This is the fast path — no need to poll for idle timeout.
+  // This is the fast path -- no need to poll for idle timeout.
   // (Handled by Path 1 below since cmdDone sets status='done' in labels.json)
 
-  // ── Path 0b: 529/overload auto-retry ──────────────────────
+  // -- Path 0b: 529/overload auto-retry ----------------------
   if (status.status === 'error') {
     const errorMsg = status.error || status.summary || '';
     if (is529Error(errorMsg)) {
@@ -904,7 +904,7 @@ while (Date.now() < deadline) {
       const retryResult = attempt529Retry(label, retryCount, errorMsg);
 
       if (!retryResult.retry) {
-        // Max retries exceeded — deliver error
+        // Max retries exceeded -- deliver error
         process.stdout.write(
           `🌶️ *dispatch* [${label}] failed after ${MAX_529_RETRIES} retries (529 overload)\n` +
           `Error: ${errorMsg}\n`
@@ -916,15 +916,15 @@ while (Date.now() < deadline) {
       await sleep(retryResult.delayMs);
 
       if (respawnSession(label)) {
-        // Session respawned — reset consecutive failures for the fresh session
+        // Session respawned -- reset consecutive failures for the fresh session
         consecutiveFailures = 0;
         process.stderr.write(`[watcher] [${label}] retry ${retryResult.newRetryCount} dispatched, continuing poll...\n`);
         await sleep(pollS * 1000);
         continue;
       } else {
-        // Respawn failed — deliver error
+        // Respawn failed -- deliver error
         process.stdout.write(
-          `🌶️ *dispatch* [${label}] 529 retry failed — could not respawn session\n` +
+          `🌶️ *dispatch* [${label}] 529 retry failed -- could not respawn session\n` +
           `Error: ${errorMsg}\n`
         );
         process.exit(1);
@@ -932,30 +932,30 @@ while (Date.now() < deadline) {
     }
   }
 
-  // ── Path 1: status auto-resolved to done ──────────────────
+  // -- Path 1: status auto-resolved to done ------------------
   if (status.status !== 'running') {
-    // ── Spawn failure detection ─────────────────────────────────────────
+    // -- Spawn failure detection -----------------------------------------
     // If the session was auto-resolved to 'done' (or 'spawn-warning') but was
-    // never seen in the gateway, it never ran — this is a spawn failure.
+    // never seen in the gateway, it never ran -- this is a spawn failure.
     // Causes: auth timeout, quota exhaustion, gateway error at spawn time.
     if (!sessionEverFound && (status.status === 'done' || status.status === 'spawn-warning' || status.status === 'error')) {
       const spawnErrMsg =
         `[dispatch] SPAWN FAILURE: session ${status.sessionKey || '(unknown)'} never appeared ` +
-        `in gateway — spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
+        `in gateway -- spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
       process.stderr.write(spawnErrMsg + '\n');
       markLabelError(label, `spawn-failure: session never appeared in gateway`);
       process.stdout.write(
-        `🌶️ *dispatch* [${label}] SPAWN FAILURE: session never appeared in gateway — ` +
+        `🌶️ *dispatch* [${label}] SPAWN FAILURE: session never appeared in gateway -- ` +
         `spawn likely failed (auth timeout, quota, or gateway error)\n`
       );
       process.exit(1);
     }
 
-    // ── Gateway-restart-kill detection ──────────────────────────────────
+    // -- Gateway-restart-kill detection ----------------------------------
     // When a gateway restart kills an in-flight session, the session disappears
     // from sessions.json and the status command auto-resolves it as 'done' with
     // a "session not found in sessions store" summary. This is NOT a real
-    // completion — the task was interrupted mid-run. Detect this pattern and
+    // completion -- the task was interrupted mid-run. Detect this pattern and
     // re-dispatch up to MAX_GW_RESTART_RETRIES times.
     //
     // Key distinction vs spawn failure:
@@ -966,11 +966,11 @@ while (Date.now() < deadline) {
     if (sessionEverFound && isGatewayRestartKill(status.summary)) {
       const gwCheckResult = dispatch('result', ['--label', label]);
       if (!gwCheckResult?.lastReply) {
-        // No result captured — session was killed before completing
+        // No result captured -- session was killed before completing
         const retryCount = getGwRestartRetryCount(label);
         if (retryCount >= MAX_GW_RESTART_RETRIES) {
           markLabelError(label,
-            `gateway-restart-kill: max retries exceeded (${retryCount}x — ${status.summary})`);
+            `gateway-restart-kill: max retries exceeded (${retryCount}x -- ${status.summary})`);
           notify(`🌶️ Dispatch: [${label}] gateway-restart-kill: max retries exceeded (${MAX_GW_RESTART_RETRIES}x)`);
           process.stdout.write(
             `🌶️ *dispatch* [${label}] failed: session killed by gateway restart, ` +
@@ -981,11 +981,11 @@ while (Date.now() < deadline) {
         }
         const newRetryCount = retryCount + 1;
         process.stderr.write(
-          `[watcher] gateway-restart-kill detected for [${label}] — ` +
+          `[watcher] gateway-restart-kill detected for [${label}] -- ` +
           `attempt ${newRetryCount}/${MAX_GW_RESTART_RETRIES}\n`
         );
         notify(
-          `🌶️ Dispatch: [${label}] session killed by gateway restart — ` +
+          `🌶️ Dispatch: [${label}] session killed by gateway restart -- ` +
           `re-dispatching (${newRetryCount}/${MAX_GW_RESTART_RETRIES})`
         );
         setGwRestartRetryCount(label, newRetryCount);
@@ -1004,7 +1004,7 @@ while (Date.now() < deadline) {
           process.exit(1);
         }
       }
-      // lastReply present — session completed before/during kill; fall through to normal delivery
+      // lastReply present -- session completed before/during kill; fall through to normal delivery
     }
 
     // Reset gw-restart retry count on successful completion
@@ -1016,16 +1016,16 @@ while (Date.now() < deadline) {
       );
     }
 
-    // ── Interrupted: session auto-resolved as incomplete ──────────────────
+    // -- Interrupted: session auto-resolved as incomplete ------------------
     // When cmdStatus auto-resolves a session as 'interrupted' (idle without
     // calling done), deliver the lastReply for diagnostics but exit non-zero
     // so the scheduler run is marked as error, not success.
     //
     // NOTE: Always resolve as 'interrupted', never 'done'. Only agent-side cmdDone may set status=done.
     if (status.status === 'interrupted') {
-      process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted — work may be incomplete\n`);
+      process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
       process.stdout.write(
-        `⚠️ dispatch [${label}] session went idle before completing — work may be incomplete\n`
+        `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete\n`
       );
       markLabelError(label, status.summary || 'interrupted: session went idle without calling done');
       process.exit(1);
@@ -1043,7 +1043,7 @@ while (Date.now() < deadline) {
     deliverResult(label, result?.lastReply, status.summary);
   }
 
-  // ── Path 2: status says 'running' but session may be idle ─
+  // -- Path 2: status says 'running' but session may be idle -
   // If the session has no recent activity, proactively check for a result.
   // This catches the gap where the session completed but status hasn't
   // auto-resolved yet. The watchdog guard in index.mjs defers auto-resolve
@@ -1061,7 +1061,7 @@ while (Date.now() < deadline) {
   await sleep(pollS * 1000);
 }
 
-// Timed out — try one last result check
+// Timed out -- try one last result check
 const finalResult = dispatch('result', ['--label', label]);
 const finalStatus = dispatch('status', ['--label', label]);
 if (finalResult?.lastReply) {
@@ -1077,15 +1077,15 @@ if (finalStatus?.status === 'done') {
 }
 // If status is interrupted (auto-resolved as incomplete), exit non-zero
 if (finalStatus?.status === 'interrupted') {
-  process.stderr.write(`[watcher] [${label}] final status=interrupted — session idle without completion\n`);
+  process.stderr.write(`[watcher] [${label}] final status=interrupted -- session idle without completion\n`);
   process.stdout.write(
-    `⚠️ dispatch [${label}] session went idle before completing — work may be incomplete\n`
+    `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete\n`
   );
   markLabelError(label, finalStatus?.summary || 'interrupted: session went idle without calling done');
   process.exit(1);
 }
 
-// ── Token-based activity check before steering ────────────────────────────
+// -- Token-based activity check before steering ----------------------------
 // Only steer if tokens have been flat for 3+ minutes post-deadline.
 // If the session is still making model calls (tokens growing), stay silent.
 function getTokenCount(sessionKey) {
@@ -1115,7 +1115,7 @@ let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null
 let baselineTokens = getTokenCount(tokenSessionKey);
 let flatSince = Date.now();
 
-// Capture the internal sessionId (UUID) from sessions.json — this is the filename
+// Capture the internal sessionId (UUID) from sessions.json -- this is the filename
 // of the JSONL file, distinct from the sessionKey (agent:main:subagent:UUID).
 // The JSONL is updated continuously during active turns, making it a reliable
 // activity signal when sessions.json totalTokens/updatedAt are stale.
@@ -1124,38 +1124,38 @@ const sessionInternalId = _deadlineEntry?.sessionId || null;
 const sessionAgent = (tokenSessionKey?.split(':')[1]) || 'main';
 let lastJsonlMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
 
-process.stderr.write(`[watcher] deadline hit for ${label} — watching token activity (baseline: ${baselineTokens})\n`);
+process.stderr.write(`[watcher] deadline hit for ${label} -- watching token activity (baseline: ${baselineTokens})\n`);
 if (sessionInternalId) {
   process.stderr.write(`[watcher] ${label} JSONL tracking: sessionId=${sessionInternalId} mtime=${lastJsonlMtime}\n`);
 }
 
-// If the session already completed (gateway pruned it → null tokens), exit cleanly.
+// If the session already completed (gateway pruned it -> null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
   if (r?.lastReply) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r.lastReply, statusAtDeadline?.summary || null);
   }
-  // Status is explicitly done — exit cleanly, no timeout noise
+  // Status is explicitly done -- exit cleanly, no timeout noise
   if (statusAtDeadline?.status === 'done') {
     markDoneSync(statusAtDeadline?.summary || 'completed');
     process.stdout.write(`✅ dispatch [${label}] completed (status=done at deadline)\n`);
     process.exit(0);
   }
-  // Truly no result and no tokens — telemetry unavailable
+  // Truly no result and no tokens -- telemetry unavailable
   if (baselineTokens === null) {
     // Check if session is actually in the store (just mid-tool-call with no tokens yet)
     const entry = getSessionStoreEntry(tokenSessionKey);
     if (!entry) {
-      // Session truly not found — telemetry unavailable, exit
+      // Session truly not found -- telemetry unavailable, exit
       process.stderr.write(`[watcher] token telemetry unavailable for ${label}; session not in store\n`);
-      markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`);
-      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry unavailable; no steer/kill attempted\n`);
+      markLabelError(label, `timed out after ${timeoutS}s -- token telemetry unavailable`);
+      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry unavailable; no steer/kill attempted\n`);
       process.exit(1);
     }
-    // Session IS in store but no tokens — mid-tool-call, fall through to activity window
+    // Session IS in store but no tokens -- mid-tool-call, fall through to activity window
     // Use updatedAt as activity signal instead of tokens
-    process.stderr.write(`[watcher] ${label} in store but no tokens (mid-tool-call?) — using updatedAt as activity signal\n`);
+    process.stderr.write(`[watcher] ${label} in store but no tokens (mid-tool-call?) -- using updatedAt as activity signal\n`);
     baselineTokens = -1; // sentinel: token-free mode
   }
 }
@@ -1180,67 +1180,67 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   // Token growth?
   const cur = getTokenCount(tokenSessionKey);
   if (cur === null) {
-    // Check updatedAt as fallback — if session is still in store and recently updated, keep waiting
+    // Check updatedAt as fallback -- if session is still in store and recently updated, keep waiting
     const entry = getSessionStoreEntry(tokenSessionKey);
     if (!entry) {
       process.stderr.write(`[watcher] token telemetry lost for ${label}; session gone from store\n`);
-      markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`);
-      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — token telemetry lost; no steer/kill attempted\n`);
+      markLabelError(label, `timed out after ${timeoutS}s -- token telemetry lost`);
+      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry lost; no steer/kill attempted\n`);
       process.exit(1);
     }
-    // Still in store — check if updatedAt advanced (tool call still running)
+    // Still in store -- check if updatedAt advanced (tool call still running)
     // Normalize: updatedAt may be seconds or milliseconds depending on agent framework version
     const rawUpdatedAt = entry.updatedAt;
     const updatedAt = (typeof rawUpdatedAt === 'number' && rawUpdatedAt < 1e12)
-      ? rawUpdatedAt * 1000   // seconds → milliseconds
+      ? rawUpdatedAt * 1000   // seconds -> milliseconds
       : rawUpdatedAt;
     if (typeof updatedAt === 'number' && updatedAt > flatSince) {
-      process.stderr.write(`[watcher] ${label} no tokens but updatedAt advanced — tool call active, resetting flat timer\n`);
+      process.stderr.write(`[watcher] ${label} no tokens but updatedAt advanced -- tool call active, resetting flat timer\n`);
       flatSince = Date.now();
     } else {
-      process.stderr.write(`[watcher] ${label} no tokens, updatedAt not advancing — may be stuck\n`);
+      process.stderr.write(`[watcher] ${label} no tokens, updatedAt not advancing -- may be stuck\n`);
     }
-    // Don't exit — let FLAT_WINDOW_MS timeout handle the stuck case normally
+    // Don't exit -- let FLAT_WINDOW_MS timeout handle the stuck case normally
     continue;
   }
   // Normal token comparison (skip if in token-free sentinel mode)
   if (baselineTokens !== -1 && cur > baselineTokens) {
-    process.stderr.write(`[watcher] ${label} still active (${baselineTokens}→${cur} tokens), resetting flat timer\n`);
+    process.stderr.write(`[watcher] ${label} still active (${baselineTokens}->${cur} tokens), resetting flat timer\n`);
     baselineTokens = cur;
     flatSince = Date.now();
   } else if (baselineTokens === -1 && cur > 0) {
-    // Tokens appeared for the first time — switch from sentinel to real token tracking
+    // Tokens appeared for the first time -- switch from sentinel to real token tracking
     process.stderr.write(`[watcher] ${label} tokens now available (${cur}), switching to token tracking\n`);
     baselineTokens = cur;
     flatSince = Date.now();
   }
 
-  // ── JSONL mtime check ─────────────────────────────────────────────────────
+  // -- JSONL mtime check -----------------------------------------------------
   // Most reliable activity signal for spawned subagent sessions: OpenClaw does
   // NOT flush totalTokens or updatedAt in sessions.json during active turns, but
   // the JSONL file IS written continuously. If the mtime advanced since last
-  // check by >1s, the session is actively processing — reset the flat timer.
+  // check by >1s, the session is actively processing -- reset the flat timer.
   const curJsonlMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
   if (curJsonlMtime !== null) {
     if (lastJsonlMtime !== null && curJsonlMtime > lastJsonlMtime + 1000) {
       process.stderr.write(
-        `[watcher] ${label} JSONL mtime advanced (${lastJsonlMtime}→${curJsonlMtime}ms), ` +
-        `session active — resetting flat timer\n`
+        `[watcher] ${label} JSONL mtime advanced (${lastJsonlMtime}->${curJsonlMtime}ms), ` +
+        `session active -- resetting flat timer\n`
       );
       lastJsonlMtime = curJsonlMtime;
       flatSince = Date.now();
     } else if (lastJsonlMtime === null) {
-      // First observation — just record, don't reset yet
+      // First observation -- just record, don't reset yet
       process.stderr.write(`[watcher] ${label} JSONL mtime first observation: ${curJsonlMtime}\n`);
       lastJsonlMtime = curJsonlMtime;
     }
   }
 }
 
-// ── Pre-steer JSONL sanity check ──────────────────────────────────────────
+// -- Pre-steer JSONL sanity check ------------------------------------------
 // Before triggering steer/markDoneSync, verify the session is not currently
 // mid-turn. A mid-turn session has an in-flight tool call (JSONL last entry
-// is tool_use or tool_result) — steeling or declaring it done would interrupt
+// is tool_use or tool_result) -- steering or declaring it done would interrupt
 // active work and produce a partial/zombie result.
 //
 // If mid-turn is detected AND the JSONL was modified recently, extend the flat
@@ -1249,7 +1249,7 @@ if (sessionInternalId) {
   const midTurnReason = getJsonlMidTurnReason(sessionInternalId, sessionAgent);
   if (midTurnReason) {
     process.stderr.write(
-      `[watcher] ${label} pre-steer sanity check: ${midTurnReason} — ` +
+      `[watcher] ${label} pre-steer sanity check: ${midTurnReason} -- ` +
       `session is mid-turn, extending flat window once\n`
     );
     notify(`🌶️ Dispatch: [${label}] pre-steer: mid-turn detected (${midTurnReason}), extending wait`);
@@ -1275,7 +1275,7 @@ if (sessionInternalId) {
       const extMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
       if (extMtime !== null && lastJsonlMtime !== null && extMtime > lastJsonlMtime + 1000) {
         process.stderr.write(
-          `[watcher] ${label} JSONL mtime advanced during extended wait (${lastJsonlMtime}→${extMtime}ms), resetting flat timer\n`
+          `[watcher] ${label} JSONL mtime advanced during extended wait (${lastJsonlMtime}->${extMtime}ms), resetting flat timer\n`
         );
         lastJsonlMtime = extMtime;
         flatSince = Date.now();
@@ -1291,13 +1291,13 @@ if (sessionInternalId) {
         flatSince = Date.now();
       }
     }
-    // Extended window expired — proceed to steer regardless
-    process.stderr.write(`[watcher] ${label} extended mid-turn wait expired — proceeding to steer\n`);
+    // Extended window expired -- proceed to steer regardless
+    process.stderr.write(`[watcher] ${label} extended mid-turn wait expired -- proceeding to steer\n`);
   }
 }
 
-// 3 min of genuinely flat tokens — now steer
-process.stderr.write(`[watcher] ${label} inactive 3min post-deadline — entering steer\n`);
+// 3 min of genuinely flat tokens -- now steer
+process.stderr.write(`[watcher] ${label} inactive 3min post-deadline -- entering steer\n`);
 
 // Get sessionKey for steer/kill
 const statusForSteer = dispatch('status', ['--label', label]);
@@ -1341,14 +1341,14 @@ for (const round of steerRounds) {
         if (r4?.lastReply) {
           deliverResult(label, r4.lastReply, st3.summary); // deliverResult calls process.exit(0)
         }
-        markLabelError(label, 'timed out — killed after steer attempts (no result captured)');
-        process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts — no result captured\n`);
+        markLabelError(label, 'timed out -- killed after steer attempts (no result captured)');
+        process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts -- no result captured\n`);
         process.exit(1);
       }
     }
   }
 }
 
-markLabelError(label, `timed out after ${timeoutS}s — killed after steer attempts`);
-process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s — session killed after steer attempts\n`);
+markLabelError(label, `timed out after ${timeoutS}s -- killed after steer attempts`);
+process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- session killed after steer attempts\n`);
 process.exit(1);

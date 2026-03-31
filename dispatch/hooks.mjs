@@ -1,19 +1,19 @@
 /**
- * dispatch-hooks.mjs — Lifecycle event emitter
+ * dispatch-hooks.mjs -- Lifecycle event emitter
  *
  * Fires structured dispatch events to:
- *   1. Loki (always — structured log stream for Grafana observability)
- *   2. DISPATCH_WEBHOOK_URL (optional — external systems, dashboards, etc.)
- *   3. Gateway post office (optional — when opts.deliverTo is set)
+ *   1. Loki (always -- structured log stream for Grafana observability)
+ *   2. DISPATCH_WEBHOOK_URL (optional -- external systems, dashboards, etc.)
+ *   3. Gateway post office (optional -- when opts.deliverTo is set)
  *
  * All calls are best-effort and non-blocking. A hook failure never
  * prevents dispatch from completing.
  *
  * Event types:
- *   dispatch.started   — job created + queued in scheduler
- *   dispatch.finished  — run completed (ok or error)
- *   dispatch.stuck     — stuck run detected by detector
- *   dispatch.cancelled — run manually cancelled
+ *   dispatch.started   -- job created + queued in scheduler
+ *   dispatch.finished  -- run completed (ok or error)
+ *   dispatch.stuck     -- stuck run detected by detector
+ *   dispatch.cancelled -- run manually cancelled
  */
 
 import { hostname } from 'os';
@@ -26,10 +26,10 @@ const HOST         = process.env.DISPATCH_HOST
   || 'unknown-host';
 const TIMEOUT_MS   = 3000;
 
-// ── Loki push ───────────────────────────────────────────────
+// -- Loki push -----------------------------------------------
 
 async function lokiPush(event, payload) {
-  if (!LOKI_URL) return; // not configured — skip silently
+  if (!LOKI_URL) return; // not configured -- skip silently
   const ts     = String(Date.now() * 1_000_000); // nanoseconds
   const logLine = JSON.stringify({ event, host: HOST, ...payload });
 
@@ -49,7 +49,7 @@ async function lokiPush(event, payload) {
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 }
 
-// ── Webhook push ────────────────────────────────────────────
+// -- Webhook push --------------------------------------------
 
 async function webhookPush(event, payload) {
   if (!WEBHOOK_URL) return;
@@ -62,7 +62,7 @@ async function webhookPush(event, payload) {
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 }
 
-// ── Post-office notification ─────────────────────────────────
+// -- Post-office notification ---------------------------------
 
 /**
  * Enqueue a completion notification into the messages queue (post office).
@@ -76,7 +76,7 @@ async function webhookPush(event, payload) {
  */
 async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram') {
   try {
-    const body = `✅ [${label}] done — ${summary}`;
+    const body = `✅ [${label}] done -- ${summary}`;
     await sendMessage({
       from_agent:  'dispatch',
       to_agent:    'main',
@@ -91,10 +91,10 @@ async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'teleg
   }
 }
 
-// ── Public API ───────────────────────────────────────────────
+// -- Public API -----------------------------------------------
 
 /**
- * Emit a dispatch lifecycle event. Best-effort — never throws.
+ * Emit a dispatch lifecycle event. Best-effort -- never throws.
  */
 export async function emitEvent(event, payload = {}) {
   const tasks = [
@@ -128,9 +128,9 @@ export function onStarted(opts) {
  * Fires to Loki + webhook (always) and optionally to the gateway post office.
  *
  * Extended opts:
- *   deliverTo       {string}  — If set, send a completion notification via gateway
- *   deliveryChannel {string}  — Channel for delivery (default: 'telegram')
- *   summary         {string}  — One-line summary to include in the notification
+ *   deliverTo       {string}  -- If set, send a completion notification via gateway
+ *   deliveryChannel {string}  -- Channel for delivery (default: 'telegram')
+ *   summary         {string}  -- One-line summary to include in the notification
  */
 export async function onFinished(opts) {
   const tasks = [

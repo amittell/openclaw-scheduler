@@ -1,4 +1,4 @@
-// Database layer — SQLite via better-sqlite3
+// Database layer -- SQLite via better-sqlite3
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';

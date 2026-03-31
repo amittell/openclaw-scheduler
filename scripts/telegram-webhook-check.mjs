@@ -189,7 +189,7 @@ async function main() {
   const requireWebhook = args['require-webhook'] !== 'false';
 
   if (args.repair === 'drop-pending') {
-    // Fix: use deleteWebhook (not setWebhook) — polling mode has no webhook URL to set.
+    // Fix: use deleteWebhook (not setWebhook) -- polling mode has no webhook URL to set.
     // setWebhook would try to re-register a webhook which is wrong in polling mode.
     // drop_pending_updates=false preserves queued messages so polling can drain them.
     const repaired = await fetchTelegram('deleteWebhook', {

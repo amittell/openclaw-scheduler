@@ -2,7 +2,7 @@
 /**
  * stuck-run-detector.mjs
  *
- * Three-phase stuck detection: liveness gating → steer → alert.
+ * Three-phase stuck detection: liveness gating -> steer -> alert.
  *
  * Phase 1 (Liveness gate): For dispatch-tracked runs, check actual session
  *   activity via `dispatch status`. Skip if tokens recently active or status=done.
@@ -10,7 +10,7 @@
  *   one more cycle to respond.
  * Phase 3 (Alert): If steer was ignored (tokens flat), alert as genuinely stuck.
  *
- * Non-dispatch scheduler jobs skip phases 1–2 and alert immediately (old behavior).
+ * Non-dispatch scheduler jobs skip phases 1-2 and alert immediately (old behavior).
  *
  * State persisted in /tmp/stuck-detector-state.json (volatile, OK to lose on reboot).
  *
@@ -32,18 +32,18 @@ import { resolveDispatchCliPath, resolveDispatchLabel } from './dispatch-cli-uti
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ── Paths ────────────────────────────────────────────────────
+// -- Paths ----------------------------------------------------
 
 const LABELS_PATH  = process.env.DISPATCH_LABELS_PATH || join(__dirname, '..', 'dispatch', 'labels.json');
 const STATE_PATH   = process.env.STUCK_STATE_PATH || join(tmpdir(), 'stuck-detector-state.json');
 const DISPATCH_CLI = resolveDispatchCliPath(process.env);
 const DISPATCH_IS_BIN = !DISPATCH_CLI.includes('/') && !DISPATCH_CLI.includes('\\');
 
-// ── Constants ────────────────────────────────────────────────
+// -- Constants ------------------------------------------------
 
-const LIVENESS_THRESHOLD_MS = 180_000; // 3 min — tokens active within this = alive
+const LIVENESS_THRESHOLD_MS = 180_000; // 3 min -- tokens active within this = alive
 
-// ── Arg Parsing ──────────────────────────────────────────────
+// -- Arg Parsing ----------------------------------------------
 
 function parseArgs(argv) {
   const out = {};
@@ -67,7 +67,7 @@ function parsePositiveInt(input, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-// ── Labels & State ───────────────────────────────────────────
+// -- Labels & State -------------------------------------------
 
 function loadLabels() {
   try {
@@ -89,7 +89,7 @@ function saveState(state) {
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + '\n');
 }
 
-// ── Dispatch Integration ────────────────────────────────────
+// -- Dispatch Integration ------------------------------------
 
 /**
  * Get liveness info from `dispatch status --label <label>`.
@@ -146,7 +146,7 @@ function steerSession(label, staleMins) {
   }
 }
 
-// ── Main ─────────────────────────────────────────────────────
+// -- Main -----------------------------------------------------
 
 const args         = parseArgs(process.argv.slice(2));
 const thresholdMin = parsePositiveInt(args['threshold-min'], 45);  // coding tasks regularly take 30m+
@@ -190,7 +190,7 @@ try {
   for (const r of rows) {
     const label = resolveDispatchLabel(r.job_name, labels);
 
-    // ── Non-dispatch job: alert immediately (old behavior) ──
+    // -- Non-dispatch job: alert immediately (old behavior) --
     if (!label) {
       alertRuns.push(r);
       continue;
@@ -198,7 +198,7 @@ try {
 
     staleLabelsThisCycle.add(label);
 
-    // ── Phase 1: Liveness gate ──────────────────────────────
+    // -- Phase 1: Liveness gate ------------------------------
 
     // Quick check: if labels.json already says done, skip (DB lag)
     if (labels[label]?.status === 'done') {
@@ -208,13 +208,13 @@ try {
 
     const liveness = getDispatchLiveness(label);
 
-    // dispatch status returned done → skip
+    // dispatch status returned done -> skip
     if (liveness?.status === 'done') {
       skippedRuns.push({ ...r, reason: 'dispatch status=done', label });
       continue;
     }
 
-    // Tokens recently active → skip (not stuck, just no heartbeat to DB)
+    // Tokens recently active -> skip (not stuck, just no heartbeat to DB)
     if (
       liveness &&
       typeof liveness.ageMs === 'number' &&
@@ -228,7 +228,7 @@ try {
       continue;
     }
 
-    // ── Phase 2 / Phase 3: Steer or Alert ───────────────────
+    // -- Phase 2 / Phase 3: Steer or Alert -------------------
 
     if (state[label]?.alertedAt) {
       // Already alerted -- don't re-steer or re-alert
@@ -236,7 +236,7 @@ try {
     }
 
     if (!state[label]) {
-      // Phase 2: First detection — steer before alerting
+      // Phase 2: First detection -- steer before alerting
       const staleMins = Math.round(r.stale_s / 60);
       const ok = steerSession(label, staleMins);
 
@@ -254,21 +254,21 @@ try {
           tokens: liveness?.tokens ?? null,
         });
       } else {
-        // Steer call failed — still alert, note the failure
+        // Steer call failed -- still alert, note the failure
         alertRuns.push({ ...r, steerNote: 'steer=failed' });
       }
     } else {
-      // Phase 3: Already steered — did it help?
+      // Phase 3: Already steered -- did it help?
       const prevTokens = state[label].tokensAtSteer;
       const curTokens  = liveness?.tokens ?? 0;
 
       if (curTokens > prevTokens) {
-        // Tokens grew since steer → it worked, clear state, skip alert
+        // Tokens grew since steer -> it worked, clear state, skip alert
         delete state[label];
         stateChanged = true;
         skippedRuns.push({
           ...r,
-          reason: `steer worked (tokens ${prevTokens}→${curTokens})`,
+          reason: `steer worked (tokens ${prevTokens}->${curTokens})`,
           label,
         });
       } else {
@@ -280,7 +280,7 @@ try {
     }
   }
 
-  // ── Clean state entries for labels no longer appearing as stale ──
+  // -- Clean state entries for labels no longer appearing as stale --
   for (const key of Object.keys(state)) {
     if (!staleLabelsThisCycle.has(key)) {
       delete state[key];
@@ -292,11 +292,11 @@ try {
     saveState(state);
   }
 
-  // ── Output ─────────────────────────────────────────────────
+  // -- Output -------------------------------------------------
 
   for (const s of skippedRuns) {
     process.stdout.write(
-      `Skipped: job="${s.job_name}" label="${s.label}" — ${s.reason}\n`
+      `Skipped: job="${s.job_name}" label="${s.label}" -- ${s.reason}\n`
     );
   }
 
@@ -309,7 +309,7 @@ try {
   if (alertRuns.length === 0) {
     if (steeredRuns.length > 0) {
       process.stdout.write(
-        `No stuck runs — ${steeredRuns.length} steered, awaiting response.\n`
+        `No stuck runs -- ${steeredRuns.length} steered, awaiting response.\n`
       );
     } else {
       process.stdout.write(`No stale runs older than ${thresholdMin} minute(s).\n`);

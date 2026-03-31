@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Scheduler v2 unified test suite — in-memory, self-contained
+// Scheduler v2 unified test suite -- in-memory, self-contained
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
 import Database from 'better-sqlite3';
@@ -65,14 +65,14 @@ import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence } from 
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
-// ── Test harness ────────────────────────────────────────────
+// -- Test harness --------------------------------------------
 let passed = 0;
 let failed = 0;
 
 const verbose = process.argv.includes('-v') || process.argv.includes('--verbose');
 function assert(cond, msg) {
-  if (cond) { passed++; if (verbose) console.log(`  ✅ ${msg}`); }
-  else { failed++; console.error(`  ✗ ${msg}`); }
+  if (cond) { passed++; if (verbose) console.log(`  PASS ${msg}`); }
+  else { failed++; console.error(`  FAIL ${msg}`); }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,16 +102,16 @@ async function stopChild(child) {
   });
 }
 
-// ── In-memory DB ────────────────────────────────────────────
+// -- In-memory DB --------------------------------------------
 setDbPath(':memory:');
 await initDb();
 const db = getDb();
 
-console.log('🧪 Scheduler v2 test suite\n');
+console.log('[TEST] Scheduler v2 test suite\n');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 1: Core (schema, cron, CRUD, runs, messages, agents)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
 console.log('Schema:');
 const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(t => t.name);
@@ -156,7 +156,7 @@ assert(jobCols.includes('max_trigger_fanout'), 'jobs.max_trigger_fanout column')
 assert(jobCols.includes('output_store_limit_bytes'), 'jobs.output_store_limit_bytes column');
 assert(jobCols.includes('output_offload_threshold_bytes'), 'jobs.output_offload_threshold_bytes column');
 
-// ── Paths ───────────────────────────────────────────────────
+// -- Paths ---------------------------------------------------
 console.log('\nPaths:');
 const fakeEnv = { HOME: '/home/tester' };
 assert(resolveSchedulerHome(fakeEnv) === '/home/tester/.openclaw/scheduler', 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
@@ -174,7 +174,7 @@ assert(
 );
 rmSync(writableSourceDir, { recursive: true, force: true });
 
-// ── Prompt context ─────────────────────────────────────────
+// -- Prompt context -----------------------------------------
 console.log('\nPrompt Context:');
 const triggerContext = buildTriggeredRunContext(
   { triggered_by_run: 'parent-run-1' },
@@ -199,7 +199,7 @@ assert(triggerContext.text.includes('stderr:'), 'trigger context includes shell 
 assert(triggerContext.meta.parent_run_status === 'error', 'trigger context meta includes parent status');
 assert(triggerContext.meta.parent_shell_exit_code === 2, 'trigger context meta includes shell exit code');
 
-// ── Shell result helpers ────────────────────────────────────
+// -- Shell result helpers ------------------------------------
 console.log('\nShell Results:');
 const shellFailure = normalizeShellResult(
   { stdout: 'hello\n', stderr: 'boom\n', error: Object.assign(new Error('failed'), { code: 7 }) },
@@ -269,7 +269,7 @@ assert(extractedShell.exitCode === 7, 'extractShellResultFromRun reads direct sh
 assert(extractedShell.stderr === 'boom', 'extractShellResultFromRun reads stderr');
 assert(extractedShell.stdoutPath === shellOffloaded.stdoutPath, 'extractShellResultFromRun reads artifact path');
 
-// ── Telegram webhook diagnostics ───────────────────────────
+// -- Telegram webhook diagnostics ---------------------------
 console.log('\nWebhook Diagnostics:');
 const healthOk = evaluateWebhookHealth({
   label: 'test-bot',
@@ -322,12 +322,12 @@ try {
 }
 assert(webhookCheckFailed, 'webhook-check wrapper invokes diagnostic script');
 
-// ── Cron ────────────────────────────────────────────────────
+// -- Cron ----------------------------------------------------
 console.log('\nCron:');
 const next = nextRunFromCron('0 9 * * *', 'America/New_York');
 assert(next !== null, 'nextRunFromCron parses');
 
-// ── Job CRUD ────────────────────────────────────────────────
+// -- Job CRUD ------------------------------------------------
 console.log('\nJobs:');
 const job = createJob({ name: 'Test Job', schedule_cron: '*/5 * * * *', payload_message: 'Hello', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 assert(job && job.name === 'Test Job', 'createJob');
@@ -443,13 +443,13 @@ assert(budgetedJob.execution_read_only === 1, 'createJob stores execution_read_o
 assert(budgetedJob.max_queued_dispatches === 3, 'createJob stores max_queued_dispatches');
 assert(budgetedJob.output_offload_threshold_bytes === 1024, 'createJob stores output_offload_threshold_bytes');
 
-// ── Due jobs ────────────────────────────────────────────────
+// -- Due jobs ------------------------------------------------
 console.log('\nDue jobs:');
 const dueJob = createJob({ name: 'Due', schedule_cron: '* * * * *', payload_message: 'due', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 db.prepare("UPDATE jobs SET next_run_at = datetime('now', '-1 minute') WHERE id = ?").run(dueJob.id);
 assert(getDueJobs().some(j => j.id === dueJob.id), 'getDueJobs finds past-due');
 
-// ── Runs ────────────────────────────────────────────────────
+// -- Runs ----------------------------------------------------
 console.log('\nRuns:');
 const run = createRun(job.id, { run_timeout_ms: 60000 });
 assert(run.status === 'running', 'initial status running');
@@ -461,14 +461,14 @@ assert(getRun(run.id).status === 'ok', 'finished ok');
 assert(getRun(run.id).summary === 'Done!', 'summary saved');
 assert(!hasRunningRun(job.id), 'no running after finish');
 
-// ── Stale detection ─────────────────────────────────────────
+// -- Stale detection -----------------------------------------
 console.log('\nStale:');
 const staleRun = createRun(job.id, { run_timeout_ms: 1000 });
 db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-120 seconds') WHERE id = ?").run(staleRun.id);
 assert(getStaleRuns(90).some(r => r.id === staleRun.id), 'stale run detected');
 
-// ── getStaleRuns: shell vs agent jobs ────────────────────────
-console.log('\n── getStaleRuns: shell vs agent jobs ──');
+// -- getStaleRuns: shell vs agent jobs ------------------------
+console.log('\n-- getStaleRuns: shell vs agent jobs --');
 
 // Create a shell job (shellCommand) for stale testing
 const shellJobForStale = createJob({
@@ -496,55 +496,55 @@ const agentJobForStale = createJob({
   origin: 'system',
 });
 
-// Test 1: Shell job running 95s with run_timeout_ms=120000 → NOT stale (95s < 120s)
+// Test 1: Shell job running 95s with run_timeout_ms=120000 -> NOT stale (95s < 120s)
 {
   const r = createRun(shellJobForStale.id, { run_timeout_ms: 120000 });
   db.prepare("UPDATE runs SET started_at = datetime('now', '-95 seconds') WHERE id = ?").run(r.id);
   assert(!getStaleRuns(90).some(x => x.id === r.id),
-    'shell job at 95s with 120s timeout → NOT stale');
+    'shell job at 95s with 120s timeout -> NOT stale');
   finishRun(r.id, 'ok');
 }
 
-// Test 2: Shell job running 130s with run_timeout_ms=120000 → IS stale (130s > 120s)
+// Test 2: Shell job running 130s with run_timeout_ms=120000 -> IS stale (130s > 120s)
 {
   const r = createRun(shellJobForStale.id, { run_timeout_ms: 120000 });
   db.prepare("UPDATE runs SET started_at = datetime('now', '-130 seconds') WHERE id = ?").run(r.id);
   assert(getStaleRuns(90).some(x => x.id === r.id),
-    'shell job at 130s with 120s timeout → IS stale');
+    'shell job at 130s with 120s timeout -> IS stale');
   finishRun(r.id, 'ok');
 }
 
-// Test 3: Agent job with last_heartbeat 95s ago → IS stale (heartbeat path)
+// Test 3: Agent job with last_heartbeat 95s ago -> IS stale (heartbeat path)
 {
   const r = createRun(agentJobForStale.id, { run_timeout_ms: 300000 });
   db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-95 seconds') WHERE id = ?").run(r.id);
   assert(getStaleRuns(90).some(x => x.id === r.id),
-    'agent job with heartbeat 95s ago → IS stale');
+    'agent job with heartbeat 95s ago -> IS stale');
   finishRun(r.id, 'ok');
 }
 
-// Test 4: Agent job with last_heartbeat 30s ago → NOT stale
+// Test 4: Agent job with last_heartbeat 30s ago -> NOT stale
 {
   const r = createRun(agentJobForStale.id, { run_timeout_ms: 300000 });
   db.prepare("UPDATE runs SET last_heartbeat = datetime('now', '-30 seconds') WHERE id = ?").run(r.id);
   assert(!getStaleRuns(90).some(x => x.id === r.id),
-    'agent job with heartbeat 30s ago → NOT stale');
+    'agent job with heartbeat 30s ago -> NOT stale');
   finishRun(r.id, 'ok');
 }
 
-// Test 5: Shell job running 200s with run_timeout_ms=300000 → NOT stale (200s < 300s)
+// Test 5: Shell job running 200s with run_timeout_ms=300000 -> NOT stale (200s < 300s)
 // Confirms shell jobs with remaining budget are never false-positive stale.
 // Note: run_timeout_ms has a NOT NULL constraint in schema, so NULL is not representable;
-// the guard in the query is defensive only. The real invariant is: elapsed < timeout → not stale.
+// the guard in the query is defensive only. The real invariant is: elapsed < timeout -> not stale.
 {
   const r = createRun(shellJobForStale.id, { run_timeout_ms: 300000 });
   db.prepare("UPDATE runs SET started_at = datetime('now', '-200 seconds') WHERE id = ?").run(r.id);
   assert(!getStaleRuns(90).some(x => x.id === r.id),
-    'shell job at 200s with 300s timeout → NOT flagged by stale detector');
+    'shell job at 200s with 300s timeout -> NOT flagged by stale detector');
   finishRun(r.id, 'ok');
 }
 
-// ── Timeout ─────────────────────────────────────────────────
+// -- Timeout -------------------------------------------------
 console.log('\nTimeout:');
 const toRun = createRun(job.id, { run_timeout_ms: 1 });
 db.prepare("UPDATE runs SET started_at = datetime('now', '-10 seconds') WHERE id = ?").run(toRun.id);
@@ -603,7 +603,7 @@ assert(getTimedOutRuns().some(r => r.id === toRun.id), 'timeout detected');
   deleteJob(timeoutRetryJob.id);
 }
 
-// ── Agents ──────────────────────────────────────────────────
+// -- Agents --------------------------------------------------
 console.log('\nAgents:');
 const agent = upsertAgent('main', { name: 'Main Agent', capabilities: ['*'] });
 assert(agent.id === 'main', 'upsertAgent');
@@ -614,7 +614,7 @@ touchAgent('main');
 assert(getAgent('main').last_seen_at !== null, 'touchAgent');
 assert(listAgents().length >= 1, 'listAgents');
 
-// ── Messages ────────────────────────────────────────────────
+// -- Messages ------------------------------------------------
 console.log('\nMessages:');
 const msg = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'Hello agent', kind: 'text', subject: 'Greeting' });
 assert(msg && msg.id, 'sendMessage');
@@ -700,7 +700,7 @@ assert(teamErr.last_error === 'simulated error', 'last_error updated on failed a
 const teamInbox = getTeamMessages('core-team', { includeRead: true, limit: 10 });
 assert(teamInbox.some(m => m.id === teamMsg.id), 'getTeamMessages finds team message');
 
-// ── Cascade delete ──────────────────────────────────────────
+// -- Cascade delete ------------------------------------------
 console.log('\nCascade:');
 const delJob = createJob({ name: 'Deletable', schedule_cron: '0 * * * *', payload_message: 'bye', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 createRun(delJob.id);
@@ -708,18 +708,18 @@ deleteJob(delJob.id);
 assert(!getJob(delJob.id), 'job deleted');
 assert(getRunsForJob(delJob.id).length === 0, 'runs cascade deleted');
 
-// ── Prune ───────────────────────────────────────────────────
+// -- Prune ---------------------------------------------------
 console.log('\nPrune:');
 for (let i = 0; i < 5; i++) { const r = createRun(job.id); finishRun(r.id, 'ok'); }
 pruneRuns(3);
 assert(getRunsForJob(job.id).length <= 3, 'pruneRuns');
 pruneMessages(0);
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 2: Workflow chaining (v3)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Chaining ──');
+console.log('\n-- Chaining --');
 
 const parent = createJob({ name: 'Parent', schedule_cron: '0 9 * * *', payload_message: 'parent', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const childSuccess = createJob({ name: 'OnSuccess', parent_id: parent.id, trigger_on: 'success', payload_message: 'on success', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
@@ -929,11 +929,11 @@ pruneExpiredJobs();
 assert(getJob(stagedFutureAt.id), 'disabled future one-shot job is not pruned before it ever runs');
 deleteJob(stagedFutureAt.id);
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 3: Cycle detection + max depth (v3b)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Cycles & Depth ──');
+console.log('\n-- Cycles & Depth --');
 
 const cA = createJob({ name: 'cA', schedule_cron: '0 6 * * *', payload_message: 'a', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const cB = createJob({ name: 'cB', parent_id: cA.id, trigger_on: 'success', payload_message: 'b', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
@@ -944,7 +944,7 @@ let err1 = false;
 try { detectCycle(cC.id, cC.id); } catch { err1 = true; }
 assert(err1, 'self-cycle detected');
 
-// Deep cycle A→B→C→A
+// Deep cycle A->B->C->A
 let err2 = false;
 try { detectCycle(cA.id, cC.id); } catch { err2 = true; }
 assert(err2, 'deep cycle detected');
@@ -973,11 +973,11 @@ let err4 = false;
 try { createJob({ name: 'D11', parent_id: deepParent.id, trigger_on: 'success', payload_message: 'too deep', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }); } catch { err4 = true; }
 assert(err4, 'depth 12 blocked by MAX_CHAIN_DEPTH');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 4: Retry logic (v3b)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Retry ──');
+console.log('\n-- Retry --');
 
 const retryJob = createJob({ name: 'Retryable', schedule_cron: '0 8 * * *', payload_message: 'retry me', max_retries: 3, delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 assert(retryJob.max_retries === 3, 'max_retries stored');
@@ -1074,11 +1074,11 @@ assert(skippedRetryAtFresh.last_status === null, 'at-job retry skip does not mut
 assert(getDueAtJobs().some(j => j.id === skippedRetryAtJob.id), 'at-job remains due if retry dispatch was not actually queued');
 deleteJob(skippedRetryAtJob.id);
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 5: Cancellation (v3b)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Cancellation ──');
+console.log('\n-- Cancellation --');
 
 const cancelP = createJob({ name: 'CancelP', schedule_cron: '0 7 * * *', payload_message: 'p', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const cancelC1 = createJob({ name: 'CancelC1', parent_id: cancelP.id, trigger_on: 'success', payload_message: 'c1', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
@@ -1107,11 +1107,11 @@ assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status ==
 cancelJob(runP.id);
 assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'cancelled', 'running run cancelled');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 6: Queue overlap policy
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Queue Overlap ──');
+console.log('\n-- Queue Overlap --');
 
 // Schema column exists
 const qCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -1124,9 +1124,9 @@ assert(qJob.queued_count === 0, 'initial queued_count = 0');
 
 // Enqueue increments counter
 enqueueJob(qJob.id);
-assert(getJob(qJob.id).queued_count === 1, 'enqueue → queued_count = 1');
+assert(getJob(qJob.id).queued_count === 1, 'enqueue -> queued_count = 1');
 enqueueJob(qJob.id);
-assert(getJob(qJob.id).queued_count === 2, 'enqueue again → queued_count = 2');
+assert(getJob(qJob.id).queued_count === 2, 'enqueue again -> queued_count = 2');
 
 const limitedQueueJob = createJob({
   name: 'LimitedQueueJob',
@@ -1145,13 +1145,13 @@ assert(queueResult2.queued === false && queueResult2.limited === true, 'enqueueJ
 // Dequeue consumes one and schedules for next tick
 const dequeued1 = dequeueJob(qJob.id);
 assert(dequeued1 === true, 'dequeue returns true');
-assert(getJob(qJob.id).queued_count === 1, 'after dequeue → queued_count = 1');
+assert(getJob(qJob.id).queued_count === 1, 'after dequeue -> queued_count = 1');
 assert(getJob(qJob.id).next_run_at !== null, 'dequeue sets next_run_at');
 
 // Dequeue the second
 const dequeued2 = dequeueJob(qJob.id);
 assert(dequeued2 === true, 'second dequeue returns true');
-assert(getJob(qJob.id).queued_count === 0, 'after second dequeue → queued_count = 0');
+assert(getJob(qJob.id).queued_count === 0, 'after second dequeue -> queued_count = 0');
 
 // Dequeue on empty returns false
 const dequeued3 = dequeueJob(qJob.id);
@@ -1167,7 +1167,7 @@ enqueueJob(qJob.id);
 enqueueJob(qJob.id);
 assert(getJob(qJob.id).queued_count === 3, 'queued 3 during running');
 
-// Finish the run — dequeue should consume one
+// Finish the run -- dequeue should consume one
 finishRun(qRun.id, 'ok', { summary: 'done' });
 const dq = dequeueJob(qJob.id);
 assert(dq === true, 'dequeue after run completion');
@@ -1179,24 +1179,24 @@ dequeueJob(qJob.id);
 assert(getJob(qJob.id).queued_count === 0, 'fully drained');
 assert(dequeueJob(qJob.id) === false, 'nothing left to dequeue');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 7: Run-Now Flag
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Run-Now Flag ──');
+console.log('\n-- Run-Now Flag --');
 
-// 1. Regular create (no run_now) → next_run_at computed from cron
+// 1. Regular create (no run_now) -> next_run_at computed from cron
 const normalJob = createJob({ name: 'NormalScheduled', schedule_cron: '0 3 * * *', payload_message: 'normal', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
 const normalNextRun = new Date(normalJob.next_run_at + 'Z');
 assert(normalNextRun > new Date(), 'regular create: next_run_at is in the future');
 
-// 2. Create with run_now=true → next_run_at is in the past
+// 2. Create with run_now=true -> next_run_at is in the past
 const runNowJob = createJob({ name: 'RunNowJob', schedule_cron: '0 3 * * *', payload_message: 'run now!', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_now: true , run_timeout_ms: 300_000, origin: 'system' });
 const runNowTime = new Date(runNowJob.next_run_at + 'Z');
 assert(runNowTime < new Date(), 'run_now=true: next_run_at is in the past');
 assert(getDueJobs().some(j => j.id === runNowJob.id), 'run_now job immediately appears in getDueJobs()');
 
-// 3. run_now=true is picked up — next_run_at should be ~1 second in the past
+// 3. run_now=true is picked up -- next_run_at should be ~1 second in the past
 const diff = Date.now() - runNowTime.getTime();
 assert(diff >= 0 && diff < 5000, 'run_now next_run_at is approximately 1 second in the past (within 5s)');
 
@@ -1226,11 +1226,11 @@ assert(getJob(laterJob.id).next_run_at === laterJob.next_run_at, 'runJobNow: nex
 const unknownResult = runJobNow('nonexistent-uuid-xxxx');
 assert(unknownResult === undefined || unknownResult === null, 'runJobNow: returns null/undefined for missing id');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION 8: payload_scope (cross-session sub-agent visibility)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── payload_scope ──');
+console.log('\n-- payload_scope --');
 
 // Schema: column must exist with default 'own'
 const scopeCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -1263,16 +1263,16 @@ assert(listedGlobal && listedGlobal.payload_scope === 'global', "listJobs includ
 const listedDefault = allJobs.find(j => j.id === scopeDefaultJob.id);
 assert(listedDefault && listedDefault.payload_scope === 'own', "listJobs: default job has payload_scope='own'");
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // DONE
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Resource Pool Concurrency (Global Locks)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Resource Pool ──');
+console.log('\n-- Resource Pool --');
 
 // schema: resource_pool column exists
 const jobColsPool = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -1310,7 +1310,7 @@ assert(getJob(noPoolJob.id).resource_pool === null, 'noPoolJob has resource_pool
 // Pool is free before any run
 assert(hasRunningRunForPool('browser') === false, 'pool free before any run');
 
-// Start a run for poolJob1 → pool becomes busy
+// Start a run for poolJob1 -> pool becomes busy
 const poolRun1 = createRun(poolJob1.id, { run_timeout_ms: 300000 });
 assert(hasRunningRunForPool('browser') === true, 'pool busy after poolJob1 run starts');
 assert(hasRunningRunForPool('other') === false, 'different pool name is not busy');
@@ -1326,14 +1326,14 @@ const busyRuns2 = getRunningRunsByPool('browser');
 assert(busyRuns2.length === 2, 'getRunningRunsByPool returns 2 runs when both jobs running');
 
 // noPoolJob is unaffected by pool checks
-assert(hasRunningRunForPool(null) === false, 'null pool → always false');
-assert(hasRunningRunForPool('') === false, 'empty string pool → always false');
+assert(hasRunningRunForPool(null) === false, 'null pool -> always false');
+assert(hasRunningRunForPool('') === false, 'empty string pool -> always false');
 
-// Finish poolJob2's run → pool still busy (poolJob1 still running)
+// Finish poolJob2's run -> pool still busy (poolJob1 still running)
 finishRun(poolRun2.id, 'ok', { summary: 'done' });
 assert(hasRunningRunForPool('browser') === true, 'pool still busy (poolJob1 still running)');
 
-// Finish poolJob1's run → pool free
+// Finish poolJob1's run -> pool free
 finishRun(poolRun1.id, 'ok', { summary: 'done' });
 assert(hasRunningRunForPool('browser') === false, 'pool free after all runs finish');
 assert(getRunningRunsByPool('browser').length === 0, 'getRunningRunsByPool returns 0 after finish');
@@ -1342,18 +1342,18 @@ assert(getRunningRunsByPool('browser').length === 0, 'getRunningRunsByPool retur
 updateJob(noPoolJob.id, { resource_pool: 'database' });
 assert(getJob(noPoolJob.id).resource_pool === 'database', 'updateJob sets resource_pool');
 
-// ═══════════════════════════════════════════════════════════
-// SECTION: Event-Based Job Chaining — trigger_condition (v4)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
+// SECTION: Event-Based Job Chaining -- trigger_condition (v4)
+// ===========================================================
 
-console.log('\n── trigger_condition ──');
+console.log('\n-- trigger_condition --');
 
 // Schema: trigger_condition column exists
 const tcCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
 assert(tcCols.includes('trigger_condition'), 'jobs.trigger_condition column exists');
 
-// ── evalTriggerCondition unit tests ──────────────────────
-// null/undefined → always matches
+// -- evalTriggerCondition unit tests ----------------------
+// null/undefined -> always matches
 assert(evalTriggerCondition(null, 'anything') === true, 'null condition always matches');
 assert(evalTriggerCondition(undefined, '') === true, 'undefined condition always matches');
 assert(evalTriggerCondition(null, '') === true, 'null condition matches empty string');
@@ -1372,9 +1372,9 @@ assert(evalTriggerCondition('regex:CPU|ALERT', 'high CPU usage') === true, 'rege
 assert(evalTriggerCondition('regex:CPU|ALERT', 'all clear') === false, 'regex: OR pattern no match');
 assert(evalTriggerCondition('regex:\\d+%', 'usage: 95%') === true, 'regex: digit pattern matches');
 assert(evalTriggerCondition('regex:\\d+%', 'usage: normal') === false, 'regex: digit pattern no match');
-assert(evalTriggerCondition('regex:[invalid', 'anything') === false, 'regex: invalid pattern → false');
+assert(evalTriggerCondition('regex:[invalid', 'anything') === false, 'regex: invalid pattern -> false');
 
-// ── fireTriggeredChildren with trigger_condition ─────────
+// -- fireTriggeredChildren with trigger_condition ---------
 const tcParent = createJob({
   name: 'TC Parent',
   schedule_cron: '0 6 * * *',
@@ -1395,7 +1395,7 @@ const tcChildAlert = createJob({
 });
 assert(getJob(tcChildAlert.id).trigger_condition === 'contains:ALERT', 'trigger_condition stored');
 
-// Child with no condition — fires on status only
+// Child with no condition -- fires on status only
 const tcChildAlways = createJob({
   name: 'TC Always',
   parent_id: tcParent.id,
@@ -1404,7 +1404,7 @@ const tcChildAlways = createJob({
   delivery_mode: 'none', delivery_opt_out_reason: 'test',
   run_timeout_ms:   300_000, origin: 'system',
 });
-assert(getJob(tcChildAlways.id).trigger_condition === null, 'no trigger_condition → null');
+assert(getJob(tcChildAlways.id).trigger_condition === null, 'no trigger_condition -> null');
 
 // Child with regex condition
 const tcChildRegex = createJob({
@@ -1420,10 +1420,10 @@ const tcChildRegex = createJob({
 // Reset next_run_at for all children
 db.prepare('UPDATE jobs SET next_run_at = NULL WHERE parent_id = ?').run(tcParent.id);
 
-// CASE 1: "ALERT: high CPU" — all three match
-// contains:ALERT → matches "ALERT: high CPU" ✓
-// no condition → always fires ✓
-// regex:CPU|MEM → matches "CPU" ✓
+// CASE 1: "ALERT: high CPU" -- all three match
+// contains:ALERT -> matches "ALERT: high CPU" (yes)
+// no condition -> always fires (yes)
+// regex:CPU|MEM -> matches "CPU" (yes)
 const triggered1 = fireTriggeredChildren(tcParent.id, 'ok', 'ALERT: high CPU');
 assert(triggered1.some(c => c.id === tcChildAlert.id), 'alert child fires: output has ALERT');
 assert(triggered1.some(c => c.id === tcChildAlways.id), 'always child fires: no condition');
@@ -1432,7 +1432,7 @@ assert(triggered1.some(c => c.id === tcChildRegex.id), 'regex child fires: outpu
 // Reset
 db.prepare('UPDATE jobs SET next_run_at = NULL WHERE parent_id = ?').run(tcParent.id);
 
-// CASE 2: "all clear" — only no-condition child should fire
+// CASE 2: "all clear" -- only no-condition child should fire
 const triggered2 = fireTriggeredChildren(tcParent.id, 'ok', 'all clear');
 assert(!triggered2.some(c => c.id === tcChildAlert.id), 'alert child does NOT fire: no ALERT in output');
 assert(triggered2.some(c => c.id === tcChildAlways.id), 'always child fires regardless of output');
@@ -1441,13 +1441,13 @@ assert(!triggered2.some(c => c.id === tcChildRegex.id), 'regex child does NOT fi
 // Reset
 db.prepare('UPDATE jobs SET next_run_at = NULL WHERE parent_id = ?').run(tcParent.id);
 
-// CASE 3: "MEM usage high" — regex child and no-condition child fire, alert child doesn't
+// CASE 3: "MEM usage high" -- regex child and no-condition child fire, alert child doesn't
 const triggered3 = fireTriggeredChildren(tcParent.id, 'ok', 'MEM usage high');
 assert(!triggered3.some(c => c.id === tcChildAlert.id), 'alert child does NOT fire: no ALERT in MEM output');
 assert(triggered3.some(c => c.id === tcChildAlways.id), 'always child fires for MEM output');
 assert(triggered3.some(c => c.id === tcChildRegex.id), 'regex child fires: output matches MEM');
 
-// CASE 4: Failure path — children only triggered on matching trigger_on
+// CASE 4: Failure path -- children only triggered on matching trigger_on
 const tcChildOnFail = createJob({
   name: 'TC OnFail',
   parent_id: tcParent.id,
@@ -1477,11 +1477,11 @@ assert(getJob(tcChildAlways.id).trigger_condition === 'contains:TEST', 'updateJo
 updateJob(tcChildAlways.id, { trigger_condition: null });
 assert(getJob(tcChildAlways.id).trigger_condition === null, 'updateJob clears trigger_condition to null');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Delivery Alias Resolution
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Delivery Aliases ──');
+console.log('\n-- Delivery Aliases --');
 
 // Table must exist
 const aliasTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_aliases'").all();
@@ -1495,7 +1495,7 @@ assert(aliasCols.includes('target'),      'delivery_aliases.target column');
 assert(aliasCols.includes('description'), 'delivery_aliases.description column');
 assert(aliasCols.includes('created_at'),  'delivery_aliases.created_at column');
 
-// Insert test fixture aliases (no longer seeded in schema — placeholder data removed for npm publish)
+// Insert test fixture aliases (no longer seeded in schema -- placeholder data removed for npm publish)
 db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
   .run('team_room', 'telegram', '-1000000001', 'Team room');
 db.prepare('INSERT OR REPLACE INTO delivery_aliases (alias, channel, target, description) VALUES (?, ?, ?, ?)')
@@ -1552,7 +1552,7 @@ assert(r3 !== null,                  'resolve @owner_dm: found');
 assert(r3?.channel === 'telegram',   'resolve @owner_dm: correct channel');
 assert(r3?.target  === '1000000001', 'resolve @owner_dm: correct target');
 
-// Unknown alias falls through (returns null → caller uses raw target, backward compat)
+// Unknown alias falls through (returns null -> caller uses raw target, backward compat)
 const r4 = resolveTestAlias('@nonexistent');
 assert(r4 === null, 'unknown @alias returns null (backward compat)');
 
@@ -1590,11 +1590,11 @@ const updatedTeamRoom = db.prepare('SELECT * FROM delivery_aliases WHERE alias =
 assert(updatedTeamRoom?.description === 'Updated description', 'alias upsert updates description');
 assert(updatedTeamRoom?.target === '-1000000001', 'alias upsert preserves target');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // v5 Features
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── v5: Delivery Semantics ──');
+console.log('\n-- v5: Delivery Semantics --');
 {
   const j1 = createJob({ name: 'at-most-once-job', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-most-once' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   assert(j1.delivery_guarantee === 'at-most-once', 'delivery_guarantee defaults to at-most-once');
@@ -1611,7 +1611,7 @@ console.log('\n── v5: Delivery Semantics ──');
   deleteJob(j1.id); deleteJob(j2.id); deleteJob(j3.id);
 }
 
-console.log('\n── v5: Job Class / Flush Hook ──');
+console.log('\n-- v5: Job Class / Flush Hook --');
 {
   const j1 = createJob({ name: 'standard-job', schedule_cron: '0 * * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   assert(j1.job_class === 'standard', 'job_class defaults to standard');
@@ -1625,7 +1625,7 @@ console.log('\n── v5: Job Class / Flush Hook ──');
   deleteJob(j1.id); deleteJob(j2.id);
 }
 
-console.log('\n── v5: Context Summary ──');
+console.log('\n-- v5: Context Summary --');
 {
   const j = createJob({ name: 'ctx-job', schedule_cron: '0 * * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   const run = createRun(j.id, { run_timeout_ms: 60000 });
@@ -1644,7 +1644,7 @@ console.log('\n── v5: Context Summary ──');
   deleteJob(j.id);
 }
 
-console.log('\n── v5: Typed Messages ──');
+console.log('\n-- v5: Typed Messages --');
 {
   // Test new message kinds
   const m1 = sendMessage({ from_agent: 'a', to_agent: 'b', kind: 'constraint', body: 'Never deploy on Fridays', owner: 'ops' });
@@ -1685,7 +1685,7 @@ console.log('\n── v5: Typed Messages ──');
   markAllRead('b');
 }
 
-console.log('\n── v5: Approval Gates ──');
+console.log('\n-- v5: Approval Gates --');
 {
   // Import approval module
   const { createApproval, getPendingApproval, listPendingApprovals, resolveApproval } = await import('./approval.js');
@@ -1732,7 +1732,7 @@ console.log('\n── v5: Approval Gates ──');
   deleteJob(j.id);
 }
 
-console.log('\n── v5: Run Replay Fields ──');
+console.log('\n-- v5: Run Replay Fields --');
 {
   const j = createJob({ name: 'replay-test', schedule_cron: '0 * * * *', payload_message: 'test', delivery_guarantee: 'at-least-once' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   const run1 = createRun(j.id, { run_timeout_ms: 60000 });
@@ -1751,7 +1751,7 @@ console.log('\n── v5: Run Replay Fields ──');
   deleteJob(j.id);
 }
 
-console.log('\n── v5: Hybrid Retrieval ──');
+console.log('\n-- v5: Hybrid Retrieval --');
 {
   const { getRecentRunSummaries, searchRunSummaries, buildRetrievalContext } = await import('./retrieval.js');
 
@@ -1790,7 +1790,7 @@ console.log('\n── v5: Hybrid Retrieval ──');
   deleteJob(j.id); deleteJob(j2.id);
 }
 
-console.log('\n── Schema Baseline ──');
+console.log('\n-- Schema Baseline --');
 {
   // Verify consolidated schema baseline is recorded
   const version = getDb().prepare('SELECT MAX(version) as v FROM schema_migrations').get();
@@ -1833,7 +1833,7 @@ console.log('\n── Schema Baseline ──');
 
 }
 
-console.log('\n── v5: Task Tracker ──');
+console.log('\n-- v5: Task Tracker --');
 {
   const tt = await import('./task-tracker.js');
 
@@ -1898,7 +1898,7 @@ console.log('\n── v5: Task Tracker ──');
     timeoutS: 0, // immediate timeout for testing
     createdBy: 'test',
   });
-  // Don't call agentStarted — leave agent in 'pending' with no heartbeat.
+  // Don't call agentStarted -- leave agent in 'pending' with no heartbeat.
   // This simulates a sub-agent that was spawned but never reported in.
   const dead = tt.checkDeadAgents();
   assert(dead.length > 0, 'dead agent detected after timeout (no heartbeat, pending)');
@@ -1910,7 +1910,7 @@ console.log('\n── v5: Task Tracker ──');
   const g2 = tt.getTaskGroup(group2.id);
   assert(g2.status === 'failed', 'group with dead agent marked failed');
 
-  // ── v8: session key registration and heartbeat ───────────
+  // -- v8: session key registration and heartbeat -----------
   const group3 = tt.createTaskGroup({
     name: 'session-tracking-test',
     expectedAgents: ['writer', 'reviewer'],
@@ -1942,12 +1942,12 @@ console.log('\n── v5: Task Tracker ──');
     createdBy: 'test',
   });
   tt.registerAgentSession(group4.id, 'active-agent', 'agent:main:subagent:active-uuid');
-  // last_heartbeat was just set — agent should be spared
+  // last_heartbeat was just set -- agent should be spared
   const notDead = tt.checkDeadAgents().filter(d => d.tracker_id === group4.id);
   assert(notDead.length === 0, 'agent with recent heartbeat not marked dead despite timeout');
 }
 
-console.log('\n── v10: Team Adapter ──');
+console.log('\n-- v10: Team Adapter --');
 {
   const ta = await import('./team-adapter.js');
   const tt = await import('./task-tracker.js');
@@ -2009,7 +2009,7 @@ console.log('\n── v10: Team Adapter ──');
   assert(events2.some(e => e.event_type === 'ack'), 'team-aware ack emits mailbox event');
 }
 
-console.log('\n── Idempotency Keys ──');
+console.log('\n-- Idempotency Keys --');
 {
   const {
     generateIdempotencyKey, generateChainIdempotencyKey, generateRunNowIdempotencyKey,
@@ -2177,7 +2177,7 @@ console.log('\n── Idempotency Keys ──');
   assert(alRun.idempotency_key === 'al-test-key-12345678901234567890', 'idempotency key available for prompt injection');
   finishRun(alRun.id, 'ok'); deleteJob(alJob.id);
 
-  // 13. IDEMPOTENT_SKIP handling — verify matchesSentinel pattern
+  // 13. IDEMPOTENT_SKIP handling -- verify matchesSentinel pattern
   // In dispatcher, matchesSentinel(trimmed, 'IDEMPOTENT_SKIP') skips delivery
   function matchesSentinelIdem(content, token) {
     if (!content) return false;
@@ -2219,7 +2219,7 @@ console.log('\n── Idempotency Keys ──');
   assert(entries.length > 0, 'listIdempotencyForJob returns entries');
   assert(entries[0].job_id === testJob.id, 'listIdempotencyForJob returns correct job entries');
 
-  // forcePruneIdempotency — same as pruneIdempotencyLedger but returns count
+  // forcePruneIdempotency -- same as pruneIdempotencyLedger but returns count
   const prunedCount = forcePruneIdempotency();
   assert(typeof prunedCount === 'number', 'forcePruneIdempotency returns a number');
 
@@ -2233,11 +2233,11 @@ console.log('\n── Idempotency Keys ──');
   deleteJob(testJob.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Shell job type (session_target = 'shell')
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Shell Jobs ──');
+console.log('\n-- Shell Jobs --');
 
 // Can create a shell job
 const shellJob = createJob({
@@ -2265,13 +2265,13 @@ updateJob(shellJob.id, { enabled: 0, delete_after_run: 1, last_run_at: '2020-01-
 pruneExpiredJobs();
 assert(!getJob(shellJob.id), 'aged shell job pruned correctly');
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Transient Error Detection & delete_after_run Safety
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Transient Error Detection ──');
+console.log('\n-- Transient Error Detection --');
 {
-  // Positive matches — these should be caught as transient errors
+  // Positive matches -- these should be caught as transient errors
   assert(detectTransientError('The AI service is temporarily overloaded. Please try again later.'), 'detects: temporarily overloaded');
   assert(detectTransientError('Service unavailable'), 'detects: service unavailable');
   assert(detectTransientError('Service is unavailable right now'), 'detects: service is unavailable');
@@ -2296,7 +2296,7 @@ console.log('\n── Transient Error Detection ──');
   assert(detectTransientError('context window exceeded'), 'detects: context window exceeded');
   assert(detectTransientError('token limit exceeded'), 'detects: token limit exceeded');
 
-  // Negative matches — these should NOT be flagged
+  // Negative matches -- these should NOT be flagged
   assert(!detectTransientError('Here is the weather report for today'), 'ignores: normal response');
   assert(!detectTransientError('HEARTBEAT_OK'), 'ignores: heartbeat');
   assert(!detectTransientError('I completed the task successfully'), 'ignores: success response');
@@ -2326,7 +2326,7 @@ console.log('\n── Transient Error Detection ──');
   assert(!matchesSentinel('HEARTBEAT_OKAY', 'HEARTBEAT_OK'), 'does not match HEARTBEAT_OKAY');
 }
 
-console.log('\n── Drain Error Detection ──');
+console.log('\n-- Drain Error Detection --');
 {
   const { isDrainError, detectTransientError: detectTransientFromUtils } = await import('./dispatcher-utils.js');
 
@@ -2348,7 +2348,7 @@ console.log('\n── Drain Error Detection ──');
   assert(detectTransientFromUtils('new tasks are not accepted'), 'detectTransientError: catches new tasks not accepted');
 }
 
-console.log('\n── delete_after_run Safety ──');
+console.log('\n-- delete_after_run Safety --');
 {
   // Test that updateJobAfterRun does NOT delete when status is 'error'
   const oneShot = createJob({
@@ -2361,7 +2361,7 @@ console.log('\n── delete_after_run Safety ──');
   });
   assert(oneShot.delete_after_run === 1, 'one-shot job has delete_after_run=1');
 
-  // Simulate error status — job should NOT be deleted
+  // Simulate error status -- job should NOT be deleted
   updateJob(oneShot.id, { last_run_at: new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''), last_status: 'error', consecutive_errors: 1 });
   const afterError = getJob(oneShot.id);
   assert(afterError !== undefined, 'one-shot job survives error status (not deleted)');
@@ -2379,11 +2379,11 @@ console.log('\n── delete_after_run Safety ──');
 }
 
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: session_target + payload_kind Validation
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Payload Validation ──');
+console.log('\n-- Payload Validation --');
 
 // 1. Valid: main + systemEvent
 {
@@ -2392,7 +2392,7 @@ console.log('\n── Payload Validation ──');
   deleteJob(j.id);
 }
 
-// 2. Invalid: main + agentTurn → should throw
+// 2. Invalid: main + agentTurn -> should throw
 {
   let threw = false;
   try { createJob({ name: 'Bad-main-agentTurn', schedule_cron: '0 9 * * *', session_target: 'main', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' , origin: 'system' }); }
@@ -2407,7 +2407,7 @@ console.log('\n── Payload Validation ──');
   deleteJob(j.id);
 }
 
-// 4. Invalid: shell + agentTurn → should throw
+// 4. Invalid: shell + agentTurn -> should throw
 {
   let threw = false;
   try { createJob({ name: 'Bad-shell-agentTurn', schedule_cron: '0 9 * * *', session_target: 'shell', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' , origin: 'system' }); }
@@ -2422,7 +2422,7 @@ console.log('\n── Payload Validation ──');
   deleteJob(j.id);
 }
 
-// 6. Invalid: isolated + shellCommand → should throw
+// 6. Invalid: isolated + shellCommand -> should throw
 {
   let threw = false;
   try { createJob({ name: 'Bad-isolated-shell', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'shellCommand', payload_message: '/bin/echo nope', delivery_mode: 'none', delivery_opt_out_reason: 'test' , origin: 'system' }); }
@@ -2430,7 +2430,7 @@ console.log('\n── Payload Validation ──');
   assert(threw, 'invalid: isolated + shellCommand rejected');
 }
 
-// 7. updateJob: changing to invalid combo → should throw
+// 7. updateJob: changing to invalid combo -> should throw
 {
   const j = createJob({ name: 'Update-validation', schedule_cron: '0 9 * * *', session_target: 'isolated', payload_kind: 'agentTurn', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
   let threw = false;
@@ -2450,7 +2450,7 @@ console.log('\n── Payload Validation ──');
   deleteJob(j.id);
 }
 
-console.log('\n── Job Spec Validation ──');
+console.log('\n-- Job Spec Validation --');
 {
   let threw = false;
   try {
@@ -2530,7 +2530,7 @@ console.log('\n── Job Spec Validation ──');
   assert(noTimeoutUpdate !== undefined, 'validateJobSpec does not require run_timeout_ms on update');
 }
 
-console.log('\n── Origin Field (v20) ──');
+console.log('\n-- Origin Field (v20) --');
 {
   // Origin is required on root job creation
   let threwNoOrigin = false;
@@ -2600,7 +2600,7 @@ console.log('\n── Origin Field (v20) ──');
     payload_message: 'child task',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
-    // no origin — child jobs are exempt
+    // no origin -- child jobs are exempt
   });
   assert(childNoOrigin && childNoOrigin.origin === null, 'child jobs do not require origin');
   deleteJob(childNoOrigin.id);
@@ -2624,9 +2624,9 @@ console.log('\n── Origin Field (v20) ──');
   assert(jCols.includes('origin'), 'jobs table has origin column');
 }
 
-console.log('\n── Delivery Enforcement (v19) ──');
+console.log('\n-- Delivery Enforcement (v19) --');
 {
-  // Test 1: agentTurn + delivery_mode "none" + no opt-out reason → throws
+  // Test 1: agentTurn + delivery_mode "none" + no opt-out reason -> throws
   let threw1 = false;
   try {
     createJob({
@@ -2639,9 +2639,9 @@ console.log('\n── Delivery Enforcement (v19) ──');
   } catch (e) {
     threw1 = e.message.includes('delivery_opt_out_reason');
   }
-  assert(threw1, 'agentTurn + delivery_mode "none" + no opt-out reason → throws');
+  assert(threw1, 'agentTurn + delivery_mode "none" + no opt-out reason -> throws');
 
-  // Test 2: agentTurn + delivery_mode "none" + opt-out reason → passes
+  // Test 2: agentTurn + delivery_mode "none" + opt-out reason -> passes
   const j2 = createJob({
     name: 'OptOutWithReason',
     schedule_cron: '0 9 * * *',
@@ -2650,10 +2650,10 @@ console.log('\n── Delivery Enforcement (v19) ──');
     delivery_opt_out_reason: 'internal monitoring, no human delivery needed',
     run_timeout_ms:   300_000, origin: 'system',
   });
-  assert(j2 && j2.delivery_opt_out_reason === 'internal monitoring, no human delivery needed', 'agentTurn + delivery_mode "none" + opt-out reason → passes');
+  assert(j2 && j2.delivery_opt_out_reason === 'internal monitoring, no human delivery needed', 'agentTurn + delivery_mode "none" + opt-out reason -> passes');
   deleteJob(j2.id);
 
-  // Test 3: agentTurn + delivery_mode "announce" + delivery_to → passes
+  // Test 3: agentTurn + delivery_mode "announce" + delivery_to -> passes
   const j3 = createJob({
     name: 'WithDeliveryTarget',
     schedule_cron: '0 9 * * *',
@@ -2663,10 +2663,10 @@ console.log('\n── Delivery Enforcement (v19) ──');
     delivery_channel: 'telegram',
     run_timeout_ms:   300_000, origin: 'system',
   });
-  assert(j3 && j3.delivery_mode === 'announce', 'agentTurn + delivery_mode "announce" + delivery_to → passes');
+  assert(j3 && j3.delivery_mode === 'announce', 'agentTurn + delivery_mode "announce" + delivery_to -> passes');
   deleteJob(j3.id);
 
-  // Test 4: systemEvent/main + delivery_mode "none" → passes (exempt)
+  // Test 4: systemEvent/main + delivery_mode "none" -> passes (exempt)
   const j4 = createJob({
     name: 'SystemEventNoDelivery',
     schedule_cron: '0 9 * * *',
@@ -2676,10 +2676,10 @@ console.log('\n── Delivery Enforcement (v19) ──');
     delivery_mode: 'none',
     run_timeout_ms:   300_000, origin: 'system',
   });
-  assert(j4 && j4.delivery_mode === 'none', 'systemEvent/main + delivery_mode "none" → passes (exempt)');
+  assert(j4 && j4.delivery_mode === 'none', 'systemEvent/main + delivery_mode "none" -> passes (exempt)');
   deleteJob(j4.id);
 
-  // Test 5: child agentTurn + delivery_mode "none" → passes (exempt)
+  // Test 5: child agentTurn + delivery_mode "none" -> passes (exempt)
   const parentJ = createJob({
     name: 'EnforcementParent',
     schedule_cron: '0 9 * * *',
@@ -2696,11 +2696,11 @@ console.log('\n── Delivery Enforcement (v19) ──');
     delivery_mode: 'none',
     run_timeout_ms:   300_000, origin: 'system',
   });
-  assert(j5 && j5.delivery_mode === 'none' && !j5.delivery_opt_out_reason, 'child agentTurn + delivery_mode "none" → passes (exempt)');
+  assert(j5 && j5.delivery_mode === 'none' && !j5.delivery_opt_out_reason, 'child agentTurn + delivery_mode "none" -> passes (exempt)');
   deleteJob(j5.id);
   deleteJob(parentJ.id);
 
-  // Test 6: shell job + delivery_mode "none" → passes (exempt, not agentTurn)
+  // Test 6: shell job + delivery_mode "none" -> passes (exempt, not agentTurn)
   const j6 = createJob({
     name: 'ShellNoDelivery',
     schedule_cron: '0 9 * * *',
@@ -2710,7 +2710,7 @@ console.log('\n── Delivery Enforcement (v19) ──');
     delivery_mode: 'none',
     run_timeout_ms:   300_000, origin: 'system',
   });
-  assert(j6 && j6.delivery_mode === 'none', 'shell + delivery_mode "none" → passes (exempt)');
+  assert(j6 && j6.delivery_mode === 'none', 'shell + delivery_mode "none" -> passes (exempt)');
   deleteJob(j6.id);
 
   // Test 7: delivery_opt_out_reason persists via updateJob
@@ -2758,9 +2758,9 @@ console.log('\n── Delivery Enforcement (v19) ──');
   deleteJob(j8.id);
 }
 
-console.log('\n── delivery_to Required for Announce Modes ──');
+console.log('\n-- delivery_to Required for Announce Modes --');
 {
-  // Test 1: createJob with delivery_mode='announce' and delivery_to=null → throws
+  // Test 1: createJob with delivery_mode='announce' and delivery_to=null -> throws
   let threw1 = false;
   try {
     createJob({
@@ -2773,9 +2773,9 @@ console.log('\n── delivery_to Required for Announce Modes ──');
   } catch (e) {
     threw1 = e.message.includes('delivery_to');
   }
-  assert(threw1, 'createJob with delivery_mode=announce and no delivery_to → throws');
+  assert(threw1, 'createJob with delivery_mode=announce and no delivery_to -> throws');
 
-  // Test 2: createJob with delivery_mode='announce' and delivery_to='123456789' → succeeds
+  // Test 2: createJob with delivery_mode='announce' and delivery_to='123456789' -> succeeds
   const j2 = createJob({
     name: 'announce-with-delivery-to',
     schedule_cron: '0 9 * * *',
@@ -2786,10 +2786,10 @@ console.log('\n── delivery_to Required for Announce Modes ──');
     run_timeout_ms: 300_000, origin: 'system',
   });
   assert(j2 && j2.delivery_mode === 'announce' && j2.delivery_to === '123456789',
-    'createJob with delivery_mode=announce and delivery_to set → succeeds');
+    'createJob with delivery_mode=announce and delivery_to set -> succeeds');
   deleteJob(j2.id);
 
-  // Test 3: createJob with delivery_mode='announce-always' and delivery_to=null → throws
+  // Test 3: createJob with delivery_mode='announce-always' and delivery_to=null -> throws
   let threw3 = false;
   try {
     createJob({
@@ -2802,9 +2802,9 @@ console.log('\n── delivery_to Required for Announce Modes ──');
   } catch (e) {
     threw3 = e.message.includes('delivery_to');
   }
-  assert(threw3, 'createJob with delivery_mode=announce-always and no delivery_to → throws');
+  assert(threw3, 'createJob with delivery_mode=announce-always and no delivery_to -> throws');
 
-  // Test 4: createJob with delivery_mode='none' and delivery_to=null → succeeds (no constraint)
+  // Test 4: createJob with delivery_mode='none' and delivery_to=null -> succeeds (no constraint)
   const j4 = createJob({
     name: 'none-mode-no-delivery-to',
     schedule_cron: '0 9 * * *',
@@ -2813,10 +2813,10 @@ console.log('\n── delivery_to Required for Announce Modes ──');
     delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000, origin: 'system',
   });
-  assert(j4 && j4.delivery_mode === 'none', 'createJob with delivery_mode=none and no delivery_to → succeeds');
+  assert(j4 && j4.delivery_mode === 'none', 'createJob with delivery_mode=none and no delivery_to -> succeeds');
   deleteJob(j4.id);
 
-  // Test 5: updateJob to set delivery_mode='announce' without delivery_to → throws
+  // Test 5: updateJob to set delivery_mode='announce' without delivery_to -> throws
   const j5base = createJob({
     name: 'update-to-announce-base',
     schedule_cron: '0 9 * * *',
@@ -2831,10 +2831,10 @@ console.log('\n── delivery_to Required for Announce Modes ──');
   } catch (e) {
     threw5 = e.message.includes('delivery_to');
   }
-  assert(threw5, 'updateJob setting delivery_mode=announce without delivery_to → throws');
+  assert(threw5, 'updateJob setting delivery_mode=announce without delivery_to -> throws');
   deleteJob(j5base.id);
 
-  // Test 6: updateJob to set delivery_mode='announce' WITH delivery_to → succeeds
+  // Test 6: updateJob to set delivery_mode='announce' WITH delivery_to -> succeeds
   const j6base = createJob({
     name: 'update-to-announce-with-target',
     schedule_cron: '0 9 * * *',
@@ -2849,11 +2849,11 @@ console.log('\n── delivery_to Required for Announce Modes ──');
     delivery_channel: 'telegram',
   });
   assert(j6updated.delivery_mode === 'announce' && j6updated.delivery_to === '123456789',
-    'updateJob setting delivery_mode=announce with delivery_to → succeeds');
+    'updateJob setting delivery_mode=announce with delivery_to -> succeeds');
   deleteJob(j6base.id);
 }
 
-console.log('\n── Delivery Chunking ──');
+console.log('\n-- Delivery Chunking --');
 {
   const short = splitMessageForChannel('telegram', 'hello world');
   assert(short.length === 1, 'short telegram message stays single-part');
@@ -2865,7 +2865,7 @@ console.log('\n── Delivery Chunking ──');
   assert(parts[0].startsWith('[1/'), 'chunked telegram parts include part prefix');
 }
 
-console.log('\n── CLI JSON / Dry-Run / Schema ──');
+console.log('\n-- CLI JSON / Dry-Run / Schema --');
 {
   const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-cli-'));
   const dbPath = join(tempRoot, 'scheduler.db');
@@ -2944,7 +2944,7 @@ console.log('\n── CLI JSON / Dry-Run / Schema ──');
   rmSync(tempRoot, { recursive: true, force: true });
 }
 
-console.log('\n── Dispatch Script Compatibility ──');
+console.log('\n-- Dispatch Script Compatibility --');
 {
   const envBase = { HOME: '/tmp/testuser' };
   const schedulerPath = '/tmp/testuser/.openclaw/scheduler/dispatch/index.mjs';
@@ -2985,11 +2985,11 @@ console.log('\n── Dispatch Script Compatibility ──');
 }
 
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Watchdog Job Type (v13)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Watchdog Jobs ──');
+console.log('\n-- Watchdog Jobs --');
 {
   // Schema: job_type column exists with default 'standard'
   const watchdogCols = db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
@@ -3093,11 +3093,11 @@ console.log('\n── Watchdog Jobs ──');
   deleteJob(wdJob.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // AUTH PROFILE
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Auth Profile ──');
+console.log('\n-- Auth Profile --');
 {
   // Create job with auth_profile: 'inherit'
   const inheritJob = createJob({
@@ -3187,7 +3187,7 @@ console.log('\n── Auth Profile ──');
   deleteJob(explicitNullJob.id);
 }
 
-console.log('\n── Migration Guard ──');
+console.log('\n-- Migration Guard --');
 {
   const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-migrate-'));
   const legacyDbPath = join(legacyDir, 'scheduler.db');
@@ -3308,7 +3308,7 @@ console.log('\n── Migration Guard ──');
   await initDb();
 }
 
-console.log('\n── Partial Legacy Jobs + Messages Migration ──');
+console.log('\n-- Partial Legacy Jobs + Messages Migration --');
 {
   const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-legacy-jobs-msg-'));
   const legacyDbPath = join(legacyDir, 'scheduler.db');
@@ -3380,7 +3380,7 @@ console.log('\n── Partial Legacy Jobs + Messages Migration ──');
   await initDb();
 }
 
-console.log('\n── Legacy At-Job Normalization ──');
+console.log('\n-- Legacy At-Job Normalization --');
 {
   const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-at-migrate-'));
   const legacyDbPath = join(legacyDir, 'scheduler.db');
@@ -3513,7 +3513,7 @@ console.log('\n── Legacy At-Job Normalization ──');
   await initDb();
 }
 
-console.log('\n── Partial Current Schema Consolidation ──');
+console.log('\n-- Partial Current Schema Consolidation --');
 {
   const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-partial-current-'));
   const legacyDbPath = join(legacyDir, 'scheduler.db');
@@ -3628,7 +3628,7 @@ console.log('\n── Partial Current Schema Consolidation ──');
   await initDb();
 }
 
-console.log('\n── Legacy Payload Normalization ──');
+console.log('\n-- Legacy Payload Normalization --');
 {
   const legacyDir = mkdtempSync(join(tmpdir(), 'scheduler-legacy-payload-'));
   const legacyDbPath = join(legacyDir, 'scheduler.db');
@@ -3768,7 +3768,7 @@ console.log('\n── Legacy Payload Normalization ──');
   await initDb();
 }
 
-console.log('\n── Dispatcher Utils ──');
+console.log('\n-- Dispatcher Utils --');
 {
   // sqliteNow returns valid datetime string
   const now = sqliteNow();
@@ -3807,7 +3807,7 @@ console.log('\n── Dispatcher Utils ──');
   assert(getBackoffMs(99) === 3600000, 'getBackoffMs(99) caps at 1h');
 }
 
-console.log('\n── Dispatch Queue Lifecycle ──');
+console.log('\n-- Dispatch Queue Lifecycle --');
 {
   const dqJob = createJob({ name: 'dq-lifecycle', schedule_cron: '0 8 * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
 
@@ -3856,7 +3856,7 @@ console.log('\n── Dispatch Queue Lifecycle ──');
   deleteJob(dqJob.id);
 }
 
-console.log('\n── Approval Timeout / Prune / Count ──');
+console.log('\n-- Approval Timeout / Prune / Count --');
 {
   const { createApproval, getApproval, countPendingApprovalsForJob,
           getTimedOutApprovals, pruneApprovals, resolveApproval } = await import('./approval.js');
@@ -3901,7 +3901,7 @@ console.log('\n── Approval Timeout / Prune / Count ──');
   deleteJob(aJob.id);
 }
 
-console.log('\n── finishRun status guard ──');
+console.log('\n-- finishRun status guard --');
 {
   const guardJob = createJob({ name: 'finish-guard-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
   const guardRun = createRun(guardJob.id, { run_timeout_ms: 300_000 });
@@ -3911,7 +3911,7 @@ console.log('\n── finishRun status guard ──');
 
   const firstDurationMs = afterFirst.duration_ms;
 
-  // Attempt to overwrite ok with error — should be a no-op (WHERE guard rejects non-matching status)
+  // Attempt to overwrite ok with error -- should be a no-op (WHERE guard rejects non-matching status)
   finishRun(guardRun.id, 'error', { summary: 'second finish', error_message: 'should not apply' });
   const afterSecond = getRun(guardRun.id);
   assert(afterSecond.status === 'ok', 'finishRun does not overwrite terminal status');
@@ -3921,7 +3921,7 @@ console.log('\n── finishRun status guard ──');
   deleteJob(guardJob.id);
 }
 
-console.log('\n── resolveApproval invalid status ──');
+console.log('\n-- resolveApproval invalid status --');
 {
   const { createApproval, resolveApproval } = await import('./approval.js');
   const rvJob = createJob({ name: 'resolve-validate-test', schedule_cron: '0 0 * * *', payload_message: 'test', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
@@ -3948,7 +3948,7 @@ console.log('\n── resolveApproval invalid status ──');
   deleteJob(rvJob.id);
 }
 
-console.log('\n── Run Session & Context Summary ──');
+console.log('\n-- Run Session & Context Summary --');
 {
   const rsJob = createJob({ name: 'run-session-test', schedule_cron: '0 8 * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
 
@@ -3979,7 +3979,7 @@ console.log('\n── Run Session & Context Summary ──');
   deleteJob(rsJob.id);
 }
 
-console.log('\n── Prompt Context Edge Cases ──');
+console.log('\n-- Prompt Context Edge Cases --');
 {
   // No trigger (no triggered_by_run)
   const noTrigger = buildTriggeredRunContext({});
@@ -4036,7 +4036,7 @@ console.log('\n── Prompt Context Edge Cases ──');
   assert(errorOnlyCtx.text.includes('Parent run error:'), 'error-only: has error label');
 }
 
-console.log('\n── Dispatcher Integration ──');
+console.log('\n-- Dispatcher Integration --');
 {
   async function withTempDispatcher({ prepare, exercise }) {
     const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-dispatcher-'));
@@ -4501,11 +4501,11 @@ console.log('\n── Dispatcher Integration ──');
   });
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Dispatch Spawn Failure Detection
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Dispatch Spawn Failure Detection ──');
+console.log('\n-- Dispatch Spawn Failure Detection --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
 
@@ -4573,7 +4573,7 @@ if (sub === 'status') {
       timeout: 12000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    // execFileSync succeeded — sfExitCode retains its initial value of 0
+    // execFileSync succeeded -- sfExitCode retains its initial value of 0
   } catch (err) {
     sfExitCode  = err.status ?? 1;
     sfStderr    = err.stderr  ?? '';
@@ -4583,7 +4583,7 @@ if (sub === 'status') {
   assert(sfStderr.includes('SPAWN FAILURE'), 'spawn-failure: watcher writes SPAWN FAILURE to stderr');
   assert(sfStdout.includes('SPAWN FAILURE'), 'spawn-failure: watcher writes SPAWN FAILURE to stdout');
 
-  // 3. Normal completion: session seen once (liveness ok), then gone → watcher resolves ok (exit 0)
+  // 3. Normal completion: session seen once (liveness ok), then gone -> watcher resolves ok (exit 0)
   //    Mock returns running+liveness for calls 1-2, then done on call 3+.
   const counterFile = join(tempDir, 'nc-counter.txt');
   writeFileSync(counterFile, '0');
@@ -4664,7 +4664,7 @@ if (sub === 'status') {
 
   // 3b. Interrupted: status auto-resolved as 'interrupted' (session went idle without calling done).
   //     Mock always returns status=interrupted with the auto-resolve summary.
-  //     Watcher must: exit non-zero (exit 1), write ⚠️ warning to stdout,
+  //     Watcher must: exit non-zero (exit 1), write warning emoji to stdout,
   //     and NOT deliver as a successful result.
   {
     const intTempDir = mkdtempSync(join(tmpdir(), 'watcher-intr-'));
@@ -4734,8 +4734,8 @@ if (sub === 'status') {
   rmSync(tempDir, { recursive: true, force: true });
 }
 
-// ── Gateway-Restart-Kill Detection ──
-console.log('\n── Gateway-Restart-Kill Recovery ──');
+// -- Gateway-Restart-Kill Detection --
+console.log('\n-- Gateway-Restart-Kill Recovery --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const watcherPath = join(dispatchDir, 'watcher.mjs');
@@ -4816,10 +4816,10 @@ if (sub === 'status') {
   assert(gkLabels['test-gk'].summary.includes('gateway-restart-kill'), 'gw-restart-kill max retries: labels.json summary contains gateway-restart-kill');
 
   // 5. GW-restart-kill first attempt: watcher re-dispatches (mock returns running after enqueue)
-  //    gwRestartRetryCount starts at 0 — watcher should retry and continue polling.
+  //    gwRestartRetryCount starts at 0 -- watcher should retry and continue polling.
   //    We simulate this by: first status call returns done/not-found (kill detected),
   //    second call also returns done/not-found (simulating another kill on the new session
-  //    with gwRestartRetryCount now=1), third call returns done/not-found (count=2=max → give up).
+  //    with gwRestartRetryCount now=1), third call returns done/not-found (count=2=max -> give up).
   const mockGwRetryPath = join(tempDir, 'mock-gw-retry.mjs');
   const mockLabelsGwRetry = join(tempDir, 'labels-gr.json');
   const grCounterFile = join(tempDir, 'gr-counter.txt');
@@ -4831,7 +4831,7 @@ const [,,sub,...rest] = process.argv;
 const counterFile = ${JSON.stringify(grCounterFile)};
 
 if (sub === 'status') {
-  // Always return session-not-found — watcher should retry up to MAX then fail
+  // Always return session-not-found -- watcher should retry up to MAX then fail
   process.stdout.write(JSON.stringify({
     ok: true,
     label: 'test-gr',
@@ -4843,7 +4843,7 @@ if (sub === 'status') {
 } else if (sub === 'result') {
   process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'done' }) + '\\n');
 } else if (sub === 'enqueue') {
-  // Simulate successful enqueue — update labels to 'running' with new sessionKey
+  // Simulate successful enqueue -- update labels to 'running' with new sessionKey
   let labelsPath = ${JSON.stringify(mockLabelsGwRetry)};
   // Extract --label from args
   const labelIdx = rest.indexOf('--label');
@@ -4863,7 +4863,7 @@ if (sub === 'status') {
 }
 `);
 
-  // gwRestartRetryCount=0 initially — watcher should retry twice then give up
+  // gwRestartRetryCount=0 initially -- watcher should retry twice then give up
   writeFileSync(mockLabelsGwRetry, JSON.stringify({
     'test-gr': {
       sessionKey: 'agent:main:subagent:gr-uuid',
@@ -4911,21 +4911,21 @@ if (sub === 'status') {
   rmSync(tempDir, { recursive: true, force: true });
 }
 
-// ── Watcher exit-code correctness (timeout paths) ──
-console.log('\n── Watcher timeout markLabelError ──');
+// -- Watcher exit-code correctness (timeout paths) --
+console.log('\n-- Watcher timeout markLabelError --');
 {
   const watcherSrc = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs'),
     'utf8'
   );
   // Timeout paths should call markLabelError, not markDoneSync, before exit(1)
-  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — token telemetry unavailable`)'),
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s -- token telemetry unavailable`)'),
     'timeout: markLabelError used for token-telemetry-unavailable path');
-  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — token telemetry lost`)'),
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s -- token telemetry lost`)'),
     'timeout: markLabelError used for token-telemetry-lost path');
-  assert(watcherSrc.includes("markLabelError(label, 'timed out — killed after steer attempts (no result captured)')"),
+  assert(watcherSrc.includes("markLabelError(label, 'timed out -- killed after steer attempts (no result captured)')"),
     'timeout: markLabelError used for steer-kill path');
-  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s — killed after steer attempts`)'),
+  assert(watcherSrc.includes('markLabelError(label, `timed out after ${timeoutS}s -- killed after steer attempts`)'),
     'timeout: markLabelError used for final killed-after-steer path');
   assert(watcherSrc.includes('isGatewayRestartKill'), 'gw-kill: isGatewayRestartKill function present');
   assert(watcherSrc.includes('MAX_GW_RESTART_RETRIES'), 'gw-kill: MAX_GW_RESTART_RETRIES constant present');
@@ -4933,11 +4933,11 @@ console.log('\n── Watcher timeout markLabelError ──');
   assert(watcherSrc.includes('gwRestartRetryCount'), 'gw-kill: gwRestartRetryCount tracked in labels');
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Sessions.json Detection, Done Subcommand, STARTUP_GRACE_MS
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Sessions.json Detection ──');
+console.log('\n-- Sessions.json Detection --');
 {
   const dispatchDir  = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexPath    = join(dispatchDir, 'index.mjs');
@@ -4945,24 +4945,24 @@ console.log('\n── Sessions.json Detection ──');
   const indexSrc     = readFileSync(indexPath, 'utf8');
   const watcherSrc   = readFileSync(watcherPath, 'utf8');
 
-  // ── 1. STARTUP_GRACE_MS constant checks ─────────────────────────────────
+  // -- 1. STARTUP_GRACE_MS constant checks ---------------------------------
   // index.mjs must default to 300_000 (not the old 90_000)
   assert(indexSrc.includes('300_000'), 'STARTUP_GRACE_MS: index.mjs uses 300_000');
   assert(!indexSrc.includes('90_000'), 'STARTUP_GRACE_MS: index.mjs does not use old 90_000');
   // watcher.mjs: _STARTUP_GRACE_MS was removed (unused dead code, fix #40)
   // index.mjs still uses 300_000 for its startup grace logic
 
-  // ── 2. readSessionsStore present in both files ───────────────────────────
+  // -- 2. readSessionsStore present in both files ---------------------------
   assert(indexSrc.includes('readSessionsStore'), 'sessions.json: readSessionsStore in index.mjs');
   assert(watcherSrc.includes('readSessionsStore'), 'sessions.json: readSessionsStore in watcher.mjs');
 
-  // ── 3. No direct sessions_list API calls for state checks in index.mjs ───
+  // -- 3. No direct sessions_list API calls for state checks in index.mjs ---
   // The three old patterns replaced: cmdStatus, cmdStuck, cmdSync
   // We verify sessions_list is not used for session state decisions
   // (it may still exist in other contexts but should not be the state oracle)
   assert(!indexSrc.includes("gatewayToolInvoke('sessions_list'"), 'sessions.json: no sessions_list calls in index.mjs');
 
-  // ── 4. sessions.json read behaviour via temp store ───────────────────────
+  // -- 4. sessions.json read behaviour via temp store -----------------------
   const testTmpDir = mkdtempSync(join(tmpdir(), 'sessions-json-test-'));
   const testLabelsPath = join(testTmpDir, 'labels.json');
   // Path must match readSessionsStore: join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json')
@@ -4970,7 +4970,7 @@ console.log('\n── Sessions.json Detection ──');
   mkdirSync(sessionsDir, { recursive: true });
   const sessionsJsonPath = join(sessionsDir, 'sessions.json');
 
-  // Fake session entry — simulates a running dispatcher-spawned session
+  // Fake session entry -- simulates a running dispatcher-spawned session
   const fakeSessionKey = 'agent:main:subagent:test-sess-uuid-001';
   const nowMs = Date.now();
   writeFileSync(sessionsJsonPath, JSON.stringify({
@@ -4993,7 +4993,7 @@ console.log('\n── Sessions.json Detection ──');
     },
   }) + '\n');
 
-  // 4a. Present + active → dispatch status should see it
+  // 4a. Present + active -> dispatch status should see it
   const statusPresentActive = execFileSync(process.execPath, [indexPath, 'status', '--label', 'test-sess'], {
     encoding: 'utf8',
     env: {
@@ -5009,7 +5009,7 @@ console.log('\n── Sessions.json Detection ──');
   assert(statusObjActive.status === 'running', 'sessions.json present+active: status=running (not auto-resolved)');
   assert(statusObjActive.liveness && !statusObjActive.liveness.error, 'sessions.json present+active: liveness has no error');
 
-  // 4b. Present + stale (>10min idle) → should auto-resolve to done
+  // 4b. Present + stale (>10min idle) -> should auto-resolve to done
   const staleMs = nowMs - 11 * 60 * 1000;
   writeFileSync(sessionsJsonPath, JSON.stringify({
     [fakeSessionKey]: {
@@ -5042,10 +5042,10 @@ console.log('\n── Sessions.json Detection ──');
   });
   const statusObjStale = JSON.parse(statusPresentStale.trim());
   assert(statusObjStale.ok === true, 'sessions.json present+stale: status ok');
-  assert(statusObjStale.status === 'interrupted', 'sessions.json present+stale: auto-resolved to interrupted (not done — agent never called done)');
+  assert(statusObjStale.status === 'interrupted', 'sessions.json present+stale: auto-resolved to interrupted (not done -- agent never called done)');
   assert(statusObjStale.syncAction && statusObjStale.syncAction.includes('auto-resolved'), 'sessions.json present+stale: syncAction includes auto-resolved');
 
-  // 4c. Absent (session key not in store) → gateway API fallback.
+  // 4c. Absent (session key not in store) -> gateway API fallback.
   //     In 2026.3.13+ subagents are NOT written to sessions.json (SessionBindingService).
   //     When session is absent from sessions.json, checkSessionDone now calls
   //     gateway sessions.list API. In test env the gateway is unreachable, so
@@ -5075,13 +5075,13 @@ console.log('\n── Sessions.json Detection ──');
   });
   const statusObjAbsent = JSON.parse(statusAbsent.trim());
   assert(statusObjAbsent.ok === true, 'sessions.json absent: status ok');
-  // With gateway API fallback: gateway unreachable in test env → safe default = running (not done)
-  assert(statusObjAbsent.status === 'running', 'sessions.json absent: deferred (gateway API fallback — unreachable in test = safe default running)');
+  // With gateway API fallback: gateway unreachable in test env -> safe default = running (not done)
+  assert(statusObjAbsent.status === 'running', 'sessions.json absent: deferred (gateway API fallback -- unreachable in test = safe default running)');
 
   rmSync(testTmpDir, { recursive: true, force: true });
 }
 
-console.log('\n── Done Subcommand ──');
+console.log('\n-- Done Subcommand --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexPath   = join(dispatchDir, 'index.mjs');
@@ -5120,7 +5120,7 @@ console.log('\n── Done Subcommand ──');
   assert(updatedLabels['my-task'].status === 'done', 'done subcommand: labels.json updated to done');
   assert(updatedLabels['my-task'].summary === 'all done!', 'done subcommand: labels.json summary updated');
 
-  // done with unregistered label → exits 0 and marks as done (not an error)
+  // done with unregistered label -> exits 0 and marks as done (not an error)
   // NOTE: Changed from exits-1 in 07838b6: unregistered labels are valid for
   //       direct subagent spawns that weren't tracked via enqueue.
   {
@@ -5139,7 +5139,7 @@ console.log('\n── Done Subcommand ──');
     assert(unregResult.status === 'done', 'done subcommand: unregistered label marked done');
   }
 
-  // done without --label → exits 2
+  // done without --label -> exits 2
   let threwNoLabel = false;
   try {
     execFileSync(process.execPath, [indexPath, 'done'], {
@@ -5159,7 +5159,7 @@ console.log('\n── Done Subcommand ──');
   assert(indexSrc.includes('cmdDone'), 'done subcommand: cmdDone function defined');
   assert(indexSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
 
-  // ── SHA validation tests ──────────────────────────────────
+  // -- SHA validation tests ----------------------------------
 
   // done with valid --sha succeeds (uses actual HEAD commit from the scheduler repo)
   {
@@ -5262,9 +5262,9 @@ console.log('\n── Done Subcommand ──');
     assert(!noShaLabels['no-sha-task'].sha, 'done without --sha (backward compat): no sha in labels.json');
   }
 
-  // ── Bug 1 fix: summary truncation at 300 chars ────────────
+  // -- Bug 1 fix: summary truncation at 300 chars ------------
 
-  // done with summary > 300 chars → truncated to 300 and warns on stderr
+  // done with summary > 300 chars -> truncated to 300 and warns on stderr
   {
     writeFileSync(doneLabels, JSON.stringify({
       'trunc-task': {
@@ -5297,7 +5297,7 @@ console.log('\n── Done Subcommand ──');
     assert(truncLabels['trunc-task'].status === 'done', 'done --summary truncation: labels.json status=done');
   }
 
-  // done with summary exactly 300 chars → accepted as-is (no truncation)
+  // done with summary exactly 300 chars -> accepted as-is (no truncation)
   {
     writeFileSync(doneLabels, JSON.stringify({
       'exact-trunc-task': {
@@ -5325,9 +5325,9 @@ console.log('\n── Done Subcommand ──');
     assert(exact300Obj.summary.length === 300, 'done --summary exactly 300 chars: summary preserved');
   }
 
-  // ── Structural checklist validation ─────────────────────────
+  // -- Structural checklist validation -------------------------
 
-  // done without --checklist → rejected (missing checklist)
+  // done without --checklist -> rejected (missing checklist)
   {
     writeFileSync(doneLabels, JSON.stringify({
       'no-checklist-task': {
@@ -5366,7 +5366,7 @@ console.log('\n── Done Subcommand ──');
     assert(noChecklistLabels['no-checklist-task'].status === 'running', 'done without --checklist: labels.json NOT updated');
   }
 
-  // done with work_complete:false → rejected
+  // done with work_complete:false -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'work-incomplete-task': {
@@ -5406,7 +5406,7 @@ console.log('\n── Done Subcommand ──');
     assert(workIncompleteLabels['work-incomplete-task'].status === 'running', 'done with work_complete:false: labels.json NOT updated');
   }
 
-  // done with tests_passed:false → rejected
+  // done with tests_passed:false -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'tests-failed-task': {
@@ -5446,7 +5446,7 @@ console.log('\n── Done Subcommand ──');
     assert(testsFailedLabels['tests-failed-task'].status === 'running', 'done with tests_passed:false: labels.json NOT updated');
   }
 
-  // done with pushed:false → rejected
+  // done with pushed:false -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'push-failed-task': {
@@ -5486,7 +5486,7 @@ console.log('\n── Done Subcommand ──');
     assert(pushFailedLabels['push-failed-task'].status === 'running', 'done with pushed:false: labels.json NOT updated');
   }
 
-  // done with invalid JSON in --checklist → rejected
+  // done with invalid JSON in --checklist -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'bad-json-task': {
@@ -5516,7 +5516,7 @@ console.log('\n── Done Subcommand ──');
     assert(threwBadJson, 'done with invalid JSON checklist: rejected (exit code 1)');
   }
 
-  // done with valid checklist (all fields true) → accepted
+  // done with valid checklist (all fields true) -> accepted
   const legitimateSummaries = [
     'Refactored the auth module and added unit tests. All 42 tests pass.',
     'Fixed the memory leak in the connection pool. Commit: abc1234.',
@@ -5555,7 +5555,7 @@ console.log('\n── Done Subcommand ──');
     assert(legitObj.ok === true, `done with valid checklist "${legit.slice(0, 40)}...": ok=true`);
   }
 
-  // done with only work_complete:true (minimal checklist) → accepted
+  // done with only work_complete:true (minimal checklist) -> accepted
   {
     writeFileSync(doneLabels, JSON.stringify({
       'minimal-checklist-task': {
@@ -5588,11 +5588,11 @@ console.log('\n── Done Subcommand ──');
     assert(minimalObj.ok === true, 'done with minimal checklist: ok=true');
   }
 
-  // ── Fix 1: Minimum runtime guard ────────────────────────────────────────
+  // -- Fix 1: Minimum runtime guard ----------------------------------------
 
-  console.log('\n  ── Minimum Runtime Guard ──');
+  console.log('\n  -- Minimum Runtime Guard --');
 
-  // Test 1: done called within 30s of spawn → rejected with "suspiciously short"
+  // Test 1: done called within 30s of spawn -> rejected with "suspiciously short"
   {
     writeFileSync(doneLabels, JSON.stringify({
       'premature-done-task': {
@@ -5623,16 +5623,16 @@ console.log('\n── Done Subcommand ──');
       prematureExitCode = err.status;
       prematureStderr = err.stderr || '';
     }
-    assert(threwPremature, 'runtime-guard: done within 30s → rejected (non-zero exit)');
-    assert(prematureExitCode === 1, 'runtime-guard: done within 30s → exit code 1');
-    assert(prematureStderr.includes('REJECTED'), 'runtime-guard: done within 30s → stderr contains REJECTED');
-    assert(prematureStderr.includes('suspiciously short'), 'runtime-guard: done within 30s → stderr mentions suspiciously short');
-    assert(prematureStderr.includes('--force-done'), 'runtime-guard: done within 30s → stderr mentions --force-done escape hatch');
+    assert(threwPremature, 'runtime-guard: done within 30s -> rejected (non-zero exit)');
+    assert(prematureExitCode === 1, 'runtime-guard: done within 30s -> exit code 1');
+    assert(prematureStderr.includes('REJECTED'), 'runtime-guard: done within 30s -> stderr contains REJECTED');
+    assert(prematureStderr.includes('suspiciously short'), 'runtime-guard: done within 30s -> stderr mentions suspiciously short');
+    assert(prematureStderr.includes('--force-done'), 'runtime-guard: done within 30s -> stderr mentions --force-done escape hatch');
     const prematureLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(prematureLabels['premature-done-task'].status === 'running', 'runtime-guard: done within 30s → labels.json NOT updated');
+    assert(prematureLabels['premature-done-task'].status === 'running', 'runtime-guard: done within 30s -> labels.json NOT updated');
   }
 
-  // Test 2: done within 30s with --force-done but no --reason → rejected
+  // Test 2: done within 30s with --force-done but no --reason -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'force-no-reason-task': {
@@ -5663,15 +5663,15 @@ console.log('\n── Done Subcommand ──');
       forceNoReasonExitCode = err.status;
       forceNoReasonStderr = err.stderr || '';
     }
-    assert(threwForceNoReason, 'runtime-guard: --force-done without --reason → rejected');
-    assert(forceNoReasonExitCode === 1, 'runtime-guard: --force-done without --reason → exit code 1');
-    assert(forceNoReasonStderr.includes('REJECTED'), 'runtime-guard: --force-done without --reason → stderr REJECTED');
-    assert(forceNoReasonStderr.includes('--reason'), 'runtime-guard: --force-done without --reason → stderr mentions --reason');
+    assert(threwForceNoReason, 'runtime-guard: --force-done without --reason -> rejected');
+    assert(forceNoReasonExitCode === 1, 'runtime-guard: --force-done without --reason -> exit code 1');
+    assert(forceNoReasonStderr.includes('REJECTED'), 'runtime-guard: --force-done without --reason -> stderr REJECTED');
+    assert(forceNoReasonStderr.includes('--reason'), 'runtime-guard: --force-done without --reason -> stderr mentions --reason');
     const forceNoReasonLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(forceNoReasonLabels['force-no-reason-task'].status === 'running', 'runtime-guard: --force-done without --reason → labels.json NOT updated');
+    assert(forceNoReasonLabels['force-no-reason-task'].status === 'running', 'runtime-guard: --force-done without --reason -> labels.json NOT updated');
   }
 
-  // Test 3: done within 30s with --force-done --reason "audit only" → accepted
+  // Test 3: done within 30s with --force-done --reason "audit only" -> accepted
   {
     writeFileSync(doneLabels, JSON.stringify({
       'force-with-reason-task': {
@@ -5689,7 +5689,7 @@ console.log('\n── Done Subcommand ──');
     try {
       forceWithReasonOut = execFileSync(process.execPath, [
         indexPath, 'done', '--label', 'force-with-reason-task', '--summary', 'audit only',
-        '--checklist', '{"work_complete":true}', '--force-done', '--reason', 'audit only — read-only task',
+        '--checklist', '{"work_complete":true}', '--force-done', '--reason', 'audit only -- read-only task',
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -5699,15 +5699,15 @@ console.log('\n── Done Subcommand ──');
     } catch {
       forceWithReasonThrew = true;
     }
-    assert(!forceWithReasonThrew, 'runtime-guard: --force-done --reason "audit only" → accepted');
+    assert(!forceWithReasonThrew, 'runtime-guard: --force-done --reason "audit only" -> accepted');
     const forceWithReasonObj = JSON.parse(forceWithReasonOut.trim());
-    assert(forceWithReasonObj.ok === true, 'runtime-guard: --force-done --reason → ok=true');
-    assert(forceWithReasonObj.status === 'done', 'runtime-guard: --force-done --reason → status=done');
+    assert(forceWithReasonObj.ok === true, 'runtime-guard: --force-done --reason -> ok=true');
+    assert(forceWithReasonObj.status === 'done', 'runtime-guard: --force-done --reason -> status=done');
     const forceWithReasonLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(forceWithReasonLabels['force-with-reason-task'].status === 'done', 'runtime-guard: --force-done --reason → labels.json updated to done');
+    assert(forceWithReasonLabels['force-with-reason-task'].status === 'done', 'runtime-guard: --force-done --reason -> labels.json updated to done');
   }
 
-  // Test 4: done called after 90s → accepted normally (no --force-done needed)
+  // Test 4: done called after 90s -> accepted normally (no --force-done needed)
   {
     writeFileSync(doneLabels, JSON.stringify({
       'long-running-task': {
@@ -5735,17 +5735,17 @@ console.log('\n── Done Subcommand ──');
     } catch {
       longRunningThrew = true;
     }
-    assert(!longRunningThrew, 'runtime-guard: done after 90s → accepted');
+    assert(!longRunningThrew, 'runtime-guard: done after 90s -> accepted');
     const longRunningObj = JSON.parse(longRunningOut.trim());
-    assert(longRunningObj.ok === true, 'runtime-guard: done after 90s → ok=true');
-    assert(longRunningObj.status === 'done', 'runtime-guard: done after 90s → status=done');
+    assert(longRunningObj.ok === true, 'runtime-guard: done after 90s -> ok=true');
+    assert(longRunningObj.status === 'done', 'runtime-guard: done after 90s -> status=done');
   }
 
-  // ── Fix 2: SHA required when task involves git operations ────────────────
+  // -- Fix 2: SHA required when task involves git operations ----------------
 
-  console.log('\n  ── Git SHA Required Gate ──');
+  console.log('\n  -- Git SHA Required Gate --');
 
-  // Test 5: task prompt contains "git push", --sha omitted → rejected
+  // Test 5: task prompt contains "git push", --sha omitted -> rejected
   {
     writeFileSync(doneLabels, JSON.stringify({
       'git-task-no-sha': {
@@ -5777,15 +5777,15 @@ console.log('\n── Done Subcommand ──');
       gitNoShaExitCode = err.status;
       gitNoShaStderr = err.stderr || '';
     }
-    assert(threwGitNoSha, 'git-sha-gate: git task without --sha → rejected');
-    assert(gitNoShaExitCode === 1, 'git-sha-gate: git task without --sha → exit code 1');
-    assert(gitNoShaStderr.includes('REJECTED'), 'git-sha-gate: git task without --sha → stderr REJECTED');
-    assert(gitNoShaStderr.includes('--sha'), 'git-sha-gate: git task without --sha → stderr mentions --sha');
+    assert(threwGitNoSha, 'git-sha-gate: git task without --sha -> rejected');
+    assert(gitNoShaExitCode === 1, 'git-sha-gate: git task without --sha -> exit code 1');
+    assert(gitNoShaStderr.includes('REJECTED'), 'git-sha-gate: git task without --sha -> stderr REJECTED');
+    assert(gitNoShaStderr.includes('--sha'), 'git-sha-gate: git task without --sha -> stderr mentions --sha');
     const gitNoShaLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(gitNoShaLabels['git-task-no-sha'].status === 'running', 'git-sha-gate: git task without --sha → labels.json NOT updated');
+    assert(gitNoShaLabels['git-task-no-sha'].status === 'running', 'git-sha-gate: git task without --sha -> labels.json NOT updated');
   }
 
-  // Test 6: task prompt contains "git push", --sha provided and valid → accepted
+  // Test 6: task prompt contains "git push", --sha provided and valid -> accepted
   {
     const validShaForGitTest = execFileSync('git', ['rev-parse', 'HEAD'], {
       encoding: 'utf8',
@@ -5820,13 +5820,13 @@ console.log('\n── Done Subcommand ──');
     } catch {
       gitWithShaThrew = true;
     }
-    assert(!gitWithShaThrew, 'git-sha-gate: git task with valid --sha → accepted');
+    assert(!gitWithShaThrew, 'git-sha-gate: git task with valid --sha -> accepted');
     const gitWithShaObj = JSON.parse(gitWithShaOut.trim());
-    assert(gitWithShaObj.ok === true, 'git-sha-gate: git task with valid --sha → ok=true');
-    assert(gitWithShaObj.status === 'done', 'git-sha-gate: git task with valid --sha → status=done');
+    assert(gitWithShaObj.ok === true, 'git-sha-gate: git task with valid --sha -> ok=true');
+    assert(gitWithShaObj.status === 'done', 'git-sha-gate: git task with valid --sha -> status=done');
   }
 
-  // Test 7: task prompt has no git operations, --sha omitted → accepted
+  // Test 7: task prompt has no git operations, --sha omitted -> accepted
   {
     writeFileSync(doneLabels, JSON.stringify({
       'non-git-task-no-sha': {
@@ -5855,10 +5855,10 @@ console.log('\n── Done Subcommand ──');
     } catch {
       nonGitNoShaThrew = true;
     }
-    assert(!nonGitNoShaThrew, 'git-sha-gate: non-git task without --sha → accepted');
+    assert(!nonGitNoShaThrew, 'git-sha-gate: non-git task without --sha -> accepted');
     const nonGitNoShaObj = JSON.parse(nonGitNoShaOut.trim());
-    assert(nonGitNoShaObj.ok === true, 'git-sha-gate: non-git task without --sha → ok=true');
-    assert(nonGitNoShaObj.status === 'done', 'git-sha-gate: non-git task without --sha → status=done');
+    assert(nonGitNoShaObj.ok === true, 'git-sha-gate: non-git task without --sha -> ok=true');
+    assert(nonGitNoShaObj.status === 'done', 'git-sha-gate: non-git task without --sha -> status=done');
   }
 
   // Test 8: negated git prose should NOT trigger the SHA gate
@@ -5890,15 +5890,15 @@ console.log('\n── Done Subcommand ──');
     } catch {
       negatedGitThrew = true;
     }
-    assert(!negatedGitThrew, 'git-sha-gate: negated git prose without --sha → accepted');
+    assert(!negatedGitThrew, 'git-sha-gate: negated git prose without --sha -> accepted');
     const negatedGitObj = JSON.parse(negatedGitOut.trim());
-    assert(negatedGitObj.ok === true, 'git-sha-gate: negated git prose without --sha → ok=true');
-    assert(negatedGitObj.status === 'done', 'git-sha-gate: negated git prose without --sha → status=done');
+    assert(negatedGitObj.ok === true, 'git-sha-gate: negated git prose without --sha -> ok=true');
+    assert(negatedGitObj.status === 'done', 'git-sha-gate: negated git prose without --sha -> status=done');
   }
 
-  // ── Fix 3: taskPrompt stored by enqueue (validated via index.mjs source) ─
+  // -- Fix 3: taskPrompt stored by enqueue (validated via index.mjs source) -
 
-  console.log('\n  ── Fix 3: taskPrompt stored ──');
+  console.log('\n  -- Fix 3: taskPrompt stored --');
   {
     const indexSrc = readFileSync(indexPath, 'utf8');
     assert(indexSrc.includes('taskPrompt'), 'fix3: index.mjs stores taskPrompt in setLabel');
@@ -5906,9 +5906,9 @@ console.log('\n── Done Subcommand ──');
     assert(indexSrc.includes('existing.taskPrompt'), 'fix3: done checks existing.taskPrompt for git patterns');
   }
 
-  // ── Fix 1 (edge case): Old label with no taskPrompt + git args → warning, NOT rejected ──
+  // -- Fix 1 (edge case): Old label with no taskPrompt + git args -> warning, NOT rejected --
 
-  console.log('\n  ── Fix 1: Old label missing taskPrompt (false negative guard) ──');
+  console.log('\n  -- Fix 1: Old label missing taskPrompt (false negative guard) --');
   {
     // Label has NO taskPrompt (enqueued before 6dfa458)
     writeFileSync(doneLabels, JSON.stringify({
@@ -5919,7 +5919,7 @@ console.log('\n── Done Subcommand ──');
         mode: 'fresh',
         spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
-        // No taskPrompt field — simulates label created before guard was added
+        // No taskPrompt field -- simulates label created before guard was added
       },
     }) + '\n');
 
@@ -5940,10 +5940,10 @@ console.log('\n── Done Subcommand ──');
     } catch {
       oldLabelThrew = true;
     }
-    assert(!oldLabelThrew, 'fix1-old-label: old label (no taskPrompt) → NOT rejected');
+    assert(!oldLabelThrew, 'fix1-old-label: old label (no taskPrompt) -> NOT rejected');
     const oldLabelObj = JSON.parse(oldLabelOut.trim());
-    assert(oldLabelObj.ok === true, 'fix1-old-label: old label (no taskPrompt) → ok=true');
-    assert(oldLabelObj.status === 'done', 'fix1-old-label: old label (no taskPrompt) → status=done');
+    assert(oldLabelObj.ok === true, 'fix1-old-label: old label (no taskPrompt) -> ok=true');
+    assert(oldLabelObj.status === 'done', 'fix1-old-label: old label (no taskPrompt) -> status=done');
     // Warning should be logged to stderr
     // (We can't easily capture stderr from execFileSync without piping, but we verify behavior is correct)
     const oldLabelLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
@@ -5954,11 +5954,11 @@ console.log('\n── Done Subcommand ──');
     assert(indexSrcFix1.includes('enqueued before guard'), 'fix1-old-label: warning mentions enqueued before guard');
   }
 
-  // ── Fix 2 (edge case): Tightened regex prevents false positives; actual commands trigger gate ──
+  // -- Fix 2 (edge case): Tightened regex prevents false positives; actual commands trigger gate --
 
-  console.log('\n  ── Fix 2: Tightened git regex (prose vs command) ──');
+  console.log('\n  -- Fix 2: Tightened git regex (prose vs command) --');
   {
-    // Test A: standalone "rebase" (no git prefix) → should NOT trigger SHA gate (old regex matched this)
+    // Test A: standalone "rebase" (no git prefix) -> should NOT trigger SHA gate (old regex matched this)
     writeFileSync(doneLabels, JSON.stringify({
       'bare-rebase-mention': {
         sessionKey: 'agent:main:subagent:bare-rebase-uuid',
@@ -5968,7 +5968,7 @@ console.log('\n── Done Subcommand ──');
         spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
         // The old regex /rebase/i would match this (false positive)
-        // The new regex requires \bgit\s+rebase\b → should NOT match
+        // The new regex requires \bgit\s+rebase\b -> should NOT match
         taskPrompt: 'Squash and rebase the commits locally before review.',
       },
     }) + '\n');
@@ -5980,7 +5980,7 @@ console.log('\n── Done Subcommand ──');
         indexPath, 'done', '--label', 'bare-rebase-mention',
         '--summary', 'reviewed',
         '--checklist', '{"work_complete":true}',
-        // No --sha — should be accepted since bare "rebase" without "git " prefix is prose
+        // No --sha -- should be accepted since bare "rebase" without "git " prefix is prose
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
@@ -5990,11 +5990,11 @@ console.log('\n── Done Subcommand ──');
     } catch {
       bareRebaseThrew = true;
     }
-    assert(!bareRebaseThrew, 'fix2-bare-rebase: "rebase" without "git " prefix → NOT rejected (old regex false positive fixed)');
+    assert(!bareRebaseThrew, 'fix2-bare-rebase: "rebase" without "git " prefix -> NOT rejected (old regex false positive fixed)');
     const bareRebaseObj = JSON.parse(bareRebaseOut.trim());
-    assert(bareRebaseObj.ok === true, 'fix2-bare-rebase: bare rebase mention → ok=true');
+    assert(bareRebaseObj.ok === true, 'fix2-bare-rebase: bare rebase mention -> ok=true');
 
-    // Test B: "git push origin main" in taskPrompt → SHOULD trigger SHA gate
+    // Test B: "git push origin main" in taskPrompt -> SHOULD trigger SHA gate
     writeFileSync(doneLabels, JSON.stringify({
       'actual-git-cmd': {
         sessionKey: 'agent:main:subagent:actual-git-cmd-uuid',
@@ -6015,7 +6015,7 @@ console.log('\n── Done Subcommand ──');
         indexPath, 'done', '--label', 'actual-git-cmd',
         '--summary', 'pushed changes',
         '--checklist', '{"work_complete":true}',
-        // No --sha — should be REJECTED since taskPrompt has actual git command
+        // No --sha -- should be REJECTED since taskPrompt has actual git command
       ], {
         encoding: 'utf8',
         env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
@@ -6027,10 +6027,10 @@ console.log('\n── Done Subcommand ──');
       actualGitExitCode = err.status;
       actualGitStderr = err.stderr || '';
     }
-    assert(actualGitThrew, 'fix2-actual-cmd: "git push origin main" in taskPrompt → rejected without --sha');
-    assert(actualGitExitCode === 1, 'fix2-actual-cmd: git command → exit code 1');
-    assert(actualGitStderr.includes('REJECTED'), 'fix2-actual-cmd: git command → stderr REJECTED');
-    assert(actualGitStderr.includes('--sha'), 'fix2-actual-cmd: git command → stderr mentions --sha');
+    assert(actualGitThrew, 'fix2-actual-cmd: "git push origin main" in taskPrompt -> rejected without --sha');
+    assert(actualGitExitCode === 1, 'fix2-actual-cmd: git command -> exit code 1');
+    assert(actualGitStderr.includes('REJECTED'), 'fix2-actual-cmd: git command -> stderr REJECTED');
+    assert(actualGitStderr.includes('--sha'), 'fix2-actual-cmd: git command -> stderr mentions --sha');
 
     // Also verify the helper is present in source
     const indexSrcFix2 = readFileSync(indexPath, 'utf8');
@@ -6044,18 +6044,18 @@ console.log('\n── Done Subcommand ──');
     );
   }
 
-  // ── Fix 3 (edge case): Session activity check via gateway API ──
+  // -- Fix 3 (edge case): Session activity check via gateway API --
 
-  console.log('\n  ── Fix 3: Session activity check (idle session guard) ──');
+  console.log('\n  -- Fix 3: Session activity check (idle session guard) --');
   {
     // Verify the implementation is present in source
     const indexSrcFix3 = readFileSync(indexPath, 'utf8');
     assert(indexSrcFix3.includes('skip-activity-check'), 'fix3-activity: --skip-activity-check flag present in source');
     assert(indexSrcFix3.includes('messageCount'), 'fix3-activity: messageCount check present in source');
-    assert(indexSrcFix3.includes('msgCount <= 2'), 'fix3-activity: ≤2 message threshold present in source');
+    assert(indexSrcFix3.includes('msgCount <= 2'), 'fix3-activity: <=2 message threshold present in source');
     assert(indexSrcFix3.includes('session activity check unavailable'), 'fix3-activity: graceful degradation warning present in source');
 
-    // Test: Gateway API unavailable → done accepted with warning (graceful degradation)
+    // Test: Gateway API unavailable -> done accepted with warning (graceful degradation)
     // In the test environment, no gateway is running, so fetch() will throw ECONNREFUSED.
     // The done command should succeed (not rejected) and log a warning.
     writeFileSync(doneLabels, JSON.stringify({
@@ -6087,10 +6087,10 @@ console.log('\n── Done Subcommand ──');
     } catch {
       noGwThrew = true;
     }
-    assert(!noGwThrew, 'fix3-graceful-degradation: gateway API unavailable → done accepted (not rejected)');
+    assert(!noGwThrew, 'fix3-graceful-degradation: gateway API unavailable -> done accepted (not rejected)');
     const noGwObj = JSON.parse(noGwOut.trim());
-    assert(noGwObj.ok === true, 'fix3-graceful-degradation: gateway unavailable → ok=true');
-    assert(noGwObj.status === 'done', 'fix3-graceful-degradation: gateway unavailable → status=done');
+    assert(noGwObj.ok === true, 'fix3-graceful-degradation: gateway unavailable -> ok=true');
+    assert(noGwObj.status === 'done', 'fix3-graceful-degradation: gateway unavailable -> status=done');
 
     // Test: --skip-activity-check bypasses the activity guard entirely
     writeFileSync(doneLabels, JSON.stringify({
@@ -6122,14 +6122,14 @@ console.log('\n── Done Subcommand ──');
     } catch {
       skipThrew = true;
     }
-    assert(!skipThrew, 'fix3-skip-activity-check: --skip-activity-check → done accepted');
+    assert(!skipThrew, 'fix3-skip-activity-check: --skip-activity-check -> done accepted');
     const skipObj = JSON.parse(skipOut.trim());
     assert(skipObj.ok === true, 'fix3-skip-activity-check: ok=true');
   }
 
-  // ── Fix 4 (edge case): --timeout stored, threshold uses stored value ──
+  // -- Fix 4 (edge case): --timeout stored, threshold uses stored value --
 
-  console.log('\n  ── Fix 4: Stored timeout used for threshold ──');
+  console.log('\n  -- Fix 4: Stored timeout used for threshold --');
   {
     // Verify the source stores `timeout` in enqueue and reads `existing.timeout` in done
     const indexSrcFix4 = readFileSync(indexPath, 'utf8');
@@ -6137,7 +6137,7 @@ console.log('\n── Done Subcommand ──');
     assert(indexSrcFix4.includes('existing.timeout'), 'fix4: done reads existing.timeout for threshold');
     assert(indexSrcFix4.includes('existing.timeout ?? existing.timeoutSeconds'), 'fix4: done falls back to timeoutSeconds');
 
-    // Test 7: label with timeout=3600 → threshold=120s (60s elapsed → still rejected)
+    // Test 7: label with timeout=3600 -> threshold=120s (60s elapsed -> still rejected)
     writeFileSync(doneLabels, JSON.stringify({
       'long-timeout-task': {
         sessionKey: 'agent:main:subagent:long-timeout-uuid',
@@ -6145,7 +6145,7 @@ console.log('\n── Done Subcommand ──');
         agent: 'main',
         mode: 'fresh',
         spawnedAt: new Date(Date.now() - 61_000).toISOString(), // 61s ago
-        // timeout=3600 → threshold=120s, so 61s < 120s → should be REJECTED
+        // timeout=3600 -> threshold=120s, so 61s < 120s -> should be REJECTED
         timeout: 3600,
         timeoutSeconds: 3600,
       },
@@ -6168,10 +6168,10 @@ console.log('\n── Done Subcommand ──');
       longTimeoutThrew = true;
       longTimeoutExitCode = err.status;
     }
-    assert(longTimeoutThrew, 'fix4-timeout-3600: 61s elapsed with timeout=3600 → rejected (threshold=120s)');
+    assert(longTimeoutThrew, 'fix4-timeout-3600: 61s elapsed with timeout=3600 -> rejected (threshold=120s)');
     assert(longTimeoutExitCode === 1, 'fix4-timeout-3600: exit code 1');
 
-    // Test 8: label with timeout=60 → threshold=60s (61s elapsed → should be ACCEPTED)
+    // Test 8: label with timeout=60 -> threshold=60s (61s elapsed -> should be ACCEPTED)
     writeFileSync(doneLabels, JSON.stringify({
       'short-timeout-task': {
         sessionKey: 'agent:main:subagent:short-timeout-uuid',
@@ -6179,7 +6179,7 @@ console.log('\n── Done Subcommand ──');
         agent: 'main',
         mode: 'fresh',
         spawnedAt: new Date(Date.now() - 61_000).toISOString(), // 61s ago
-        // timeout=60 → threshold=60s, so 61s > 60s → should be ACCEPTED
+        // timeout=60 -> threshold=60s, so 61s > 60s -> should be ACCEPTED
         timeout: 60,
         timeoutSeconds: 60,
       },
@@ -6201,15 +6201,15 @@ console.log('\n── Done Subcommand ──');
     } catch {
       shortTimeoutThrew = true;
     }
-    assert(!shortTimeoutThrew, 'fix4-timeout-60: 61s elapsed with timeout=60 → accepted (threshold=60s)');
+    assert(!shortTimeoutThrew, 'fix4-timeout-60: 61s elapsed with timeout=60 -> accepted (threshold=60s)');
     const shortTimeoutObj = JSON.parse(shortTimeoutOut.trim());
     assert(shortTimeoutObj.ok === true, 'fix4-timeout-60: ok=true');
     assert(shortTimeoutObj.status === 'done', 'fix4-timeout-60: status=done');
   }
 
-  // ── Fix 5: Watcher auto-resolve uses 'interrupted' not 'done' (source check) ──
+  // -- Fix 5: Watcher auto-resolve uses 'interrupted' not 'done' (source check) --
 
-  console.log('\n  ── Fix 5: Watcher uses interrupted not done for auto-resolve ──');
+  console.log('\n  -- Fix 5: Watcher uses interrupted not done for auto-resolve --');
   {
     const dispatchDir2 = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
     const watcherSrc = readFileSync(join(dispatchDir2, 'watcher.mjs'), 'utf8');
@@ -6226,11 +6226,11 @@ console.log('\n── Done Subcommand ──');
 }
 
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: At-Jobs (one-shot scheduling, v18)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── At-Jobs (one-shot scheduling) ──');
+console.log('\n-- At-Jobs (one-shot scheduling) --');
 
 // Schema: new columns exist
 // Note: uses getDb() (not the cached 'db' from test startup) since migration guard
@@ -6500,19 +6500,19 @@ assert(AT_JOB_CRON_SENTINEL === '0 0 31 2 *', 'AT_JOB_CRON_SENTINEL is the expec
 }
 
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: Watchdog Heartbeat Guard
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Tests the lastPing-based liveness guard added to cmdStatus and cmdSync
 // in dispatch/index.mjs (Part 2 of fix/watchdog-premature-resolve).
 
-console.log('\n── Watchdog Heartbeat Guard ──');
+console.log('\n-- Watchdog Heartbeat Guard --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexPath   = join(dispatchDir, 'index.mjs');
   const watcherPath = join(dispatchDir, 'watcher.mjs');
 
-  // ── Source-level presence checks ─────────────────────────────────────
+  // -- Source-level presence checks -------------------------------------
   const indexSrc  = readFileSync(indexPath, 'utf8');
   const watcherSrc = readFileSync(watcherPath, 'utf8');
 
@@ -6529,8 +6529,8 @@ console.log('\n── Watchdog Heartbeat Guard ──');
   assert(indexSrc.includes('idleThresholdMs'),        'index.mjs uses idleThresholdMs instead of hardcoded 10 min');
   assert(indexSrc.includes('PING_STALE_MS_SYNC'),     'index.mjs applies same guard in cmdSync');
 
-  // ── Helper: create temp env with stale sessions.json ─────────────────
-  // Uses a session idle for 15 min — normally triggering auto-resolve.
+  // -- Helper: create temp env with stale sessions.json -----------------
+  // Uses a session idle for 15 min -- normally triggering auto-resolve.
   function makeWdgEnv(tmpDir) {
     const labelsPath  = join(tmpDir, 'labels.json');
     const sessionsDir = join(tmpDir, '.openclaw', 'agents', 'main', 'sessions');
@@ -6561,7 +6561,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
 
   const tmpBase = mkdtempSync(join(tmpdir(), 'wdg-hb-test-'));
 
-  // ── Test 1: fresh lastPing + within hardCeiling → stays running ───────
+  // -- Test 1: fresh lastPing + within hardCeiling -> stays running -------
   // Without the guard this session (idle 15 min, timeout 600s) would resolve.
   // With a fresh ping (30s old) and elapsed < hardCeiling (15 min < 15 min... use 6 min),
   // cmdStatus should defer auto-resolve.
@@ -6578,19 +6578,19 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         mode:           'fresh',
         spawnedAt:      new Date(Date.now() - 6 * 60 * 1000).toISOString(), // 6 min ago
         timeoutSeconds: 600,    // hardCeiling = 900s = 15 min; elapsed = 6 min < 15 min
-        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago — fresh
+        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago -- fresh
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t1');
-    assert(result.status === 'running',   'watchdog guard t1: fresh lastPing + within ceiling → stays running');
+    assert(result.status === 'running',   'watchdog guard t1: fresh lastPing + within ceiling -> stays running');
     assert(!result.syncAction,            'watchdog guard t1: no auto-resolve action taken');
   }
 
-  // ── Test 2: stale lastPing + within hardCeiling → falls through, auto-resolves ─
+  // -- Test 2: stale lastPing + within hardCeiling -> falls through, auto-resolves -
   // lastPing = 4 min ago (> PING_STALE_MS = 3 min), elapsed = 8 min < hardCeiling (15 min).
   // Should fall through to checkSessionDone with idleThresholdMs = 10 min.
-  // Session idle 15 min > 10 min → auto-resolves.
+  // Session idle 15 min > 10 min -> auto-resolves.
   {
     const tmpDir = join(tmpBase, 't2');
     mkdirSync(tmpDir);
@@ -6604,17 +6604,17 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         mode:           'fresh',
         spawnedAt:      new Date(Date.now() - 8 * 60 * 1000).toISOString(),  // 8 min ago
         timeoutSeconds: 600,    // hardCeiling = 15 min; elapsed = 8 min < 15 min
-        lastPing:       new Date(Date.now() - 4 * 60 * 1000).toISOString(),  // 4 min ago — stale
+        lastPing:       new Date(Date.now() - 4 * 60 * 1000).toISOString(),  // 4 min ago -- stale
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t2');
-    assert(result.status === 'interrupted', 'watchdog guard t2: stale lastPing → falls through → auto-resolves as interrupted');
+    assert(result.status === 'interrupted', 'watchdog guard t2: stale lastPing -> falls through -> auto-resolves as interrupted');
   }
 
-  // ── Test 3: elapsedMs >= hardCeilingMs → resolves regardless of fresh ping ─
-  // elapsed = 20 min ≥ hardCeiling (600 * 1.5s = 15 min).
-  // Uses 2-min threshold; session idle 15 min > 2 min → auto-resolves.
+  // -- Test 3: elapsedMs >= hardCeilingMs -> resolves regardless of fresh ping -
+  // elapsed = 20 min >= hardCeiling (600 * 1.5s = 15 min).
+  // Uses 2-min threshold; session idle 15 min > 2 min -> auto-resolves.
   // (Fresh ping cannot save a zombie session past the hard ceiling.)
   {
     const tmpDir = join(tmpBase, 't3');
@@ -6628,22 +6628,22 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         agent:          'main',
         mode:           'fresh',
         spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(), // 20 min ago
-        timeoutSeconds: 600,   // hardCeiling = 15 min; elapsed = 20 min ≥ 15 min
-        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago — fresh
+        timeoutSeconds: 600,   // hardCeiling = 15 min; elapsed = 20 min >= 15 min
+        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),      // 30s ago -- fresh
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t3');
-    assert(result.status === 'interrupted', 'watchdog guard t3: past hard ceiling → resolves as interrupted regardless of fresh ping');
+    assert(result.status === 'interrupted', 'watchdog guard t3: past hard ceiling -> resolves as interrupted regardless of fresh ping');
   }
 
-  // ── Test 4: no lastPing (backward compat) → uses idleThresholdMs ─────
+  // -- Test 4: no lastPing (backward compat) -> uses idleThresholdMs -----
   // Sessions dispatched before the heartbeat feature have no lastPing.
   // Behavior should use idleThresholdMs = max(timeoutSeconds*1000, 10 min).
 
-  // 4a: timeoutSeconds=600 → idleThreshold=10 min, hardCeiling=15 min.
-  //     spawnedAt 12 min ago → elapsed(12 min) < hardCeiling(15 min) → idleThresholdMs path.
-  //     Session idle 15 min (makeWdgEnv default) > idleThreshold 10 min → resolves.
+  // 4a: timeoutSeconds=600 -> idleThreshold=10 min, hardCeiling=15 min.
+  //     spawnedAt 12 min ago -> elapsed(12 min) < hardCeiling(15 min) -> idleThresholdMs path.
+  //     Session idle 15 min (makeWdgEnv default) > idleThreshold 10 min -> resolves.
   //     (Previously used timeoutSeconds=300 / spawnedAt=20 min which fell into the zombie-guard
   //     path instead of the intended idleThresholdMs path.)
   {
@@ -6659,15 +6659,15 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         mode:           'fresh',
         spawnedAt:      new Date(Date.now() - 12 * 60 * 1000).toISOString(), // 12 min ago < hardCeiling(15 min)
         timeoutSeconds: 600,   // idleThreshold = max(600000, 600000) = 10 min; hardCeiling = 15 min
-        // no lastPing — backward compat
+        // no lastPing -- backward compat
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t4a');
-    assert(result.status === 'interrupted', 'watchdog guard t4a: no lastPing + idle > idleThreshold → resolves as interrupted (idleThresholdMs path)');
+    assert(result.status === 'interrupted', 'watchdog guard t4a: no lastPing + idle > idleThreshold -> resolves as interrupted (idleThresholdMs path)');
   }
 
-  // 4b: timeoutSeconds=1800 → idleThreshold=30 min. Session idle 15 min < 30 min → stays running.
+  // 4b: timeoutSeconds=1800 -> idleThreshold=30 min. Session idle 15 min < 30 min -> stays running.
   {
     const tmpDir = join(tmpBase, 't4b');
     mkdirSync(tmpDir);
@@ -6675,7 +6675,7 @@ console.log('\n── Watchdog Heartbeat Guard ──');
 
     // Override sessions.json so session is 15 min stale (same as makeWdgEnv default)
     // but hardCeiling = 1800 * 1.5 = 2700s = 45 min, elapsed = 20 min < 45 min,
-    // idleThreshold = max(1800000, 600000) = 30 min > silence(15 min) → stays running.
+    // idleThreshold = max(1800000, 600000) = 30 min > silence(15 min) -> stays running.
     writeFileSync(labelsPath, JSON.stringify({
       'wdg-t4b': {
         sessionKey:     fakeSessionKey,
@@ -6684,22 +6684,22 @@ console.log('\n── Watchdog Heartbeat Guard ──');
         mode:           'fresh',
         spawnedAt:      new Date(Date.now() - 20 * 60 * 1000).toISOString(), // 20 min ago
         timeoutSeconds: 1800,  // idleThreshold = 30 min, hardCeiling = 45 min
-        // no lastPing — backward compat
+        // no lastPing -- backward compat
       },
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t4b');
-    assert(result.status === 'running', 'watchdog guard t4b: no lastPing + idle < idleThreshold → stays running');
+    assert(result.status === 'running', 'watchdog guard t4b: no lastPing + idle < idleThreshold -> stays running');
   }
 
   rmSync(tmpBase, { recursive: true, force: true });
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Post-Office Routing
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Post-Office Routing: gatewayNotify enqueues to messages table ──');
+console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table --');
 {
   // Import onFinished from hooks.mjs (which uses sendMessage internally)
   const { onFinished } = await import('./dispatch/hooks.mjs');
@@ -6710,7 +6710,7 @@ console.log('\n── Post-Office Routing: gatewayNotify enqueues to messages ta
   // Count messages before
   const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result'").get();
 
-  // Call onFinished with deliverTo set — triggers gatewayNotify → sendMessage
+  // Call onFinished with deliverTo set -- triggers gatewayNotify -> sendMessage
   await onFinished({
     label:          'test-label-post-office',
     job_id:         'jid-post-office',
@@ -6737,7 +6737,7 @@ console.log('\n── Post-Office Routing: gatewayNotify enqueues to messages ta
   assert(msg.status === 'pending',                       'gatewayNotify: message status=pending (not yet delivered)');
 }
 
-console.log('\n── Post-Office Routing: handleDelivery (announce) enqueues to messages table ──');
+console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to messages table --');
 {
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
 
@@ -6757,7 +6757,7 @@ console.log('\n── Post-Office Routing: handleDelivery (announce) enqueues to
     delivery_channel: 'telegram',
     delivery_to: '1234567890',
   };
-  await handleDelivery(announceJob, '✅ shell job done — all tests passed');
+  await handleDelivery(announceJob, 'shell job done -- all tests passed');
 
   const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
   assert(after.cnt === before.cnt + 1, 'handleDelivery(announce): enqueues one message');
@@ -6774,7 +6774,7 @@ console.log('\n── Post-Office Routing: handleDelivery (announce) enqueues to
   assert(logs.some(l => l.msg.includes('Enqueued')),   'handleDelivery(announce): logs Enqueued');
 }
 
-console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue ──');
+console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');
 {
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
 
@@ -6799,11 +6799,11 @@ console.log('\n── Post-Office Routing: handleDelivery (delivery_mode=none) d
   assert(after.cnt === before.cnt, 'handleDelivery(none): does not enqueue any message');
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // SECTION: inbox-consumer per-message delivery routing (v21)
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── inbox-consumer per-message delivery_to routing ──');
+console.log('\n-- inbox-consumer per-message delivery_to routing --');
 {
   const liveDb = getDb();
 
@@ -6828,7 +6828,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
   assert(m1.delivery_to === '-100000000', 'sendMessage stores delivery_to on message');
   assert(m1.channel === 'telegram', 'sendMessage stores channel on message');
 
-  // Test 2: sendMessage without delivery_to → null
+  // Test 2: sendMessage without delivery_to -> null
   const m2 = sendMessage({
     from_agent: 'scheduler',
     to_agent:   'main',
@@ -6837,7 +6837,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     body:       'Job completed for DM delivery',
     channel:    'telegram',
   });
-  assert(m2.delivery_to === null, 'sendMessage without delivery_to → null');
+  assert(m2.delivery_to === null, 'sendMessage without delivery_to -> null');
 
   // Test 3: getMessage returns delivery_to
   const fetched1 = getMessage(m1.id);
@@ -6864,7 +6864,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
   assert(withoutDeliveryTo[0].delivery_to === null, 'selectPendingMessages: delivery_to is null when not set');
 
   // Test 5: per-message routing logic (mirrors inbox-consumer drainOnce)
-  // Message WITH delivery_to → routes to delivery_to, not the default --to
+  // Message WITH delivery_to -> routes to delivery_to, not the default --to
   const defaultTo = '123456789';
   const defaultChannel = 'telegram';
 
@@ -6876,7 +6876,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     assert(msgChannel === 'telegram', 'routing: msg.channel used when present');
   }
 
-  // Test 6: Message WITHOUT delivery_to → falls back to default --to
+  // Test 6: Message WITHOUT delivery_to -> falls back to default --to
   {
     const msg = withoutDeliveryTo[0];
     const msgTarget = msg.delivery_to || defaultTo;
@@ -6885,7 +6885,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     assert(msgChannel === defaultChannel, 'routing: falls back to default channel when msg.channel is null');
   }
 
-  // Test 7: Message with channel set → uses that channel, not default
+  // Test 7: Message with channel set -> uses that channel, not default
   const m3 = sendMessage({
     from_agent:  'scheduler',
     to_agent:    'main',
@@ -6903,7 +6903,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
   }
 
   // Test 8: dispatcher-delivery.js sendMessage includes delivery_to (integration check)
-  // handleDelivery already calls sendMessage with delivery_to — verify it's stored
+  // handleDelivery already calls sendMessage with delivery_to -- verify it's stored
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
   const deliveryLogs = [];
   const { handleDelivery: handleDeliveryV21 } = createDeliveryHelpers({
@@ -6917,7 +6917,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
     delivery_channel: 'telegram',
     delivery_to: '-100000000',
   };
-  await handleDeliveryV21(jobV21, '🎉 group job done');
+  await handleDeliveryV21(jobV21, 'group job done');
 
   const groupMsg = liveDb.prepare(
     "SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND subject='GroupChatJob' ORDER BY created_at DESC LIMIT 1"
@@ -6930,7 +6930,7 @@ console.log('\n── inbox-consumer per-message delivery_to routing ──');
   markAllRead('main');
 }
 
-console.log('\n── dispatch/index.mjs --deliver-to error message ──');
+console.log('\n-- dispatch/index.mjs --deliver-to error message --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexSrc = readFileSync(join(dispatchDir, 'index.mjs'), 'utf8');
@@ -6950,7 +6950,7 @@ console.log('\n── dispatch/index.mjs --deliver-to error message ──');
 // SECTION: v0.2 Runtime Features
 // ============================================================
 
-console.log('\n── v0.2 Schema Column Verification ──');
+console.log('\n-- v0.2 Schema Column Verification --');
 {
   const liveDb = getDb();
   const jobCols = liveDb.prepare("PRAGMA table_info(jobs)").all().map(c => c.name);
@@ -6980,7 +6980,7 @@ console.log('\n── v0.2 Schema Column Verification ──');
   }
 }
 
-console.log('\n── v0.2 Validation: valid fields accepted ──');
+console.log('\n-- v0.2 Validation: valid fields accepted --');
 {
   const v02Job = createJob({
     name: 'v02-valid-fields',
@@ -7026,7 +7026,7 @@ console.log('\n── v0.2 Validation: valid fields accepted ──');
   assert(v02Job.contract_network === 'restricted', 'v0.2 contract_network stored');
 }
 
-console.log('\n── v0.2 Validation: invalid enum rejected ──');
+console.log('\n-- v0.2 Validation: invalid enum rejected --');
 {
   let threwInvalidTrustLevel = false;
   try {
@@ -7114,7 +7114,7 @@ console.log('\n── v0.2 Validation: invalid enum rejected ──');
   assert(threwInvalidEnforcement, 'createJob rejects invalid contract_trust_enforcement enum');
 }
 
-console.log('\n── v0.2 Validation: credential handoff target guard ──');
+console.log('\n-- v0.2 Validation: credential handoff target guard --');
 {
   let threwNonShellPresentation = false;
   try {
@@ -7155,7 +7155,7 @@ console.log('\n── v0.2 Validation: credential handoff target guard ──');
   deleteJob(shellHandoffJob.id);
 }
 
-console.log('\n── v0.2 Validation: invalid JSON blob rejected ──');
+console.log('\n-- v0.2 Validation: invalid JSON blob rejected --');
 {
   let threwBadIdentityJson = false;
   try {
@@ -7243,7 +7243,7 @@ console.log('\n── v0.2 Validation: invalid JSON blob rejected ──');
   assert(threwBadAllowedPaths, 'createJob rejects non-JSON contract_allowed_paths blob');
 }
 
-console.log('\n── v0.2 Validation: null values accepted (all optional) ──');
+console.log('\n-- v0.2 Validation: null values accepted (all optional) --');
 {
   const minimalJob = createJob({
     name: 'v02-no-v02-fields',
@@ -7264,7 +7264,7 @@ console.log('\n── v0.2 Validation: null values accepted (all optional) ─�
   assert(minimalJob.contract_max_cost_usd === null, 'contract_max_cost_usd defaults to null');
 }
 
-console.log('\n── v0.2 Validation: contract_max_cost_usd ──');
+console.log('\n-- v0.2 Validation: contract_max_cost_usd --');
 {
   let threwNegativeCost = false;
   try {
@@ -7342,7 +7342,7 @@ console.log('\n── v0.2 Validation: contract_max_cost_usd ──');
   assert(validCostJob.contract_max_cost_usd === 99.99, 'createJob stores valid contract_max_cost_usd');
 }
 
-console.log('\n── v0.2 Storage Round-Trip ──');
+console.log('\n-- v0.2 Storage Round-Trip --');
 {
   const identityBlob = JSON.stringify({
     subject_kind: 'service',
@@ -7432,7 +7432,7 @@ console.log('\n── v0.2 Storage Round-Trip ──');
   assert(updated2.identity_trust_level === 'restricted', 'roundtrip: updateJob changes identity_trust_level');
 }
 
-console.log('\n── v0.2 resolveIdentity ──');
+console.log('\n-- v0.2 resolveIdentity --');
 {
   // With identity JSON blob
   const blobResult = await resolveIdentity({
@@ -7481,7 +7481,7 @@ console.log('\n── v0.2 resolveIdentity ──');
   assert(malformedResult.raw && malformedResult.raw.error, 'resolveIdentity: malformed blob includes error in raw');
 }
 
-console.log('\n── v0.2 evaluateTrust ──');
+console.log('\n-- v0.2 evaluateTrust --');
 {
   // Sufficient trust + block enforcement -> permit
   const permitResult = evaluateTrust(
@@ -7557,7 +7557,7 @@ console.log('\n── v0.2 evaluateTrust ──');
   assert(TRUST_LEVELS.indexOf('supervised') < TRUST_LEVELS.indexOf('autonomous'), 'TRUST_LEVELS: supervised < autonomous');
 }
 
-console.log('\n── v0.2 evaluateTrust enforcement normalization ──');
+console.log('\n-- v0.2 evaluateTrust enforcement normalization --');
 {
   // advisory normalizes to warn
   const advisoryResult = evaluateTrust(
@@ -7588,7 +7588,7 @@ console.log('\n── v0.2 evaluateTrust enforcement normalization ──');
   assert(strictSufficient.decision === 'permit', 'evaluateTrust: strict + sufficient trust -> permit');
 }
 
-console.log('\n── v0.2 verifyAuthorizationProof ──');
+console.log('\n-- v0.2 verifyAuthorizationProof --');
 {
   // Valid proof structure -> verified:true
   const validProof = await verifyAuthorizationProof({
@@ -7651,7 +7651,7 @@ console.log('\n── v0.2 verifyAuthorizationProof ──');
   assert(missingVerifier.error.includes('not loaded'), 'verifyAuthorizationProof: missing explicit verifier error mentions not loaded');
 }
 
-console.log('\n── v0.2 evaluateAuthorization ──');
+console.log('\n-- v0.2 evaluateAuthorization --');
 {
   // No authorization -> null
   assert(await evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
@@ -7747,7 +7747,7 @@ console.log('\n── v0.2 evaluateAuthorization ──');
   assert(weirdAuthDecision.reason.includes('unsupported decision'), 'evaluateAuthorization: unsupported provider decision explains denial');
 }
 
-console.log('\n── v0.2 generateEvidence ──');
+console.log('\n-- v0.2 generateEvidence --');
 {
   // With evidence declaration
   const evidenceResult = generateEvidence(
@@ -7788,7 +7788,7 @@ console.log('\n── v0.2 generateEvidence ──');
   assert(badEvidence.payload_summary.error && badEvidence.payload_summary.error.includes('parse failed'), 'generateEvidence: bad JSON error in payload_summary');
 }
 
-console.log('\n── v0.2 summarizeCredentialHandoff ──');
+console.log('\n-- v0.2 summarizeCredentialHandoff --');
 {
   // With presentation bindings
   const handoffResult = summarizeCredentialHandoff({
@@ -7833,7 +7833,7 @@ console.log('\n── v0.2 summarizeCredentialHandoff ──');
   assert(malformedHandoff.bindings_count === 0, 'summarizeCredentialHandoff: malformed JSON bindings_count is 0');
 }
 
-console.log('\n── v0.2 persistV02Outcomes ──');
+console.log('\n-- v0.2 persistV02Outcomes --');
 {
   const outcomeJob = createJob({
     name: 'v02-persist-outcomes',
@@ -7915,7 +7915,7 @@ console.log('\n── v0.2 persistV02Outcomes ──');
   assert(stringStored.identity_resolved === '{"raw":"string"}', 'persistV02Outcomes: string values stored as-is');
 }
 
-console.log('\n── v0.2 Capabilities CLI ──');
+console.log('\n-- v0.2 Capabilities CLI --');
 {
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
   const capsOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'capabilities', '--json'], {
@@ -7939,11 +7939,11 @@ console.log('\n── v0.2 Capabilities CLI ──');
   assert(capsOut.features.runtime_execution === true, 'capabilities: runtime_execution enabled');
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // v0.2 resolveIdentity with mock provider
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── v0.2 resolveIdentity with provider ──');
+console.log('\n-- v0.2 resolveIdentity with provider --');
 {
   // resolveIdentity with provider in ctx resolves via provider
   const providerJob = {
@@ -8038,11 +8038,11 @@ console.log('\n── v0.2 resolveIdentity with provider ──');
   assert(missingProviderResult.error.includes('not loaded'), 'resolveIdentity with missing provider: error mentions not loaded');
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Provider Registry
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Provider Registry ──');
+console.log('\n-- Provider Registry --');
 {
   // loadProviders loads mock-stripe from test-providers directory
   resetProviderRegistry();
@@ -8061,11 +8061,11 @@ console.log('\n── Provider Registry ──');
   resetProviderRegistry();
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Shell env var injection
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Shell env var injection ──');
+console.log('\n-- Shell env var injection --');
 {
   const shellResult = await runShellCommand('echo $TEST_INJECT_VAR', 5000, { TEST_INJECT_VAR: 'hello_from_test' });
   assert(shellResult.stdout.includes('hello_from_test'), 'runShellCommand: env vars passed to subprocess');
@@ -8115,7 +8115,7 @@ function buildPrepareDispatchDeps(overrides = {}) {
     };
 }
 
-console.log('\n── prepareDispatch v0.2 gating ──');
+console.log('\n-- prepareDispatch v0.2 gating --');
 {
   const scalarIdentityJob = createJob({
     name: 'prepare-dispatch-scalar-identity',
@@ -8487,11 +8487,11 @@ console.log('\n── prepareDispatch v0.2 gating ──');
   deleteJob(legacyNonShellHandoffJob.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // child_credential_policy validation
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── child_credential_policy validation ──');
+console.log('\n-- child_credential_policy validation --');
 {
   // validateJobSpec accepts valid child_credential_policy values
   const validPolicies = ['downscope', 'inherit', 'none', 'independent'];
@@ -8539,11 +8539,11 @@ console.log('\n── child_credential_policy validation ──');
   assert(invalidThrew, 'validateJobSpec rejects invalid child_credential_policy');
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Regression: materialization failure aborts dispatch
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Materialization failure abort ──');
+console.log('\n-- Materialization failure abort --');
 {
   const matFailJob = createJob({
     name: 'prepare-dispatch-mat-fail',
@@ -8650,11 +8650,11 @@ console.log('\n── Materialization failure abort ──');
   deleteJob(matFalseJob.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Regression: downscope happy path with real parent run
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Downscope happy path ──');
+console.log('\n-- Downscope happy path --');
 {
   const dsHappyProvider = {
     name: 'ds-happy-provider',
@@ -8758,11 +8758,11 @@ console.log('\n── Downscope happy path ──');
   deleteJob(dsParent.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Regression: downscope fails closed when parent session unavailable
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Downscope fail-closed ──');
+console.log('\n-- Downscope fail-closed --');
 {
   const dsFailProvider = {
     name: 'ds-fail-provider',
@@ -8829,11 +8829,11 @@ console.log('\n── Downscope fail-closed ──');
   deleteJob(dsFailParent.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Regression: escalate decision aborts dispatch
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Authorization escalate abort ──');
+console.log('\n-- Authorization escalate abort --');
 {
   const escalateJob = createJob({
     name: 'prepare-dispatch-escalate',
@@ -8865,11 +8865,11 @@ console.log('\n── Authorization escalate abort ──');
   deleteJob(escalateJob.id);
 }
 
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 // Regression: credential redaction in persisted outcomes
-// ═══════════════════════════════════════════════════════════
+// ===========================================================
 
-console.log('\n── Credential redaction ──');
+console.log('\n-- Credential redaction --');
 {
   const redactJob = createJob({
     name: 'prepare-dispatch-redact',
@@ -8969,9 +8969,9 @@ console.log('\n── Credential redaction ──');
   deleteJob(redactJob.id);
 }
 
-// ── compareTrustLevels ──
+// -- compareTrustLevels --
 
-console.log('\n── compareTrustLevels ──');
+console.log('\n-- compareTrustLevels --');
 {
   assert(compareTrustLevels('untrusted', 'autonomous') === -1, 'compareTrustLevels: untrusted < autonomous');
   assert(compareTrustLevels('autonomous', 'untrusted') === 1, 'compareTrustLevels: autonomous > untrusted');
@@ -8981,9 +8981,9 @@ console.log('\n── compareTrustLevels ──');
   assert(compareTrustLevels('unknown', 'untrusted') === -1, 'compareTrustLevels: unrecognized < known');
 }
 
-// ── authorization_ref-only denial ──
+// -- authorization_ref-only denial --
 
-console.log('\n── authorization_ref-only denial ──');
+console.log('\n-- authorization_ref-only denial --');
 {
   const refOnlyResult = await evaluateAuthorization(
     { authorization: null, authorization_ref: 'arn:aws:iam::123456789012:policy/Deny' },
@@ -8995,9 +8995,9 @@ console.log('\n── authorization_ref-only denial ──');
   assert(refOnlyResult.reason.includes('not yet implemented'), 'authorization_ref-only: reason mentions not implemented');
 }
 
-// ── independent child trust cap ──
+// -- independent child trust cap --
 
-console.log('\n── independent child trust cap ──');
+console.log('\n-- independent child trust cap --');
 {
   const parentJob = createJob({
     name: 'trust-cap-parent',
@@ -9058,9 +9058,9 @@ console.log('\n── independent child trust cap ──');
   deleteJob(parentJob.id);
 }
 
-// ── independent child within trust cap passes ──
+// -- independent child within trust cap passes --
 
-console.log('\n── independent child within trust cap passes ──');
+console.log('\n-- independent child within trust cap passes --');
 {
   const parentJobOk = createJob({
     name: 'trust-cap-parent-ok',
@@ -9118,9 +9118,9 @@ console.log('\n── independent child within trust cap passes ──');
   deleteJob(parentJobOk.id);
 }
 
-// ── downscope trust elevation detection ──
+// -- downscope trust elevation detection --
 
-console.log('\n── downscope trust elevation detection ──');
+console.log('\n-- downscope trust elevation detection --');
 {
   // Create a provider that returns a session with HIGHER trust than parent
   const elevatingProvider = {
@@ -9200,9 +9200,9 @@ console.log('\n── downscope trust elevation detection ──');
   deleteJob(dsParent.id);
 }
 
-// ── malformed identity JSON on non-shell job does not masquerade as handoff ──
+// -- malformed identity JSON on non-shell job does not masquerade as handoff --
 
-console.log('\n── malformed identity JSON on non-shell job ──');
+console.log('\n-- malformed identity JSON on non-shell job --');
 {
   const malformedIdentityJob = createJob({
     name: 'malformed-identity-nonshell',
@@ -9232,9 +9232,9 @@ console.log('\n── malformed identity JSON on non-shell job ──');
   deleteJob(malformedIdentityJob.id);
 }
 
-// ── security abort skips triggered children ──
+// -- security abort skips triggered children --
 
-console.log('\n── security abort skips triggered children ──');
+console.log('\n-- security abort skips triggered children --');
 {
   let childrenFired = false;
   const secAbortJob = createJob({
@@ -9264,9 +9264,9 @@ console.log('\n── security abort skips triggered children ──');
   deleteJob(secAbortJob.id);
 }
 
-// ── evidence integrity field ──
+// -- evidence integrity field --
 
-console.log('\n── evidence integrity field ──');
+console.log('\n-- evidence integrity field --');
 {
   const evidence = generateEvidence(
     { evidence: JSON.stringify({ collect: 'all' }) },
@@ -9278,9 +9278,9 @@ console.log('\n── evidence integrity field ──');
   assert(evidence.hash === null, 'evidence: hash is null');
 }
 
-// ── persistV02Outcomes guards ──
+// -- persistV02Outcomes guards --
 
-console.log('\n── persistV02Outcomes guards ──');
+console.log('\n-- persistV02Outcomes guards --');
 {
   // Null runId should no-op
   persistV02Outcomes(null, { identity_resolved: 'test' });
@@ -9290,9 +9290,9 @@ console.log('\n── persistV02Outcomes guards ──');
   assert(true, 'persistV02Outcomes: null/empty/undefined runId no-ops safely');
 }
 
-// ── getStaleRuns type guard ──
+// -- getStaleRuns type guard --
 
-console.log('\n── getStaleRuns type guard ──');
+console.log('\n-- getStaleRuns type guard --');
 {
   let threwOnString = false;
   try {
@@ -9323,9 +9323,9 @@ console.log('\n── getStaleRuns type guard ──');
   assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
 }
 
-// ── Gateway scope header ──
+// -- Gateway scope header --
 
-console.log('\n── Gateway scope header ──');
+console.log('\n-- Gateway scope header --');
 {
   const originalFetch = globalThis.fetch;
   const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -9388,6 +9388,6 @@ console.log('\n── Gateway scope header ──');
 }
 
 closeDb();
-console.log(`\n${'═'.repeat(40)}`);
+console.log(`\n${'='.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
