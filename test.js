@@ -41,7 +41,6 @@ import { upsertAgent, getAgent, listAgents, setAgentStatus, touchAgent } from '.
 import {
   splitMessageForChannel,
   TELEGRAM_MAX_MESSAGE_LENGTH,
-  buildEnvInjectHeader,
   checkGatewayHealth,
   invokeGatewayTool,
   runAgentTurn,
@@ -9324,54 +9323,9 @@ console.log('\n── getStaleRuns type guard ──');
   assert(Array.isArray(staleRuns), 'getStaleRuns: returns array for valid input');
 }
 
-// ── buildEnvInjectHeader ──
+// ── Gateway scope header ──
 
-console.log('\n── buildEnvInjectHeader ──');
-{
-  // Valid plain object with string values -> header present
-  const valid = buildEnvInjectHeader({ STRIPE_KEY: 'sk_test_123', NODE_ENV: 'production' });
-  assert(valid['x-openclaw-env-inject'] !== undefined, 'buildEnvInjectHeader: returns header for valid env map');
-  const parsed = JSON.parse(valid['x-openclaw-env-inject']);
-  assert(parsed.STRIPE_KEY === 'sk_test_123', 'buildEnvInjectHeader: header value is correctly JSON-encoded');
-
-  // Empty object -> no header
-  const empty = buildEnvInjectHeader({});
-  assert(Object.keys(empty).length === 0, 'buildEnvInjectHeader: empty object returns no header');
-
-  // null -> no header
-  const nullInput = buildEnvInjectHeader(null);
-  assert(Object.keys(nullInput).length === 0, 'buildEnvInjectHeader: null returns no header');
-
-  // undefined -> no header
-  const undefinedInput = buildEnvInjectHeader(undefined);
-  assert(Object.keys(undefinedInput).length === 0, 'buildEnvInjectHeader: undefined returns no header');
-
-  // Array -> no header (not a plain object)
-  const arrayInput = buildEnvInjectHeader(['not', 'an', 'object']);
-  assert(Object.keys(arrayInput).length === 0, 'buildEnvInjectHeader: array returns no header');
-
-  // Non-string values -> no header
-  const nonStringVals = buildEnvInjectHeader({ key: 123 });
-  assert(Object.keys(nonStringVals).length === 0, 'buildEnvInjectHeader: non-string values returns no header');
-
-  // Non-plain object (prototype not Object.prototype) -> no header
-  const dateInput = buildEnvInjectHeader(new Date());
-  assert(Object.keys(dateInput).length === 0, 'buildEnvInjectHeader: Date instance returns no header');
-
-  // Hidden toJSON hooks should not alter the serialized payload
-  const hiddenToJson = { STRIPE_KEY: 'sk_clean' };
-  Object.defineProperty(hiddenToJson, 'toJSON', {
-    value: () => ({ STRIPE_KEY: 'sk_mutated', EXTRA: 'should-not-appear' }),
-  });
-  const hiddenSerialized = buildEnvInjectHeader(hiddenToJson);
-  const hiddenParsed = JSON.parse(hiddenSerialized['x-openclaw-env-inject']);
-  assert(hiddenParsed.STRIPE_KEY === 'sk_clean', 'buildEnvInjectHeader: ignores hidden toJSON overrides');
-  assert(hiddenParsed.EXTRA === undefined, 'buildEnvInjectHeader: serializes only validated env entries');
-}
-
-// ── Gateway env-inject request path ──
-
-console.log('\n── Gateway env-inject request path ──');
+console.log('\n── Gateway scope header ──');
 {
   const originalFetch = globalThis.fetch;
   const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -9394,62 +9348,36 @@ console.log('\n── Gateway env-inject request path ──');
       message: 'hello',
       agentId: 'main',
       sessionKey: 'session-1',
-      materializedEnv: { STRIPE_KEY: 'sk_test_123' },
       timeoutMs: 1000,
     });
-    assert(
-      captured[0]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ STRIPE_KEY: 'sk_test_123' }),
-      'runAgentTurn: forwards x-openclaw-env-inject for valid env maps',
-    );
     assert(
       captured[0]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
       'runAgentTurn: sends operator.write scope for chat completions',
     );
 
-    await runAgentTurn({
-      message: 'hello',
-      agentId: 'main',
-      sessionKey: 'session-2',
-      materializedEnv: {},
-      timeoutMs: 1000,
-    });
-    assert(
-      captured[1]?.opts?.headers?.['x-openclaw-env-inject'] === undefined,
-      'runAgentTurn: omits x-openclaw-env-inject for empty env maps',
-    );
-    assert(
-      captured[1]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
-      'runAgentTurn: keeps operator.write scope on chat completions without env inject',
-    );
-
     await runAgentTurnWithActivityTimeout({
       message: 'hello',
       agentId: 'main',
-      sessionKey: 'session-3',
-      materializedEnv: { NODE_ENV: 'production' },
+      sessionKey: 'session-2',
       pollIntervalMs: 60_000,
       idleTimeoutMs: 60_000,
       absoluteTimeoutMs: 1_000,
     });
     assert(
-      captured[2]?.opts?.headers?.['x-openclaw-env-inject'] === JSON.stringify({ NODE_ENV: 'production' }),
-      'runAgentTurnWithActivityTimeout: forwards x-openclaw-env-inject for valid env maps',
-    );
-    assert(
-      captured[2]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
+      captured[1]?.opts?.headers?.['x-openclaw-scopes'] === 'operator.write',
       'runAgentTurnWithActivityTimeout: sends operator.write scope for chat completions',
     );
 
     await invokeGatewayTool('sessions_list', { limit: 1 });
     assert(
-      captured[3]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      captured[2]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
       'invokeGatewayTool: does not send chat-completions scope header',
     );
 
     const healthOk = await checkGatewayHealth();
     assert(healthOk === true, 'checkGatewayHealth: returns true for ok responses');
     assert(
-      captured[4]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
+      captured[3]?.opts?.headers?.['x-openclaw-scopes'] === undefined,
       'checkGatewayHealth: does not send chat-completions scope header',
     );
   } finally {
