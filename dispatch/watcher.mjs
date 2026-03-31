@@ -1240,7 +1240,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
 // -- Pre-steer JSONL sanity check ------------------------------------------
 // Before triggering steer/markDoneSync, verify the session is not currently
 // mid-turn. A mid-turn session has an in-flight tool call (JSONL last entry
-// is tool_use or tool_result) -- steeling or declaring it done would interrupt
+// is tool_use or tool_result) -- steering or declaring it done would interrupt
 // active work and produce a partial/zombie result.
 //
 // If mid-turn is detected AND the JSONL was modified recently, extend the flat

@@ -71,7 +71,7 @@ let failed = 0;
 
 const verbose = process.argv.includes('-v') || process.argv.includes('--verbose');
 function assert(cond, msg) {
-  if (cond) { passed++; if (verbose) console.log(`  ✅ ${msg}`); }
+  if (cond) { passed++; if (verbose) console.log(`  PASS ${msg}`); }
   else { failed++; console.error(`  FAIL ${msg}`); }
 }
 
