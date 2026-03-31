@@ -18,7 +18,7 @@ export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
       if (resolved) {
         channel = resolved.channel;
         target = resolved.target;
-        log('info', `Resolved alias '${job.delivery_to}' → ${channel}/${target}`);
+        log('info', `Resolved alias '${job.delivery_to}' -> ${channel}/${target}`);
       }
     }
 

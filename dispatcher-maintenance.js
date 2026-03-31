@@ -234,7 +234,7 @@ export function ensureAgentInboxJobs({ log, getDb, createJob }) {
         origin:           'system',
       });
 
-      log('info', `Created inbox consumer job: ${jobName} → ${agent.delivery_channel}:${agent.delivery_to}`);
+      log('info', `Created inbox consumer job: ${jobName} -> ${agent.delivery_channel}:${agent.delivery_to}`);
     }
   } catch (err) {
     log('error', `ensureAgentInboxJobs error: ${err.message}`);

@@ -1,4 +1,4 @@
-// Message queue — inter-agent communication
+// Message queue -- inter-agent communication
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 
@@ -277,8 +277,8 @@ export function expireMessages() {
 /**
  * Prune old read/expired/delivered messages.
  * - read/expired/failed: after keepDays (default 30)
- * - delivered: after deliveredKeepDays (default 3) — delivered means consumed, no longer needed
- * - system kind pending/delivered: after systemKeepDays (default 3) — failure notifications, not actionable
+ * - delivered: after deliveredKeepDays (default 3) -- delivered means consumed, no longer needed
+ * - system kind pending/delivered: after systemKeepDays (default 3) -- failure notifications, not actionable
  */
 export function pruneMessages(keepDays = 30, deliveredKeepDays = 3, systemKeepDays = 3) {
   const db = getDb();

@@ -191,7 +191,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     } else if (result.idemAction === 'release') {
       releaseIdempotencyKey(ctx.idemKey);
     }
-    // 'noop' — leave key claimed without writing result hash
+    // 'noop' -- leave key claimed without writing result hash
   }
 
   // 3. Agent status cleanup (only for strategies that set busy)
@@ -262,7 +262,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 }
 
-// ── Phase 1: Guards + run creation ──────────────────────────
+// -- Phase 1: Guards + run creation --------------------------
 
 /**
  * DispatchContext shape (returned by prepareDispatch):
@@ -817,7 +817,7 @@ export async function prepareDispatch(job, opts, deps) {
   return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes, materializedEnv, materializationCleanup };
 }
 
-// ── Strategy: Watchdog ──────────────────────────────────────
+// -- Strategy: Watchdog --------------------------------------
 
 export async function executeWatchdog(job, ctx, deps) {
   const { runShellCommand, handleDelivery, updateJob, deleteJob, log } = deps;
@@ -921,7 +921,7 @@ export async function executeWatchdog(job, ctx, deps) {
   return result;
 }
 
-// ── Strategy: Main session ──────────────────────────────────
+// -- Strategy: Main session ----------------------------------
 
 export async function executeMain(job, ctx, deps) {
   const { sendSystemEvent, buildExecutionIntentNote } = deps;
@@ -945,7 +945,7 @@ export async function executeMain(job, ctx, deps) {
   return result;
 }
 
-// ── Strategy: Shell ─────────────────────────────────────────
+// -- Strategy: Shell -----------------------------------------
 
 export async function executeShell(job, ctx, deps) {
   const { runShellCommand, normalizeShellResult, log } = deps;
@@ -999,7 +999,7 @@ export async function executeShell(job, ctx, deps) {
   return result;
 }
 
-// ── Strategy: Agent (isolated session) ──────────────────────
+// -- Strategy: Agent (isolated session) ----------------------
 
 export async function executeAgent(job, ctx, deps) {
   const {
@@ -1125,7 +1125,7 @@ export async function executeAgent(job, ctx, deps) {
   return result;
 }
 
-// ── Strategy dispatcher with error-catch wrapper ────────────
+// -- Strategy dispatcher with error-catch wrapper ------------
 
 export async function executeStrategy(job, ctx, deps) {
   const { handleDelivery, log } = deps;
@@ -1145,7 +1145,7 @@ export async function executeStrategy(job, ctx, deps) {
 
     log('error', `Failed: ${job.name}: ${err.message}`, { jobId: job.id });
 
-    // ── Drain-error retry for isolated agentTurn jobs ──────────
+    // -- Drain-error retry for isolated agentTurn jobs ----------
     // Gateway drain errors are transient infra noise -- the job never ran.
     // Don't increment consecutive_errors, and schedule a single retry after 90s.
     const isIsolatedAgent = job.session_target !== 'main' && job.session_target !== 'shell' && job.job_type !== 'watchdog';

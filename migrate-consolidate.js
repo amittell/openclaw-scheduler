@@ -1,14 +1,14 @@
 /**
- * migrate-consolidate.js — Single idempotent migration for existing databases
+ * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
  * Brings any DB from any prior version up to the current schema (v23).
- * Fresh installs get everything from schema.sql directly — this only
+ * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
  * Replaces: migrate-v3.js, migrate-v3b.js, migrate-v5.js, migrate-v6.js,
  *           migrate-v7.js, migrate-v8.js, migrate-v9.js, migrate-v10.js, migrate-v11.js, migrate-v12.js, migrate-v13.js, migrate-v14.js, migrate-v15.js, migrate-v16.js, migrate-v17.js, migrate-v18.js, migrate-v19.js, migrate-v20.js
  *
- * Safe to run multiple times — all operations are idempotent.
+ * Safe to run multiple times -- all operations are idempotent.
  * Note: schedule_cron NOT NULL constraint cannot be dropped via ALTER TABLE in SQLite.
  * At-jobs on existing DBs use sentinel '0 0 31 2 *' to satisfy the constraint.
  */
@@ -33,7 +33,7 @@ export default function migrateConsolidate() {
   `).get(name);
 
   // Already fully up to date?
-  // Note: we can't just check schema_migrations version — schema.sql inserts
+  // Note: we can't just check schema_migrations version -- schema.sql inserts
   // version markers via INSERT OR IGNORE, but CREATE TABLE IF NOT EXISTS
   // doesn't add new columns to existing tables. So we also check if the
   // latest column actually exists before skipping.
@@ -146,7 +146,7 @@ export default function migrateConsolidate() {
     return false;
   }
 
-  // ── Column additions (all idempotent — column already exists = silent ignore) ─
+  // -- Column additions (all idempotent -- column already exists = silent ignore) -
 
   const alters = [
     // Legacy partial-table backfills for jobs
@@ -451,7 +451,7 @@ export default function migrateConsolidate() {
     /* best-effort normalization for legacy rows */
   }
 
-  // ── Tables that may be absent on very old installs ────────────────────
+  // -- Tables that may be absent on very old installs ---------------------
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS approvals (
@@ -562,7 +562,7 @@ export default function migrateConsolidate() {
     );
   `);
 
-  // ── Indexes that may be absent ────────────────────────────────────────
+  // -- Indexes that may be absent ----------------------------------------
 
   try {
     db.exec(`
@@ -672,7 +672,7 @@ export default function migrateConsolidate() {
     `);
   } catch { /* index may already exist */ }
 
-  // ── Record all versions ───────────────────────────────────────────────
+  // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
   for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]) {

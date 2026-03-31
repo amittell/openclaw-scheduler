@@ -1,26 +1,26 @@
 #!/usr/bin/env node
 /**
- * dispatch — Sub-agent dispatch CLI for OpenClaw
+ * dispatch -- Sub-agent dispatch CLI for OpenClaw
  *
  * Spawns and steers isolated agent sessions via the OpenClaw Gateway API.
- * Tracks label→session mappings in a local JSON ledger.
+ * Tracks label->session mappings in a local JSON ledger.
  *
  * Subcommands:
- *   enqueue    Spawn a session via gateway, store label→sessionKey, return immediately
+ *   enqueue    Spawn a session via gateway, store label->sessionKey, return immediately
  *   status     Query session status by label
  *   stuck      Find sessions running past threshold with no activity
  *   result     Get last assistant message from a session
  *   send       Send a message INTO a running session (mid-session steering)
- *   steer      Alias for send — explicitly for mid-session course correction
+ *   steer      Alias for send -- explicitly for mid-session course correction
  *   heartbeat  Check session liveness
  *   list       List all tracked labels
  *   sync       Reconcile labels.json with sessions store state
- *   done       Agent-side completion signal — set label status=done immediately
+ *   done       Agent-side completion signal -- set label status=done immediately
  *
  * Exit codes:
- *   0  — success / nothing stuck
- *   1  — stuck runs found, or hard error
- *   2  — argument error
+ *   0  -- success / nothing stuck
+ *   1  -- stuck runs found, or hard error
+ *   2  -- argument error
  *
  * Usage: openclaw-scheduler <subcommand> [options]
  */
@@ -40,7 +40,7 @@ const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789'
 let labelsCache = null;
 let labelsCacheSignature = null;
 
-// ── Invocation Directory ─────────────────────────────────────
+// -- Invocation Directory -------------------------------------
 // When invoked via symlink (e.g. my-brand/index.mjs -> dispatch/index.mjs),
 // __dirname resolves to the real path (dispatch/). INVOKE_DIR resolves to the
 // symlink's directory so config.json, labels.json, and self-references use the
@@ -54,15 +54,15 @@ const INVOKE_DIR = (() => {
   return __dirname;
 })();
 
-// ── Config ───────────────────────────────────────────────────
+// -- Config ---------------------------------------------------
 
 const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(INVOKE_DIR, 'labels.json');
 
 /** Load dispatch config from config.json.
  *  Resolution order:
  *    1. DISPATCH_CONFIG_DIR env var (branded wrapper deployments)
- *    2. INVOKE_DIR (argv[1] dirname — supports symlink-based branding)
- *    3. __dirname (dispatch module directory — fallback)
+ *    2. INVOKE_DIR (argv[1] dirname -- supports symlink-based branding)
+ *    3. __dirname (dispatch module directory -- fallback)
  */
 function loadConfig() {
   const searchDirs = [];
@@ -94,7 +94,7 @@ function getGatewayToken() {
 
 const GATEWAY_TOKEN = getGatewayToken();
 
-// ── Helpers ──────────────────────────────────────────────────
+// -- Helpers --------------------------------------------------
 
 function die(msg, code = 1) {
   process.stderr.write(`[${BRAND}] ${msg}\n`);
@@ -145,7 +145,7 @@ function taskRequiresGitSha(taskPrompt) {
   return false;
 }
 
-// ── Labels Ledger ────────────────────────────────────────────
+// -- Labels Ledger --------------------------------------------
 
 function getLabelsSignature() {
   try {
@@ -201,7 +201,7 @@ function setLabel(name, data) {
   return labels[name];
 }
 
-// ── Gateway Calls ────────────────────────────────────────────
+// -- Gateway Calls --------------------------------------------
 
 /**
  * Call a gateway RPC method via `openclaw gateway call`.
@@ -243,7 +243,7 @@ function gatewayCall(method, params = {}, opts = {}) {
   }
 }
 
-// ── Gateway Error Log Check ──────────────────────────────────
+// -- Gateway Error Log Check ----------------------------------
 
 /**
  * Check the gateway error log for 529/FailoverError/overload errors
@@ -306,14 +306,14 @@ function check529InGatewayLog(sessionKey) {
   }
 }
 
-// ── Sessions Store (Direct Read) ─────────────────────────────
+// -- Sessions Store (Direct Read) -----------------------------
 
 /**
  * Read the sessions.json store for an agent directly from disk.
- * This is the ground truth for session state — sessions spawned via the
+ * This is the ground truth for session state -- sessions spawned via the
  * dispatcher HTTP agent endpoint appear here but NOT in sessions_list API.
  *
- * Sessions are NOT pruned on completion — completed sessions stay in the file.
+ * Sessions are NOT pruned on completion -- completed sessions stay in the file.
  *
  * @param {string} agent - Agent ID (default: 'main')
  * @returns {Object|null} - The sessions store object, or null on error
@@ -384,16 +384,16 @@ function agentFromSessionKey(sessionKey) {
   return 'main';
 }
 
-// ── Gateway Session State Check ──────────────────────────────
+// -- Gateway Session State Check ------------------------------
 
 /**
  * Determine if a session should be auto-resolved as "done" based on sessions.json state.
  *
  * Decision logic (in priority order):
- *   1. Store unavailable (null)                    → do NOT resolve (safe default)
- *   2. Session key NOT in store                    → resolve (never spawned or spawn failure)
- *   3. Session found but idle past threshold       → resolve (completed)
- *   4. Session has recent activity                 → do NOT resolve
+ *   1. Store unavailable (null)                    -> do NOT resolve (safe default)
+ *   2. Session key NOT in store                    -> resolve (never spawned or spawn failure)
+ *   3. Session found but idle past threshold       -> resolve (completed)
+ *   4. Session has recent activity                 -> do NOT resolve
  *
  * @param {string}      sessionKey       - The session key to check
  * @param {Object|null} sessionsStore    - Sessions.json object (null = unavailable)
@@ -410,7 +410,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   const logCheck = check529InGatewayLog(sessionKey);
 
   if (sessionsStore === null) {
-    // Store unavailable — safe default is to NOT auto-resolve
+    // Store unavailable -- safe default is to NOT auto-resolve
     return {
       shouldResolve: false,
       reason:       'sessions store unavailable for state check',
@@ -418,7 +418,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     };
   }
 
-  // 1. Not in sessions store → session never appeared or already cleaned up
+  // 1. Not in sessions store -> session never appeared or already cleaned up
   //    BUT: young sessions (<5 min old) may simply not have propagated yet,
   //    especially right after a gateway restart. Don't auto-resolve those.
   //    Also: in openclaw 2026.3.13+, subagent sessions are tracked via
@@ -430,7 +430,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     if (ageMs < YOUNG_SESSION_MS) {
       return {
         shouldResolve: false,
-        reason:       'session young, not yet in sessions store — deferring',
+        reason:       'session young, not yet in sessions store -- deferring',
         lastActivity:  null,
       };
     }
@@ -442,7 +442,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
       const listResult = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
       const liveSession = listResult?.sessions?.find(s => s.key === sessionKey);
       if (liveSession) {
-        // Session is alive in gateway — do NOT auto-resolve
+        // Session is alive in gateway -- do NOT auto-resolve
         return {
           shouldResolve: false,
           reason:       'session not in sessions.json but confirmed active via gateway API',
@@ -450,10 +450,10 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
         };
       }
     } catch {
-      // Gateway unreachable — safe default: do NOT auto-resolve
+      // Gateway unreachable -- safe default: do NOT auto-resolve
       return {
         shouldResolve: false,
-        reason:       'sessions store miss + gateway API unreachable — deferring',
+        reason:       'sessions store miss + gateway API unreachable -- deferring',
         lastActivity:  null,
       };
     }
@@ -464,7 +464,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
         ? `529/overload error detected: ${logCheck.error}`
         : sessionEverFound
           ? 'session not found in sessions store or gateway API'
-          : 'session never found — spawn likely failed',
+          : 'session never found -- spawn likely failed',
       lastActivity:  null,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
@@ -488,7 +488,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     };
   }
 
-  // Session has recent activity — might still be working
+  // Session has recent activity -- might still be working
   return {
     shouldResolve: false,
     reason:       'session has recent activity in sessions store',
@@ -496,11 +496,11 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   };
 }
 
-// ── Watchdog Helpers ─────────────────────────────────────────
+// -- Watchdog Helpers -----------------------------------------
 
 /**
  * Disarm (disable) a watchdog job for a label if one is registered.
- * Best-effort — failures are logged but don't throw.
+ * Best-effort -- failures are logged but don't throw.
  */
 function disarmWatchdog(label) {
   const entry = getLabel(label);
@@ -518,17 +518,17 @@ function disarmWatchdog(label) {
   }
 }
 
-// ── Session Helpers ──────────────────────────────────────────
+// -- Session Helpers ------------------------------------------
 
 /** Build a unique session key for a new subagent session. */
 function makeSessionKey(agentId) {
   return `agent:${agentId}:subagent:${randomUUID()}`;
 }
 
-// ── Subcommands ──────────────────────────────────────────────
+// -- Subcommands ----------------------------------------------
 
 /**
- * enqueue — spawn a session via gateway API.
+ * enqueue -- spawn a session via gateway API.
  *
  * Flags:
  *   --label <string>         Required. Human-readable name
@@ -542,8 +542,8 @@ function makeSessionKey(agentId) {
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
  *   --mode <fresh|reuse>
- *       fresh  — always spawn new session (default)
- *       reuse  — look up prior session_key for this label, send into it
+ *       fresh  -- always spawn new session (default)
+ *       reuse  -- look up prior session_key for this label, send into it
  *   --session-key <key>      Explicit session key override
  *   --model <string>         Model override (e.g. anthropic/claude-sonnet-4-6)
  */
@@ -575,7 +575,7 @@ async function cmdEnqueue(flags) {
     }
   }
 
-  // ── Auto-derive deliver-to from origin ─────────────────────────────────
+  // -- Auto-derive deliver-to from origin ---------------------------------
   // If origin is "telegram:<id>", use <id> as the default deliver-to target.
   let defaultDeliverTo   = null;
   let defaultDeliverCh   = 'telegram';
@@ -592,10 +592,10 @@ async function cmdEnqueue(flags) {
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
 
-  // ── Verify command flag ───────────────────────────────────
+  // -- Verify command flag -----------------------------------
   const verifyCmd       = flags['verify-cmd'] || null;
 
-  // ── Watchdog monitoring flags ─────────────────────────────
+  // -- Watchdog monitoring flags -----------------------------
   const noMonitorRaw    = flags['no-monitor'];
   const noMonitor       = !!noMonitorRaw;
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
@@ -603,7 +603,7 @@ async function cmdEnqueue(flags) {
   const monitorTimeout  = parseInt(flags['monitor-timeout'] || String(config.watchdogTimeoutMin ?? 60), 10);
   if (!Number.isFinite(monitorTimeout) || monitorTimeout <= 0) die('--monitor-timeout must be a positive integer', 2);
 
-  // ── Delivery enforcement for agentTurn jobs ─────────────────
+  // -- Delivery enforcement for agentTurn jobs -----------------
   // agentTurn jobs must have a delivery target OR explicitly opt out via --no-monitor "<reason>"
   const isAgentTurn = !flags['payload-kind'] || flags['payload-kind'] === 'agentTurn';
   if (isAgentTurn && !deliverTo && !noMonitor) {
@@ -621,14 +621,14 @@ async function cmdEnqueue(flags) {
   const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
   const model       = flags.model            || null;
 
-  // ── Session key resolution ──────────────────────────────────
+  // -- Session key resolution ----------------------------------
   let sessionKey = flags['session-key'] || null;
 
   if (!sessionKey && mode === 'reuse') {
     const existing = getLabel(label);
     if (existing?.sessionKey) {
       sessionKey = existing.sessionKey;
-      process.stderr.write(`[${agentBrand}] mode=reuse → continuing session ${sessionKey}\n`);
+      process.stderr.write(`[${agentBrand}] mode=reuse -> continuing session ${sessionKey}\n`);
     } else {
       die(`mode=reuse: no prior session found for label "${label}". Use --mode fresh.`);
     }
@@ -641,7 +641,7 @@ async function cmdEnqueue(flags) {
 
   const idem = randomUUID();
 
-  // ── Patch session (model, thinking, spawnDepth) if fresh ────
+  // -- Patch session (model, thinking, spawnDepth) if fresh ----
   if (isFresh) {
     try {
       gatewayCall('sessions.patch', { key: sessionKey, spawnDepth: 1 }, { timeout: 10000 });
@@ -669,7 +669,7 @@ async function cmdEnqueue(flags) {
     }
   }
 
-  // ── Build the task message ──────────────────────────────────
+  // -- Build the task message ----------------------------------
   const parts = [
     `[Subagent Context] You are running as a subagent (depth 1/3). Results auto-announce to your requester; do not busy-poll for status.`,
     ``,
@@ -693,12 +693,12 @@ async function cmdEnqueue(flags) {
 
   parts.push(`[Subagent Task]: ${message}`);
 
-  // Append agent-side done signal instructions (Fix 2 — push-based completion)
-  // Always point to dispatch/index.mjs (__dirname) — the canonical done handler.
+  // Append agent-side done signal instructions (Fix 2 -- push-based completion)
+  // Always point to dispatch/index.mjs (__dirname) -- the canonical done handler.
   const doneScriptPath = join(__dirname, 'index.mjs');
   parts.push(``);
   parts.push(`---`);
-  parts.push(`COMPLETION SIGNAL — READ CAREFULLY:`);
+  parts.push(`COMPLETION SIGNAL -- READ CAREFULLY:`);
   parts.push(``);
   parts.push(`Only call this command after ALL of the following are true:`);
   parts.push(`  1. All file edits are saved`);
@@ -706,15 +706,15 @@ async function cmdEnqueue(flags) {
   parts.push(`  3. All API calls (e.g. GitHub comment replies) are done`);
   parts.push(`  4. You have verified the work is complete`);
   parts.push(``);
-  parts.push(`Call this as your ABSOLUTE FINAL action — nothing else runs after this:`);
+  parts.push(`Call this as your ABSOLUTE FINAL action -- nothing else runs after this:`);
   parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' \\`);
   parts.push(`    --summary "<what you actually did>" \\`);
   parts.push(`    --checklist '{"work_complete":true,"tests_passed":true,"pushed":true}' \\`);
   parts.push(`    [--sha "<git commit SHA if applicable>"]`);
   parts.push(``);
   parts.push(`Checklist rules:`);
-  parts.push(`  - work_complete MUST be true — you are asserting you have finished ALL assigned work`);
-  parts.push(`  - If tests failed or push failed, do NOT set tests_passed:true or pushed:true — instead continue working`);
+  parts.push(`  - work_complete MUST be true -- you are asserting you have finished ALL assigned work`);
+  parts.push(`  - If tests failed or push failed, do NOT set tests_passed:true or pushed:true -- instead continue working`);
   parts.push(`  - Only include tests_passed/pushed if they apply to your task`);
   parts.push(`If your task involved git commits, --sha is required and must be the actual SHA of your pushed commit. The done script will reject invented or placeholder SHAs.`);
   parts.push(`Do NOT call done while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
@@ -730,10 +730,10 @@ async function cmdEnqueue(flags) {
 
   const taskMessage = parts.join('\n');
 
-  // ── Call gateway agent method ───────────────────────────────
+  // -- Call gateway agent method -------------------------------
   // Gateway deliver is used as a fast-path secondary. The scheduler watcher
   // (created below) is the primary delivery path with retry + audit trail.
-  // Both may fire — at-least-once semantics, duplicates acceptable.
+  // Both may fire -- at-least-once semantics, duplicates acceptable.
   try {
     const response = gatewayCall('agent', {
       message:        taskMessage,
@@ -781,7 +781,7 @@ async function cmdEnqueue(flags) {
       agent, mode, session_key: sessionKey,
     }).catch(() => {});
 
-    // ── Send "Starting" notification via gateway HTTP API ─────
+    // -- Send "Starting" notification via gateway HTTP API -----
     if (deliverTo && GATEWAY_TOKEN) {
       try {
         await fetch(`${GATEWAY_URL}/tools/invoke`, {
@@ -807,7 +807,7 @@ async function cmdEnqueue(flags) {
       }
     }
 
-    // ── Register scheduler watcher for delivery ───────────────
+    // -- Register scheduler watcher for delivery ---------------
     // Creates a one-shot shell job that runs watcher.mjs (blocks until session
     // completes, outputs result). The scheduler's handleDelivery delivers with
     // retry, alias resolution, and audit trail in scheduler.db.
@@ -851,7 +851,7 @@ async function cmdEnqueue(flags) {
       }
     }
 
-    // ── Register watchdog monitoring job ─────────────────────
+    // -- Register watchdog monitoring job ---------------------
     let watchdogJobOk = false;
     let watchdogJobId = null;
     if (monitorEnabled && deliverTo) {
@@ -928,9 +928,9 @@ async function cmdEnqueue(flags) {
           : 'Session spawned via gateway. Agent is running.',
     });
 
-    // ── Post-spawn verification (Fix 3) ────────────────────────────────
+    // -- Post-spawn verification (Fix 3) --------------------------------
     // Canary: poll sessions.json up to 3 times at 10s intervals to confirm the
-    // session appeared in the store. Non-fatal — output is already written above.
+    // session appeared in the store. Non-fatal -- output is already written above.
     // If the session never shows up, stderr gets a loud warning and ledger status
     // is set to 'spawn-warning'. The watcher provides the definitive error path.
     const SPAWN_POLL_MAX = 3;
@@ -947,7 +947,7 @@ async function cmdEnqueue(flags) {
     if (!spawnConfirmed) {
       process.stderr.write(
         `[${agentBrand}] WARNING: session ${sessionKey} did not appear in gateway after ` +
-        `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s — spawn may have failed\n`
+        `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s -- spawn may have failed\n`
       );
       setLabel(label, { status: 'spawn-warning' });
     }
@@ -957,7 +957,7 @@ async function cmdEnqueue(flags) {
 }
 
 /**
- * status — show session status for a label.
+ * status -- show session status for a label.
  * Syncs from gateway state for "running" sessions before returning.
  *
  * Flags:
@@ -986,32 +986,32 @@ function cmdStatus(flags) {
     const ageMs = Date.now() - spawnedAtMs;
     const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
 
-    // ── Heartbeat-based liveness guard ──────────────────────────────────
+    // -- Heartbeat-based liveness guard ----------------------------------
     // The watcher process writes lastPing every 60s while the session is live.
-    // If the ping is fresh, the watcher is alive and working — defer auto-resolve
+    // If the ping is fresh, the watcher is alive and working -- defer auto-resolve
     // to avoid killing sessions during slow tool calls, docker builds, etc.
     //
-    // PING_STALE_MS:   3× the 60s ping interval — if we haven't heard from the
+    // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard from the
     //                  watcher in 3 min, it's probably dead; fall through to check.
-    // hardCeilingMs:   job timeout * 1.5 — absolute max regardless of ping age.
+    // hardCeilingMs:   job timeout * 1.5 -- absolute max regardless of ping age.
     //                  Catches zombie watchers (watcher alive but session is stuck).
-    // idleThresholdMs: max(job timeout, 10 min) — replaces the old hardcoded 10-min
+    // idleThresholdMs: max(job timeout, 10 min) -- replaces the old hardcoded 10-min
     //                  threshold so longer jobs aren't killed at exactly 10 min.
     const PING_STALE_MS  = 3 * 60 * 1000;
     const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
     // hardCeilingMs must be >= idleThresholdMs to avoid the ceiling undercutting the
-    // idle floor (e.g. timeoutSeconds=300 → ceiling=7.5 min < idle=10 min would force
+    // idle floor (e.g. timeoutSeconds=300 -> ceiling=7.5 min < idle=10 min would force
     // zombie-guard threshold for sessions that should still use idleThresholdMs).
     const hardCeilingMs  = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMs * 1.5);
 
     let check;
     if (ageMs < STARTUP_GRACE_MS) {
-      // Within startup grace — never auto-resolve
+      // Within startup grace -- never auto-resolve
       check = { shouldResolve: false };
     } else if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
       if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
-        // Watcher alive and within job ceiling — defer auto-resolve
+        // Watcher alive and within job ceiling -- defer auto-resolve
         check = { shouldResolve: false };
       } else {
         // Ping stale OR past hard ceiling: fall through to session store check
@@ -1019,7 +1019,7 @@ function cmdStatus(flags) {
         check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
       }
     } else {
-      // No lastPing — backward compat (sessions dispatched before heartbeat feature).
+      // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
       // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
       const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
       check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
@@ -1086,7 +1086,7 @@ function cmdStatus(flags) {
 }
 
 /**
- * stuck — find sessions running past threshold.
+ * stuck -- find sessions running past threshold.
  * Auto-resolves sessions the gateway considers done before alerting.
  * Exits 1 only if genuinely stuck sessions remain after sync.
  *
@@ -1141,7 +1141,7 @@ async function cmdStuck(flags) {
   for (const [name, entry] of Object.entries(labels)) {
     if (entry.status !== 'running') continue;
 
-    // ── Per-job timeout: don't flag until the job's own timeout has elapsed ──
+    // -- Per-job timeout: don't flag until the job's own timeout has elapsed --
     const jobTimeoutMs      = entry.timeoutSeconds ? entry.timeoutSeconds * 1000 : 0;
     const effectiveThreshMs = Math.max(jobTimeoutMs, thresholdMs);
 
@@ -1150,22 +1150,22 @@ async function cmdStuck(flags) {
 
     if (ageMs < effectiveThreshMs) continue;
 
-    // ── Skip if session is within startup grace period ────────────────────
+    // -- Skip if session is within startup grace period --------------------
     const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
     if (ageMs < STARTUP_GRACE_MS) continue;
 
-    // ── Skip if an active watcher is already monitoring this session ──────
+    // -- Skip if an active watcher is already monitoring this session ------
     if (hasActiveWatcher(name)) {
       watcherSkipped.push({ label: name, reason: 'active dispatch-deliver watcher' });
       continue;
     }
 
-    // ── Check sessions store state before alerting ───────────
+    // -- Check sessions store state before alerting -----------
     const stuckSessionsStore = getSessionsStoreForEntry(entry);
     const check = checkSessionDone(entry.sessionKey, stuckSessionsStore, effectiveThreshMs, true, spawnedAt);
 
     if (check.shouldResolve) {
-      // Gateway says this session is done — auto-mark and skip alert
+      // Gateway says this session is done -- auto-mark and skip alert
       if (check.is529) {
         setLabel(name, {
           status:  'error',
@@ -1185,7 +1185,7 @@ async function cmdStuck(flags) {
       continue;
     }
 
-    // Session is still active (or gateway unavailable) — evaluate as potentially stuck
+    // Session is still active (or gateway unavailable) -- evaluate as potentially stuck
     const lastActivity = check.lastActivity || spawnedAt;
     const silenceMs    = Date.now() - lastActivity;
 
@@ -1204,7 +1204,7 @@ async function cmdStuck(flags) {
 
   // Log auto-resolved sessions to stderr (informational, won't trigger delivery)
   if (autoResolved.length > 0) {
-    const lines = autoResolved.map(r => `  ✓ ${r.label}: ${r.reason}`).join('\n');
+    const lines = autoResolved.map(r => `  [ok] ${r.label}: ${r.reason}`).join('\n');
     process.stderr.write(`[${BRAND}] auto-resolved ${autoResolved.length} completed session(s):\n${lines}\n`);
   }
 
@@ -1222,7 +1222,7 @@ async function cmdStuck(flags) {
   }
 
   const lines = stuckSessions.map(s =>
-    `• ${s.label} (running ${s.ageMin}min, silent ${s.silenceMin}min)`
+    `* ${s.label} (running ${s.ageMin}min, silent ${s.silenceMin}min)`
   ).join('\n');
 
   process.stdout.write(
@@ -1240,7 +1240,7 @@ async function cmdStuck(flags) {
 }
 
 /**
- * sync — reconcile labels.json with sessions store state.
+ * sync -- reconcile labels.json with sessions store state.
  * Auto-resolves any "running" sessions that the sessions store considers done.
  *
  * Flags:
@@ -1267,7 +1267,7 @@ function cmdSync(flags) {
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const elapsedMs   = Date.now() - spawnedAtMs;
 
-    // ── Heartbeat-based liveness guard (mirrors cmdStatus logic) ─────────
+    // -- Heartbeat-based liveness guard (mirrors cmdStatus logic) ---------
     // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
     // See cmdStatus for full commentary on PING_STALE_MS / hardCeilingMs.
     const PING_STALE_MS_SYNC  = 3 * 60 * 1000;
@@ -1278,7 +1278,7 @@ function cmdSync(flags) {
     if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
       if (pingAgeMs < PING_STALE_MS_SYNC && elapsedMs < hardCeilingMsSync) {
-        // Watcher alive and within ceiling — skip auto-resolve for this cycle
+        // Watcher alive and within ceiling -- skip auto-resolve for this cycle
         continue;
       }
     }
@@ -1317,7 +1317,7 @@ function cmdSync(flags) {
 }
 
 /**
- * result — get the last assistant reply from a session.
+ * result -- get the last assistant reply from a session.
  *
  * Flags:
  *   --label <string>    Required
@@ -1356,7 +1356,7 @@ function cmdResult(flags) {
     } catch {}
   }
 
-  // ── Watchdog cleanup: disable watchdog job when result is available ──
+  // -- Watchdog cleanup: disable watchdog job when result is available --
   if (lastReply && entry.watchdogJobId) {
     disarmWatchdog(label);
   }
@@ -1374,7 +1374,7 @@ function cmdResult(flags) {
 }
 
 /**
- * done — agent-side completion signal (push-based).
+ * done -- agent-side completion signal (push-based).
  * Called by the subagent itself as its LAST action when fully complete.
  * Sets labels.json status=done so the watcher resolves immediately.
  *
@@ -1396,13 +1396,13 @@ async function cmdDone(flags) {
   const forceReason   = flags.reason || null;
   if (!label) die('--label is required', 2);
 
-  // Structural completion checklist — replaces planning-phrase guard.
+  // Structural completion checklist -- replaces planning-phrase guard.
   // Agents must assert completion status explicitly via structured fields.
   if (!checklistRaw) {
     die(
       'REJECTED: --checklist is required. Pass --checklist with JSON object asserting completion status. ' +
       "Example: --checklist '{\"work_complete\":true}' " +
-      'work_complete MUST be true — you are asserting all assigned work is finished. ' +
+      'work_complete MUST be true -- you are asserting all assigned work is finished. ' +
       'Do NOT call done while planning, reading files, or mid-task.',
       1,
     );
@@ -1424,7 +1424,7 @@ async function cmdDone(flags) {
     );
   }
 
-  // Validate optional fields if present — reject if any are explicitly false
+  // Validate optional fields if present -- reject if any are explicitly false
   const optionalValidated = ['tests_passed', 'pushed'];
   for (const field of optionalValidated) {
     if (field in checklist && checklist[field] === false) {
@@ -1449,7 +1449,7 @@ async function cmdDone(flags) {
 
   const existing = getLabel(label);
 
-  // ── Fix 1: Minimum runtime guard ────────────────────────────────────────
+  // -- Fix 1: Minimum runtime guard ----------------------------------------
   // Prevent agents from calling done immediately after spawning before doing
   // any real work. Threshold scales with the task's configured timeout.
   if (existing) {
@@ -1464,12 +1464,12 @@ async function cmdDone(flags) {
         if (!forceDone) {
           const elapsedS = Math.round(elapsedMs / 1000);
           die(
-            `REJECTED: Session ran for only ${elapsedS}s — suspiciously short for this task scope. ` +
+            `REJECTED: Session ran for only ${elapsedS}s -- suspiciously short for this task scope. ` +
             `If work is genuinely complete, re-run with --force-done --reason "explanation".`,
             1,
           );
         }
-        // --force-done present — require --reason
+        // --force-done present -- require --reason
         if (!forceReason || !forceReason.trim()) {
           die(
             'REJECTED: --force-done requires --reason explaining why short runtime is valid.',
@@ -1484,7 +1484,7 @@ async function cmdDone(flags) {
     }
   }
 
-  // ── Fix 2: SHA required when task involves git operations ────────────────
+  // -- Fix 2: SHA required when task involves git operations ----------------
   // If the stored task prompt references git operations, --sha is mandatory.
   // Fix 1 (edge case): old labels enqueued before 6dfa458 have no taskPrompt stored.
   //   When taskPrompt is absent, skip the git-SHA check to avoid breaking existing labels,
@@ -1494,7 +1494,7 @@ async function cmdDone(flags) {
   if (existing) {
     const taskPrompt = existing.taskPrompt;
     if (!taskPrompt) {
-      // taskPrompt absent — label enqueued before guard was added; skip check but warn.
+      // taskPrompt absent -- label enqueued before guard was added; skip check but warn.
       process.stderr.write(
         `[${BRAND}] warn: taskPrompt not stored for label=${label} (enqueued before guard), skipping git-SHA check\n`,
       );
@@ -1511,9 +1511,9 @@ async function cmdDone(flags) {
 
   // Validate --sha if provided
   if (sha) {
-    // Sanitize: must be a valid git SHA (7–40 hex chars)
+    // Sanitize: must be a valid git SHA (7-40 hex chars)
     if (!/^[0-9a-f]{7,40}$/i.test(sha)) {
-      die(`REJECTED: --sha "${sha}" is not a valid git SHA (must be 7–40 hex characters). Pass the actual commit SHA.`, 1);
+      die(`REJECTED: --sha "${sha}" is not a valid git SHA (must be 7-40 hex characters). Pass the actual commit SHA.`, 1);
     }
     // Verify the commit exists in the local git environment
     try {
@@ -1523,7 +1523,7 @@ async function cmdDone(flags) {
     }
   }
 
-  // ── Fix 3: Session activity check ────────────────────────────────────────
+  // -- Fix 3: Session activity check ----------------------------------------
   // A session that was spawned 2h ago but did nothing (e.g. immediately called done)
   // would pass the wall-clock guard. Check message count via the gateway sessions API
   // to catch idle sessions regardless of wall-clock age.
@@ -1542,25 +1542,25 @@ async function cmdDone(flags) {
         const msgCount = sessionInfo?.messageCount ?? sessionInfo?.messages?.length ?? null;
         if (msgCount !== null && msgCount <= 2) {
           die(
-            `REJECTED: Session has only ${msgCount} messages — likely did not complete the assigned work. ` +
+            `REJECTED: Session has only ${msgCount} messages -- likely did not complete the assigned work. ` +
             `Use --force-done --reason if work is genuinely complete, or --skip-activity-check to bypass this check.`,
             1,
           );
         }
       }
-      // Non-2xx (session not found, etc.) → skip check gracefully
+      // Non-2xx (session not found, etc.) -> skip check gracefully
     } catch (activityErr) {
-      // Gateway API unavailable or timed out — skip check, log warning, do NOT fail.
+      // Gateway API unavailable or timed out -- skip check, log warning, do NOT fail.
       process.stderr.write(
-        `[${BRAND}] warn: session activity check unavailable for label=${label}: ${activityErr.message} — skipping check\n`,
+        `[${BRAND}] warn: session activity check unavailable for label=${label}: ${activityErr.message} -- skipping check\n`,
       );
     }
   }
 
   if (!existing) {
     // Label was never registered (e.g. direct subagent spawn, not via enqueue).
-    // This is not an error — the work completed, the label just wasn't tracked.
-    process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" — registering as done\n`);
+    // This is not an error -- the work completed, the label just wasn't tracked.
+    process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" -- registering as done\n`);
     setLabel(label, { status: 'done', summary, ...(sha ? { sha } : {}) });
 
     // No watcher is polling for this label, so actively notify via the gateway
@@ -1582,7 +1582,7 @@ async function cmdDone(flags) {
         deliveryChannel,
       }).catch(() => {});
     } else {
-      process.stderr.write(`[${BRAND}] warn: no deliverTo in config — completion not delivered for "${label}"\n`);
+      process.stderr.write(`[${BRAND}] warn: no deliverTo in config -- completion not delivered for "${label}"\n`);
     }
 
     out({ ok: true, label, status: 'done', summary, message: 'Label not previously registered; marked done.' });
@@ -1614,7 +1614,7 @@ async function cmdDone(flags) {
 }
 
 /**
- * send / steer — send a message into a running session.
+ * send / steer -- send a message into a running session.
  *
  * Flags:
  *   --label <string>     Required (unless --session-key)
@@ -1661,7 +1661,7 @@ async function cmdSend(flags) {
 }
 
 /**
- * heartbeat — check session liveness.
+ * heartbeat -- check session liveness.
  *
  * Flags:
  *   --label <string>       Check session for this label
@@ -1711,7 +1711,7 @@ function cmdHeartbeat(flags) {
 }
 
 /**
- * list — list all tracked labels and their sessions.
+ * list -- list all tracked labels and their sessions.
  *
  * Flags:
  *   --status <status>    Filter by status (running|done|error)
@@ -1742,11 +1742,11 @@ function cmdList(flags) {
   out({ ok: true, count: entries.length, labels: entries });
 }
 
-// ── Usage ────────────────────────────────────────────────────
+// -- Usage ----------------------------------------------------
 
 function usage() {
   process.stdout.write(`
-${BRAND} 🌶️ — sub-agent dispatch CLI (native gateway API)
+${BRAND} -- sub-agent dispatch CLI (native gateway API)
 
 Usage: openclaw-scheduler <subcommand> [flags]
 
@@ -1779,7 +1779,7 @@ Subcommands:
 `);
 }
 
-// ── Main ─────────────────────────────────────────────────────
+// -- Main -----------------------------------------------------
 
 const [,, subcommand, ...rest] = process.argv;
 const flags = parseFlags(rest);

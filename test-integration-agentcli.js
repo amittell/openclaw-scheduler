@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { setDbPath, initDb, getDb } from './db.js';
 import { validateJobSpec, createJob, getJob } from './jobs.js';
 
-// ── Resolve agentcli paths ────────────────────────────────────
+// -- Resolve agentcli paths ------------------------------------
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const AGENTCLI_PATH = process.env.AGENTCLI_PATH || resolve(__dirname, '../agentcli');
@@ -18,7 +18,7 @@ const agentcliBin = resolve(AGENTCLI_PATH, 'bin/agentcli.js');
 const agentcliExamples = resolve(AGENTCLI_PATH, 'examples');
 const agentcliAvailable = existsSync(agentcliBin);
 
-// ── Test harness (matches test.js pattern) ────────────────────
+// -- Test harness (matches test.js pattern) --------------------
 
 let passed = 0;
 let failed = 0;
@@ -29,7 +29,7 @@ function assert(cond, msg) {
   else { failed++; console.error(`  FAIL ${msg}`); }
 }
 
-// ── Helper: compile a manifest via agentcli CLI ───────────────
+// -- Helper: compile a manifest via agentcli CLI ---------------
 
 function compileManifest(manifestPath) {
   try {
@@ -67,7 +67,7 @@ function toSchedulerSpec(compiledJob) {
   return spec;
 }
 
-// ── In-memory DB ──────────────────────────────────────────────
+// -- In-memory DB ----------------------------------------------
 
 setDbPath(':memory:');
 await initDb();
@@ -75,9 +75,9 @@ const _db = getDb();
 
 console.log('agentcli integration tests\n');
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (a) Compiled hello-world validates and creates
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('Compiled v1 job spec validates and creates:');
 
@@ -254,9 +254,9 @@ for (const jobSpec of helloWorldJobs) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (b) Compiled triggered child validates with parent
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('\nTriggered child validates with parent:');
 
@@ -278,9 +278,9 @@ if (childJob) {
   assert(childJob.schedule_cron === '0 0 31 2 *', 'child uses sentinel cron for triggered jobs');
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (c) v0.2 job spec validates and round-trips
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('\nv0.2 job spec validates and round-trips:');
 
@@ -369,9 +369,9 @@ if (!v02Threw) {
   assert(v02Fetched.contract_audit === 'always', 'contract_audit round-trips');
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (d) All agentcli examples compile and validate (if available)
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('\nAll agentcli examples compile and validate:');
 
@@ -415,9 +415,9 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
   console.log('  (skipped: agentcli not available)');
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (e) Backward compat: v1-only spec still works on v0.2 schema
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('\nBackward compat -- v1-only spec works on v0.2 schema:');
 
@@ -473,9 +473,9 @@ if (!v1Threw) {
   assert(v1Fetched.payload_message === 'uptime', 'v1 payload_message persists');
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 // (f) child_credential_policy field stored in scheduler
-// ═══════════════════════════════════════════════════════════════
+// ===============================================================
 
 console.log('\nchild_credential_policy field stored in scheduler:');
 
@@ -514,7 +514,7 @@ console.log('\nchild_credential_policy field stored in scheduler:');
   }
 }
 
-// ── Summary ───────────────────────────────────────────────────
+// -- Summary ---------------------------------------------------
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
 if (!agentcliAvailable) {

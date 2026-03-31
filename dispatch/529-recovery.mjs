@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dispatch 529 recovery — scheduler safety net for 529/overload errors.
+ * dispatch 529 recovery -- scheduler safety net for 529/overload errors.
  *
  * Scans labels.json for sessions in 'error' state with 529/overload patterns.
  * If retryCount < MAX_RETRIES and the watcher hasn't already handled it,
@@ -15,8 +15,8 @@
  * Run by scheduler every 10 minutes as a safety net.
  *
  * Exit codes:
- *   0 — all good (nothing to retry, or retries dispatched)
- *   1 — error
+ *   0 -- all good (nothing to retry, or retries dispatched)
+ *   1 -- error
  */
 
 import { readFileSync, writeFileSync, renameSync } from 'fs';
@@ -33,7 +33,7 @@ const MAX_RETRIES = 3;
 // (don't revive ancient failures)
 const MAX_ERROR_AGE_MS = 60 * 60 * 1000;
 // Minimum time since last retry before the safety net triggers
-// (give the watcher time to handle it first — 5 minutes)
+// (give the watcher time to handle it first -- 5 minutes)
 const MIN_SINCE_LAST_UPDATE_MS = 5 * 60 * 1000;
 
 const OVERLOAD_PATTERNS = [
@@ -75,7 +75,7 @@ function notify(message) {
 }
 
 function respawnSession(label, entry) {
-  const continuationMsg = `[Auto-retry after 529 overload — scheduler safety net] This is an automatic retry. Please continue your previous task from where you left off.`;
+  const continuationMsg = `[Auto-retry after 529 overload -- scheduler safety net] This is an automatic retry. Please continue your previous task from where you left off.`;
 
   // Try send (reuse session) first
   try {
@@ -119,7 +119,7 @@ function respawnSession(label, entry) {
   }
 }
 
-// ── Main ────────────────────────────────────────────────────
+// -- Main ----------------------------------------------------
 
 const labels = loadLabels();
 const now = Date.now();
@@ -131,7 +131,7 @@ for (const [name, entry] of Object.entries(labels)) {
   const errorMsg = entry.error || '';
   if (!is529Error(errorMsg)) continue;
 
-  // Check age — don't retry very old errors
+  // Check age -- don't retry very old errors
   const updatedAt = entry.updatedAt ? new Date(entry.updatedAt).getTime() : 0;
   const errorAge = now - updatedAt;
   if (errorAge > MAX_ERROR_AGE_MS) {
@@ -182,7 +182,7 @@ for (const [name, entry] of Object.entries(labels)) {
   }
 }
 
-// Output summary — scheduler delivers stdout if non-empty and delivery_mode=announce
+// Output summary -- scheduler delivers stdout if non-empty and delivery_mode=announce
 if (results.length > 0) {
   const retried = results.filter(r => r.action === 'retried');
   const skipped = results.filter(r => r.action === 'skip');
