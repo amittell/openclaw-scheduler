@@ -528,7 +528,7 @@ Examples:
 - `agent:main:subagent:a1b2c3d4-...` -- main agent, scheduler-dispatched
   isolated session
 - `agent:beta:openai:e5f6g7h8-...` -- beta, OpenAI-compat chat session
-- `agent:main:telegram:webhook:484946046` -- main agent, Telegram peer
+- `agent:main:telegram:webhook:123456789` -- main agent, Telegram peer
 
 This namespacing provides session isolation between agents. Agent beta's
 sessions cannot read main's conversation history or tool state, and

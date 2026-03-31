@@ -692,6 +692,12 @@ Each isolated job prompt includes:
 
 ## Delivery Modes
 
+The scheduler delivers job output through the OpenClaw gateway's messaging
+system. All channels supported by the gateway work with the scheduler:
+**Telegram**, **Discord**, **WhatsApp**, **Signal**, **iMessage**, and **Slack**.
+Set `delivery_channel` to the channel name and `delivery_to` to the
+channel-specific target (chat ID, channel ID, phone number, handle, etc.).
+
 | Mode | When output is delivered |
 |------|-------------------------|
 | `none` | Never (background jobs) |
@@ -699,6 +705,9 @@ Each isolated job prompt includes:
 | `announce-always` | Always delivers output (LLM or shell), including `main` session jobs |
 
 > **Note:** delivery is suppressed if `delivery_channel` or `delivery_to` are absent, regardless of `delivery_mode`.
+>
+> Examples in this document use Telegram for delivery_channel since it is the
+> most common configuration. Replace with your channel of choice.
 
 ---
 
@@ -1700,7 +1709,7 @@ openclaw-scheduler enqueue \
 
 # Fallback (if openclaw-scheduler is not in PATH):
 node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
-  --label "fix-deploy-script" --message "..." --deliver-to YOUR_TELEGRAM_ID
+  --label "fix-deploy-script" --message "..." --deliver-to YOUR_CHAT_ID
 ```
 
 ### Flag Reference
@@ -1738,7 +1747,7 @@ node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
 
 ### Multi-agent Orchestration
 
-The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are delivered back to the requesting Telegram chat without the orchestrator polling.
+The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are delivered back to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
 
 **Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. The dispatcher sets `spawnDepth: 1` on each fresh session automatically.
 
@@ -1751,19 +1760,19 @@ The main agent acts as the orchestrator and delegates parallel units of work to 
 openclaw-scheduler enqueue \
   --label   "worker-schema"   \
   --message "Review the DB schema and write documentation for all tables" \
-  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
+  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-frontend" \
   --message "Audit the React components for accessibility issues" \
-  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
+  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-docs"     \
   --message "Update the API docs to reflect the new /v2 endpoints" \
-  --thinking high --timeout 600 --deliver-to YOUR_TELEGRAM_ID
+  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
 
-# Each worker auto-announces its result to Telegram when done.
+# Each worker auto-announces its result to the configured channel when done.
 # No polling needed. Watchdog jobs are auto-registered for each.
 ```
 
@@ -1809,7 +1818,7 @@ openclaw-scheduler status --label worker-schema
 
 ### Monitoring and the Watchdog
 
-When `--deliver-to` is set and `--no-monitor` is not passed, `enqueue` automatically registers a watchdog job in the scheduler DB alongside the delivery watcher job. The watchdog runs on the configured cron schedule and calls `stuck --threshold-min <watchdogTimeoutMin>` for the dispatched label. If the session has been silent past the threshold, the watchdog posts an alert to the configured Telegram target and then disables itself.
+When `--deliver-to` is set and `--no-monitor` is not passed, `enqueue` automatically registers a watchdog job in the scheduler DB alongside the delivery watcher job. The watchdog runs on the configured cron schedule and calls `stuck --threshold-min <watchdogTimeoutMin>` for the dispatched label. If the session has been silent past the threshold, the watchdog posts an alert to the configured delivery target and then disables itself.
 
 Check active dispatch sessions:
 
