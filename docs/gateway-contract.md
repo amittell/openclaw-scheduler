@@ -491,6 +491,112 @@ after completion. Label status is updated in labels.json to `done`,
 
 ---
 
+## Multi-Agent Gateway Routing
+
+A single OpenClaw gateway instance serves multiple agents. The scheduler
+dispatches to specific agents by setting the `x-openclaw-agent-id` header
+(or encoding the agent ID in the model string as `openclaw:<agentId>`).
+No pre-registration step is required -- the gateway creates agent-scoped
+state on first request.
+
+### Agent ID resolution
+
+The gateway resolves the target agent ID from each inbound request using
+two sources, in priority order:
+
+1. **Header**: `x-openclaw-agent-id` (or `x-openclaw-agent`). Highest
+   priority. This is what the scheduler sets.
+2. **Model string**: `openclaw:<agentId>` or `agent:<agentId>` patterns
+   parsed from the `model` field in the request body.
+
+If neither is present, the gateway defaults to `"main"`. Agent IDs are
+normalized to lowercase and must match `[a-z0-9][a-z0-9_-]{0,63}`.
+
+Reference: `openclaw/src/gateway/http-utils.ts`
+(`resolveAgentIdFromHeader`, `resolveAgentIdFromModel`,
+`resolveAgentIdForRequest`).
+
+### Agent-scoped session keys
+
+Sessions are namespaced by agent ID. The session key format is:
+
+```
+agent:<agentId>:<prefix>:<identifier>
+```
+
+Examples:
+- `agent:main:subagent:a1b2c3d4-...` -- main agent, scheduler-dispatched
+  isolated session
+- `agent:beta:openai:e5f6g7h8-...` -- beta, OpenAI-compat chat session
+- `agent:main:telegram:webhook:484946046` -- main agent, Telegram peer
+
+This namespacing provides session isolation between agents. Agent beta's
+sessions cannot read main's conversation history or tool state, and
+vice versa, even though both run on the same gateway.
+
+Reference: `openclaw/src/routing/session-key.ts`
+(`buildAgentMainSessionKey`, `DEFAULT_AGENT_ID`).
+
+### Per-agent configuration
+
+Each agent has its own configuration directory at
+`~/.openclaw/agents/<agentId>/agent/`, containing:
+
+- `models.json` -- provider endpoints and model definitions for this
+  agent. Different agents can use different model providers (e.g. main
+  uses Anthropic, beta uses OpenAI Codex via a different base URL).
+- `auth-profiles.json` -- credential profiles scoped to this agent.
+  Each agent can have independent API keys, OAuth tokens, and provider
+  configurations.
+- `sessions/` -- per-agent session store (sessions.json + JSONL files).
+
+The gateway reads from the correct agent directory based on the resolved
+agent ID. This means agents on the same gateway can have completely
+independent credential surfaces.
+
+### Scheduler dispatch to non-default agents
+
+The scheduler targets a specific agent by setting `agent_id` on the job:
+
+```json
+{
+  "name": "Beta Agent Daily Task",
+  "agent_id": "beta",
+  "session_target": "isolated",
+  "payload_kind": "agentTurn",
+  "payload_message": "perform daily check"
+}
+```
+
+At dispatch time, `gateway.js` sets `x-openclaw-agent-id: beta` on the
+outbound `/v1/chat/completions` request. The gateway routes the request
+to beta's agent scope, creates a session under `agent:beta:...`, and
+uses beta's model and auth profile configuration.
+
+Jobs without an explicit `agent_id` default to `"main"`.
+
+### Multi-agent trust considerations
+
+When multiple agents share a gateway, each agent is a separate execution
+principal with its own credential surface:
+
+- Auth profiles are per-agent (`~/.openclaw/agents/<id>/agent/auth-profiles.json`).
+  A job dispatched to beta uses beta's profiles, not main's.
+- The scheduler's `child_credential_policy` applies within a single
+  agent's dispatch chain. Cross-agent credential scoping (e.g. a main
+  job triggering a beta child with downscoped credentials) is not
+  currently supported -- each agent resolves credentials from its own
+  profile store.
+- The `x-openclaw-env-inject` header is agent-agnostic: materialized
+  env vars are forwarded to whichever agent the job targets.
+- Session isolation between agents is enforced by the session key
+  namespace. Agent A cannot access agent B's sessions or conversation
+  history through the gateway.
+
+For the broader trust architecture, see `docs/trust-architecture.md`.
+
+---
+
 ## Activity Timeout Pattern
 
 `runAgentTurnWithActivityTimeout()` in `gateway.js` (line 119) implements a
