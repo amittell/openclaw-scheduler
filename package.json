@@ -90,7 +90,11 @@
     "UNINSTALL.md",
     "UPGRADING.md",
     "BEST-PRACTICES.md",
-    "QUICK-START.md"
+    "QUICK-START.md",
+    "AGENTS.md",
+    "CONTEXT.md",
+    "JOB-QUICK-REF.md",
+    "docs"
   ],
   "keywords": [
     "openclaw",
