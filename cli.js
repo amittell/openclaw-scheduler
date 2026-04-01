@@ -141,7 +141,7 @@ function emit(data, human = null) {
 
 function fail(message, code = 1) {
   if (jsonMode) {
-    console.error(fmt({ ok: false, error: message }));
+    console.log(fmt({ ok: false, error: message }));
   } else {
     console.error(message);
   }

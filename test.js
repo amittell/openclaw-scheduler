@@ -2930,16 +2930,72 @@ console.log('\n-- CLI JSON / Dry-Run / Schema --');
   assert(runOut.dispatch_kind === 'manual' && typeof runOut.dispatch_id === 'string', 'jobs run --json returns durable dispatch');
 
   // Test: jobs cancel with no ID should fail
+  let cancelErr = null;
   try {
     execFileSync(process.execPath, [cliPath, 'jobs', 'cancel', '--json'], {
       cwd: process.cwd(),
       env: baseEnv,
       encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert(false, 'jobs cancel with no ID should have thrown');
   } catch (err) {
+    cancelErr = err;
     assert(err.status !== 0, 'jobs cancel with no ID exits non-zero');
   }
+  const cancelStdout = String(cancelErr?.stdout || '');
+  const cancelStderr = String(cancelErr?.stderr || '');
+  let cancelJson = null;
+  try { cancelJson = JSON.parse(cancelStdout); } catch {}
+  assert(cancelJson?.ok === false, 'jobs cancel --json writes structured error payload to stdout');
+  assert(cancelJson?.error === 'Usage: jobs cancel <id> [--no-cascade]', 'jobs cancel --json preserves usage error message');
+  assert(cancelStderr.trim() === '', 'jobs cancel --json does not write structured error payload to stderr');
+
+  rmSync(tempRoot, { recursive: true, force: true });
+}
+
+console.log('\n-- CLI Launcher Routing --');
+{
+  const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-bin-'));
+  const dbPath = join(tempRoot, 'scheduler.db');
+  const homeDir = join(tempRoot, 'home');
+  const labelsPath = join(tempRoot, 'labels.json');
+  const binPath = join(dirname(fileURLToPath(import.meta.url)), 'bin/openclaw-scheduler.js');
+
+  mkdirSync(homeDir, { recursive: true });
+  writeFileSync(labelsPath, JSON.stringify({
+    'worker-schema': {
+      sessionKey: 'agent:main:subagent:test-session',
+      status: 'done',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: '2026-03-31T12:00:00.000Z',
+      updatedAt: '2026-03-31T12:05:00.000Z',
+      summary: 'completed',
+    },
+  }, null, 2));
+
+  const baseEnv = {
+    ...process.env,
+    HOME: homeDir,
+    SCHEDULER_DB: dbPath,
+    DISPATCH_LABELS_PATH: labelsPath,
+  };
+  const schedulerStatus = execFileSync(process.execPath, [binPath, 'status'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  });
+  assert(schedulerStatus.includes('=== OpenClaw Scheduler Status ==='), 'bin status without --label routes to scheduler CLI health view');
+
+  const dispatchStatus = JSON.parse(execFileSync(process.execPath, [binPath, 'status', '--label', 'worker-schema', '--json'], {
+    cwd: process.cwd(),
+    env: baseEnv,
+    encoding: 'utf8',
+  }));
+  assert(dispatchStatus.ok === true, 'bin status --label returns dispatch status payload');
+  assert(dispatchStatus.label === 'worker-schema', 'bin status --label preserves requested label');
+  assert(dispatchStatus.status === 'done', 'bin status --label routes to dispatch label status');
 
   rmSync(tempRoot, { recursive: true, force: true });
 }

@@ -13,7 +13,6 @@ const root = join(__dirname, '..');
 const DISPATCH_SUBCOMMANDS = new Set([
   'dispatch',
   'enqueue',
-  'status',
   'stuck',
   'result',
   'sync',
@@ -33,13 +32,14 @@ Commands:
                    Run interactive setup wizard
   start            Start dispatcher loop
   migrate          Import OC cron jobs from ~/.openclaw/cron/jobs.json
+  status           Show scheduler health
   webhook-check    Run Telegram webhook health check / repair utility
   help             Show this help
 
 Dispatch subcommands (routed to dispatch/index.mjs):
   dispatch <sub>   Explicit dispatch namespace
   enqueue          Spawn a sub-agent session (alias: dispatch enqueue)
-  status           Query session status by label
+  dispatch status  Query session status by label
   stuck            Find sessions running past threshold
   result           Get last assistant reply from a session
   send / steer     Send/steer a running session
@@ -59,6 +59,10 @@ Flags:
 Environment:
   DISPATCH_CONFIG_DIR   Override dispatch config directory (default: ~/.openclaw/dispatch)
 `);
+}
+
+function hasDispatchStatusLabel(args) {
+  return args.some(arg => arg === '--label' || arg.startsWith('--label='));
 }
 
 function runScript(script, args) {
@@ -114,6 +118,11 @@ if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   process.stdout.write(`${pkg.name} ${pkg.version}\n`);
   process.exit(0);
+} else if (cmd === 'status' && hasDispatchStatusLabel(args.slice(1))) {
+  // Preserve the historical dispatch convenience alias:
+  //   openclaw-scheduler status --label <name>
+  // Without --label, "status" means scheduler health via cli.js.
+  runDispatch(args);
 } else if (DISPATCH_SUBCOMMANDS.has(cmd)) {
   // Route dispatch subcommands to dispatch/index.mjs
   // If the command is 'dispatch', strip it and pass the rest
