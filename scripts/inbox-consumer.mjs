@@ -118,7 +118,7 @@ function formatMessageForDelivery(msg, { brand = 'Scheduler' } = {}) {
   const subject = msg.subject || 'Notification';
   const header = `${brand} | ${subject} | ${age}`;
 
-  return `${header}\n\n${body}`.slice(0, 4000);
+  return `${header}\n\n${body}`;
 }
 
 /**
