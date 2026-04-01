@@ -17,6 +17,12 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 |---|---|
 | `index.mjs` | CLI entry point — 10 subcommands |
 | `hooks.mjs` | Lifecycle event emitter (Loki + optional HTTP webhook) |
+| `watcher.mjs` | Delivery monitoring process |
+| `529-recovery.mjs` | Transient error recovery |
+| `deliver-watcher.sh` | Shell wrapper for result retrieval |
+| `chilisaus.mjs` | Branded wrapper |
+| `config.example.json` | Example config |
+| `test-done-postoffice.mjs` | Done handler test |
 | `labels.json` | Local label→session ledger (gitignored) |
 | `README.md` | This file |
 
@@ -77,6 +83,11 @@ node dispatch/index.mjs enqueue \
 | `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call |
 | `--deliver-channel` | `telegram` | Delivery channel for `--deliver-to` (telegram, slack, etc.) |
 | `--delivery-mode` | `announce` | `announce`, `announce-always`, `none` |
+| `--origin` | -- | Dispatch origin (e.g. `telegram:12345`) |
+| `--no-monitor` | false | Skip watcher monitoring |
+| `--monitor-interval` | -- | Watcher cron expression |
+| `--monitor-timeout` | -- | Watcher timeout in minutes |
+| `--verify-cmd` | -- | Post-completion verification command |
 
 ### `status` — session status for a label
 
@@ -173,6 +184,17 @@ node dispatch/index.mjs list [--status running] [--limit 10]
 ```
 
 Shows all labels in the ledger, sorted by most recent. Filter by status.
+
+### `sync` -- reconcile labels with sessions store
+
+```bash
+node dispatch/index.mjs sync
+```
+
+Reconciles `labels.json` with the gateway sessions store. Sessions that no
+longer exist on the gateway are marked stale, and sessions present on the
+gateway but missing from the ledger are imported. Useful after gateway restarts
+or manual session cleanup.
 
 ---
 
@@ -313,7 +335,7 @@ Key improvements:
 - **Mid-session steering** — `send`/`steer` inject messages into running sessions
 - **No DB dependency** — labels.json is a simple JSON file
 - **Session reuse** — `--mode reuse` continues conversations
-- **Simpler** -- single-file CLI vs multi-file DB schema + dispatcher integration
+- **Simpler** -- lightweight multi-file CLI vs full DB schema + dispatcher integration
 
 ---
 

@@ -82,7 +82,7 @@ export function updateContextSummary(runId, summaryObj) // store JSON context_su
 ```js
 async function replayOrphanedRuns()        // called from main() after initDb, before tick loop
 async function checkApprovals()            // called from tick(), checks timeouts + approved gates
-function buildContextSummary(job, inbox)   // returns {messages_injected, scope, ...}
+// Note: context metadata is built inline within buildJobPrompt() and returned as contextMeta
 ```
 
 ### cli.js — new commands:
@@ -116,7 +116,7 @@ function buildContextSummary(job, inbox)   // returns {messages_injected, scope,
 - New field `context_summary` on runs (TEXT, stores JSON)
 - In buildJobPrompt: collect metadata into an object: { messages_injected: N, scope: 'own'|'global', aliases_resolved: [...], job_class, delivery_guarantee, context_retrieval, retrieval_results: N }
 - After creating the run, store the summary via updateContextSummary()
-- Expose in `runs list` and `runs get` CLI output
+- Expose in `runs list` and `runs get` CLI output (note: CLI exposure is deferred)
 
 ### F4: Typed Message Contract
 - New message kinds: 'decision', 'constraint', 'fact', 'preference'

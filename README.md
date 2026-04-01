@@ -276,6 +276,7 @@ ocs jobs add '{
   "session_target": "shell",
   "payload_message": "df -h /",
   "delivery_mode": "none",
+  "run_timeout_ms": 120000,
   "origin": "system"
 }'
 ```
@@ -324,6 +325,7 @@ ocs jobs add '{
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 120000,
   "origin": "system"
 }'
 ```
@@ -347,6 +349,7 @@ ocs jobs add '{
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 300000,
   "origin": "system"
 }'
 ```
@@ -373,7 +376,7 @@ ocs jobs add '{
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
+  "run_timeout_ms": 120000
 }'
 ```
 
@@ -435,6 +438,7 @@ ocs jobs add '{
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 120000,
   "origin": "system"
 }'
 ```
@@ -455,6 +459,7 @@ ocs jobs add '{
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 300000,
   "origin": "system"
 }'
 ```
@@ -479,6 +484,7 @@ ocs jobs add '{
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 600000,
   "origin": "system"
 }'
 ```
@@ -496,7 +502,7 @@ ocs jobs add '{
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
+  "run_timeout_ms": 120000
 }'
 ```
 
@@ -519,7 +525,7 @@ ocs jobs add '{
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
+  "run_timeout_ms": 120000
 }'
 ```
 
@@ -753,7 +759,9 @@ openclaw-scheduler jobs add '{
   "payload_message": "/path/to/backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 600000,
+  "origin": "system"
 }'
 ```
 
@@ -763,7 +771,7 @@ openclaw-scheduler jobs add '{
 - Output captured up to 1MB, with preview/offload budgets to keep large output out of the main run row
 - Shell runs persist structured failure context on `runs`: `shell_exit_code`, `shell_signal`, `shell_timed_out`, `shell_stdout`, `shell_stderr`, plus optional `shell_stdout_path` / `shell_stderr_path` when large output is offloaded
 - Failure-triggered agent children receive shell context with separate exit code, stdout, and stderr blocks
-- `run_timeout_ms` controls max execution time (default 300000ms = 5 min)
+- `run_timeout_ms` controls max execution time (required, no default)
 - Workflow chains work the same way — shell jobs can trigger children on success/failure
 - Shell jobs now honor `max_retries` before failure children fire, the same as isolated agent jobs
 - `openclaw-scheduler runs output <run-id> stdout|stderr` retrieves stored or offloaded shell output on demand
@@ -777,7 +785,9 @@ openclaw-scheduler jobs add '{
   "payload_message": "PGPASSWORD=secret pg_dump mydb > /backups/mydb.sql && echo OK",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 600000,
+  "origin": "system"
 }'
 ```
 
@@ -796,7 +806,8 @@ openclaw-scheduler jobs add '{
   "approval_required": 1,
   "approval_timeout_s": 3600,
   "approval_auto": "reject",
-  "payload_message": "Deploy the application to production"
+  "payload_message": "Deploy the application to production",
+  "run_timeout_ms": 300000
 }'
 ```
 
@@ -909,7 +920,9 @@ Jobs can be linked into parent → child chains. When a parent completes, its ch
 openclaw-scheduler jobs add '{
   "name": "Build App",
   "schedule_cron": "0 10 * * *",
-  "payload_message": "Build the application"
+  "payload_message": "Build the application",
+  "run_timeout_ms": 300000,
+  "origin": "system"
 }'
 # → id: "abc123..."
 
@@ -918,17 +931,19 @@ openclaw-scheduler jobs add '{
   "name": "Deploy App",
   "payload_message": "Deploy to production",
   "parent_id": "abc123...",
-  "trigger_on": "success"
+  "trigger_on": "success",
+  "run_timeout_ms": 300000
 }'
 
 # Child: fires when parent fails
 openclaw-scheduler jobs add '{
   "name": "Build Alert",
-  "payload_message": "Build failed — check logs",
+  "payload_message": "Build failed -- check logs",
   "parent_id": "abc123...",
   "trigger_on": "failure",
   "delivery_mode": "announce",
-  "delivery_to": "YOUR_CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "run_timeout_ms": 300000
 }'
 ```
 
@@ -947,7 +962,8 @@ openclaw-scheduler jobs add '{
   "parent_id": "<monitor-job-id>",
   "trigger_on": "success",
   "trigger_condition": "contains:ALERT",
-  "payload_message": "Handle the alert"
+  "payload_message": "Handle the alert",
+  "run_timeout_ms": 300000
 }'
 
 # Regex condition
@@ -956,7 +972,8 @@ openclaw-scheduler jobs add '{
   "parent_id": "<monitor-job-id>",
   "trigger_on": "success",
   "trigger_condition": "regex:ERROR.*critical",
-  "payload_message": "Handle critical error"
+  "payload_message": "Handle critical error",
+  "run_timeout_ms": 300000
 }'
 ```
 
@@ -976,7 +993,8 @@ openclaw-scheduler jobs add '{
   "payload_message": "deploy",
   "agent_id": "ops",
   "parent_id": "<build-id>",
-  "trigger_on": "success"
+  "trigger_on": "success",
+  "run_timeout_ms": 300000
 }'
 ```
 
@@ -988,7 +1006,8 @@ openclaw-scheduler jobs add '{
   "payload_message": "Verify services healthy",
   "parent_id": "<deploy-id>",
   "trigger_on": "success",
-  "trigger_delay_s": 60
+  "trigger_delay_s": 60,
+  "run_timeout_ms": 300000
 }'
 ```
 
@@ -1028,7 +1047,9 @@ openclaw-scheduler jobs add '{
   "name": "Flaky Deploy",
   "schedule_cron": "0 10 * * *",
   "payload_message": "deploy to prod",
-  "max_retries": 3
+  "max_retries": 3,
+  "run_timeout_ms": 300000,
+  "origin": "system"
 }'
 ```
 
@@ -1128,7 +1149,8 @@ openclaw-scheduler jobs add '{
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
-  "run_timeout_ms": 60000
+  "run_timeout_ms": 60000,
+  "origin": "system"
 }'
 ```
 
@@ -1195,7 +1217,7 @@ openclaw-scheduler agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 21 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 23 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -1514,7 +1536,7 @@ node migrate.js   # imports from ~/.openclaw/cron/jobs.json
 
 ### Schema baseline
 
-As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v21`).
+As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v23`).
 
 - Net-new installs: `initDb()` applies `schema.sql` directly.
 - Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
@@ -1622,8 +1644,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── dispatcher-utils.js       # Shared dispatcher helpers and dependency wiring
 ├── dispatch-queue.js         # Durable dispatch queue (manual runs, retries, chain triggers)
 ├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v21) — all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v21
+├── schema.sql             # Complete schema (v23) -- all tables and columns, no incremental DDL
+├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v23
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)

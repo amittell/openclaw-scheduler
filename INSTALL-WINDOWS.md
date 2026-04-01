@@ -43,16 +43,16 @@ Use this path only if you can't use WSL2 — for example, if OpenClaw itself is 
 | OpenClaw gateway | Must be running with a valid auth token |
 | Git for Windows | [git-scm.com](https://git-scm.com) or use GitHub Desktop |
 
-**Build tools for `better-sqlite3`** (required — it compiles a native addon):
+**Build tools for `better-sqlite3`** (required -- it compiles a native addon):
 
-Option 1 — automated:
+Option 1 -- Visual Studio Build Tools (recommended):
+1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) -- select the **"Desktop development with C++"** workload
+2. Install [Python 3.x](https://python.org) -- check "Add to PATH" during install
+
+Option 2 -- `windows-build-tools` (deprecated, may not work on newer Windows):
 ```powershell
 npm install -g windows-build-tools
 ```
-
-Option 2 — manual (more reliable on Windows 11):
-1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) — select the **"Desktop development with C++"** workload
-2. Install [Python 3.x](https://python.org) — check "Add to PATH" during install
 
 Verify:
 ```powershell
@@ -163,14 +163,15 @@ Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway process environment (se
 ### Step 7: Start with PM2
 
 ```powershell
-pm2 start dispatcher.js --name openclaw-scheduler `
-  --env OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789 `
-  --env OPENCLAW_GATEWAY_TOKEN=YOUR_GATEWAY_TOKEN `
-  --env SCHEDULER_TICK_MS=10000 `
-  --env SCHEDULER_STALE_THRESHOLD_S=90
+$env:OPENCLAW_GATEWAY_URL = "http://127.0.0.1:18789"
+$env:OPENCLAW_GATEWAY_TOKEN = "YOUR_GATEWAY_TOKEN"
+$env:SCHEDULER_TICK_MS = "10000"
+$env:SCHEDULER_STALE_THRESHOLD_S = "90"
+pm2 start dispatcher.js --name openclaw-scheduler
 
 # Optional verbose logging:
-pm2 restart openclaw-scheduler --update-env --env SCHEDULER_DEBUG=1
+$env:SCHEDULER_DEBUG = "1"
+pm2 restart openclaw-scheduler --update-env
 
 # Save PM2 process list (persists across restarts)
 pm2 save

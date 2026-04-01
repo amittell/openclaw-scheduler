@@ -38,8 +38,8 @@ context: it checks `OPENCLAW_GATEWAY_TOKEN` first, then falls back to reading
 `~/.openclaw/openclaw.json` at `gateway.auth.token`.
 
 Reference:
-- `gateway.js` lines 15-34 (`getGatewayToken`, `authHeaders`)
-- `dispatch/index.mjs` lines 86-96 (`getGatewayToken`, `GATEWAY_TOKEN`)
+- `gateway.js` (`getGatewayToken`, `authHeaders`)
+- `dispatch/index.mjs` (`getGatewayToken`, `GATEWAY_TOKEN`)
 
 ---
 
@@ -48,8 +48,8 @@ Reference:
 Resolved from `OPENCLAW_GATEWAY_URL`, defaulting to `http://127.0.0.1:18789`.
 
 Reference:
-- `gateway.js` line 8
-- `dispatch/index.mjs` line 39
+- `gateway.js` (`GATEWAY_URL`)
+- `dispatch/index.mjs` (`GATEWAY_URL`)
 
 ---
 
@@ -61,8 +61,8 @@ Reference:
 single user message to an agent and receives the complete assistant response.
 
 **Callers**:
-- `gateway.js` `runAgentTurn()` (line 59)
-- `gateway.js` `runAgentTurnWithActivityTimeout()` (line 183)
+- `gateway.js` `runAgentTurn()`
+- `gateway.js` `runAgentTurnWithActivityTimeout()`
 
 **Request headers**:
 
@@ -131,7 +131,7 @@ The scheduler reads `data.choices[0].message.content` and `data.usage`.
 **Purpose**: Invoke gateway-side tools for session listing, message delivery,
 and session management.
 
-**Caller**: `gateway.js` `invokeGatewayTool()` (line 266)
+**Caller**: `gateway.js` `invokeGatewayTool()`
 
 **Request headers**:
 
@@ -157,7 +157,7 @@ first 500 chars>`.
 
 #### Tool: `sessions_list`
 
-**Caller**: `gateway.js` `listSessions()` (line 291)
+**Caller**: `gateway.js` `listSessions()`
 
 **Args**:
 
@@ -187,16 +187,15 @@ Each session object is expected to have at minimum: `key` (or `sessionKey`),
 
 **Used by**:
 - `runAgentTurnWithActivityTimeout` -- polls session activity during long runs
-  (line 144)
-- `getAllSubAgentSessions` -- fetches all active subagent sessions (line 305)
-- `dispatcher-strategies.js` -- resolves `auth_profile: 'inherit'` by finding
-  the main session's auth profile (line 582)
+- `getAllSubAgentSessions` -- fetches all active subagent sessions
+- `dispatcher-strategies.js` `executeAgent()` -- resolves `auth_profile: 'inherit'` by finding
+  the main session's auth profile
 - `dispatcher-maintenance.js` via `checkTaskTrackers` -- correlates subagent
   sessions with task group agents
 
 #### Tool: `message`
 
-**Caller**: `gateway.js` `deliverMessage()` (line 385)
+**Caller**: `gateway.js` `deliverMessage()`
 
 **Args**:
 
@@ -213,7 +212,7 @@ Used for delivering job results, check-in updates, and notifications to
 Telegram or other channels. Messages exceeding `TELEGRAM_MAX_MESSAGE_LENGTH`
 (4096 chars) are split into numbered chunks by `splitMessageForChannel`.
 
-**Also used directly in dispatch/index.mjs** (line 782-799) via raw `fetch` to
+**Also used directly in dispatch/index.mjs** `cmdEnqueue()` via raw `fetch` to
 `POST /tools/invoke` for the "Starting..." notification when spawning a
 subagent session:
 
@@ -237,8 +236,8 @@ subagent session:
 **Purpose**: Determine whether the gateway is reachable and responsive.
 
 **Callers**:
-- `gateway.js` `checkGatewayHealth()` (line 402)
-- `gateway.js` `waitForGateway()` (line 423)
+- `gateway.js` `checkGatewayHealth()`
+- `gateway.js` `waitForGateway()`
 
 **Request headers**: `Authorization: Bearer <token>` when available.
 
@@ -255,7 +254,7 @@ subagent session:
 **Scheduler behavior when unhealthy**:
 - Isolated jobs are deferred (next_run_at pushed forward by 60s).
 - Shell and main-session jobs continue regardless.
-- Health is re-checked every 60 seconds (`dispatcher.js` line 490).
+- Health is re-checked every 60 seconds (`dispatcher.js` `tick()`).
 
 ---
 
@@ -264,7 +263,7 @@ subagent session:
 **Purpose**: Retrieve session metadata including message count for activity
 validation.
 
-**Caller**: `dispatch/index.mjs` `cmdDone()` (line 1529)
+**Caller**: `dispatch/index.mjs` `cmdDone()`
 
 **Request headers**: `Authorization: Bearer <GATEWAY_TOKEN>`
 
@@ -294,7 +293,7 @@ non-fatal -- the activity check is skipped with a stderr warning.
 `session_target: 'main'` that communicate via the primary conversation thread
 rather than isolated sessions.
 
-**Caller**: `gateway.js` `sendSystemEvent()` (line 243)
+**Caller**: `gateway.js` `sendSystemEvent()`
 
 **Invocation**:
 
@@ -316,7 +315,7 @@ openclaw doctor output) is stripped by finding the first `{` character.
 **Error semantics**: Throws `system event failed: <message>`.
 
 **Used by**: `dispatcher-strategies.js` for main-session dispatch strategy, and
-`dispatcher.js` via `buildDispatchDeps()` (line 293).
+`dispatcher.js` via `buildDispatchDeps()`.
 
 ---
 
@@ -326,7 +325,7 @@ openclaw doctor output) is stripped by finding the first `{` character.
 `dispatch/index.mjs` for session management operations that are not exposed as
 direct HTTP endpoints.
 
-**Caller**: `dispatch/index.mjs` `gatewayCall()` (line 210)
+**Caller**: `dispatch/index.mjs` `gatewayCall()`
 
 **Invocation**:
 
@@ -348,7 +347,7 @@ parseable JSON before throwing.
 
 **`sessions.patch`** -- Configure session properties before agent dispatch.
 
-Called in `cmdEnqueue()` (lines 644-666) for fresh sessions:
+Called in `cmdEnqueue()` for fresh sessions:
 
 ```json
 // Set spawn depth
@@ -363,7 +362,7 @@ Called in `cmdEnqueue()` (lines 644-666) for fresh sessions:
 
 **`agent`** -- Dispatch a message to an agent session.
 
-Called in `cmdEnqueue()` (line 735) and `cmdSend()` (line 1638):
+Called in `cmdEnqueue()` and `cmdSend()`:
 
 ```json
 {
@@ -386,7 +385,7 @@ For `cmdSend` (mid-session steering), the call uses `lane: 'nested'` and
 
 **`chat.history`** -- Retrieve session transcript.
 
-Called in `cmdResult()` (line 1335):
+Called in `cmdResult()`:
 
 ```json
 { "sessionKey": "<session key>" }
@@ -407,7 +406,7 @@ The scheduler scans backwards to find the last assistant message.
 
 **`sessions.list`** -- List active sessions (gateway API fallback).
 
-Called in `checkSessionDone()` (line 442) when a session is not found in the
+Called in `checkSessionDone()` when a session is not found in the
 local sessions.json store:
 
 ```json
@@ -426,8 +425,8 @@ written to sessions.json.
 ### Creation
 
 Sessions are created implicitly. The scheduler generates a session key in the
-format `agent:<agentId>:subagent:<uuid>` (dispatch/index.mjs `makeSessionKey`,
-line 524). No explicit "create session" API exists -- the gateway creates the
+format `agent:<agentId>:subagent:<uuid>` (dispatch/index.mjs `makeSessionKey()`).
+No explicit "create session" API exists -- the gateway creates the
 session when it first receives a request with that key.
 
 ### Configuration (Pre-dispatch)
@@ -465,13 +464,13 @@ agent is still active.
 
 1. **Local sessions store**: Reads
    `~/.openclaw/agents/<agent>/sessions/sessions.json` directly from disk
-   (`readSessionsStore`, line 321). This is treated as ground truth for
+   (`readSessionsStore()`). This is treated as ground truth for
    sessions that appear there.
 
 2. **Gateway API fallback**: When a session is not found in the local store
    (common for subagent sessions in openclaw 2026.3.13+),
    `checkSessionDone()` falls back to `openclaw gateway call sessions.list`
-   (line 442) to confirm whether the session is still active.
+   to confirm whether the session is still active.
 
 ### Completion Detection
 
@@ -599,7 +598,7 @@ For the broader trust architecture, see `docs/trust-architecture.md`.
 
 ## Activity Timeout Pattern
 
-`runAgentTurnWithActivityTimeout()` in `gateway.js` (line 119) implements a
+`runAgentTurnWithActivityTimeout()` in `gateway.js` implements a
 two-tier timeout for the `/v1/chat/completions` call:
 
 ### Absolute Timeout
@@ -646,7 +645,7 @@ If a profile is found, it replaces `'inherit'` with the resolved profile ID
 string. If no main session profile is found, `'inherit'` is passed through
 as-is to the gateway.
 
-Reference: `dispatcher-strategies.js` lines 578-601.
+Reference: `dispatcher-strategies.js` `executeAgent()`.
 
 ### "provider:label" (explicit)
 A specific provider and label string (e.g. `anthropic:production`) is passed
@@ -708,7 +707,7 @@ This path requires matching receiver-side support in the gateway. Until that
 support is available, `auth_profile` forwarding remains the compatibility path
 for agent-side credential selection.
 
-Reference: `gateway.js` (`buildEnvInjectHeader()`, `runAgentTurn()`,
+Reference: `gateway.js` (`runAgentTurn()`,
 `runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
 (`executeAgent()`).
 
@@ -773,9 +772,9 @@ For the broader trust architecture that frames this provider trust boundary
 within the scheduler/child execution model, see `docs/trust-architecture.md`.
 
 Reference:
-- `dispatcher.js` lines 818-819
-- `provider-registry.js` lines 8-35
-- `v02-runtime.js` lines 50-122, 250-324, 338-414
+- `dispatcher.js` `main()` (provider loading at startup)
+- `provider-registry.js` `loadProviders()`
+- `v02-runtime.js` (`resolveIdentity()`, `verifyAuthorizationProof()`, `evaluateAuthorization()`)
 
 ---
 
