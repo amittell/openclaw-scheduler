@@ -203,15 +203,19 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
       && deliveryContent?.trim();
 
+    const deliveryOpts = result.imageAttachments?.length > 0
+      ? { imageAttachments: result.imageAttachments }
+      : {};
+
     if (shouldAnnounce) {
       if (result.deliveryOverride) {
-        await handleDelivery(job, result.deliveryOverride);
+        await handleDelivery(job, result.deliveryOverride, deliveryOpts);
       } else if (result.status === 'error') {
         const willRetry = (job.max_retries ?? 0) > 0 && (ctx.run.retry_count || 0) < job.max_retries;
         const retryLabel = willRetry ? 'will retry' : 'no retries configured';
-        await handleDelivery(job, `\u26a0\ufe0f Job soft-failed (${retryLabel}): ${job.name}\n\n${deliveryContent}`);
+        await handleDelivery(job, `\u26a0\ufe0f Job soft-failed (${retryLabel}): ${job.name}\n\n${deliveryContent}`, deliveryOpts);
       } else {
-        await handleDelivery(job, deliveryContent);
+        await handleDelivery(job, deliveryContent, deliveryOpts);
       }
     }
   }
@@ -1008,6 +1012,9 @@ export async function executeShell(job, ctx, deps) {
   result.summary = shellResult.summary;
   result.errorMessage = shellResult.errorMessage;
   result.content = shellResult.deliveryText;
+  if (shellResult.imageAttachments?.length > 0) {
+    result.imageAttachments = shellResult.imageAttachments;
+  }
   result.runFinishFields = {
     context_summary: shellResult.contextSummary,
     shell_exit_code: shellResult.exitCode,

@@ -81,8 +81,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Output handling (v14)
   output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536,
-  output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000,
-  output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000,
+  output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 65536,
+  output_summary_limit_bytes INTEGER NOT NULL DEFAULT 65536,
   output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
 
   -- Session continuity (v9)

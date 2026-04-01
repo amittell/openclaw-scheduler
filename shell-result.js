@@ -4,8 +4,8 @@ import { getResolvedDbPath } from './db.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from './paths.js';
 
 export const DEFAULT_STORE_LIMIT = 64 * 1024;
-export const DEFAULT_EXCERPT_LIMIT = 2000;
-export const DEFAULT_SUMMARY_LIMIT = 5000;
+export const DEFAULT_EXCERPT_LIMIT = 64 * 1024;
+export const DEFAULT_SUMMARY_LIMIT = 64 * 1024;
 export const DEFAULT_OFFLOAD_THRESHOLD = 64 * 1024;
 
 function toText(value) {
@@ -92,7 +92,24 @@ export function normalizeShellResult(
     artifactsDir = resolveArtifactsDir({ dbPath: getResolvedDbPath() }),
   } = {}
 ) {
-  const stdoutText = toText(stdout);
+  const rawStdout = toText(stdout);
+
+  // Extract [IMAGE:path] markers from stdout before processing.
+  // Scripts can signal image attachments by writing lines like:
+  //   [IMAGE:/tmp/chart.png]
+  //   [IMAGE:/tmp/report.pdf]
+  // Extracted paths are passed through to the delivery layer.
+  const IMAGE_MARKER_RE = /^\[IMAGE:(\/[^\]\n]+)\]$/gm;
+  const imageAttachments = [];
+  let match;
+  while ((match = IMAGE_MARKER_RE.exec(rawStdout)) !== null) {
+    imageAttachments.push(match[1]);
+  }
+  // Strip markers from stdout so they don't appear in delivery text
+  const stdoutText = imageAttachments.length > 0
+    ? rawStdout.replace(IMAGE_MARKER_RE, '').replace(/\n{3,}/g, '\n\n').trim()
+    : rawStdout;
+
   const stderrText = toText(stderr);
   const stdoutBytes = textBytes(stdoutText);
   const stderrBytes = textBytes(stderrText);
@@ -144,6 +161,7 @@ export function normalizeShellResult(
     stderrTruncated: stderrStored.truncated,
     summary: truncateText(previewText, summaryLimit).text,
     deliveryText: previewText,
+    imageAttachments,
     errorMessage,
     contextSummary: {
       shell_result: {
