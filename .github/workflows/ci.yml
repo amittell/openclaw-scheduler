@@ -27,7 +27,8 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
-          - windows-latest
+          # windows-latest: disabled until test suite path handling is
+          # cross-platform. Windows installs use WSL2 (see INSTALL-WINDOWS.md).
 
     steps:
       - name: Checkout
