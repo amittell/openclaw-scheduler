@@ -386,6 +386,13 @@ This is a high-trust boundary: every file in that directory is dynamically impor
 at scheduler startup. The directory must not be world-writable. See
 `docs/gateway-contract.md` for the full provider plugin contract.
 
+### Adopting jobs under agentcli
+
+If you install agentcli after upgrading, you can adopt existing scheduler jobs
+into declarative manifests. See [AGENTS.md](AGENTS.md#adding-agentcli-later-adopting-existing-jobs)
+for the adoption flow and [README.md](README.md#adopting-existing-scheduler-jobs)
+for detailed examples.
+
 ---
 
 ## Troubleshooting

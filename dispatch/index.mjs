@@ -332,7 +332,7 @@ function readSessionsStore(agent = 'main') {
  * Reads sessions.json, finds sessions active within the last 10 minutes,
  * excludes subagent sessions, returns deliveryContext.to of the most recent one.
  *
- * @returns {string|null} - e.g. "telegram:-1001234567890", or null if not found
+ * @returns {string|null} - e.g. "telegram:-100200000000", or null if not found
  */
 function getActiveOriginFromSessions() {
   const store = readSessionsStore("main");
@@ -362,8 +362,8 @@ function getActiveOriginFromSessions() {
       const deliveryTo = session.deliveryContext?.to || null;
       if (deliveryTo) {
         bestTime = updatedAt;
-        // deliveryContext.to format: "telegram:-1001234567890"
-        // Convert to origin format: "telegram:-1001234567890"
+        // deliveryContext.to format: "telegram:-100200000000"
+        // Convert to origin format: "telegram:-100200000000"
         best = deliveryTo;
       }
     }
@@ -616,7 +616,7 @@ async function cmdEnqueue(flags) {
   if (isAgentTurn && !deliverTo && !noMonitor) {
     die(
       "REJECTED: --deliver-to is required for dispatch jobs.\n" +
-      "Pass --deliver-to <chat_id> (e.g. --deliver-to -1001234567890 for a group, " +
+      "Pass --deliver-to <chat_id> (e.g. --deliver-to -100200000000 for a group, " +
       "or --deliver-to 123456789 for a DM).\n" +
       "Alternatively, pass --origin telegram:<chat_id> to auto-derive the delivery target.\n" +
       "Pass --no-monitor \"<reason>\" only if you explicitly want to skip delivery (audit trail required).",

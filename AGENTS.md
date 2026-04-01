@@ -121,7 +121,7 @@ Signal, iMessage, and Slack.
 Set `delivery_channel` and `delivery_to` on the job, or use delivery aliases:
 
 ```bash
-openclaw-scheduler alias add ops_team telegram -1001234567890
+openclaw-scheduler alias add ops_team telegram -100200000000
 # Then use @ops_team as delivery_to in any job
 ```
 

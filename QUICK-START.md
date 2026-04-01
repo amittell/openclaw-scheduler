@@ -106,7 +106,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/check-api.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -130,7 +130,7 @@ ocs jobs add '{
   "payload_message": "Summarize the most important errors and follow-ups from the last 24 hours.",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -154,7 +154,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/nightly-backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -170,7 +170,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/verify-backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -243,3 +243,10 @@ For `announce` and `announce-always`, you must set `delivery_channel` and `deliv
 - [BEST-PRACTICES.md](BEST-PRACTICES.md) -- operational patterns and anti-patterns
 - [README.md](README.md) -- full reference manual (chains, retries, approvals, messaging, etc.)
 - [UNINSTALL.md](UNINSTALL.md) -- how to remove the scheduler and restore built-in cron
+
+### Optional: agentcli
+
+For declarative workflow manifests, stable job IDs, and v0.2 identity support,
+install [agentcli](https://github.com/amittell/agentcli) and use `agentcli apply`
+to manage jobs. See [Working with agentcli](README.md#working-with-agentcli) in
+the README.
