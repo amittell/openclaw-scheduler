@@ -296,6 +296,10 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (mode === 'create' || 'schedule_tz' in normalized) {
     assertSafeString('schedule_tz', merged.schedule_tz || 'UTC', { maxLength: 128 });
+    if (merged.schedule_tz && merged.schedule_tz !== 'UTC') {
+      try { Intl.DateTimeFormat(undefined, { timeZone: merged.schedule_tz }); }
+      catch { throw new Error(`schedule_tz "${merged.schedule_tz}" is not a valid IANA timezone`); }
+    }
   }
 
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);

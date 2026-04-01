@@ -1239,6 +1239,10 @@ export async function executeStrategy(job, ctx, deps) {
         log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
           jobId: job.id, runId: ctx.run.id,
         });
+        if (job.delivery_mode === 'announce' || job.delivery_mode === 'announce-always') {
+          const retryMsg = `Job "${job.name}" failed with exception, retry ${retry.retryCount}/${job.max_retries} scheduled`;
+          await handleDelivery(job, retryMsg);
+        }
         getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
         if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
         if (dequeueJob(job.id)) {

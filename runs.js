@@ -86,8 +86,8 @@ export function finishRun(id, status, opts = {}) {
   `).run(
     status,
     durationMs,
-    opts.summary || null,
-    opts.error_message || null,
+    opts.summary ?? null,
+    opts.error_message ?? null,
     opts.context_summary ? JSON.stringify(opts.context_summary) : null,
     opts.shell_exit_code ?? null,
     opts.shell_signal ?? null,
@@ -178,6 +178,7 @@ export function getTimedOutRuns() {
     FROM runs r
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
+      AND r.run_timeout_ms IS NOT NULL
       AND (julianday('now') - julianday(r.started_at)) * 86400000 > r.run_timeout_ms
   `).all();
 }
