@@ -2,21 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.1] -- 2026-04-01
 
 ### Fixed
 - fix(watcher): exit cleanly when session status=done (PR #1)
 - fix(watchdog): prevent auto-resolving active sessions with heartbeat + hard ceiling (PR #2)
 - fix(gateway): reset idle timer while fetch is in flight (PR #3)
 - fix(watcher): prevent premature kill of active subagent sessions with JSONL activity signal (PR #7)
+- fix(db): add SQLite busy_timeout (5s) to prevent SQLITE_BUSY on CLI + dispatcher contention
+- fix(approvals): prevent double-dispatch race on auto-approved jobs
+- fix(watcher): cap deadline extension at min(timeout, 4h) to prevent zombie watchers
+- fix(runs): preserve empty string summary/error_message (use ?? instead of ||)
+- fix(runs): guard getTimedOutRuns against NULL run_timeout_ms on legacy rows
+- fix(gateway): use byte length for Telegram message chunking (4096-byte limit)
+- fix(jobs): validate schedule_tz as real IANA timezone via Intl.DateTimeFormat
+- fix(dispatcher): wrap delete_after_run cleanup in transaction
+- fix(dispatch): remove 4000-char truncation in formatMessageForDelivery
+- fix(dispatch): add retry exception path delivery announcement
+- fix(dispatch): fix dispatch CLI subcommand routing in bin wrapper
 
 ### Added
 - feat: v0.2 runtime with identity/trust/authorization/evidence/credential handoff (PR #4)
 - feat: x-openclaw-env-inject header for agent task credentials (PR #5)
+- feat: [IMAGE:path] marker protocol for shell job image attachments
+- feat: auto-delete watcher and watchdog jobs after completion (delete_after_run)
+- feat: enforce delivery_to as required field on job INSERT
+- feat: multi-platform CI (Linux, macOS, Windows)
 - docs: trust architecture, multi-agent gateway routing, agent adoption files
+- docs: AGENTS.md, CONTEXT.md, JOB-QUICK-REF.md for agent adoption
 
 ### Changed
 - chore: replace non-ASCII characters with ASCII equivalents (PR #6)
+- chore: bump output_excerpt_limit and output_summary_limit defaults to 64KB
 
 ## [0.2.0] -- 2026-03-11
 
