@@ -2579,9 +2579,9 @@ console.log('\n-- Origin Field (v20) --');
     payload_message: 'test',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
-    origin: 'telegram:-1001234567890',
+    origin: 'telegram:-100200000000',
   });
-  assert(groupJob.origin === 'telegram:-1001234567890', 'createJob stores group chat origin');
+  assert(groupJob.origin === 'telegram:-100200000000', 'createJob stores group chat origin');
   deleteJob(groupJob.id);
 
   // Child jobs are exempt from origin requirement
@@ -6973,7 +6973,7 @@ console.log('\n-- dispatch/index.mjs --deliver-to error message --');
 
   // Verify improved error message contains --deliver-to guidance
   assert(indexSrc.includes('REJECTED: --deliver-to is required for dispatch jobs'), 'dispatch error: REJECTED prefix present');
-  assert(indexSrc.includes('-1001234567890'), 'dispatch error: generic group ID example present');
+  assert(indexSrc.includes('-100200000000'), 'dispatch error: generic group ID example present');
   assert(indexSrc.includes('123456789'), 'dispatch error: generic DM example present');
   assert(indexSrc.includes('--origin telegram:<chat_id>'), 'dispatch error: --origin auto-derive guidance present');
   assert(indexSrc.includes('audit trail required'), 'dispatch error: --no-monitor audit trail note present');

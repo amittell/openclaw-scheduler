@@ -61,9 +61,11 @@ In practice, this gives you:
 34. [Best Practices](#best-practices)
 35. [File Reference](#file-reference)
 36. [Testing](#testing)
-37. [Companion Scripts](#companion-scripts)
-38. [Sub-agent Dispatch](#sub-agent-dispatch)
-39. [Troubleshooting](#troubleshooting)
+37. [Sub-agent Dispatch](#sub-agent-dispatch)
+38. [Working with agentcli](#working-with-agentcli)
+39. [Trust Architecture](#trust-architecture)
+40. [Troubleshooting](#troubleshooting)
+41. [Companion Scripts](#companion-scripts)
 
 ---
 
@@ -321,7 +323,7 @@ ocs jobs add '{
   "payload_message": "curl -fsS http://127.0.0.1:8080/health || exit 1",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -344,7 +346,7 @@ ocs jobs add '{
   "payload_message": "Summarize the last 24 hours of important errors, deploys, and follow-ups in 5 bullet points.",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -370,7 +372,7 @@ ocs jobs add '{
   "payload_message": "find /backups -type f -mtime +14 -delete",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -432,7 +434,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/check-api.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -452,7 +454,7 @@ ocs jobs add '{
   "payload_message": "Summarize the most important errors, deploys, and follow-ups from the last 24 hours in 5 bullet points.",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -476,7 +478,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/nightly-backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -493,7 +495,7 @@ ocs jobs add '{
   "payload_message": "/usr/local/bin/verify-backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -516,7 +518,7 @@ ocs jobs add '{
   "payload_message": "find /tmp/myapp -type f -mtime +7 -delete",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }'
 ```
@@ -717,7 +719,7 @@ Delivery aliases let you define named delivery targets (e.g., `@my_team`) instea
 
 ```bash
 # Create a named alias
-openclaw-scheduler alias add my_team telegram -1001234567890
+openclaw-scheduler alias add my_team telegram -100200000000
 
 # Use @alias in job (resolves at dispatch time)
 openclaw-scheduler jobs add '{
@@ -751,7 +753,7 @@ openclaw-scheduler jobs add '{
   "payload_message": "/path/to/backup.sh",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }'
 ```
 
@@ -775,7 +777,7 @@ openclaw-scheduler jobs add '{
   "payload_message": "PGPASSWORD=secret pg_dump mydb > /backups/mydb.sql && echo OK",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }'
 ```
 
@@ -870,7 +872,7 @@ openclaw-scheduler tasks create '{
   "expected_agents": ["schema-agent","frontend-agent","docs-agent"],
   "timeout_s": 1800,
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }'
 
 # Monitor
@@ -926,7 +928,7 @@ openclaw-scheduler jobs add '{
   "parent_id": "abc123...",
   "trigger_on": "failure",
   "delivery_mode": "announce",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }'
 ```
 
@@ -1122,10 +1124,10 @@ openclaw-scheduler jobs add '{
   "name": "Inbox Consumer",
   "schedule_cron": "*/5 * * * *",
   "session_target": "shell",
-  "payload_message": "npm exec --prefix ~/.openclaw/scheduler openclaw-inbox-consumer -- --to YOUR_TELEGRAM_ID",
+  "payload_message": "npm exec --prefix ~/.openclaw/scheduler openclaw-inbox-consumer -- --to YOUR_CHAT_ID",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "run_timeout_ms": 60000
 }'
 ```
@@ -1704,7 +1706,7 @@ openclaw-scheduler enqueue \
   --mode        fresh                                                         \
   --thinking    high                                                          \
   --timeout     3600                                                          \
-  --deliver-to  YOUR_TELEGRAM_ID                                                     \
+  --deliver-to  YOUR_CHAT_ID                                                     \
   --delivery-mode announce
 
 # Fallback (if openclaw-scheduler is not in PATH):

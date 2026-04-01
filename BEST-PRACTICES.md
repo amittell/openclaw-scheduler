@@ -309,7 +309,7 @@ For watchdog and health-check jobs, instruct the agent to reply `HEARTBEAT_OK` w
   "payload_message": "Check disk usage on all mounted filesystems. If all mounts are under 80% full, reply with exactly: HEARTBEAT_OK\nIf any mount is 80% or more, describe the affected mounts and their usage.",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }
 ```
 
@@ -337,7 +337,7 @@ node ~/.openclaw/scheduler/cli.js jobs add '{
   "payload_message": "Send Jordan a reminder to review the PR they opened this morning. Be specific about which PR.",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "delete_after_run": true
 }'
 ```
@@ -399,7 +399,7 @@ TRACKER_ID=$(node ~/.openclaw/scheduler/cli.js tasks create '{
   "expectedAgents": ["writer", "reviewer"],
   "timeoutS": 3600,
   "deliveryChannel": "telegram",
-  "deliveryTo": "YOUR_TELEGRAM_ID"
+  "deliveryTo": "YOUR_CHAT_ID"
 }' | grep '"id"' | cut -d'"' -f4)
 ```
 

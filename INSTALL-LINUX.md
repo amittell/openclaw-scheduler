@@ -307,7 +307,7 @@ const job = createJob({
   payload_message: 'Confirm scheduler is working. Send a brief greeting.',
   delivery_mode: 'announce',
   delivery_channel: 'telegram',
-  delivery_to: 'YOUR_TELEGRAM_ID',
+  delivery_to: 'YOUR_CHAT_ID',
   delete_after_run: true,
   origin: 'system',
   run_timeout_ms: 300000,

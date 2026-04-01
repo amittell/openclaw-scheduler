@@ -55,6 +55,17 @@ All PRs target `main`. There are no long-lived feature branches.
 3. `npm publish` -- `prepublishOnly` re-runs the verification gate
 4. Push the version commit and tag: `git push && git push --tags`
 
+### Agent-Facing Documentation
+
+The following files ship in the npm package for agent adoption:
+
+- `AGENTS.md` -- discovery flow, working rules, CLI commands
+- `CONTEXT.md` -- repo positioning, design bias
+- `JOB-QUICK-REF.md` -- copy-paste job patterns, field reference
+- `docs/` -- gateway contract, trust architecture, ADRs
+
+Update these when adding new features or changing the CLI API.
+
 ## Pull Requests
 
 - explain whether the change affects runtime behavior, package/install behavior, or both

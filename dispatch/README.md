@@ -59,7 +59,7 @@ node dispatch/index.mjs enqueue \
   --model   anthropic/claude-sonnet-4-6 \
   --thinking high                   \
   --timeout  300                    \
-  --deliver-to YOUR_TELEGRAM_ID     \
+  --deliver-to YOUR_CHAT_ID     \
   --deliver-channel telegram        \
   --delivery-mode announce
 ```
@@ -327,7 +327,7 @@ openclaw-scheduler jobs add '{
   "payload_message": "node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_TELEGRAM_ID"
+  "delivery_to": "YOUR_CHAT_ID"
 }'
 ```
 
