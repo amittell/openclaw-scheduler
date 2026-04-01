@@ -22,7 +22,9 @@ export const SCHEDULER_SCHEMAS = {
       max_trigger_fanout: { type: 'integer', min: 1, default: 25 },
       delivery_mode: { type: 'string', enum: ['announce', 'announce-always', 'none'], default: 'announce' },
       delivery_channel: { type: 'string', nullable: true },
-      delivery_to: { type: 'string', nullable: true },
+      // REQUIRED on insert for non-exempt jobs. Exempt: job_type='watchdog', name starts with 'watchdog:',
+      // session_target='main', or delivery_mode='none'. Set to the origin chat_id so results reach the right chat.
+      delivery_to: { type: 'string', nullable: true, required: 'non-system jobs', description: 'Target chat/user id for delivery (e.g. telegram chat_id). Required on insert for non-system jobs.' },
       parent_id: { type: 'string', nullable: true },
       trigger_on: { type: 'string', enum: ['success', 'failure', 'complete'], nullable: true },
       trigger_delay_s: { type: 'integer', min: 0, default: 0 },
