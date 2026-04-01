@@ -264,20 +264,6 @@ pm2 start dispatcher.js --name openclaw-scheduler `
 
 ---
 
-## Optional: QMD Memory Daemon
-
-If your OpenClaw instance uses QMD for hybrid memory search:
-
-- **WSL2:** Follow the QMD daemon section in [INSTALL-LINUX.md](INSTALL-LINUX.md) — systemd works identically inside WSL2.
-- **Native Windows (PM2):** Not supported. QMD daemon requires a POSIX shell and Metal/CUDA GPU drivers. Run QMD inside WSL2 even if the rest of OpenClaw is native.
-
-Three rules apply on all platforms — see [BEST-PRACTICES.md](BEST-PRACTICES.md) → "Shell Daemon Keepalive Jobs":
-1. Wrapper script must block on the daemon PID — never exit after setup
-2. Keepalive job must call `deep_search` (not BM25 `qmd search`) to actually warm GPU models
-3. Session files must not live in `/tmp` — use `XDG_CACHE_HOME` for persistence across reboots
-
----
-
 ## Rollback
 
 ```powershell
