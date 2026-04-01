@@ -15,7 +15,7 @@ Copy-paste patterns for common scheduler jobs.
   "run_timeout_ms": 600000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }
 ```
@@ -34,8 +34,8 @@ Copy-paste patterns for common scheduler jobs.
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
-  "origin": "CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "origin": "YOUR_CHAT_ID"
 }
 ```
 
@@ -66,7 +66,7 @@ openclaw-scheduler jobs add '{
   "run_timeout_ms": 600000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }' --at '2026-04-01T14:00:00-04:00'
 ```
@@ -91,7 +91,7 @@ openclaw-scheduler jobs add '{ ... }' --in '2h'
     "run_timeout_ms": 300000,
     "delivery_mode": "announce",
     "delivery_channel": "telegram",
-    "delivery_to": "CHAT_ID",
+    "delivery_to": "YOUR_CHAT_ID",
     "origin": "system"
   },
   {
@@ -104,7 +104,7 @@ openclaw-scheduler jobs add '{ ... }' --in '2h'
     "run_timeout_ms": 300000,
     "delivery_mode": "announce",
     "delivery_channel": "telegram",
-    "delivery_to": "CHAT_ID",
+    "delivery_to": "YOUR_CHAT_ID",
     "origin": "system"
   }
 ]
@@ -123,11 +123,9 @@ Create parent first, then child with `parent_id` set to the parent's ID.
   "payload_message": "sync-api.sh",
   "run_timeout_ms": 120000,
   "max_retries": 3,
-  "retry_delay_s": 60,
-  "retry_backoff": "exponential",
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }
 ```
@@ -145,7 +143,7 @@ Create parent first, then child with `parent_id` set to the parent's ID.
   "approval_timeout_s": 3600,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }
 ```
@@ -170,8 +168,8 @@ openclaw-scheduler jobs reject <id> "not ready yet"
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
-  "origin": "CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "origin": "YOUR_CHAT_ID"
 }
 ```
 
@@ -195,25 +193,25 @@ openclaw-scheduler jobs reject <id> "not ready yet"
 | `schedule_tz` | string | no | Timezone (default: UTC) |
 | `session_target` | string | yes | `shell`, `isolated`, or `main` |
 | `agent_id` | string | no | Target agent (default: `main`) |
-| `payload_kind` | string | yes | `shellCommand` or `systemEvent` |
+| `payload_kind` | string | yes | `shellCommand`, `systemEvent`, or `agentTurn` |
 | `payload_message` | string | yes | Shell command or agent prompt |
 | `payload_model` | string | no | Model override for agent tasks |
 | `run_timeout_ms` | integer | yes | Max run duration in ms (no default) |
 | `delivery_mode` | string | no | `none`, `announce`, `announce-always` |
 | `delivery_channel` | string | no | Channel name (telegram, discord, etc.) |
 | `delivery_to` | string | no | Chat ID, channel ID, or @alias |
-| `origin` | string | yes | Source chat ID or `system` |
+| `origin` | string | yes (root jobs only; child jobs inherit) | Source chat ID or `system` |
 | `parent_id` | string | no | Parent job ID (for chains) |
 | `trigger_on` | string | no | `success`, `failure`, `complete` |
 | `trigger_condition` | string | no | `contains:X` or `regex:X` |
 | `trigger_delay_s` | integer | no | Delay before trigger fires |
 | `max_retries` | integer | no | Retry count on failure |
-| `retry_delay_s` | integer | no | Delay between retries |
-| `retry_backoff` | string | no | `fixed` or `exponential` |
 | `overlap_policy` | string | no | `allow`, `skip`, `queue` |
 | `approval_required` | boolean | no | Require HITL approval |
 | `approval_timeout_s` | integer | no | Approval window in seconds |
 | `enabled` | integer | no | 1 (enabled) or 0 (disabled) |
+
+For the full field list, run `openclaw-scheduler schema jobs`.
 
 ## Delivery channels
 

@@ -461,7 +461,9 @@ and fires jobs independently of your chat sessions.
 - List jobs: `openclaw-scheduler jobs list`
 - Add job: `openclaw-scheduler jobs add '<json>'`
 - View runs: `openclaw-scheduler runs list <job-id>`
-- Force run now: `sqlite3 scheduler.db "UPDATE jobs SET next_run_at = datetime('now','-1 second') WHERE name = 'Job Name'"`
+- Force run now: `openclaw-scheduler jobs run <id>`
+
+> **Warning:** Avoid direct `sqlite3 ... UPDATE jobs SET next_run_at` statements against the live database. SQLite WAL locking can conflict with the running scheduler process and cause SQLITE_BUSY errors or stale reads. Use the CLI command above instead -- it enqueues through the dispatch queue safely.
 - Logs: `tail -f /tmp/openclaw-scheduler.log`
 
 ### When you receive a scheduled prompt

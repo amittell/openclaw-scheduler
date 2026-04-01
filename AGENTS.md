@@ -46,7 +46,7 @@ Successful operations return:
 
 When first interacting with `openclaw-scheduler`, use this sequence:
 
-1. `openclaw-scheduler --json` -- show usage (with `--json` for structured help)
+1. `openclaw-scheduler` -- show usage (plain-text help output)
 2. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
 3. `openclaw-scheduler agents list --json` -- see registered agents
 4. `openclaw-scheduler schema jobs` -- get the job field schema
@@ -66,8 +66,8 @@ Every job needs at minimum:
   "payload_kind": "shellCommand",
   "payload_message": "echo hello",
   "run_timeout_ms": 300000,
-  "delivery_to": "CHAT_ID",
-  "origin": "CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "origin": "YOUR_CHAT_ID"
 }
 ```
 
@@ -85,9 +85,9 @@ openclaw-scheduler jobs add '{ ... }' --in '15m'
 
 ```bash
 # Parent runs on cron
-openclaw-scheduler jobs add '{ "name": "Collect", "schedule_cron": "0 6 * * *", ... }'
+openclaw-scheduler jobs add '{ "name": "Collect", "schedule_cron": "0 6 * * *", "run_timeout_ms": 300000, "origin": "system", ... }'
 # Child triggers on parent success
-openclaw-scheduler jobs add '{ "name": "Process", "parent_id": "<PARENT_ID>", "trigger_on": "success", ... }'
+openclaw-scheduler jobs add '{ "name": "Process", "parent_id": "<PARENT_ID>", "trigger_on": "success", "run_timeout_ms": 300000, "origin": "system", ... }'
 ```
 
 ## Managing Jobs
@@ -140,7 +140,7 @@ openclaw-scheduler alias add ops_team telegram -100200000000
   "run_timeout_ms": 600000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }
 ```
@@ -158,8 +158,8 @@ openclaw-scheduler alias add ops_team telegram -100200000000
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
-  "origin": "CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "origin": "YOUR_CHAT_ID"
 }
 ```
 
@@ -167,9 +167,7 @@ openclaw-scheduler alias add ops_team telegram -100200000000
 
 ```json
 {
-  "max_retries": 3,
-  "retry_delay_s": 60,
-  "retry_backoff": "exponential"
+  "max_retries": 3
 }
 ```
 
@@ -229,7 +227,7 @@ Replace `heartbeat.every` with a scheduler job:
   "run_timeout_ms": 30000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "CHAT_ID",
+  "delivery_to": "YOUR_CHAT_ID",
   "origin": "system"
 }
 ```

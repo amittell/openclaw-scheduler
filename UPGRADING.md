@@ -156,20 +156,15 @@ All tests must pass before restarting the service. If tests fail, do not restart
 
 ---
 
-## Step 4: Run Migrations (if needed)
+## Step 4: Schema Migrations
 
-The dispatcher runs pending schema migrations automatically on startup. You do not normally need to run them manually.
+The dispatcher runs pending schema migrations automatically on startup. No manual migration step is needed.
 
-If the CHANGELOG mentions a schema migration, you can apply it ahead of the restart:
+Note: `migrate.js` is the OC cron importer (for importing jobs from the old OC cron system), not the schema migrator. Do not run it expecting schema changes.
+
+To verify the current schema version:
 
 ### macOS / Linux / Windows WSL2
-
-```bash
-cd ~/.openclaw/scheduler
-node migrate.js
-```
-
-To verify the schema version after migration:
 
 ```bash
 cd ~/.openclaw/scheduler
@@ -180,7 +175,6 @@ node -e "const db=require('better-sqlite3')('scheduler.db');console.log(db.prepa
 
 ```powershell
 cd $env:USERPROFILE\.openclaw\scheduler
-node migrate.js
 node -e "const db=require('better-sqlite3')('scheduler.db');console.log(db.prepare('SELECT MAX(version) as v FROM schema_migrations').get());db.close()"
 ```
 
@@ -274,7 +268,7 @@ There is no required upgrade order. Hosts do not share state and can run differe
 #### macOS host over SSH
 
 ```bash
-HOST=alexm@your-mac-host.lan
+HOST=youruser@your-mac-host.lan
 
 ssh $HOST "cd ~/.openclaw/scheduler && git pull && npm install"
 ssh $HOST "cd ~/.openclaw/scheduler && SCHEDULER_DB=:memory: node test.js" 2>&1 | tail -5
@@ -286,7 +280,7 @@ ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && cd ~/.openclaw/scheduler && no
 #### Linux / Windows WSL2 host over SSH
 
 ```bash
-HOST=alexm@your-linux-host.lan
+HOST=youruser@your-linux-host.lan
 
 ssh $HOST "cd ~/.openclaw/scheduler && git pull && npm install"
 ssh $HOST "cd ~/.openclaw/scheduler && SCHEDULER_DB=:memory: node test.js" 2>&1 | tail -5

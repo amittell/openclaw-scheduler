@@ -19,7 +19,7 @@ OpenClaw's built-in `cron/jobs.json` and heartbeat are fine for simple tasks. Th
 - **Retries** -- automatic retry with exponential backoff on failure
 - **Chains** -- parent/child jobs that trigger on success, failure, or output patterns
 - **Approval gates** -- human-in-the-loop before risky steps execute
-- **Delivery** -- send results to Telegram, with alias routing and chunking
+- **Delivery** -- send results to Telegram, Discord, WhatsApp, Signal, iMessage, or Slack, with alias routing and chunking
 - **Audit trail** -- every dispatch, retry, and delivery is recorded in SQLite
 
 | Before (built-in) | After (scheduler) |
@@ -104,6 +104,7 @@ ocs jobs add '{
   "schedule_cron": "*/5 * * * *",
   "session_target": "shell",
   "payload_message": "/usr/local/bin/check-api.sh",
+  "run_timeout_ms": 60000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
@@ -128,6 +129,7 @@ ocs jobs add '{
   "schedule_tz": "America/New_York",
   "session_target": "isolated",
   "payload_message": "Summarize the most important errors and follow-ups from the last 24 hours.",
+  "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
@@ -152,6 +154,7 @@ ocs jobs add '{
   "schedule_cron": "0 2 * * *",
   "session_target": "shell",
   "payload_message": "/usr/local/bin/nightly-backup.sh",
+  "run_timeout_ms": 300000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
@@ -168,6 +171,7 @@ ocs jobs add '{
   "trigger_delay_s": 60,
   "session_target": "shell",
   "payload_message": "/usr/local/bin/verify-backup.sh",
+  "run_timeout_ms": 60000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",

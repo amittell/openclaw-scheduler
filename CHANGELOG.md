@@ -2,13 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- fix(watcher): exit cleanly when session status=done (PR #1)
+- fix(watchdog): prevent auto-resolving active sessions with heartbeat + hard ceiling (PR #2)
+- fix(gateway): reset idle timer while fetch is in flight (PR #3)
+- fix(watcher): prevent premature kill of active subagent sessions with JSONL activity signal (PR #7)
+
+### Added
+- feat: v0.2 runtime with identity/trust/authorization/evidence/credential handoff (PR #4)
+- feat: x-openclaw-env-inject header for agent task credentials (PR #5)
+- docs: trust architecture, multi-agent gateway routing, agent adoption files
+
+### Changed
+- chore: replace non-ASCII characters with ASCII equivalents (PR #6)
+
 ## [0.2.0] -- 2026-03-11
 
 ### Added
 - Strategy pattern refactor: decomposed 614-line `dispatchJob` closure into explicit `DispatchContext` + strategy functions (`prepareDispatch`, `executeStrategy`, `finalizeDispatch`) in new `dispatcher-strategies.js`
 - Auth profile resolution for isolated agent turns: `auth_profile` field on jobs supports `'inherit'` (looks up main session profile) or explicit `'provider:label'`
 - Drain-error retry: transient infrastructure errors (HTTP 529) bypass normal retry ladder and re-enqueue immediately
-- One-shot `at`-style scheduling via `schedule_kind: 'at'` and `schedule_at` fields (schema v20)
+- One-shot `at`-style scheduling via `schedule_kind: 'at'` and `schedule_at` fields (schema v18)
 - Complete TypeScript type coverage: 26 previously missing function signatures, 4 corrected return types, 51 missing schema columns added to `index.d.ts`
 - Expanded type smoke tests from 23 to 192+ lines exercising all typed APIs
 - 5 new test coverage areas: dispatcher-utils, dispatch-queue lifecycle, approval timeout/prune/count, run session/context, prompt-context edge cases
@@ -27,11 +43,11 @@ All notable changes to this project will be documented in this file.
 - Default `schedule_tz` changed from `America/New_York` to `UTC` in schema, validation, and setup
 - `--json` mode wired through all CLI subcommands (msg, tasks, team, queue, idem) via `emit()`/`fail()` helpers
 - Dispatch subsystem portability: `process.execPath` replaces bare `node`, `__dirname`-relative paths replace hardcoded install paths
-- Dispatcher reduced from ~1200 lines to ~656 lines; `dispatchJob` is now a 5-line orchestrator
+- Dispatcher reduced from ~1200 lines to ~850 lines; `dispatchJob` is now a 5-line orchestrator (strategy code lives in `dispatcher-strategies.js`)
 - `buildDispatchDeps()` wires 36+ dependencies via dependency injection
 - Full validation gate moved into local verification commands (`npm run verify:local` / `npm run verify:smoke`); GitHub Actions now runs a single lightweight smoke job
-- Test baseline updated to 1037 passed
-- Schema baseline is now v21
+- Test baseline updated to 1410 passed
+- Schema baseline is now v23
 
 ## [0.1.0] -- 2026-03-08
 
