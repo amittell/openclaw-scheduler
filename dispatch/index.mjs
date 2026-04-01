@@ -871,6 +871,7 @@ async function cmdEnqueue(flags) {
           // Watcher constants: FLAT_WINDOW_MS=180s, MAX_DEADLINE_EXTENSION=4h.
           run_timeout_ms:           Math.max(watcherTimeoutS, 4 * 3600) * 1000
                                     + 420 * 1000,  // +7min headroom (2*FLAT_WINDOW + 1min slop)
+          delete_after_run:         1,             // auto-delete after watcher completes
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
@@ -910,6 +911,7 @@ async function cmdEnqueue(flags) {
           watchdog_alert_target:    alertTarget,
           watchdog_self_destruct:   1,
           watchdog_started_at:      new Date().toISOString(),
+          delete_after_run:         1,             // auto-delete after watchdog fires
           origin:                   origin || 'system',
         });
         const schedulerCli = join(__dirname, '..', 'cli.js');
