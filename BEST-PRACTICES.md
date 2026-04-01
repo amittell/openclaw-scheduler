@@ -70,23 +70,23 @@ Use `shell` when:
 
 #### Shell Daemon Keepalive Jobs — Critical Rules
 
-When using shell jobs to keep a background daemon (e.g. QMD, a model server, a vector DB) warm and running, three rules prevent silent failures:
+When using shell jobs to keep a background daemon (e.g. a model server, a vector DB, an MCP bridge) warm and running, three rules prevent silent failures:
 
 **Rule 1: The daemon wrapper script must block.**
 
 If your launchd/systemd service runs a wrapper script that sets up the daemon and then exits, the service manager restarts the script immediately -- potentially spawning multiple daemon instances fighting for the same port, causing hangs or crashes.
 
 ```bash
-# ❌ Wrong — script exits after setup, KeepAlive loops it immediately
+# Wrong -- script exits after setup, KeepAlive loops it immediately
 ./bridge.py daemon start   # starts daemon, initializes session, exits
-./bridge.py warmup         # exits → service restarts → another daemon spawns
+./bridge.py warmup         # exits -> service restarts -> another daemon spawns
 
-# ✅ Correct — start daemon in background, block on its PID
+# Correct -- start daemon in background, block on its PID
 ./mydaemon --port 8181 &
 DAEMON_PID=$!
 ./bridge.py daemon init    # session setup (runs once)
 ./bridge.py warmup         # pre-warm (runs once)
-wait $DAEMON_PID           # blocks until daemon dies → then service restarts cleanly
+wait $DAEMON_PID           # blocks until daemon dies -> then service restarts cleanly
 ```
 
 On macOS (`KeepAlive: true` launchd, whether LaunchAgent or LaunchDaemon) and Linux (`Restart=always` systemd), the moment your script exits the service manager restarts it. Always block on the daemon process with `wait $PID`.
@@ -96,16 +96,15 @@ On macOS (`KeepAlive: true` launchd, whether LaunchAgent or LaunchDaemon) and Li
 A keepalive that pings `/health` or runs a lightweight query does NOT keep ML/neural models warm in GPU memory. Only calls that trigger real model inference keep the models loaded.
 
 ```bash
-# ❌ Wrong — BM25 text search, no model loading, GPU models go cold
-qmd search "keepalive" --limit 1 --collection memory-root-main
+# Wrong -- lightweight health check, no model loading, GPU models go cold
+curl -sf http://localhost:8181/health
 
-# ✅ Correct — deep_search triggers embedding + reranker model inference
-python3 /path/to/mcporter-qmd.py call qmd.deep_search \
-  --args '{"query":"memory","limit":1,"minScore":0,"collection":"memory-root-main"}' \
-  --timeout 30000
+# Correct -- inference query triggers embedding + reranker model loading
+curl -sf http://localhost:8181/v1/embeddings \
+  -d '{"input":"keepalive","model":"default"}' > /dev/null
 ```
 
-Schedule model-warming keepalives at least every 10 minutes. Every 30 minutes is too infrequent — models unload from GPU between calls, causing cold-start delays (10–20s) on the next real query.
+Schedule model-warming keepalives at least every 10 minutes. Every 30 minutes is too infrequent -- models unload from GPU between calls, causing cold-start delays (10-20s) on the next real query.
 
 **Rule 3: Daemon session/state files must not live in `/tmp`.**
 
