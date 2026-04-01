@@ -305,17 +305,46 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
 
+  // INSERT-only: enforce delivery_to for all non-exempt jobs.
+  // Exempt from this requirement:
+  //   - job_type='watchdog' (internal health monitor jobs)
+  //   - name starts with 'watchdog:' (watchdog jobs by naming convention)
+  //   - session_target='main' (injects into the main session, no chat routing needed)
+  //   - delivery_mode='none' (explicitly opted out of delivery)
+  if (mode === 'create') {
+    const _target = merged.session_target || 'isolated';
+    const _dmode = merged.delivery_mode || 'announce';
+    const _type = merged.job_type || 'standard';
+    const _name = String(merged.name || '');
+    const _isExempt =
+      _type === 'watchdog' ||
+      _name.startsWith('watchdog:') ||
+      _target === 'main' ||
+      _dmode === 'none';
+    if (!_isExempt && (!merged.delivery_to || String(merged.delivery_to).trim() === '')) {
+      throw new Error(
+        'delivery_to is required on job insert. Set it to the origin chat_id ' +
+        '(e.g. -1001234567890 for a group chat, or 987654321 for a personal DM).'
+      );
+    }
+  }
+
   // Enforce: delivery_to is required when delivery_mode is explicitly set to
   // 'announce' or 'announce-always'. Validates on create (when delivery_mode is
   // explicitly provided) and on update (when delivery_mode is being changed or
   // the merged record would end up in announce mode without a delivery_to).
+  // Exempt: watchdog jobs, session_target='main' (no external chat routing needed).
   {
     const modeExplicitlySet = 'delivery_mode' in normalized;
     const deliveryToExplicitlySet = 'delivery_to' in normalized;
     const effectiveMode = merged.delivery_mode || 'announce';
     const isAnnounceMode = ['announce', 'announce-always'].includes(effectiveMode);
+    const _announceExempt =
+      (merged.job_type || 'standard') === 'watchdog' ||
+      String(merged.name || '').startsWith('watchdog:') ||
+      (merged.session_target || 'isolated') === 'main';
 
-    if (isAnnounceMode && (mode === 'create' || modeExplicitlySet || deliveryToExplicitlySet)) {
+    if (isAnnounceMode && !_announceExempt && (mode === 'create' || modeExplicitlySet || deliveryToExplicitlySet)) {
       // Re-evaluate: if mode is being set to announce OR delivery_to is being
       // cleared on an announce-mode job, check the merged delivery_to is present.
       if (!merged.delivery_to || (typeof merged.delivery_to === 'string' && merged.delivery_to.trim() === '')) {
