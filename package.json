@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
   "main": "./index.js",
