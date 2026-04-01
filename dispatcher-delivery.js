@@ -6,7 +6,7 @@ export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
     return resolveDeliveryAlias(target);
   }
 
-  async function handleDelivery(job, content) {
+  async function handleDelivery(job, content, opts = {}) {
     if (!['announce', 'announce-always'].includes(job.delivery_mode)) return;
     if (!job.delivery_channel && !job.delivery_to) return;
 
@@ -24,7 +24,7 @@ export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
 
     try {
       const subject = (job.name || '').slice(0, 100);
-      sendMessage({
+      const msg = {
         from_agent: 'scheduler',
         to_agent:   'main',
         kind:       'result',
@@ -32,8 +32,15 @@ export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
         body:       content,
         channel,
         delivery_to: target,
-      });
-      log('info', `Enqueued: ${job.name}`, { channel, to: target });
+      };
+      // Pass image attachment paths so the message consumer can deliver them
+      // as photo/file attachments instead of plain text. Scripts signal this
+      // by writing [IMAGE:/path/to/file] markers to stdout.
+      if (opts.imageAttachments?.length > 0) {
+        msg.attachments = opts.imageAttachments;
+      }
+      sendMessage(msg);
+      log('info', `Enqueued: ${job.name}`, { channel, to: target, attachments: opts.imageAttachments?.length || 0 });
     } catch (err) {
       log('error', `Delivery enqueue failed: ${job.name}: ${err.message}`);
     }
