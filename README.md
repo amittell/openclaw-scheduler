@@ -204,7 +204,7 @@ npm run verify:local                 # full local maintainer gate
 npm run verify:smoke                 # lightweight smoke gate used by GitHub Actions
 ```
 
-GitHub Actions intentionally stays minimal: one Ubuntu/Node 20 smoke run on pushes to `main`, pull requests, or manual dispatch. The full release gate runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
+GitHub Actions runs the smoke gate plus the in-memory test suite on Linux, macOS, and Windows with Node 20. The full release gate still runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
 
 The package also exports a small safe programmatic API surface for tooling:
 
@@ -1804,7 +1804,7 @@ Check status at any time:
 
 ```bash
 openclaw-scheduler list --status running
-openclaw-scheduler status --label worker-schema
+openclaw-scheduler dispatch status --label worker-schema
 ```
 
 ### Branding and Configuration
@@ -1854,7 +1854,7 @@ openclaw-scheduler list --status running
 node ~/.openclaw/scheduler/dispatch/index.mjs stuck --threshold-min 15
 
 # Status for a specific label
-openclaw-scheduler status --label fix-deploy-script
+openclaw-scheduler dispatch status --label fix-deploy-script
 ```
 
 The watchdog disarms itself automatically when the agent calls `done`, when `status` or `sync` auto-resolves the session from gateway idle state, or when `result` is fetched after a successful completion.

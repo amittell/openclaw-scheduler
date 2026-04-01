@@ -29,8 +29,8 @@ For manifest authoring, validation, and identity/authorization profiles, use
 
 ## Error Handling
 
-CLI errors are written to stderr. With `--json`, structured output goes to
-stdout:
+CLI errors exit non-zero. In plain-text mode, the message goes to stderr. With
+`--json`, the structured error object goes to stdout:
 
 ```json
 { "ok": false, "error": "Human-readable error message" }
