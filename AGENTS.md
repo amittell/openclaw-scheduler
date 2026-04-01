@@ -192,17 +192,113 @@ scheduler serves all agents through one shared gateway.
 { "agent_id": "ops" }
 ```
 
-## Using with agentcli
+## Migrating from Built-in Cron/Heartbeat
 
-If `agentcli` is available, prefer it for complex workflows:
+OpenClaw's built-in `cron/jobs.json` and heartbeat work for simple tasks. The
+scheduler replaces them when jobs need run history, retries, chains, approvals,
+or delivery.
+
+### Import existing cron jobs
 
 ```bash
+openclaw-scheduler migrate    # imports from ~/.openclaw/cron/jobs.json
+openclaw-scheduler jobs list  # verify imported jobs
+```
+
+### Disable the old cron system
+
+After importing, disable the built-in cron so jobs do not run in both systems:
+
+```bash
+openclaw cron edit <job-id> --disable    # for each job
+openclaw config set cron.enabled false
+openclaw config set agents.defaults.heartbeat.every "0m"
+```
+
+### Heartbeat replacement
+
+Replace `heartbeat.every` with a scheduler job:
+
+```json
+{
+  "name": "Gateway Liveness Check",
+  "schedule_cron": "*/5 * * * *",
+  "session_target": "shell",
+  "payload_kind": "shellCommand",
+  "payload_message": "curl -sf http://127.0.0.1:18789/health || exit 1",
+  "run_timeout_ms": 30000,
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "CHAT_ID",
+  "origin": "system"
+}
+```
+
+See [QUICK-START.md](QUICK-START.md) for detailed migration examples including
+shell crons, agent prompts, and multi-step chains.
+
+## Using with agentcli
+
+agentcli is the control-plane companion. It provides declarative manifests,
+stable job IDs, workflow chain compilation, and v0.2 identity/authorization
+support. The scheduler works without it, but agentcli is preferred for
+complex workflows.
+
+### Installing alongside the scheduler (same time)
+
+```bash
+npm install -g agentcli
 agentcli validate manifest.json
 agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db --dry-run
 agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db
 ```
 
-agentcli provides stable job IDs, manifest validation, workflow chain
-compilation, and v0.2 identity/authorization support. See the
+Jobs created via `agentcli apply` use stable IDs (SHA256 of workflow:task) and
+can be updated by re-applying the same manifest.
+
+### Adding agentcli later (adopting existing jobs)
+
+If the scheduler already has jobs created directly via CLI or by the agent,
+agentcli can adopt them:
+
+1. Write a manifest with task names matching the existing job names.
+
+2. Run a one-time adoption by name:
+
+```bash
+agentcli apply manifest.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --adopt-by name --dry-run           # preview first
+
+agentcli apply manifest.json \
+  --db ~/.openclaw/scheduler/scheduler.db \
+  --adopt-by name                     # execute adoption
+```
+
+This replaces each matched job with a stable-ID version. The old job is
+deleted after the new one is created.
+
+3. On subsequent applies, use the default (no `--adopt-by` flag):
+
+```bash
+agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db
+```
+
+Jobs are now matched by stable ID, so the manifest can be renamed or
+reorganized without losing job mapping.
+
+### Full migration path: OOB cron -> scheduler -> agentcli
+
+1. Import OOB cron jobs: `openclaw-scheduler migrate`
+2. Disable built-in cron (see "Migrating from Built-in Cron" above)
+3. Verify jobs run correctly in the scheduler
+4. Install agentcli: `npm install -g agentcli`
+5. Write a manifest covering the imported jobs
+6. Adopt by name: `agentcli apply manifest.json --adopt-by name`
+7. Future updates: `agentcli apply manifest.json` (stable IDs)
+
+See the
 [agentcli AGENTS.md](https://github.com/amittell/agentcli/blob/main/AGENTS.md)
-for its agent instructions.
+for agentcli-specific agent instructions and the
+[MANIFEST-QUICK-REF.md](https://github.com/amittell/agentcli/blob/main/MANIFEST-QUICK-REF.md)
+for copy-paste manifest patterns.
