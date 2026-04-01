@@ -468,9 +468,11 @@ function updateJobAfterRun(job, status) {
   // At-jobs (one-shot): don't advance cron schedule -- delete or disable
   if (freshJob.schedule_kind === 'at') {
     if (freshJob.delete_after_run) {
-      updateJob(job.id, patch);
+      getDb().transaction(() => {
+        updateJob(job.id, patch);
+        deleteJob(job.id);
+      })();
       log('info', `Deleting one-shot at-job: ${job.name}`, { jobId: job.id });
-      deleteJob(job.id);
     } else {
       patch.enabled = 0; // Disable so it won't fire again via getDueAtJobs
       updateJob(job.id, patch);
@@ -491,11 +493,14 @@ function updateJobAfterRun(job, status) {
     if (backoffDate > nextDate) patch.next_run_at = backoffDate.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
   }
 
-  updateJob(job.id, patch);
-
   if (status === 'ok' && freshJob.delete_after_run) {
+    getDb().transaction(() => {
+      updateJob(job.id, patch);
+      deleteJob(freshJob.id);
+    })();
     log('info', `Deleting one-shot: ${freshJob.name}`);
-    deleteJob(freshJob.id);
+  } else {
+    updateJob(job.id, patch);
   }
 }
 

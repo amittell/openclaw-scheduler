@@ -342,23 +342,36 @@ export function resolveDeliveryAlias(rawTarget) {
   }
 }
 
-function chunkPlainText(message, maxLength) {
+function chunkPlainText(message, maxBytes) {
   const text = String(message ?? '');
-  if (text.length <= maxLength) return [text];
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return [text];
 
   const chunks = [];
   let rest = text;
-  const hardLimit = Math.max(256, maxLength - 12);
+  const hardLimit = Math.max(256, maxBytes - 12);
 
   while (rest.length > 0) {
-    if (rest.length <= hardLimit) {
+    if (Buffer.byteLength(rest, 'utf8') <= hardLimit) {
       chunks.push(rest);
       break;
     }
 
-    let splitAt = rest.lastIndexOf('\n', hardLimit);
-    if (splitAt < hardLimit * 0.5) splitAt = rest.lastIndexOf(' ', hardLimit);
-    if (splitAt < hardLimit * 0.5) splitAt = hardLimit;
+    // Walk forward tracking byte count to find the character index at the byte limit
+    let byteCount = 0;
+    let charLimit = 0;
+    for (let i = 0; i < rest.length; i++) {
+      const code = rest.codePointAt(i);
+      const charBytes = code > 0xFFFF ? 4 : code > 0x7FF ? 3 : code > 0x7F ? 2 : 1;
+      if (byteCount + charBytes > hardLimit) break;
+      byteCount += charBytes;
+      charLimit = i + 1;
+      // Skip surrogate pair trailing unit
+      if (code > 0xFFFF) i++;
+    }
+
+    let splitAt = rest.lastIndexOf('\n', charLimit);
+    if (splitAt < charLimit * 0.5) splitAt = rest.lastIndexOf(' ', charLimit);
+    if (splitAt < charLimit * 0.5) splitAt = charLimit;
 
     const part = rest.slice(0, splitAt).trimEnd();
     chunks.push(part);

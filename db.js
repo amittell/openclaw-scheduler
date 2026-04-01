@@ -25,6 +25,7 @@ export function getDb() {
     if (dbPath !== ':memory:') ensureSchedulerDbParent(dbPath);
     _db = new Database(dbPath);
     if (dbPath !== ':memory:') _db.pragma('journal_mode = WAL');
+    _db.pragma('busy_timeout = 5000');
     _db.pragma('foreign_keys = ON');
   }
   return _db;

@@ -16,6 +16,12 @@ export async function checkApprovals({
 
       if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
         resolveApproval(approval.id, 'approved', 'timeout');
+        getDb().prepare(`
+          UPDATE approvals
+          SET status = 'dispatched',
+              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
+          WHERE id = ? AND status = 'approved'
+        `).run(approval.id);
         log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
         if (approval.run_id) {
           getDb().prepare(`
@@ -31,12 +37,6 @@ export async function checkApprovals({
           approvalBypass: true,
           dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
         });
-        getDb().prepare(`
-          UPDATE approvals
-          SET status = 'dispatched',
-              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
-          WHERE id = ? AND status = 'approved'
-        `).run(approval.id);
       } else {
         resolveApproval(approval.id, 'timed_out', 'timeout');
         if (approval.dispatch_queue_id) setDispatchStatus(approval.dispatch_queue_id, 'cancelled');

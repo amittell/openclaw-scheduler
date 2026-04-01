@@ -840,16 +840,19 @@ let lastTokens = null;
 let preDeadlineJsonlMtime = null;  // JSONL mtime sampled each poll cycle for subagent activity signal
 let preDeadlineSessionId = null;   // reset on respawn to avoid cross-session mtime comparison
 const ROLLING_EXTEND_MS = 5 * 60 * 1000;            // extend by 5min when active
-const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // cap: never extend past 4h total
+const MAX_DEADLINE_EXTENSION = 4 * 60 * 60 * 1000;  // absolute hard ceiling for any deadline extension
 
 /**
  * Attempt to push the watcher deadline forward by ROLLING_EXTEND_MS, capped at
- * spawnTime + MAX_DEADLINE_EXTENSION.  Returns true if the deadline was actually moved.
+ * spawnTime + min(timeoutS, MAX_DEADLINE_EXTENSION).  This prevents a watcher
+ * from outliving its own timeout boundary via repeated JSONL mtime extensions.
+ * MAX_DEADLINE_EXTENSION (4h) is the absolute hard ceiling for any watcher.
+ * Returns true if the deadline was actually moved.
  * @param {string} reason - Human-readable reason for the log line
  */
 function tryExtendDeadline(reason) {
   const proposed = Date.now() + ROLLING_EXTEND_MS;
-  const cap = spawnTime + MAX_DEADLINE_EXTENSION;
+  const cap = spawnTime + Math.min(timeoutS * 1000, MAX_DEADLINE_EXTENSION);
   const extension = Math.min(proposed, cap);
   if (extension <= deadline) return false;
   deadline = extension;
