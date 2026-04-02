@@ -1140,18 +1140,13 @@ Use this when you want scripts to enqueue only actionable signals, then a single
 # 1) Enqueue a signal
 openclaw-scheduler msg send monitor-agent main "Found 3 critical errors in prod logs"
 
-# 2) Add a consumer shell job (every 5 minutes)
-openclaw-scheduler jobs add '{
-  "name": "Inbox Consumer",
-  "schedule_cron": "*/5 * * * *",
-  "session_target": "shell",
-  "payload_message": "npm exec --prefix ~/.openclaw/scheduler openclaw-inbox-consumer -- --to YOUR_CHAT_ID",
-  "delivery_mode": "announce",
-  "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID",
-  "run_timeout_ms": 60000,
-  "origin": "system"
-}'
+# 2) Run the inbox consumer daemon (event-driven, watches SQLite WAL)
+#    Delivers within ~250ms of a message landing in the DB.
+#    No polling cron needed — the daemon watches for WAL changes.
+node scripts/inbox-consumer.mjs --watch --to YOUR_CHAT_ID --channel telegram
+
+# Or as a one-shot drain (useful for testing):
+node scripts/inbox-consumer.mjs --to YOUR_CHAT_ID --channel telegram
 ```
 
 ---
