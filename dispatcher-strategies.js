@@ -1119,6 +1119,22 @@ export async function executeAgent(job, ctx, deps) {
     }
   }
 
+  // Apply auth profile to session store BEFORE the agent turn.
+  // The x-openclaw-auth-profile HTTP header is not read by the gateway (dead header).
+  // Writing authProfileOverride directly to sessions.json is the effective mechanism
+  // for auth profile propagation to isolated/embedded sessions.
+  if (resolvedAuthProfile && resolvedAuthProfile !== 'inherit') {
+    const { applyAuthProfileToSessionStore: applyAuthProfile } = deps;
+    if (typeof applyAuthProfile === 'function') {
+      const applyResult = applyAuthProfile(sessionKey, resolvedAuthProfile, job.agent_id || 'main');
+      if (applyResult.ok) {
+        log('debug', `Applied auth profile '${resolvedAuthProfile}' to session store for ${sessionKey}`, { jobId: job.id });
+      } else {
+        log('warn', `Failed to apply auth profile to session store: ${applyResult.error}`, { jobId: job.id, sessionKey });
+      }
+    }
+  }
+
   const turnResult = await runAgentTurnWithActivityTimeout({
     message: prompt,
     agentId: job.agent_id || 'main',

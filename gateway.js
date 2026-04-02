@@ -1,6 +1,6 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFileSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db.js';
@@ -470,4 +470,66 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
     }
   }
   return false;
+}
+
+/**
+ * Write authProfileOverride directly to the gateway's sessions.json store.
+ *
+ * The gateway reads sessions.json on each agent turn (with mtime-based cache
+ * invalidation), so writing here before dispatch ensures the embedded runner
+ * picks up the correct auth profile.
+ *
+ * The x-openclaw-auth-profile HTTP header sent by runAgentTurnWithActivityTimeout
+ * is NOT read by the gateway (dead header). This direct store write is the
+ * effective mechanism for auth profile propagation to isolated sessions.
+ *
+ * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
+ * @param {string} authProfile - Auth profile ID (e.g. 'anthropic:gmail')
+ * @param {string} [agentId='main'] - Agent ID for store path resolution
+ * @returns {{ ok: boolean, error?: string }}
+ */
+export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
+  if (!sessionKey || !authProfile) {
+    return { ok: false, error: 'sessionKey and authProfile are required' };
+  }
+
+  // The gateway stores sessions under the canonical key format:
+  // agent:<agentId>:<sessionKey>
+  const canonicalKey = `agent:${agentId}:${sessionKey}`;
+  const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
+
+  try {
+    if (!existsSync(sessionsPath)) {
+      return { ok: false, error: `sessions.json not found at ${sessionsPath}` };
+    }
+
+    const raw = readFileSync(sessionsPath, 'utf-8');
+    const store = JSON.parse(raw);
+
+    const entry = store[canonicalKey];
+    if (!entry) {
+      // Session doesn't exist yet -- create a minimal entry.
+      // The gateway will populate the rest on the first agent turn.
+      store[canonicalKey] = {
+        updatedAt: Date.now(),
+        authProfileOverride: authProfile,
+        authProfileOverrideSource: 'user',
+      };
+    } else if (entry.authProfileOverride !== authProfile) {
+      // Update existing entry
+      entry.authProfileOverride = authProfile;
+      entry.authProfileOverrideSource = 'user';
+      entry.updatedAt = Date.now();
+      // Clear compaction count so the override sticks across compactions
+      delete entry.authProfileOverrideCompactionCount;
+    } else {
+      // Already set correctly -- no-op
+      return { ok: true };
+    }
+
+    writeFileSync(sessionsPath, JSON.stringify(store), 'utf-8');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `Failed to update sessions.json: ${err.message}` };
+  }
 }
