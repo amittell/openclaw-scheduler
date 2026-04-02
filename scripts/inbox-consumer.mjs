@@ -137,12 +137,17 @@ function _formatMessagesDebug(msgs, agentId) {
 }
 
 function selectPendingMessages(db, agentId, limit) {
+  // Only fetch 'pending' messages for user-facing delivery.
+  // Messages with status='delivered' have already been injected into an AI
+  // agent's context prompt (by buildJobPrompt/markDelivered in dispatcher.js)
+  // and must NOT be re-delivered to the user via Telegram — doing so causes
+  // duplicate notifications on every inbox-consumer run.
   return db.prepare(`
     SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority,
            delivery_to, channel
     FROM messages
     WHERE (to_agent = ? OR to_agent = 'broadcast')
-      AND status IN ('pending', 'delivered')
+      AND status = 'pending'
     ORDER BY
       CASE kind
         WHEN 'constraint' THEN 0
