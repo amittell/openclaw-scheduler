@@ -380,11 +380,22 @@ function buildJobPrompt(job, run) {
     );
   }
 
-  // Include any pending messages for this agent
+  // Include any pending messages for this agent.
+  // getInbox() without includeDelivered already filters to status='pending' only,
+  // but we add an explicit guard here to log and skip any message that slipped
+  // through with status='delivered' or 'read' -- re-displaying such messages
+  // would cause duplicate notifications when the inbox-consumer later picks them up.
   const inbox = getInbox(job.agent_id || 'main', { limit: 5 });
-  if (inbox.length > 0) {
+  const injectableMessages = inbox.filter(msg => {
+    if (msg.status && msg.status !== 'pending') {
+      log('warn', `buildJobPrompt: skipping non-pending message ${msg.id} (status=${msg.status}) for agent ${job.agent_id || 'main'}`);
+      return false;
+    }
+    return true;
+  });
+  if (injectableMessages.length > 0) {
     parts.push('\n--- Pending Messages ---');
-    for (const msg of inbox) {
+    for (const msg of injectableMessages) {
       const kindLabel = msg.kind && !['text', 'result', 'status', 'system', 'spawn'].includes(msg.kind)
         ? `[${msg.kind}]${msg.owner ? ` (owner: ${msg.owner})` : ''} `
         : '';
@@ -404,7 +415,7 @@ function buildJobPrompt(job, run) {
 
   // Collect context metadata
   const contextMeta = {
-    messages_injected: inbox.length,
+    messages_injected: injectableMessages.length,
     scope: job.payload_scope || 'own',
     job_class: job.job_class || 'standard',
     delivery_guarantee: job.delivery_guarantee || 'at-most-once',
