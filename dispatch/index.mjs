@@ -1474,15 +1474,9 @@ async function cmdDone(flags) {
     }
   }
 
-  // Bug 1 fix: truncate summary to 300 chars (delivery path silently truncates at 500)
-  const MAX_SUMMARY = 300;
-  let summary = rawSummary;
-  if (rawSummary.length > MAX_SUMMARY) {
-    process.stderr.write(
-      `[${BRAND}] warn: --summary truncated from ${rawSummary.length} chars to ${MAX_SUMMARY} chars\n`,
-    );
-    summary = rawSummary.slice(0, MAX_SUMMARY);
-  }
+  // Summary passes through as-is; SQLite TEXT has no practical limit and
+  // the scheduler schema already sets output_summary_limit_bytes DEFAULT 65536.
+  const summary = rawSummary;
 
   const existing = getLabel(label);
 

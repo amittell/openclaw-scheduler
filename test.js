@@ -5425,9 +5425,9 @@ console.log('\n-- Done Subcommand --');
     assert(!noShaLabels['no-sha-task'].sha, 'done without --sha (backward compat): no sha in labels.json');
   }
 
-  // -- Bug 1 fix: summary truncation at 300 chars ------------
+  // -- No summary truncation: full summary stored as-is -------
 
-  // done with summary > 300 chars -> truncated to 300 and warns on stderr
+  // done with summary > 300 chars -> full summary stored (no truncation)
   {
     writeFileSync(doneLabels, JSON.stringify({
       'trunc-task': {
@@ -5450,42 +5450,12 @@ console.log('\n-- Done Subcommand --');
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    // We can't easily capture stderr from execFileSync with stdio pipe, so
-    // just verify the stored summary is at most 300 chars
     const truncObj = JSON.parse(truncOut.trim());
-    assert(truncObj.ok === true, 'done --summary truncation: ok=true');
-    assert(truncObj.summary.length === 300, 'done --summary truncation: summary truncated to 300 chars');
+    assert(truncObj.ok === true, 'done --summary long (no truncation): ok=true');
+    assert(truncObj.summary.length === 350, 'done --summary long (no truncation): full summary preserved');
     const truncLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
-    assert(truncLabels['trunc-task'].summary.length === 300, 'done --summary truncation: labels.json summary at most 300 chars');
-    assert(truncLabels['trunc-task'].status === 'done', 'done --summary truncation: labels.json status=done');
-  }
-
-  // done with summary exactly 300 chars -> accepted as-is (no truncation)
-  {
-    writeFileSync(doneLabels, JSON.stringify({
-      'exact-trunc-task': {
-        sessionKey: 'agent:main:subagent:exact-trunc-uuid',
-        status: 'running',
-        agent: 'main',
-        mode: 'fresh',
-        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
-        timeoutSeconds: 300,
-      },
-    }) + '\n');
-
-    const exact300 = 'y'.repeat(300);
-    const exact300Out = execFileSync(process.execPath, [
-      indexPath, 'done', '--label', 'exact-trunc-task', '--summary', exact300,
-      '--checklist', '{"work_complete":true}',
-    ], {
-      encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const exact300Obj = JSON.parse(exact300Out.trim());
-    assert(exact300Obj.ok === true, 'done --summary exactly 300 chars: ok=true');
-    assert(exact300Obj.summary.length === 300, 'done --summary exactly 300 chars: summary preserved');
+    assert(truncLabels['trunc-task'].summary.length === 350, 'done --summary long (no truncation): labels.json full summary stored');
+    assert(truncLabels['trunc-task'].status === 'done', 'done --summary long (no truncation): labels.json status=done');
   }
 
   // -- Structural checklist validation -------------------------
