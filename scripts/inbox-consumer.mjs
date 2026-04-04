@@ -278,8 +278,30 @@ try {
     }, 250);
   });
 
+  // Periodic poll fallback — catches messages that slip through WAL checkpoints.
+  // When SQLite checkpoints the WAL (merges it back into the main DB), the WAL
+  // file is reset and the watcher may miss a subsequent write. This belt-and-
+  // suspenders poll ensures delivery within at most INBOX_POLL_INTERVAL_MS.
+  const pollIntervalMs = parsePositiveInt(process.env.INBOX_POLL_INTERVAL_MS, 60000);
+  const pollInterval = setInterval(async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      const n = await drainOnce(db, { to: deliveryTo, channel, agentId, limit, brand });
+      if (n > 0) {
+        process.stdout.write(`[inbox-consumer] poll fallback delivered ${n} pending message(s)\n`);
+      }
+    } catch (err) {
+      process.stderr.write(`[inbox-consumer] poll fallback error: ${err.message}\n`);
+    } finally {
+      draining = false;
+    }
+  }, pollIntervalMs);
+  process.stdout.write(`[inbox-consumer] poll fallback enabled (interval=${pollIntervalMs}ms)\n`);
+
   const shutdown = (signal) => {
     if (timer) clearTimeout(timer);
+    clearInterval(pollInterval);
     watcher.close();
     process.stdout.write(`[inbox-consumer] ${signal}; exiting\n`);
     process.exit(0);
