@@ -7183,6 +7183,140 @@ console.log('\n-- dispatch/index.mjs --deliver-to error message --');
 }
 
 // ============================================================
+// SECTION: getActiveOriginFromSessions group-preference tiebreaker
+// ============================================================
+
+console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
+{
+  // We test the logic indirectly by writing a temp sessions.json into a temp
+  // HOME dir and invoking the CLI with no --origin flag, then checking stderr
+  // for the "auto-detected origin from active session: <origin>" log line.
+
+  const dispatchDir  = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath    = join(dispatchDir, 'index.mjs');
+
+  function runAutoDetect(sessions) {
+    const tmpBase = mkdtempSync(join(tmpdir(), 'origin-tiebreak-'));
+    const sessionsDir = join(tmpBase, '.openclaw', 'agents', 'main', 'sessions');
+    const labelsPath  = join(tmpBase, 'labels.json');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
+    writeFileSync(labelsPath, JSON.stringify({}) + '\n');
+
+    let stderr = '';
+    try {
+      execFileSync(
+        process.execPath,
+        [indexPath, 'enqueue',
+          '--label', 'test-origin-tiebreak',
+          '--message', 'ping',
+          '--deliver-to', '999',
+          '--delivery-mode', 'none',
+          '--timeout', '300',
+          '--no-monitor',
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, HOME: tmpBase, DISPATCH_LABELS_PATH: labelsPath },
+          timeout: 15_000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }
+      );
+    } catch (err) {
+      stderr = err.stderr || '';
+    }
+
+    rmSync(tmpBase, { recursive: true, force: true });
+    const m = /auto-detected origin from active session: ([^\n]+)/.exec(stderr);
+    return m ? m[1].trim() : null;
+  }
+
+  const now = Date.now();
+  const recent1 = now - 30_000;  // 30 s ago (more recent)
+  const recent2 = now - 60_000;  // 60 s ago (older, but within 10 min)
+
+  // Test 1: only direct session active -> returns direct session
+  {
+    const sessions = {
+      'agent:main:telegram:direct:alex': {
+        updatedAt: recent1,
+        deliveryContext: { to: 'telegram:484946046' },
+        chatType: 'direct',
+      },
+    };
+    const origin = runAutoDetect(sessions);
+    assert(origin === 'telegram:484946046', 'origin-tiebreak: only direct active -> returns direct');
+  }
+
+  // Test 2: only group session active -> returns group session
+  {
+    const sessions = {
+      'agent:main:telegram:group:-5240776892': {
+        updatedAt: recent1,
+        deliveryContext: { to: 'telegram:-5240776892' },
+        chatType: 'group',
+      },
+    };
+    const origin = runAutoDetect(sessions);
+    assert(origin === 'telegram:-5240776892', 'origin-tiebreak: only group active -> returns group');
+  }
+
+  // Test 3: group more recent than direct -> returns group (original behavior preserved)
+  {
+    const sessions = {
+      'agent:main:telegram:group:-5240776892': {
+        updatedAt: recent1,
+        deliveryContext: { to: 'telegram:-5240776892' },
+        chatType: 'group',
+      },
+      'agent:main:telegram:direct:alex': {
+        updatedAt: recent2,
+        deliveryContext: { to: 'telegram:484946046' },
+        chatType: 'direct',
+      },
+    };
+    const origin = runAutoDetect(sessions);
+    assert(origin === 'telegram:-5240776892', 'origin-tiebreak: group more recent -> returns group');
+  }
+
+  // Test 4 (THE FIX): direct more recent than group -> still returns group
+  {
+    const sessions = {
+      'agent:main:telegram:direct:alex': {
+        updatedAt: recent1,  // more recent (agent just replied in DM)
+        deliveryContext: { to: 'telegram:484946046' },
+        chatType: 'direct',
+      },
+      'agent:main:telegram:group:-5240776892': {
+        updatedAt: recent2,  // older (actual triggering context)
+        deliveryContext: { to: 'telegram:-5240776892' },
+        chatType: 'group',
+      },
+    };
+    const origin = runAutoDetect(sessions);
+    assert(origin === 'telegram:-5240776892', 'origin-tiebreak: direct more recent than group -> still returns group (THE FIX)');
+  }
+
+  // Test 5: no chatType field, infer from session key pattern
+  {
+    const sessions = {
+      'agent:main:telegram:direct:alex': {
+        updatedAt: recent1,
+        deliveryContext: { to: 'telegram:484946046' },
+        // no chatType field - fall back to key pattern
+      },
+      'agent:main:telegram:group:-5240776892': {
+        updatedAt: recent2,
+        deliveryContext: { to: 'telegram:-5240776892' },
+        // no chatType field - fall back to key pattern
+      },
+    };
+    const origin = runAutoDetect(sessions);
+    assert(origin === 'telegram:-5240776892', 'origin-tiebreak: no chatType field, key-pattern fallback -> still returns group');
+  }
+}
+
+// ============================================================
 // SECTION: v0.2 Runtime Features
 // ============================================================
 

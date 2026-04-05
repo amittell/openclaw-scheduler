@@ -334,13 +334,27 @@ function readSessionsStore(agent = 'main') {
  *
  * @returns {string|null} - e.g. "telegram:-100200000000", or null if not found
  */
+/**
+ * Infer the chat type ("group" | "direct" | "") from a session object and its key.
+ * Checks session.chatType first, then falls back to key pattern matching.
+ * Key patterns:  agent:main:<channel>:group:<id>   → group
+ *                agent:main:<channel>:direct:<id>  → direct
+ */
+function inferChatType(key, session) {
+  if (session.chatType) return session.chatType;
+  if (key.includes(":group:")) return "group";
+  if (key.includes(":direct:")) return "direct";
+  return "";
+}
+
 function getActiveOriginFromSessions() {
   const store = readSessionsStore("main");
   if (!store) return null;
 
-  let best = null;
-  let bestTime = 0;
   const TEN_MIN_MS = 10 * 60 * 1000;
+
+  /** @type {Array<{origin: string, updatedAt: number, chatType: string}>} */
+  const candidates = [];
 
   for (const [key, session] of Object.entries(store)) {
     // Only consider main sessions, not subagents
@@ -357,19 +371,37 @@ function getActiveOriginFromSessions() {
     // Must be recently active
     if (Date.now() - updatedAt > TEN_MIN_MS) continue;
 
-    if (updatedAt > bestTime) {
-      // Prefer deliveryContext.to if available
-      const deliveryTo = session.deliveryContext?.to || null;
-      if (deliveryTo) {
-        bestTime = updatedAt;
-        // deliveryContext.to format: "telegram:-100200000000"
-        // Convert to origin format: "telegram:-100200000000"
-        best = deliveryTo;
-      }
-    }
+    // Prefer deliveryContext.to if available
+    const deliveryTo = session.deliveryContext?.to || null;
+    if (!deliveryTo) continue;
+
+    candidates.push({
+      origin: deliveryTo,
+      updatedAt,
+      chatType: inferChatType(key, session),
+    });
   }
 
-  return best;
+  if (candidates.length === 0) return null;
+
+  // Tiebreaker: prefer group sessions over direct/DM sessions.
+  // When both a DM and a group session are recently active, the DM session
+  // often has a more recent updatedAt (agent just replied there), but the
+  // triggering context was the group chat.  Within the same chat type, prefer
+  // the most recently updated session.
+  const typeScore = (chatType) => {
+    if (chatType === "group")  return 2;
+    if (chatType === "direct") return 0;
+    return 1; // unknown / other
+  };
+
+  candidates.sort((a, b) => {
+    const scoreDiff = typeScore(b.chatType) - typeScore(a.chatType);
+    if (scoreDiff !== 0) return scoreDiff;
+    return b.updatedAt - a.updatedAt;
+  });
+
+  return candidates[0].origin;
 }
 
 /**
@@ -849,7 +881,8 @@ async function cmdEnqueue(flags) {
         const watcherPath = join(__dirname, 'watcher.mjs');
         // Watcher timeout = session timeout + 120s buffer for startup/polling
         const watcherTimeoutS = timeoutS + 120;
-        const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20`;
+        const idleThresholdS = flags['idle-threshold'] || '300';
+        const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20 --idle-threshold ${idleThresholdS}`;
 
         const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
         const jobSpec = JSON.stringify({
