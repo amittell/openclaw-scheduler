@@ -27,6 +27,27 @@ For manifest authoring, validation, and identity/authorization profiles, use
 - Shell jobs (`session_target: "shell"`) run without the gateway. Agent jobs
   (`session_target: "isolated"` or `"main"`) require a running gateway.
 
+## Checking Job Status — Always Poll, Never Infer
+
+When reporting on whether a dispatched job is running, done, or stuck, **always call the status command directly** — never infer from check-in messages or notifications that appeared in your conversation.
+
+Check-in messages are delivered asynchronously. By the time they appear, the job may already be finished, failed, or on a later step. Conversation messages are stale by definition.
+
+```bash
+# For chilisaus-dispatched jobs:
+node ~/.openclaw/chilisaus/index.mjs status --label <label>
+
+# For scheduler jobs:
+openclaw-scheduler runs list <job-id> --json
+openclaw-scheduler runs running --json
+```
+
+The `status` output gives authoritative `status` (`accepted` / `running` / `done` / `error`), `updatedAt` timestamp, and final `summary`. Use that.
+
+**Rule: if you haven't polled status, you don't know the status.**
+
+---
+
 ## Error Handling
 
 CLI errors exit non-zero. In plain-text mode, the message goes to stderr. With

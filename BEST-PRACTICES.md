@@ -360,6 +360,23 @@ The dispatcher picks this up on its next tick (within 15s) and creates and immed
 
 ---
 
+### Checking Job Status — Always Poll, Never Infer
+
+When reporting on whether a dispatched job is running, done, or stuck, **always call `status` directly** — never infer from check-in messages that appeared in the conversation.
+
+Check-in messages (from `agent-checkin.mjs` or similar) are delivered asynchronously via the scheduler inbox. By the time they appear in your conversation, the job may have already finished, failed, or moved on to a later step. Treating them as real-time signals produces stale or incorrect status reports.
+
+```bash
+# Always do this before reporting job status:
+node ~/.openclaw/chilisaus/index.mjs status --label <label>
+```
+
+The `status` output gives you the authoritative `status` field (`accepted` / `running` / `done` / `error`), the last `updatedAt` timestamp, and the final `summary`. Use that — not the most recent check-in message.
+
+**Rule: if you haven't polled `status`, you don't know the status.**
+
+---
+
 ### Communicating Between Jobs
 
 Jobs can pass data to each other using the inter-agent message queue. Messages injected into a job's context appear in the `--- Pending Messages ---` block at the top of the prompt.
