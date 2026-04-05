@@ -134,7 +134,7 @@ Use `isolated` when:
 
 | Rule | Bad | Good |
 |------|-----|------|
-| Be imperative and specific | "check kubernetes" | "Check k8s pods in requesthub-prod and requesthub-dev. List any non-Running pods." |
+| Be imperative and specific | "check kubernetes" | "Check k8s pods in myapp-prod and myapp-staging. List any non-Running pods." |
 | Include a success signal | *(nothing)* | "If all pods Running, reply with exactly: HEARTBEAT_OK" |
 | Specify output format | *(nothing)* | "Format issues as: ⚠️ \<namespace\>/\<pod\>: \<status\>" |
 | State available resources | *(implicit)* | "Your memory files are in ~/.openclaw/workspace/memory/" |
@@ -147,7 +147,7 @@ Check everything and let me know if anything is wrong
 
 **Good prompt:**
 ```
-Check k8s pod health across requesthub-prod and requesthub-dev namespaces.
+Check k8s pod health across myapp-prod and myapp-staging namespaces.
 List any non-Running pods. If all pods are Running, reply with exactly: HEARTBEAT_OK
 Format any issues as: ⚠️ <namespace>/<pod>: <status>
 ```
@@ -282,7 +282,7 @@ When the dispatcher fires an isolated job, the agent receives a message structur
 From: scheduler | result | Previous backup: 3 files committed, pushed to origin
 ---
 
-Check k8s pod health across requesthub-prod and requesthub-dev.
+Check k8s pod health across myapp-prod and myapp-staging.
 If all pods are Running, reply with exactly: HEARTBEAT_OK
 Format any issues as: ⚠️ <namespace>/<pod>: <status>
 ```
