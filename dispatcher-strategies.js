@@ -1119,6 +1119,21 @@ export async function executeAgent(job, ctx, deps) {
     }
   }
 
+  // Always sync the live auth store to the agent's auth-profiles.json BEFORE
+  // every agent turn. This ensures sessions that reuse a stable key (scheduler:<jobId>)
+  // always have fresh credentials -- token refreshes, order changes, and new
+  // profiles are picked up automatically without requiring an explicit auth_profile
+  // on every job.
+  const { syncAuthStoreToSession: syncAuth } = deps;
+  if (typeof syncAuth === 'function') {
+    const syncResult = syncAuth(job.agent_id || 'main');
+    if (syncResult.ok) {
+      log('debug', `Synced live auth store to agent '${job.agent_id || 'main'}'`, { jobId: job.id });
+    } else {
+      log('warn', `Failed to sync auth store: ${syncResult.error}`, { jobId: job.id });
+    }
+  }
+
   // Apply auth profile to session store BEFORE the agent turn.
   // The x-openclaw-auth-profile HTTP header is not read by the gateway (dead header).
   // Writing authProfileOverride directly to sessions.json is the effective mechanism

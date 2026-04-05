@@ -54,6 +54,7 @@ import {
   runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
   applyAuthProfileToSessionStore,
+  syncAuthStoreToSession,
 } from './gateway.js';
 import { normalizeShellResult } from './shell-result.js';
 import {
@@ -309,6 +310,7 @@ function buildDispatchDeps() {
     matchesSentinel, detectTransientError,
     listSessions,
     applyAuthProfileToSessionStore,
+    syncAuthStoreToSession,
     // Finalize
     updateIdempotencyResultHash,
     shouldRetry, scheduleRetry,

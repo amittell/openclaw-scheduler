@@ -1,6 +1,6 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db.js';
@@ -531,5 +531,42 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
     return { ok: true };
   } catch (err) {
     return { ok: false, error: `Failed to update sessions.json: ${err.message}` };
+  }
+}
+
+/**
+ * Sync the live auth-profiles.json from ~/.openclaw/credentials/ to the agent's
+ * auth store at ~/.openclaw/agents/<agentId>/agent/auth-profiles.json.
+ *
+ * This ensures scheduler sessions always use fresh credentials (tokens, order,
+ * default profile) even when no explicit auth_profile is set on the job.
+ * Without this, sessions created from a stable session key inherit a stale
+ * copy of the auth store that was snapshotted when the session was first created.
+ *
+ * This is a fast file-copy operation (~1ms) and is safe to call before every
+ * agent turn.
+ *
+ * @param {string} [agentId='main'] - Agent ID for store path resolution
+ * @returns {{ ok: boolean, error?: string }}
+ */
+export function syncAuthStoreToSession(agentId = 'main') {
+  const livePath = join(HOME_DIR, '.openclaw', 'credentials', 'auth-profiles.json');
+  const agentStorePath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent', 'auth-profiles.json');
+
+  try {
+    if (!existsSync(livePath)) {
+      return { ok: false, error: `Live auth store not found at ${livePath}` };
+    }
+
+    // Ensure the agent directory exists
+    const agentDir = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent');
+    if (!existsSync(agentDir)) {
+      mkdirSync(agentDir, { recursive: true });
+    }
+
+    copyFileSync(livePath, agentStorePath);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `Failed to sync auth store: ${err.message}` };
   }
 }
