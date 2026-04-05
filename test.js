@@ -9757,6 +9757,88 @@ console.log('\n-- Gateway scope header --');
   }
 }
 
+// ===========================================================
+// SECTION: ORIGIN_CHAT_ID auto-inject in cmdEnqueue
+// ===========================================================
+
+console.log('\n-- ORIGIN_CHAT_ID auto-inject (source check) --');
+{
+  const { readFileSync: rfs } = await import('node:fs');
+  const { join: pjoin, dirname: pdir } = await import('node:path');
+  const { fileURLToPath: pftu } = await import('node:url');
+  const indexSrcOCID = rfs(pjoin(pdir(pftu(import.meta.url)), 'dispatch', 'index.mjs'), 'utf8');
+
+  // Source-level: the injection block must be present
+  assert(
+    indexSrcOCID.includes("ORIGIN_CHAT_ID:") &&
+    indexSrcOCID.includes("!message.includes('ORIGIN_CHAT_ID:')"),
+    'ORIGIN_CHAT_ID: injection guard present in index.mjs',
+  );
+  assert(
+    indexSrcOCID.includes('ORIGIN_CHAT_ID: ${deliverTo}'),
+    'ORIGIN_CHAT_ID: inject uses deliverTo value in template literal',
+  );
+  // The injection must appear AFTER deliverTo is resolved and BEFORE parts = [
+  const deliverToIdx  = indexSrcOCID.indexOf("const deliverTo      = flags['deliver-to']");
+  const injectIdx     = indexSrcOCID.indexOf("!message.includes('ORIGIN_CHAT_ID:')");
+  const partsIdx      = indexSrcOCID.indexOf('const parts = [');
+  assert(deliverToIdx < injectIdx, 'ORIGIN_CHAT_ID: inject is after deliverTo resolution');
+  assert(injectIdx    < partsIdx,  'ORIGIN_CHAT_ID: inject is before prompt parts assembly');
+}
+
+console.log('\n-- ORIGIN_CHAT_ID auto-inject (runtime behavior) --');
+{
+  // We test the injection logic directly by evaluating the conditional that cmdEnqueue uses.
+  // Three cases:
+  //   A) deliverTo set, message lacks ORIGIN_CHAT_ID:  → injected at top
+  //   B) deliverTo set, message already has ORIGIN_CHAT_ID:  → not modified
+  //   C) deliverTo null/empty  → not injected
+
+  function simulateInject(deliverTo, message) {
+    if (deliverTo && !message.includes('ORIGIN_CHAT_ID:')) {
+      message = `ORIGIN_CHAT_ID: ${deliverTo}\n\n${message}`;
+    }
+    return message;
+  }
+
+  // Case A: inject
+  const resultA = simulateInject('-5240776892', 'Fix the bug and push.');
+  assert(
+    resultA.startsWith('ORIGIN_CHAT_ID: -5240776892\n\n'),
+    'ORIGIN_CHAT_ID: Case A — injected at top when missing',
+  );
+  assert(
+    resultA.endsWith('Fix the bug and push.'),
+    'ORIGIN_CHAT_ID: Case A — original message body preserved after injection',
+  );
+
+  // Case B: already present — no modification
+  const msgWithId = 'ORIGIN_CHAT_ID: -9999999999\n\nDo the work.';
+  const resultB = simulateInject('-5240776892', msgWithId);
+  assert(
+    resultB === msgWithId,
+    'ORIGIN_CHAT_ID: Case B — not modified when already present',
+  );
+  assert(
+    !resultB.startsWith('ORIGIN_CHAT_ID: -5240776892'),
+    'ORIGIN_CHAT_ID: Case B — deliverTo value not overwritten into existing header',
+  );
+
+  // Case C: no deliverTo — not injected
+  const resultC = simulateInject(null, 'Do the work.');
+  assert(
+    resultC === 'Do the work.',
+    'ORIGIN_CHAT_ID: Case C — not injected when deliverTo is null',
+  );
+
+  // Case D: empty-string deliverTo — not injected
+  const resultD = simulateInject('', 'Do the work.');
+  assert(
+    resultD === 'Do the work.',
+    'ORIGIN_CHAT_ID: Case D — not injected when deliverTo is empty string',
+  );
+}
+
 closeDb();
 console.log(`\n${'='.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

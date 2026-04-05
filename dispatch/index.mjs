@@ -631,6 +631,14 @@ async function cmdEnqueue(flags) {
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
 
+  // -- Auto-inject ORIGIN_CHAT_ID into prompt message ---------
+  // Ensures the spawned agent always knows where to send message tool calls,
+  // matching the delivery target. Skip if already present (caller is explicit)
+  // or if there's no delivery target.
+  if (deliverTo && !message.includes('ORIGIN_CHAT_ID:')) {
+    message = `ORIGIN_CHAT_ID: ${deliverTo}\n\n${message}`;
+  }
+
   // -- Verify command flag -----------------------------------
   const verifyCmd       = flags['verify-cmd'] || null;
 
