@@ -539,12 +539,12 @@ function disarmWatchdog(label) {
   if (!entry?.watchdogJobId) return;
   try {
     const schedulerCli = join(__dirname, '..', 'cli.js');
-    execFileSync(process.execPath, [schedulerCli, 'jobs', 'disable', entry.watchdogJobId], {
+    execFileSync(process.execPath, [schedulerCli, 'jobs', 'delete', entry.watchdogJobId], {
       encoding: 'utf-8',
       timeout:  5000,
       stdio:    ['pipe', 'pipe', 'pipe'],
     });
-    process.stderr.write(`[${BRAND}] watchdog disarmed for ${label}\n`);
+    process.stderr.write(`[${BRAND}] watchdog deleted for ${label}\n`);
   } catch (err) {
     process.stderr.write(`[${BRAND}] watchdog disarm failed for ${label}: ${err.message}\n`);
   }
