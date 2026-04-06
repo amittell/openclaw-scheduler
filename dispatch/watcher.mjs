@@ -657,6 +657,49 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
 }
 
 /**
+ * Read the last assistant entry's stop_reason from the session JSONL.
+ * Returns the stop_reason string (e.g. 'end_turn', 'tool_use') or null if unavailable.
+ *
+ * Uses readJsonlLastLines with n=10 to scan enough history to find the last
+ * assistant message even if several tool_result entries follow it.
+ *
+ * @param {string} sessionId - Internal session UUID
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @returns {string|null} stop_reason string or null
+ */
+function getSessionStopReason(sessionId, agentDir = 'main') {
+  const lastLines = readJsonlLastLines(sessionId, agentDir, 10);
+  if (!lastLines) return null;
+  // Walk backwards to find last role=assistant entry
+  for (let i = lastLines.length - 1; i >= 0; i--) {
+    const entry = lastLines[i];
+    if (entry?.role === 'assistant') {
+      return entry?.stop_reason ?? null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Returns true if the session has cleanly finished with stop_reason=end_turn.
+ * Requires:
+ *   - stop_reason === 'end_turn' on the last assistant entry
+ *   - getJsonlMidTurnReason() returns null (no in-flight tool calls or pending results)
+ *
+ * Used for Path 2a early delivery: skip FLAT_WINDOW_MS wait when session is
+ * verifiably done via JSONL stop_reason signal.
+ *
+ * @param {string} sessionId - Internal session UUID
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @returns {boolean}
+ */
+function isSessionCleanlyFinished(sessionId, agentDir = 'main') {
+  if (getJsonlMidTurnReason(sessionId, agentDir) !== null) return false;
+  const stopReason = getSessionStopReason(sessionId, agentDir);
+  return stopReason === 'end_turn';
+}
+
+/**
  * Update labels.json to mark the watched label as done (best-effort, atomic write).
  * Called before exit to ensure labels.json is reconciled even if sync fails.
  */
@@ -1083,6 +1126,22 @@ while (Date.now() < deadline) {
     }
     const result = dispatch('result', ['--label', label]);
     deliverResult(label, result?.lastReply, status.summary);
+  }
+
+  // -- Path 2a: stop_reason early delivery (clean end_turn) --
+  // If the last assistant message has stop_reason=end_turn and no tool calls
+  // are in flight, deliver immediately without waiting for FLAT_WINDOW_MS.
+  // This is the fast path for sessions that write stop_reason to JSONL.
+  if (status.sessionKey) {
+    const _e2a = getSessionStoreEntry(status.sessionKey);
+    const _sid2a = _e2a?.sessionId || null;
+    const _adir2a = (status.sessionKey.split(':')[1]) || 'main';
+    if (_sid2a && isSessionCleanlyFinished(_sid2a, _adir2a)) {
+      process.stderr.write(`[watcher] stop_reason=end_turn detected -- delivering early\n`);
+      const result = dispatch('result', ['--label', label]);
+      deliverResult(label, result?.lastReply, 'completed (stop_reason=end_turn)');
+      // deliverResult exits
+    }
   }
 
   // -- Path 2: status says 'running' but session may be idle -

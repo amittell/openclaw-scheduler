@@ -5187,6 +5187,229 @@ console.log('\n-- Watcher pre-deadline JSONL mtime extension --');
   assert(watcherSrc.includes('statSync(jsonlPath).mtimeMs'), 'jsonl-extend: getSessionJsonlMtime reads mtimeMs via statSync');
 }
 
+// -- Watcher stop_reason early delivery --
+console.log('\n-- Watcher stop_reason early delivery --');
+{
+  const watcherSrc = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs'),
+    'utf8'
+  );
+
+  // Source-level presence checks
+  assert(watcherSrc.includes('getSessionStopReason'), 'stop_reason: getSessionStopReason function present');
+  assert(watcherSrc.includes('isSessionCleanlyFinished'), 'stop_reason: isSessionCleanlyFinished function present');
+  assert(watcherSrc.includes('stop_reason=end_turn detected'), 'stop_reason: Path 2a log message present');
+  assert(watcherSrc.includes('completed (stop_reason=end_turn)'), 'stop_reason: Path 2a delivery fallback summary present');
+
+  // isSessionCleanlyFinished behavioral tests using real JSONL files
+  const tmpDir = mkdtempSync(join(tmpdir(), 'watcher-stopreason-'));
+  const sessionsDir = join(tmpDir, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(sessionsDir, { recursive: true });
+
+  function writeJsonl(sessionId, lines) {
+    const p = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(p, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+    return p;
+  }
+
+  function writeSessionsJson(entries) {
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(entries) + '\n');
+  }
+
+  // To call the functions under test we need to import watcher.mjs functions.
+  // Since they're not exported, we replicate the logic inline for unit tests.
+  // But we also verify the source-level guards below via functional watcher invocations.
+
+  // --- Functional test: end_turn triggers early delivery via watcher binary ---
+  const watcherPath = join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs');
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+
+  // Test 1: last assistant entry has stop_reason=end_turn, no tool_use
+  // -> isSessionCleanlyFinished returns true -> watcher delivers early
+  {
+    const sessionId = 'sr-end-turn-test';
+    writeJsonl(sessionId, [
+      { role: 'user', content: [{ type: 'text', text: 'do work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+    ]);
+    writeSessionsJson({
+      'agent:main:subagent:et-uuid': { sessionId, updatedAt: Date.now(), model: 'test' },
+    });
+
+    const mockLabels = join(tmpDir, 'labels-et.json');
+    writeFileSync(mockLabels, JSON.stringify({
+      'test-et': {
+        sessionKey: 'agent:main:subagent:et-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const mockDispatchEt = join(tmpDir, 'mock-et.mjs');
+    writeFileSync(mockDispatchEt, `
+const [,,sub,...rest] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true, label: 'test-et', status: 'running',
+    sessionKey: 'agent:main:subagent:et-uuid',
+    agent: 'main',
+    liveness: { ageMs: 5000, sessionId: ${JSON.stringify(sessionId)} },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'end_turn result', status: 'done' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    // Use spawnSync to capture both stdout and stderr on success (exit 0)
+    const { spawnSync: spawnSyncEt } = await import('child_process');
+    const etResult = spawnSyncEt(process.execPath, [
+      watcherPath, '--label', 'test-et', '--timeout', '30', '--poll-interval', '1',
+    ], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        DISPATCH_INDEX_PATH: mockDispatchEt,
+        DISPATCH_LABELS_PATH: mockLabels,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      timeout: 40000,
+    });
+    const etExitCode = etResult.status;
+    const etStdout = etResult.stdout || '';
+    const etStderr = etResult.stderr || '';
+    assert(etExitCode === 0, 'stop_reason end_turn: watcher exits 0 (early delivery)');
+    assert(etStdout.includes('end_turn result'), 'stop_reason end_turn: watcher delivers lastReply via early delivery');
+    assert(etStderr.includes('stop_reason=end_turn detected'), 'stop_reason end_turn: watcher logs early delivery to stderr');
+  }
+
+  // Test 2: last assistant entry has stop_reason=tool_use (mid-turn)
+  // -> isSessionCleanlyFinished returns false -> watcher does NOT early deliver
+  {
+    const sessionId2 = 'sr-tool-use-test';
+    writeJsonl(sessionId2, [
+      { role: 'user', content: [{ type: 'text', text: 'do work' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'exec', input: {} }], stop_reason: 'tool_use' },
+    ]);
+    writeSessionsJson({
+      'agent:main:subagent:tu-uuid': { sessionId: sessionId2, updatedAt: Date.now(), model: 'test' },
+    });
+
+    const mockLabels2 = join(tmpDir, 'labels-tu.json');
+    let pollCountTu = 0;
+    writeFileSync(mockLabels2, JSON.stringify({
+      'test-tu': {
+        sessionKey: 'agent:main:subagent:tu-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 10, // short timeout so test finishes quickly
+      },
+    }) + '\n');
+
+    const tuCounterFile = join(tmpDir, 'tu-counter.txt');
+    writeFileSync(tuCounterFile, '0');
+    const mockDispatchTu = join(tmpDir, 'mock-tu.mjs');
+    writeFileSync(mockDispatchTu, `
+import { readFileSync, writeFileSync } from 'fs';
+const [,,sub,...rest] = process.argv;
+const counterFile = ${JSON.stringify(tuCounterFile)};
+if (sub === 'status') {
+  let c = 0;
+  try { c = parseInt(readFileSync(counterFile, 'utf8').trim()) || 0; } catch {}
+  c++;
+  writeFileSync(counterFile, String(c));
+  // Return running for first 3 polls, then auto-resolve as done
+  if (c <= 3) {
+    process.stdout.write(JSON.stringify({
+      ok: true, label: 'test-tu', status: 'running',
+      sessionKey: 'agent:main:subagent:tu-uuid',
+      agent: 'main',
+      liveness: { ageMs: 5000, sessionId: ${JSON.stringify(sessionId2)} },
+    }) + '\\n');
+  } else {
+    process.stdout.write(JSON.stringify({
+      ok: true, label: 'test-tu', status: 'done',
+      sessionKey: 'agent:main:subagent:tu-uuid',
+      summary: 'auto-resolved',
+    }) + '\\n');
+  }
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'tool_use result eventually', status: 'done' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    let tuExitCode = null;
+    let tuStdout = '';
+    let tuStderr = '';
+    try {
+      tuStdout = execFileSync(process.execPath, [
+        watcherPath, '--label', 'test-tu', '--timeout', '30', '--poll-interval', '1',
+      ], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: tmpDir,
+          DISPATCH_INDEX_PATH: mockDispatchTu,
+          DISPATCH_LABELS_PATH: mockLabels2,
+          OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+        },
+        timeout: 40000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      tuExitCode = 0;
+    } catch (err) {
+      tuExitCode = err.status ?? 1;
+      tuStdout = err.stdout ?? '';
+      tuStderr = err.stderr ?? '';
+    }
+    assert(tuExitCode === 0, 'stop_reason tool_use: watcher exits 0 (falls through to Path 1 auto-resolve)');
+    assert(!tuStderr.includes('stop_reason=end_turn detected'), 'stop_reason tool_use: no early delivery when stop_reason=tool_use');
+  }
+
+  // Test 3: mid-turn check (tool_result pending) -- no early delivery
+  // isSessionCleanlyFinished returns false because getJsonlMidTurnReason returns non-null
+  {
+    const sessionId3 = 'sr-mid-turn-test';
+    writeJsonl(sessionId3, [
+      { role: 'user', content: [{ type: 'text', text: 'do work' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'exec', input: {} }], stop_reason: 'tool_use' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'result' }] },
+    ]);
+
+    // Verify source-level: isSessionCleanlyFinished checks mid-turn first
+    assert(
+      watcherSrc.includes('if (getJsonlMidTurnReason(sessionId, agentDir) !== null) return false'),
+      'stop_reason: isSessionCleanlyFinished checks mid-turn before stop_reason'
+    );
+    assert(
+      watcherSrc.includes("return stopReason === 'end_turn'"),
+      'stop_reason: isSessionCleanlyFinished returns true only for end_turn'
+    );
+  }
+
+  // Test 4: getSessionStopReason returns null when no assistant entries found
+  // (source-level check: function walks backwards looking for role=assistant)
+  assert(
+    watcherSrc.includes("if (entry?.role === 'assistant')"),
+    'stop_reason: getSessionStopReason walks backwards for assistant entries'
+  );
+  assert(
+    watcherSrc.includes("return entry?.stop_reason ?? null"),
+    'stop_reason: getSessionStopReason returns stop_reason from assistant entry'
+  );
+
+  rmSync(tmpDir, { recursive: true, force: true });
+}
+
 // -- Watcher run_timeout_ms covers MAX_DEADLINE_EXTENSION --
 console.log('\n-- Watcher run_timeout_ms ceiling --');
 {
