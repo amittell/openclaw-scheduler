@@ -105,6 +105,24 @@ npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@latest
 ```
 
+### Local source tarball upgrade (`npm pack`)
+
+Use this when you want to upgrade a host to a locally built package before publishing to npmjs.org.
+
+```bash
+git clone https://github.com/amittell/openclaw-scheduler /tmp/openclaw-scheduler
+cd /tmp/openclaw-scheduler
+git pull
+npm ci
+npm run verify:local
+npm pack
+
+mkdir -p ~/.openclaw/scheduler-runtime
+npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+```
+
+Keep `SCHEDULER_HOME=~/.openclaw/scheduler` and `SCHEDULER_DB=~/.openclaw/scheduler/scheduler.db`, and point the service at `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js`.
+
 ---
 
 ## Step 2: Install Dependencies
@@ -275,6 +293,19 @@ ssh $HOST "cd ~/.openclaw/scheduler && SCHEDULER_DB=:memory: node test.js" 2>&1 
 ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
 sleep 3
 ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && cd ~/.openclaw/scheduler && node cli.js status"
+```
+
+#### macOS host over SSH using a local tarball
+
+```bash
+HOST=youruser@your-mac-host.lan
+TARBALL=./openclaw-scheduler-*.tgz
+
+scp $TARBALL $HOST:~/.openclaw/
+ssh $HOST "mkdir -p ~/.openclaw/scheduler-runtime && npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
+ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
+sleep 3
+ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && launchctl print gui/\$(id -u)/ai.openclaw.scheduler | sed -n '1,20p'"
 ```
 
 #### Linux / Windows WSL2 host over SSH

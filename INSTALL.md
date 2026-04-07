@@ -39,6 +39,21 @@ npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- help
 
 Runtime state for npm installs defaults to `~/.openclaw/scheduler/`, not the package directory under `node_modules/`.
 
+To test the published package layout from local source before publishing, build a tarball and install it into a separate runtime prefix:
+
+```bash
+git clone https://github.com/amittell/openclaw-scheduler /tmp/openclaw-scheduler
+cd /tmp/openclaw-scheduler
+npm ci
+npm run verify:local
+npm pack
+
+mkdir -p ~/.openclaw/scheduler-runtime
+npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+```
+
+In that setup, run the service from `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js` and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
+
 ---
 
 ## Step 2: Install Dependencies
@@ -221,6 +236,14 @@ If you installed from npm:
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup --service-mode agent
 # or:
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup --service-mode daemon
+```
+
+If you installed from a locally packed tarball:
+
+```bash
+npm exec --prefix ~/.openclaw/scheduler-runtime openclaw-scheduler -- setup --service-mode agent
+# or:
+npm exec --prefix ~/.openclaw/scheduler-runtime openclaw-scheduler -- setup --service-mode daemon
 ```
 
 What each mode does:
