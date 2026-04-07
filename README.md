@@ -206,6 +206,23 @@ npm run verify:smoke                 # lightweight smoke gate used by GitHub Act
 
 GitHub Actions runs the smoke gate plus the in-memory test suite on Linux, macOS, and Windows with Node 20. The full release gate still runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
 
+### Option C: local npm pack (simulate the published package from source)
+
+Use this when you want to test the exact package layout end users get from npm without publishing to npmjs.org yet.
+
+```bash
+git clone https://github.com/amittell/openclaw-scheduler /tmp/openclaw-scheduler
+cd /tmp/openclaw-scheduler
+npm ci
+npm run verify:local
+npm pack
+
+mkdir -p ~/.openclaw/scheduler-runtime
+npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+```
+
+Point your service at `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js`, and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
+
 The package also exports a small safe programmatic API surface for tooling:
 
 ```js
