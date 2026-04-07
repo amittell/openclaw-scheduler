@@ -493,9 +493,15 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
     return { ok: false, error: 'sessionKey and authProfile are required' };
   }
 
-  // The gateway stores sessions under the canonical key format:
-  // agent:<agentId>:<sessionKey>
-  const canonicalKey = `agent:${agentId}:${sessionKey}`;
+  // The gateway may persist session state under either the canonical agent-scoped
+  // key or the flat transport key, depending on which path created the session.
+  // Keep both aliases in sync so isolated scheduler jobs cannot miss the override.
+  const canonicalMatch = sessionKey.match(/^agent:[^:]+:(.+)$/);
+  const canonicalKey = sessionKey.startsWith('agent:')
+    ? sessionKey
+    : `agent:${agentId}:${sessionKey}`;
+  const flatSessionKey = canonicalMatch?.[1] || sessionKey;
+  const keyAliases = Array.from(new Set([canonicalKey, flatSessionKey]));
   const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
 
   try {
@@ -506,24 +512,35 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
     const raw = readFileSync(sessionsPath, 'utf-8');
     const store = JSON.parse(raw);
 
-    const entry = store[canonicalKey];
-    if (!entry) {
-      // Session doesn't exist yet -- create a minimal entry.
-      // The gateway will populate the rest on the first agent turn.
-      store[canonicalKey] = {
-        updatedAt: Date.now(),
-        authProfileOverride: authProfile,
-        authProfileOverrideSource: 'user',
-      };
-    } else if (entry.authProfileOverride !== authProfile) {
-      // Update existing entry
-      entry.authProfileOverride = authProfile;
-      entry.authProfileOverrideSource = 'user';
-      entry.updatedAt = Date.now();
-      // Clear compaction count so the override sticks across compactions
-      delete entry.authProfileOverrideCompactionCount;
-    } else {
-      // Already set correctly -- no-op
+    const now = Date.now();
+    let changed = false;
+
+    for (const key of keyAliases) {
+      const entry = store[key];
+      if (!entry) {
+        // Session doesn't exist yet -- create a minimal entry.
+        // The gateway will populate the rest on the first agent turn.
+        store[key] = {
+          updatedAt: now,
+          authProfileOverride: authProfile,
+          authProfileOverrideSource: 'user',
+        };
+        changed = true;
+        continue;
+      }
+
+      if (entry.authProfileOverride !== authProfile || entry.authProfileOverrideSource !== 'user') {
+        // Update existing entry
+        entry.authProfileOverride = authProfile;
+        entry.authProfileOverrideSource = 'user';
+        entry.updatedAt = now;
+        // Clear compaction count so the override sticks across compactions
+        delete entry.authProfileOverrideCompactionCount;
+        changed = true;
+      }
+    }
+
+    if (!changed) {
       return { ok: true };
     }
 

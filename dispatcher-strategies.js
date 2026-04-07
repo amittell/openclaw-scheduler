@@ -1083,7 +1083,10 @@ export async function executeAgent(job, ctx, deps) {
   // the warm session. This avoids full agent bootstrap on every dispatch --
   // memory search, plugin init, and context loading only happen on the first
   // run. Later runs get a pre-warmed session with context already loaded.
-  const sessionKey = job.preferred_session_key || `scheduler:${job.id}`;
+  const requestedSessionKey = job.preferred_session_key || `scheduler:${job.id}`;
+  const sessionKey = requestedSessionKey.startsWith('agent:')
+    ? requestedSessionKey
+    : `agent:${job.agent_id || 'main'}:${requestedSessionKey}`;
   updateRunSession(ctx.run.id, sessionKey, null);
 
   // Mark agent as busy
