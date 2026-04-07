@@ -70,6 +70,7 @@
     "migrate.js",
     "migrate-consolidate.js",
     "paths.js",
+    "provider-registry.js",
     "prompt-context.js",
     "retrieval.js",
     "runs.js",
