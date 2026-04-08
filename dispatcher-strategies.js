@@ -1137,19 +1137,28 @@ export async function executeAgent(job, ctx, deps) {
     }
   }
 
-  // Apply auth profile to session store BEFORE the agent turn.
-  // The x-openclaw-auth-profile HTTP header is not read by the gateway (dead header).
-  // Writing authProfileOverride directly to sessions.json is the effective mechanism
-  // for auth profile propagation to isolated/embedded sessions.
-  if (resolvedAuthProfile && resolvedAuthProfile !== 'inherit') {
-    const { applyAuthProfileToSessionStore: applyAuthProfile } = deps;
-    if (typeof applyAuthProfile === 'function') {
-      const applyResult = applyAuthProfile(sessionKey, resolvedAuthProfile, job.agent_id || 'main');
-      if (applyResult.ok) {
-        log('debug', `Applied auth profile '${resolvedAuthProfile}' to session store for ${sessionKey}`, { jobId: job.id });
-      } else {
-        log('warn', `Failed to apply auth profile to session store: ${applyResult.error}`, { jobId: job.id, sessionKey });
-      }
+  // Apply auth profile and model overrides to the session store BEFORE the agent turn.
+  // The x-openclaw-auth-profile HTTP header is not read by the gateway (dead header),
+  // and provider/model overrides must be expressed via sessions.json because the chat
+  // completions surface only accepts openclaw[:agentId] for embedded scheduler turns.
+  const { applySessionOverridesToSessionStore: applySessionOverrides } = deps;
+  if (typeof applySessionOverrides === 'function') {
+    const applyResult = applySessionOverrides(
+      sessionKey,
+      {
+        authProfile: resolvedAuthProfile,
+        modelRef: job.payload_model || null,
+      },
+      job.agent_id || 'main',
+    );
+    if (applyResult.ok) {
+      log('debug', `Applied session overrides for ${sessionKey}`, {
+        jobId: job.id,
+        authProfile: resolvedAuthProfile || null,
+        modelRef: job.payload_model || null,
+      });
+    } else {
+      log('warn', `Failed to apply session overrides: ${applyResult.error}`, { jobId: job.id, sessionKey });
     }
   }
 
@@ -1157,7 +1166,6 @@ export async function executeAgent(job, ctx, deps) {
     message: prompt,
     agentId: job.agent_id || 'main',
     sessionKey,
-    model: job.payload_model || undefined,
     authProfile: resolvedAuthProfile,
     // materializedEnv deferred: the x-openclaw-env-inject header is not sent
     // until the OpenClaw gateway implements the receiver side. See

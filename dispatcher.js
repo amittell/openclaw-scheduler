@@ -53,7 +53,7 @@ import { upsertAgent, setAgentStatus } from './agents.js';
 import {
   runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
-  applyAuthProfileToSessionStore,
+  applySessionOverridesToSessionStore,
   syncAuthStoreToSession,
 } from './gateway.js';
 import { normalizeShellResult } from './shell-result.js';
@@ -309,7 +309,7 @@ function buildDispatchDeps() {
     updateContextSummary, releaseIdempotencyKey,
     matchesSentinel, detectTransientError,
     listSessions,
-    applyAuthProfileToSessionStore,
+    applySessionOverridesToSessionStore,
     syncAuthStoreToSession,
     // Finalize
     updateIdempotencyResultHash,
