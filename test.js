@@ -5222,7 +5222,6 @@ console.log('\n-- Watcher stop_reason early delivery --');
 
   // --- Functional test: end_turn triggers early delivery via watcher binary ---
   const watcherPath = join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs');
-  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
 
   // Test 1: last assistant entry has stop_reason=end_turn, no tool_use
   // -> isSessionCleanlyFinished returns true -> watcher delivers early
@@ -5301,7 +5300,6 @@ if (sub === 'status') {
     });
 
     const mockLabels2 = join(tmpDir, 'labels-tu.json');
-    let pollCountTu = 0;
     writeFileSync(mockLabels2, JSON.stringify({
       'test-tu': {
         sessionKey: 'agent:main:subagent:tu-uuid',
@@ -5347,11 +5345,10 @@ if (sub === 'status') {
 }
 `);
 
-    let tuExitCode = null;
-    let tuStdout = '';
+    let tuExitCode;
     let tuStderr = '';
     try {
-      tuStdout = execFileSync(process.execPath, [
+      execFileSync(process.execPath, [
         watcherPath, '--label', 'test-tu', '--timeout', '30', '--poll-interval', '1',
       ], {
         encoding: 'utf8',
@@ -5368,7 +5365,6 @@ if (sub === 'status') {
       tuExitCode = 0;
     } catch (err) {
       tuExitCode = err.status ?? 1;
-      tuStdout = err.stdout ?? '';
       tuStderr = err.stderr ?? '';
     }
     assert(tuExitCode === 0, 'stop_reason tool_use: watcher exits 0 (falls through to Path 1 auto-resolve)');
