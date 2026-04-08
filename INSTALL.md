@@ -48,11 +48,11 @@ npm ci
 npm run verify:local
 npm pack
 
-mkdir -p ~/.openclaw/scheduler-runtime
-npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+mkdir -p ~/.openclaw/packages/openclaw-scheduler
+npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
-In that setup, run the service from `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js` and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
+In that setup, run the service from `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js` and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
 
 ---
 
@@ -241,9 +241,9 @@ npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup --service-mo
 If you installed from a locally packed tarball:
 
 ```bash
-npm exec --prefix ~/.openclaw/scheduler-runtime openclaw-scheduler -- setup --service-mode agent
+npm exec --prefix ~/.openclaw/packages/openclaw-scheduler openclaw-scheduler -- setup --service-mode agent
 # or:
-npm exec --prefix ~/.openclaw/scheduler-runtime openclaw-scheduler -- setup --service-mode daemon
+npm exec --prefix ~/.openclaw/packages/openclaw-scheduler openclaw-scheduler -- setup --service-mode daemon
 ```
 
 What each mode does:

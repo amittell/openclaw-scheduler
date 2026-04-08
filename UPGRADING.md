@@ -117,11 +117,11 @@ npm ci
 npm run verify:local
 npm pack
 
-mkdir -p ~/.openclaw/scheduler-runtime
-npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+mkdir -p ~/.openclaw/packages/openclaw-scheduler
+npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
-Keep `SCHEDULER_HOME=~/.openclaw/scheduler` and `SCHEDULER_DB=~/.openclaw/scheduler/scheduler.db`, and point the service at `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js`.
+Keep `SCHEDULER_HOME=~/.openclaw/scheduler` and `SCHEDULER_DB=~/.openclaw/scheduler/scheduler.db`, and point the service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`.
 
 ---
 
@@ -302,7 +302,7 @@ HOST=youruser@your-mac-host.lan
 TARBALL=./openclaw-scheduler-*.tgz
 
 scp $TARBALL $HOST:~/.openclaw/
-ssh $HOST "mkdir -p ~/.openclaw/scheduler-runtime && npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
+ssh $HOST "mkdir -p ~/.openclaw/packages/openclaw-scheduler && npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
 ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
 sleep 3
 ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && launchctl print gui/\$(id -u)/ai.openclaw.scheduler | sed -n '1,20p'"

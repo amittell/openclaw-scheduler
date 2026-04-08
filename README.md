@@ -217,11 +217,11 @@ npm ci
 npm run verify:local
 npm pack
 
-mkdir -p ~/.openclaw/scheduler-runtime
-npm install --prefix ~/.openclaw/scheduler-runtime --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+mkdir -p ~/.openclaw/packages/openclaw-scheduler
+npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
-Point your service at `~/.openclaw/scheduler-runtime/node_modules/openclaw-scheduler/dispatcher.js`, and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
+Point your service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`, and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
 
 The package also exports a small safe programmatic API surface for tooling:
 
