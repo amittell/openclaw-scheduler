@@ -455,6 +455,7 @@ export interface AgentTurnWithTimeoutOpts {
   sessionKey?: string;
   model?: string;
   authProfile?: string | null;
+  sessionKinds?: string[];
   idleTimeoutMs?: number;
   pollIntervalMs?: number;
   absoluteTimeoutMs?: number;
