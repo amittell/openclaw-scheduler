@@ -3,7 +3,7 @@
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
 import Database from 'better-sqlite3';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
@@ -4893,6 +4893,156 @@ if (sub === 'status') {
   assert(ncExitCode === 0, 'normal completion: watcher exits 0');
   assert(ncStdout.includes('Task completed successfully!'), 'normal completion: watcher delivers lastReply in output');
   assert(!ncStdout.includes('SPAWN FAILURE'), 'normal completion: watcher does NOT report spawn failure');
+
+  // 3a. Summary-only completion: when there is no captured lastReply but the done summary
+  //     is meaningful, watcher should deliver the summary body instead of the old
+  //     'completed (no reply captured)' fallback.
+  {
+    const summaryTempDir = mkdtempSync(join(tmpdir(), 'watcher-summary-'));
+    const mockSummaryPath = join(summaryTempDir, 'mock-summary.mjs');
+    const mockLabelsSummary = join(summaryTempDir, 'labels-summary.json');
+    const summaryCounterFile = join(summaryTempDir, 'summary-counter.txt');
+    writeFileSync(summaryCounterFile, '0');
+
+    writeFileSync(mockSummaryPath, `
+import { readFileSync, writeFileSync } from 'fs';
+const [,,sub] = process.argv;
+const counterFile = ${JSON.stringify(summaryCounterFile)};
+let count = 0;
+try { count = parseInt(readFileSync(counterFile, 'utf8').trim()) || 0; } catch {}
+if (sub === 'status') {
+  count++;
+  writeFileSync(counterFile, String(count));
+  if (count === 1) {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-summary',
+      status: 'running',
+      sessionKey: 'agent:main:subagent:summary-uuid',
+      liveness: { ageMs: 3000, updatedAt: Date.now() - 3000, sessionId: 'summary-sid' },
+    }) + '\\n');
+  } else {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-summary',
+      status: 'done',
+      summary: 'Fixed delivery guard and added watcher tests.',
+      sessionKey: 'agent:main:subagent:summary-uuid',
+      liveness: { error: 'session not found in gateway store' },
+    }) + '\\n');
+  }
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'done' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    writeFileSync(mockLabelsSummary, JSON.stringify({
+      'test-summary': {
+        sessionKey: 'agent:main:subagent:summary-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    let summaryExitCode;
+    let summaryStdout;
+    try {
+      summaryStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-summary', '--timeout', '5', '--poll-interval', '1'], {
+        env: {
+          ...process.env,
+          DISPATCH_INDEX_PATH: mockSummaryPath,
+          DISPATCH_LABELS_PATH: mockLabelsSummary,
+          OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+        },
+        encoding: 'utf8',
+        timeout: 12000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      summaryExitCode = 0;
+    } catch (err) {
+      summaryExitCode = err.status ?? 1;
+      summaryStdout = err.stdout ?? '';
+    }
+
+    assert(summaryExitCode === 0, 'summary-only completion: watcher exits 0');
+    assert(summaryStdout.includes('Fixed delivery guard and added watcher tests.'), 'summary-only completion: watcher delivers meaningful done summary');
+    assert(!summaryStdout.includes('completed (no reply captured)'), 'summary-only completion: watcher suppresses no-reply fallback banner');
+  }
+
+  // 3ab. Trivial completion text should be suppressed instead of posted into chat.
+  {
+    const trivialTempDir = mkdtempSync(join(tmpdir(), 'watcher-trivial-'));
+    const mockTrivialPath = join(trivialTempDir, 'mock-trivial.mjs');
+    const mockLabelsTrivial = join(trivialTempDir, 'labels-trivial.json');
+    const trivialCounterFile = join(trivialTempDir, 'trivial-counter.txt');
+    writeFileSync(trivialCounterFile, '0');
+
+    writeFileSync(mockTrivialPath, `
+import { readFileSync, writeFileSync } from 'fs';
+const [,,sub] = process.argv;
+const counterFile = ${JSON.stringify(trivialCounterFile)};
+let count = 0;
+try { count = parseInt(readFileSync(counterFile, 'utf8').trim()) || 0; } catch {}
+if (sub === 'status') {
+  count++;
+  writeFileSync(counterFile, String(count));
+  if (count === 1) {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-trivial',
+      status: 'running',
+      sessionKey: 'agent:main:subagent:trivial-uuid',
+      liveness: { ageMs: 3000, updatedAt: Date.now() - 3000, sessionId: 'trivial-sid' },
+    }) + '\\n');
+  } else {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      label: 'test-trivial',
+      status: 'done',
+      summary: 'completed (agent signal)',
+      sessionKey: 'agent:main:subagent:trivial-uuid',
+      liveness: { error: 'session not found in gateway store' },
+    }) + '\\n');
+  }
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'Hi.', status: 'done' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    writeFileSync(mockLabelsTrivial, JSON.stringify({
+      'test-trivial': {
+        sessionKey: 'agent:main:subagent:trivial-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const trivialRun = spawnSync(process.execPath, [watcherPath, '--label', 'test-trivial', '--timeout', '5', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockTrivialPath,
+        DISPATCH_LABELS_PATH: mockLabelsTrivial,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 12000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    assert((trivialRun.status ?? 1) === 0, 'trivial completion: watcher still exits 0');
+    assert((trivialRun.stdout || '').trim() === '', 'trivial completion: watcher emits no delivery body');
+    assert((trivialRun.stderr || '').includes('completion delivery suppressed'), 'trivial completion: watcher logs suppression to stderr');
+  }
 
   // 3b. Interrupted: status auto-resolved as 'interrupted' (session went idle without calling done).
   //     Mock always returns status=interrupted with the auto-resolve summary.

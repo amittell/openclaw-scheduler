@@ -53,6 +53,55 @@ const ACTIVITY_POLL_MS = 30_000;
  *  so PING_INTERVAL_MS must stay well below PING_STALE_MS (3 * 60_000). */
 const PING_INTERVAL_MS = 60_000; // 60 seconds
 
+const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)$/i;
+const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
+
+function normalizeCompletionText(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function isMeaningfulCompletionText(value) {
+  const text = normalizeCompletionText(value);
+  if (!text) return false;
+
+  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  if (GENERIC_COMPLETION_TEXT_RE.test(normalized)) return false;
+  if (TRIVIAL_CHATTER_RE.test(normalized)) return false;
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length === 1) return false;
+  if (words.length === 2 && normalized.length < 12 && !/[\n:;,-]/.test(text)) return false;
+
+  return true;
+}
+
+function resolveCompletionDelivery(lastReply, fallbackSummary) {
+  const reply = normalizeCompletionText(lastReply);
+  const summary = normalizeCompletionText(fallbackSummary);
+
+  if (isMeaningfulCompletionText(reply)) {
+    return {
+      deliveryText: reply,
+      summary: summary || reply.slice(0, 500),
+    };
+  }
+
+  if (isMeaningfulCompletionText(summary)) {
+    return {
+      deliveryText: summary,
+      summary,
+    };
+  }
+
+  return {
+    deliveryText: null,
+    summary: null,
+  };
+}
+
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
@@ -775,20 +824,17 @@ function deliverResult(label, lastReply, fallbackSummary) {
   }
 
   // Update labels.json before exiting -- prevents stuck detector false positives
-  const summary = fallbackSummary || (lastReply ? lastReply.slice(0, 500) : null);
-  markLabelDone(label, summary);
+  const completion = resolveCompletionDelivery(lastReply, fallbackSummary);
+  markLabelDone(label, completion.summary);
 
-  if (lastReply) {
+  if (completion.deliveryText) {
     const maxLen = 3500;
-    const reply = lastReply.length > maxLen
-      ? lastReply.slice(0, maxLen) + '\n\n..[truncated]'
-      : lastReply;
+    const reply = completion.deliveryText.length > maxLen
+      ? completion.deliveryText.slice(0, maxLen) + '\n\n..[truncated]'
+      : completion.deliveryText;
     process.stdout.write(`🌶️ *dispatch* [${label}] completed:\n\n${reply}\n`);
   } else {
-    process.stdout.write(
-      `🌶️ *dispatch* [${label}] completed (no reply captured)\n` +
-      `Summary: ${fallbackSummary || 'none'}\n`
-    );
+    process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
   }
   process.exit(0);
 }
@@ -1165,16 +1211,10 @@ while (Date.now() < deadline) {
 // Timed out -- try one last result check
 const finalResult = dispatch('result', ['--label', label]);
 const finalStatus = dispatch('status', ['--label', label]);
-if (finalResult?.lastReply) {
+if (finalStatus?.status === 'done') {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
-  deliverResult(label, finalResult.lastReply, finalStatus?.summary || null);
-}
-// If status is explicitly done, exit cleanly even without lastReply
-if (finalStatus?.status === 'done') {
-  markDoneSync(finalStatus?.summary || 'completed');
-  process.stdout.write(`✅ dispatch [${label}] completed (status=done, no lastReply captured)\n`);
-  process.exit(0);
+  deliverResult(label, finalResult?.lastReply || null, finalStatus?.summary || null);
 }
 // If status is interrupted (auto-resolved as incomplete), exit non-zero
 if (finalStatus?.status === 'interrupted') {
