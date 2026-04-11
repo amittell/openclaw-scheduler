@@ -31,6 +31,7 @@ import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { resolveCompletionDelivery } from './completion.mjs';
 import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,54 +54,6 @@ const ACTIVITY_POLL_MS = 30_000;
  *  so PING_INTERVAL_MS must stay well below PING_STALE_MS (3 * 60_000). */
 const PING_INTERVAL_MS = 60_000; // 60 seconds
 
-const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)$/i;
-const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
-
-function normalizeCompletionText(value) {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
-function isMeaningfulCompletionText(value) {
-  const text = normalizeCompletionText(value);
-  if (!text) return false;
-
-  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (!normalized) return false;
-  if (GENERIC_COMPLETION_TEXT_RE.test(normalized)) return false;
-  if (TRIVIAL_CHATTER_RE.test(normalized)) return false;
-
-  const words = normalized.split(/\s+/).filter(Boolean);
-  if (words.length === 1) return false;
-  if (words.length === 2 && normalized.length < 12 && !/[\n:;,-]/.test(text)) return false;
-
-  return true;
-}
-
-function resolveCompletionDelivery(lastReply, fallbackSummary) {
-  const reply = normalizeCompletionText(lastReply);
-  const summary = normalizeCompletionText(fallbackSummary);
-
-  if (isMeaningfulCompletionText(reply)) {
-    return {
-      deliveryText: reply,
-      summary: summary || reply.slice(0, 500),
-    };
-  }
-
-  if (isMeaningfulCompletionText(summary)) {
-    return {
-      deliveryText: summary,
-      summary,
-    };
-  }
-
-  return {
-    deliveryText: null,
-    summary: null,
-  };
-}
 
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -790,7 +743,7 @@ function markLabelError(label, errorSummary) {
  * If the verify command exits non-zero, the job is marked as error and
  * an alert is written to stdout (delivery target receives the failure notice).
  */
-function deliverResult(label, lastReply, fallbackSummary) {
+function deliverResult(label, lastReply, fallbackSummary, completionPayload = null) {
   // -- verify-cmd check -----------------------------------------------------
   // Run the stored verify-cmd (if any) before declaring the job done.
   // A non-zero exit flips the job to error state and sends an alert instead.
@@ -824,7 +777,11 @@ function deliverResult(label, lastReply, fallbackSummary) {
   }
 
   // Update labels.json before exiting -- prevents stuck detector false positives
-  const completion = resolveCompletionDelivery(lastReply, fallbackSummary);
+  const completion = resolveCompletionDelivery({
+    lastReply,
+    completion: completionPayload,
+    fallbackSummary,
+  });
   markLabelDone(label, completion.summary);
 
   if (completion.deliveryText) {
@@ -910,6 +867,7 @@ let recoverySessionKey = null;  // captured during polling for steer/kill
 
 // Module-level state accessible by SIGTERM handler
 let lastKnownReply = null;
+let lastKnownCompletion = null;
 
 // -- SIGTERM handler (scheduler kills watcher with SIGTERM before SIGKILL) --
 // Ensures labels.json is updated and a delivery attempt is made even when killed.
@@ -919,9 +877,10 @@ process.on('SIGTERM', () => {
   try {
     const result = dispatch('result', ['--label', label]);
     if (result?.lastReply) lastKnownReply = result.lastReply;
+    if (result?.completion) lastKnownCompletion = result.completion;
   } catch {}
   // deliverResult calls process.exit(0) internally
-  deliverResult(label, lastKnownReply, 'interrupted by watcher timeout');
+  deliverResult(label, lastKnownReply, 'interrupted by watcher timeout', lastKnownCompletion);
 });
 
 // -- Rolling deadline vars ------------------------------------
@@ -1096,7 +1055,7 @@ while (Date.now() < deadline) {
     // If the session DID produce a lastReply before being killed, deliver it normally.
     if (sessionEverFound && isGatewayRestartKill(status.summary)) {
       const gwCheckResult = dispatch('result', ['--label', label]);
-      if (!gwCheckResult?.lastReply) {
+      if (!gwCheckResult?.lastReply && !gwCheckResult?.completion?.deliveryText) {
         // No result captured -- session was killed before completing
         const retryCount = getGwRestartRetryCount(label);
         if (retryCount >= MAX_GW_RESTART_RETRIES) {
@@ -1135,7 +1094,7 @@ while (Date.now() < deadline) {
           process.exit(1);
         }
       }
-      // lastReply present -- session completed before/during kill; fall through to normal delivery
+      // lastReply or completion payload present -- session completed before/during kill; fall through to normal delivery
     }
 
     // Reset gw-restart retry count on successful completion
@@ -1171,7 +1130,7 @@ while (Date.now() < deadline) {
       }
     }
     const result = dispatch('result', ['--label', label]);
-    deliverResult(label, result?.lastReply, status.summary);
+    deliverResult(label, result?.lastReply, status.summary, result?.completion || status?.completion || null);
   }
 
   // -- Path 2a: stop_reason early delivery (clean end_turn) --
@@ -1185,7 +1144,7 @@ while (Date.now() < deadline) {
     if (_sid2a && isSessionCleanlyFinished(_sid2a, _adir2a)) {
       process.stderr.write(`[watcher] stop_reason=end_turn detected -- delivering early\n`);
       const result = dispatch('result', ['--label', label]);
-      deliverResult(label, result?.lastReply, 'completed (stop_reason=end_turn)');
+      deliverResult(label, result?.lastReply, 'completed (stop_reason=end_turn)', result?.completion || null);
       // deliverResult exits
     }
   }
@@ -1199,8 +1158,8 @@ while (Date.now() < deadline) {
   const ageMs = status.liveness?.ageMs;
   if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
     const result = dispatch('result', ['--label', label]);
-    if (result?.lastReply) {
-      deliverResult(label, result.lastReply, null);
+    if (result?.lastReply || result?.completion?.deliveryText) {
+      deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
   }
 
@@ -1214,7 +1173,12 @@ const finalStatus = dispatch('status', ['--label', label]);
 if (finalStatus?.status === 'done') {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
-  deliverResult(label, finalResult?.lastReply || null, finalStatus?.summary || null);
+  deliverResult(
+    label,
+    finalResult?.lastReply || null,
+    finalStatus?.summary || null,
+    finalResult?.completion || finalStatus?.completion || null,
+  );
 }
 // If status is interrupted (auto-resolved as incomplete), exit non-zero
 if (finalStatus?.status === 'interrupted') {
@@ -1273,9 +1237,9 @@ if (sessionInternalId) {
 // If the session already completed (gateway pruned it -> null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
-  if (r?.lastReply) {
+  if (r?.lastReply || r?.completion?.deliveryText) {
     // deliverResult calls process.exit(0) internally
-    deliverResult(label, r.lastReply, statusAtDeadline?.summary || null);
+    deliverResult(label, r?.lastReply || null, statusAtDeadline?.summary || null, r?.completion || null);
   }
   // Status is explicitly done -- exit cleanly, no timeout noise
   if (statusAtDeadline?.status === 'done') {
@@ -1310,12 +1274,12 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
   if (st?.status === 'done') {
     const r = dispatch('result', ['--label', label]);
     // deliverResult calls process.exit(0) internally
-    deliverResult(label, r?.lastReply, st.summary);
+    deliverResult(label, r?.lastReply || null, st.summary, r?.completion || st?.completion || null);
   }
   const r2 = dispatch('result', ['--label', label]);
-  if (r2?.lastReply) {
+  if (r2?.lastReply || r2?.completion?.deliveryText) {
     // deliverResult calls process.exit(0) internally
-    deliverResult(label, r2.lastReply, null);
+    deliverResult(label, r2?.lastReply || null, null, r2?.completion || null);
   }
 
   // Token growth?
@@ -1404,12 +1368,12 @@ if (sessionInternalId) {
       if (stExt?.status === 'done') {
         const rExt = dispatch('result', ['--label', label]);
         // deliverResult calls process.exit(0) internally
-        deliverResult(label, rExt?.lastReply, stExt.summary);
+        deliverResult(label, rExt?.lastReply || null, stExt.summary, rExt?.completion || stExt?.completion || null);
       }
       const rExt2 = dispatch('result', ['--label', label]);
-      if (rExt2?.lastReply) {
+      if (rExt2?.lastReply || rExt2?.completion?.deliveryText) {
         // deliverResult calls process.exit(0) internally
-        deliverResult(label, rExt2.lastReply, null);
+        deliverResult(label, rExt2?.lastReply || null, null, rExt2?.completion || null);
       }
 
       // JSONL mtime check during extended wait
@@ -1461,12 +1425,12 @@ for (const round of steerRounds) {
   if (st2?.status === 'done') {
     const r3 = dispatch('result', ['--label', label]);
     // deliverResult calls process.exit(0) internally
-    deliverResult(label, r3?.lastReply, st2.summary);
+    deliverResult(label, r3?.lastReply || null, st2.summary, r3?.completion || st2?.completion || null);
   }
   const r3 = dispatch('result', ['--label', label]);
-  if (r3?.lastReply) {
+  if (r3?.lastReply || r3?.completion?.deliveryText) {
     // deliverResult calls process.exit(0) internally
-    deliverResult(label, r3.lastReply, null);
+    deliverResult(label, r3?.lastReply || null, null, r3?.completion || null);
   }
 
   if (!round.msg && steerSessionKey) {
@@ -1479,8 +1443,8 @@ for (const round of steerRounds) {
       if (st3?.status === 'done') {
         // Check if a result was captured before marking as error
         const r4 = dispatch('result', ['--label', label]);
-        if (r4?.lastReply) {
-          deliverResult(label, r4.lastReply, st3.summary); // deliverResult calls process.exit(0)
+        if (r4?.lastReply || r4?.completion?.deliveryText) {
+          deliverResult(label, r4?.lastReply || null, st3.summary, r4?.completion || st3?.completion || null); // deliverResult calls process.exit(0)
         }
         markLabelError(label, 'timed out -- killed after steer attempts (no result captured)');
         process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts -- no result captured\n`);

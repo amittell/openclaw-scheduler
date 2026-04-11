@@ -55,6 +55,7 @@ import {
 import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
+import { buildTerminalCompletionPayload, resolveCompletionDelivery } from './dispatch/completion.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
@@ -5716,6 +5717,46 @@ console.log('\n-- Sessions.json Detection --');
   rmSync(testTmpDir, { recursive: true, force: true });
 }
 
+console.log('\n-- Completion payload helpers --');
+{
+  const helperSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  const synthesized = buildTerminalCompletionPayload({
+    summary: 'completed (agent signal)',
+    checklist: { work_complete: true, tests_passed: true, pushed: true },
+    sha: helperSha,
+  });
+
+  assert(synthesized.summary === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: generic summary synthesized from checklist+sha');
+  assert(synthesized.deliveryText === synthesized.summary, 'completion helper: synthesized summary reused as deliveryText');
+  assert(synthesized.checklist?.tests_passed === true, 'completion helper: checklist preserved');
+  assert(synthesized.sha === helperSha, 'completion helper: sha preserved');
+  assert(synthesized.debug?.rawSummary === 'completed (agent signal)', 'completion helper: raw summary preserved in debug');
+
+  const resolvedReply = resolveCompletionDelivery({
+    lastReply: 'Implemented deterministic completion delivery and pushed the fix.',
+    completion: synthesized,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(resolvedReply.deliveryText === 'Implemented deterministic completion delivery and pushed the fix.', 'completion helper: explicit prose reply wins over synthesized metadata');
+
+  const resolvedSynth = resolveCompletionDelivery({
+    lastReply: null,
+    completion: synthesized,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(resolvedSynth.deliveryText === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: synthesized metadata used when prose reply missing');
+
+  const suppressed = resolveCompletionDelivery({
+    lastReply: null,
+    completion: buildTerminalCompletionPayload({
+      summary: 'completed (agent signal)',
+      checklist: { work_complete: true },
+    }),
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(suppressed.deliveryText === null, 'completion helper: minimal work_complete-only payload does not force delivery');
+}
+
 console.log('\n-- Done Subcommand --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
@@ -5754,6 +5795,9 @@ console.log('\n-- Done Subcommand --');
   const updatedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
   assert(updatedLabels['my-task'].status === 'done', 'done subcommand: labels.json updated to done');
   assert(updatedLabels['my-task'].summary === 'all done!', 'done subcommand: labels.json summary updated');
+  assert(updatedLabels['my-task'].completion?.deliveryText === 'all done!', 'done subcommand: completion payload stores explicit prose delivery text');
+  assert(updatedLabels['my-task'].completion?.checklist?.work_complete === true, 'done subcommand: completion payload stores checklist metadata');
+  assert(doneObj.completion?.deliveryText === 'all done!', 'done subcommand: JSON response includes completion payload');
 
   // done with unregistered label -> exits 0 and marks as done (not an error)
   // NOTE: Changed from exits-1 in 07838b6: unregistered labels are valid for
@@ -5895,6 +5939,58 @@ console.log('\n-- Done Subcommand --');
     assert(noShaObj.status === 'done', 'done without --sha (backward compat): status=done');
     const noShaLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
     assert(!noShaLabels['no-sha-task'].sha, 'done without --sha (backward compat): no sha in labels.json');
+  }
+
+  // done with omitted summary + structured metadata -> deterministic synthesized completion payload
+  {
+    writeFileSync(doneLabels, JSON.stringify({
+      'metadata-only-task': {
+        sessionKey: 'agent:main:subagent:metadata-only-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const metadataSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', cwd: dirname(fileURLToPath(import.meta.url)) }).trim();
+    const metadataOut = execFileSync(process.execPath, [
+      indexPath, 'done', '--label', 'metadata-only-task',
+      '--checklist', '{"work_complete":true,"tests_passed":true,"pushed":true}',
+      '--sha', metadataSha,
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const metadataObj = JSON.parse(metadataOut.trim());
+    const expectedSynth = `Work complete. Tests passed. Pushed ${metadataSha.slice(0, 7)}.`;
+    assert(metadataObj.summary === expectedSynth, 'done metadata-only: summary synthesized deterministically from checklist+sha');
+    assert(metadataObj.completion?.deliveryText === expectedSynth, 'done metadata-only: completion deliveryText synthesized');
+
+    const metadataLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+    assert(metadataLabels['metadata-only-task'].summary === expectedSynth, 'done metadata-only: labels.json summary stores synthesized completion text');
+    assert(metadataLabels['metadata-only-task'].completion?.debug?.rawSummary === 'completed (agent signal)', 'done metadata-only: raw generic summary preserved in debug metadata');
+    assert(metadataLabels['metadata-only-task'].completion?.checklist?.pushed === true, 'done metadata-only: checklist metadata preserved');
+
+    const metadataStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'metadata-only-task'], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim());
+    assert(metadataStatus.completion?.deliveryText === expectedSynth, 'done metadata-only: status exposes completion payload');
+
+    const metadataResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'metadata-only-task'], {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim());
+    assert(metadataResult.lastReply === null, 'done metadata-only: result still reports lastReply=null without transcript prose');
+    assert(metadataResult.completion?.deliveryText === expectedSynth, 'done metadata-only: result exposes completion payload for watcher delivery');
   }
 
   // -- No summary truncation: full summary stored as-is -------
@@ -7377,6 +7473,138 @@ console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to mes
   assert(msg.status === 'pending',                      'handleDelivery(announce): status=pending');
 
   assert(logs.some(l => l.msg.includes('Enqueued')),   'handleDelivery(announce): logs Enqueued');
+}
+
+console.log('\n-- Post-Office Routing: dispatch completion watcher + announce path --');
+{
+  const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
+
+  const liveDb = getDb();
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath = join(dispatchDir, 'index.mjs');
+  const watcherPath = join(dispatchDir, 'watcher.mjs');
+  const { handleDelivery } = createDeliveryHelpers({
+    log: () => {},
+    deliverMessage: async () => { throw new Error('should not call deliverMessage directly'); },
+    resolveDeliveryAlias: () => null,
+  });
+
+  async function runDispatchCompletionDeliveryCase({
+    slug,
+    summary,
+    checklist,
+    sha,
+    expectedDeliveryText,
+    expectEnqueued,
+  }) {
+    const tempDir = mkdtempSync(join(tmpdir(), `dispatch-post-office-${slug}-`));
+    const labelsPath = join(tempDir, 'labels.json');
+    const label = `post-office-${slug}`;
+    const jobName = `DispatchCompletion-${slug}`;
+    const sessionKey = `agent:main:subagent:${slug}`;
+    const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId: `session-${slug}`,
+        updatedAt: Date.now(),
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const doneArgs = [
+      indexPath, 'done', '--label', label,
+      '--checklist', JSON.stringify(checklist),
+    ];
+    if (summary !== undefined) doneArgs.push('--summary', summary);
+    if (sha) doneArgs.push('--sha', sha);
+
+    execFileSync(process.execPath, doneArgs, {
+      encoding: 'utf8',
+      env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999', HOME: tempDir },
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const watcherRun = spawnSync(process.execPath, [watcherPath, '--label', label, '--timeout', '5', '--poll-interval', '1'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999',
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+        HOME: tempDir,
+      },
+      timeout: 15000,
+    });
+
+    const stdout = watcherRun.stdout || '';
+    const stderr = watcherRun.stderr || '';
+    assert(watcherRun.status === 0, `dispatch completion ${slug}: watcher exits 0 for completed label`);
+
+    const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=?").get(jobName).cnt;
+    if (stdout.trim()) {
+      await handleDelivery({
+        name: jobName,
+        delivery_mode: 'announce',
+        delivery_channel: 'telegram',
+        delivery_to: '1234567890',
+      }, stdout.trim());
+    }
+    const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=?").get(jobName).cnt;
+
+    if (expectEnqueued) {
+      assert(stdout.includes(expectedDeliveryText), `dispatch completion ${slug}: watcher stdout contains expected completion text`);
+      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one post-office message`);
+      const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
+      assert(msg.body.includes(expectedDeliveryText), `dispatch completion ${slug}: queued post-office message contains completion text`);
+    } else {
+      assert(stdout.trim() === '', `dispatch completion ${slug}: watcher emits no delivery body when no meaningful completion text exists`);
+      assert(stderr.includes('completion delivery suppressed'), `dispatch completion ${slug}: watcher logs suppressed delivery to stderr`);
+      assert(after === before, `dispatch completion ${slug}: announce path skips post-office enqueue when watcher stdout is empty`);
+    }
+
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+
+  const repoSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    encoding: 'utf8',
+    cwd: dirname(fileURLToPath(import.meta.url)),
+  }).trim();
+
+  await runDispatchCompletionDeliveryCase({
+    slug: 'prose-present',
+    summary: 'Implemented deterministic completion delivery and updated the watcher path.',
+    checklist: { work_complete: true },
+    expectedDeliveryText: 'Implemented deterministic completion delivery and updated the watcher path.',
+    expectEnqueued: true,
+  });
+
+  await runDispatchCompletionDeliveryCase({
+    slug: 'metadata-synth',
+    checklist: { work_complete: true, tests_passed: true, pushed: true },
+    sha: repoSha,
+    expectedDeliveryText: `Work complete. Tests passed. Pushed ${repoSha.slice(0, 7)}.`,
+    expectEnqueued: true,
+  });
+
+  await runDispatchCompletionDeliveryCase({
+    slug: 'neither-present',
+    checklist: { work_complete: true },
+    expectedDeliveryText: null,
+    expectEnqueued: false,
+  });
 }
 
 console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');

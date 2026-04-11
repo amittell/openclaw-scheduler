@@ -32,6 +32,7 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
+import { buildTerminalCompletionPayload } from './completion.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1157,6 +1158,7 @@ function cmdStatus(flags) {
     spawnedAt:  current.spawnedAt,
     updatedAt:  current.updatedAt,
     summary:    current.summary || null,
+    completion: current.completion || null,
     error:      current.error || null,
     liveness,
     ...(syncAction ? { syncAction } : {}),
@@ -1446,6 +1448,7 @@ function cmdResult(flags) {
     status:     entry.status,
     spawnedAt:  entry.spawnedAt,
     summary:    entry.summary || (lastReply ? lastReply.slice(0, 500) : null),
+    completion: entry.completion || null,
     lastReply:  lastReply || null,
     error:      entry.error || null,
   });
@@ -1515,9 +1518,15 @@ async function cmdDone(flags) {
     }
   }
 
-  // Summary passes through as-is; SQLite TEXT has no practical limit and
-  // the scheduler schema already sets output_summary_limit_bytes DEFAULT 65536.
-  const summary = rawSummary;
+  // Summary passes through as-is for raw diagnostics, but we also persist a
+  // first-class completion payload with deterministic delivery text so the
+  // watcher/post-office path never depends solely on transcript recovery.
+  const completion = buildTerminalCompletionPayload({
+    summary: rawSummary,
+    checklist,
+    sha,
+  });
+  const summary = completion.summary || rawSummary;
 
   const existing = getLabel(label);
 
@@ -1633,7 +1642,7 @@ async function cmdDone(flags) {
     // Label was never registered (e.g. direct subagent spawn, not via enqueue).
     // This is not an error -- the work completed, the label just wasn't tracked.
     process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" -- registering as done\n`);
-    setLabel(label, { status: 'done', summary, ...(sha ? { sha } : {}) });
+    setLabel(label, { status: 'done', summary, completion, ...(sha ? { sha } : {}) });
 
     // No watcher is polling for this label, so actively notify via the gateway
     // post office using delivery config from config.json as fallback target.
@@ -1657,13 +1666,14 @@ async function cmdDone(flags) {
       process.stderr.write(`[${BRAND}] warn: no deliverTo in config -- completion not delivered for "${label}"\n`);
     }
 
-    out({ ok: true, label, status: 'done', summary, message: 'Label not previously registered; marked done.' });
+    out({ ok: true, label, status: 'done', summary, completion, message: 'Label not previously registered; marked done.' });
     return;
   }
 
   setLabel(label, {
     status:  'done',
     summary,
+    completion,
     ...(sha ? { sha } : {}),
   });
 
@@ -1682,7 +1692,7 @@ async function cmdDone(flags) {
     session_key: existing.sessionKey || null,
   }).catch(() => {});
 
-  out({ ok: true, label, status: 'done', summary, message: 'Label marked done via agent signal.' });
+  out({ ok: true, label, status: 'done', summary, completion, message: 'Label marked done via agent signal.' });
 }
 
 /**
