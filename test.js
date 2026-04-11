@@ -61,7 +61,7 @@ import {
   TRUST_LEVELS, compareTrustLevels,
 } from './v02-runtime.js';
 import { runShellCommand } from './dispatcher-shell.js';
-import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence } from './dispatcher-strategies.js';
+import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence, executeAgent } from './dispatcher-strategies.js';
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
@@ -3243,6 +3243,75 @@ console.log('\n-- Auth Profile --');
   deleteJob(explicitNullJob.id);
 }
 
+console.log('\n-- Fallback Model/Auth Fields --');
+{
+  const fallbackJob = createJob({
+    name: 'Test Fallback Fields',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test fallback fields',
+    session_target: 'isolated',
+    payload_model: 'gpt-5-mini',
+    payload_model_fallback: 'openclaw:main',
+    auth_profile: 'anthropic:gmail',
+    auth_profile_fallback: 'openai:work',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000, origin: 'system',
+  });
+  assert(fallbackJob.payload_model_fallback === 'openclaw:main', 'payload_model_fallback stored correctly');
+  assert(fallbackJob.auth_profile_fallback === 'openai:work', 'auth_profile_fallback stored correctly');
+
+  const fetchedFallback = getJob(fallbackJob.id);
+  assert(fetchedFallback.payload_model_fallback === 'openclaw:main', 'getJob returns payload_model_fallback');
+  assert(fetchedFallback.auth_profile_fallback === 'openai:work', 'getJob returns auth_profile_fallback');
+
+  const updatedFallback = updateJob(fallbackJob.id, {
+    payload_model_fallback: 'gpt-4.1-mini',
+    auth_profile_fallback: 'anthropic:backup',
+  });
+  assert(updatedFallback.payload_model_fallback === 'gpt-4.1-mini', 'payload_model_fallback updates correctly');
+  assert(updatedFallback.auth_profile_fallback === 'anthropic:backup', 'auth_profile_fallback updates correctly');
+
+  const clearedFallback = updateJob(fallbackJob.id, {
+    payload_model_fallback: null,
+    auth_profile_fallback: null,
+  });
+  assert(clearedFallback.payload_model_fallback === null, 'payload_model_fallback clears back to null');
+  assert(clearedFallback.auth_profile_fallback === null, 'auth_profile_fallback clears back to null');
+
+  const wsFallback = validateJobSpec({
+    name: 'Fallback whitespace',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'x',
+    payload_model_fallback: '  ',
+    auth_profile_fallback: '  ',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000, origin: 'system',
+  }, null, 'create');
+  assert(wsFallback.payload_model_fallback === null, 'payload_model_fallback whitespace normalizes to null');
+  assert(wsFallback.auth_profile_fallback === null, 'auth_profile_fallback whitespace normalizes to null');
+
+  let caught = false;
+  try {
+    validateJobSpec({ payload_model_fallback: 123, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('payload_model_fallback must be a string');
+  }
+  assert(caught, 'payload_model_fallback rejects non-string types');
+
+  caught = false;
+  try {
+    validateJobSpec({ auth_profile_fallback: true, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('auth_profile_fallback must be a string');
+  }
+  assert(caught, 'auth_profile_fallback rejects non-string types');
+
+  const version = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get();
+  assert(version.v >= 24, 'schema_migrations has v24');
+
+  deleteJob(fallbackJob.id);
+}
+
 console.log('\n-- Auth Profile Session Store Propagation --');
 {
   // Test applyAuthProfileToSessionStore writes authProfileOverride to sessions.json
@@ -3384,37 +3453,52 @@ console.log('\n-- Sync Auth Store to Session --');
   console.log('  sync auth store to session: pass');
 }
 
-console.log('\n-- Sync Auth Store Integration with executeAgent --');
+console.log('\n-- executeAgent fallback selection --');
 {
-  // Verify that syncAuthStoreToSession is in the dispatcher deps bag
-  const dispatcherSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher.js'), 'utf-8');
-  assert(dispatcherSrc.includes('syncAuthStoreToSession'), 'dispatcher.js imports syncAuthStoreToSession');
-  assert(dispatcherSrc.includes('syncAuthStoreToSession,'), 'dispatcher.js passes syncAuthStoreToSession in deps');
+  const turnAttempts = [];
+  const appliedProfiles = [];
+  const syncCalls = [];
+  const logs = [];
 
-  // Verify dispatcher-strategies.js calls syncAuth unconditionally before agent turn
-  const strategiesSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher-strategies.js'), 'utf-8');
-  const syncCallIdx = strategiesSrc.indexOf('syncAuthStoreToSession: syncAuth');
-  assert(syncCallIdx > -1, 'dispatcher-strategies.js destructures syncAuthStoreToSession');
-  // Find the actual syncAuth() invocation and the actual turnResult = await runAgentTurnWithActivityTimeout() call
-  const syncInvokeIdx = strategiesSrc.indexOf('syncAuth(job.agent_id');
-  const turnInvokeIdx = strategiesSrc.indexOf('await runAgentTurnWithActivityTimeout(');
-  assert(syncInvokeIdx > -1, 'syncAuth invocation found');
-  assert(turnInvokeIdx > -1, 'runAgentTurnWithActivityTimeout invocation found');
-  assert(turnInvokeIdx > syncInvokeIdx, 'syncAuth is called before runAgentTurnWithActivityTimeout');
+  const result = await executeAgent({
+    id: 'fallback-runtime-job',
+    name: 'Fallback Runtime Job',
+    agent_id: 'main',
+    payload_model: 'gpt-5-mini',
+    payload_model_fallback: 'gpt-4.1-mini',
+    auth_profile: 'anthropic:primary',
+    auth_profile_fallback: 'openai:backup',
+    payload_timeout_seconds: 120,
+    run_timeout_ms: 300_000,
+  }, { run: { id: 'fallback-runtime-run' } }, {
+    waitForGateway: async () => true,
+    updateRunSession: () => {},
+    setAgentStatus: () => {},
+    buildJobPrompt: () => ({ prompt: 'do the thing', contextMeta: {} }),
+    updateContextSummary: () => {},
+    releaseDispatch: () => {},
+    releaseIdempotencyKey: () => {},
+    updateJob: () => {},
+    matchesSentinel: () => false,
+    detectTransientError: () => false,
+    sqliteNow,
+    log: (...args) => logs.push(args),
+    syncAuthStoreToSession: () => { syncCalls.push('sync'); return { ok: true }; },
+    applyAuthProfileToSessionStore: (_sessionKey, authProfile) => { appliedProfiles.push(authProfile); return { ok: true }; },
+    runAgentTurnWithActivityTimeout: async ({ model, authProfile }) => {
+      turnAttempts.push({ model: model || null, authProfile: authProfile || null });
+      if (turnAttempts.length === 1) throw new Error('primary selection failed');
+      return { content: 'Fallback path succeeded' };
+    },
+  });
 
-  // Verify the sync call is NOT inside an if(resolvedAuthProfile) guard
-  // Extract the syncAuth call context (the ~20 lines around it)
-  const lines = strategiesSrc.split('\n');
-  const syncLine = lines.findIndex(l => l.includes('syncAuthStoreToSession: syncAuth'));
-  assert(syncLine > -1, 'found syncAuth destructuring line');
-  // Check that the syncAuth call is at function body level (not inside an if block)
-  const syncCallLine = lines.findIndex((l, i) => i > syncLine && l.includes('syncAuth('));
-  assert(syncCallLine > -1, 'found syncAuth() call');
-  // The line should not be deeply indented (inside an if) -- it should be at the same level as other unconditional calls
-  const indent = lines[syncCallLine].match(/^(\s*)/)[1].length;
-  assert(indent <= 6, `syncAuth call indentation (${indent}) suggests it is unconditional (not inside if block)`);
-
-  console.log('  sync auth store integration with executeAgent: pass');
+  assert(result.status === 'ok', 'executeAgent fallback: returns ok after fallback turn succeeds');
+  assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
+  assert(turnAttempts[0].model === 'gpt-5-mini' && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary selection uses primary model/auth profile');
+  assert(turnAttempts[1].model === 'gpt-4.1-mini' && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry uses configured fallback model/auth profile');
+  assert(syncCalls.length === 2, 'executeAgent fallback: syncAuthStoreToSession runs before both attempts');
+  assert(JSON.stringify(appliedProfiles) === JSON.stringify(['anthropic:primary', 'openai:backup']), 'executeAgent fallback: applies primary then fallback auth profile to session store');
+  assert(logs.some(entry => String(entry[1] || '').includes('retrying with configured fallback')), 'executeAgent fallback: logs fallback retry');
 }
 
 console.log('\n-- Migration Guard --');
@@ -3843,11 +3927,13 @@ console.log('\n-- Partial Current Schema Consolidation --');
     process.stderr.write = originalStderrWrite;
   }
   const migratedDb = getDb();
+  const migratedJobCols = migratedDb.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
   const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
   const migratedMsgCols = migratedDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
   const migratedTtaCols = migratedDb.prepare('PRAGMA table_info(task_tracker_agents)').all().map(c => c.name);
   assert(!migrationLogs.includes('migrate-consolidate error'), 'partial current-schema migration completes without consolidate errors');
   assert(!migrationLogs.includes('Schema apply warning'), 'partial current-schema migration completes without schema warnings');
+  assert(migratedJobCols.includes('payload_model_fallback') && migratedJobCols.includes('auth_profile_fallback'), 'partial current-schema migration backfills jobs fallback selection columns');
   assert(migratedRunCols.includes('idempotency_key'), 'partial current-schema migration backfills runs.idempotency_key');
   assert(migratedMsgCols.includes('team_id'), 'partial current-schema migration backfills messages.team_id');
   assert(migratedTtaCols.includes('tracker_id'), 'partial current-schema migration backfills task_tracker_agents.tracker_id');
@@ -8663,7 +8749,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 23, 'capabilities: schema_version is 23');
+  assert(capsOut.schema_version === 24, 'capabilities: schema_version is 24');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

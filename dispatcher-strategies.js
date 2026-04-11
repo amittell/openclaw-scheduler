@@ -1051,13 +1051,89 @@ export async function executeShell(job, ctx, deps) {
 
 // -- Strategy: Agent (isolated session) ----------------------
 
+function describeAgentSelection(selection) {
+  return {
+    model: selection?.model || null,
+    auth_profile: selection?.authProfile || null,
+  };
+}
+
+function sameAgentSelection(left, right) {
+  return (left?.model || undefined) === (right?.model || undefined)
+    && (left?.authProfile || undefined) === (right?.authProfile || undefined);
+}
+
+async function resolveConfiguredAuthProfile(authProfile, deps, jobId, fieldName = 'auth_profile') {
+  const { listSessions, log } = deps;
+  let resolvedAuthProfile = authProfile || undefined;
+  if (resolvedAuthProfile !== 'inherit') return resolvedAuthProfile;
+
+  try {
+    const sessions = await listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 });
+    const sessionList = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions || [];
+    const mainSession = Array.isArray(sessionList)
+      ? sessionList.find(s => {
+          const key = s.key || s.sessionKey || '';
+          return key.includes(':main:') || key.endsWith(':main') || key === 'main';
+        })
+      : null;
+    const profileId = mainSession?.authProfileOverride || mainSession?.authProfile || mainSession?.profile;
+    if (profileId) {
+      resolvedAuthProfile = profileId;
+      log('debug', `Resolved ${fieldName} 'inherit' -> '${profileId}'`, { jobId });
+    } else {
+      log('debug', `${fieldName} 'inherit' -- no main session profile found, passing 'inherit' as-is`, { jobId });
+    }
+  } catch (err) {
+    log('warn', `Failed to resolve ${fieldName} 'inherit': ${err.message}`, { jobId });
+    // Fall through with 'inherit' -- gateway may handle it.
+  }
+
+  return resolvedAuthProfile;
+}
+
+async function runAgentTurnForSelection(job, deps, prompt, sessionKey, selection) {
+  const { runAgentTurnWithActivityTimeout, log } = deps;
+  const { syncAuthStoreToSession: syncAuth, applyAuthProfileToSessionStore: applyAuthProfile } = deps;
+
+  // Always sync the live auth store before each attempt so refreshed credentials
+  // are visible to any embedded/isolated runner startup.
+  if (typeof syncAuth === 'function') {
+    const syncResult = syncAuth(job.agent_id || 'main');
+    if (syncResult.ok) {
+      log('debug', `Synced live auth store to agent '${job.agent_id || 'main'}'`, { jobId: job.id });
+    } else {
+      log('warn', `Failed to sync auth store: ${syncResult.error}`, { jobId: job.id });
+    }
+  }
+
+  if (selection.authProfile && selection.authProfile !== 'inherit' && typeof applyAuthProfile === 'function') {
+    const applyResult = applyAuthProfile(sessionKey, selection.authProfile, job.agent_id || 'main');
+    if (applyResult.ok) {
+      log('debug', `Applied auth profile '${selection.authProfile}' to session store for ${sessionKey}`, { jobId: job.id });
+    } else {
+      log('warn', `Failed to apply auth profile to session store: ${applyResult.error}`, { jobId: job.id, sessionKey });
+    }
+  }
+
+  return runAgentTurnWithActivityTimeout({
+    message: prompt,
+    agentId: job.agent_id || 'main',
+    sessionKey,
+    model: selection.model || undefined,
+    authProfile: selection.authProfile,
+    idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
+    pollIntervalMs: 60000,
+    absoluteTimeoutMs: job.run_timeout_ms || 300000,
+  });
+}
+
 export async function executeAgent(job, ctx, deps) {
   const {
     waitForGateway, updateRunSession, setAgentStatus,
-    buildJobPrompt, runAgentTurnWithActivityTimeout,
+    buildJobPrompt,
     updateContextSummary, releaseDispatch, releaseIdempotencyKey,
     updateJob, matchesSentinel, detectTransientError,
-    listSessions,
     sqliteNow, log,
   } = deps;
   const result = makeDefaultResult();
@@ -1096,76 +1172,44 @@ export async function executeAgent(job, ctx, deps) {
   const { prompt, contextMeta } = buildJobPrompt(job, ctx.run);
   try { updateContextSummary(ctx.run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
 
-  // Resolve auth_profile: use effective profile from child credential policy
-  // if available (set by 'inherit' policy), otherwise fall back to the job's own.
-  let resolvedAuthProfile = ctx.v02Outcomes?.effective_auth_profile || job.auth_profile || undefined;
-  if (resolvedAuthProfile === 'inherit') {
-    try {
-      const sessions = await listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 });
-      const sessionList = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions || [];
-      const mainSession = Array.isArray(sessionList)
-        ? sessionList.find(s => {
-            const key = s.key || s.sessionKey || '';
-            return key.includes(':main:') || key.endsWith(':main') || key === 'main';
-          })
-        : null;
-      const profileId = mainSession?.authProfileOverride || mainSession?.authProfile || mainSession?.profile;
-      if (profileId) {
-        resolvedAuthProfile = profileId;
-        log('debug', `Resolved auth_profile 'inherit' -> '${profileId}'`, { jobId: job.id });
-      } else {
-        log('debug', `auth_profile 'inherit' -- no main session profile found, passing 'inherit' as-is`, { jobId: job.id });
-      }
-    } catch (err) {
-      log('warn', `Failed to resolve 'inherit' auth_profile: ${err.message}`, { jobId: job.id });
-      // Fall through with 'inherit' -- gateway may handle it
-    }
-  }
-
-  // Always sync the live auth store to the agent's auth-profiles.json BEFORE
-  // every agent turn. This ensures sessions that reuse a stable key (scheduler:<jobId>)
-  // always have fresh credentials -- token refreshes, order changes, and new
-  // profiles are picked up automatically without requiring an explicit auth_profile
-  // on every job.
-  const { syncAuthStoreToSession: syncAuth } = deps;
-  if (typeof syncAuth === 'function') {
-    const syncResult = syncAuth(job.agent_id || 'main');
-    if (syncResult.ok) {
-      log('debug', `Synced live auth store to agent '${job.agent_id || 'main'}'`, { jobId: job.id });
-    } else {
-      log('warn', `Failed to sync auth store: ${syncResult.error}`, { jobId: job.id });
-    }
-  }
-
-  // Apply auth profile to session store BEFORE the agent turn.
-  // The x-openclaw-auth-profile HTTP header is not read by the gateway (dead header).
-  // Writing authProfileOverride directly to sessions.json is the effective mechanism
-  // for auth profile propagation to isolated/embedded sessions.
-  if (resolvedAuthProfile && resolvedAuthProfile !== 'inherit') {
-    const { applyAuthProfileToSessionStore: applyAuthProfile } = deps;
-    if (typeof applyAuthProfile === 'function') {
-      const applyResult = applyAuthProfile(sessionKey, resolvedAuthProfile, job.agent_id || 'main');
-      if (applyResult.ok) {
-        log('debug', `Applied auth profile '${resolvedAuthProfile}' to session store for ${sessionKey}`, { jobId: job.id });
-      } else {
-        log('warn', `Failed to apply auth profile to session store: ${applyResult.error}`, { jobId: job.id, sessionKey });
-      }
-    }
-  }
-
-  const turnResult = await runAgentTurnWithActivityTimeout({
-    message: prompt,
-    agentId: job.agent_id || 'main',
-    sessionKey,
+  const primarySelection = {
     model: job.payload_model || undefined,
-    authProfile: resolvedAuthProfile,
-    // materializedEnv deferred: the x-openclaw-env-inject header is not sent
-    // until the OpenClaw gateway implements the receiver side. See
-    // openclaw/docs/env-inject-proposal.md for the gateway spec.
-    idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
-    pollIntervalMs: 60000,
-    absoluteTimeoutMs: job.run_timeout_ms || 300000,
-  });
+    authProfile: await resolveConfiguredAuthProfile(
+      ctx.v02Outcomes?.effective_auth_profile || job.auth_profile || undefined,
+      deps,
+      job.id,
+      ctx.v02Outcomes?.effective_auth_profile ? 'effective_auth_profile' : 'auth_profile'
+    ),
+  };
+  const hasConfiguredFallback = job.payload_model_fallback != null || job.auth_profile_fallback != null;
+  const fallbackSelection = hasConfiguredFallback ? {
+    model: job.payload_model_fallback || primarySelection.model || undefined,
+    authProfile: job.auth_profile_fallback != null
+      ? await resolveConfiguredAuthProfile(job.auth_profile_fallback, deps, job.id, 'auth_profile_fallback')
+      : primarySelection.authProfile,
+  } : null;
+
+  let turnResult;
+  try {
+    turnResult = await runAgentTurnForSelection(job, deps, prompt, sessionKey, primarySelection);
+  } catch (primaryError) {
+    const canTryConfiguredFallback = fallbackSelection && !sameAgentSelection(primarySelection, fallbackSelection);
+    if (!canTryConfiguredFallback) throw primaryError;
+
+    log('warn', 'Primary agent selection failed; retrying with configured fallback', {
+      jobId: job.id,
+      primary: describeAgentSelection(primarySelection),
+      fallback: describeAgentSelection(fallbackSelection),
+      error: primaryError.message,
+    });
+
+    try {
+      turnResult = await runAgentTurnForSelection(job, deps, prompt, sessionKey, fallbackSelection);
+      log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });
+    } catch (fallbackError) {
+      throw new Error(`Primary agent selection failed: ${primaryError.message}; configured fallback also failed: ${fallbackError.message}`, { cause: fallbackError });
+    }
+  }
 
   const content = turnResult.content || '';
   const trimmed = content.trim();

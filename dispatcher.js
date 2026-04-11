@@ -425,8 +425,10 @@ function buildJobPrompt(job, run) {
     execution_intent: job.execution_intent || 'execute',
     execution_read_only: Boolean(job.execution_read_only),
     payload_model: job.payload_model || null,
+    payload_model_fallback: job.payload_model_fallback || null,
     payload_thinking: job.payload_thinking || null,
     auth_profile: job.auth_profile || null,
+    auth_profile_fallback: job.auth_profile_fallback || null,
   };
 
   const triggerContext = buildTriggeredRunContext(run);

@@ -35,11 +35,11 @@ function sqliteNow(offsetMs = 0) {
 
 const PATCHABLE_COLUMNS = new Set([
   'enabled', 'name', 'schedule_cron', 'schedule_tz', 'schedule_at', 'schedule_kind',
-  'next_run_at', 'last_run_at', 'last_status', 'payload_message', 'payload_model',
+  'next_run_at', 'last_run_at', 'last_status', 'payload_message', 'payload_model', 'payload_model_fallback',
   'payload_thinking', 'payload_timeout_seconds', 'session_target', 'run_timeout_ms',
   'max_retries', 'consecutive_errors',
   'delivery_mode', 'delivery_channel', 'delivery_to', 'delivery_opt_out_reason',
-  'delete_after_run', 'ttl_hours', 'auth_profile', 'origin',
+  'delete_after_run', 'ttl_hours', 'auth_profile', 'auth_profile_fallback', 'origin',
   'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
   'watchdog_check_cmd', 'watchdog_timeout_min', 'watchdog_started_at',
   'watchdog_target_label', 'watchdog_alert_channel', 'watchdog_alert_target',
@@ -192,9 +192,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'resource_pool',
     'preferred_session_key',
     'payload_model',
+    'payload_model_fallback',
     'payload_thinking',
     'trigger_condition',
     'auth_profile',
+    'auth_profile_fallback',
     'delivery_opt_out_reason',
     'origin',
     // v0.2 nullable strings
@@ -397,6 +399,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (mode === 'create' || 'payload_model' in normalized) {
     assertSafeString('payload_model', merged.payload_model, { allowEmpty: false, maxLength: 256 });
   }
+  if (mode === 'create' || 'payload_model_fallback' in normalized) {
+    assertSafeString('payload_model_fallback', merged.payload_model_fallback, { allowEmpty: false, maxLength: 256 });
+  }
   if (mode === 'create' || 'payload_thinking' in normalized) {
     assertSafeString('payload_thinking', merged.payload_thinking, { allowEmpty: false, maxLength: 64 });
   }
@@ -406,6 +411,14 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
         throw new Error('auth_profile must be a string or null');
       }
       assertSafeString('auth_profile', merged.auth_profile, { allowEmpty: false, maxLength: 256 });
+    }
+  }
+  if (mode === 'create' || 'auth_profile_fallback' in normalized) {
+    if (merged.auth_profile_fallback != null) {
+      if (typeof merged.auth_profile_fallback !== 'string') {
+        throw new Error('auth_profile_fallback must be a string or null');
+      }
+      assertSafeString('auth_profile_fallback', merged.auth_profile_fallback, { allowEmpty: false, maxLength: 256 });
     }
   }
 
@@ -651,7 +664,7 @@ export function createJob(opts) {
     INSERT INTO jobs (
       id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
       session_target, agent_id, payload_kind, payload_message,
-      payload_model, payload_thinking, payload_timeout_seconds,
+      payload_model, payload_model_fallback, payload_thinking, payload_timeout_seconds,
       execution_intent, execution_read_only,
       overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals, max_trigger_fanout,
       delivery_mode, delivery_channel, delivery_to,
@@ -668,7 +681,7 @@ export function createJob(opts) {
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
       watchdog_self_destruct, watchdog_started_at,
       ttl_hours,
-      auth_profile,
+      auth_profile, auth_profile_fallback,
       delivery_opt_out_reason,
       origin,
       identity_principal, identity_run_as, identity_attestation, identity_ref,
@@ -684,7 +697,7 @@ export function createJob(opts) {
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?, ?,
+      ?, ?, ?, ?,
       ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?,
@@ -698,7 +711,7 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?, ?,
       ?, ?,
-      ?,
+      ?, ?,
       ?,
       ?,
       ?,
@@ -728,6 +741,7 @@ export function createJob(opts) {
     finalKind,
     normalized.payload_message,
     normalized.payload_model || null,
+    normalized.payload_model_fallback || null,
     normalized.payload_thinking || null,
     normalized.payload_timeout_seconds ?? 120,
     normalized.execution_intent || 'execute',
@@ -771,6 +785,7 @@ export function createJob(opts) {
     normalized.watchdog_started_at || null,
     normalized.ttl_hours || null,
     normalized.auth_profile || null,
+    normalized.auth_profile_fallback || null,
     normalized.delivery_opt_out_reason || null,
     normalized.origin || null,
     normalized.identity_principal || null,
@@ -830,7 +845,7 @@ export function updateJob(id, patch) {
   const allowed = [
     'name', 'enabled', 'schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz',
     'session_target', 'agent_id', 'payload_kind', 'payload_message',
-    'payload_model', 'payload_thinking', 'payload_timeout_seconds',
+    'payload_model', 'payload_model_fallback', 'payload_thinking', 'payload_timeout_seconds',
     'execution_intent', 'execution_read_only',
     'overlap_policy', 'run_timeout_ms', 'max_queued_dispatches', 'max_pending_approvals', 'max_trigger_fanout',
     'delivery_mode', 'delivery_channel', 'delivery_to',
@@ -846,7 +861,7 @@ export function updateJob(id, patch) {
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
     'watchdog_self_destruct', 'watchdog_started_at',
     'ttl_hours',
-    'auth_profile',
+    'auth_profile', 'auth_profile_fallback',
     'delivery_opt_out_reason',
     'origin',
     // v0.2 fields

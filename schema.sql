@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 23)
+-- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 24)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   payload_kind    TEXT NOT NULL,                      -- 'systemEvent' | 'agentTurn' | 'shellCommand'
   payload_message TEXT NOT NULL,
   payload_model   TEXT,
+  payload_model_fallback TEXT,
   payload_thinking TEXT,
   payload_timeout_seconds INTEGER DEFAULT 120,
   execution_intent TEXT NOT NULL DEFAULT 'execute',   -- 'execute' | 'plan'
@@ -90,6 +91,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
   -- Auth profile override (v16)
   auth_profile    TEXT DEFAULT NULL,                  -- null=default, 'inherit'=main session profile, or 'provider:label'
+
+  -- Fallback selection overrides (v24)
+  auth_profile_fallback TEXT DEFAULT NULL,            -- optional fallback auth profile used after primary selection failure
 
   -- Delivery opt-out (v19)
   delivery_opt_out_reason TEXT DEFAULT NULL,          -- set when delivery_mode='none' to explicitly skip delivery
@@ -478,3 +482,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (20);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (21);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (22);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (23);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (24);

@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v23).
+ * Brings any DB from any prior version up to the current schema (v24).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -58,6 +58,7 @@ export default function migrateConsolidate() {
       'max_trigger_fanout', 'output_store_limit_bytes',
       'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
       'output_offload_threshold_bytes', 'ttl_hours', 'auth_profile',
+      'payload_model_fallback', 'auth_profile_fallback',
       'schedule_kind', 'schedule_at', 'delivery_channel', 'delivery_to',
       'delivery_opt_out_reason', 'origin', 'parent_id', 'created_at',
       'updated_at', 'delete_after_run', 'next_run_at', 'last_run_at',
@@ -137,7 +138,7 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 23
+    current >= 24
     && hasLatestColumns
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
@@ -345,6 +346,9 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN credential_handoff_summary TEXT DEFAULT NULL`,
     // v23: child credential policy
     `ALTER TABLE jobs ADD COLUMN child_credential_policy TEXT DEFAULT NULL`,
+    // v24: explicit fallback model/auth selection
+    `ALTER TABLE jobs ADD COLUMN payload_model_fallback TEXT`,
+    `ALTER TABLE jobs ADD COLUMN auth_profile_fallback TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {

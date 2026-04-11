@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - feat: x-openclaw-env-inject header for agent task credentials (PR #5)
 - feat: [IMAGE:path] marker protocol for shell job image attachments
 - feat: auto-delete watcher and watchdog jobs after completion (delete_after_run)
+- feat(jobs): add durable payload_model_fallback/auth_profile_fallback fields with same-run fallback retry
 - feat: enforce delivery_to as required field on job INSERT
 - feat: multi-platform CI (Linux, macOS, Windows)
 - docs: trust architecture, multi-agent gateway routing, agent adoption files

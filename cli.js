@@ -222,19 +222,23 @@ switch (command) {
         const isWatchdog = args.includes('--watchdog');
         const profileIdx = args.indexOf('--profile');
         const profileValue = profileIdx >= 0 ? args[profileIdx + 1] : undefined;
+        const fallbackProfileIdx = args.indexOf('--fallback-profile');
+        const fallbackProfileValue = fallbackProfileIdx >= 0 ? args[fallbackProfileIdx + 1] : undefined;
         const atIdx = args.indexOf('--at');
         const atValue = atIdx >= 0 ? args[atIdx + 1] : undefined;
         const inIdx = args.indexOf('--in');
         const inValue = inIdx >= 0 ? args[inIdx + 1] : undefined;
         const skipArgs = new Set(['--dry-run', '--watchdog']);
         if (profileIdx >= 0) { skipArgs.add(args[profileIdx]); skipArgs.add(args[profileIdx + 1]); }
+        if (fallbackProfileIdx >= 0) { skipArgs.add(args[fallbackProfileIdx]); skipArgs.add(args[fallbackProfileIdx + 1]); }
         if (atIdx >= 0) { skipArgs.add(args[atIdx]); skipArgs.add(args[atIdx + 1]); }
         if (inIdx >= 0) { skipArgs.add(args[inIdx]); skipArgs.add(args[inIdx + 1]); }
         const payload = args.find(a => !skipArgs.has(a));
-        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]');
+        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>] [--fallback-profile <id>]');
         let spec;
         try { spec = JSON.parse(payload); } catch { fail('Invalid JSON. Usage: jobs add \'{"name":"..."}\''); }
         if (profileValue !== undefined) spec.auth_profile = profileValue;
+        if (fallbackProfileValue !== undefined) spec.auth_profile_fallback = fallbackProfileValue;
 
         // One-shot scheduling via --at or --in
         if (atValue || inValue) {
@@ -302,14 +306,18 @@ switch (command) {
         const dryRun = args.includes('--dry-run');
         const updateProfileIdx = args.indexOf('--profile');
         const updateProfileValue = updateProfileIdx >= 0 ? args[updateProfileIdx + 1] : undefined;
+        const updateFallbackProfileIdx = args.indexOf('--fallback-profile');
+        const updateFallbackProfileValue = updateFallbackProfileIdx >= 0 ? args[updateFallbackProfileIdx + 1] : undefined;
         const updateFilterArgs = new Set(['--dry-run']);
         if (updateProfileIdx >= 0) { updateFilterArgs.add(args[updateProfileIdx]); updateFilterArgs.add(args[updateProfileIdx + 1]); }
+        if (updateFallbackProfileIdx >= 0) { updateFilterArgs.add(args[updateFallbackProfileIdx]); updateFilterArgs.add(args[updateFallbackProfileIdx + 1]); }
         const updateArgs = args.filter(a => !updateFilterArgs.has(a));
         const current = getJob(updateArgs[0]);
         if (!current) fail(`Job not found: ${updateArgs[0]}`);
         let patch;
         try { patch = JSON.parse(updateArgs[1]); } catch { fail('Invalid JSON. Usage: jobs update <id> \'{"key":"value"}\''); }
         if (updateProfileValue !== undefined) patch.auth_profile = updateProfileValue;
+        if (updateFallbackProfileValue !== undefined) patch.auth_profile_fallback = updateFallbackProfileValue;
         const normalized = validateJobSpec(patch, current, 'update');
         if (dryRun) {
           emit({ ok: true, dry_run: true, valid: true, normalized });
