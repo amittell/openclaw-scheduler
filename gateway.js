@@ -718,6 +718,9 @@ export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, 
 }
 
 export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
+  if (!sessionKey || !authProfile) {
+    return { ok: false, error: 'sessionKey and authProfile are required' };
+  }
   return applySessionOverridesToSessionStore(sessionKey, { authProfile }, agentId);
 }
 

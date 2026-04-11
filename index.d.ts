@@ -33,6 +33,7 @@ export interface JobSpec {
   payload_kind?: 'systemEvent' | 'agentTurn' | 'shellCommand';
   payload_message: string;
   payload_model?: string | null;
+  payload_model_fallback?: string | null;
   payload_thinking?: string | null;
   payload_timeout_seconds?: number;
   payload_scope?: 'own' | 'global';
@@ -87,6 +88,7 @@ export interface JobSpec {
 
   // Auth profile override
   auth_profile?: string | null;
+  auth_profile_fallback?: string | null;
 
   // Delivery opt-out
   delivery_opt_out_reason?: string | null;
@@ -150,6 +152,8 @@ export interface JobRecord extends JobSpec {
   schedule_cron: string | null;
   schedule_at: string | null;
   schedule_tz: string;
+  payload_model_fallback?: string | null;
+  auth_profile_fallback?: string | null;
   payload_kind: 'systemEvent' | 'agentTurn' | 'shellCommand';
   payload_message: string;
   ttl_hours: number | null;

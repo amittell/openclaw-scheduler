@@ -90,6 +90,10 @@ single user message to an agent and receives the complete assistant response.
 The `model` field defaults to `openclaw:<agentId>` but can be overridden via
 `job.payload_model`.
 
+If `job.payload_model_fallback` and/or `job.auth_profile_fallback` are set, the
+scheduler retries once in the same run with the configured fallback selection
+after a primary selection error.
+
 **Response body** (expected):
 
 ```json
@@ -650,6 +654,23 @@ Reference: `dispatcher-strategies.js` `executeAgent()`.
 ### "provider:label" (explicit)
 A specific provider and label string (e.g. `anthropic:production`) is passed
 directly as the `x-openclaw-auth-profile` header value without resolution.
+
+---
+
+## Fallback Model / Auth Selection
+
+Jobs can optionally persist `payload_model_fallback` and `auth_profile_fallback`
+alongside the primary `payload_model` / `auth_profile` fields.
+
+Runtime behavior:
+
+- The scheduler attempts the primary selection first.
+- If the primary chat-completions request errors before a usable assistant
+  reply is returned, `executeAgent()` retries once in the same run using the
+  configured fallback overrides.
+- Any fallback dimension left unset keeps the primary effective value.
+- Existing jobs remain backward-compatible because both fallback fields default
+  to `NULL` and no retry is attempted unless a fallback override is configured.
 
 ---
 
