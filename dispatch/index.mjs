@@ -448,6 +448,17 @@ function inferChatType(key, session) {
   return "";
 }
 
+function parseOriginTarget(origin) {
+  const match = /^([^:]+):(.+)$/.exec(origin || '');
+  if (!match) return { channel: null, target: null };
+  return { channel: match[1], target: match[2] };
+}
+
+function originFromDeliveryTarget(deliverTo, deliverChannel = 'telegram') {
+  if (!deliverTo) return null;
+  return `${deliverChannel || 'telegram'}:${deliverTo}`;
+}
+
 function getActiveOriginFromSessions() {
   const store = readSessionsStore("main");
   if (!store) return null;
@@ -728,8 +739,11 @@ function makeSessionKey(agentId) {
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
- *   --origin <origin>        Required. Where the job was dispatched from (e.g. "telegram:<your-user-id>", "system")
+ *   --origin <origin>        Explicit dispatch origin for audit/retries (e.g. "telegram:<chat_id>", "system")
+ *                            If omitted but --deliver-to is explicit, dispatch derives origin from that target.
+ *                            Active-session auto-detect is preserved only as a manual/local fallback when both are absent.
  *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call.
+ *                            Chat-triggered callers should pass inbound metadata chat_id here, especially for group chats.
  *                            Defaults to origin chat ID when --origin is a "telegram:<id>" string.
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
@@ -764,30 +778,44 @@ async function cmdEnqueue(flags) {
     process.stderr.write(`[${BRAND}] WARNING: --timeout not specified, defaulting to 300s. ` +
       `Pass --timeout explicitly (≥1200 for thinking=high tasks) to avoid premature watcher kills.\n`);
   }
-  let origin = flags.origin || null;
+  const explicitOrigin = flags.origin || null;
+  const explicitDeliverTo = flags['deliver-to'] || null;
+  const explicitDeliverChannel = flags['deliver-channel'] || null;
+  let origin = explicitOrigin;
 
-  // Auto-detect origin from active sessions if not explicitly provided
-  if (!origin) {
+  // Contract: chat-triggered callers should pass --deliver-to from inbound
+  // metadata chat_id. If they omit --origin, derive it from that explicit
+  // delivery target so dispatch never falls back to whichever session happened
+  // to be active most recently.
+  if (!origin && explicitDeliverTo) {
+    origin = originFromDeliveryTarget(explicitDeliverTo, explicitDeliverChannel || 'telegram');
+  }
+
+  // Preserve active-session inference only as a manual/local fallback when the
+  // caller truly omitted both origin and delivery target.
+  if (!origin && !explicitDeliverTo) {
     origin = getActiveOriginFromSessions();
     if (origin) {
       process.stderr.write(`[${BRAND}] auto-detected origin from active session: ${origin}\n`);
+      process.stderr.write(`[${BRAND}] NOTE: active-session origin detection is a manual/local fallback. ` +
+        `Chat-triggered callers should pass --deliver-to from inbound metadata chat_id.\n`);
     }
   }
 
   // -- Auto-derive deliver-to from origin ---------------------------------
   // If origin is "telegram:<id>", use <id> as the default deliver-to target.
   let defaultDeliverTo   = null;
-  let defaultDeliverCh   = 'telegram';
+  let defaultDeliverCh   = explicitDeliverChannel || 'telegram';
   if (origin) {
-    const originMatch = /^([^:]+):(.+)$/.exec(origin);
-    if (originMatch) {
-      defaultDeliverCh  = originMatch[1];
-      defaultDeliverTo  = originMatch[2];
+    const { channel, target } = parseOriginTarget(origin);
+    if (channel && target) {
+      if (!explicitDeliverChannel) defaultDeliverCh = channel;
+      defaultDeliverTo = target;
     }
   }
 
-  const deliverTo      = flags['deliver-to']       || defaultDeliverTo;
-  const deliverChannel = flags['deliver-channel']   || defaultDeliverCh || 'telegram';
+  const deliverTo      = explicitDeliverTo         || defaultDeliverTo;
+  const deliverChannel = explicitDeliverChannel     || defaultDeliverCh || 'telegram';
   const deliverMode    = flags['delivery-mode']     || 'announce';
   const mode        = flags.mode             || 'fresh';
 
@@ -818,6 +846,7 @@ async function cmdEnqueue(flags) {
       "REJECTED: --deliver-to is required for dispatch jobs.\n" +
       "Pass --deliver-to <chat_id> (e.g. --deliver-to -100200000000 for a group, " +
       "or --deliver-to 123456789 for a DM).\n" +
+      "Chat-triggered callers should pass inbound metadata chat_id here, especially for group chats.\n" +
       "Alternatively, pass --origin telegram:<chat_id> to auto-derive the delivery target.\n" +
       "Pass --no-monitor \"<reason>\" only if you explicitly want to skip delivery (audit trail required).",
       2
@@ -2067,9 +2096,10 @@ Usage: openclaw-scheduler <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
            [--timeout <s>] [--mode fresh|reuse] [--model <m>]
-           [--origin <o>]  (auto-detected from active session; override with e.g. "telegram:<your-group-id>")
+           [--origin <o>]  (recommended explicit value, e.g. "telegram:<chat_id>" or "system")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
-           (--deliver-to defaults to origin chat ID when --origin is "telegram:<id>")
+           (--deliver-to should come from inbound metadata chat_id; explicit --deliver-to becomes origin when --origin is omitted)
+           (active-session auto-detect is preserved only as a manual/local fallback)
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
            [--verify-cmd <shell_cmd>]
 
