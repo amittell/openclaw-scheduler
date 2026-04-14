@@ -2,11 +2,11 @@
 // Standalone test for getActiveOriginFromSessions group-preference tiebreaker
 // Run: node test-origin-tiebreak.mjs
 
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -29,35 +29,48 @@ function runAutoDetect(sessions) {
   const tmpBase = mkdtempSync(join(tmpdir(), 'origin-tiebreak-'));
   const sessionsDir = join(tmpBase, '.openclaw', 'agents', 'main', 'sessions');
   const labelsPath  = join(tmpBase, 'labels.json');
+  const binDir = join(tmpBase, 'bin');
+  const openclawPath = join(binDir, 'openclaw');
   mkdirSync(sessionsDir, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
   writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
   writeFileSync(labelsPath, JSON.stringify({}) + '\n');
+  writeFileSync(openclawPath, [
+    '#!/usr/bin/env node',
+    "const args = process.argv.slice(2);",
+    "const method = args[0] === 'gateway' && args[1] === 'call' ? args[2] : null;",
+    "if (method === 'agent') {",
+    "  process.stdout.write(JSON.stringify({ ok: true, runId: 'run-test' }));",
+    '} else {',
+    "  process.stdout.write('{}');",
+    '}',
+    '',
+  ].join('\n'));
+  chmodSync(openclawPath, 0o755);
 
-  let stderr = '';
-  try {
-    execFileSync(
-      process.execPath,
-      [indexPath, 'enqueue',
-        '--label', 'test-origin-tiebreak',
-        '--message', 'ping',
-        '--deliver-to', '999',
-        '--delivery-mode', 'none',
-        '--timeout', '300',
-        '--no-monitor',
-      ],
-      {
-        encoding: 'utf8',
-        env: { ...process.env, HOME: tmpBase, DISPATCH_LABELS_PATH: labelsPath },
-        timeout: 15_000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }
-    );
-  } catch (err) {
-    stderr = err.stderr || '';
-  }
+  const run = spawnSync(
+    process.execPath,
+    [indexPath, 'enqueue',
+      '--label', 'test-origin-tiebreak',
+      '--message', 'ping',
+      '--delivery-mode', 'none',
+      '--timeout', '300',
+      '--no-monitor',
+    ],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: tmpBase,
+        DISPATCH_LABELS_PATH: labelsPath,
+        PATH: `${binDir}:${process.env.PATH || ''}`,
+      },
+      timeout: 15_000,
+    }
+  );
 
   rmSync(tmpBase, { recursive: true, force: true });
-  const m = /auto-detected origin from active session: ([^\n]+)/.exec(stderr);
+  const m = /auto-detected origin from active session: ([^\n]+)/.exec(run.stderr || '');
   return m ? m[1].trim() : null;
 }
 

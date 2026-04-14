@@ -1748,6 +1748,8 @@ node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
   --label "fix-deploy-script" --message "..." --deliver-to YOUR_CHAT_ID
 ```
 
+For normal chat-triggered dispatches, always pass `--deliver-to` from the inbound metadata `chat_id`. If you omit `--origin`, dispatch now derives it from that explicit delivery target instead of guessing from whichever session was active most recently. The old active-session lookup is kept only as a manual/local fallback when both values are absent.
+
 ### Flag Reference
 
 | Flag | Default | Description |
@@ -1758,7 +1760,7 @@ node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
 | `--model` | -- | Model override, e.g. `anthropic/claude-sonnet-4-6`. |
-| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers a scheduler watcher job for reliable at-least-once delivery. |
+| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers a scheduler watcher job for reliable at-least-once delivery. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
 | `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
 | `--timeout` | `300` | Session timeout in seconds. |
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |

@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -7774,9 +7774,150 @@ console.log('\n-- dispatch/index.mjs --deliver-to error message --');
   assert(indexSrc.includes('123456789'), 'dispatch error: generic DM example present');
   assert(indexSrc.includes('--origin telegram:<chat_id>'), 'dispatch error: --origin auto-derive guidance present');
   assert(indexSrc.includes('audit trail required'), 'dispatch error: --no-monitor audit trail note present');
+  assert(indexSrc.includes('inbound metadata chat_id'), 'dispatch error: inbound metadata chat_id guidance present');
 
   // Verify the old confusing message is gone
   assert(!indexSrc.includes('--origin is required for agentTurn jobs'), 'dispatch error: old confusing --origin message removed');
+}
+
+// ============================================================
+// SECTION: explicit delivery target contract
+// ============================================================
+
+console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath = join(dispatchDir, 'index.mjs');
+
+  function runEnqueueWithStub({ label, sessions = {}, extraArgs = [] }) {
+    const tmpBase = mkdtempSync(join(tmpdir(), 'dispatch-origin-contract-'));
+    const sessionsDir = join(tmpBase, '.openclaw', 'agents', 'main', 'sessions');
+    const labelsPath = join(tmpBase, 'labels.json');
+    const binDir = join(tmpBase, 'bin');
+    const callsPath = join(tmpBase, 'openclaw-calls.jsonl');
+    const openclawPath = join(binDir, 'openclaw');
+
+    mkdirSync(sessionsDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
+    writeFileSync(labelsPath, JSON.stringify({}) + '\n');
+
+    const stubSource = [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      'const args = process.argv.slice(2);',
+      "const paramsIdx = args.indexOf('--params');",
+      "const method = args[0] === 'gateway' && args[1] === 'call' ? args[2] : null;",
+      "const params = paramsIdx >= 0 ? JSON.parse(args[paramsIdx + 1]) : null;",
+      `const callsPath = ${JSON.stringify(callsPath)};`,
+      "fs.appendFileSync(callsPath, JSON.stringify({ args, method, params }) + '\\n');",
+      "if (method === 'agent') {",
+      "  process.stdout.write(JSON.stringify({ ok: true, runId: 'run-test' }));",
+      '} else {',
+      "  process.stdout.write('{}');",
+      '}',
+      '',
+    ].join('\n');
+    writeFileSync(openclawPath, stubSource);
+    chmodSync(openclawPath, 0o755);
+
+    const run = spawnSync(
+      process.execPath,
+      [
+        indexPath,
+        'enqueue',
+        '--label', label,
+        '--message', 'ping',
+        '--timeout', '300',
+        '--delivery-mode', 'none',
+        '--no-monitor',
+        ...extraArgs,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: tmpBase,
+          DISPATCH_LABELS_PATH: labelsPath,
+          PATH: `${binDir}:${process.env.PATH || ''}`,
+        },
+      }
+    );
+
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    let calls = [];
+    try {
+      calls = readFileSync(callsPath, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => JSON.parse(line));
+    } catch {}
+
+    const agentCall = calls.find(call => call.method === 'agent')?.params || null;
+    rmSync(tmpBase, { recursive: true, force: true });
+    return { ...run, labels, calls, agentCall };
+  }
+
+  const now = Date.now();
+  const recent1 = now - 30_000;
+  const recent2 = now - 60_000;
+
+  {
+    const result = runEnqueueWithStub({
+      label: 'explicit-group-contract',
+      extraArgs: ['--deliver-to', '-5240776892'],
+    });
+    assert(result.status === 0, 'explicit delivery: enqueue succeeds');
+    assert(result.agentCall?.replyTo === '-5240776892', 'explicit delivery: gateway replyTo pinned to explicit group target');
+    assert(result.agentCall?.replyChannel === 'telegram', 'explicit delivery: gateway replyChannel defaults to telegram');
+    assert(result.agentCall?.deliver === true, 'explicit delivery: gateway deliver flag stays enabled');
+    assert(result.labels['explicit-group-contract']?.deliverTo === '-5240776892', 'explicit delivery: label stores explicit deliverTo');
+    assert(result.labels['explicit-group-contract']?.origin === 'telegram:-5240776892', 'explicit delivery: origin derives from explicit deliver target when omitted');
+    assert(!result.stderr.includes('auto-detected origin from active session'), 'explicit delivery: no ambient auto-detect when deliver-to is explicit');
+  }
+
+  {
+    const result = runEnqueueWithStub({
+      label: 'explicit-beats-ambient-dm',
+      sessions: {
+        'agent:main:telegram:direct:alex': {
+          updatedAt: recent1,
+          deliveryContext: { to: 'telegram:484946046' },
+          chatType: 'direct',
+        },
+      },
+      extraArgs: ['--deliver-to', '-5240776892'],
+    });
+    assert(result.status === 0, 'explicit vs ambient: enqueue succeeds');
+    assert(result.labels['explicit-beats-ambient-dm']?.origin === 'telegram:-5240776892', 'explicit vs ambient: ambient DM does not steal origin');
+    assert(result.labels['explicit-beats-ambient-dm']?.origin !== 'telegram:484946046', 'explicit vs ambient: origin is not the active DM session');
+    assert(result.agentCall?.replyTo === '-5240776892', 'explicit vs ambient: gateway still delivers to explicit group');
+    assert(!result.stderr.includes('auto-detected origin from active session'), 'explicit vs ambient: explicit deliver-to skips ambient auto-detect path');
+  }
+
+  {
+    const result = runEnqueueWithStub({
+      label: 'manual-fallback-origin',
+      sessions: {
+        'agent:main:telegram:direct:alex': {
+          updatedAt: recent1,
+          deliveryContext: { to: 'telegram:484946046' },
+          chatType: 'direct',
+        },
+        'agent:main:telegram:group:-5240776892': {
+          updatedAt: recent2,
+          deliveryContext: { to: 'telegram:-5240776892' },
+          chatType: 'group',
+        },
+      },
+    });
+    assert(result.status === 0, 'manual fallback: enqueue succeeds without explicit target');
+    assert(result.stderr.includes('auto-detected origin from active session: telegram:-5240776892'), 'manual fallback: logs auto-detected group origin');
+    assert(result.stderr.includes('manual/local fallback'), 'manual fallback: explains fallback contract in stderr');
+    assert(result.labels['manual-fallback-origin']?.origin === 'telegram:-5240776892', 'manual fallback: label stores fallback origin');
+    assert(result.agentCall?.replyTo === '-5240776892', 'manual fallback: gateway replyTo still derives from fallback origin');
+  }
 }
 
 // ============================================================
@@ -7786,8 +7927,9 @@ console.log('\n-- dispatch/index.mjs --deliver-to error message --');
 console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
 {
   // We test the logic indirectly by writing a temp sessions.json into a temp
-  // HOME dir and invoking the CLI with no --origin flag, then checking stderr
-  // for the "auto-detected origin from active session: <origin>" log line.
+  // HOME dir and invoking the CLI with no explicit --origin/--deliver-to, then
+  // checking stderr for the "auto-detected origin from active session: <origin>"
+  // log line.
 
   const dispatchDir  = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
   const indexPath    = join(dispatchDir, 'index.mjs');
@@ -7796,35 +7938,48 @@ console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
     const tmpBase = mkdtempSync(join(tmpdir(), 'origin-tiebreak-'));
     const sessionsDir = join(tmpBase, '.openclaw', 'agents', 'main', 'sessions');
     const labelsPath  = join(tmpBase, 'labels.json');
+    const binDir = join(tmpBase, 'bin');
+    const openclawPath = join(binDir, 'openclaw');
     mkdirSync(sessionsDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
     writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
     writeFileSync(labelsPath, JSON.stringify({}) + '\n');
+    writeFileSync(openclawPath, [
+      '#!/usr/bin/env node',
+      "const args = process.argv.slice(2);",
+      "const method = args[0] === 'gateway' && args[1] === 'call' ? args[2] : null;",
+      "if (method === 'agent') {",
+      "  process.stdout.write(JSON.stringify({ ok: true, runId: 'run-test' }));",
+      '} else {',
+      "  process.stdout.write('{}');",
+      '}',
+      '',
+    ].join('\n'));
+    chmodSync(openclawPath, 0o755);
 
-    let stderr = '';
-    try {
-      execFileSync(
-        process.execPath,
-        [indexPath, 'enqueue',
-          '--label', 'test-origin-tiebreak',
-          '--message', 'ping',
-          '--deliver-to', '999',
-          '--delivery-mode', 'none',
-          '--timeout', '300',
-          '--no-monitor',
-        ],
-        {
-          encoding: 'utf8',
-          env: { ...process.env, HOME: tmpBase, DISPATCH_LABELS_PATH: labelsPath },
-          timeout: 15_000,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        }
-      );
-    } catch (err) {
-      stderr = err.stderr || '';
-    }
+    const run = spawnSync(
+      process.execPath,
+      [indexPath, 'enqueue',
+        '--label', 'test-origin-tiebreak',
+        '--message', 'ping',
+        '--delivery-mode', 'none',
+        '--timeout', '300',
+        '--no-monitor',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: tmpBase,
+          DISPATCH_LABELS_PATH: labelsPath,
+          PATH: `${binDir}:${process.env.PATH || ''}`,
+        },
+        timeout: 15_000,
+      }
+    );
 
     rmSync(tmpBase, { recursive: true, force: true });
-    const m = /auto-detected origin from active session: ([^\n]+)/.exec(stderr);
+    const m = /auto-detected origin from active session: ([^\n]+)/.exec(run.stderr || '');
     return m ? m[1].trim() : null;
   }
 

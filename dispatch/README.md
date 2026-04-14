@@ -80,10 +80,10 @@ node dispatch/index.mjs enqueue \
 | `--model` | — | Model override (e.g. `anthropic/claude-sonnet-4-6`) |
 | `--thinking` | — | Reasoning level: `low`, `high`, `xhigh` |
 | `--timeout` | `300` | Seconds before run times out |
-| `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call |
+| `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
 | `--deliver-channel` | `telegram` | Delivery channel for `--deliver-to` (telegram, slack, etc.) |
 | `--delivery-mode` | `announce` | `announce`, `announce-always`, `none` |
-| `--origin` | -- | Dispatch origin (e.g. `telegram:12345`) |
+| `--origin` | -- | Dispatch origin (e.g. `telegram:12345`). If omitted but `--deliver-to` is explicit, dispatch derives origin from that target. Active-session auto-detect is fallback for manual/local use only. |
 | `--no-monitor` | false | Skip watcher monitoring |
 | `--monitor-interval` | -- | Watcher cron expression |
 | `--monitor-timeout` | -- | Watcher timeout in minutes |
