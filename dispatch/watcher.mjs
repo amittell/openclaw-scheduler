@@ -870,17 +870,47 @@ let lastKnownReply = null;
 let lastKnownCompletion = null;
 
 // -- SIGTERM handler (scheduler kills watcher with SIGTERM before SIGKILL) --
-// Ensures labels.json is updated and a delivery attempt is made even when killed.
+// Hand off to a fresh watcher instead of converting the kill into a fake success.
 process.on('SIGTERM', () => {
-  process.stderr.write(`[watcher] SIGTERM received for ${label} -- marking as interrupted\n`);
-  // Try to fetch the latest result before dying
+  process.stderr.write(`[watcher] SIGTERM received for ${label} -- attempting watcher handoff\n`);
+
+  let latestStatus = null;
+  try {
+    latestStatus = dispatch('status', ['--label', label]);
+  } catch {}
+
   try {
     const result = dispatch('result', ['--label', label]);
     if (result?.lastReply) lastKnownReply = result.lastReply;
     if (result?.completion) lastKnownCompletion = result.completion;
   } catch {}
-  // deliverResult calls process.exit(0) internally
-  deliverResult(label, lastKnownReply, 'interrupted by watcher timeout', lastKnownCompletion);
+
+  if (latestStatus?.status === 'done') {
+    deliverResult(label, lastKnownReply, latestStatus.summary || null, lastKnownCompletion || latestStatus?.completion || null);
+  }
+
+  if (latestStatus?.status === 'interrupted') {
+    markLabelError(label, latestStatus.summary || 'interrupted: session went idle without calling done');
+    process.exit(1);
+  }
+
+  if (latestStatus?.status && latestStatus.status !== 'running') {
+    const summary = latestStatus.error || latestStatus.summary || `terminal failure (${latestStatus.status})`;
+    markLabelError(label, summary);
+    process.stdout.write(`🌶️ *dispatch* [${label}] failed\nSummary: ${summary}\n`);
+    process.exit(1);
+  }
+
+  const handoff = dispatch('watcher-handoff', ['--label', label, '--reason', 'sigterm']);
+  if (handoff?.ok && (handoff.scheduled || handoff.reason === 'label already terminal' || handoff.reason === 'delivery disabled for this label')) {
+    process.stderr.write(`[watcher] SIGTERM handoff ${handoff.scheduled ? 'scheduled' : 'skipped'} for ${label}\n`);
+    process.exit(0);
+  }
+
+  const failureSummary = 'interrupted by watcher timeout (handoff failed)';
+  markLabelError(label, failureSummary);
+  process.stdout.write(`⚠️ dispatch [${label}] watcher interrupted and handoff failed\nSummary: ${failureSummary}\n`);
+  process.exit(1);
 });
 
 // -- Rolling deadline vars ------------------------------------
@@ -1024,11 +1054,21 @@ while (Date.now() < deadline) {
 
   // -- Path 1: status auto-resolved to done ------------------
   if (status.status !== 'running') {
+    const terminalResult = dispatch('result', ['--label', label]);
+    const terminalCompletion = terminalResult?.completion || status?.completion || null;
+    const hasTerminalCompletionEvidence = Boolean(
+      terminalResult?.lastReply
+      || terminalResult?.completion?.deliveryText
+      || terminalResult?.completion?.summary
+      || status?.completion?.deliveryText
+      || status?.completion?.summary
+    );
+
     // -- Spawn failure detection -----------------------------------------
     // If the session was auto-resolved to 'done' (or 'spawn-warning') but was
-    // never seen in the gateway, it never ran -- this is a spawn failure.
-    // Causes: auth timeout, quota exhaustion, gateway error at spawn time.
-    if (!sessionEverFound && (status.status === 'done' || status.status === 'spawn-warning' || status.status === 'error')) {
+    // never seen in the gateway, it never ran -- unless a terminal completion
+    // payload/reply proves the work already finished before this watcher saw it.
+    if (!sessionEverFound && (status.status === 'spawn-warning' || status.status === 'error' || (status.status === 'done' && !hasTerminalCompletionEvidence))) {
       const spawnErrMsg =
         `[dispatch] SPAWN FAILURE: session ${status.sessionKey || '(unknown)'} never appeared ` +
         `in gateway -- spawn likely failed (auth timeout, quota, or gateway error). Label: ${label}`;
@@ -1054,8 +1094,7 @@ while (Date.now() < deadline) {
     //
     // If the session DID produce a lastReply before being killed, deliver it normally.
     if (sessionEverFound && isGatewayRestartKill(status.summary)) {
-      const gwCheckResult = dispatch('result', ['--label', label]);
-      if (!gwCheckResult?.lastReply && !gwCheckResult?.completion?.deliveryText) {
+      if (!terminalResult?.lastReply && !terminalResult?.completion?.deliveryText) {
         // No result captured -- session was killed before completing
         const retryCount = getGwRestartRetryCount(label);
         if (retryCount >= MAX_GW_RESTART_RETRIES) {
@@ -1129,8 +1168,7 @@ while (Date.now() < deadline) {
         process.stderr.write(`[watcher] [${label}] completed after ${currentRetryCount} retry(ies), reset retryCount\n`);
       }
     }
-    const result = dispatch('result', ['--label', label]);
-    deliverResult(label, result?.lastReply, status.summary, result?.completion || status?.completion || null);
+    deliverResult(label, terminalResult?.lastReply, status.summary, terminalCompletion);
   }
 
   // -- Path 2a: stop_reason early delivery (clean end_turn) --
