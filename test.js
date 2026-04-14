@@ -4975,6 +4975,198 @@ if (sub === 'status') {
     assert(!summaryStdout.includes('completed (no reply captured)'), 'summary-only completion: watcher suppresses no-reply fallback banner');
   }
 
+
+  // 3aa. SIGTERM while the underlying task is still running should hand off to a
+  //      fresh watcher, and the next watcher should deliver the real completion.
+  {
+    const handoffTempDir = mkdtempSync(join(tmpdir(), 'watcher-handoff-'));
+    const mockHandoffPath = join(handoffTempDir, 'mock-handoff.mjs');
+    const mockLabelsHandoff = join(handoffTempDir, 'labels-handoff.json');
+    const mockStatePath = join(handoffTempDir, 'state.json');
+
+    writeFileSync(mockStatePath, JSON.stringify({
+      status: {
+        ok: true,
+        label: 'test-handoff',
+        status: 'running',
+        sessionKey: 'agent:main:subagent:handoff-uuid',
+        summary: null,
+        error: null,
+        liveness: { ageMs: 3000, updatedAt: Date.now() - 3000, sessionId: 'handoff-sid' },
+      },
+      result: {
+        ok: true,
+        label: 'test-handoff',
+        status: 'running',
+        summary: null,
+        completion: null,
+        lastReply: null,
+        error: null,
+      },
+      handoffs: 0,
+      reasons: [],
+      statusReads: 0,
+      resultReads: 0,
+    }, null, 2));
+
+    writeFileSync(mockHandoffPath, `
+import { readFileSync, writeFileSync } from 'fs';
+const statePath = ${JSON.stringify(mockStatePath)};
+const state = JSON.parse(readFileSync(statePath, 'utf8'));
+const [,,sub, ...rest] = process.argv;
+const flags = {};
+for (let i = 0; i < rest.length; i++) {
+  const arg = rest[i];
+  const next = rest[i + 1];
+  if (arg.startsWith('--')) {
+    if (next && !next.startsWith('--')) {
+      flags[arg.slice(2)] = next;
+      i++;
+    } else {
+      flags[arg.slice(2)] = true;
+    }
+  }
+}
+if (sub === 'status') {
+  state.statusReads = (state.statusReads || 0) + 1;
+  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  process.stdout.write(JSON.stringify(state.status) + '\\n');
+} else if (sub === 'result') {
+  state.resultReads = (state.resultReads || 0) + 1;
+  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  process.stdout.write(JSON.stringify(state.result) + '\\n');
+} else if (sub === 'watcher-handoff') {
+  state.handoffs = (state.handoffs || 0) + 1;
+  state.reasons = [...(state.reasons || []), flags.reason || null];
+  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  process.stdout.write(JSON.stringify({ ok: true, scheduled: true, jobId: 'handoff-job-1', reason: flags.reason || null }) + '\\n');
+} else if (sub === 'sync') {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: false, sub }) + '\\n');
+  process.exit(1);
+}
+`);
+
+    writeFileSync(mockLabelsHandoff, JSON.stringify({
+      'test-handoff': {
+        sessionKey: 'agent:main:subagent:handoff-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 120_000).toISOString(),
+        timeoutSeconds: 30,
+        idleThresholdSeconds: 1,
+        deliverTo: 'telegram:test',
+        deliverChannel: 'telegram',
+        deliveryMode: 'announce',
+        origin: 'telegram:test',
+      },
+    }) + '\n');
+
+    let handoffExitCode = null;
+    let handoffSignal = null;
+    let handoffStdout = '';
+    let handoffStderr = '';
+    const handoffChild = spawn(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '30', '--poll-interval', '5', '--idle-threshold', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockHandoffPath,
+        DISPATCH_LABELS_PATH: mockLabelsHandoff,
+        OPENCLAW_GATEWAY_TOKEN: 'test-token',
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    handoffChild.stdout.on('data', chunk => { handoffStdout += chunk.toString(); });
+    handoffChild.stderr.on('data', chunk => { handoffStderr += chunk.toString(); });
+    const handoffReadyDeadline = Date.now() + 5000;
+    while (Date.now() < handoffReadyDeadline) {
+      const currentState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
+      if ((currentState.statusReads || 0) > 0) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    handoffChild.kill('SIGTERM');
+    await new Promise(resolve => {
+      handoffChild.on('exit', (code, signal) => {
+        handoffExitCode = code;
+        handoffSignal = signal;
+        resolve();
+      });
+    });
+
+    const handoffState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
+    const handoffLabels = JSON.parse(readFileSync(mockLabelsHandoff, 'utf8'));
+    assert(handoffExitCode === 0, 'sigterm handoff: watcher exits 0 so the kill is not misreported as a completed delivery');
+    assert(handoffSignal === null, 'sigterm handoff: watcher handles SIGTERM and exits cleanly');
+    assert(handoffState.handoffs === 1, 'sigterm handoff: watcher schedules exactly one successor watcher');
+    assert(Array.isArray(handoffState.reasons) && handoffState.reasons[0] === 'sigterm', 'sigterm handoff: handoff reason recorded as sigterm');
+    assert(handoffStdout.trim() === '', 'sigterm handoff: watcher emits no chat delivery while handing off');
+    assert(handoffStderr.includes('SIGTERM received'), 'sigterm handoff: watcher logs the SIGTERM event');
+    assert(!handoffStdout.includes('interrupted by watcher timeout'), 'sigterm handoff: watcher no longer delivers fake timeout success text');
+    assert(handoffLabels['test-handoff'].status === 'running', 'sigterm handoff: label remains running for the successor watcher');
+
+    writeFileSync(mockStatePath, JSON.stringify({
+      status: {
+        ok: true,
+        label: 'test-handoff',
+        status: 'done',
+        sessionKey: 'agent:main:subagent:handoff-uuid',
+        summary: 'Handoff preserved the real completion delivery.',
+        error: null,
+        completion: {
+          summary: 'Handoff preserved the real completion delivery.',
+          deliveryText: 'Handoff preserved the real completion delivery.',
+        },
+        liveness: { error: 'session not found in gateway store' },
+      },
+      result: {
+        ok: true,
+        label: 'test-handoff',
+        status: 'done',
+        summary: 'Handoff preserved the real completion delivery.',
+        completion: {
+          summary: 'Handoff preserved the real completion delivery.',
+          deliveryText: 'Handoff preserved the real completion delivery.',
+        },
+        lastReply: null,
+        error: null,
+      },
+      handoffs: handoffState.handoffs,
+      reasons: handoffState.reasons,
+      statusReads: handoffState.statusReads,
+      resultReads: handoffState.resultReads,
+    }, null, 2));
+
+    let resumedStdout = '';
+    let resumedExitCode = 0;
+    try {
+      resumedStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '5', '--poll-interval', '1', '--idle-threshold', '1'], {
+        env: {
+          ...process.env,
+          DISPATCH_INDEX_PATH: mockHandoffPath,
+          DISPATCH_LABELS_PATH: mockLabelsHandoff,
+            OPENCLAW_GATEWAY_TOKEN: 'test-token',
+          OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+        },
+        encoding: 'utf8',
+        timeout: 12000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resumedExitCode = err.status ?? 1;
+      resumedStdout = err.stdout ?? '';
+    }
+
+    const finalLabels = JSON.parse(readFileSync(mockLabelsHandoff, 'utf8'));
+    assert(resumedExitCode === 0, 'sigterm handoff: successor watcher exits 0 on real completion');
+    assert(resumedStdout.includes('Handoff preserved the real completion delivery.'), 'sigterm handoff: successor watcher delivers the actual completion text');
+    assert(!resumedStdout.includes('interrupted by watcher timeout'), 'sigterm handoff: successor watcher output stays free of fake timeout text');
+    assert(finalLabels['test-handoff'].status === 'done', 'sigterm handoff: successor watcher marks the label done after real completion');
+
+    rmSync(handoffTempDir, { recursive: true, force: true });
+  }
+
   // 3ab. Trivial completion text should be suppressed instead of posted into chat.
   {
     const trivialTempDir = mkdtempSync(join(tmpdir(), 'watcher-trivial-'));

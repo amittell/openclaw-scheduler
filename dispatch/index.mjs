@@ -551,6 +551,65 @@ function disarmWatchdog(label) {
   }
 }
 
+
+function quoteForSingleQuotedShell(value) {
+  return String(value).replace(/'/g, "'\''");
+}
+
+/**
+ * Schedule a one-shot delivery watcher shell job for a dispatch label.
+ * Used both for the initial watcher registration and SIGTERM handoffs.
+ */
+function scheduleDeliveryWatcherJob({
+  label,
+  deliverTo,
+  deliverChannel = 'telegram',
+  timeoutSeconds = 300,
+  idleThresholdSeconds = 300,
+  origin = 'system',
+  agentBrand = BRAND,
+  nameSuffix = '',
+}) {
+  if (!label) throw new Error('label is required');
+  if (!deliverTo) throw new Error('deliverTo is required');
+
+  const schedulerCli = join(__dirname, '..', 'cli.js');
+  const watcherPath = join(__dirname, 'watcher.mjs');
+  const watcherTimeoutS = Number(timeoutSeconds) + 120;
+  const idleThresholdS = Number(idleThresholdSeconds) || 300;
+  const sq = quoteForSingleQuotedShell;
+  const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20 --idle-threshold ${idleThresholdS}`;
+
+  const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const jobSpec = {
+    name:                     `${agentBrand}-deliver:${label}${nameSuffix}`,
+    schedule_kind:            'at',
+    schedule_at:              nowUtc,
+    session_target:           'shell',
+    payload_kind:             'shellCommand',
+    payload_message:          watcherCmd,
+    delivery_mode:            'announce-always',
+    delivery_channel:         deliverChannel,
+    delivery_to:              deliverTo,
+    delivery_guarantee:       'at-least-once',
+    ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,
+    overlap_policy:           'skip',
+    run_timeout_ms:           Math.max(watcherTimeoutS, 4 * 3600) * 1000
+                              + 420 * 1000,
+    delete_after_run:         1,
+    origin:                   origin || 'system',
+  };
+
+  const raw = execFileSync(process.execPath, [schedulerCli, '--json', 'jobs', 'add', JSON.stringify(jobSpec)], {
+    encoding: 'utf-8',
+    timeout:  10000,
+    stdio:    ['pipe', 'pipe', 'pipe'],
+  });
+
+  const parsed = JSON.parse(raw.trim());
+  return parsed?.job || null;
+}
+
 // -- Session Helpers ------------------------------------------
 
 /** Build a unique session key for a new subagent session. */
@@ -837,6 +896,7 @@ async function cmdEnqueue(flags) {
       verifyCmd:      verifyCmd || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
+      idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
       // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.
       timeout:        timeoutS,
       status:         'running',
@@ -887,43 +947,20 @@ async function cmdEnqueue(flags) {
     let schedulerWatcherOk = false;
     if (deliverTo && deliverMode !== 'none') {
       try {
-        const watcherPath = join(__dirname, 'watcher.mjs');
-        // Watcher timeout = session timeout + 120s buffer for startup/polling
-        const watcherTimeoutS = timeoutS + 120;
-        const idleThresholdS = flags['idle-threshold'] || '300';
-        const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20 --idle-threshold ${idleThresholdS}`;
-
-        const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
-        const jobSpec = JSON.stringify({
-          name:                     `${agentBrand}-deliver:${label}`,
-          schedule_kind:            'at',
-          schedule_at:              nowUtc,
-          session_target:           'shell',
-          payload_kind:             'shellCommand',
-          payload_message:          watcherCmd,
-          delivery_mode:            'announce-always',
-          delivery_channel:         deliverChannel,
-          delivery_to:              deliverTo,
-          delivery_guarantee:       'at-least-once',
-          ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,  // configurable TTL (deliver_watcher_ttl_hours); default 48h
-          overlap_policy:           'skip',
-          // Shell ceiling = max(initial timeout, rolling extension cap) + headroom.
-          // The watcher can extend its deadline up to MAX_DEADLINE_EXTENSION (4h) on
-          // activity (token growth / JSONL mtime). Headroom covers 2*FLAT_WINDOW + slop.
-          // Watcher constants: FLAT_WINDOW_MS=180s, MAX_DEADLINE_EXTENSION=4h.
-          run_timeout_ms:           Math.max(watcherTimeoutS, 4 * 3600) * 1000
-                                    + 420 * 1000,  // +7min headroom (2*FLAT_WINDOW + 1min slop)
-          delete_after_run:         1,             // auto-delete after watcher completes
-          origin:                   origin || 'system',
-        });
-        const schedulerCli = join(__dirname, '..', 'cli.js');
-        execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', jobSpec], {
-          encoding: 'utf-8',
-          timeout:  10000,
-          stdio:    ['pipe', 'pipe', 'pipe'],
+        const watcherJob = scheduleDeliveryWatcherJob({
+          label,
+          deliverTo,
+          deliverChannel,
+          timeoutSeconds: timeoutS,
+          idleThresholdSeconds: flags['idle-threshold'] || '300',
+          origin: origin || 'system',
+          agentBrand,
         });
         schedulerWatcherOk = true;
-        process.stderr.write(`[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}\n`);
+        process.stderr.write(
+          `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
+          `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
+        );
       } catch (err) {
         process.stderr.write(`[${agentBrand}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
       }
@@ -1192,7 +1229,7 @@ function hasActiveWatcher(label) {
           r.status = 'running'
           OR (r.status = 'pending' AND r.started_at > datetime('now','-5 minutes'))
         )
-    `).get(`%-deliver:${label}`);
+    `).get(`%-deliver:${label}%`);
     return (row?.c || 0) > 0;
   } catch {
     return false;
@@ -1451,6 +1488,53 @@ function cmdResult(flags) {
     completion: entry.completion || null,
     lastReply:  lastReply || null,
     error:      entry.error || null,
+  });
+}
+
+
+function cmdWatcherHandoff(flags) {
+  const label = flags.label;
+  const reason = flags.reason || null;
+  if (!label) die('--label is required', 2);
+
+  const entry = getLabel(label);
+  if (!entry) {
+    out({ ok: false, scheduled: false, label, message: 'No session found for this label' });
+    return;
+  }
+
+  if (entry.status && entry.status !== 'running') {
+    out({ ok: true, scheduled: false, label, reason: 'label already terminal', status: entry.status });
+    return;
+  }
+
+  if (!entry.deliverTo || entry.deliveryMode === 'none') {
+    out({ ok: true, scheduled: false, label, reason: 'delivery disabled for this label' });
+    return;
+  }
+
+  const agentBrand = config.agents?.[entry.agent || 'main']?.name
+    || (entry.agent && entry.agent !== 'main' ? entry.agent : null)
+    || config.name
+    || BRAND;
+
+  const watcherJob = scheduleDeliveryWatcherJob({
+    label,
+    deliverTo: entry.deliverTo,
+    deliverChannel: entry.deliverChannel || 'telegram',
+    timeoutSeconds: Number(entry.timeoutSeconds ?? entry.timeout) || 300,
+    idleThresholdSeconds: Number(entry.idleThresholdSeconds) || 300,
+    origin: entry.origin || 'system',
+    agentBrand,
+    nameSuffix: `:handoff:${Date.now()}`,
+  });
+
+  out({
+    ok: true,
+    scheduled: true,
+    label,
+    jobId: watcherJob?.id || null,
+    reason,
   });
 }
 
@@ -1847,6 +1931,8 @@ Subcommands:
 
   result   --label <l>
 
+  watcher-handoff --label <l> [--reason <text>]
+
   send     --label <l> --message <m> [--session-key <k>]
 
   steer    --label <l> --message <m>  (alias for send)
@@ -1871,6 +1957,7 @@ switch (subcommand) {
   case 'status':    cmdStatus(flags);          break;
   case 'stuck':     await cmdStuck(flags);     break;
   case 'result':    cmdResult(flags);          break;
+  case 'watcher-handoff': cmdWatcherHandoff(flags); break;
   case 'send':      await cmdSend(flags);      break;
   case 'steer':     await cmdSend(flags);      break;
   case 'heartbeat': cmdHeartbeat(flags);       break;
