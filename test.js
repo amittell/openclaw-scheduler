@@ -6270,12 +6270,38 @@ console.log('\n-- Completion payload helpers --');
   });
   assert(suppressed.deliveryText === null, 'completion helper: minimal work_complete-only payload does not force delivery');
 
-  const suppressedTransport = resolveCompletionDelivery({
+  const internalFallback = resolveCompletionDelivery({
     lastReply: null,
     completion: null,
-    fallbackSummary: 'Auto-resolved: session not found in gateway store',
+    fallbackSummary: 'Auto-resolved: session went idle without calling done. Work may be incomplete. (session idle 12 min)',
   });
-  assert(suppressedTransport.deliveryText === null, 'completion helper: internal transport summaries are suppressed instead of leaking to chat');
+  assert(internalFallback.source === 'internal-noise', 'completion helper: internal transport fallback summary classified as internal-noise');
+  assert(internalFallback.deliveryText && !internalFallback.deliveryText.includes('Auto-resolved'), 'completion helper: internal transport fallback replaced with human-readable explanation');
+  assert(!internalFallback.deliveryText.includes('session went idle without calling done'), 'completion helper: internal idle-without-done string is not leaked to delivery text');
+
+  const internalCompletionPayload = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary: 'session not found in gateway store',
+      deliveryText: 'session not found in gateway store',
+      debug: { deliverySource: 'summary' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(internalCompletionPayload.source === 'internal-noise', 'completion helper: internal completion payload summary classified as internal-noise');
+  assert(internalCompletionPayload.deliveryText && !internalCompletionPayload.deliveryText.includes('session not found in gateway store'), 'completion helper: internal session-not-found string is not leaked from completion payload');
+
+  const longHumanReport = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary: 'Investigated gateway instability, reproduced an intermittent "session not found in gateway store" symptom, added retry guards, verified end-to-end delivery, and documented operator follow-up with rollback notes for the team.',
+      deliveryText: null,
+      debug: { deliverySource: 'summary' },
+    },
+    fallbackSummary: null,
+  });
+  assert(longHumanReport.source === 'completion-summary', 'completion helper: long-form human-readable summary remains deliverable');
+  assert(longHumanReport.deliveryText && longHumanReport.deliveryText.includes('Investigated gateway instability'), 'completion helper: long-form human-readable report is preserved');
 
   const suppressedDone = resolveCompletionDelivery({
     lastReply: 'Done.',
@@ -8027,6 +8053,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist,
     sha,
     expectedDeliveryText,
+    unexpectedDeliveryText,
     expectEnqueued,
   }) {
     const tempDir = mkdtempSync(join(tmpdir(), `dispatch-post-office-${slug}-`));
@@ -8098,9 +8125,15 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
 
     if (expectEnqueued) {
       assert(stdout.includes(expectedDeliveryText), `dispatch completion ${slug}: watcher stdout contains expected completion text`);
+      if (unexpectedDeliveryText) {
+        assert(!stdout.includes(unexpectedDeliveryText), `dispatch completion ${slug}: watcher stdout suppresses internal transport status text`);
+      }
       assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one post-office message`);
       const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
       assert(msg.body.includes(expectedDeliveryText), `dispatch completion ${slug}: queued post-office message contains completion text`);
+      if (unexpectedDeliveryText) {
+        assert(!msg.body.includes(unexpectedDeliveryText), `dispatch completion ${slug}: queued post-office message suppresses internal transport status text`);
+      }
     } else {
       assert(stdout.trim() === '', `dispatch completion ${slug}: watcher emits no delivery body when no meaningful completion text exists`);
       assert(stderr.includes('completion delivery suppressed'), `dispatch completion ${slug}: watcher logs suppressed delivery to stderr`);
@@ -8128,6 +8161,15 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
     expectedDeliveryText: `Work complete. Tests passed. Pushed ${repoSha.slice(0, 7)}.`,
+    expectEnqueued: true,
+  });
+
+  await runDispatchCompletionDeliveryCase({
+    slug: 'internal-noise-only',
+    summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete. (session idle 12 min)',
+    checklist: { work_complete: true },
+    expectedDeliveryText: 'The session ended without a final completion signal, so no reliable final report is available.',
+    unexpectedDeliveryText: 'Auto-resolved: session went idle without calling done',
     expectEnqueued: true,
   });
 

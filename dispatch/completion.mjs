@@ -5,7 +5,15 @@ const MAX_LIST_ITEMS = 3;
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)[.!?]*$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
 const INTERNAL_DONE_PAYLOAD_RE = /"message"\s*:\s*"Label marked done via agent signal\."|"status"\s*:\s*"done"/i;
-const INTERNAL_TRANSPORT_TEXT_RE = /(?:^|\n)\s*(?:Auto-resolved(?::|\s+as\s+)|session not found in (?:gateway|sessions) store|session never found|The delivery watcher stopped before the task reached a terminal state\.|session went idle without calling done\.)/i;
+const INTERNAL_TRANSPORT_PREFIX_RE = /^auto-resolved(?:\s+as\s+[a-z-]+)?\s*:/i;
+const INTERNAL_TRANSPORT_PHRASES = [
+  'session not found in gateway store',
+  'session not found in sessions store',
+  'session never found',
+  'the delivery watcher stopped before the task reached a terminal state',
+  'session went idle without calling done',
+];
+const INTERNAL_TRANSPORT_SHORT_WORD_LIMIT = 24;
 const RAW_PAYLOAD_MARKERS_RE = /"(?:ok|status|label|sessionKey|idempotencyKey|deliveryText|summary|message|checklist|stdout|stderr|tool|args|result|content)"\s*:/i;
 const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
 
@@ -17,6 +25,25 @@ export function normalizeCompletionText(value) {
 
 function stripAnsi(text) {
   return text.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function normalizedWords(value) {
+  return value.toLowerCase().replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+}
+
+export function isInternalTransportNoiseText(value) {
+  const text = normalizeCompletionText(value);
+  if (!text) return false;
+
+  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  if (INTERNAL_TRANSPORT_PREFIX_RE.test(normalized)) return true;
+  if (INTERNAL_DONE_PAYLOAD_RE.test(normalized)) return true;
+
+  const words = normalizedWords(text);
+  if (words.length > INTERNAL_TRANSPORT_SHORT_WORD_LIMIT) return false;
+
+  return INTERNAL_TRANSPORT_PHRASES.some((phrase) => normalized.includes(phrase));
 }
 
 function cleanMarkdown(text) {
@@ -158,7 +185,7 @@ function looksLikeRawPayloadText(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return false;
   if (INTERNAL_DONE_PAYLOAD_RE.test(normalized)) return true;
-  if (INTERNAL_TRANSPORT_TEXT_RE.test(normalized)) return true;
+  if (isInternalTransportNoiseText(normalized)) return true;
   return (/^[\[{]/.test(normalized) && RAW_PAYLOAD_MARKERS_RE.test(normalized));
 }
 
@@ -289,6 +316,17 @@ export function isMeaningfulCompletionText(value) {
   return Boolean(summarizeCompletionText(value));
 }
 
+function buildInternalNoiseFallback(noisyTexts) {
+  const joined = noisyTexts.join(' ').toLowerCase();
+  if (joined.includes('session went idle without calling done')) {
+    return 'The session ended without a final completion signal, so no reliable final report is available.';
+  }
+  if (joined.includes('session not found') || joined.includes('session never found')) {
+    return 'The session ended before a final report could be retrieved, so there is no user-facing completion message to deliver.';
+  }
+  return 'The session completed with internal transport status only and no user-facing completion report.';
+}
+
 function shortSha(sha) {
   const text = normalizeCompletionText(sha);
   if (!text) return null;
@@ -367,12 +405,20 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
+  const rawReply = normalizeCompletionText(lastReply);
+  const rawCompletionSummary = normalizeCompletionText(completion?.summary);
+  const rawCompletionDelivery = normalizeCompletionText(completion?.deliveryText);
+  const rawFallback = normalizeCompletionText(fallbackSummary);
+
   const reply = summarizeCompletionText(lastReply);
-  const completionDelivery = summarizeCompletionText(completion?.deliveryText);
   const completionSummary = summarizeCompletionText(completion?.summary);
+  const completionDelivery = summarizeCompletionText(completion?.deliveryText);
   const fallback = summarizeCompletionText(fallbackSummary);
 
-  if (reply) {
+  const noisyTexts = [rawReply, rawCompletionDelivery, rawCompletionSummary, rawFallback].filter(isInternalTransportNoiseText);
+  const isDeliverableText = (rawText, summarizedText) => Boolean(summarizedText) && !isInternalTransportNoiseText(rawText ?? summarizedText);
+
+  if (isDeliverableText(rawReply, reply)) {
     return {
       deliveryText: reply,
       summary: completionSummary || fallback || reply,
@@ -380,7 +426,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (completionDelivery) {
+  if (isDeliverableText(rawCompletionDelivery, completionDelivery)) {
     return {
       deliveryText: completionDelivery,
       summary: completionSummary || completionDelivery,
@@ -388,7 +434,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (completionSummary) {
+  if (isDeliverableText(rawCompletionSummary, completionSummary)) {
     return {
       deliveryText: completionSummary,
       summary: completionSummary,
@@ -396,11 +442,20 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (fallback) {
+  if (isDeliverableText(rawFallback, fallback)) {
     return {
       deliveryText: fallback,
       summary: fallback,
       source: 'summary',
+    };
+  }
+
+  if (noisyTexts.length > 0) {
+    const fallbackDelivery = buildInternalNoiseFallback(noisyTexts);
+    return {
+      deliveryText: fallbackDelivery,
+      summary: fallbackDelivery,
+      source: 'internal-noise',
     };
   }
 
