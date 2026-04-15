@@ -31,7 +31,7 @@ import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { resolveCompletionDelivery } from './completion.mjs';
+import { hasCompletionSignal, resolveCompletionDelivery } from './completion.mjs';
 import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1094,7 +1094,8 @@ while (Date.now() < deadline) {
     //
     // If the session DID produce a lastReply before being killed, deliver it normally.
     if (sessionEverFound && isGatewayRestartKill(status.summary)) {
-      if (!terminalResult?.lastReply && !terminalResult?.completion?.deliveryText) {
+      const gwCheckResult = dispatch('result', ['--label', label]);
+      if (!gwCheckResult?.lastReply && !hasCompletionSignal(gwCheckResult?.completion)) {
         // No result captured -- session was killed before completing
         const retryCount = getGwRestartRetryCount(label);
         if (retryCount >= MAX_GW_RESTART_RETRIES) {
@@ -1196,7 +1197,7 @@ while (Date.now() < deadline) {
   const ageMs = status.liveness?.ageMs;
   if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
     const result = dispatch('result', ['--label', label]);
-    if (result?.lastReply || result?.completion?.deliveryText) {
+    if (result?.lastReply || hasCompletionSignal(result?.completion)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
   }
@@ -1275,7 +1276,7 @@ if (sessionInternalId) {
 // If the session already completed (gateway pruned it -> null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
-  if (r?.lastReply || r?.completion?.deliveryText) {
+  if (r?.lastReply || hasCompletionSignal(r?.completion)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r?.lastReply || null, statusAtDeadline?.summary || null, r?.completion || null);
   }
@@ -1315,7 +1316,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
     deliverResult(label, r?.lastReply || null, st.summary, r?.completion || st?.completion || null);
   }
   const r2 = dispatch('result', ['--label', label]);
-  if (r2?.lastReply || r2?.completion?.deliveryText) {
+  if (r2?.lastReply || hasCompletionSignal(r2?.completion)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r2?.lastReply || null, null, r2?.completion || null);
   }
@@ -1409,7 +1410,7 @@ if (sessionInternalId) {
         deliverResult(label, rExt?.lastReply || null, stExt.summary, rExt?.completion || stExt?.completion || null);
       }
       const rExt2 = dispatch('result', ['--label', label]);
-      if (rExt2?.lastReply || rExt2?.completion?.deliveryText) {
+      if (rExt2?.lastReply || hasCompletionSignal(rExt2?.completion)) {
         // deliverResult calls process.exit(0) internally
         deliverResult(label, rExt2?.lastReply || null, null, rExt2?.completion || null);
       }
@@ -1466,7 +1467,7 @@ for (const round of steerRounds) {
     deliverResult(label, r3?.lastReply || null, st2.summary, r3?.completion || st2?.completion || null);
   }
   const r3 = dispatch('result', ['--label', label]);
-  if (r3?.lastReply || r3?.completion?.deliveryText) {
+  if (r3?.lastReply || hasCompletionSignal(r3?.completion)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r3?.lastReply || null, null, r3?.completion || null);
   }
@@ -1481,7 +1482,7 @@ for (const round of steerRounds) {
       if (st3?.status === 'done') {
         // Check if a result was captured before marking as error
         const r4 = dispatch('result', ['--label', label]);
-        if (r4?.lastReply || r4?.completion?.deliveryText) {
+        if (r4?.lastReply || hasCompletionSignal(r4?.completion)) {
           deliverResult(label, r4?.lastReply || null, st3.summary, r4?.completion || st3?.completion || null); // deliverResult calls process.exit(0)
         }
         markLabelError(label, 'timed out -- killed after steer attempts (no result captured)');

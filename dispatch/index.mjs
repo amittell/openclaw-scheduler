@@ -967,7 +967,7 @@ async function cmdEnqueue(flags) {
   parts.push(``);
   parts.push(`Call this as your ABSOLUTE FINAL action -- nothing else runs after this:`);
   parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' \\`);
-  parts.push(`    --summary "<what you actually did>" \\`);
+  parts.push(`    --summary "<human-readable summary of what you actually did>" \\`);
   parts.push(`    --checklist '{"work_complete":true,"tests_passed":true,"pushed":true}' \\`);
   parts.push(`    [--sha "<git commit SHA if applicable>"]`);
   parts.push(``);
@@ -1921,6 +1921,7 @@ async function cmdDone(flags) {
         duration_ms: 0,
         session_key: null,
         summary,
+        completion,
         deliverTo,
         deliveryChannel,
       }).catch(() => {});
@@ -1952,6 +1953,8 @@ async function cmdDone(flags) {
     status:      'ok',
     duration_ms: Date.now() - spawnedAtMs,
     session_key: existing.sessionKey || null,
+    summary,
+    completion,
   }).catch(() => {});
 
   out({ ok: true, label, status: 'done', summary, completion, message: 'Label marked done via agent signal.' });

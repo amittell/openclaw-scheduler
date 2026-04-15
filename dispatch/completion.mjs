@@ -308,6 +308,28 @@ export function isMeaningfulCompletionText(value) {
   return Boolean(summarizeCompletionText(value));
 }
 
+function getCompletionSummaryHuman(completion) {
+  return normalizeCompletionText(completion?.summary_human ?? completion?.summaryHuman);
+}
+
+function getCompletionTechnicalDetails(completion) {
+  const details = completion?.details_technical ?? completion?.technicalDetails ?? null;
+  if (!details) return null;
+  if (typeof details === 'string') return normalizeCompletionText(details);
+  if (typeof details !== 'object' || Array.isArray(details)) return null;
+  return Object.keys(details).length > 0 ? details : null;
+}
+
+export function hasCompletionSignal(completion) {
+  if (!completion || typeof completion !== 'object' || Array.isArray(completion)) return false;
+  if (getCompletionSummaryHuman(completion)) return true;
+  if (normalizeCompletionText(completion?.summary)) return true;
+  if (normalizeCompletionText(completion?.deliveryText)) return true;
+  if (normalizeCompletionText(completion?.sha)) return true;
+  if (getCompletionTechnicalDetails(completion)) return true;
+  return !!cloneChecklist(completion?.checklist);
+}
+
 function buildInternalNoiseFallback(noisyTexts) {
   const joined = noisyTexts.join(' ').toLowerCase();
   if (joined.includes('session went idle without calling done')) {
@@ -332,6 +354,25 @@ function cloneChecklist(checklist) {
   } catch {
     return { ...checklist };
   }
+}
+
+function buildTechnicalDetails({ checklist, sha, rawSummary, summaryHuman } = {}) {
+  const details = {};
+  const normalizedChecklist = cloneChecklist(checklist);
+  const normalizedSha = normalizeCompletionText(sha);
+  const normalizedRawSummary = normalizeCompletionText(rawSummary);
+  const normalizedSummaryHuman = normalizeCompletionText(summaryHuman);
+
+  if (normalizedChecklist) details.checklist = normalizedChecklist;
+  if (normalizedSha) {
+    details.sha = normalizedSha;
+    details.sha_short = shortSha(normalizedSha);
+  }
+  if (normalizedRawSummary && normalizedRawSummary !== normalizedSummaryHuman) {
+    details.raw_summary = normalizedRawSummary;
+  }
+
+  return Object.keys(details).length > 0 ? details : null;
 }
 
 export function synthesizeCompletionReply({ checklist, sha } = {}) {
@@ -370,67 +411,105 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
   const normalizedSummary = summarizeCompletionText(rawSummary);
-  const rawSummaryLooksHuman = Boolean(rawSummary) && !looksLikeRawPayloadText(rawSummary) && !looksLikeGunbrokerReport(rawSummary) && prepareLines(rawSummary).length <= 3;
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
-  const effectiveSummary = normalizedSummary || synthesizedReply || null;
-  const deliveryText = normalizedSummary || synthesizedReply || null;
+  const summaryHuman = normalizedSummary || synthesizedReply || null;
+  const effectiveSummary = summaryHuman || rawSummary || null;
+  const deliveryText = summaryHuman || null;
+  const detailsTechnical = buildTechnicalDetails({
+    checklist: normalizedChecklist,
+    sha: normalizedSha,
+    rawSummary,
+    summaryHuman,
+  });
 
   return {
     version: 2,
     recordedAt: new Date().toISOString(),
+    summary_human: summaryHuman,
     summary: effectiveSummary,
+    details_technical: detailsTechnical,
     deliveryText,
-    prose: rawSummaryLooksHuman ? normalizedSummary : null,
+    prose: normalizedSummary,
     checklist: normalizedChecklist,
     sha: normalizedSha,
     debug: {
       rawSummary,
       normalizedSummary,
       synthesizedReply,
-      deliverySource: normalizedSummary
-        ? rawSummaryLooksHuman ? 'summary' : 'normalized-summary'
-        : synthesizedReply ? 'synthesized' : 'none',
+      deliverySource: normalizedSummary ? 'summary_human' : synthesizedReply ? 'technical-synthesis' : 'none',
     },
   };
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
+  const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
   const rawCompletionSummary = normalizeCompletionText(completion?.summary);
   const rawCompletionDelivery = normalizeCompletionText(completion?.deliveryText);
   const rawFallback = normalizeCompletionText(fallbackSummary);
 
   const reply = summarizeCompletionText(lastReply);
+  const completionSummaryHuman = summarizeCompletionText(rawCompletionSummaryHuman);
   const completionSummary = summarizeCompletionText(completion?.summary);
   const completionDelivery = summarizeCompletionText(completion?.deliveryText);
   const fallback = summarizeCompletionText(fallbackSummary);
+  const synthesizedFromTechnical = synthesizeCompletionReply({
+    checklist: completion?.checklist,
+    sha: completion?.sha,
+  });
 
-  const noisyTexts = [rawReply, rawCompletionDelivery, rawCompletionSummary, rawFallback].filter(isInternalTransportNoiseText);
+  const preferredSummary = completionSummaryHuman || completionSummary || fallback || synthesizedFromTechnical || null;
+  const noisyTexts = [
+    rawReply,
+    rawCompletionSummaryHuman,
+    rawCompletionDelivery,
+    rawCompletionSummary,
+    rawFallback,
+  ].filter(isInternalTransportNoiseText);
   const isDeliverableText = (rawText, summarizedText) => Boolean(summarizedText) && !isInternalTransportNoiseText(rawText ?? summarizedText);
+  const structuredCandidates = [
+    {
+      rawText: rawCompletionSummaryHuman,
+      text: completionSummaryHuman,
+      summary: completionSummaryHuman,
+      source: 'summary_human',
+    },
+    {
+      rawText: rawCompletionSummary,
+      text: completionSummary,
+      summary: completionSummary,
+      source: 'completion-summary',
+    },
+    {
+      rawText: rawCompletionDelivery,
+      text: completionDelivery,
+      summary: completionSummaryHuman || completionSummary || completionDelivery,
+      source: completion?.debug?.deliverySource || 'completion-legacy',
+    },
+    {
+      rawText: synthesizedFromTechnical,
+      text: synthesizedFromTechnical,
+      summary: synthesizedFromTechnical,
+      source: 'technical-synthesis',
+    },
+  ];
+
+  for (const candidate of structuredCandidates) {
+    if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
+    return {
+      deliveryText: candidate.text,
+      summary: candidate.summary || candidate.text,
+      source: candidate.source,
+    };
+  }
 
   if (isDeliverableText(rawReply, reply)) {
     return {
       deliveryText: reply,
-      summary: completionSummary || fallback || reply,
+      summary: preferredSummary || reply,
       source: 'lastReply',
-    };
-  }
-
-  if (isDeliverableText(rawCompletionDelivery, completionDelivery)) {
-    return {
-      deliveryText: completionDelivery,
-      summary: completionSummary || completionDelivery,
-      source: completion?.debug?.deliverySource || 'completion',
-    };
-  }
-
-  if (isDeliverableText(rawCompletionSummary, completionSummary)) {
-    return {
-      deliveryText: completionSummary,
-      summary: completionSummary,
-      source: 'completion-summary',
     };
   }
 
@@ -453,7 +532,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   return {
     deliveryText: null,
-    summary: null,
+    summary: preferredSummary || completionDelivery || reply || null,
     source: 'none',
   };
 }
