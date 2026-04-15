@@ -6188,6 +6188,59 @@ console.log('\n-- Completion payload helpers --');
   });
   assert(resolvedReply.deliveryText === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: structured completion metadata stays authoritative over transcript reply');
 
+  const rawPayloadReply = resolveCompletionDelivery({
+    lastReply: JSON.stringify({
+      ok: true,
+      label: 'job',
+      status: 'done',
+      summary: 'Scanner found two real deals and filtered out ammo false positives.',
+      message: 'Label marked done via agent signal.',
+    }),
+    completion: synthesized,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(rawPayloadReply.deliveryText === 'Scanner found two real deals and filtered out ammo false positives.', 'completion helper: raw done payload is reduced to its human summary');
+  assert(!rawPayloadReply.deliveryText.includes('Label marked done via agent signal.'), 'completion helper: raw done payload does not leak internal status text');
+  assert(!rawPayloadReply.deliveryText.includes('"status"'), 'completion helper: raw done payload does not leak JSON');
+
+  const overlongReply = resolveCompletionDelivery({
+    lastReply: [
+      'Sentence 1 explains one part of the fix in plain language.',
+      'Sentence 2 explains another part of the fix in plain language.',
+      'Sentence 3 explains how delivery got normalized.',
+      'Sentence 4 explains how tests cover the regression.',
+      'Sentence 5 explains how the watcher stays authoritative.',
+      'Sentence 6 explains how long reports are shortened before posting.',
+      'Sentence 7 explains how raw payloads are suppressed.',
+      'Sentence 8 explains the remaining implementation detail that should not hit chat.',
+    ].join(' '),
+    completion: null,
+    fallbackSummary: null,
+  });
+  assert(overlongReply.deliveryText.startsWith('Sentence 1 explains one part of the fix in plain language.'), 'completion helper: overlong prose keeps the opening context');
+  assert(!overlongReply.deliveryText.includes('Sentence 6 explains how long reports are shortened before posting.'), 'completion helper: overlong prose is shortened aggressively');
+
+  const gunbrokerReply = resolveCompletionDelivery({
+    lastReply: [
+      '🔫 **Colt Python** Deal Scanner',
+      'Baseline: $2,100 median (18 items)',
+      '',
+      '#1 [1234567890](https://www.gunbroker.com/item/1234567890) | **+32%** — $1,400 (6 bids, 2h)',
+      '   Colt Python 6in blued',
+      '',
+      '#2 [1234567891](https://www.gunbroker.com/item/1234567891) | **+25%** — $1,550 (4 bids, 5h)',
+      '   Colt Python 4in stainless',
+      '',
+      '#3 [1234567892](https://www.gunbroker.com/item/1234567892) | **+19%** — $1,680 (3 bids, 9h)',
+      '   Colt Python Elite',
+      '',
+      '#4 [1234567893](https://www.gunbroker.com/item/1234567893) | **+14%** — $1,790 (2 bids, 1d)',
+    ].join('\n'),
+    completion: null,
+    fallbackSummary: null,
+  });
+  assert(gunbrokerReply.deliveryText === 'Colt Python Deal Scanner. Baseline: $2,100 median (18 items). Top deals: #1 +32% at $1,400 (6 bids, 2h); #2 +25% at $1,550 (4 bids, 5h); #3 +19% at $1,680 (3 bids, 9h).', 'completion helper: gunbroker-style report is compressed into a readable summary');
+
   const resolvedSynth = resolveCompletionDelivery({
     lastReply: null,
     completion: synthesized,
@@ -6230,6 +6283,10 @@ console.log('\n-- Completion payload helpers --');
     fallbackSummary: null,
   });
   assert(suppressedDone.deliveryText === null, 'completion helper: generic Done. reply is suppressed instead of being delivered as a success report');
+
+  const dispatchSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'index.mjs'), 'utf8');
+  assert(/deliver:\s*false/.test(dispatchSource), 'dispatch enqueue: direct gateway delivery is disabled to avoid double delivery');
+  assert(!/deliver:\s*!!deliverTo/.test(dispatchSource), 'dispatch enqueue: old direct deliver toggle is gone');
 }
 
 console.log('\n-- Done Subcommand --');

@@ -371,7 +371,14 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const completionDelivery = summarizeCompletionText(completion?.deliveryText);
   const completionSummary = summarizeCompletionText(completion?.summary);
   const fallback = summarizeCompletionText(fallbackSummary);
-  const preferredSummary = completionSummary || fallback;
+
+  if (reply) {
+    return {
+      deliveryText: reply,
+      summary: completionSummary || fallback || reply,
+      source: 'lastReply',
+    };
+  }
 
   if (completionDelivery) {
     return {
@@ -386,14 +393,6 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: completionSummary,
       summary: completionSummary,
       source: 'completion-summary',
-    };
-  }
-
-  if (reply) {
-    return {
-      deliveryText: reply,
-      summary: preferredSummary || reply,
-      source: 'lastReply',
     };
   }
 
