@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify (Linux / Node 20)
+    name: Verify (Linux / Node 22)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -23,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
 
       - name: Install dependencies
@@ -59,6 +59,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Debug npm config
+        run: |
+          npm --version
+          npm config list
+          cat ~/.npmrc || true
+
       - name: Verify tag matches package.json version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -70,5 +76,3 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
