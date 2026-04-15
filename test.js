@@ -6195,6 +6195,18 @@ console.log('\n-- Completion payload helpers --');
   });
   assert(resolvedSynth.deliveryText === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: synthesized metadata used when prose reply missing');
 
+  const embeddedInternal = resolveCompletionDelivery({
+    lastReply: JSON.stringify({
+      ok: true,
+      status: 'done',
+      summary: 'Watcher preserved the clean human report.',
+      message: 'Label marked done via agent signal.',
+    }),
+    completion: null,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(embeddedInternal.deliveryText === 'Watcher preserved the clean human report.', 'completion helper: embedded done payload summary is extracted instead of leaking raw JSON');
+
   const suppressed = resolveCompletionDelivery({
     lastReply: null,
     completion: buildTerminalCompletionPayload({
@@ -6204,6 +6216,20 @@ console.log('\n-- Completion payload helpers --');
     fallbackSummary: 'completed (agent signal)',
   });
   assert(suppressed.deliveryText === null, 'completion helper: minimal work_complete-only payload does not force delivery');
+
+  const suppressedTransport = resolveCompletionDelivery({
+    lastReply: null,
+    completion: null,
+    fallbackSummary: 'Auto-resolved: session not found in gateway store',
+  });
+  assert(suppressedTransport.deliveryText === null, 'completion helper: internal transport summaries are suppressed instead of leaking to chat');
+
+  const suppressedDone = resolveCompletionDelivery({
+    lastReply: 'Done.',
+    completion: null,
+    fallbackSummary: null,
+  });
+  assert(suppressedDone.deliveryText === null, 'completion helper: generic Done. reply is suppressed instead of being delivered as a success report');
 }
 
 console.log('\n-- Done Subcommand --');
