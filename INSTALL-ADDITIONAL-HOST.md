@@ -12,7 +12,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 | Requirement | Notes |
 |-------------|-------|
 | macOS or Linux | Tested on macOS arm64 |
-| Node.js >= 20 | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
+| Node.js >= 22 | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 

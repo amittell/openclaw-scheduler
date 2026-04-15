@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Node](https://img.shields.io/badge/node-%E2%89%A520-green)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522-green)](https://nodejs.org)
 
 A durable orchestration runtime for [OpenClaw](https://openclaw.ai) agents and shell workflows. Use it when built-in cron and heartbeat stop being enough: jobs fail and disappear into logs, shell scripts depend on gateway uptime, multi-step workflows need retries and approvals, and you want a real audit trail for what ran, what failed, and what triggered what.
 
@@ -11,7 +11,7 @@ It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler th
 **Repo:** `github.com/amittell/openclaw-scheduler`
 **Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
-**Runtime:** Node.js 20+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
+**Runtime:** Node.js 22+ (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
 **Tests:** run with `npm test` (full suite, in-memory SQLite)
 **Platform:** macOS · Linux · Windows (WSL2)
 
@@ -204,7 +204,7 @@ npm run verify:local                 # full local maintainer gate
 npm run verify:smoke                 # lightweight smoke gate used by GitHub Actions
 ```
 
-GitHub Actions runs the smoke gate plus the in-memory test suite on Linux, macOS, and Windows with Node 20. The full release gate still runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
+GitHub Actions runs the smoke gate plus the in-memory test suite on Linux and macOS with Node 22. Publishing uses Node 24 (npm 22+) for OIDC trusted publisher support. The full release gate still runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
 
 ### Option C: local npm pack (simulate the published package from source)
 

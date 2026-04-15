@@ -12,7 +12,7 @@ Step-by-step guide to deploy the scheduler on a Linux host running OpenClaw.
 
 | Requirement | Notes |
 |-------------|-------|
-| Node.js >= 20 | Install via [nvm](https://github.com/nvm-sh/nvm) or [NodeSource](https://github.com/nodesource/distributions) |
+| Node.js >= 22 | Install via [nvm](https://github.com/nvm-sh/nvm) or [NodeSource](https://github.com/nodesource/distributions) |
 | build-essential | `sudo apt install build-essential python3` — required for `better-sqlite3` native compile |
 | OpenClaw gateway running | With auth token |
 | Git | `sudo apt install git` |

@@ -38,7 +38,7 @@ Use this path only if you can't use WSL2 — for example, if OpenClaw itself is 
 
 | Requirement | Install |
 |-------------|---------|
-| Node.js >= 20 | [nodejs.org](https://nodejs.org) -- use the LTS installer |
+| Node.js >= 22 | [nodejs.org](https://nodejs.org) -- use the LTS installer |
 | pm2 | `npm install -g pm2` |
 | OpenClaw gateway | Must be running with a valid auth token |
 | Git for Windows | [git-scm.com](https://git-scm.com) or use GitHub Desktop |

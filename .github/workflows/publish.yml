@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify (Linux / Node 22)
+    name: Verify (Linux / Node 24)
     runs-on: ubuntu-latest
     permissions:
       contents: read
