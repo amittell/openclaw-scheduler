@@ -1,13 +1,12 @@
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
 const INTERNAL_TRANSPORT_PREFIX_RE = /^auto-resolved(?:\s+as\s+[a-z-]+)?\s*:/i;
-const INTERNAL_TRANSPORT_PHRASES = [
-  'session not found in gateway store',
-  'session not found in sessions store',
-  'session never found',
-  'session went idle without calling done',
+const INTERNAL_TRANSPORT_PATTERNS = [
+  /^session not found in gateway store[.!?]*$/i,
+  /^session not found in sessions store[.!?]*$/i,
+  /^session never found(?:\s+--\s+spawn likely failed)?[.!?]*$/i,
+  /^session went idle without calling done(?:\.\s*work may be incomplete\.)?(?:\s*\([^)]*\))?[.!?]*$/i,
 ];
-const INTERNAL_TRANSPORT_SHORT_WORD_LIMIT = 24;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -15,22 +14,15 @@ export function normalizeCompletionText(value) {
   return trimmed ? trimmed : null;
 }
 
-function normalizedWords(value) {
-  return value.toLowerCase().replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
-}
-
 export function isInternalTransportNoiseText(value) {
   const text = normalizeCompletionText(value);
   if (!text) return false;
 
-  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   if (INTERNAL_TRANSPORT_PREFIX_RE.test(normalized)) return true;
 
-  const words = normalizedWords(text);
-  if (words.length > INTERNAL_TRANSPORT_SHORT_WORD_LIMIT) return false;
-
-  return INTERNAL_TRANSPORT_PHRASES.some((phrase) => normalized.includes(phrase));
+  return INTERNAL_TRANSPORT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 export function isMeaningfulCompletionText(value) {
