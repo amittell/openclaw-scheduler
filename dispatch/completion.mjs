@@ -40,6 +40,28 @@ export function isMeaningfulCompletionText(value) {
   return true;
 }
 
+function getCompletionSummaryHuman(completion) {
+  return normalizeCompletionText(completion?.summary_human ?? completion?.summaryHuman);
+}
+
+function getCompletionTechnicalDetails(completion) {
+  const details = completion?.details_technical ?? completion?.technicalDetails ?? null;
+  if (!details) return null;
+  if (typeof details === 'string') return normalizeCompletionText(details);
+  if (typeof details !== 'object' || Array.isArray(details)) return null;
+  return Object.keys(details).length > 0 ? details : null;
+}
+
+export function hasCompletionSignal(completion) {
+  if (!completion || typeof completion !== 'object' || Array.isArray(completion)) return false;
+  if (getCompletionSummaryHuman(completion)) return true;
+  if (normalizeCompletionText(completion?.summary)) return true;
+  if (normalizeCompletionText(completion?.deliveryText)) return true;
+  if (normalizeCompletionText(completion?.sha)) return true;
+  if (getCompletionTechnicalDetails(completion)) return true;
+  return !!cloneChecklist(completion?.checklist);
+}
+
 function buildInternalNoiseFallback(noisyTexts) {
   const joined = noisyTexts.join(' ').toLowerCase();
   if (joined.includes('session went idle without calling done')) {
@@ -64,6 +86,25 @@ function cloneChecklist(checklist) {
   } catch {
     return { ...checklist };
   }
+}
+
+function buildTechnicalDetails({ checklist, sha, rawSummary, summaryHuman } = {}) {
+  const details = {};
+  const normalizedChecklist = cloneChecklist(checklist);
+  const normalizedSha = normalizeCompletionText(sha);
+  const normalizedRawSummary = normalizeCompletionText(rawSummary);
+  const normalizedSummaryHuman = normalizeCompletionText(summaryHuman);
+
+  if (normalizedChecklist) details.checklist = normalizedChecklist;
+  if (normalizedSha) {
+    details.sha = normalizedSha;
+    details.sha_short = shortSha(normalizedSha);
+  }
+  if (normalizedRawSummary && normalizedRawSummary !== normalizedSummaryHuman) {
+    details.raw_summary = normalizedRawSummary;
+  }
+
+  return Object.keys(details).length > 0 ? details : null;
 }
 
 export function synthesizeCompletionReply({ checklist, sha } = {}) {
@@ -105,13 +146,22 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
   const synthesizedReply = prose
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
-  const effectiveSummary = prose || synthesizedReply || rawSummary || null;
-  const deliveryText = prose || synthesizedReply || null;
+  const summaryHuman = prose || synthesizedReply || null;
+  const effectiveSummary = summaryHuman || rawSummary || null;
+  const deliveryText = summaryHuman || null;
+  const detailsTechnical = buildTechnicalDetails({
+    checklist: normalizedChecklist,
+    sha: normalizedSha,
+    rawSummary,
+    summaryHuman,
+  });
 
   return {
-    version: 1,
+    version: 2,
     recordedAt: new Date().toISOString(),
+    summary_human: summaryHuman,
     summary: effectiveSummary,
+    details_technical: detailsTechnical,
     deliveryText,
     prose,
     checklist: normalizedChecklist,
@@ -119,20 +169,61 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
     debug: {
       rawSummary,
       synthesizedReply,
-      deliverySource: prose ? 'summary' : synthesizedReply ? 'synthesized' : 'none',
+      deliverySource: prose ? 'summary_human' : synthesizedReply ? 'technical-synthesis' : 'none',
     },
   };
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const reply = normalizeCompletionText(lastReply);
+  const completionSummaryHuman = getCompletionSummaryHuman(completion);
   const completionSummary = normalizeCompletionText(completion?.summary);
   const completionDelivery = normalizeCompletionText(completion?.deliveryText);
   const fallback = normalizeCompletionText(fallbackSummary);
-  const preferredSummary = completionSummary || fallback;
-  const noisyTexts = [reply, completionDelivery, completionSummary, fallback].filter(isInternalTransportNoiseText);
+  const synthesizedFromTechnical = synthesizeCompletionReply({
+    checklist: completion?.checklist,
+    sha: completion?.sha,
+  });
+  const preferredSummary = completionSummaryHuman || completionSummary || fallback;
+  const noisyTexts = [
+    reply,
+    completionSummaryHuman,
+    completionDelivery,
+    completionSummary,
+    fallback,
+  ].filter(isInternalTransportNoiseText);
   const isDeliverableText = (text) => isMeaningfulCompletionText(text) && !isInternalTransportNoiseText(text);
-  const meaningfulSummary = [completionSummary, fallback].find(isDeliverableText) || null;
+  const structuredCandidates = [
+    {
+      text: completionSummaryHuman,
+      summary: completionSummaryHuman,
+      source: 'summary_human',
+    },
+    {
+      text: completionSummary,
+      summary: completionSummary,
+      source: 'completion-summary',
+    },
+    {
+      text: completionDelivery,
+      summary: completionSummaryHuman || completionSummary || completionDelivery,
+      source: completion?.debug?.deliverySource || 'completion-legacy',
+    },
+    {
+      text: synthesizedFromTechnical,
+      summary: synthesizedFromTechnical,
+      source: 'technical-synthesis',
+    },
+  ];
+
+  for (const candidate of structuredCandidates) {
+    if (!isDeliverableText(candidate.text)) continue;
+    return {
+      deliveryText: candidate.text,
+      summary: candidate.summary || candidate.text,
+      source: candidate.source,
+    };
+  }
 
   if (isDeliverableText(reply)) {
     return {
@@ -142,19 +233,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (isDeliverableText(completionDelivery)) {
+  if (isDeliverableText(fallback)) {
     return {
-      deliveryText: completionDelivery,
-      summary: completionSummary || completionDelivery,
-      source: completion?.debug?.deliverySource || 'completion',
-    };
-  }
-
-  if (meaningfulSummary) {
-    return {
-      deliveryText: meaningfulSummary,
-      summary: meaningfulSummary,
-      source: completionSummary && meaningfulSummary === completionSummary ? 'completion-summary' : 'summary',
+      deliveryText: fallback,
+      summary: fallback,
+      source: 'summary',
     };
   }
 
@@ -169,7 +252,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   return {
     deliveryText: null,
-    summary: preferredSummary || null,
+    summary: preferredSummary || completionDelivery || reply || synthesizedFromTechnical || null,
     source: 'none',
   };
 }

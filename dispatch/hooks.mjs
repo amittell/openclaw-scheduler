@@ -17,6 +17,7 @@
  */
 
 import { hostname } from 'os';
+import { resolveCompletionDelivery } from './completion.mjs';
 import { sendMessage } from '../messages.js';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
@@ -70,13 +71,23 @@ async function webhookPush(event, payload) {
  * Used for unregistered-label done signals where no watcher is waiting.
  *
  * @param {string} label           - Dispatch label
- * @param {string} summary         - One-line summary of what was done
+ * @param {string} summary         - Legacy fallback summary
  * @param {string} deliverTo       - Target chat/user ID (stored for reference)
  * @param {string} [deliveryChannel='telegram'] - Channel to deliver via (stored for reference)
+ * @param {object} [completion=null] - Structured completion payload
  */
-async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram') {
+async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram', completion = null) {
   try {
-    const body = `✅ [${label}] done -- ${summary}`;
+    const delivery = resolveCompletionDelivery({
+      completion,
+      fallbackSummary: summary,
+    });
+    const bodyText = delivery.deliveryText || null;
+    if (!bodyText) {
+      process.stderr.write(`[dispatch-hooks] completion delivery suppressed for ${label}: no meaningful structured summary\n`);
+      return;
+    }
+    const body = `✅ [${label}] done\n\n${bodyText}`;
     await sendMessage({
       from_agent:  'dispatch',
       to_agent:    'main',
@@ -130,7 +141,8 @@ export function onStarted(opts) {
  * Extended opts:
  *   deliverTo       {string}  -- If set, send a completion notification via gateway
  *   deliveryChannel {string}  -- Channel for delivery (default: 'telegram')
- *   summary         {string}  -- One-line summary to include in the notification
+ *   summary         {string}  -- Legacy fallback summary for notification formatting
+ *   completion      {object}  -- Structured completion payload
  */
 export async function onFinished(opts) {
   const tasks = [
@@ -150,7 +162,7 @@ export async function onFinished(opts) {
   if (opts.deliverTo) {
     const summary = opts.summary || opts.status || 'completed';
     tasks.push(
-      gatewayNotify(opts.label, summary, opts.deliverTo, opts.deliveryChannel || 'telegram')
+      gatewayNotify(opts.label, summary, opts.deliverTo, opts.deliveryChannel || 'telegram', opts.completion || null)
     );
   }
 
