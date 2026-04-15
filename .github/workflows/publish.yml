@@ -23,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
 
       - name: Install dependencies
@@ -52,7 +52,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
           registry-url: 'https://registry.npmjs.org'
 
@@ -67,14 +67,6 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
             exit 1
           fi
-
-      - name: Debug OIDC
-        run: |
-          echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
-          echo "GITHUB_REF: $GITHUB_REF"
-          echo "GITHUB_WORKFLOW: $GITHUB_WORKFLOW"
-          echo "GITHUB_WORKFLOW_REF: $GITHUB_WORKFLOW_REF"
-          curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://registry.npmjs.org" | python3 -c "import sys,json,base64; t=json.load(sys.stdin)['value']; p=t.split('.')[1]+'=='; d=json.loads(base64.urlsafe_b64decode(p)); print('iss:', d.get('iss')); print('sub:', d.get('sub')); print('aud:', d.get('aud')); print('job_workflow_ref:', d.get('job_workflow_ref'))"
 
       - name: Publish
         run: npm publish --access public --provenance
