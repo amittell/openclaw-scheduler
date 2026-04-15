@@ -583,7 +583,7 @@ function makeSessionKey(agentId) {
  *   --origin <origin>        Explicit dispatch origin for audit/retries (e.g. "telegram:<chat_id>", "system")
  *                            If omitted but --deliver-to is explicit, dispatch derives origin from that target.
  *                            Active-session auto-detect is preserved only as a manual/local fallback when both are absent.
- *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Enables deliver:true on the gateway call.
+ *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher for durable final delivery.
  *                            Chat-triggered callers should pass inbound metadata chat_id here, especially for group chats.
  *                            Defaults to origin chat ID when --origin is a "telegram:<id>" string.
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
@@ -831,15 +831,16 @@ async function cmdEnqueue(flags) {
   const taskMessage = parts.join('\n');
 
   // -- Call gateway agent method -------------------------------
-  // Gateway deliver is used as a fast-path secondary. The scheduler watcher
-  // (created below) is the primary delivery path with retry + audit trail.
-  // Both may fire -- at-least-once semantics, duplicates acceptable.
+  // Final user delivery belongs to the scheduler watcher below.
+  // Keep the gateway spawn fire-and-forget so raw tool output or internal
+  // done payloads cannot leak directly to the chat ahead of the durable
+  // post-office delivery path.
   try {
     const response = gatewayCall('agent', {
       message:        taskMessage,
       sessionKey,
       idempotencyKey: idem,
-      deliver:        !!deliverTo,
+      deliver:        false,
       lane:           'subagent',
       timeout:        timeoutS,
       label:          label,
@@ -911,7 +912,7 @@ async function cmdEnqueue(flags) {
     // Creates a one-shot shell job that runs watcher.mjs (blocks until session
     // completes, outputs result). The scheduler's handleDelivery delivers with
     // retry, alias resolution, and audit trail in scheduler.db.
-    // Gateway deliver:true is kept as a fast-path secondary (see deliver flag above).
+    // The watcher is the only final-delivery path for dispatched jobs.
     const sq = s => String(s).replace(/'/g, "'\\''");
     let schedulerWatcherOk = false;
     if (deliverTo && deliverMode !== 'none') {
@@ -1018,7 +1019,7 @@ async function cmdEnqueue(flags) {
       status:     'accepted',
       delivery:   deliverTo ? {
         scheduler: schedulerWatcherOk,
-        gateway:   !!deliverTo,
+        gateway:   false,
         target:    deliverTo,
         channel:   deliverChannel,
       } : null,
@@ -1030,10 +1031,10 @@ async function cmdEnqueue(flags) {
         ...(monitorEnabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
       } : null,
       message:    schedulerWatcherOk
-        ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
+        ? 'Session spawned. Durable delivery watcher registered.'
         : deliverTo
-          ? 'Session spawned. Delivery via gateway only (scheduler watcher failed).'
-          : 'Session spawned via gateway. Agent is running.',
+          ? 'Session spawned, but durable delivery watcher registration failed. Final delivery may require manual follow-up.'
+          : 'Session spawned. Agent is running.',
     });
 
     // -- Post-spawn verification (Fix 3) --------------------------------
@@ -1547,15 +1548,15 @@ async function cmdDone(flags) {
     }
   }
 
-  // Summary passes through as-is for raw diagnostics, but we also persist a
-  // first-class completion payload with deterministic delivery text so the
-  // watcher/post-office path never depends solely on transcript recovery.
+  // Persist a first-class completion payload with deterministic delivery text
+  // so the watcher/post-office path never depends solely on transcript recovery
+  // or on whatever raw blob the model chose to print at the end.
   const completion = buildTerminalCompletionPayload({
     summary: rawSummary,
     checklist,
     sha,
   });
-  const summary = completion.summary || rawSummary;
+  const summary = completion.summary || null;
 
   const existing = getLabel(label);
 

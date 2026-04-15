@@ -1728,7 +1728,7 @@ npm test
 
 ## Sub-agent Dispatch
 
-The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in a local `labels.json` ledger, and auto-announces its result when the agent calls `done` as its final action. The module also supports symlink-based branding: a wrapper directory (such as `my-brand`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
+The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in a local `labels.json` ledger, and delivered back through a scheduler watcher when the agent calls `done` as its final action. That watcher is the only final-delivery path for dispatched jobs, and it normalizes completions into short human-readable summaries before posting them to chat. The module also supports symlink-based branding: a wrapper directory (such as `my-brand`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
 
 ### Quick Example
 
@@ -1760,7 +1760,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
 | `--model` | -- | Model override, e.g. `anthropic/claude-sonnet-4-6`. |
-| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers a scheduler watcher job for reliable at-least-once delivery. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
+| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher job for durable final delivery. The gateway spawn itself stays fire-and-forget so raw tool output and internal done payloads cannot leak directly to chat. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
 | `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
 | `--timeout` | `300` | Session timeout in seconds. |
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
@@ -1777,7 +1777,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `stuck` | Check all running sessions against the stuck threshold. Exits 1 if genuinely stuck sessions remain after auto-resolving completed ones. |
 | `result` | Retrieve the last assistant reply from a session transcript via `chat.history`. |
 | `sync` | Reconcile `labels.json` with sessions store state. Auto-marks sessions as done or error based on idle time. Supports `--dry-run`. |
-| `done` | Agent-side completion signal. The agent calls this as its final action to mark itself done immediately (push-based; no idle timeout wait). |
+| `done` | Agent-side completion signal. The agent calls this as its final action to mark itself done immediately (push-based; no idle timeout wait). The stored completion payload is normalized for channel-safe delivery, with checklist/sha metadata used as a fallback when the raw summary is generic or noisy. |
 | `send` | Inject a message into a running session for mid-run steering. The agent sees it as a new user turn. |
 | `steer` | Alias for `send`. The name makes steering intent explicit. |
 | `heartbeat` | Check whether a session has been active within the last 10 minutes. Accepts `--label` or `--session-key`. |
@@ -1810,7 +1810,7 @@ openclaw-scheduler enqueue \
   --message "Update the API docs to reflect the new /v2 endpoints" \
   --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
 
-# Each worker auto-announces its result to the configured channel when done.
+# Each worker gets a watcher-delivered, channel-safe completion summary when done.
 # No polling needed. Watchdog jobs are auto-registered for each.
 ```
 
