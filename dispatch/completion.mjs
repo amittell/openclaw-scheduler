@@ -6,14 +6,13 @@ const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|oka
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
 const INTERNAL_DONE_PAYLOAD_RE = /"message"\s*:\s*"Label marked done via agent signal\."|"status"\s*:\s*"done"/i;
 const INTERNAL_TRANSPORT_PREFIX_RE = /^auto-resolved(?:\s+as\s+[a-z-]+)?\s*:/i;
-const INTERNAL_TRANSPORT_PHRASES = [
-  'session not found in gateway store',
-  'session not found in sessions store',
-  'session never found',
-  'the delivery watcher stopped before the task reached a terminal state',
-  'session went idle without calling done',
+const INTERNAL_TRANSPORT_PATTERNS = [
+  /^session not found in gateway store[.!?]*$/i,
+  /^session not found in sessions store[.!?]*$/i,
+  /^session never found(?:\s+--\s+spawn likely failed)?[.!?]*$/i,
+  /^the delivery watcher stopped before the task reached a terminal state[.!?]*$/i,
+  /^session went idle without calling done(?:\.\s*work may be incomplete\.)?(?:\s*\([^)]*\))?[.!?]*$/i,
 ];
-const INTERNAL_TRANSPORT_SHORT_WORD_LIMIT = 24;
 const RAW_PAYLOAD_MARKERS_RE = /"(?:ok|status|label|sessionKey|idempotencyKey|deliveryText|summary|message|checklist|stdout|stderr|tool|args|result|content)"\s*:/i;
 const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
 
@@ -27,23 +26,16 @@ function stripAnsi(text) {
   return text.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
-function normalizedWords(value) {
-  return value.toLowerCase().replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
-}
-
 export function isInternalTransportNoiseText(value) {
   const text = normalizeCompletionText(value);
   if (!text) return false;
 
-  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   if (INTERNAL_TRANSPORT_PREFIX_RE.test(normalized)) return true;
   if (INTERNAL_DONE_PAYLOAD_RE.test(normalized)) return true;
 
-  const words = normalizedWords(text);
-  if (words.length > INTERNAL_TRANSPORT_SHORT_WORD_LIMIT) return false;
-
-  return INTERNAL_TRANSPORT_PHRASES.some((phrase) => normalized.includes(phrase));
+  return INTERNAL_TRANSPORT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function cleanMarkdown(text) {
