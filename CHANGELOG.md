@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] -- 2026-04-15
+
+### Fixed
+- fix(dispatch): make completion delivery deterministic
+- fix(dispatch): suppress junk completion fallbacks
+- fix(package): include provider registry in npm tarball
+- fix(scheduler): canonicalize isolated session auth overrides
+- fix(dispatch): delete watchdog jobs on disarm instead of disable to prevent accumulation
+
+### Added
+- feat(watcher): add stop_reason-based early delivery (Path 2a)
+- feat(dispatch): auto-inject ORIGIN_CHAT_ID from deliverTo into prompt
+- fix(dispatch): prefer group sessions over DM in auto-detected origin
+
+### Changed
+- ci: upgrade checkout and setup-node actions to v5
+- docs: align packaged runtime path with host layout
+- docs: document local npm pack install and upgrade flow
+- test: remove dead locals in watcher coverage
+
 ## [0.2.1] -- 2026-04-01
 
 ### Fixed
