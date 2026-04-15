@@ -1,10 +1,36 @@
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
+const INTERNAL_TRANSPORT_PREFIX_RE = /^auto-resolved(?:\s+as\s+[a-z-]+)?\s*:/i;
+const INTERNAL_TRANSPORT_PHRASES = [
+  'session not found in gateway store',
+  'session not found in sessions store',
+  'session never found',
+  'session went idle without calling done',
+];
+const INTERNAL_TRANSPORT_SHORT_WORD_LIMIT = 24;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizedWords(value) {
+  return value.toLowerCase().replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+}
+
+export function isInternalTransportNoiseText(value) {
+  const text = normalizeCompletionText(value);
+  if (!text) return false;
+
+  const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  if (INTERNAL_TRANSPORT_PREFIX_RE.test(normalized)) return true;
+
+  const words = normalizedWords(text);
+  if (words.length > INTERNAL_TRANSPORT_SHORT_WORD_LIMIT) return false;
+
+  return INTERNAL_TRANSPORT_PHRASES.some((phrase) => normalized.includes(phrase));
 }
 
 export function isMeaningfulCompletionText(value) {
@@ -20,6 +46,17 @@ export function isMeaningfulCompletionText(value) {
   if (words.length === 1) return false;
 
   return true;
+}
+
+function buildInternalNoiseFallback(noisyTexts) {
+  const joined = noisyTexts.join(' ').toLowerCase();
+  if (joined.includes('session went idle without calling done')) {
+    return 'The session ended without a final completion signal, so no reliable final report is available.';
+  }
+  if (joined.includes('session not found') || joined.includes('session never found')) {
+    return 'The session ended before a final report could be retrieved, so there is no user-facing completion message to deliver.';
+  }
+  return 'The session completed with internal transport status only and no user-facing completion report.';
 }
 
 function shortSha(sha) {
@@ -101,9 +138,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const completionDelivery = normalizeCompletionText(completion?.deliveryText);
   const fallback = normalizeCompletionText(fallbackSummary);
   const preferredSummary = completionSummary || fallback;
-  const meaningfulSummary = [completionSummary, fallback].find(isMeaningfulCompletionText) || null;
+  const noisyTexts = [reply, completionDelivery, completionSummary, fallback].filter(isInternalTransportNoiseText);
+  const isDeliverableText = (text) => isMeaningfulCompletionText(text) && !isInternalTransportNoiseText(text);
+  const meaningfulSummary = [completionSummary, fallback].find(isDeliverableText) || null;
 
-  if (isMeaningfulCompletionText(reply)) {
+  if (isDeliverableText(reply)) {
     return {
       deliveryText: reply,
       summary: preferredSummary || reply.slice(0, 500),
@@ -111,7 +150,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (isMeaningfulCompletionText(completionDelivery)) {
+  if (isDeliverableText(completionDelivery)) {
     return {
       deliveryText: completionDelivery,
       summary: completionSummary || completionDelivery,
@@ -124,6 +163,15 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: meaningfulSummary,
       summary: meaningfulSummary,
       source: completionSummary && meaningfulSummary === completionSummary ? 'completion-summary' : 'summary',
+    };
+  }
+
+  if (noisyTexts.length > 0) {
+    const fallbackDelivery = buildInternalNoiseFallback(noisyTexts);
+    return {
+      deliveryText: fallbackDelivery,
+      summary: fallbackDelivery,
+      source: 'internal-noise',
     };
   }
 
