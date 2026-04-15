@@ -55,7 +55,7 @@ import {
 import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
-import { buildTerminalCompletionPayload, resolveCompletionDelivery } from './dispatch/completion.mjs';
+import { buildTerminalCompletionPayload, hasCompletionSignal, resolveCompletionDelivery } from './dispatch/completion.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
@@ -5726,24 +5726,49 @@ console.log('\n-- Completion payload helpers --');
     sha: helperSha,
   });
 
+  assert(synthesized.version === 2, 'completion helper: payload version bumped for structured summary contract');
+  assert(synthesized.summary_human === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: summary_human synthesized from checklist+sha');
   assert(synthesized.summary === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: generic summary synthesized from checklist+sha');
-  assert(synthesized.deliveryText === synthesized.summary, 'completion helper: synthesized summary reused as deliveryText');
+  assert(synthesized.deliveryText === synthesized.summary_human, 'completion helper: deliveryText mirrors summary_human');
+  assert(synthesized.details_technical?.sha_short === 'deadbee', 'completion helper: technical details retain short sha');
   assert(synthesized.checklist?.tests_passed === true, 'completion helper: checklist preserved');
   assert(synthesized.sha === helperSha, 'completion helper: sha preserved');
   assert(synthesized.debug?.rawSummary === 'completed (agent signal)', 'completion helper: raw summary preserved in debug');
+  assert(hasCompletionSignal(synthesized) === true, 'completion helper: synthesized payload counts as a completion signal');
 
-  const resolvedReply = resolveCompletionDelivery({
-    lastReply: 'Implemented deterministic completion delivery and pushed the fix.',
-    completion: synthesized,
+  const structuredFirst = resolveCompletionDelivery({
+    lastReply: 'Raw transcript text that should not beat structured completion.',
+    completion: {
+      summary_human: 'Human-ready summary from structured completion.',
+      summary: 'Human-ready summary from structured completion.',
+      checklist: { work_complete: true },
+    },
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(resolvedReply.deliveryText === 'Implemented deterministic completion delivery and pushed the fix.', 'completion helper: explicit prose reply wins over synthesized metadata');
+  assert(structuredFirst.source === 'summary_human', 'completion helper: summary_human is the primary structured delivery field');
+  assert(structuredFirst.deliveryText === 'Human-ready summary from structured completion.', 'completion helper: summary_human beats raw transcript fallback');
+
+  const summaryFallback = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary: 'Summary field still renders when summary_human is absent.',
+      checklist: { work_complete: true },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(summaryFallback.source === 'completion-summary', 'completion helper: summary field is used when summary_human is absent');
+  assert(summaryFallback.deliveryText === 'Summary field still renders when summary_human is absent.', 'completion helper: summary field remains deliverable without summary_human');
 
   const resolvedSynth = resolveCompletionDelivery({
     lastReply: null,
-    completion: synthesized,
+    completion: {
+      summary: 'completed (agent signal)',
+      checklist: { work_complete: true, tests_passed: true, pushed: true },
+      sha: helperSha,
+    },
     fallbackSummary: 'completed (agent signal)',
   });
+  assert(resolvedSynth.source === 'technical-synthesis', 'completion helper: checklist+sha synthesize a human fallback when summary_human is absent');
   assert(resolvedSynth.deliveryText === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: synthesized metadata used when prose reply missing');
 
   const suppressed = resolveCompletionDelivery({
@@ -5828,8 +5853,10 @@ console.log('\n-- Done Subcommand --');
   const updatedLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
   assert(updatedLabels['my-task'].status === 'done', 'done subcommand: labels.json updated to done');
   assert(updatedLabels['my-task'].summary === 'all done!', 'done subcommand: labels.json summary updated');
+  assert(updatedLabels['my-task'].completion?.summary_human === 'all done!', 'done subcommand: completion payload stores summary_human');
   assert(updatedLabels['my-task'].completion?.deliveryText === 'all done!', 'done subcommand: completion payload stores explicit prose delivery text');
   assert(updatedLabels['my-task'].completion?.checklist?.work_complete === true, 'done subcommand: completion payload stores checklist metadata');
+  assert(doneObj.completion?.summary_human === 'all done!', 'done subcommand: JSON response includes summary_human');
   assert(doneObj.completion?.deliveryText === 'all done!', 'done subcommand: JSON response includes completion payload');
 
   // done with unregistered label -> exits 0 and marks as done (not an error)
@@ -6001,6 +6028,7 @@ console.log('\n-- Done Subcommand --');
     const metadataObj = JSON.parse(metadataOut.trim());
     const expectedSynth = `Work complete. Tests passed. Pushed ${metadataSha.slice(0, 7)}.`;
     assert(metadataObj.summary === expectedSynth, 'done metadata-only: summary synthesized deterministically from checklist+sha');
+    assert(metadataObj.completion?.summary_human === expectedSynth, 'done metadata-only: summary_human synthesized');
     assert(metadataObj.completion?.deliveryText === expectedSynth, 'done metadata-only: completion deliveryText synthesized');
 
     const metadataLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
@@ -6014,6 +6042,7 @@ console.log('\n-- Done Subcommand --');
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim());
+    assert(metadataStatus.completion?.summary_human === expectedSynth, 'done metadata-only: status exposes summary_human');
     assert(metadataStatus.completion?.deliveryText === expectedSynth, 'done metadata-only: status exposes completion payload');
 
     const metadataResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'metadata-only-task'], {
@@ -6023,6 +6052,7 @@ console.log('\n-- Done Subcommand --');
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim());
     assert(metadataResult.lastReply === null, 'done metadata-only: result still reports lastReply=null without transcript prose');
+    assert(metadataResult.completion?.summary_human === expectedSynth, 'done metadata-only: result exposes summary_human');
     assert(metadataResult.completion?.deliveryText === expectedSynth, 'done metadata-only: result exposes completion payload for watcher delivery');
   }
 
@@ -7435,40 +7465,82 @@ console.log('\n-- Watchdog Heartbeat Guard --');
 
 console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table --');
 {
-  // Import onFinished from hooks.mjs (which uses sendMessage internally)
   const { onFinished } = await import('./dispatch/hooks.mjs');
-
-  // Use getDb() to get the current open DB instance (not the stale top-level `db`)
   const liveDb = getDb();
+  const repoSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    encoding: 'utf8',
+    cwd: dirname(fileURLToPath(import.meta.url)),
+  }).trim();
 
-  // Count messages before
-  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result'").get();
+  async function runGatewayNotifyCase({
+    label,
+    summary,
+    completion,
+    expectedBodyText,
+    unexpectedBodyText,
+  }) {
+    const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=?").get(label).cnt;
 
-  // Call onFinished with deliverTo set -- triggers gatewayNotify -> sendMessage
-  await onFinished({
-    label:          'test-label-post-office',
-    job_id:         'jid-post-office',
-    run_id:         'rid-post-office',
-    agent:          'main',
-    status:         'ok',
-    deliverTo:      '1234567890',
-    deliveryChannel: 'telegram',
-    summary:        'post-office test completed',
+    await onFinished({
+      label,
+      job_id: `jid-${label}`,
+      run_id: `rid-${label}`,
+      agent: 'main',
+      status: 'ok',
+      deliverTo: '1234567890',
+      deliveryChannel: 'telegram',
+      summary,
+      completion,
+    });
+
+    const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=?").get(label).cnt;
+    assert(after === before + 1, `gatewayNotify ${label}: enqueues one message to messages table`);
+
+    const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(label);
+    assert(msg !== undefined,                              `gatewayNotify ${label}: message exists`);
+    assert(msg.from_agent === 'dispatch',                  `gatewayNotify ${label}: from_agent=dispatch`);
+    assert(msg.to_agent === 'main',                        `gatewayNotify ${label}: to_agent=main`);
+    assert(msg.kind === 'result',                          `gatewayNotify ${label}: kind=result`);
+    assert(msg.subject === label,                          `gatewayNotify ${label}: subject=label`);
+    assert(msg.body.includes(label),                       `gatewayNotify ${label}: body includes label`);
+    assert(msg.body.includes(expectedBodyText),            `gatewayNotify ${label}: body includes structured delivery text`);
+    if (unexpectedBodyText) {
+      assert(!msg.body.includes(unexpectedBodyText),       `gatewayNotify ${label}: body suppresses fallback/raw text`);
+    }
+    assert(msg.channel === 'telegram',                     `gatewayNotify ${label}: channel stored for reference`);
+    assert(msg.status === 'pending',                       `gatewayNotify ${label}: message status=pending (not yet delivered)`);
+  }
+
+  await runGatewayNotifyCase({
+    label: 'test-label-post-office',
+    summary: 'post-office test completed',
+    completion: null,
+    expectedBodyText: 'post-office test completed',
   });
 
-  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result'").get();
-  assert(after.cnt === before.cnt + 1, 'gatewayNotify: enqueues one message to messages table');
+  await runGatewayNotifyCase({
+    label: 'test-label-post-office-human',
+    summary: 'raw transcript fallback should not win',
+    completion: {
+      summary_human: 'Human summary from structured completion.',
+      summary: 'Human summary from structured completion.',
+      checklist: { work_complete: true },
+    },
+    expectedBodyText: 'Human summary from structured completion.',
+    unexpectedBodyText: 'raw transcript fallback should not win',
+  });
 
-  const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject='test-label-post-office'").get();
-  assert(msg !== undefined,                              'gatewayNotify: message exists');
-  assert(msg.from_agent === 'dispatch',                  'gatewayNotify: from_agent=dispatch');
-  assert(msg.to_agent === 'main',                        'gatewayNotify: to_agent=main');
-  assert(msg.kind === 'result',                          'gatewayNotify: kind=result');
-  assert(msg.subject === 'test-label-post-office',       'gatewayNotify: subject=label');
-  assert(msg.body.includes('test-label-post-office'),    'gatewayNotify: body includes label');
-  assert(msg.body.includes('post-office test completed'),'gatewayNotify: body includes summary');
-  assert(msg.channel === 'telegram',                     'gatewayNotify: channel stored for reference');
-  assert(msg.status === 'pending',                       'gatewayNotify: message status=pending (not yet delivered)');
+  await runGatewayNotifyCase({
+    label: 'test-label-post-office-synth',
+    summary: 'completed (agent signal)',
+    completion: {
+      summary: 'completed (agent signal)',
+      checklist: { work_complete: true, tests_passed: true, pushed: true },
+      sha: repoSha,
+    },
+    expectedBodyText: `Work complete. Tests passed. Pushed ${repoSha.slice(0, 7)}.`,
+    unexpectedBodyText: 'completed (agent signal)',
+  });
 }
 
 console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to messages table --');
@@ -7600,6 +7672,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
 
     if (expectEnqueued) {
       assert(stdout.includes(expectedDeliveryText), `dispatch completion ${slug}: watcher stdout contains expected completion text`);
+      assert(!stdout.includes('completed (no reply captured)'), `dispatch completion ${slug}: watcher avoids useless no-reply fallback when structured data exists`);
       if (unexpectedDeliveryText) {
         assert(!stdout.includes(unexpectedDeliveryText), `dispatch completion ${slug}: watcher stdout suppresses internal transport status text`);
       }
