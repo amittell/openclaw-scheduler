@@ -110,6 +110,15 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function toTimestampMs(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 /** Parse --flag value pairs from argv (supports both --flag value and --flag=value) */
 function parseFlags(argv) {
   const flags = {};
@@ -247,23 +256,16 @@ function gatewayCall(method, params = {}, opts = {}) {
 // -- Gateway Error Log Check ----------------------------------
 
 /**
- * Check the gateway error log for 529/FailoverError/overload errors
+ * Check the gateway error log for the most recent diagnostic lane task error
  * matching a specific session key.
  *
  * Scans the last N bytes of gateway.err.log for diagnostic lane task errors
- * that reference the session key and match overload patterns.
+ * that reference the session key and returns the newest error line.
  *
  * @param {string} sessionKey - The session key to check
  * @returns {{ found: boolean, error: string|null, timestamp: string|null }}
  */
-function check529InGatewayLog(sessionKey) {
-  const OVERLOAD_PATTERNS = [
-    /529/i,
-    /failover\s*error/i,
-    /overload/i,
-    /temporarily\s+overloaded/i,
-  ];
-
+function getGatewayLaneTaskError(sessionKey) {
   try {
     const logPath = join(HOME_DIR, '.openclaw', 'logs', 'gateway.err.log');
     if (!existsSync(logPath)) return { found: false, error: null, timestamp: null };
@@ -285,26 +287,47 @@ function check529InGatewayLog(sessionKey) {
       if (!line.includes(sessionKey)) continue;
       if (!line.includes('lane task error')) continue;
 
-      // Extract the error message
       const errorMatch = line.match(/error="([^"]+)"/);
       if (!errorMatch) continue;
 
-      const errorMsg = errorMatch[1];
-      if (OVERLOAD_PATTERNS.some(p => p.test(errorMsg))) {
-        // Extract timestamp
-        const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/);
-        return {
-          found: true,
-          error: `FailoverError (529): ${errorMsg}`,
-          timestamp: tsMatch ? tsMatch[1] : null,
-        };
-      }
+      const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/);
+      return {
+        found: true,
+        error: errorMatch[1],
+        timestamp: tsMatch ? tsMatch[1] : null,
+      };
     }
 
     return { found: false, error: null, timestamp: null };
   } catch {
     return { found: false, error: null, timestamp: null };
   }
+}
+
+/**
+ * Check the gateway error log for 529/FailoverError/overload errors
+ * matching a specific session key.
+ *
+ * @param {string} sessionKey - The session key to check
+ * @returns {{ found: boolean, error: string|null, timestamp: string|null }}
+ */
+function check529InGatewayLog(sessionKey) {
+  const OVERLOAD_PATTERNS = [
+    /529/i,
+    /failover\s*error/i,
+    /overload/i,
+    /temporarily\s+overloaded/i,
+  ];
+
+  const laneError = getGatewayLaneTaskError(sessionKey);
+  if (!laneError.found || !laneError.error) return { found: false, error: null, timestamp: null };
+  if (!OVERLOAD_PATTERNS.some(p => p.test(laneError.error))) return { found: false, error: null, timestamp: null };
+
+  return {
+    found: true,
+    error: `FailoverError (529): ${laneError.error}`,
+    timestamp: laneError.timestamp,
+  };
 }
 
 // -- Sessions Store (Direct Read) -----------------------------
@@ -326,6 +349,83 @@ function readSessionsStore(agent = 'main') {
   } catch {
     return null;
   }
+}
+
+function getSessionJsonlPath(agent = 'main', sessionId) {
+  if (!sessionId) return null;
+  return join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', `${sessionId}.jsonl`);
+}
+
+function inspectSessionActivitySignal(sessionKey, sessionsStore) {
+  if (!sessionKey || !sessionsStore?.[sessionKey]) {
+    return { found: false, hasActivitySignal: false, messageCount: null, jsonlExists: false, hasTokens: false, updatedAtMs: null };
+  }
+
+  const agent = agentFromSessionKey(sessionKey) || 'main';
+  const entry = sessionsStore[sessionKey];
+  const jsonlPath = getSessionJsonlPath(agent, entry.sessionId);
+  const jsonlExists = jsonlPath ? existsSync(jsonlPath) : false;
+  const hasTokens = typeof entry.totalTokens === 'number' && entry.totalTokens > 0;
+  let messageCount = null;
+
+  try {
+    const history = gatewayCall('chat.history', { sessionKey }, { timeout: 8000 });
+    if (Array.isArray(history?.messages)) {
+      messageCount = history.messages.length;
+    }
+  } catch {}
+
+  return {
+    found: true,
+    hasActivitySignal: jsonlExists || hasTokens || (typeof messageCount === 'number' && messageCount > 0),
+    messageCount,
+    jsonlExists,
+    hasTokens,
+    updatedAtMs: toTimestampMs(entry.updatedAt),
+  };
+}
+
+function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, startupGraceMs) {
+  if (!sessionKey || !sessionsStore?.[sessionKey]) {
+    return { shouldResolve: false, reason: null, errorMsg: null };
+  }
+
+  const ageMs = spawnedAtMs ? Date.now() - spawnedAtMs : Infinity;
+  if (ageMs < startupGraceMs || ageMs > startupGraceMs * 2) {
+    return { shouldResolve: false, reason: null, errorMsg: null };
+  }
+
+  const signal = inspectSessionActivitySignal(sessionKey, sessionsStore);
+  if (signal.hasActivitySignal) {
+    return { shouldResolve: false, reason: null, errorMsg: null };
+  }
+
+  const laneError = getGatewayLaneTaskError(sessionKey);
+  if (laneError.found && laneError.error) {
+    return {
+      shouldResolve: true,
+      reason: `diagnostic lane error: ${laneError.error}`,
+      errorMsg: `spawn-failure: ${laneError.error}`,
+    };
+  }
+
+  if (signal.messageCount === 0) {
+    return {
+      shouldResolve: true,
+      reason: 'session entered sessions store but never wrote transcript/history',
+      errorMsg: 'spawn-failure: session entered sessions store but never wrote transcript/history',
+    };
+  }
+
+  if (signal.updatedAtMs !== null && spawnedAtMs && signal.updatedAtMs <= spawnedAtMs + 5000) {
+    return {
+      shouldResolve: true,
+      reason: 'session entered sessions store but never showed any activity',
+      errorMsg: 'spawn-failure: session entered sessions store but never showed any activity',
+    };
+  }
+
+  return { shouldResolve: false, reason: null, errorMsg: null };
 }
 
 /**
@@ -1018,17 +1118,25 @@ async function cmdEnqueue(flags) {
     for (let spawnPoll = 0; spawnPoll < SPAWN_POLL_MAX; spawnPoll++) {
       await sleep(SPAWN_POLL_DELAY_MS);
       const spawnStore = readSessionsStore(agent);
-      if (spawnStore && sessionKey in spawnStore) {
+      const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
+      if (signal.hasActivitySignal) {
         spawnConfirmed = true;
         break;
       }
     }
     if (!spawnConfirmed) {
-      process.stderr.write(
-        `[${agentBrand}] WARNING: session ${sessionKey} did not appear in gateway after ` +
-        `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s -- spawn may have failed\n`
-      );
-      setLabel(label, { status: 'spawn-warning' });
+      const laneError = getGatewayLaneTaskError(sessionKey);
+      const spawnError = laneError.found && laneError.error
+        ? `spawn-failure: ${laneError.error}`
+        : `spawn-failure: session ${sessionKey} never produced transcript/history within ` +
+          `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s`;
+      process.stderr.write(`[${agentBrand}] WARNING: ${spawnError}\n`);
+      setLabel(label, {
+        status: 'error',
+        error: spawnError,
+        summary: spawnError,
+      });
+      disarmWatchdog(label);
     }
   } catch (err) {
     die(`gateway agent call failed: ${err.message}`);
@@ -1065,62 +1173,80 @@ function cmdStatus(flags) {
     const ageMs = Date.now() - spawnedAtMs;
     const STARTUP_GRACE_MS = config.startupGraceMs ?? 300_000;
 
-    // -- Heartbeat-based liveness guard ----------------------------------
-    // The watcher process writes lastPing every 60s while the session is live.
-    // If the ping is fresh, the watcher is alive and working -- defer auto-resolve
-    // to avoid killing sessions during slow tool calls, docker builds, etc.
-    //
-    // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard from the
-    //                  watcher in 3 min, it's probably dead; fall through to check.
-    // hardCeilingMs:   job timeout * 1.5 -- absolute max regardless of ping age.
-    //                  Catches zombie watchers (watcher alive but session is stuck).
-    // idleThresholdMs: max(job timeout, 10 min) -- replaces the old hardcoded 10-min
-    //                  threshold so longer jobs aren't killed at exactly 10 min.
-    const PING_STALE_MS  = 3 * 60 * 1000;
-    const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
-    // hardCeilingMs must be >= idleThresholdMs to avoid the ceiling undercutting the
-    // idle floor (e.g. timeoutSeconds=300 -> ceiling=7.5 min < idle=10 min would force
-    // zombie-guard threshold for sessions that should still use idleThresholdMs).
-    const hardCeilingMs  = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMs * 1.5);
+    const bootstrapFailure = !entry.lastPing
+      ? inspectSessionBootstrapFailure(
+          entry.sessionKey,
+          sessionsStore,
+          spawnedAtMs,
+          STARTUP_GRACE_MS,
+        )
+      : { shouldResolve: false, reason: null, errorMsg: null };
+    if (bootstrapFailure.shouldResolve) {
+      setLabel(label, {
+        status:  'error',
+        error:   bootstrapFailure.errorMsg,
+        summary: `Auto-resolved as spawn failure: ${bootstrapFailure.reason}`,
+      });
+      syncAction = `auto-resolved as spawn failure: ${bootstrapFailure.reason}`;
+      disarmWatchdog(label);
+    } else {
+      // -- Heartbeat-based liveness guard ----------------------------------
+      // The watcher process writes lastPing every 60s while the session is live.
+      // If the ping is fresh, the watcher is alive and working -- defer auto-resolve
+      // to avoid killing sessions during slow tool calls, docker builds, etc.
+      //
+      // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard from the
+      //                  watcher in 3 min, it's probably dead; fall through to check.
+      // hardCeilingMs:   job timeout * 1.5 -- absolute max regardless of ping age.
+      //                  Catches zombie watchers (watcher alive but session is stuck).
+      // idleThresholdMs: max(job timeout, 10 min) -- replaces the old hardcoded 10-min
+      //                  threshold so longer jobs aren't killed at exactly 10 min.
+      const PING_STALE_MS  = 3 * 60 * 1000;
+      const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
+      // hardCeilingMs must be >= idleThresholdMs to avoid the ceiling undercutting the
+      // idle floor (e.g. timeoutSeconds=300 -> ceiling=7.5 min < idle=10 min would force
+      // zombie-guard threshold for sessions that should still use idleThresholdMs).
+      const hardCeilingMs  = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMs * 1.5);
 
-    let check;
-    if (ageMs < STARTUP_GRACE_MS) {
-      // Within startup grace -- never auto-resolve
-      check = { shouldResolve: false };
-    } else if (entry.lastPing) {
-      const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
-      if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
-        // Watcher alive and within job ceiling -- defer auto-resolve
+      let check;
+      if (ageMs < STARTUP_GRACE_MS) {
+        // Within startup grace -- never auto-resolve
         check = { shouldResolve: false };
+      } else if (entry.lastPing) {
+        const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
+        if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
+          // Watcher alive and within job ceiling -- defer auto-resolve
+          check = { shouldResolve: false };
+        } else {
+          // Ping stale OR past hard ceiling: fall through to session store check
+          const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
+          check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
+        }
       } else {
-        // Ping stale OR past hard ceiling: fall through to session store check
+        // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
+        // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
         const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
         check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
       }
-    } else {
-      // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
-      // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
-      const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
-      check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
-    }
 
-    if (check.shouldResolve) {
-      if (check.is529) {
-        setLabel(label, {
-          status:  'error',
-          error:   check.errorMsg || `529/overload: ${check.reason}`,
-          summary: `Auto-resolved as error: ${check.reason}`,
-        });
-        syncAction = `auto-resolved as 529 error: ${check.reason}`;
-      } else {
-        setLabel(label, {
-          status:  'interrupted',
-          summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
-        });
-        syncAction = `auto-resolved as interrupted: ${check.reason}`;
+      if (check.shouldResolve) {
+        if (check.is529) {
+          setLabel(label, {
+            status:  'error',
+            error:   check.errorMsg || `529/overload: ${check.reason}`,
+            summary: `Auto-resolved as error: ${check.reason}`,
+          });
+          syncAction = `auto-resolved as 529 error: ${check.reason}`;
+        } else {
+          setLabel(label, {
+            status:  'interrupted',
+            summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+          });
+          syncAction = `auto-resolved as interrupted: ${check.reason}`;
+        }
+        // Disarm watchdog when session is auto-resolved
+        disarmWatchdog(label);
       }
-      // Disarm watchdog when session is auto-resolved
-      disarmWatchdog(label);
     }
   }
 
@@ -1346,6 +1472,28 @@ function cmdSync(flags) {
     const syncStore = getSyncStore(entry);
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const elapsedMs   = Date.now() - spawnedAtMs;
+    const STARTUP_GRACE_MS_SYNC = config.startupGraceMs ?? 300_000;
+
+    const bootstrapFailure = !entry.lastPing
+      ? inspectSessionBootstrapFailure(
+          entry.sessionKey,
+          syncStore,
+          spawnedAtMs,
+          STARTUP_GRACE_MS_SYNC,
+        )
+      : { shouldResolve: false, reason: null, errorMsg: null };
+    if (bootstrapFailure.shouldResolve) {
+      changes.push({ label: name, from: 'running', to: 'error', reason: bootstrapFailure.reason });
+      if (!dryRun) {
+        setLabel(name, {
+          status: 'error',
+          error: bootstrapFailure.errorMsg,
+          summary: `Synced as spawn failure: ${bootstrapFailure.reason}`,
+        });
+        disarmWatchdog(name);
+      }
+      continue;
+    }
 
     // -- Heartbeat-based liveness guard (mirrors cmdStatus logic) ---------
     // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
