@@ -388,19 +388,43 @@ export function splitMessageForChannel(channel, message) {
   return [String(message ?? '')];
 }
 
+export function normalizeDeliveryTarget(channel, target) {
+  let resolvedChannel = channel || null;
+  let resolvedTarget = target;
+
+  const normalizedTarget = typeof resolvedTarget === 'string' ? resolvedTarget.trim() : resolvedTarget;
+  if (!normalizedTarget) {
+    return { channel: resolvedChannel, target: normalizedTarget || null };
+  }
+
+  const prefixedMatch = normalizedTarget.match(/^([a-z0-9_-]+)([:/])(.*)$/i);
+  if (prefixedMatch) {
+    const [, prefix,, rest] = prefixedMatch;
+    if (!resolvedChannel || resolvedChannel === prefix) {
+      resolvedChannel = prefix;
+      resolvedTarget = rest;
+    }
+  }
+
+  if (resolvedTarget && resolvedChannel && resolvedTarget.startsWith(resolvedChannel + '/')) {
+    resolvedTarget = resolvedTarget.slice(resolvedChannel.length + 1);
+  }
+  if (resolvedTarget && resolvedChannel && resolvedTarget.startsWith(resolvedChannel + ':')) {
+    resolvedTarget = resolvedTarget.slice(resolvedChannel.length + 1);
+  }
+
+  return {
+    channel: resolvedChannel,
+    target: typeof resolvedTarget === 'string' ? resolvedTarget.trim() : resolvedTarget,
+  };
+}
+
 /**
  * Send a message to a Telegram/channel target via message tool.
  * Automatically resolves delivery aliases (e.g. '@team_room', 'owner_dm').
  */
 export async function deliverMessage(channel, target, message) {
-  let resolvedChannel = channel;
-  let resolvedTarget = target;
-
-  // Strip channel prefix from target if present (e.g., "telegram/123456789" -> "123456789")
-  // Some jobs store the channel in the delivery_to field as "channel/id".
-  if (resolvedTarget && resolvedChannel && resolvedTarget.startsWith(resolvedChannel + '/')) {
-    resolvedTarget = resolvedTarget.slice(resolvedChannel.length + 1);
-  }
+  let { channel: resolvedChannel, target: resolvedTarget } = normalizeDeliveryTarget(channel, target);
 
   // Resolve alias: try '@name' strip and bare name lookup
   if (resolvedTarget) {

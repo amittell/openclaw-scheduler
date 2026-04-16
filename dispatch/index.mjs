@@ -32,7 +32,7 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
-import { buildTerminalCompletionPayload } from './completion.mjs';
+import { buildTerminalCompletionPayload, hasCompletionSignal } from './completion.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1034,7 +1034,7 @@ async function cmdEnqueue(flags) {
     let watchdogJobId = null;
     if (monitorEnabled && deliverTo) {
       try {
-        const checkCmd = `'${sq(process.execPath)}' '${sq(join(__dirname, 'index.mjs'))}' stuck --label '${sq(label)}' --threshold-min ${monitorTimeout}`;
+        const checkCmd = `'${sq(process.execPath)}' '${sq(join(__dirname, 'index.mjs'))}' result --label '${sq(label)}'`;
         const alertChannel = deliverChannel || 'telegram';
         const alertTarget  = deliverTo;
         const watchdogSpec = JSON.stringify({
@@ -1585,7 +1585,7 @@ function cmdResult(flags) {
   }
 
   // -- Watchdog cleanup: disable watchdog job when result is available --
-  if (lastReply && entry.watchdogJobId) {
+  if ((lastReply || hasCompletionSignal(entry.completion)) && entry.watchdogJobId) {
     disarmWatchdog(label);
   }
 
