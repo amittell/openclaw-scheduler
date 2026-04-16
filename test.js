@@ -4748,11 +4748,112 @@ console.log('\n-- Dispatch Spawn Failure Detection --');
   // checkSessionDone now has sessionEverFound param
   assert(indexSrc.includes('sessionEverFound'), 'Fix 4: checkSessionDone has sessionEverFound param');
   assert(indexSrc.includes('session never found'), 'Fix 4: distinct reason for spawn-failure case');
+  assert(indexSrc.includes('inspectSessionBootstrapFailure'), 'bootstrap reconciliation helper is present');
+  assert(indexSrc.includes('Auto-resolved as spawn failure'), 'cmdStatus can surface local bootstrap failures as errors');
+  assert(indexSrc.includes('Synced as spawn failure'), 'cmdSync can reconcile local bootstrap failures as errors');
+  assert(indexSrc.includes('never produced transcript/history within'), 'cmdEnqueue escalates silent bootstrap failures');
   // post-spawn poll code exists
-  assert(indexSrc.includes('spawn-warning'), 'Fix 3: cmdEnqueue sets spawn-warning status');
+  assert(indexSrc.includes('spawn-warning'), 'Fix 3: legacy spawn-warning marker remains in source for compatibility');
   assert(indexSrc.includes('SPAWN_POLL_MAX'), 'Fix 3: post-spawn poll loop present');
 
-  // 2. Spawn-failure path: watcher exits non-zero when session never appears in gateway
+  // 2. Status/sync bootstrap reconciliation: session entered sessions store but
+  // never produced transcript/history, so dispatch should mark it as a spawn failure
+  // instead of an interrupted idle session. Use an age inside the bootstrap
+  // reconciliation window (> startupGrace, < startupGrace * 2).
+  const bootstrapDir = mkdtempSync(join(tmpdir(), 'dispatch-bootstrap-'));
+  const bootstrapHome = join(bootstrapDir, 'home');
+  const bootstrapBin = join(bootstrapDir, 'bin');
+  const bootstrapSessionsDir = join(bootstrapHome, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(bootstrapBin, { recursive: true });
+  mkdirSync(bootstrapSessionsDir, { recursive: true });
+
+  const fakeOpenclaw = join(bootstrapBin, 'openclaw');
+  writeFileSync(fakeOpenclaw, `#!/usr/bin/env node
+const method = process.argv[4];
+if (process.argv[2] === 'gateway' && process.argv[3] === 'call') {
+  if (method === 'chat.history') {
+    process.stdout.write(JSON.stringify({ messages: [] }) + '\\n');
+    process.exit(0);
+  }
+  if (method === 'sessions.list') {
+    process.stdout.write(JSON.stringify({ sessions: [] }) + '\\n');
+    process.exit(0);
+  }
+}
+process.stderr.write('unexpected fake openclaw args: ' + process.argv.slice(2).join(' ') + '\\n');
+process.exit(1);
+`);
+  execFileSync('chmod', ['+x', fakeOpenclaw]);
+
+  const bootstrapIso = new Date(Date.now() - 8 * 60 * 1000).toISOString();
+  const bootstrapSessionKey = 'agent:main:subagent:bootstrap-status';
+  writeFileSync(join(bootstrapSessionsDir, 'sessions.json'), JSON.stringify({
+    [bootstrapSessionKey]: {
+      sessionId: 'bootstrap-sid',
+      updatedAt: bootstrapIso,
+      totalTokens: 0,
+    },
+  }) + '\n');
+
+  const bootstrapStatusLabels = join(bootstrapDir, 'labels-status.json');
+  writeFileSync(bootstrapStatusLabels, JSON.stringify({
+    'bootstrap-status': {
+      sessionKey: bootstrapSessionKey,
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: bootstrapIso,
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  const statusOut = execFileSync(process.execPath, [join(dispatchDir, 'index.mjs'), 'status', '--label', 'bootstrap-status'], {
+    env: {
+      ...process.env,
+      HOME: bootstrapHome,
+      PATH: `${bootstrapBin}:${process.env.PATH}`,
+      DISPATCH_LABELS_PATH: bootstrapStatusLabels,
+    },
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const statusJson = JSON.parse(statusOut);
+  const statusLabels = JSON.parse(readFileSync(bootstrapStatusLabels, 'utf8'));
+  assert(statusJson.status === 'error', 'bootstrap status: auto-resolves local startup failure to error');
+  assert((statusJson.syncAction || '').includes('spawn failure'), 'bootstrap status: reports spawn-failure syncAction');
+  assert((statusJson.error || '').includes('spawn-failure: session entered sessions store but never wrote transcript/history'), 'bootstrap status: preserves spawn-failure diagnostic');
+  assert(statusLabels['bootstrap-status']?.status === 'error', 'bootstrap status: labels.json updated to error');
+
+  const bootstrapSyncLabels = join(bootstrapDir, 'labels-sync.json');
+  writeFileSync(bootstrapSyncLabels, JSON.stringify({
+    'bootstrap-sync': {
+      sessionKey: bootstrapSessionKey,
+      status: 'running',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: bootstrapIso,
+      timeoutSeconds: 300,
+    },
+  }) + '\n');
+
+  const syncOut = execFileSync(process.execPath, [join(dispatchDir, 'index.mjs'), 'sync'], {
+    env: {
+      ...process.env,
+      HOME: bootstrapHome,
+      PATH: `${bootstrapBin}:${process.env.PATH}`,
+      DISPATCH_LABELS_PATH: bootstrapSyncLabels,
+    },
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const syncJson = JSON.parse(syncOut);
+  const syncLabels = JSON.parse(readFileSync(bootstrapSyncLabels, 'utf8'));
+  assert(syncJson.changes === 1, 'bootstrap sync: reports one reconciled label');
+  assert(syncJson.details?.[0]?.to === 'error', 'bootstrap sync: reconciles running label to error');
+  assert(syncLabels['bootstrap-sync']?.status === 'error', 'bootstrap sync: labels.json updated to error');
+  assert((syncLabels['bootstrap-sync']?.summary || '').includes('Synced as spawn failure'), 'bootstrap sync: stores spawn-failure summary');
+
+  // 3. Spawn-failure path: watcher exits non-zero when session never appears in gateway
   //    We use a mock dispatch that always returns status=done with liveness error,
   //    simulating auto-resolve after STARTUP_GRACE_MS with session never found.
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-sftest-'));
