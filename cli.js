@@ -100,8 +100,8 @@ Queue:
   queue prune                        Prune old messages now
 
 Messages:
-  messages send --from <label> [--to <agent>] [--kind <kind>] --body "<text>"
-                                     Send a checkpoint/status message (kind defaults to 'status', to defaults to 'main')
+  messages send --from <label> [--to <agent>] [--kind <kind>] [--channel <channel>] [--delivery-to <target>] --body "<text>"
+                                     Send a checkpoint/status message (kind defaults to 'status', to defaults to 'main'; channel/delivery-to override inbox-consumer defaults)
   msg send <from> <to> <body>        Send a message (positional form)
   msg inbox <agent-id> [limit]       Get inbox (unread)
   msg team-inbox <team-id> [limit] [member-id] [task-id]  Get team mailbox
@@ -610,10 +610,19 @@ switch (command) {
         const mTo   = mFlags.to   || 'main';
         const mKind = mFlags.kind || 'status';
         const mBody = mFlags.body;
+        const mChannel = mFlags.channel || null;
+        const mDeliveryTo = mFlags['delivery-to'] || null;
         if (!mFrom || !mBody) {
-          fail('Usage: messages send --from <label> [--to <agent>] [--kind <kind>] --body "<text>"');
+          fail('Usage: messages send --from <label> [--to <agent>] [--kind <kind>] [--channel <channel>] [--delivery-to <target>] --body "<text>"');
         }
-        const msg = sendMessage({ from_agent: mFrom, to_agent: mTo, kind: mKind, body: mBody });
+        const msg = sendMessage({
+          from_agent: mFrom,
+          to_agent: mTo,
+          kind: mKind,
+          body: mBody,
+          channel: mChannel,
+          delivery_to: mDeliveryTo,
+        });
         emit({ ok: true, message: msg }, `Sent: ${fmt(msg)}`);
         break;
       }

@@ -2,6 +2,8 @@
 // Strategy pattern for dispatchJob: each execution target returns a DispatchResult,
 // and finalizeDispatch processes it uniformly.
 
+import { fileURLToPath } from 'url';
+
 /**
  * DispatchResult shape (returned by every strategy):
  * {
@@ -48,6 +50,103 @@ function safeParse(str) {
   } catch (_e) {
     return null;
   }
+}
+
+function shellSingleQuote(value) {
+  return "'" + String(value ?? '').replaceAll("'", "'\\''") + "'";
+}
+
+function parseStructuredWatchdogPayload(text) {
+  const direct = safeParse(text);
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace <= firstBrace) return null;
+
+  const candidate = text.slice(firstBrace, lastBrace + 1);
+  const parsed = safeParse(candidate);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+}
+
+const TERMINAL_WATCHDOG_STATUSES = new Set(['done', 'error', 'interrupted', 'spawn-warning']);
+
+function normalizeWatchdogText(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function firstWatchdogText(...values) {
+  for (const value of values) {
+    const text = normalizeWatchdogText(value);
+    if (text) return text;
+  }
+  return null;
+}
+
+function resolveWatchdogTerminalPayload(stdout) {
+  const text = normalizeWatchdogText(stdout);
+  if (!text) return null;
+
+  const parsed = parseStructuredWatchdogPayload(text);
+  if (!parsed) return null;
+
+  const status = typeof parsed.status === 'string' ? parsed.status : null;
+  const terminal = parsed.terminal === true || (status ? TERMINAL_WATCHDOG_STATUSES.has(status) : false);
+  if (!terminal) return null;
+
+  const detail = firstWatchdogText(
+    parsed.deliveryText,
+    parsed.lastReply,
+    parsed.error,
+    parsed.summary,
+    parsed.completion?.deliveryText,
+    parsed.completion?.summary,
+  );
+
+  if (status && status !== 'done') {
+    return {
+      kind: 'failed',
+      detail: detail || `Task ended with status ${status}.`,
+    };
+  }
+
+  return {
+    kind: 'completed',
+    detail: detail || `Task reported terminal status ${status || 'done'}.`,
+  };
+}
+
+function buildFireAndForgetDeliveryInstruction(job) {
+  if (!job.delivery_mode || job.delivery_mode === 'none' || !job.delivery_channel || !job.delivery_to) {
+    return '';
+  }
+
+  const schedulerCliPath = fileURLToPath(new URL('./cli.js', import.meta.url));
+  const fromLabel = `scheduler-fire-and-forget:${job.id || job.name || 'job'}`;
+  const baseCmd = [
+    'node',
+    shellSingleQuote(schedulerCliPath),
+    'messages',
+    'send',
+    '--from', shellSingleQuote(fromLabel),
+    '--to', 'main',
+    '--channel', shellSingleQuote(job.delivery_channel),
+    '--delivery-to', shellSingleQuote(job.delivery_to),
+  ].join(' ');
+
+  return [
+    '\n[SYSTEM NOTE -- delivery]',
+    'When you have completed this task, queue the result through the scheduler post office.',
+    `Final result: ${baseCmd} --kind result --body "<final result>"`,
+    `Progress update: ${baseCmd} --kind status --body "<brief progress update>"`,
+    'Do NOT use the message tool, sessions_send, or any direct chat delivery.',
+    'The inbox consumer will deliver queued messages durably to the configured target.',
+    'Keep queued updates concise and actionable.',
+    'If there is nothing noteworthy to report, do not queue a message.',
+    '[END SYSTEM NOTE]\n',
+  ].join('\n');
 }
 
 function getIdentityTrustLevel(identity) {
@@ -850,16 +949,29 @@ export async function executeWatchdog(job, ctx, deps) {
     if (elapsedMin >= job.watchdog_timeout_min) timedOut = true;
   }
 
+  const terminalPayload = resolveWatchdogTerminalPayload(stdout);
+
   if (exitCode === 2) {
     result.summary = `Watchdog check failed (transient): ${stderr || stdout}`;
     result.skipDelivery = true;
     log('debug', `Watchdog check transient failure: ${job.name}`, { exitCode, stderr: stderr.slice(0, 200) });
 
-  } else if (exitCode === 0 && stdout) {
-    const completionMsg = `\u2705 [watchdog] Task "${job.watchdog_target_label}" completed -- watchdog disarmed`;
+  } else if (exitCode === 0 && terminalPayload) {
+    const completionMsg = terminalPayload.kind === 'failed'
+      ? [
+        `⚠️ [watchdog] Task "${job.watchdog_target_label}" ended with failure -- watchdog disarmed`,
+        terminalPayload.detail ? `Details: ${terminalPayload.detail}` : null,
+      ].filter(Boolean).join('\n')
+      : [
+        `\u2705 [watchdog] Task "${job.watchdog_target_label}" completed -- watchdog disarmed`,
+        terminalPayload.detail || null,
+      ].filter(Boolean).join('\n\n');
     result.summary = completionMsg;
     result.content = completionMsg;
-    log('info', `Watchdog: target completed: ${job.watchdog_target_label}`, { jobId: job.id });
+    log(terminalPayload.kind === 'failed' ? 'warn' : 'info', `Watchdog: target terminal: ${job.watchdog_target_label}`, {
+      jobId: job.id,
+      terminalKind: terminalPayload.kind,
+    });
 
     if (job.watchdog_alert_channel && job.watchdog_alert_target) {
       await handleDelivery({
@@ -909,10 +1021,12 @@ export async function executeWatchdog(job, ctx, deps) {
     result.skipDelivery = true;
 
   } else if (exitCode === 0) {
-    result.summary = `Watchdog check: target still running (${elapsedMin}min elapsed)`;
+    result.summary = stdout
+      ? `Watchdog check returned non-terminal output; target still running (${elapsedMin}min elapsed)`
+      : `Watchdog check: target still running (${elapsedMin}min elapsed)`;
     result.skipDelivery = true;
     log('debug', `Watchdog: target still running: ${job.watchdog_target_label}`, {
-      jobId: job.id, elapsedMin,
+      jobId: job.id, elapsedMin, sawStdout: Boolean(stdout),
     });
   } else {
     result.summary = `Watchdog check command returned unexpected exit code ${exitCode}`;
@@ -963,27 +1077,14 @@ export async function executeMain(job, ctx, deps) {
     ? `[SYSTEM NOTE -- model policy]\nPrefer reasoning depth: ${job.payload_thinking}.\n[END SYSTEM NOTE]\n\n`
     : '';
 
-  // Build the delivery reply-to instruction so the agent can send results
-  // back through the scheduler post office when it finishes processing.
-  let deliveryInstruction = '';
-  if (job.delivery_mode && job.delivery_mode !== 'none' && job.delivery_channel && job.delivery_to) {
-    deliveryInstruction = [
-      '\n[SYSTEM NOTE -- delivery]',
-      `When you have completed this task, send your results using the message tool.`,
-      `Channel: ${job.delivery_channel}`,
-      `Target: ${job.delivery_to}`,
-      `Keep the message concise and actionable.`,
-      `If there is nothing noteworthy to report, do not send a message.`,
-      '[END SYSTEM NOTE]\n',
-    ].join('\n');
-  }
+  const deliveryInstruction = buildFireAndForgetDeliveryInstruction(job);
 
   const prompt = `${executionNote ? `${executionNote}\n\n` : ''}${modelNote}${deliveryInstruction}${job.payload_message}`;
   await sendSystemEvent(prompt, 'now');
 
   result.summary = 'System event dispatched (fire-and-forget)';
   result.content = job.payload_message;
-  result.skipDelivery = true; // Agent handles delivery via message tool
+  result.skipDelivery = true; // Async completion is queued through the scheduler post office
   result.skipChildren = true;
   result.skipDequeue = true;
 

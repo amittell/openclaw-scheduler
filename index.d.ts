@@ -620,6 +620,7 @@ export const gateway: {
   listSessions(opts?: { activeMinutes?: number; limit?: number; kinds?: string[] }): Promise<Record<string, unknown>>;
   getAllSubAgentSessions(activeMinutes?: number): Promise<Array<Record<string, unknown>>>;
   splitMessageForChannel(channel: string, message: string): string[];
+  normalizeDeliveryTarget(channel: string | null, target: string | null): { channel: string | null; target: string | null };
   resolveDeliveryAlias(rawTarget: string): { channel: string; target: string } | null;
   deliverMessage(channel: string, target: string, message: string): Promise<DeliveryResult>;
   checkGatewayHealth(): Promise<boolean>;
