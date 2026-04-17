@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Scheduler CLI -- manage jobs, runs, messages, agents
-import { readFileSync } from 'fs';
-import { initDb, getDb } from './db.js';
+import { existsSync, readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, finishRun } from './runs.js';
 import {
@@ -9,13 +11,52 @@ import {
   ackMessage, listMessageReceipts, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
+import { resolveSchedulerHome } from './paths.js';
 import { SCHEDULER_SCHEMAS } from './scheduler-schema.js';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliArgs = process.argv.slice(2);
 const jsonFlagIndex = cliArgs.indexOf('--json');
 const jsonMode = jsonFlagIndex >= 0;
 if (jsonFlagIndex >= 0) cliArgs.splice(jsonFlagIndex, 1);
 const [command, sub, ...args] = cliArgs;
+
+function firstNonEmpty(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : '';
+}
+
+function isNodeModulesInstall(moduleDir) {
+  return /[\\/]node_modules[\\/](?:@[^\\/]+[\\/])?openclaw-scheduler(?:[\\/]|$)/.test(moduleDir);
+}
+
+function isValidationOnlyCommand(cmd, subcommand, rest) {
+  return cmd === 'jobs' && (
+    subcommand === 'validate'
+    || (subcommand === 'add' && rest.includes('--dry-run'))
+  );
+}
+
+function getDbPathMismatchNotice(env = process.env) {
+  if (firstNonEmpty(env.SCHEDULER_DB)) return null;
+  if (isNodeModulesInstall(__dirname)) return null;
+
+  const repoDbPath = join(__dirname, 'scheduler.db');
+  const resolvedDbPath = getResolvedDbPath();
+  if (resolvedDbPath !== repoDbPath) return null;
+
+  const runtimeDbPath = join(resolveSchedulerHome(env), 'scheduler.db');
+  if (runtimeDbPath === resolvedDbPath) return null;
+  if (!existsSync(runtimeDbPath)) return null;
+
+  return { resolvedDbPath, runtimeDbPath };
+}
+
+function formatDbPathMismatchNotice({ resolvedDbPath, runtimeDbPath }, { validation = false } = {}) {
+  const prefix = validation ? 'Refusing to run validation.' : 'Warning: source checkout CLI is using a repo-local DB.';
+  return `${prefix} repo-local=${resolvedDbPath} runtime=${runtimeDbPath}. Re-run via the installed package CLI or set SCHEDULER_DB explicitly.`;
+}
 
 function usage() {
   console.log(`
@@ -117,6 +158,14 @@ Schema:
 Capabilities:
   capabilities                       Report v0.2 feature support
 `);
+}
+
+const dbPathMismatchNotice = getDbPathMismatchNotice(process.env);
+if (dbPathMismatchNotice) {
+  if (isValidationOnlyCommand(command, sub, args)) {
+    fail(formatDbPathMismatchNotice(dbPathMismatchNotice, { validation: true }));
+  }
+  process.stderr.write(`${formatDbPathMismatchNotice(dbPathMismatchNotice)}\n`);
 }
 
 await initDb();
@@ -953,6 +1002,7 @@ switch (command) {
   // -- Status ----------------------------------------------
   case 'status': {
     const db = getDb();
+    const dbPath = getResolvedDbPath();
     const jobs = listJobs();
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
@@ -982,6 +1032,7 @@ switch (command) {
       .filter(j => j.enabled && j.next_run_at)
       .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0] || null;
     const payload = {
+      db_path: dbPath,
       jobs_total: jobs.length,
       jobs_enabled: jobs.filter(j => j.enabled).length,
       running_runs: runningRuns.length,
@@ -997,6 +1048,7 @@ switch (command) {
     };
     emit(payload, () => {
       console.log('=== OpenClaw Scheduler Status ===');
+      console.log(`DB:       ${dbPath}`);
       console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
       console.log(`Running:  ${runningRuns.length}`);
       console.log(`Stale:    ${stale.length}`);

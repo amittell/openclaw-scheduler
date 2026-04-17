@@ -4,7 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -167,6 +167,13 @@ assert(
     moduleDir: '/home/tester/.openclaw/scheduler/node_modules/openclaw-scheduler'
   }) === '/home/tester/.openclaw/scheduler/scheduler.db',
   'npm installs default DB path to scheduler home, not node_modules'
+);
+assert(
+  resolveSchedulerDbPath({
+    env: fakeEnv,
+    moduleDir: '/home/tester/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler'
+  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  'installed package layout resolves DB path to scheduler home'
 );
 const writableSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-src-'));
 assert(
@@ -2997,6 +3004,92 @@ console.log('\n-- CLI Launcher Routing --');
   assert(dispatchStatus.ok === true, 'bin status --label returns dispatch status payload');
   assert(dispatchStatus.label === 'worker-schema', 'bin status --label preserves requested label');
   assert(dispatchStatus.status === 'done', 'bin status --label routes to dispatch label status');
+
+  rmSync(tempRoot, { recursive: true, force: true });
+}
+
+console.log('\n-- Installed Package DB Resolution --');
+{
+  const repoRoot = dirname(fileURLToPath(import.meta.url));
+  const repoDbPath = join(repoRoot, 'scheduler.db');
+  const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-installed-'));
+  const installDir = join(tempRoot, 'node_modules', 'openclaw-scheduler');
+  const homeDir = join(tempRoot, 'home');
+  const runtimeDbPath = join(homeDir, '.openclaw', 'scheduler', 'scheduler.db');
+
+  mkdirSync(join(tempRoot, 'node_modules'), { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  symlinkSync(repoRoot, installDir, 'dir');
+
+  const installedEnv = { ...process.env, HOME: homeDir };
+  delete installedEnv.SCHEDULER_DB;
+  const statusOut = JSON.parse(execFileSync(process.execPath, ['--preserve-symlinks', '--preserve-symlinks-main', join(installDir, 'cli.js'), 'status', '--json'], {
+    cwd: tempRoot,
+    env: installedEnv,
+    encoding: 'utf8',
+  }));
+  assert(statusOut.db_path === runtimeDbPath, 'installed package status resolves to scheduler home DB');
+  assert(statusOut.db_path !== repoDbPath, 'installed package status ignores repo-local scheduler.db');
+  assert(existsSync(runtimeDbPath), 'installed package status initializes runtime DB under scheduler home');
+
+  rmSync(tempRoot, { recursive: true, force: true });
+}
+
+console.log('\n-- Source CLI DB Mismatch Guard --');
+{
+  const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-db-guard-'));
+  const homeDir = join(tempRoot, 'home');
+  const runtimeDbPath = join(homeDir, '.openclaw', 'scheduler', 'scheduler.db');
+  const repoDbPath = join(dirname(fileURLToPath(import.meta.url)), 'scheduler.db');
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
+  const spec = JSON.stringify({
+    name: 'Guarded Validate',
+    schedule_cron: '0 10 * * *',
+    payload_message: 'noop',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300000,
+    origin: 'system',
+  });
+
+  mkdirSync(dirname(runtimeDbPath), { recursive: true });
+  new Database(runtimeDbPath).close();
+  const guardEnv = { ...process.env, HOME: homeDir };
+  delete guardEnv.SCHEDULER_DB;
+
+  let validateErr = null;
+  try {
+    execFileSync(process.execPath, [cliPath, 'jobs', 'validate', spec, '--json'], {
+      cwd: tempRoot,
+      env: guardEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    validateErr = err;
+  }
+  assert(validateErr?.status !== 0, 'source checkout jobs validate fails on repo/runtime DB mismatch');
+  const validateJson = JSON.parse(String(validateErr?.stdout || '{}'));
+  assert(validateJson.ok === false, 'source checkout mismatch returns structured JSON error');
+  assert(validateJson.error.includes('Refusing to run validation.'), 'source checkout mismatch explains validation refusal');
+  assert(validateJson.error.includes(repoDbPath), 'source checkout mismatch reports repo-local DB path');
+  assert(validateJson.error.includes(runtimeDbPath), 'source checkout mismatch reports runtime DB path');
+
+  let dryRunErr = null;
+  try {
+    execFileSync(process.execPath, [cliPath, 'jobs', 'add', spec, '--dry-run', '--json'], {
+      cwd: tempRoot,
+      env: guardEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    dryRunErr = err;
+  }
+  assert(dryRunErr?.status !== 0, 'source checkout dry-run add fails on repo/runtime DB mismatch');
+  const dryRunJson = JSON.parse(String(dryRunErr?.stdout || '{}'));
+  assert(dryRunJson.ok === false, 'source checkout dry-run mismatch returns structured JSON error');
+  assert(dryRunJson.error.includes('Refusing to run validation.'), 'source checkout dry-run mismatch reuses validation refusal');
 
   rmSync(tempRoot, { recursive: true, force: true });
 }
