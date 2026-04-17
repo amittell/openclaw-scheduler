@@ -19,7 +19,7 @@ import os from 'os';
 import { execSync } from 'child_process';
 
 import { fileURLToPath } from 'url';
-import { ensureSchedulerDbParent, resolveSchedulerDbPath } from './paths.js';
+import { ensureSchedulerDbParent, resolveSchedulerDbPath, resolveServiceWorkingDirectory } from './paths.js';
 import { createJob } from './jobs.js';
 import { initDb } from './db.js';
 
@@ -152,7 +152,8 @@ print();
 // --- Step 1: Paths ------------------------------------------------------------
 
 print('-- Step 1: Paths ---------------------------------------');
-const schedulerPath = __dirname;
+const schedulerInstallRoot = __dirname;
+const serviceWorkingDirectory = resolveServiceWorkingDirectory({ env: process.env, moduleDir: schedulerInstallRoot });
 const defaultWorkspace = path.join(os.homedir(), '.openclaw', 'workspace');
 const workspacePath = await ask('Workspace path', defaultWorkspace);
 const defaultGateway = 'http://127.0.0.1:18789';
@@ -162,10 +163,11 @@ const schedulerDbPath = resolveSchedulerDbPath({ env: process.env });
 if (schedulerDbPath !== ':memory:') ensureSchedulerDbParent(schedulerDbPath);
 
 print();
-print(`  Scheduler:  ${schedulerPath}`);
-print(`  Workspace:  ${workspacePath}`);
-print(`  Gateway:    ${gatewayUrl}`);
-print(`  Deliver to: ${deliverTo || '(none -- skipping job creation)'}`);
+print(`  Scheduler install root: ${schedulerInstallRoot}`);
+print(`  Service working dir:   ${serviceWorkingDirectory}`);
+print(`  Workspace:             ${workspacePath}`);
+print(`  Gateway:               ${gatewayUrl}`);
+print(`  Deliver to:            ${deliverTo || '(none -- skipping job creation)'}`);
 print();
 
 // --- Preflight: npm install behavior -----------------------------------------
@@ -193,9 +195,9 @@ print();
 
 print('-- Step 2: Database migrations -------------------------');
 try {
-  const { setDbPath } = await import(path.join(schedulerPath, 'db.js'));
+  const { setDbPath } = await import(path.join(schedulerInstallRoot, 'db.js'));
   setDbPath(schedulerDbPath);
-  const migrate = (await import(path.join(schedulerPath, 'migrate-consolidate.js'))).default;
+  const migrate = (await import(path.join(schedulerInstallRoot, 'migrate-consolidate.js'))).default;
   const ran = migrate();
   if (ran) {
     ok(`Migrations applied -> ${schedulerDbPath}`);
@@ -213,9 +215,9 @@ print();
 print('-- Step 3: Agent memory files --------------------------');
 
 const memoryMd = path.join(workspacePath, 'MEMORY.md');
-const memoryEntry = `- **Scheduler Queue Pattern:** Use \`node ${schedulerPath}/cli.js msg send <from> <to> "body"\` for signal-only queue entries.
-  Inbox Consumer (\`${schedulerPath}/scripts/inbox-consumer.mjs\`) drains pending queue messages to Telegram.
-  Stuck Run Detector (\`${schedulerPath}/scripts/stuck-run-detector.mjs\`) alerts on stale \`running\` runs.`;
+const memoryEntry = `- **Scheduler Queue Pattern:** Use \`node ${schedulerInstallRoot}/cli.js msg send <from> <to> "body"\` for signal-only queue entries.
+  Inbox Consumer (\`${schedulerInstallRoot}/scripts/inbox-consumer.mjs\`) drains pending queue messages to Telegram.
+  Stuck Run Detector (\`${schedulerInstallRoot}/scripts/stuck-run-detector.mjs\`) alerts on stale \`running\` runs.`;
 
 const memResult = appendIfMissing(memoryMd, 'Scheduler Queue Pattern', memoryEntry);
 if (memResult === true)       ok('Appended scheduler queue entry -> MEMORY.md');
@@ -228,10 +230,10 @@ const indexSection = `### Scheduler & Dispatch
 
 | File | Covers | Load |
 |------|--------|------|
-| \`${schedulerPath}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. launchd service: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
-| \`${schedulerPath}/cli.js\` | Queue + run operations: \`msg send\`, \`msg inbox\`, \`runs running\`, \`runs stale\`. | Day-to-day scheduler operations |
-| \`${schedulerPath}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
-| \`${schedulerPath}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
+| \`${schedulerInstallRoot}/\` | Standalone SQLite scheduler. CLI: \`node cli.js\`. launchd service: \`ai.openclaw.scheduler\`. | Any scheduler/cron work |
+| \`${schedulerInstallRoot}/cli.js\` | Queue + run operations: \`msg send\`, \`msg inbox\`, \`runs running\`, \`runs stale\`. | Day-to-day scheduler operations |
+| \`${schedulerInstallRoot}/scripts/inbox-consumer.mjs\` | Drains queue messages for one agent and delivers to Telegram. | Queue/inbox consumption |
+| \`${schedulerInstallRoot}/scripts/stuck-run-detector.mjs\` | Detects stale \`running\` runs and exits non-zero for alerts. | Run health monitoring |`;
 
 // Try inserting before a common section header, fall back to append.
 // NOTE: the link emoji anchors must match the actual markdown heading in
@@ -278,7 +280,7 @@ if (!deliverTo) {
     const existingNames = listJobs().map(r => r.name);
 
     // Inbox Consumer
-    const icScript = path.join(schedulerPath, 'scripts', 'inbox-consumer.mjs');
+    const icScript = path.join(schedulerInstallRoot, 'scripts', 'inbox-consumer.mjs');
     const icName = 'Inbox Consumer';
     if (existingNames.includes(icName)) {
       skip(`"${icName}" job already exists`);
@@ -304,7 +306,7 @@ if (!deliverTo) {
 
     // Stuck Run Detector
     const srdName = 'Stuck Run Detector';
-    const srdScript = path.join(schedulerPath, 'scripts', 'stuck-run-detector.mjs');
+    const srdScript = path.join(schedulerInstallRoot, 'scripts', 'stuck-run-detector.mjs');
     const srdCmd = `node ${srdScript} --threshold-min 45`;  // coding tasks regularly take 30m+
     if (existingNames.includes(srdName)) {
       skip(`"${srdName}" job already exists`);
@@ -338,7 +340,7 @@ print();
 
 const platform = process.platform;
 const nodePath  = process.execPath;
-const indexPath = path.join(schedulerPath, 'dispatcher.js');
+const indexPath = path.join(schedulerInstallRoot, 'dispatcher.js');
 const logPath   = platform === 'win32'
   ? path.join(os.tmpdir(), 'openclaw-scheduler.log')
   : '/tmp/openclaw-scheduler.log';
@@ -457,7 +459,7 @@ if (platform === 'darwin') {
     <string>${xmlEscape(indexPath)}</string>
   </array>
 ${userXml}  <key>WorkingDirectory</key>
-  <string>${xmlEscape(schedulerPath)}</string>
+  <string>${xmlEscape(serviceWorkingDirectory)}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
@@ -565,7 +567,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${schedulerPath}
+WorkingDirectory=${serviceWorkingDirectory}
 ExecStart=${nodePath} --no-warnings ${indexPath}
 Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}${gatewayToken ? `\nEnvironment="OPENCLAW_GATEWAY_TOKEN=${gatewayToken.replace(/"/g, '\\"')}"` : ''}
 Environment=SCHEDULER_DB=${schedulerDbPath}
@@ -612,7 +614,7 @@ WantedBy=default.target
       if (install) {
         try {
           execSync(
-            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${schedulerPath}" ` +
+            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${serviceWorkingDirectory}" ` +
             `--log "${logPath}"`,
             {
               stdio: 'inherit',
@@ -652,7 +654,7 @@ WantedBy=default.target
   print('  Setup steps:');
   print('  1. Install WSL2:  wsl --install  (in PowerShell as Admin)');
   print('  2. Open your WSL terminal and run this wizard again from there:');
-  print(`     cd ${schedulerPath.replace(/\\/g, '/')}`);
+  print(`     cd ${schedulerInstallRoot.replace(/\\/g, '/')}`);
   print('     node setup.mjs');
   print();
   print('  WSL2 with systemd enabled gives the best experience (auto-start on login).');

@@ -9,7 +9,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { setDbPath, initDb, closeDb, getDb } from './db.js';
-import { resolveSchedulerDbPath, resolveSchedulerHome } from './paths.js';
+import { resolveSchedulerDbPath, resolveSchedulerHome, resolveServiceWorkingDirectory } from './paths.js';
 import {
   createJob, getJob, listJobs, updateJob, deleteJob,
   getDueJobs, getDueAtJobs, hasRunningRun, nextRunFromCron,
@@ -159,20 +159,21 @@ assert(jobCols.includes('output_offload_threshold_bytes'), 'jobs.output_offload_
 
 // -- Paths ---------------------------------------------------
 console.log('\nPaths:');
-const fakeEnv = { HOME: '/home/tester' };
-assert(resolveSchedulerHome(fakeEnv) === '/home/tester/.openclaw/scheduler', 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
+const fakeHome = mkdtempSync(join(tmpdir(), 'scheduler-home-'));
+const fakeEnv = { HOME: fakeHome };
+assert(resolveSchedulerHome(fakeEnv) === join(fakeHome, '.openclaw', 'scheduler'), 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
 assert(
   resolveSchedulerDbPath({
     env: fakeEnv,
     moduleDir: '/home/tester/.openclaw/scheduler/node_modules/openclaw-scheduler'
-  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  }) === join(fakeHome, '.openclaw', 'scheduler', 'scheduler.db'),
   'npm installs default DB path to scheduler home, not node_modules'
 );
 assert(
   resolveSchedulerDbPath({
     env: fakeEnv,
     moduleDir: '/home/tester/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler'
-  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  }) === join(fakeHome, '.openclaw', 'scheduler', 'scheduler.db'),
   'installed package layout resolves DB path to scheduler home'
 );
 const writableSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-src-'));
@@ -181,6 +182,20 @@ assert(
   'writable source checkout defaults DB path to package directory'
 );
 rmSync(writableSourceDir, { recursive: true, force: true });
+assert(
+  resolveServiceWorkingDirectory({
+    env: fakeEnv,
+    moduleDir: '/home/tester/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler'
+  }) === join(fakeHome, '.openclaw', 'scheduler'),
+  'installed package layout resolves service cwd to scheduler home'
+);
+const serviceSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-service-src-'));
+assert(
+  resolveServiceWorkingDirectory({ env: fakeEnv, moduleDir: serviceSourceDir }) === serviceSourceDir,
+  'source checkout resolves service cwd to install root'
+);
+rmSync(serviceSourceDir, { recursive: true, force: true });
+rmSync(fakeHome, { recursive: true, force: true });
 
 // -- Prompt context -----------------------------------------
 console.log('\nPrompt Context:');

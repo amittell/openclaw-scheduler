@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, mkdirSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -23,6 +23,17 @@ function ensureWritableDir(dirPath) {
 
 function isNodeModulesInstall(moduleDir) {
   return /[\\/]node_modules[\\/](?:@[^\\/]+[\\/])?openclaw-scheduler(?:[\\/]|$)/.test(moduleDir);
+}
+
+function isUsableWorkingDirectory(dirPath) {
+  const candidate = firstNonEmpty(dirPath);
+  if (!candidate) return false;
+  try {
+    accessSync(candidate, constants.R_OK | constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function resolveSchedulerHome(env = process.env) {
@@ -60,6 +71,37 @@ export function resolveBackupStagingDir(env = process.env) {
   const explicit = firstNonEmpty(env.SCHEDULER_BACKUP_STAGING_DIR);
   if (explicit) return explicit;
   return join(resolveSchedulerHome(env), '.backup-staging');
+}
+
+export function resolveServiceWorkingDirectory(params = {}) {
+  const env = params.env || process.env;
+  const explicitPath = firstNonEmpty(params.explicitPath);
+  if (explicitPath) {
+    try {
+      mkdirSync(explicitPath, { recursive: true });
+      if (isUsableWorkingDirectory(explicitPath)) return explicitPath;
+    } catch {
+      // Fall through to install-root/scheduler-home heuristics.
+    }
+  }
+
+  const moduleDir = firstNonEmpty(params.moduleDir) || __dirname;
+  if (!isNodeModulesInstall(moduleDir) && isUsableWorkingDirectory(moduleDir)) {
+    return moduleDir;
+  }
+
+  const schedulerHome = resolveSchedulerHome(env);
+  try {
+    mkdirSync(schedulerHome, { recursive: true });
+    if (isUsableWorkingDirectory(schedulerHome)) return schedulerHome;
+  } catch {
+    // Fall through to other safe directories.
+  }
+
+  const home = firstNonEmpty(env.HOME) || homedir();
+  if (isUsableWorkingDirectory(home)) return home;
+
+  return tmpdir();
 }
 
 export function resolveArtifactsDir(params = {}) {
