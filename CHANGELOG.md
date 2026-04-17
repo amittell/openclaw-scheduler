@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] -- 2026-04-16
+
+### Fixed
+- fix(cli): harden runtime DB path resolution so installed package layouts prefer `~/.openclaw/scheduler/scheduler.db` instead of a repo-local checkout DB
+- fix(cli): refuse validation-only commands (`jobs validate`, `jobs add --dry-run`) when a source checkout detects an existing runtime DB mismatch
+- test(cli): add installed-package and repo/runtime mismatch coverage for DB path hardening
+
+### Changed
+- docs: bump minimum supported Node.js version from 20 to 22 to match the package engine requirement
+
 ## [0.2.2] -- 2026-04-15
 
 ### Fixed
