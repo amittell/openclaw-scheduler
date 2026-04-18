@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
   "main": "./index.js",
@@ -37,6 +37,7 @@
   "files": [
     "bin",
     "dispatch/529-recovery.mjs",
+    "dispatch/completion.mjs",
     "dispatch/config.example.json",
     "dispatch/deliver-watcher.sh",
     "dispatch/hooks.mjs",

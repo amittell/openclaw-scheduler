@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] -- 2026-04-18
+
+### Fixed
+- fix(package): include dispatch/completion.mjs in the published npm tarball so dispatch CLI and watcher startup no longer crash with ERR_MODULE_NOT_FOUND in installed deployments
+
 ## [0.2.3] -- 2026-04-16
 
 ### Fixed
