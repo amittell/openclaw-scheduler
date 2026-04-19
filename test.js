@@ -5830,7 +5830,7 @@ console.log('\n-- Completion payload helpers --');
     completion: synthesized,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(resolvedReply.deliveryText === 'Implemented deterministic completion delivery and pushed the fix.', 'completion helper: explicit prose reply wins over synthesized metadata');
+  assert(resolvedReply.deliveryText === 'Work complete. Tests passed. Pushed deadbee.', 'completion helper: structured completion metadata stays authoritative over transcript reply');
 
   const resolvedSynth = resolveCompletionDelivery({
     lastReply: null,

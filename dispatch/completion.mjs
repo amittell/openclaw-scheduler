@@ -101,15 +101,6 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const completionDelivery = normalizeCompletionText(completion?.deliveryText);
   const fallback = normalizeCompletionText(fallbackSummary);
   const preferredSummary = completionSummary || fallback;
-  const meaningfulSummary = [completionSummary, fallback].find(isMeaningfulCompletionText) || null;
-
-  if (isMeaningfulCompletionText(reply)) {
-    return {
-      deliveryText: reply,
-      summary: preferredSummary || reply.slice(0, 500),
-      source: 'lastReply',
-    };
-  }
 
   if (isMeaningfulCompletionText(completionDelivery)) {
     return {
@@ -119,11 +110,27 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  if (meaningfulSummary) {
+  if (isMeaningfulCompletionText(completionSummary)) {
     return {
-      deliveryText: meaningfulSummary,
-      summary: meaningfulSummary,
-      source: completionSummary && meaningfulSummary === completionSummary ? 'completion-summary' : 'summary',
+      deliveryText: completionSummary,
+      summary: completionSummary,
+      source: 'completion-summary',
+    };
+  }
+
+  if (isMeaningfulCompletionText(reply)) {
+    return {
+      deliveryText: reply,
+      summary: preferredSummary || reply.slice(0, 500),
+      source: 'lastReply',
+    };
+  }
+
+  if (isMeaningfulCompletionText(fallback)) {
+    return {
+      deliveryText: fallback,
+      summary: fallback,
+      source: 'summary',
     };
   }
 
