@@ -54,6 +54,7 @@ import {
 } from './dispatcher-utils.js';
 import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
+import { parseLaunchctlPrint, evaluateInboxWatcherHealth } from './scripts/inbox-watcher-guardrail.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
 import { buildTerminalCompletionPayload, resolveCompletionDelivery } from './dispatch/completion.mjs';
 import {
@@ -312,6 +313,68 @@ assert(healthAlert.issues.some(issue => issue.startsWith('pending_update_count='
 assert(healthAlert.recommendation.includes('drop_pending_updates=true'), 'webhook health recommends drop pending repair');
 assert(chooseRepairWebhookUrl({ url: 'https://current.example/hook' }, 'https://expected.example/hook') === 'https://expected.example/hook', 'repair prefers expected webhook url over current');
 assert(chooseRepairWebhookUrl({ url: '' }, 'https://expected.example/hook') === 'https://expected.example/hook', 'repair falls back to expected webhook url');
+
+console.log('\nInbox Watcher Guardrail:');
+const parsedLaunchctl = parseLaunchctlPrint(`gui/501/com.openclaw.inbox-watcher = {\n\tstate = running\n\tpid = 32865\n\truns = 4\n\tlast terminating signal = Terminated: 15\n}`);
+assert(parsedLaunchctl.state === 'running', 'launchctl parser extracts state');
+assert(parsedLaunchctl.pid === 32865, 'launchctl parser extracts pid');
+assert(parsedLaunchctl.runs === 4, 'launchctl parser extracts runs');
+
+const nowMs = Date.now();
+const guardrailOk = evaluateInboxWatcherHealth({
+  launchctl: { exists: true, state: 'running', pid: 111, runs: 2 },
+  plist: { exists: true, scriptPath: '/tmp/inbox-consumer.mjs', scriptExists: true },
+  queue: { pendingCount: 0, oldestAgeSec: 0 },
+  previousObservation: {
+    observedAt: new Date(nowMs - 120_000).toISOString(),
+    launchctl: { runs: 1 },
+  },
+  nowMs,
+  ageThresholdSec: 600,
+  countThreshold: 10,
+  crashLoopWindowSec: 900,
+  crashLoopRunsThreshold: 3,
+});
+assert(guardrailOk.status === 'OK', 'inbox watcher guardrail reports OK when watcher and queue are healthy');
+assert(guardrailOk.shouldKickstart === false, 'healthy inbox watcher does not request kickstart');
+
+const guardrailAlert = evaluateInboxWatcherHealth({
+  launchctl: { exists: true, state: 'waiting', pid: null, runs: 8 },
+  plist: { exists: true, scriptPath: '/missing/inbox-consumer.mjs', scriptExists: false },
+  queue: { pendingCount: 14, oldestAgeSec: 1200 },
+  previousObservation: {
+    observedAt: new Date(nowMs - 180_000).toISOString(),
+    launchctl: { runs: 3 },
+  },
+  nowMs,
+  ageThresholdSec: 600,
+  countThreshold: 10,
+  crashLoopWindowSec: 900,
+  crashLoopRunsThreshold: 3,
+});
+assert(guardrailAlert.status === 'ALERT', 'inbox watcher guardrail alerts on broken delivery path');
+assert(guardrailAlert.issueCodes.includes('plist_script_missing'), 'guardrail flags missing script path target');
+assert(guardrailAlert.issueCodes.includes('watcher_not_running'), 'guardrail flags non-running watcher');
+assert(guardrailAlert.issueCodes.includes('watcher_crash_loop'), 'guardrail flags crash loop from launchctl run count deltas');
+assert(guardrailAlert.issueCodes.includes('queue_piling'), 'guardrail flags queue buildup');
+assert(guardrailAlert.issueCodes.includes('queue_stale'), 'guardrail flags stale pending queue');
+assert(guardrailAlert.shouldKickstart === false, 'guardrail skips kickstart when launch agent script path is missing');
+
+const guardrailRecoverable = evaluateInboxWatcherHealth({
+  launchctl: { exists: true, state: 'running', pid: 222, runs: 5 },
+  plist: { exists: true, scriptPath: '/tmp/inbox-consumer.mjs', scriptExists: true },
+  queue: { pendingCount: 12, oldestAgeSec: 900 },
+  previousObservation: {
+    observedAt: new Date(nowMs - 120_000).toISOString(),
+    launchctl: { runs: 5 },
+  },
+  nowMs,
+  ageThresholdSec: 600,
+  countThreshold: 10,
+  crashLoopWindowSec: 900,
+  crashLoopRunsThreshold: 3,
+});
+assert(guardrailRecoverable.shouldKickstart === true, 'guardrail requests kickstart for recoverable queue stalls');
 
 let webhookCheckFailed = false;
 try {
