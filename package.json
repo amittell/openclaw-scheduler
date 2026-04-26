@@ -42,6 +42,7 @@
     "dispatch/deliver-watcher.sh",
     "dispatch/hooks.mjs",
     "dispatch/index.mjs",
+    "dispatch/message-input.mjs",
     "dispatch/README.md",
     "dispatch/watcher.mjs",
     "scripts/dispatch-cli-utils.mjs",

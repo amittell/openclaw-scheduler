@@ -68,12 +68,21 @@ node dispatch/index.mjs enqueue \
   --deliver-to YOUR_CHAT_ID     \
   --deliver-channel telegram        \
   --delivery-mode announce
+
+# Literal-safe prompt input for shell-sensitive text:
+cat prompt.md | node dispatch/index.mjs enqueue \
+  --label "ticket-43" \
+  --message-stdin \
+  --delivery-mode none
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--label` | required | Human name — used for lookup/reuse |
-| `--message` | required | Prompt sent to the agent |
+| `--message` | required* | Prompt sent to the agent |
+| `--message-file` | — | Read prompt text from a file. Use `-` to read from stdin. Safer than inline shell quoting for prompts with backticks, quotes, or markdown. |
+| `--message-env` | — | Read prompt text from an environment variable. |
+| `--message-stdin` | — | Read prompt text from stdin explicitly. If stdin is piped and no explicit source is set, dispatch auto-reads stdin. |
 | `--mode` | `fresh` | `fresh` = new session; `reuse` = continue last session for this label |
 | `--session-key` | — | Explicit session key (bypasses ledger lookup) |
 | `--agent` | `main` | Agent ID |
@@ -88,6 +97,8 @@ node dispatch/index.mjs enqueue \
 | `--monitor-interval` | -- | Watcher cron expression |
 | `--monitor-timeout` | -- | Watcher timeout in minutes |
 | `--verify-cmd` | -- | Post-completion verification command |
+
+*One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
 
 ### `status` — session status for a label
 
@@ -151,6 +162,10 @@ Notes:
 node dispatch/index.mjs send \
   --label "ticket-42" \
   --message "Tests still failing on line 42, focus on the edge case"
+
+cat <<'EOF' | node dispatch/index.mjs send --label "ticket-42" --message-stdin
+Use literal `code`, quotes, and $(examples) safely
+EOF
 ```
 
 Sends a message directly into the running session. The agent sees it as a new

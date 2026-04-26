@@ -34,6 +34,7 @@ import { homedir } from 'os';
 import Database from 'better-sqlite3';
 import { buildTerminalCompletionPayload, hasCompletionSignal } from './completion.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
+import { resolveMessageInput } from './message-input.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
@@ -735,7 +736,11 @@ function makeSessionKey(agentId) {
  *
  * Flags:
  *   --label <string>         Required. Human-readable name
- *   --message <string>       Required. Prompt sent to the agent
+ *   --message <string>       Prompt sent to the agent
+ *   --message-file <path>    Read prompt text from a file (`-` = stdin)
+ *   --message-env <VAR>      Read prompt text from an environment variable
+ *   --message-stdin          Read prompt text from stdin explicitly
+ *                            (stdin is also auto-read when piped and no other message source is set)
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
@@ -754,18 +759,23 @@ function makeSessionKey(agentId) {
  *   --model <string>         Model override (e.g. anthropic/claude-sonnet-4-6)
  */
 async function cmdEnqueue(flags) {
-  const label   = flags.label;
-  let   message = flags.message;
+  const label = flags.label;
   if (!label) die('--label is required', 2);
-  // Support --message-file for multiline prompts without shell escaping issues
-  if (!message && flags['message-file']) {
-    try {
-      message = readFileSync(flags['message-file'], 'utf-8').trim();
-    } catch (err) {
-      die(`--message-file: could not read file: ${err.message}`, 2);
-    }
+
+  let message = null;
+  try {
+    message = await resolveMessageInput({
+      message: flags.message,
+      messageFile: flags['message-file'],
+      messageEnv: flags['message-env'],
+      messageStdin: flags['message-stdin'],
+    });
+  } catch (err) {
+    die(err.message, 2);
   }
-  if (!message) die('--message or --message-file is required', 2);
+  if (message === null || message.length === 0) {
+    die('--message, --message-file, --message-env, --message-stdin, or piped stdin is required', 2);
+  }
 
   const agent       = flags.agent            || 'main';
   const thinking    = flags.thinking         || null;
@@ -1964,16 +1974,31 @@ async function cmdDone(flags) {
  * send / steer -- send a message into a running session.
  *
  * Flags:
- *   --label <string>     Required (unless --session-key)
- *   --message <string>   Required. Message to send
- *   --session-key <key>  Optional. Direct session key (bypasses label lookup)
+ *   --label <string>      Required (unless --session-key)
+ *   --message <string>    Message to send
+ *   --message-file <path> Read message text from a file (`-` = stdin)
+ *   --message-env <VAR>   Read message text from an environment variable
+ *   --message-stdin       Read message text from stdin explicitly
+ *                         (stdin is also auto-read when piped and no other message source is set)
+ *   --session-key <key>   Optional. Direct session key (bypasses label lookup)
  */
 async function cmdSend(flags) {
-  const label     = flags.label;
-  const message   = flags.message;
+  const label = flags.label;
   const directKey = flags['session-key'];
+  let message = null;
 
-  if (!message) die('--message is required', 2);
+  try {
+    message = await resolveMessageInput({
+      message: flags.message,
+      messageFile: flags['message-file'],
+      messageEnv: flags['message-env'],
+      messageStdin: flags['message-stdin'],
+    });
+  } catch (err) {
+    die(err.message, 2);
+  }
+
+  if (message === null || message.length === 0) die('--message, --message-file, --message-env, --message-stdin, or piped stdin is required', 2);
   if (!label && !directKey) die('--label or --session-key is required', 2);
 
   let sessionKey = directKey;
@@ -2098,14 +2123,15 @@ ${BRAND} -- sub-agent dispatch CLI (native gateway API)
 Usage: openclaw-scheduler <subcommand> [flags]
 
 Subcommands:
-  enqueue  --label <l> --message <m>|--message-file <f> [--agent <a>] [--thinking <t>]
-           [--timeout <s>] [--mode fresh|reuse] [--model <m>]
+  enqueue  --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
+           [--agent <a>] [--thinking <t>] [--timeout <s>] [--mode fresh|reuse] [--model <m>]
            [--origin <o>]  (recommended explicit value, e.g. "telegram:<chat_id>" or "system")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
            (--deliver-to should come from inbound metadata chat_id; explicit --deliver-to becomes origin when --origin is omitted)
            (active-session auto-detect is preserved only as a manual/local fallback)
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
            [--verify-cmd <shell_cmd>]
+           (stdin is auto-read when piped and no explicit message source is set)
 
   status   --label <l>
 
@@ -2115,9 +2141,11 @@ Subcommands:
 
   watcher-handoff --label <l> [--reason <text>]
 
-  send     --label <l> --message <m> [--session-key <k>]
+  send     --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
+           [--session-key <k>]
 
-  steer    --label <l> --message <m>  (alias for send)
+  steer    --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
+           (alias for send)
 
   heartbeat --label <l>  OR  --session-key <k>
 

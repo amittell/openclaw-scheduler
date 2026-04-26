@@ -1746,6 +1746,12 @@ openclaw-scheduler enqueue \
 # Fallback (if openclaw-scheduler is not in PATH):
 node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
   --label "fix-deploy-script" --message "..." --deliver-to YOUR_CHAT_ID
+
+# Literal-safe prompt input when the text contains shell metacharacters:
+cat prompt.md | openclaw-scheduler enqueue \
+  --label "fix-deploy-script" \
+  --message-stdin \
+  --deliver-to YOUR_CHAT_ID
 ```
 
 For normal chat-triggered dispatches, always pass `--deliver-to` from the inbound metadata `chat_id`. If you omit `--origin`, dispatch now derives it from that explicit delivery target instead of guessing from whichever session was active most recently. The old active-session lookup is kept only as a manual/local fallback when both values are absent.
@@ -1756,7 +1762,9 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 |------|---------|-------------|
 | `--label` | required | Human-readable name for the session. Used for status lookups, reuse, and watchdog tracking. |
 | `--message` | required* | Prompt sent to the agent. |
-| `--message-file` | -- | Path to a file whose contents are used as the prompt. Alternative to `--message`; avoids shell-escaping issues with long prompts. |
+| `--message-file` | -- | Path to a file whose contents are used as the prompt. Use `-` to read from stdin. Safer than inline shell quoting for prompts with backticks, quotes, or markdown. |
+| `--message-env` | -- | Environment variable name whose value is used as the prompt. Useful when the prompt contains shell-significant characters. |
+| `--message-stdin` | -- | Read the prompt from stdin explicitly. If stdin is piped and no explicit prompt source is set, dispatch auto-reads stdin. |
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
 | `--model` | -- | Model override, e.g. `anthropic/claude-sonnet-4-6`. |
@@ -1766,7 +1774,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
 | `--no-monitor` | -- | Disable watchdog registration for this dispatch. |
 
-*Either `--message` or `--message-file` is required.
+*One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
 
 ### Subcommand Reference
 
