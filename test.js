@@ -8482,11 +8482,13 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
       ],
       {
         encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env,
           HOME: tmpBase,
           DISPATCH_LABELS_PATH: labelsPath,
           PATH: `${binDir}:${process.env.PATH || ''}`,
+          OPENCLAW_GATEWAY_TOKEN: '',
         },
       }
     );
@@ -8568,6 +8570,213 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
 }
 
 // ============================================================
+// SECTION: literal-safe prompt input for dispatch
+// ============================================================
+
+console.log('\n-- dispatch/index.mjs literal-safe prompt input --');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath = join(dispatchDir, 'index.mjs');
+
+  function runDispatchWithStub({ subcommand, args = [], env = {}, input } = {}) {
+    const tmpBase = mkdtempSync(join(tmpdir(), 'dispatch-msgsafe-'));
+    const labelsPath = join(tmpBase, 'labels.json');
+    const binDir = join(tmpBase, 'bin');
+    const callsPath = join(tmpBase, 'openclaw-calls.jsonl');
+    const openclawPath = join(binDir, 'openclaw');
+    const sessionsDir = join(tmpBase, '.openclaw', 'agents', 'main', 'sessions');
+    const sessionKey = 'agent:main:subagent:literal-safe-test';
+
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(labelsPath, JSON.stringify({}) + '\n');
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId: 'session-literal-safe-test',
+        updatedAt: Date.now(),
+        totalTokens: 1,
+      },
+    }) + '\n');
+
+    const stubSource = [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      'const args = process.argv.slice(2);',
+      "const paramsIdx = args.indexOf('--params');",
+      "const method = args[0] === 'gateway' && args[1] === 'call' ? args[2] : null;",
+      "const params = paramsIdx >= 0 ? JSON.parse(args[paramsIdx + 1]) : null;",
+      `const callsPath = ${JSON.stringify(callsPath)};`,
+      "fs.appendFileSync(callsPath, JSON.stringify({ args, method, params }) + '\\n');",
+      "if (method === 'agent') {",
+      "  process.stdout.write(JSON.stringify({ ok: true, runId: 'run-test' }));",
+      '} else {',
+      "  process.stdout.write('{}');",
+      '}',
+      '',
+    ].join('\n');
+    writeFileSync(openclawPath, stubSource);
+    chmodSync(openclawPath, 0o755);
+
+    const effectiveArgs = subcommand === 'enqueue' && !args.includes('--session-key')
+      ? [...args, '--session-key', sessionKey]
+      : args;
+
+    const run = spawnSync(
+      process.execPath,
+      [indexPath, subcommand, ...effectiveArgs],
+      {
+        encoding: 'utf8',
+        ...(input === undefined ? { stdio: ['ignore', 'pipe', 'pipe'] } : {}),
+        input,
+        env: {
+          ...process.env,
+          HOME: tmpBase,
+          DISPATCH_LABELS_PATH: labelsPath,
+          PATH: `${binDir}:${process.env.PATH || ''}`,
+          OPENCLAW_GATEWAY_TOKEN: '',
+          ...env,
+        },
+        timeout: 30_000,
+      }
+    );
+
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    let calls = [];
+    try {
+      calls = readFileSync(callsPath, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => JSON.parse(line));
+    } catch {}
+
+    const agentCall = calls.find(call => call.method === 'agent')?.params || null;
+    rmSync(tmpBase, { recursive: true, force: true });
+    return { ...run, labels, calls, agentCall };
+  }
+
+  const sideEffectDir = mkdtempSync(join(tmpdir(), 'dispatch-msgsafe-sideeffects-'));
+  try {
+    const markerBacktick = join(sideEffectDir, 'backtick-ran');
+    const markerDollar = join(sideEffectDir, 'dollar-ran');
+    const hazardPayload = [
+      `Literal backticks: \`touch ${markerBacktick}\``,
+      `Single quote: ' and double quote: " and parens: (keep me literal)`,
+      `Command substitution: $(touch ${markerDollar})`,
+      'Inline code: `npm test && git push` should stay literal.',
+    ].join('\n');
+
+    {
+      const result = runDispatchWithStub({
+        subcommand: 'enqueue',
+        args: [
+          '--label', 'literal-env',
+          '--message-env', 'PROMPT_PAYLOAD',
+          '--origin', 'system',
+          '--timeout', '300',
+          '--delivery-mode', 'none',
+          '--no-monitor',
+        ],
+        env: { PROMPT_PAYLOAD: hazardPayload },
+      });
+      assert(result.status === 0, 'dispatch prompt safety: enqueue accepts --message-env');
+      assert(result.agentCall?.message?.includes(hazardPayload), 'dispatch prompt safety: --message-env payload is embedded literally in the gateway task');
+      assert(result.labels['literal-env']?.taskPrompt === hazardPayload, 'dispatch prompt safety: --message-env payload stored literally');
+      assert(!existsSync(markerBacktick), 'dispatch prompt safety: --message-env does not execute backticks');
+      assert(!existsSync(markerDollar), 'dispatch prompt safety: --message-env does not execute command substitution');
+    }
+
+    {
+      const promptFile = join(sideEffectDir, 'literal-prompt.md');
+      const filePayload = hazardPayload + '\n';
+      writeFileSync(promptFile, filePayload);
+      const result = runDispatchWithStub({
+        subcommand: 'enqueue',
+        args: [
+          '--label', 'literal-file',
+          '--message-file', promptFile,
+          '--origin', 'system',
+          '--timeout', '300',
+          '--delivery-mode', 'none',
+          '--no-monitor',
+        ],
+      });
+      assert(result.status === 0, 'dispatch prompt safety: enqueue accepts --message-file');
+      assert(result.agentCall?.message?.includes(filePayload), 'dispatch prompt safety: --message-file preserves file contents literally inside the gateway task');
+      assert(result.labels['literal-file']?.taskPrompt === filePayload, 'dispatch prompt safety: --message-file stores payload without trimming');
+    }
+
+    {
+      const result = runDispatchWithStub({
+        subcommand: 'enqueue',
+        args: [
+          '--label', 'literal-stdin',
+          '--message-stdin',
+          '--origin', 'system',
+          '--timeout', '300',
+          '--delivery-mode', 'none',
+          '--no-monitor',
+        ],
+        input: hazardPayload,
+      });
+      assert(result.status === 0, 'dispatch prompt safety: enqueue accepts --message-stdin');
+      assert(result.agentCall?.message?.includes(hazardPayload), 'dispatch prompt safety: --message-stdin preserves stdin payload literally inside the gateway task');
+    }
+
+    {
+      const result = runDispatchWithStub({
+        subcommand: 'enqueue',
+        args: [
+          '--label', 'literal-auto-stdin',
+          '--origin', 'system',
+          '--timeout', '300',
+          '--delivery-mode', 'none',
+          '--no-monitor',
+        ],
+        input: hazardPayload,
+      });
+      assert(result.status === 0, 'dispatch prompt safety: enqueue auto-reads piped stdin');
+      assert(result.agentCall?.message?.includes(hazardPayload), 'dispatch prompt safety: auto-read stdin preserves payload literally inside the gateway task');
+    }
+
+    {
+      const result = runDispatchWithStub({
+        subcommand: 'send',
+        args: [
+          '--session-key', 'agent:main:subagent:test',
+          '--message-env', 'PROMPT_PAYLOAD',
+        ],
+        env: { PROMPT_PAYLOAD: hazardPayload },
+      });
+      assert(result.status === 0, 'dispatch prompt safety: send accepts --message-env');
+      assert(result.agentCall?.message === hazardPayload, 'dispatch prompt safety: send preserves literal env payload');
+      assert(!existsSync(markerBacktick), 'dispatch prompt safety: send does not execute backticks');
+      assert(!existsSync(markerDollar), 'dispatch prompt safety: send does not execute command substitution');
+    }
+
+    {
+      const result = runDispatchWithStub({
+        subcommand: 'enqueue',
+        args: [
+          '--label', 'literal-conflict',
+          '--message', 'inline',
+          '--message-env', 'PROMPT_PAYLOAD',
+          '--origin', 'system',
+          '--timeout', '300',
+          '--delivery-mode', 'none',
+          '--no-monitor',
+        ],
+        env: { PROMPT_PAYLOAD: hazardPayload },
+      });
+      assert(result.status === 2, 'dispatch prompt safety: conflicting prompt sources are rejected');
+      assert(result.stderr.includes('choose only one of --message, --message-env'), 'dispatch prompt safety: conflict error names both prompt sources');
+    }
+  } finally {
+    rmSync(sideEffectDir, { recursive: true, force: true });
+  }
+}
+
+// ============================================================
 // SECTION: getActiveOriginFromSessions group-preference tiebreaker
 // ============================================================
 
@@ -8615,11 +8824,13 @@ console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
       ],
       {
         encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env,
           HOME: tmpBase,
           DISPATCH_LABELS_PATH: labelsPath,
           PATH: `${binDir}:${process.env.PATH || ''}`,
+          OPENCLAW_GATEWAY_TOKEN: '',
         },
         timeout: 15_000,
       }
