@@ -5,6 +5,7 @@ const MAX_LIST_ITEMS = 3;
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)[.!?]*$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
 const INTERNAL_DONE_PAYLOAD_RE = /"message"\s*:\s*"Label marked done via agent signal\."|"status"\s*:\s*"done"/i;
+const INTERNAL_DONE_MESSAGE_RE = /^label marked done via agent signal\.[!?]*$/i;
 const INTERNAL_TRANSPORT_PREFIX_RE = /^auto-resolved(?:\s+as\s+[a-z-]+)?\s*:/i;
 const INTERNAL_TRANSPORT_PATTERNS = [
   /^session not found in gateway store[.!?]*$/i,
@@ -22,8 +23,10 @@ export function normalizeCompletionText(value) {
   return trimmed ? trimmed : null;
 }
 
+const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+
 function stripAnsi(text) {
-  return text.replace(/\u001b\[[0-9;]*m/g, '');
+  return text.replace(ANSI_ESCAPE_RE, '');
 }
 
 export function isInternalTransportNoiseText(value) {
@@ -34,6 +37,7 @@ export function isInternalTransportNoiseText(value) {
   if (!normalized) return false;
   if (INTERNAL_TRANSPORT_PREFIX_RE.test(normalized)) return true;
   if (INTERNAL_DONE_PAYLOAD_RE.test(normalized)) return true;
+  if (INTERNAL_DONE_MESSAGE_RE.test(normalized)) return true;
 
   return INTERNAL_TRANSPORT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
@@ -139,7 +143,7 @@ function prepareLines(text) {
     .filter(Boolean)
     .filter(line => !/^```/.test(line))
     .filter(line => !/^[`~=_-]{3,}$/.test(line))
-    .filter(line => !/^[{}\[\],]+$/.test(line))
+    .filter(line => ![...line].every(char => '{}[],'.includes(char)))
     .filter(line => !STACK_TRACE_LINE_RE.test(line));
 }
 
@@ -178,7 +182,7 @@ function looksLikeRawPayloadText(text) {
   if (!normalized) return false;
   if (INTERNAL_DONE_PAYLOAD_RE.test(normalized)) return true;
   if (isInternalTransportNoiseText(normalized)) return true;
-  return (/^[\[{]/.test(normalized) && RAW_PAYLOAD_MARKERS_RE.test(normalized));
+  return (/^[[{]/.test(normalized) && RAW_PAYLOAD_MARKERS_RE.test(normalized));
 }
 
 function looksLikeGunbrokerReport(text) {
@@ -190,7 +194,7 @@ function looksLikeGunbrokerReport(text) {
 function parseGunbrokerItem(line) {
   const normalized = normalizeCompletionText(line);
   if (!normalized) return null;
-  const match = normalized.match(/^#(\d+)(?:\s+\S+)?\s*\|\s*([+\-]\d+%)\s*[—-]\s*\$?([\d,]+)\s*\(([^)]*)\)/);
+  const match = normalized.match(/^#(\d+)(?:\s+\S+)?\s*\|\s*([+-]\d+%)\s*[—-]\s*\$?([\d,]+)\s*\(([^)]*)\)/);
   if (!match) return shortenFragment(normalized, 100);
   const [, rank, edge, price, context] = match;
   return `#${rank} ${edge} at $${price} (${context.trim()})`;
@@ -459,8 +463,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     checklist: completion?.checklist,
     sha: completion?.sha,
   });
-
+  const completionDeliverySource = normalizeCompletionText(completion?.debug?.deliverySource);
   const preferredSummary = completionSummaryHuman || completionSummary || fallback || synthesizedFromTechnical || null;
+  const authoritativeStructuredSummary = completionDeliverySource && completionDeliverySource !== 'technical-synthesis'
+    ? preferredSummary
+    : null;
   const noisyTexts = [
     rawReply,
     rawCompletionSummaryHuman,
@@ -468,35 +475,33 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     rawCompletionSummary,
     rawFallback,
   ].filter(isInternalTransportNoiseText);
-  const isDeliverableText = (rawText, summarizedText) => Boolean(summarizedText) && !isInternalTransportNoiseText(rawText ?? summarizedText);
+  const isDeliverableText = (rawText, summarizedText) => Boolean(summarizedText)
+    && !isInternalTransportNoiseText(summarizedText)
+    && (!rawText || !isInternalTransportNoiseText(rawText) || looksLikeRawPayloadText(rawText));
   const structuredCandidates = [
     {
       rawText: rawCompletionSummaryHuman,
       text: completionSummaryHuman,
       summary: completionSummaryHuman,
-      source: 'summary_human',
+      source: completionDeliverySource === 'technical-synthesis' ? 'technical-synthesis' : 'summary_human',
     },
     {
       rawText: rawCompletionSummary,
       text: completionSummary,
       summary: completionSummary,
-      source: 'completion-summary',
+      source: completionDeliverySource === 'technical-synthesis' && completionSummary === synthesizedFromTechnical
+        ? 'technical-synthesis'
+        : 'completion-summary',
     },
     {
       rawText: rawCompletionDelivery,
       text: completionDelivery,
       summary: completionSummaryHuman || completionSummary || completionDelivery,
-      source: completion?.debug?.deliverySource || 'completion-legacy',
-    },
-    {
-      rawText: synthesizedFromTechnical,
-      text: synthesizedFromTechnical,
-      summary: synthesizedFromTechnical,
-      source: 'technical-synthesis',
+      source: completionDeliverySource || 'completion-legacy',
     },
   ];
 
-  for (const candidate of structuredCandidates) {
+  for (const candidate of structuredCandidates.filter(candidate => candidate.source !== 'technical-synthesis')) {
     if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
     return {
       deliveryText: candidate.text,
@@ -508,8 +513,25 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   if (isDeliverableText(rawReply, reply)) {
     return {
       deliveryText: reply,
-      summary: preferredSummary || reply,
+      summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
+    };
+  }
+
+  if (isDeliverableText(synthesizedFromTechnical, synthesizedFromTechnical)) {
+    return {
+      deliveryText: synthesizedFromTechnical,
+      summary: synthesizedFromTechnical,
+      source: 'technical-synthesis',
+    };
+  }
+
+  for (const candidate of structuredCandidates.filter(candidate => candidate.source === 'technical-synthesis')) {
+    if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
+    return {
+      deliveryText: candidate.text,
+      summary: candidate.summary || candidate.text,
+      source: candidate.source,
     };
   }
 
@@ -532,7 +554,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   return {
     deliveryText: null,
-    summary: preferredSummary || completionDelivery || reply || null,
+    summary: authoritativeStructuredSummary || preferredSummary || completionDelivery || reply || null,
     source: 'none',
   };
 }

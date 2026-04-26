@@ -5395,7 +5395,7 @@ if (sub === 'status') {
       resultReads: handoffState.resultReads,
     }, null, 2));
 
-    let resumedStdout = '';
+    let resumedStdout;
     let resumedExitCode = 0;
     try {
       resumedStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '5', '--poll-interval', '1', '--idle-threshold', '1'], {
@@ -8518,7 +8518,7 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
     assert(result.status === 0, 'explicit delivery: enqueue succeeds');
     assert(result.agentCall?.replyTo === '-5240776892', 'explicit delivery: gateway replyTo pinned to explicit group target');
     assert(result.agentCall?.replyChannel === 'telegram', 'explicit delivery: gateway replyChannel defaults to telegram');
-    assert(result.agentCall?.deliver === true, 'explicit delivery: gateway deliver flag stays enabled');
+    assert(result.agentCall?.deliver === false, 'explicit delivery: gateway keeps direct gateway delivery disabled');
     assert(result.labels['explicit-group-contract']?.deliverTo === '-5240776892', 'explicit delivery: label stores explicit deliverTo');
     assert(result.labels['explicit-group-contract']?.origin === 'telegram:-5240776892', 'explicit delivery: origin derives from explicit deliver target when omitted');
     assert(!result.stderr.includes('auto-detected origin from active session'), 'explicit delivery: no ambient auto-detect when deliver-to is explicit');

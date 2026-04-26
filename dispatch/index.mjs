@@ -664,7 +664,7 @@ function disarmWatchdog(label) {
 
 
 function quoteForSingleQuotedShell(value) {
-  return String(value).replace(/'/g, "'\''");
+  return String(value).replace(/'/g, "'\"'\"'");
 }
 
 /**
