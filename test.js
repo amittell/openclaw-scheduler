@@ -6208,6 +6208,36 @@ console.log('\n-- Completion payload helpers --');
   assert(summaryFallback.source === 'completion-summary', 'completion helper: summary field is used when summary_human is absent');
   assert(summaryFallback.deliveryText === 'Summary field still renders when summary_human is absent.', 'completion helper: summary field remains deliverable without summary_human');
 
+  const alreadyHumanTechnical = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary: 'Updated the completion watcher so structured summaries survive handoff and users now get one clean final report.',
+      checklist: { work_complete: true },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(alreadyHumanTechnical.deliveryText === 'Updated the completion watcher so structured summaries survive handoff and users now get one clean final report.', 'completion helper: already-human technical summary passes through unchanged');
+  assert(!alreadyHumanTechnical.deliveryText.includes('Technical details:'), 'completion helper: already-human technical summary does not grow a technical footer');
+
+  const technicalCommitSummary = 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary';
+  const humanizedTechnicalPayload = buildTerminalCompletionPayload({
+    summary: technicalCommitSummary,
+    checklist: { work_complete: true, tests_passed: true, pushed: true },
+    sha: helperSha,
+  });
+  assert(humanizedTechnicalPayload.summary_human && humanizedTechnicalPayload.summary_human.includes('final completion message'), 'completion helper: technical commit-style summary is humanized for delivery');
+  assert(!humanizedTechnicalPayload.summary_human.includes('fix(dispatch):'), 'completion helper: humanized summary does not leak commit-style prefix');
+  assert(humanizedTechnicalPayload.details_technical?.raw_summary === technicalCommitSummary, 'completion helper: technical raw summary is preserved in details');
+
+  const humanizedTechnicalDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: humanizedTechnicalPayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Technical details:'), 'completion helper: humanized technical summary keeps concise technical details underneath');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes(technicalCommitSummary), 'completion helper: technical details retain the original technical summary');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Checks: tests passed; pushed deadbee.'), 'completion helper: technical details preserve structured verification metadata');
+
   const rawPayloadReply = resolveCompletionDelivery({
     lastReply: JSON.stringify({
       ok: true,
@@ -8125,6 +8155,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist,
     sha,
     expectedDeliveryText,
+    expectedTechnicalDetailsText,
     unexpectedDeliveryText,
     expectEnqueued,
   }) {
@@ -8204,6 +8235,10 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one post-office message`);
       const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
       assert(msg.body.includes(expectedDeliveryText), `dispatch completion ${slug}: queued post-office message contains completion text`);
+      if (expectedTechnicalDetailsText) {
+        assert(stdout.includes(expectedTechnicalDetailsText), `dispatch completion ${slug}: watcher stdout includes concise technical details`);
+        assert(msg.body.includes(expectedTechnicalDetailsText), `dispatch completion ${slug}: queued post-office message includes concise technical details`);
+      }
       if (unexpectedDeliveryText) {
         assert(!msg.body.includes(unexpectedDeliveryText), `dispatch completion ${slug}: queued post-office message suppresses internal transport status text`);
       }
@@ -8234,6 +8269,16 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
     expectedDeliveryText: `Work complete. Tests passed. Pushed ${repoSha.slice(0, 7)}.`,
+    expectEnqueued: true,
+  });
+
+  await runDispatchCompletionDeliveryCase({
+    slug: 'technical-humanized',
+    summary: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
+    checklist: { work_complete: true, tests_passed: true, pushed: true },
+    sha: repoSha,
+    expectedDeliveryText: 'Cleaned up how the final completion message is delivered and kept the structured summary.',
+    expectedTechnicalDetailsText: 'Technical details: fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     expectEnqueued: true,
   });
 

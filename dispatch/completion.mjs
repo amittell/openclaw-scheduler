@@ -16,6 +16,22 @@ const INTERNAL_TRANSPORT_PATTERNS = [
 ];
 const RAW_PAYLOAD_MARKERS_RE = /"(?:ok|status|label|sessionKey|idempotencyKey|deliveryText|summary|message|checklist|stdout|stderr|tool|args|result|content)"\s*:/i;
 const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
+const TECHNICAL_COMMIT_PREFIX_RE = /^(?:fix|feat|feature|chore|refactor|perf|docs|test|tests|build|ci|style|revert|hotfix)(?:\([^)]+\))?!?:\s*/i;
+const FILE_CONTEXT_PREFIX_RE = /^(?:(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)):\s*/i;
+const CODEISH_MARKER_RE = /(?:`[^`]+`|--[a-z0-9-]+|\b[A-Z_]{3,}\b|\b[a-z0-9_]+\(\)|\b[a-z]+[A-Z][A-Za-z0-9_]+\b|\b(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\b|\b[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)\b)/;
+const HUMAN_CUE_RE = /\b(?:now|so that|so\b|because|this\b|future runs?|expect|easier|readable|reliable|cleaner|people|users?|operators?|chat|helps?|lets?|allows?|prevents?|stops?|keeps?|avoids?)\b/i;
+const TECHNICAL_KEYWORDS = [
+  'api', 'artifact', 'assert', 'build', 'checklist', 'cli', 'commit', 'completion', 'config', 'context',
+  'cron', 'db', 'delivery', 'dispatch', 'gateway', 'guard', 'hook', 'json', 'job', 'label', 'lint',
+  'message', 'metadata', 'notify', 'output', 'path', 'payload', 'pipeline', 'post-office', 'queue', 'raw',
+  'regex', 'report', 'retry', 'scheduler', 'session', 'sha', 'shell', 'spec', 'sql', 'stderr', 'stdout',
+  'structured', 'summary', 'sync', 'test', 'tests', 'tool', 'transcript', 'transport', 'typecheck', 'watcher',
+  'webhook', 'workflow'
+];
+const TECHNICAL_KEYWORD_RE = new RegExp(`\\b(?:${TECHNICAL_KEYWORDS.join('|')})\\b`, 'gi');
+const TECHNICAL_SIGNAL_RE = /\b(?:human(?:-|\s)?readable|summary|summaries|completion|deliver(?:y|ed)?|notification|message|report|chat|duplicate|double-delivery|single final|user-facing)\b/i;
+const RELIABILITY_SIGNAL_RE = /\b(?:fix|guard|retry|timeout|error|fail|stuck|prevent|avoid|dedupe|deduplicat|preserve|ensure|handle|recover|reliab)\b/i;
+const TEST_FRAGMENT_RE = /\b(?:test|tests|spec|coverage|lint|typecheck|tsc|eslint|oxlint|assert(?:ion)?s?)\b/i;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -177,6 +193,16 @@ function shortenFragment(text, maxChars = 110) {
   return truncateText(cleaned, maxChars);
 }
 
+function lowerFirst(text) {
+  if (!text) return text;
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
+function upperFirst(text) {
+  if (!text) return text;
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 function looksLikeRawPayloadText(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return false;
@@ -277,6 +303,309 @@ function summarizeProse(text) {
 
   if (!kept.length) return truncateText(normalized, MAX_DELIVERY_CHARS);
   return kept.join(' ');
+}
+
+function countTechnicalKeywordHits(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return 0;
+  const matches = cleanMarkdown(normalized).match(TECHNICAL_KEYWORD_RE) || [];
+  return new Set(matches.map(match => match.toLowerCase())).size;
+}
+
+function looksTechnicalCompletionSummary(rawText, summarizedText = null) {
+  const raw = normalizeCompletionText(rawText);
+  if (!raw) return false;
+
+  const cleaned = cleanMarkdown(raw).replace(/\s+/g, ' ').trim();
+  if (!cleaned) return false;
+
+  const hasDelimiter = /[;|]/.test(cleaned) || /\n[-*#]/.test(raw);
+  const hardTechnical = TECHNICAL_COMMIT_PREFIX_RE.test(cleaned)
+    || FILE_CONTEXT_PREFIX_RE.test(cleaned)
+    || CODEISH_MARKER_RE.test(cleaned)
+    || hasDelimiter;
+
+  let technicalScore = 0;
+  if (TECHNICAL_COMMIT_PREFIX_RE.test(cleaned)) technicalScore += 3;
+  if (FILE_CONTEXT_PREFIX_RE.test(cleaned)) technicalScore += 3;
+  if (CODEISH_MARKER_RE.test(cleaned)) technicalScore += 2;
+  if (hasDelimiter) technicalScore += 1;
+  technicalScore += Math.min(2, countTechnicalKeywordHits(cleaned));
+  if (/\b(?:summary_human|deliveryText|details_technical|sessionKey|idempotencyKey)\b/.test(cleaned)) {
+    technicalScore += 2;
+  }
+
+  let humanScore = 0;
+  if (HUMAN_CUE_RE.test(cleaned)) humanScore += 2;
+  if (/\b(?:people|users?|operators?)\b/i.test(cleaned)) humanScore += 1;
+  if (/\b(?:now|because|so that|helps?|prevents?|avoids?|keeps?|lets?|allows?)\b/i.test(cleaned)) humanScore += 1;
+  if (summarizedText && summarizeProse(summarizedText) && !TECHNICAL_COMMIT_PREFIX_RE.test(cleaned) && !FILE_CONTEXT_PREFIX_RE.test(cleaned)) {
+    humanScore += 1;
+  }
+
+  if (!hardTechnical) {
+    return technicalScore >= 5 && technicalScore > humanScore + 2;
+  }
+
+  return technicalScore >= 3 && technicalScore > humanScore + 1;
+}
+
+function replaceTechnicalPhrases(text) {
+  if (!text) return text;
+  return text
+    .replace(/\bsummary_human\b/gi, 'human summary')
+    .replace(/\bsummaryHuman\b/g, 'human summary')
+    .replace(/\bdeliveryText\b/g, 'delivery text')
+    .replace(/\bdetails_technical\b/gi, 'technical details')
+    .replace(/\bresolveCompletionDelivery\b/g, 'completion delivery logic')
+    .replace(/\bbuildTerminalCompletionPayload\b/g, 'completion payload builder')
+    .replace(/\bstructured completion summary\b/gi, 'the structured summary')
+    .replace(/\bstructured completion\b(?!\s+summary)\b/gi, 'structured completion data')
+    .replace(/\bcompletion delivery\b/gi, 'how the final completion message is delivered')
+    .replace(/\bdelivery path\b/gi, 'delivery flow')
+    .replace(/\bwatcher path\b/gi, 'completion watcher flow')
+    .replace(/\bwatcher\b/gi, 'completion watcher')
+    .replace(/\bstdout\b/gi, 'command output')
+    .replace(/\bstderr\b/gi, 'error output')
+    .replace(/\bpayload\b/gi, 'result payload')
+    .replace(/\braw transcript\b/gi, 'raw completion text')
+    .replace(/\bdouble[- ]delivery\b/gi, 'duplicate completion messages')
+    .replace(/\bsingle final user-facing completion\b/gi, 'one final completion message')
+    .replace(/\bsummary fallback\b/gi, 'fallback summary');
+}
+
+function humanizeCamelToken(token) {
+  if (!/[a-z][A-Z]/.test(token) && !token.includes('_')) return token;
+  return token
+    .replace(/_/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase();
+}
+
+function cleanTechnicalFragment(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  let cleaned = cleanMarkdown(normalized)
+    .replace(TECHNICAL_COMMIT_PREFIX_RE, '')
+    .replace(FILE_CONTEXT_PREFIX_RE, '')
+    .replace(/\b(?:[A-Za-z0-9_.-]+\/)+([A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml))\b/g, '$1')
+    .replace(/\b([a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*)\b/g, (_, token) => humanizeCamelToken(token))
+    .replace(/\(\)/g, '')
+    .replace(/^[:\-–—]+\s*/, '')
+    .replace(/^and\s+/i, '')
+    .replace(/^then\s+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  cleaned = replaceTechnicalPhrases(cleaned)
+    .replace(/\s+,/g, ',')
+    .replace(/\s+\./g, '.')
+    .replace(/[;,:]+$/g, '')
+    .trim();
+
+  return cleaned || null;
+}
+
+function isTestOrValidationFragment(fragment) {
+  const cleaned = normalizeCompletionText(fragment);
+  if (!cleaned) return false;
+  return TEST_FRAGMENT_RE.test(cleaned)
+    && !/\b(?:human(?:-|\s)?readable|summary|summaries|message|report|chat|duplicate|user-facing)\b/i.test(cleaned);
+}
+
+function toPastTenseFragment(fragment) {
+  let text = cleanTechnicalFragment(fragment);
+  if (!text) return null;
+
+  const rewrites = [
+    [/^clean up\b/i, 'cleaned up'],
+    [/^normalize\b/i, 'cleaned up'],
+    [/^humani[sz]e\b/i, 'made more readable'],
+    [/^rewrite\b/i, 'reworked'],
+    [/^refactor\b/i, 'refined'],
+    [/^fix\b/i, 'fixed'],
+    [/^update\b/i, 'updated'],
+    [/^adjust\b/i, 'adjusted'],
+    [/^change\b/i, 'updated'],
+    [/^improve\b/i, 'improved'],
+    [/^add\b/i, 'added'],
+    [/^introduce\b/i, 'introduced'],
+    [/^enable\b/i, 'enabled'],
+    [/^support\b/i, 'supported'],
+    [/^preserve\b/i, 'kept'],
+    [/^keep\b/i, 'kept'],
+    [/^retain\b/i, 'retained'],
+    [/^prevent\b/i, 'prevented'],
+    [/^avoid\b/i, 'avoided'],
+    [/^stop\b/i, 'stopped'],
+    [/^pass through\b/i, 'passed through'],
+    [/^leave\b/i, 'left'],
+    [/^prefer\b/i, 'preferred'],
+    [/^wire\b/i, 'wired up'],
+    [/^route\b/i, 'routed'],
+    [/^surface\b/i, 'surfaced'],
+    [/^append\b/i, 'appended'],
+    [/^format\b/i, 'formatted'],
+    [/^teach\b/i, 'taught'],
+    [/^ensure\b/i, 'ensured'],
+    [/^dedupe\b/i, 'deduplicated'],
+  ];
+
+  for (const [pattern, replacement] of rewrites) {
+    if (pattern.test(text)) {
+      text = text.replace(pattern, replacement);
+      break;
+    }
+  }
+
+  text = text.replace(/\s+/g, ' ').trim();
+  return text ? upperFirst(text) : null;
+}
+
+function extractTechnicalFragments(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return [];
+
+  const fragments = prepareLines(normalized)
+    .flatMap(line => line.split(/\s*;\s*|\s+\|\s+|\s+&&\s+|\s+->\s+|\s+=>\s+/))
+    .map(fragment => fragment.trim())
+    .filter(Boolean);
+
+  return fragments.map(cleanTechnicalFragment).filter(Boolean);
+}
+
+function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
+  const cleanedRaw = normalizeCompletionText(rawText);
+  const fallback = normalizeCompletionText(fallbackSummary);
+  if (!cleanedRaw) return fallback;
+
+  const fragments = extractTechnicalFragments(cleanedRaw);
+  const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
+  const chosen = (primaryFragments.length > 0 ? primaryFragments : fragments)
+    .slice(0, 2)
+    .map(fragment => toPastTenseFragment(fragment))
+    .filter(Boolean);
+
+  let actionSummary = fallback;
+  if (chosen.length === 1) {
+    actionSummary = asSentence(chosen[0]);
+  } else if (chosen.length >= 2) {
+    actionSummary = `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
+  }
+
+  const normalizedRaw = cleanMarkdown(cleanedRaw).toLowerCase();
+  const extras = [];
+  if (TECHNICAL_SIGNAL_RE.test(normalizedRaw)) {
+    if (/\b(?:duplicate|duplicate completion messages|one final completion message)\b/.test(normalizedRaw)) {
+      extras.push('That keeps the final result easier to read and avoids duplicate completion messages.');
+      extras.push('Future runs should now send one clean completion message automatically.');
+    } else if (/\b(?:structured|context|preserve|kept)\b/.test(normalizedRaw)) {
+      extras.push('That keeps the useful context attached to the final result.');
+      extras.push('Future runs should now deliver the cleaner version automatically.');
+    } else {
+      extras.push('That makes the final result easier to read in chat.');
+      extras.push('Future runs should now deliver the cleaner version automatically.');
+    }
+  } else if (RELIABILITY_SIGNAL_RE.test(normalizedRaw)) {
+    extras.push('That should make the workflow more reliable.');
+    if (/\b(?:job|run|scheduler|dispatch|session|watcher)\b/.test(normalizedRaw)) {
+      extras.push('Future runs should be less likely to fail the same way.');
+    }
+  }
+
+  return truncateText([actionSummary, ...extras].filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
+}
+
+export function humanizeCompletionText(value) {
+  const raw = normalizeCompletionText(value);
+  if (!raw) return null;
+
+  const summarized = summarizeCompletionText(raw);
+  if (!summarized) return null;
+  if (!looksTechnicalCompletionSummary(raw, summarized)) return summarized;
+
+  return buildHumanizedTechnicalSummary(raw, summarized) || summarized;
+}
+
+function summarizeChecklistTechnicalDetails(checklist, sha) {
+  const normalizedChecklist = cloneChecklist(checklist);
+  if (!normalizedChecklist) return null;
+
+  const parts = [];
+  if (normalizedChecklist.tests_passed === true) parts.push('tests passed');
+  if (normalizedChecklist.pushed === true) {
+    const short = shortSha(sha);
+    parts.push(short ? `pushed ${short}` : 'changes pushed');
+  } else if (sha) {
+    parts.push(`commit ${shortSha(sha)}`);
+  }
+
+  const extraTrueFlags = Object.entries(normalizedChecklist)
+    .filter(([key, flagValue]) => flagValue === true && !['work_complete', 'tests_passed', 'pushed'].includes(key))
+    .map(([key]) => key.replace(/_/g, ' '));
+
+  if (extraTrueFlags.length > 0) {
+    parts.push(`checks: ${extraTrueFlags.slice(0, 3).join(', ')}`);
+  }
+
+  return parts.length > 0 ? `Checks: ${parts.join('; ')}.` : null;
+}
+
+function buildTechnicalDetailsText({ rawText, summaryText, completion } = {}) {
+  const raw = normalizeCompletionText(rawText);
+  const summary = normalizeCompletionText(summaryText);
+  const details = getCompletionTechnicalDetails(completion);
+  const parts = [];
+
+  const rawTechnical = raw && looksTechnicalCompletionSummary(raw, summary) && raw !== summary;
+  if (rawTechnical) {
+    parts.push(truncateText(cleanMarkdown(raw).replace(/\s+/g, ' ').trim(), 260));
+  }
+
+  let completionDetailsAreTechnical = false;
+  if (typeof details === 'string') {
+    const normalized = normalizeCompletionText(details);
+    completionDetailsAreTechnical = Boolean(normalized && looksTechnicalCompletionSummary(normalized, summary));
+    if (normalized
+      && !isInternalTransportNoiseText(normalized)
+      && (completionDetailsAreTechnical || rawTechnical)
+      && (!rawTechnical || normalized !== raw)) {
+      parts.push(truncateText(normalized, 220));
+    }
+  } else if (details && typeof details === 'object') {
+    const rawSummary = normalizeCompletionText(details.raw_summary);
+    completionDetailsAreTechnical = Boolean(rawSummary && looksTechnicalCompletionSummary(rawSummary, summary));
+    if (rawSummary
+      && !isInternalTransportNoiseText(rawSummary)
+      && (completionDetailsAreTechnical || rawTechnical)
+      && (!rawTechnical || rawSummary !== raw)) {
+      parts.push(truncateText(cleanMarkdown(rawSummary).replace(/\s+/g, ' ').trim(), 220));
+    }
+  }
+
+  const checklistDetails = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
+  if (checklistDetails && (rawTechnical || completionDetailsAreTechnical)) parts.push(checklistDetails);
+
+  const unique = [];
+  const seen = new Set();
+  for (const part of parts) {
+    const normalized = normalizeCompletionText(part);
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(normalized);
+  }
+
+  return unique.length > 0 ? unique.join(' ') : null;
+}
+
+function composeDeliveryText(summaryText, technicalDetailsText = null) {
+  const summary = normalizeCompletionText(summaryText);
+  if (!summary) return null;
+  const technical = normalizeCompletionText(technicalDetailsText);
+  return technical ? `${summary}\n\nTechnical details: ${technical}` : summary;
 }
 
 export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {
@@ -414,7 +743,7 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
   const rawSummary = normalizeCompletionText(summary);
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
-  const normalizedSummary = summarizeCompletionText(rawSummary);
+  const normalizedSummary = humanizeCompletionText(rawSummary);
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
@@ -454,11 +783,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const rawCompletionDelivery = normalizeCompletionText(completion?.deliveryText);
   const rawFallback = normalizeCompletionText(fallbackSummary);
 
-  const reply = summarizeCompletionText(lastReply);
-  const completionSummaryHuman = summarizeCompletionText(rawCompletionSummaryHuman);
-  const completionSummary = summarizeCompletionText(completion?.summary);
-  const completionDelivery = summarizeCompletionText(completion?.deliveryText);
-  const fallback = summarizeCompletionText(fallbackSummary);
+  const reply = humanizeCompletionText(lastReply);
+  const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman);
+  const completionSummary = humanizeCompletionText(completion?.summary);
+  const completionDelivery = humanizeCompletionText(completion?.deliveryText);
+  const fallback = humanizeCompletionText(fallbackSummary);
   const synthesizedFromTechnical = synthesizeCompletionReply({
     checklist: completion?.checklist,
     sha: completion?.sha,
@@ -503,16 +832,26 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   for (const candidate of structuredCandidates.filter(candidate => candidate.source !== 'technical-synthesis')) {
     if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
+    const technicalDetailsText = buildTechnicalDetailsText({
+      rawText: candidate.rawText,
+      summaryText: candidate.text,
+      completion,
+    });
     return {
-      deliveryText: candidate.text,
+      deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
       summary: candidate.summary || candidate.text,
       source: candidate.source,
     };
   }
 
   if (isDeliverableText(rawReply, reply)) {
+    const technicalDetailsText = buildTechnicalDetailsText({
+      rawText: rawReply,
+      summaryText: reply,
+      completion,
+    });
     return {
-      deliveryText: reply,
+      deliveryText: composeDeliveryText(reply, technicalDetailsText),
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
     };
@@ -528,8 +867,13 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   for (const candidate of structuredCandidates.filter(candidate => candidate.source === 'technical-synthesis')) {
     if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
+    const technicalDetailsText = buildTechnicalDetailsText({
+      rawText: candidate.rawText,
+      summaryText: candidate.text,
+      completion,
+    });
     return {
-      deliveryText: candidate.text,
+      deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
       summary: candidate.summary || candidate.text,
       source: candidate.source,
     };
