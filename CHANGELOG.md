@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] -- 2026-04-27
+
+### Fixed
+- fix(dispatch): make completion prompts task-aware so `dispatch done` no longer implies `tests_passed:true` / `pushed:true` for tasks that explicitly should not push or do not require tests
+- fix(dispatch): recover completion text conservatively from terminal assistant turns instead of treating arbitrary mid-task chatter as the final delivery payload
+- fix(watcher): surface real missed-`done` final reports as interrupted diagnostics instead of silently timing out without useful delivery context
+- fix(dispatch): prefer structured, human-readable completion summaries and suppress generic/internal completion noise in announce flows
+- fix(dispatch): preserve embedded completion summaries, prefer explicit delivery targets for origin detection, and normalize dispatched completion delivery behavior
+- fix(dispatch): harden literal-safe prompt input handling and watcher SIGTERM handoff during delivery/recovery paths
+
+### Added
+- feat(dispatch): prefer structured human completion summaries in dispatch delivery flows
+- feat(dispatch): add inbox watcher delivery guardrail to catch broken packaged-layout consumer wiring earlier
+
 ## [0.2.4] -- 2026-04-18
 
 ### Fixed
