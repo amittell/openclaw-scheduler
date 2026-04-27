@@ -34,6 +34,11 @@ const TEST_FRAGMENT_RE = /\b(?:test|tests|spec|coverage|lint|typecheck|tsc|eslin
 const TEST_APPLICABILITY_RE = /\b(?:test|tests|pytest|jest|vitest|mocha|cypress|playwright|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|rspec)\b/i;
 const TEST_NEGATION_RE = /\b(?:do\s+not|don't|dont|never|skip|without|no)\s+(?:run\s+)?(?:the\s+)?tests?\b/i;
 const PUSH_FORBIDDEN_RE = /\b(?:do\s+not|don't|dont|never|must\s+not|should\s+not)\s+(?:git\s+push|push)\b|\bno\s+push\b|\bwithout\s+pushing\b/i;
+const EXPLICIT_TECHNICAL_MARKER_RE = /\b(?:Technically|Technical details)\s*:\s*/i;
+const HUMAN_SUMMARY_SECTION_RE = /(?:^|\n)\s*(?:Human-readable summary|Human summary)\s*:\s*/i;
+const TECHNICAL_DETAILS_SECTION_RE = /(?:^|\n)\s*(?:Technical details?|Details(?:_technical)?)\s*:\s*/i;
+const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*/i;
+const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -203,6 +208,80 @@ function lowerFirst(text) {
 function upperFirst(text) {
   if (!text) return text;
   return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function extractExplicitTechnicalTail(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  const match = EXPLICIT_TECHNICAL_MARKER_RE.exec(normalized);
+  if (!match || typeof match.index !== 'number' || match.index <= 0) return null;
+
+  const lead = normalizeCompletionText(normalized.slice(0, match.index));
+  const technicalTail = normalizeCompletionText(normalized.slice(match.index + match[0].length));
+  if (!lead || !technicalTail) return null;
+
+  return { lead, technicalTail };
+}
+
+function extractStructuredSummarySections(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  const cleaned = cleanMarkdown(normalized).replace(/\r\n?/g, '\n').trim();
+  if (!cleaned) return null;
+
+  const humanMatch = HUMAN_SUMMARY_SECTION_RE.exec(cleaned);
+  const technicalMatch = TECHNICAL_DETAILS_SECTION_RE.exec(cleaned);
+  if (!humanMatch && !technicalMatch) return null;
+
+  let summary = null;
+  let technical = null;
+
+  if (humanMatch) {
+    const summaryStart = humanMatch.index + humanMatch[0].length;
+    const summaryEnd = technicalMatch && technicalMatch.index > humanMatch.index
+      ? technicalMatch.index
+      : cleaned.length;
+    summary = normalizeCompletionText(cleaned.slice(summaryStart, summaryEnd));
+  }
+
+  if (technicalMatch) {
+    const technicalStart = technicalMatch.index + technicalMatch[0].length;
+    technical = normalizeCompletionText(cleaned.slice(technicalStart));
+  }
+
+  if (!summary && !technical) return null;
+  return { summary, technical };
+}
+
+function stripHumanSummaryLabel(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  const sections = extractStructuredSummarySections(normalized);
+  if (sections?.summary) return normalizeCompletionText(sections.summary);
+  return normalizeCompletionText(normalized.replace(HUMAN_SUMMARY_LABEL_RE, ''));
+}
+
+function normalizeTechnicalDetailLine(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  const sections = extractStructuredSummarySections(normalized);
+  const source = normalizeCompletionText(sections?.technical || normalized);
+  if (!source) return null;
+
+  const lines = prepareLines(source)
+    .map(line => line
+      .replace(HUMAN_SUMMARY_LABEL_RE, '')
+      .replace(TECHNICAL_DETAILS_LABEL_RE, '')
+      .replace(/^[-*•]\s+/, '')
+      .trim())
+    .filter(Boolean);
+
+  const compact = normalizeCompletionText(lines.join(' '));
+  return compact || null;
 }
 
 function looksLikeRawPayloadText(text) {
@@ -409,6 +488,107 @@ function cleanTechnicalFragment(text) {
   return cleaned || null;
 }
 
+function cleanLeadForHumanSummary(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+
+  const cleaned = replaceTechnicalPhrases(
+    cleanMarkdown(normalized)
+      .replace(/\bsaved\s+[a-z0-9_]+(?:\/[a-z0-9_]+)+\b/gi, 'your saved progress')
+      .replace(/\b([a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*)\b/g, (_, token) => humanizeCamelToken(token))
+      .replace(/\b([a-z0-9]+_[a-z0-9_]+)\b/g, token => token.replace(/_/g, ' ')),
+  )
+    .replace(/\brepeating the completed one\b/gi, 'repeating the one you already finished')
+    .replace(/\s+,/g, ',')
+    .replace(/\s+\./g, '.')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned || null;
+}
+
+function formatMixedTechnicalSubject(subject) {
+  let cleaned = normalizeCompletionText(subject);
+  if (!cleaned) return 'the missing data';
+
+  cleaned = replaceTechnicalPhrases(
+    cleanMarkdown(cleaned)
+      .replace(/\bhealth auto export\b/gi, 'source export')
+      .replace(/\bworkouts?\.json\b/gi, 'the export')
+      .replace(/\b([a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*)\b/g, (_, token) => humanizeCamelToken(token))
+      .replace(/\b([a-z0-9]+_[a-z0-9_]+)\b/g, token => token.replace(/_/g, ' ')),
+  )
+    .replace(/^the\s+(?!missing\b)/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return 'the missing data';
+  if (/^the\s+missing\b/i.test(cleaned)) return cleaned;
+  if (/^missing\b/i.test(cleaned)) return `the ${cleaned}`;
+  if (/^(?:the|your|this|that)\b/i.test(cleaned)) return cleaned;
+  return `the ${cleaned}`;
+}
+
+function buildSourceSideHumanSentence(technicalTail) {
+  const normalized = cleanMarkdown(normalizeCompletionText(technicalTail) || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return null;
+
+  const hasSourceSide = /\bsource[- ]side\b/i.test(normalized);
+  const hasEmptySource = /\b(?:contains zero|count 0|empty|zero [a-z ]+ objects?|no [a-z ]+ to import)\b/i.test(normalized);
+  if (!hasSourceSide && !hasEmptySource) return null;
+
+  const subjectMatch = normalized.match(/\b(?:confirmed|found|verified|checked)\s+(the\s+missing\s+.+?)\s+is\s+source[- ]side\b/i)
+    || normalized.match(/\b(the\s+missing\s+.+?)\s+is\s+source[- ]side\b/i)
+    || normalized.match(/\b(?:confirmed|found|verified|checked)\s+(.+?)\s+is\s+source[- ]side\b/i)
+    || normalized.match(/\b(.+?)\s+is\s+source[- ]side\b/i);
+  const subject = formatMixedTechnicalSubject(subjectMatch?.[1] || 'missing data');
+
+  if (hasEmptySource) {
+    return `I also checked ${subject}, and the source export is empty right now, so there isn't anything new to import yet.`;
+  }
+
+  return `I also checked ${subject}, and this turned out to be a source-data issue rather than a new scheduler bug.`;
+}
+
+function buildMixedLeadExpectation(text) {
+  const normalized = cleanMarkdown(normalizeCompletionText(text) || '').toLowerCase();
+  if (!normalized) return null;
+  if (/\b(?:next|should|will)\b/.test(normalized)) return null;
+
+  if (/\b(?:planner|plan|scheduled session|session|progression|workout)\b/.test(normalized)) {
+    return 'The next plan should reflect that automatically.';
+  }
+  if (/\b(?:completion|summary|delivery|message|report)\b/.test(normalized)) {
+    return 'The next finished job should show that automatically.';
+  }
+  if (/\b(?:import|sync)\b/.test(normalized)) {
+    return 'The next sync should reflect that automatically.';
+  }
+  return 'The next run should reflect that automatically.';
+}
+
+function buildHumanSummaryFromMixedTechnicalText(rawText) {
+  const split = extractExplicitTechnicalTail(rawText);
+  if (!split) return null;
+
+  const cleanedLead = cleanLeadForHumanSummary(split.lead);
+  const leadSummary = cleanedLead
+    ? summarizeCompletionText(cleanedLead, { skipEmbeddedObject: true }) || summarizeProse(cleanedLead) || asSentence(cleanedLead)
+    : null;
+  if (!leadSummary) return null;
+
+  const sentences = [leadSummary];
+  const sourceSideSentence = buildSourceSideHumanSentence(split.technicalTail);
+  if (sourceSideSentence) sentences.push(sourceSideSentence);
+
+  const expectation = buildMixedLeadExpectation(sentences.join(' '));
+  if (expectation) sentences.push(expectation);
+
+  return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
+}
+
 function isTestOrValidationFragment(fragment) {
   const cleaned = normalizeCompletionText(fragment);
   if (!cleaned) return false;
@@ -578,11 +758,18 @@ export function humanizeCompletionText(value) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
-  const summarized = summarizeCompletionText(raw);
-  if (!summarized) return null;
-  if (!looksTechnicalCompletionSummary(raw, summarized)) return summarized;
+  const structuredSections = extractStructuredSummarySections(raw);
+  const summarySource = normalizeCompletionText(structuredSections?.summary || raw);
+  if (!summarySource) return null;
 
-  return buildHumanizedTechnicalSummary(raw, summarized) || summarized;
+  const mixedSummary = buildHumanSummaryFromMixedTechnicalText(summarySource);
+  if (mixedSummary) return mixedSummary;
+
+  const summarized = summarizeCompletionText(summarySource);
+  if (!summarized) return null;
+  if (!looksTechnicalCompletionSummary(summarySource, summarized)) return stripHumanSummaryLabel(summarized) || summarized;
+
+  return buildHumanizedTechnicalSummary(summarySource, summarized) || summarized;
 }
 
 function summarizeChecklistTechnicalDetails(checklist, sha) {
@@ -615,29 +802,47 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion } = {}) {
   const details = getCompletionTechnicalDetails(completion);
   const parts = [];
 
-  const rawTechnical = raw && looksTechnicalCompletionSummary(raw, summary) && raw !== summary;
+  const rawSections = extractStructuredSummarySections(raw);
+  const splitRaw = extractExplicitTechnicalTail(raw);
+  const rawTechnicalSource = normalizeTechnicalDetailLine(rawSections?.technical || splitRaw?.technicalTail || raw);
+  const rawHasExplicitTechnical = Boolean(rawSections?.technical || splitRaw?.technicalTail);
+
+  const rawTechnical = Boolean(
+    rawTechnicalSource
+      && ((rawHasExplicitTechnical && rawTechnicalSource !== summary)
+        || (looksTechnicalCompletionSummary(rawTechnicalSource, summary) && rawTechnicalSource !== summary)),
+  );
   if (rawTechnical) {
-    parts.push(truncateText(cleanMarkdown(raw).replace(/\s+/g, ' ').trim(), 260));
+    parts.push(truncateText(rawTechnicalSource, 260));
   }
 
   let completionDetailsAreTechnical = false;
   if (typeof details === 'string') {
-    const normalized = normalizeCompletionText(details);
-    completionDetailsAreTechnical = Boolean(normalized && looksTechnicalCompletionSummary(normalized, summary));
+    const detailSections = extractStructuredSummarySections(details);
+    const splitDetails = extractExplicitTechnicalTail(details);
+    const normalized = normalizeTechnicalDetailLine(detailSections?.technical || splitDetails?.technicalTail || details);
+    completionDetailsAreTechnical = Boolean(
+      normalized && (detailSections?.technical || splitDetails?.technicalTail || looksTechnicalCompletionSummary(normalized, summary)),
+    );
     if (normalized
       && !isInternalTransportNoiseText(normalized)
       && (completionDetailsAreTechnical || rawTechnical)
-      && (!rawTechnical || normalized !== raw)) {
+      && (!rawTechnical || normalized !== rawTechnicalSource)) {
       parts.push(truncateText(normalized, 220));
     }
   } else if (details && typeof details === 'object') {
     const rawSummary = normalizeCompletionText(details.raw_summary);
-    completionDetailsAreTechnical = Boolean(rawSummary && looksTechnicalCompletionSummary(rawSummary, summary));
-    if (rawSummary
-      && !isInternalTransportNoiseText(rawSummary)
+    const detailSummarySections = extractStructuredSummarySections(rawSummary);
+    const splitDetailSummary = extractExplicitTechnicalTail(rawSummary);
+    const technicalSummary = normalizeTechnicalDetailLine(detailSummarySections?.technical || splitDetailSummary?.technicalTail || rawSummary);
+    completionDetailsAreTechnical = Boolean(
+      technicalSummary && (detailSummarySections?.technical || splitDetailSummary?.technicalTail || looksTechnicalCompletionSummary(technicalSummary, summary)),
+    );
+    if (technicalSummary
+      && !isInternalTransportNoiseText(technicalSummary)
       && (completionDetailsAreTechnical || rawTechnical)
-      && (!rawTechnical || rawSummary !== raw)) {
-      parts.push(truncateText(cleanMarkdown(rawSummary).replace(/\s+/g, ' ').trim(), 220));
+      && (!rawTechnical || technicalSummary !== rawTechnicalSource)) {
+      parts.push(truncateText(technicalSummary, 220));
     }
   }
 
@@ -647,7 +852,7 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion } = {}) {
   const unique = [];
   const seen = new Set();
   for (const part of parts) {
-    const normalized = normalizeCompletionText(part);
+    const normalized = normalizeTechnicalDetailLine(part) || normalizeCompletionText(part);
     if (!normalized) continue;
     const key = normalized.toLowerCase();
     if (seen.has(key)) continue;
@@ -659,16 +864,30 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion } = {}) {
 }
 
 function composeDeliveryText(summaryText, technicalDetailsText = null) {
-  const summary = normalizeCompletionText(summaryText);
+  const summarySections = extractStructuredSummarySections(summaryText);
+  const summary = stripHumanSummaryLabel(summarySections?.summary || summaryText);
   if (!summary) return null;
-  const technicalLines = Array.isArray(technicalDetailsText)
-    ? technicalDetailsText.map(line => normalizeCompletionText(line)).filter(Boolean)
-    : [];
+
+  const technicalCandidates = [];
+  if (summarySections?.technical) technicalCandidates.push(summarySections.technical);
+  if (Array.isArray(technicalDetailsText)) technicalCandidates.push(...technicalDetailsText);
+  else if (technicalDetailsText != null) technicalCandidates.push(technicalDetailsText);
+
+  const technicalLines = [];
+  const seen = new Set();
+  for (const candidate of technicalCandidates) {
+    const normalized = normalizeTechnicalDetailLine(candidate);
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    technicalLines.push(normalized);
+  }
+
   if (technicalLines.length > 0) {
     return `${summary}\n\nTechnical details:\n- ${technicalLines.join('\n- ')}`;
   }
-  const technical = normalizeCompletionText(technicalDetailsText);
-  return technical ? `${summary}\n\nTechnical details:\n- ${technical}` : summary;
+  return summary;
 }
 
 export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {

@@ -6411,6 +6411,63 @@ console.log('\n-- Completion payload helpers --');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes(`\n\nTechnical details:\n- ${weakTechnicalLeadSummary}`), 'completion helper: stripped technical specifics remain available in the technical details block');
 
+  const fitnessStyleWeakSummary = 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.';
+  const expectedFitnessLead = "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.";
+  const fitnessStylePayload = buildTerminalCompletionPayload({
+    summary: fitnessStyleWeakSummary,
+    checklist: { work_complete: true },
+  });
+  assert(fitnessStylePayload.summary_human === expectedFitnessLead, 'completion helper: mixed human-plus-technical fitness summary gets a clean human lead');
+  assert(!fitnessStylePayload.summary_human.includes('Technically:'), 'completion helper: mixed human-plus-technical fitness summary strips inline technical phrasing from the lead');
+
+  const fitnessStyleDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: fitnessStylePayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.startsWith(expectedFitnessLead), 'completion helper: mixed human-plus-technical fitness summary keeps the plain-English lead first');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('\n\nTechnical details:\n- mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness summary moves the implementation details underneath');
+  assert(fitnessStyleDelivery.deliveryText && !fitnessStyleDelivery.deliveryText.includes('Technically:'), 'completion helper: mixed human-plus-technical fitness summary removes the inline Technically marker from delivery text');
+
+  const brokenAppleHealthShape = [
+    'Human-readable summary:',
+    expectedFitnessLead,
+    '',
+    'Technical details:',
+    '- mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.',
+  ].join('\n');
+  const brokenAppleHealthDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary_human: brokenAppleHealthShape,
+      summary: brokenAppleHealthShape,
+      deliveryText: brokenAppleHealthShape,
+      details_technical: { raw_summary: brokenAppleHealthShape },
+      checklist: { work_complete: true },
+      debug: { deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  const brokenAppleHealthText = brokenAppleHealthDelivery.deliveryText || '';
+  const brokenAppleLead = brokenAppleHealthText.split('\n\nTechnical details:\n')[0] || '';
+  assert(brokenAppleHealthText.startsWith(expectedFitnessLead), 'completion helper: broken Apple Health labeled shape keeps a single clean lead');
+  assert((brokenAppleHealthText.split(expectedFitnessLead).length - 1) === 1, 'completion helper: broken Apple Health labeled shape does not duplicate the lead block');
+  assert((brokenAppleHealthText.match(/Human-readable summary:/gi) || []).length === 0, 'completion helper: broken Apple Health labeled shape strips duplicated Human-readable summary labels');
+  assert((brokenAppleHealthText.match(/Technical details:/gi) || []).length === 1, 'completion helper: broken Apple Health labeled shape emits exactly one technical details label');
+  assert(!brokenAppleLead.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: broken Apple Health labeled shape keeps technical text out of the lead');
+
+  const preservedAppleHealthLead = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary_human: expectedFitnessLead,
+      summary: expectedFitnessLead,
+      checklist: { work_complete: true },
+      debug: { deliverySource: 'summary_human' },
+    },
+    fallbackSummary: null,
+  });
+  assert(preservedAppleHealthLead.deliveryText === expectedFitnessLead, 'completion helper: already-good Apple Health lead is preserved without extra blocks');
+
   const rawPayloadReply = resolveCompletionDelivery({
     lastReply: JSON.stringify({
       ok: true,
@@ -8571,6 +8628,15 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
   });
 
   await runDispatchCompletionDeliveryCase({
+    slug: 'fitness-mixed-summary',
+    summary: 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.',
+    checklist: { work_complete: true },
+    expectedDeliveryText: "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.",
+    expectedTechnicalDetailsText: 'Technical details:\n- mapped imported Tonal workoutId values back to tonal_program_schedule',
+    expectEnqueued: true,
+  });
+
+  await runDispatchCompletionDeliveryCase({
     slug: 'internal-noise-only',
     summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete. (session idle 12 min)',
     checklist: { work_complete: true },
@@ -8657,7 +8723,8 @@ console.log('\n-- inbox-consumer per-message delivery_to routing --');
   assert(fetched1.delivery_to === '-100000000', 'getMessage returns delivery_to correctly');
 
   // Test 4: inbox-consumer selectPendingMessages query returns delivery_to and channel
-  // We simulate this by running the same SQL used in inbox-consumer
+  // We simulate the same ordering/shape used in inbox-consumer, but fetch a wider slice
+  // so earlier dispatch-delivery cases in this file cannot crowd out the test rows.
   const pendingMsgs = liveDb.prepare(`
     SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority,
            delivery_to, channel
@@ -8665,7 +8732,7 @@ console.log('\n-- inbox-consumer per-message delivery_to routing --');
     WHERE (to_agent = ? OR to_agent = 'broadcast')
       AND status IN ('pending', 'delivered')
     ORDER BY priority DESC, created_at ASC
-    LIMIT 10
+    LIMIT 100
   `).all('main');
 
   const withDeliveryTo = pendingMsgs.filter(m => m.delivery_to === '-100000000');
