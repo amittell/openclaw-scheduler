@@ -29,7 +29,6 @@ const TECHNICAL_KEYWORDS = [
   'webhook', 'workflow'
 ];
 const TECHNICAL_KEYWORD_RE = new RegExp(`\\b(?:${TECHNICAL_KEYWORDS.join('|')})\\b`, 'gi');
-const TECHNICAL_SIGNAL_RE = /\b(?:human(?:-|\s)?readable|summary|summaries|completion|deliver(?:y|ed)?|notification|message|report|chat|duplicate|double-delivery|single final|user-facing)\b/i;
 const RELIABILITY_SIGNAL_RE = /\b(?:fix|guard|retry|timeout|error|fail|stuck|prevent|avoid|dedupe|deduplicat|preserve|ensure|handle|recover|reliab)\b/i;
 const TEST_FRAGMENT_RE = /\b(?:test|tests|spec|coverage|lint|typecheck|tsc|eslint|oxlint|assert(?:ion)?s?)\b/i;
 
@@ -475,6 +474,48 @@ function extractTechnicalFragments(text) {
   return fragments.map(cleanTechnicalFragment).filter(Boolean);
 }
 
+function detectTechnicalThemes(rawText, fragments = []) {
+  const raw = cleanMarkdown(normalizeCompletionText(rawText) || '').toLowerCase();
+  const combined = [raw, fragments.join(' ').toLowerCase()].filter(Boolean).join(' ');
+  return {
+    completionFlow: /\b(?:completion|deliver(?:y|ed)?|notification|message|report|chat|summary|summaries|human(?:-|\s)?readable|plain english|user-facing)\b/.test(combined),
+    detailSeparation: /\b(?:technical details?|details_technical|debug|underneath|below|separate|separated|split|move|moved)\b/.test(combined),
+    duplicatePrevention: /\b(?:duplicate|double[- ]delivery|single final|dedupe|deduplicat|one clean)\b/.test(combined),
+    contextPreservation: /\b(?:structured|context|preserve|kept|retain|survive)\b/.test(combined),
+    reliability: RELIABILITY_SIGNAL_RE.test(combined),
+    addedBehavior: /\b(?:add|added|introduce|introduced|support|supported|enable|enabled)\b/.test(combined),
+    testOnly: fragments.length > 0 && fragments.every(isTestOrValidationFragment),
+  };
+}
+
+function isPlainEnglishLeadText(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return false;
+  if (FILE_CONTEXT_PREFIX_RE.test(normalized)) return false;
+  if (CODEISH_MARKER_RE.test(normalized)) return false;
+  if (/\b(?:summary(?:_human|Human)?|deliveryText|details_technical|sessionKey|idempotencyKey|payload-precedence|raw summary|watcher path|completion delivery)\b/i.test(normalized)) {
+    return false;
+  }
+  return !looksTechnicalCompletionSummary(normalized, normalized);
+}
+
+function buildCompletionLeadFromThemes(themes) {
+  const sentences = [];
+  if (themes.duplicatePrevention) {
+    sentences.push('Final completion updates now arrive as one clean plain-English summary.');
+    sentences.push('That makes the result easier to scan and avoids noisy repeat messages.');
+  } else {
+    sentences.push('Final completion updates now start with a short plain-English summary.');
+    if (themes.contextPreservation) {
+      sentences.push('That makes the result easier to read without hiding the useful detail.');
+    } else {
+      sentences.push('That makes the result easier to scan without hiding the useful detail.');
+    }
+  }
+  sentences.push('Future runs should show the clean summary first, with technical details underneath when needed.');
+  return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
+}
+
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const cleanedRaw = normalizeCompletionText(rawText);
   const fallback = normalizeCompletionText(fallbackSummary);
@@ -482,36 +523,49 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
 
   const fragments = extractTechnicalFragments(cleanedRaw);
   const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
-  const chosen = (primaryFragments.length > 0 ? primaryFragments : fragments)
+  const sourceFragments = primaryFragments.length > 0 ? primaryFragments : fragments;
+  const themes = detectTechnicalThemes(cleanedRaw, fragments);
+
+  if (themes.completionFlow) {
+    return buildCompletionLeadFromThemes(themes);
+  }
+
+  const chosen = sourceFragments
     .slice(0, 2)
     .map(fragment => toPastTenseFragment(fragment))
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter(fragment => isPlainEnglishLeadText(fragment));
 
-  let actionSummary = fallback;
+  let actionSummary;
   if (chosen.length === 1) {
     actionSummary = asSentence(chosen[0]);
   } else if (chosen.length >= 2) {
     actionSummary = `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
+  } else if (fallback && isPlainEnglishLeadText(fallback)) {
+    actionSummary = asSentence(fallback);
+  } else if (themes.testOnly) {
+    actionSummary = 'Added focused coverage for the weak spot.';
+  } else if (themes.reliability) {
+    actionSummary = 'The requested fix is in place.';
+  } else if (themes.addedBehavior) {
+    actionSummary = 'The requested behavior is now in place.';
+  } else {
+    actionSummary = 'The update is in place.';
   }
 
-  const normalizedRaw = cleanMarkdown(cleanedRaw).toLowerCase();
   const extras = [];
-  if (TECHNICAL_SIGNAL_RE.test(normalizedRaw)) {
-    if (/\b(?:duplicate|duplicate completion messages|one final completion message)\b/.test(normalizedRaw)) {
-      extras.push('That keeps the final result easier to read and avoids duplicate completion messages.');
-      extras.push('Future runs should now send one clean completion message automatically.');
-    } else if (/\b(?:structured|context|preserve|kept)\b/.test(normalizedRaw)) {
-      extras.push('That keeps the useful context attached to the final result.');
-      extras.push('Future runs should now deliver the cleaner version automatically.');
-    } else {
-      extras.push('That makes the final result easier to read in chat.');
-      extras.push('Future runs should now deliver the cleaner version automatically.');
-    }
-  } else if (RELIABILITY_SIGNAL_RE.test(normalizedRaw)) {
+  if (themes.testOnly) {
+    extras.push('That makes the behavior easier to trust.');
+    extras.push('Future regressions should get caught quickly.');
+  } else if (themes.reliability) {
     extras.push('That should make the workflow more reliable.');
-    if (/\b(?:job|run|scheduler|dispatch|session|watcher)\b/.test(normalizedRaw)) {
-      extras.push('Future runs should be less likely to fail the same way.');
-    }
+    extras.push('Future runs should be less likely to hit the same problem.');
+  } else if (themes.addedBehavior) {
+    extras.push('That makes the new behavior available without extra follow-up.');
+    extras.push('Future runs should use it automatically.');
+  } else {
+    extras.push('That should make the result easier to work with.');
+    extras.push('Future runs should reflect the change automatically.');
   }
 
   return truncateText([actionSummary, ...extras].filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
@@ -598,14 +652,20 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion } = {}) {
     unique.push(normalized);
   }
 
-  return unique.length > 0 ? unique.join(' ') : null;
+  return unique;
 }
 
 function composeDeliveryText(summaryText, technicalDetailsText = null) {
   const summary = normalizeCompletionText(summaryText);
   if (!summary) return null;
+  const technicalLines = Array.isArray(technicalDetailsText)
+    ? technicalDetailsText.map(line => normalizeCompletionText(line)).filter(Boolean)
+    : [];
+  if (technicalLines.length > 0) {
+    return `${summary}\n\nTechnical details:\n- ${technicalLines.join('\n- ')}`;
+  }
   const technical = normalizeCompletionText(technicalDetailsText);
-  return technical ? `${summary}\n\nTechnical details: ${technical}` : summary;
+  return technical ? `${summary}\n\nTechnical details:\n- ${technical}` : summary;
 }
 
 export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {

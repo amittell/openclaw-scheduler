@@ -6225,7 +6225,8 @@ console.log('\n-- Completion payload helpers --');
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: helperSha,
   });
-  assert(humanizedTechnicalPayload.summary_human && humanizedTechnicalPayload.summary_human.includes('final completion message'), 'completion helper: technical commit-style summary is humanized for delivery');
+  const expectedTechnicalLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
+  assert(humanizedTechnicalPayload.summary_human === expectedTechnicalLead, 'completion helper: technical commit-style summary gets a plain-English lead');
   assert(!humanizedTechnicalPayload.summary_human.includes('fix(dispatch):'), 'completion helper: humanized summary does not leak commit-style prefix');
   assert(humanizedTechnicalPayload.details_technical?.raw_summary === technicalCommitSummary, 'completion helper: technical raw summary is preserved in details');
 
@@ -6234,9 +6235,26 @@ console.log('\n-- Completion payload helpers --');
     completion: humanizedTechnicalPayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Technical details:'), 'completion helper: humanized technical summary keeps concise technical details underneath');
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes(technicalCommitSummary), 'completion helper: technical details retain the original technical summary');
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Checks: tests passed; pushed deadbee.'), 'completion helper: technical details preserve structured verification metadata');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('\n\nTechnical details:\n- '), 'completion helper: humanized technical summary keeps a separate technical details block underneath');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes(`- ${technicalCommitSummary}`), 'completion helper: technical details retain the original technical summary');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('- Checks: tests passed; pushed deadbee.'), 'completion helper: technical details preserve structured verification metadata');
+
+  const weakTechnicalLeadSummary = 'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions';
+  const weakTechnicalLeadPayload = buildTerminalCompletionPayload({
+    summary: weakTechnicalLeadSummary,
+    checklist: { work_complete: true, tests_passed: true },
+  });
+  const expectedWeakLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to scan without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
+  assert(weakTechnicalLeadPayload.summary_human === expectedWeakLead, 'completion helper: weak technical lead is rewritten into plain English first');
+  assert(!/dispatch\/completion\.mjs|summary_human|deliveryText|details_technical|payload-precedence/.test(weakTechnicalLeadPayload.summary_human), 'completion helper: plain-English lead strips filenames and internal implementation terms');
+
+  const weakTechnicalLeadDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: weakTechnicalLeadPayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes(`\n\nTechnical details:\n- ${weakTechnicalLeadSummary}`), 'completion helper: stripped technical specifics remain available in the technical details block');
 
   const rawPayloadReply = resolveCompletionDelivery({
     lastReply: JSON.stringify({
@@ -8277,8 +8295,8 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     summary: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
-    expectedDeliveryText: 'Cleaned up how the final completion message is delivered and kept the structured summary.',
-    expectedTechnicalDetailsText: 'Technical details: fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
+    expectedDeliveryText: 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.',
+    expectedTechnicalDetailsText: 'Technical details:\n- fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     expectEnqueued: true,
   });
 
