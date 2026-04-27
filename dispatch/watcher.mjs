@@ -31,7 +31,11 @@ import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { hasCompletionSignal, resolveCompletionDelivery } from './completion.mjs';
+import {
+  extractTerminalAssistantReplyFromEntries,
+  hasCompletionSignal,
+  resolveCompletionDelivery,
+} from './completion.mjs';
 import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -586,6 +590,28 @@ function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
   }
 }
 
+function readJsonlTailEntries(sessionId, agentDir = 'main', n = 200) {
+  return readJsonlLastLines(sessionId, agentDir, n);
+}
+
+function getSessionTerminalReply(sessionId, agentDir = 'main') {
+  const entries = readJsonlTailEntries(sessionId, agentDir, 200);
+  return extractTerminalAssistantReplyFromEntries(entries);
+}
+
+function formatDiagnosticSnippet(reply) {
+  if (!reply || typeof reply !== 'string') return '';
+  const normalized = reply.trim();
+  if (!normalized) return '';
+
+  const maxLen = 1200;
+  const clipped = normalized.length > maxLen
+    ? normalized.slice(0, maxLen) + '\n\n..[truncated]'
+    : normalized;
+
+  return `\n\nLast assistant report observed:\n${clipped}`;
+}
+
 /**
  * Check if a session is currently mid-turn by inspecting its JSONL tail.
  * Returns a reason string if mid-turn is detected, null if safe to proceed.
@@ -794,6 +820,21 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
   }
   process.exit(0);
+}
+
+function emitInterruptedOutcome(label, summary, result = null) {
+  process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
+  markLabelError(label, summary || 'interrupted: session went idle without calling done');
+  process.stdout.write(
+    `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
+    `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
+  );
+  process.exit(1);
+}
+
+function emitTimeoutOutcome(label, message, result = null) {
+  process.stdout.write(`${message}${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`);
+  process.exit(1);
 }
 
 // -- Watcher heartbeat interval ref --------------------------------------
@@ -1153,12 +1194,8 @@ while (Date.now() < deadline) {
     //
     // NOTE: Always resolve as 'interrupted', never 'done'. Only agent-side cmdDone may set status=done.
     if (status.status === 'interrupted') {
-      process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
-      process.stdout.write(
-        `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete\n`
-      );
-      markLabelError(label, status.summary || 'interrupted: session went idle without calling done');
-      process.exit(1);
+      const interruptedResult = dispatch('result', ['--label', label]);
+      emitInterruptedOutcome(label, status.summary, interruptedResult);
     }
 
     // Reset 529 retryCount on successful completion
@@ -1180,10 +1217,11 @@ while (Date.now() < deadline) {
     const _e2a = getSessionStoreEntry(status.sessionKey);
     const _sid2a = _e2a?.sessionId || null;
     const _adir2a = (status.sessionKey.split(':')[1]) || 'main';
-    if (_sid2a && isSessionCleanlyFinished(_sid2a, _adir2a)) {
+    const terminalJsonlReply = _sid2a ? getSessionTerminalReply(_sid2a, _adir2a) : null;
+    if (_sid2a && terminalJsonlReply && isSessionCleanlyFinished(_sid2a, _adir2a)) {
       process.stderr.write(`[watcher] stop_reason=end_turn detected -- delivering early\n`);
       const result = dispatch('result', ['--label', label]);
-      deliverResult(label, result?.lastReply, 'completed (stop_reason=end_turn)', result?.completion || null);
+      deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
       // deliverResult exits
     }
   }
@@ -1222,11 +1260,7 @@ if (finalStatus?.status === 'done') {
 // If status is interrupted (auto-resolved as incomplete), exit non-zero
 if (finalStatus?.status === 'interrupted') {
   process.stderr.write(`[watcher] [${label}] final status=interrupted -- session idle without completion\n`);
-  process.stdout.write(
-    `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete\n`
-  );
-  markLabelError(label, finalStatus?.summary || 'interrupted: session went idle without calling done');
-  process.exit(1);
+  emitInterruptedOutcome(label, finalStatus?.summary, finalResult);
 }
 
 // -- Token-based activity check before steering ----------------------------
@@ -1294,8 +1328,7 @@ if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
       // Session truly not found -- telemetry unavailable, exit
       process.stderr.write(`[watcher] token telemetry unavailable for ${label}; session not in store\n`);
       markLabelError(label, `timed out after ${timeoutS}s -- token telemetry unavailable`);
-      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry unavailable; no steer/kill attempted\n`);
-      process.exit(1);
+      emitTimeoutOutcome(label, `⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry unavailable; no steer/kill attempted`, r);
     }
     // Session IS in store but no tokens -- mid-tool-call, fall through to activity window
     // Use updatedAt as activity signal instead of tokens
@@ -1329,8 +1362,8 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
     if (!entry) {
       process.stderr.write(`[watcher] token telemetry lost for ${label}; session gone from store\n`);
       markLabelError(label, `timed out after ${timeoutS}s -- token telemetry lost`);
-      process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry lost; no steer/kill attempted\n`);
-      process.exit(1);
+      const tokenLostResult = dispatch('result', ['--label', label]);
+      emitTimeoutOutcome(label, `⏱ dispatch [${label}] timed out after ${timeoutS}s -- token telemetry lost; no steer/kill attempted`, tokenLostResult);
     }
     // Still in store -- check if updatedAt advanced (tool call still running)
     // Normalize: updatedAt may be seconds or milliseconds depending on agent framework version
@@ -1486,13 +1519,12 @@ for (const round of steerRounds) {
           deliverResult(label, r4?.lastReply || null, st3.summary, r4?.completion || st3?.completion || null); // deliverResult calls process.exit(0)
         }
         markLabelError(label, 'timed out -- killed after steer attempts (no result captured)');
-        process.stdout.write(`⏱ dispatch [${label}] killed after steer attempts -- no result captured\n`);
-        process.exit(1);
+        emitTimeoutOutcome(label, `⏱ dispatch [${label}] killed after steer attempts -- no result captured`, r4);
       }
     }
   }
 }
 
 markLabelError(label, `timed out after ${timeoutS}s -- killed after steer attempts`);
-process.stdout.write(`⏱ dispatch [${label}] timed out after ${timeoutS}s -- session killed after steer attempts\n`);
-process.exit(1);
+const timeoutResult = dispatch('result', ['--label', label]);
+emitTimeoutOutcome(label, `⏱ dispatch [${label}] timed out after ${timeoutS}s -- session killed after steer attempts`, timeoutResult);

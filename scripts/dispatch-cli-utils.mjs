@@ -63,3 +63,56 @@ export function resolveDispatchLabel(jobName, labels = {}) {
   }
   return null;
 }
+
+function normalizeOptionalString(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+/**
+ * Build a human-clear, machine-usable delivery surface for dispatch CLI output.
+ * Distinguishes between enabled delivery, intentional disablement, and missing/legacy state.
+ */
+export function buildDispatchDeliverySurface(record = {}) {
+  const deliverTo = normalizeOptionalString(record.deliverTo ?? record.delivery_to);
+  const deliverChannel = normalizeOptionalString(record.deliverChannel ?? record.delivery_channel);
+  const deliveryMode = normalizeOptionalString(record.deliveryMode ?? record.delivery_mode);
+  const explicitReason = normalizeOptionalString(
+    record.deliveryDisabledReason
+      ?? record.delivery_opt_out_reason
+      ?? record.reason
+  );
+  const deliveryDisabled = record.deliveryDisabled === true
+    || (record.delivery_mode === 'none' && !deliverTo)
+    || (record.deliveryMode === 'none' && !deliverTo);
+
+  if (deliverTo) {
+    return {
+      status: 'enabled',
+      mode: deliveryMode || 'announce',
+      channel: deliverChannel,
+      target: deliverTo,
+      ...(typeof record.scheduler === 'boolean' ? { scheduler: record.scheduler } : {}),
+      ...(typeof record.gateway === 'boolean' ? { gateway: record.gateway } : {}),
+    };
+  }
+
+  if (deliveryDisabled || explicitReason) {
+    return {
+      status: 'disabled',
+      mode: deliveryMode || null,
+      channel: null,
+      target: null,
+      reason: explicitReason || 'explicit opt-out',
+    };
+  }
+
+  return {
+    status: 'missing',
+    mode: deliveryMode || null,
+    channel: null,
+    target: null,
+    reason: 'delivery target missing or not recorded',
+  };
+}

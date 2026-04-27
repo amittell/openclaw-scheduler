@@ -32,9 +32,17 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
-import { buildTerminalCompletionPayload, hasCompletionSignal } from './completion.mjs';
+import {
+  buildCompletionSignalInstructions,
+  buildTerminalCompletionPayload,
+  extractLastMeaningfulAssistantReplyFromEntries,
+  extractTerminalAssistantReplyFromEntries,
+  hasCompletionSignal,
+  taskRequiresGitSha,
+} from './completion.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
+import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
@@ -139,21 +147,6 @@ function parseFlags(argv) {
     }
   }
   return flags;
-}
-
-function taskRequiresGitSha(taskPrompt) {
-  if (!taskPrompt || typeof taskPrompt !== 'string') return false;
-
-  const commandPattern = /\bgit\s+(push|rebase|cherry-pick)\b|(?:^|\s)--force-with-lease\b|(?:^|\s)--force-push\b/ig;
-  let match;
-  while ((match = commandPattern.exec(taskPrompt)) !== null) {
-    const before = taskPrompt.slice(Math.max(0, match.index - 40), match.index);
-    const negatedContext = /\b(?:do\s+not|don't|dont|never)\s+(?:use|run|call|invoke)?\s*$/i.test(before)
-      || /\bavoid\s+(?:using\s+)?$/i.test(before)
-      || /\bwithout\s+(?:using\s+)?$/i.test(before);
-    if (!negatedContext) return true;
-  }
-  return false;
 }
 
 // -- Labels Ledger --------------------------------------------
@@ -427,6 +420,27 @@ function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, 
   }
 
   return { shouldResolve: false, reason: null, errorMsg: null };
+}
+
+function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
+  if (!sessionId) return null;
+  try {
+    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', `${sessionId}.jsonl`);
+    return readFileSync(jsonlPath, 'utf-8')
+      .split('\n')
+      .filter(line => line.trim())
+      .slice(-maxLines)
+      .map(line => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -842,6 +856,9 @@ async function cmdEnqueue(flags) {
 
   // -- Watchdog monitoring flags -----------------------------
   const noMonitorRaw    = flags['no-monitor'];
+  const noMonitorReason = typeof noMonitorRaw === 'string' && noMonitorRaw.trim()
+    ? noMonitorRaw.trim()
+    : null;
   const noMonitor       = !!noMonitorRaw;
   const monitorEnabled  = !noMonitor && flags.monitor !== 'false';
   const monitorInterval = flags['monitor-interval'] || config.watchdogIntervalCron || '*/15 * * * *';
@@ -967,26 +984,11 @@ async function cmdEnqueue(flags) {
   const doneScriptPath = join(__dirname, 'index.mjs');
   parts.push(``);
   parts.push(`---`);
-  parts.push(`COMPLETION SIGNAL -- READ CAREFULLY:`);
-  parts.push(``);
-  parts.push(`Only call this command after ALL of the following are true:`);
-  parts.push(`  1. All file edits are saved`);
-  parts.push(`  2. All commits are pushed (git push completed successfully)`);
-  parts.push(`  3. All API calls (e.g. GitHub comment replies) are done`);
-  parts.push(`  4. You have verified the work is complete`);
-  parts.push(``);
-  parts.push(`Call this as your ABSOLUTE FINAL action -- nothing else runs after this:`);
-  parts.push(`  node '${doneScriptPath}' done --label '${label.replace(/'/g, "'\\''")}' \\`);
-  parts.push(`    --summary "<human-readable summary of what you actually did>" \\`);
-  parts.push(`    --checklist '{"work_complete":true,"tests_passed":true,"pushed":true}' \\`);
-  parts.push(`    [--sha "<git commit SHA if applicable>"]`);
-  parts.push(``);
-  parts.push(`Checklist rules:`);
-  parts.push(`  - work_complete MUST be true -- you are asserting you have finished ALL assigned work`);
-  parts.push(`  - If tests failed or push failed, do NOT set tests_passed:true or pushed:true -- instead continue working`);
-  parts.push(`  - Only include tests_passed/pushed if they apply to your task`);
-  parts.push(`If your task involved git commits, --sha is required and must be the actual SHA of your pushed commit. The done script will reject invented or placeholder SHAs.`);
-  parts.push(`Do NOT call done while planning, reading files, or mid-task. If you have not yet pushed a commit, you are not done.`);
+  parts.push(buildCompletionSignalInstructions({
+    label,
+    taskPrompt: message,
+    doneScriptPath,
+  }));
   parts.push(`---`);
   parts.push(``);
   parts.push(`---`);
@@ -1021,6 +1023,11 @@ async function cmdEnqueue(flags) {
       } : {}),
     }, { timeout: 15000 });
 
+    const deliveryDisabled = !deliverTo && noMonitor;
+    const deliveryDisabledReason = deliveryDisabled
+      ? (noMonitorReason || 'explicit opt-out via --no-monitor')
+      : null;
+
     // Update ledger
     setLabel(label, {
       sessionKey,
@@ -1033,6 +1040,8 @@ async function cmdEnqueue(flags) {
       deliverTo:      deliverTo || null,
       deliverChannel: deliverChannel || null,
       deliveryMode:   deliverMode || null,
+      deliveryDisabled,
+      deliveryDisabledReason,
       verifyCmd:      verifyCmd || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
@@ -1156,6 +1165,18 @@ async function cmdEnqueue(flags) {
       }
     }
 
+    const delivery = buildDispatchDeliverySurface({
+      deliverTo,
+      deliverChannel,
+      deliveryMode: deliverMode,
+      deliveryDisabled,
+      deliveryDisabledReason,
+      ...(deliverTo ? {
+        scheduler: schedulerWatcherOk,
+        gateway: true,
+      } : {}),
+    });
+
     out({
       ok:         true,
       label,
@@ -1164,12 +1185,7 @@ async function cmdEnqueue(flags) {
       mode:       isFresh ? 'fresh' : 'reuse',
       agent,
       status:     'accepted',
-      delivery:   deliverTo ? {
-        scheduler: schedulerWatcherOk,
-        gateway:   false,
-        target:    deliverTo,
-        channel:   deliverChannel,
-      } : null,
+      delivery,
       watchdog:   monitorEnabled ? {
         enabled:  watchdogJobOk,
         jobId:    watchdogJobId,
@@ -1177,11 +1193,13 @@ async function cmdEnqueue(flags) {
         timeout:  monitorTimeout,
         ...(monitorEnabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
       } : null,
-      message:    schedulerWatcherOk
-        ? 'Session spawned. Durable delivery watcher registered.'
-        : deliverTo
-          ? 'Session spawned, but durable delivery watcher registration failed. Final delivery may require manual follow-up.'
-          : 'Session spawned. Agent is running.',
+      message:    delivery.status === 'disabled'
+        ? `Session spawned. Delivery intentionally disabled${delivery.reason ? ` (${delivery.reason}).` : '.'}`
+        : schedulerWatcherOk
+          ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
+          : deliverTo
+            ? 'Session spawned. Delivery via gateway only (scheduler watcher failed).'
+            : 'Session spawned. Delivery target missing or not recorded.',
     });
 
     // -- Post-spawn verification (Fix 3) --------------------------------
@@ -1331,6 +1349,9 @@ function cmdStatus(flags) {
   if (entry.sessionKey && sessionsStore) {
     const sessionEntry = sessionsStore[entry.sessionKey];
     if (sessionEntry) {
+      if (sessionEntry.sessionId && entry.sessionId !== sessionEntry.sessionId) {
+        setLabel(label, { sessionId: sessionEntry.sessionId });
+      }
       liveness = {
         updatedAt: sessionEntry.updatedAt,
         ageMs:     sessionEntry.updatedAt
@@ -1362,6 +1383,7 @@ function cmdStatus(flags) {
     updatedAt:  current.updatedAt,
     summary:    current.summary || null,
     completion: current.completion || null,
+    delivery:   buildDispatchDeliverySurface(current),
     error:      current.error || null,
     liveness,
     ...(syncAction ? { syncAction } : {}),
@@ -1637,25 +1659,55 @@ function cmdResult(flags) {
     return;
   }
 
-  // Try to get the session transcript to find last assistant message
+  // Conservative transcript recovery:
+  // - lastReply is ONLY populated from a terminal JSONL-scoped assistant reply
+  // - diagnosticReply captures the last meaningful assistant text for timeout reporting
   let lastReply = null;
+  let diagnosticReply = null;
+  let recoverySource = null;
+  let recoverySessionId = entry.sessionId || null;
+  const resultAgent = entry.agent || agentFromSessionKey(entry.sessionKey) || 'main';
+  const resultStore = entry.sessionKey ? readSessionsStore(resultAgent) : null;
+  const resultSessionEntry = entry.sessionKey && resultStore ? resultStore[entry.sessionKey] : null;
+
+  if (resultSessionEntry?.sessionId) {
+    recoverySessionId = resultSessionEntry.sessionId;
+    if (entry.sessionId !== recoverySessionId) {
+      setLabel(label, { sessionId: recoverySessionId });
+    }
+  }
+
+  if (recoverySessionId) {
+    const jsonlEntries = readJsonlTailEntries(recoverySessionId, resultAgent, 200);
+    const terminalReply = extractTerminalAssistantReplyFromEntries(jsonlEntries);
+    const jsonlDiagnostic = extractLastMeaningfulAssistantReplyFromEntries(jsonlEntries);
+
+    if (terminalReply) {
+      lastReply = terminalReply;
+      recoverySource = 'jsonl-terminal';
+    }
+    if (jsonlDiagnostic) {
+      diagnosticReply = jsonlDiagnostic;
+      if (!recoverySource) recoverySource = 'jsonl-diagnostic';
+    }
+  }
+
   if (entry.sessionKey) {
     try {
       const result = gatewayCall('chat.history', {
         sessionKey: entry.sessionKey,
       }, { timeout: 10000 });
 
-      if (result?.messages?.length) {
-        for (let i = result.messages.length - 1; i >= 0; i--) {
-          const e = result.messages[i];
-          if (e.role === 'assistant' && e.content) {
-            lastReply = typeof e.content === 'string'
-              ? e.content
-              : Array.isArray(e.content)
-                ? e.content.map(c => c.text || '').join('')
-                : JSON.stringify(e.content);
-            break;
-          }
+      if (result?.messages?.length && !diagnosticReply) {
+        diagnosticReply = extractLastMeaningfulAssistantReplyFromEntries(result.messages);
+        if (diagnosticReply && !recoverySource) recoverySource = 'history-diagnostic';
+      }
+
+      if (!lastReply && result?.messages?.length) {
+        const historyTerminal = extractTerminalAssistantReplyFromEntries(result.messages);
+        if (historyTerminal) {
+          lastReply = historyTerminal;
+          recoverySource = 'history-terminal';
         }
       }
     } catch {}
@@ -1674,7 +1726,13 @@ function cmdResult(flags) {
     spawnedAt:  entry.spawnedAt,
     summary:    entry.summary || (lastReply ? lastReply.slice(0, 500) : null),
     completion: entry.completion || null,
+    delivery:   buildDispatchDeliverySurface(entry),
     lastReply:  lastReply || null,
+    diagnosticReply: diagnosticReply || lastReply || null,
+    recovery: recoverySource || recoverySessionId ? {
+      source: recoverySource || null,
+      sessionId: recoverySessionId || null,
+    } : null,
     error:      entry.error || null,
   });
 }
@@ -2097,6 +2155,7 @@ function cmdList(flags) {
   let entries = Object.entries(labels).map(([name, data]) => ({
     label: name,
     ...data,
+    delivery: buildDispatchDeliverySurface(data),
   }));
 
   if (filterStatus) {

@@ -31,6 +31,9 @@ const TECHNICAL_KEYWORDS = [
 const TECHNICAL_KEYWORD_RE = new RegExp(`\\b(?:${TECHNICAL_KEYWORDS.join('|')})\\b`, 'gi');
 const RELIABILITY_SIGNAL_RE = /\b(?:fix|guard|retry|timeout|error|fail|stuck|prevent|avoid|dedupe|deduplicat|preserve|ensure|handle|recover|reliab)\b/i;
 const TEST_FRAGMENT_RE = /\b(?:test|tests|spec|coverage|lint|typecheck|tsc|eslint|oxlint|assert(?:ion)?s?)\b/i;
+const TEST_APPLICABILITY_RE = /\b(?:test|tests|pytest|jest|vitest|mocha|cypress|playwright|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|rspec)\b/i;
+const TEST_NEGATION_RE = /\b(?:do\s+not|don't|dont|never|skip|without|no)\s+(?:run\s+)?(?:the\s+)?tests?\b/i;
+const PUSH_FORBIDDEN_RE = /\b(?:do\s+not|don't|dont|never|must\s+not|should\s+not)\s+(?:git\s+push|push)\b|\bno\s+push\b|\bwithout\s+pushing\b/i;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -747,6 +750,175 @@ function cloneChecklist(checklist) {
   } catch {
     return { ...checklist };
   }
+}
+
+function hasNegatedCommandContext(text, matchIndex) {
+  const before = text.slice(Math.max(0, matchIndex - 40), matchIndex);
+  return /\b(?:do\s+not|don't|dont|never)\s+(?:use|run|call|invoke)?\s*$/i.test(before)
+    || /\bavoid\s+(?:using\s+)?$/i.test(before)
+    || /\bwithout\s+(?:using\s+)?$/i.test(before);
+}
+
+export function taskRequiresGitSha(taskPrompt) {
+  if (!taskPrompt || typeof taskPrompt !== 'string') return false;
+
+  const commandPattern = /\bgit\s+(push|rebase|cherry-pick)\b|(?:^|\s)--force-with-lease\b|(?:^|\s)--force-push\b/ig;
+  let match;
+  while ((match = commandPattern.exec(taskPrompt)) !== null) {
+    if (!hasNegatedCommandContext(taskPrompt, match.index)) return true;
+  }
+  return false;
+}
+
+export function inferTaskCompletionRequirements(taskPrompt) {
+  const text = typeof taskPrompt === 'string' ? taskPrompt : '';
+  const pushForbidden = PUSH_FORBIDDEN_RE.test(text);
+  const pushRequired = !pushForbidden && taskRequiresGitSha(text);
+  const testsApplicable = TEST_APPLICABILITY_RE.test(text) && !TEST_NEGATION_RE.test(text);
+
+  return {
+    pushRequired,
+    pushForbidden,
+    testsApplicable,
+  };
+}
+
+export function buildCompletionChecklistExample(taskPromptOrRequirements) {
+  const requirements = typeof taskPromptOrRequirements === 'string' || taskPromptOrRequirements == null
+    ? inferTaskCompletionRequirements(taskPromptOrRequirements)
+    : taskPromptOrRequirements;
+
+  const example = { work_complete: true };
+  if (requirements?.testsApplicable) example.tests_passed = true;
+  if (requirements?.pushRequired) example.pushed = true;
+  return JSON.stringify(example);
+}
+
+export function buildCompletionSignalInstructions({ label, taskPrompt, doneScriptPath } = {}) {
+  const escapedLabel = String(label || '').replace(/'/g, "'\\''");
+  const requirements = inferTaskCompletionRequirements(taskPrompt);
+  const checklistExample = buildCompletionChecklistExample(requirements);
+
+  const readinessChecks = [
+    'All file edits are saved',
+    requirements.testsApplicable
+      ? 'Any required tests / validation for this task have passed'
+      : 'Any required validation for this task is complete',
+    'All required API calls / external follow-up actions are done',
+  ];
+
+  if (requirements.pushRequired) {
+    readinessChecks.push('Any required git push / history-editing step for this task is complete');
+  }
+
+  readinessChecks.push('You have verified the work is complete');
+
+  const lines = [];
+  lines.push('COMPLETION SIGNAL -- READ CAREFULLY:');
+  lines.push('');
+  lines.push('Only call this command after ALL of the following are true:');
+  readinessChecks.forEach((line, idx) => lines.push(`  ${idx + 1}. ${line}`));
+  lines.push('');
+  lines.push('Call this as your ABSOLUTE FINAL action -- nothing else runs after this:');
+  lines.push(`  node '${doneScriptPath}' done --label '${escapedLabel}' \\`);
+  lines.push('    --summary "<human-readable summary of what you actually did>" \\');
+  lines.push(`    --checklist '${checklistExample}' \\`);
+  lines.push('    [--sha "<git commit SHA if applicable>"]');
+  lines.push('');
+  lines.push('Checklist rules:');
+  lines.push('  - work_complete MUST be true -- you are asserting you have finished ALL assigned work');
+  lines.push('  - Only include tests_passed if validation/testing was actually required for this task');
+  lines.push('  - Only include pushed:true if this task required a pushed git change');
+
+  if (requirements.pushForbidden) {
+    lines.push('  - This task explicitly says not to push -- do not wait on a push or set pushed:true before calling done');
+  }
+
+  lines.push('If this task required a pushed git change, --sha is required and must be the actual pushed commit SHA. The done script will reject invented or placeholder SHAs.');
+  lines.push('Do NOT call done while planning, reading files, or mid-task.');
+
+  if (requirements.pushRequired) {
+    lines.push('If the required push for this task has not happened yet, you are not done.');
+  }
+
+  return lines.join('\n');
+}
+
+function extractTextSegments(content) {
+  if (typeof content === 'string') return [content];
+  if (!content || typeof content !== 'object') return [];
+
+  if (Array.isArray(content)) {
+    return content.flatMap(part => {
+      if (typeof part === 'string') return [part];
+      if (part && typeof part.text === 'string') return [part.text];
+      return [];
+    });
+  }
+
+  if (typeof content.text === 'string') return [content.text];
+  return [];
+}
+
+function entryHasToolUse(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'tool_use') return true;
+  if (!Array.isArray(entry.content)) return false;
+  return entry.content.some(part => part?.type === 'tool_use');
+}
+
+function entryHasToolResult(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'tool_result') return true;
+  if (!Array.isArray(entry.content)) return false;
+  return entry.content.some(part => part?.type === 'tool_result');
+}
+
+function extractEntryText(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  return normalizeCompletionText(extractTextSegments(entry.content).join('').trim());
+}
+
+export function extractLastMeaningfulAssistantReplyFromEntries(entries) {
+  if (!Array.isArray(entries)) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.role !== 'assistant') continue;
+    if (entryHasToolUse(entry)) continue;
+
+    const text = extractEntryText(entry);
+    if (isMeaningfulCompletionText(text)) return text;
+  }
+
+  return null;
+}
+
+export function extractTerminalAssistantReplyFromEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry || typeof entry !== 'object') continue;
+
+    if (entry.role === 'assistant') {
+      if (entryHasToolUse(entry)) return null;
+
+      const text = extractEntryText(entry);
+      if (!text) continue;
+      if (!isMeaningfulCompletionText(text)) return null;
+
+      const stopReason = entry.stop_reason ?? entry.stopReason ?? null;
+      return stopReason === 'end_turn' ? text : null;
+    }
+
+    if (entry.role === 'user') {
+      if (entryHasToolResult(entry)) return null;
+      return null;
+    }
+  }
+
+  return null;
 }
 
 function buildTechnicalDetails({ checklist, sha, rawSummary, summaryHuman } = {}) {

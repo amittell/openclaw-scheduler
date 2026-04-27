@@ -46,7 +46,7 @@ import {
   runAgentTurn,
   runAgentTurnWithActivityTimeout,
 } from './gateway.js';
-import { resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
+import { buildDispatchDeliverySurface, resolveDispatchCliPath, resolveDispatchLabel } from './scripts/dispatch-cli-utils.mjs';
 import { buildTriggeredRunContext } from './prompt-context.js';
 import {
   matchesSentinel, detectTransientError, adaptiveDeferralMs,
@@ -56,7 +56,14 @@ import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { parseLaunchctlPrint, evaluateInboxWatcherHealth } from './scripts/inbox-watcher-guardrail.mjs';
 import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
-import { buildTerminalCompletionPayload, hasCompletionSignal, resolveCompletionDelivery } from './dispatch/completion.mjs';
+import {
+  buildCompletionChecklistExample,
+  buildCompletionSignalInstructions,
+  buildTerminalCompletionPayload,
+  extractTerminalAssistantReplyFromEntries,
+  hasCompletionSignal,
+  resolveCompletionDelivery,
+} from './dispatch/completion.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
@@ -3195,6 +3202,72 @@ console.log('\n-- Dispatch Script Compatibility --');
   assert(resolveDispatchLabel('alpha', labels) === 'alpha', 'resolveDispatchLabel handles direct label match');
   assert(resolveDispatchLabel('dispatch-deliver:alpha', labels) === 'alpha', 'resolveDispatchLabel handles dispatch watcher prefix');
   assert(resolveDispatchLabel('dispatch-deliver:missing', labels) === null, 'resolveDispatchLabel returns null for missing label');
+
+  const disabledDelivery = buildDispatchDeliverySurface({
+    deliveryDisabled: true,
+    deliveryDisabledReason: 'smoketest',
+    deliveryMode: 'announce',
+  });
+  assert(disabledDelivery.status === 'disabled', 'buildDispatchDeliverySurface marks explicit opt-out as disabled');
+  assert(disabledDelivery.reason === 'smoketest', 'buildDispatchDeliverySurface preserves disabled reason');
+  assert(disabledDelivery.target === null, 'buildDispatchDeliverySurface disabled target is null explicitly');
+
+  const enabledDelivery = buildDispatchDeliverySurface({
+    deliverTo: '1234567890',
+    deliverChannel: 'telegram',
+    deliveryMode: 'announce',
+    scheduler: true,
+    gateway: true,
+  });
+  assert(enabledDelivery.status === 'enabled', 'buildDispatchDeliverySurface marks routed delivery as enabled');
+  assert(enabledDelivery.target === '1234567890', 'buildDispatchDeliverySurface preserves delivery target');
+  assert(enabledDelivery.channel === 'telegram', 'buildDispatchDeliverySurface preserves delivery channel');
+}
+
+console.log('\n-- dispatch status delivery surface clarity --');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath = join(dispatchDir, 'index.mjs');
+  const tmpBase = mkdtempSync(join(tmpdir(), 'dispatch-delivery-surface-'));
+
+  try {
+    function runStatusWithLabels(label, entry) {
+      const tmpDir = mkdtempSync(join(tmpBase, 'case-'));
+      const labelsPath = join(tmpDir, 'labels.json');
+      writeFileSync(labelsPath, JSON.stringify({ [label]: entry }) + '\n');
+      return JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', label], {
+        encoding: 'utf8',
+        env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tmpDir },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }));
+    }
+
+    const disabledStatus = runStatusWithLabels('smoketest-run', {
+      status: 'done',
+      deliveryDisabled: true,
+      deliveryDisabledReason: 'smoketest',
+      deliveryMode: 'announce',
+      spawnedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    assert(disabledStatus.delivery?.status === 'disabled', 'status surface marks intentional no-delivery dispatch as disabled');
+    assert(disabledStatus.delivery?.reason === 'smoketest', 'status surface preserves no-delivery reason');
+
+    const enabledStatus = runStatusWithLabels('delivered-run', {
+      status: 'done',
+      deliverTo: '1234567890',
+      deliverChannel: 'telegram',
+      deliveryMode: 'announce',
+      spawnedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    assert(enabledStatus.delivery?.status === 'enabled', 'status surface keeps delivered dispatch marked as enabled');
+    assert(enabledStatus.delivery?.target === '1234567890', 'status surface keeps delivered dispatch target');
+    assert(enabledStatus.delivery?.channel === 'telegram', 'status surface keeps delivered dispatch channel');
+  } finally {
+    rmSync(tmpBase, { recursive: true, force: true });
+  }
 }
 
 
@@ -5564,6 +5637,88 @@ if (sub === 'status') {
     rmSync(intTempDir, { recursive: true, force: true });
   }
 
+  // 3c. Missed-done recovery: if the run wrote a real terminal final report but never
+  //     called done, watcher should surface that report in interrupted diagnostics
+  //     without turning the run into a successful completion.
+  {
+    const missedTempDir = mkdtempSync(join(tmpdir(), 'watcher-missed-done-'));
+    const mockMissedPath = join(missedTempDir, 'mock-missed-done.mjs');
+    const mockLabelsMissed = join(missedTempDir, 'labels-missed.json');
+    const sessionsDir = join(missedTempDir, '.openclaw', 'agents', 'main', 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+
+    const missedLabel = 'test-missed-done';
+    const missedSessionKey = 'agent:main:subagent:missed-done-uuid';
+    const missedSessionId = 'missed-done-sid';
+    const finalReport = 'Final report: implemented the fix, ran the targeted validation, and documented the caveats.';
+    const actualIndexPath = join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'index.mjs');
+
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [missedSessionKey]: { sessionId: missedSessionId, updatedAt: Date.now(), model: 'test' },
+    }) + '\n');
+    writeFileSync(join(sessionsDir, `${missedSessionId}.jsonl`), [
+      JSON.stringify({ role: 'user', content: [{ type: 'text', text: 'Please fix it' }] }),
+      JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: finalReport }], stop_reason: 'end_turn' }),
+    ].join('\n') + '\n');
+    writeFileSync(mockLabelsMissed, JSON.stringify({
+      [missedLabel]: {
+        sessionKey: missedSessionKey,
+        sessionId: missedSessionId,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    writeFileSync(mockMissedPath, `
+import { execFileSync } from 'child_process';
+const [,,sub,...rest] = process.argv;
+const indexPath = ${JSON.stringify(actualIndexPath)};
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(missedLabel)},
+    status: 'interrupted',
+    summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete.',
+    sessionKey: ${JSON.stringify(missedSessionKey)},
+    liveness: { ageMs: 900000, updatedAt: Date.now() - 900000 },
+  }) + '\\n');
+} else if (sub === 'result') {
+  const out = execFileSync(process.execPath, [indexPath, 'result', ...rest], {
+    encoding: 'utf8',
+    env: process.env,
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  process.stdout.write(out);
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    const missedRun = spawnSync(process.execPath, [watcherPath, '--label', missedLabel, '--timeout', '5', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        HOME: missedTempDir,
+        DISPATCH_INDEX_PATH: mockMissedPath,
+        DISPATCH_LABELS_PATH: mockLabelsMissed,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    assert((missedRun.status ?? 1) === 1, 'missed-done recovery: watcher still exits non-zero for interrupted run');
+    assert((missedRun.stdout || '').includes('went idle before completing'), 'missed-done recovery: watcher keeps interrupted warning');
+    assert((missedRun.stdout || '').includes(finalReport), 'missed-done recovery: watcher surfaces recovered final assistant report in diagnostics');
+    assert(!(missedRun.stdout || '').includes('completed:'), 'missed-done recovery: watcher does not mislabel recovered diagnostics as successful completion');
+
+    rmSync(missedTempDir, { recursive: true, force: true });
+  }
+
   rmSync(tempDir, { recursive: true, force: true });
 }
 
@@ -5829,7 +5984,7 @@ console.log('\n-- Watcher stop_reason early delivery --');
     const sessionId = 'sr-end-turn-test';
     writeJsonl(sessionId, [
       { role: 'user', content: [{ type: 'text', text: 'do work' }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Final report: delivered via end_turn fast path.' }], stop_reason: 'end_turn' },
     ]);
     writeSessionsJson({
       'agent:main:subagent:et-uuid': { sessionId, updatedAt: Date.now(), model: 'test' },
@@ -5858,7 +6013,7 @@ if (sub === 'status') {
     liveness: { ageMs: 5000, sessionId: ${JSON.stringify(sessionId)} },
   }) + '\\n');
 } else if (sub === 'result') {
-  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'end_turn result', status: 'done' }) + '\\n');
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'Final report: delivered via end_turn fast path.', status: 'done' }) + '\\n');
 } else {
   process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
 }
@@ -5883,7 +6038,7 @@ if (sub === 'status') {
     const etStdout = etResult.stdout || '';
     const etStderr = etResult.stderr || '';
     assert(etExitCode === 0, 'stop_reason end_turn: watcher exits 0 (early delivery)');
-    assert(etStdout.includes('end_turn result'), 'stop_reason end_turn: watcher delivers lastReply via early delivery');
+    assert(etStdout.includes('Final report: delivered via end_turn fast path.'), 'stop_reason end_turn: watcher delivers lastReply via early delivery');
     assert(etStderr.includes('stop_reason=end_turn detected'), 'stop_reason end_turn: watcher logs early delivery to stderr');
   }
 
@@ -6388,6 +6543,120 @@ console.log('\n-- Completion payload helpers --');
   assert(!/deliver:\s*!!deliverTo/.test(dispatchSource), 'dispatch enqueue: old direct deliver toggle is gone');
 }
 
+console.log('\n-- Completion instructions + conservative transcript recovery helpers --');
+{
+  const noPushPrompt = 'Update the docs, make a local git commit if helpful, but do NOT push. Do not run tests for this task.';
+  const noPushChecklist = buildCompletionChecklistExample(noPushPrompt);
+  const noPushInstructions = buildCompletionSignalInstructions({
+    label: 'no-push-task',
+    taskPrompt: noPushPrompt,
+    doneScriptPath: '/tmp/dispatch/index.mjs',
+  });
+
+  assert(noPushChecklist === '{"work_complete":true}', 'completion instructions: no-push task example checklist only requires work_complete');
+  assert(noPushInstructions.includes("--checklist '{\"work_complete\":true}'"), 'completion instructions: no-push task embeds minimal checklist example');
+  assert(!noPushInstructions.includes('"tests_passed":true'), 'completion instructions: no-push task does not require tests_passed in example');
+  assert(!noPushInstructions.includes('"pushed":true'), 'completion instructions: no-push task does not require pushed in example');
+  assert(noPushInstructions.includes('explicitly says not to push'), 'completion instructions: no-push task warns not to wait on push');
+  assert(!noPushInstructions.includes('If the required push for this task has not happened yet, you are not done.'), 'completion instructions: no-push task omits push-required warning');
+
+  const pushPrompt = 'Run the tests, fix the bug, and git push origin HEAD when you are done.';
+  const pushChecklist = buildCompletionChecklistExample(pushPrompt);
+  const pushInstructions = buildCompletionSignalInstructions({
+    label: 'push-task',
+    taskPrompt: pushPrompt,
+    doneScriptPath: '/tmp/dispatch/index.mjs',
+  });
+
+  assert(pushChecklist === '{"work_complete":true,"tests_passed":true,"pushed":true}', 'completion instructions: push-required task example includes tests_passed and pushed');
+  assert(pushInstructions.includes('If the required push for this task has not happened yet, you are not done.'), 'completion instructions: push-required task keeps push gate');
+
+  const recoveredTerminal = extractTerminalAssistantReplyFromEntries([
+    { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Still working through the files.' }], stop_reason: 'end_turn' },
+    { role: 'assistant', content: [{ type: 'text', text: 'Final report: implemented the fix and validated the result.' }], stop_reason: 'end_turn' },
+  ]);
+  assert(recoveredTerminal === 'Final report: implemented the fix and validated the result.', 'completion helpers: terminal assistant report is recoverable from transcript tail');
+
+  const suppressedTerminal = extractTerminalAssistantReplyFromEntries([
+    { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'I am starting by reading files.' }], stop_reason: 'end_turn' },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+  ]);
+  assert(suppressedTerminal === null, 'completion helpers: mid-task chatter followed by tool activity is not treated as terminal completion');
+}
+
+console.log('\n-- cmdResult conservative transcript recovery --');
+{
+  const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
+  const indexPath = join(dispatchDir, 'index.mjs');
+  const tempDir = mkdtempSync(join(tmpdir(), 'dispatch-result-recovery-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+  mkdirSync(sessionsDir, { recursive: true });
+
+  function seedResultCase({ label, sessionKey, sessionId, entries }) {
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        sessionId,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 90_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: { sessionId, updatedAt: Date.now(), model: 'test' },
+    }) + '\n');
+    writeFileSync(join(sessionsDir, `${sessionId}.jsonl`), entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+  }
+
+  seedResultCase({
+    label: 'result-terminal',
+    sessionKey: 'agent:main:subagent:result-terminal',
+    sessionId: 'result-terminal-sid',
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Final report: implemented the fix and validated the result.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const recoveredResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-terminal'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(recoveredResult.lastReply === 'Final report: implemented the fix and validated the result.', 'cmdResult: terminal JSONL reply recovered as lastReply');
+  assert(recoveredResult.diagnosticReply === recoveredResult.lastReply, 'cmdResult: terminal JSONL reply also available as diagnosticReply');
+  assert(recoveredResult.recovery?.source === 'jsonl-terminal', 'cmdResult: terminal recovery source recorded as jsonl-terminal');
+
+  seedResultCase({
+    label: 'result-midtask',
+    sessionKey: 'agent:main:subagent:result-midtask',
+    sessionId: 'result-midtask-sid',
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'I am starting by reading files.' }], stop_reason: 'end_turn' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    ],
+  });
+
+  const guardedResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-midtask'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(guardedResult.lastReply === null, 'cmdResult: mid-task chatter is not promoted to lastReply');
+  assert(guardedResult.diagnosticReply === 'I am starting by reading files.', 'cmdResult: mid-task chatter remains available only as diagnosticReply');
+  assert(guardedResult.recovery?.source === 'jsonl-diagnostic', 'cmdResult: mid-task chatter recovery source recorded as diagnostic only');
+
+  rmSync(tempDir, { recursive: true, force: true });
+}
+
 console.log('\n-- Done Subcommand --');
 {
   const dispatchDir = join(dirname(fileURLToPath(import.meta.url)), 'dispatch');
@@ -6467,9 +6736,10 @@ console.log('\n-- Done Subcommand --');
 
   // index.mjs source includes done in switch + cmdDone function
   const indexSrc = readFileSync(indexPath, 'utf8');
+  const completionSrc = readFileSync(join(dispatchDir, 'completion.mjs'), 'utf8');
   assert(indexSrc.includes("case 'done'"), 'done subcommand: switch case exists in index.mjs');
   assert(indexSrc.includes('cmdDone'), 'done subcommand: cmdDone function defined');
-  assert(indexSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
+  assert(completionSrc.includes('COMPLETION SIGNAL'), 'done subcommand: task template includes COMPLETION SIGNAL');
 
   // -- SHA validation tests ----------------------------------
 
@@ -7370,13 +7640,13 @@ console.log('\n-- Done Subcommand --');
     assert(actualGitStderr.includes('--sha'), 'fix2-actual-cmd: git command -> stderr mentions --sha');
 
     // Also verify the helper is present in source
-    const indexSrcFix2 = readFileSync(indexPath, 'utf8');
+    const completionSrcFix2 = readFileSync(join(dispatchDir, 'completion.mjs'), 'utf8');
     assert(
-      indexSrcFix2.includes('taskRequiresGitSha'),
+      completionSrcFix2.includes('taskRequiresGitSha'),
       'fix2-regex: taskRequiresGitSha helper present in source',
     );
     assert(
-      indexSrcFix2.includes('negatedContext'),
+      completionSrcFix2.includes('hasNegatedCommandContext'),
       'fix2-regex: negated context handling present in source',
     );
   }
