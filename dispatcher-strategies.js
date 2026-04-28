@@ -1095,6 +1095,20 @@ export async function executeMain(job, ctx, deps) {
 
 // -- Strategy: Shell -----------------------------------------
 
+function isCompletionDeliveryWatcherJob(job) {
+  return /^(?:dispatch|chilisaus)-deliver:/.test(String(job?.name || ''));
+}
+
+function buildCompletionWatcherNoPayloadMessage(job, shellResult) {
+  const statusLabel = shellResult.status === 'ok'
+    ? 'completed without a deliverable result'
+    : `failed before producing a deliverable result${shellResult.errorMessage ? ` (${shellResult.errorMessage})` : ''}`;
+  return [
+    `⚠️ Completion delivery watcher for ${job.name} ${statusLabel}.`,
+    'No internal diagnostics were delivered as the completion message; check the scheduler run logs for stderr/details.',
+  ].join('\n');
+}
+
 export async function executeShell(job, ctx, deps) {
   const { runShellCommand, normalizeShellResult, log } = deps;
   const result = makeDefaultResult();
@@ -1129,18 +1143,54 @@ export async function executeShell(job, ctx, deps) {
     shell_stderr_bytes: shellResult.stderrBytes,
   };
 
-  // Shell delivery logic: announce-always sends on all results, announce sends on error only
-  const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
-  if (job.delivery_mode === 'announce-always' && announcePayload) {
-    const prefix = shellResult.status === 'ok' ? '' : `\u26a0\ufe0f Shell job failed: ${job.name}\n\n`;
-    result.deliveryOverride = `${prefix}${announcePayload}`;
-  } else if (job.delivery_mode === 'announce' && shellResult.status !== 'ok' && announcePayload) {
-    result.deliveryOverride = announcePayload;
+  if (isCompletionDeliveryWatcherJob(job)) {
+    const watcherStdout = (shellResult.stdout || '').trim();
+    const watcherStderr = (shellResult.stderr || '').trim();
+
+    if (watcherStdout) {
+      // Completion watcher stdout is the only user-facing contract.  Stderr is
+      // diagnostics-only and must never be repackaged as a "successful" final
+      // completion if the watcher suppressed the real payload.
+      result.summary = watcherStdout;
+      result.content = watcherStdout;
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        result.deliveryOverride = watcherStdout;
+      } else {
+        result.skipDelivery = true;
+      }
+    } else {
+      const noPayloadMessage = buildCompletionWatcherNoPayloadMessage(job, shellResult);
+      result.status = 'error';
+      result.summary = noPayloadMessage;
+      result.errorMessage = 'Completion delivery watcher produced no user-facing stdout payload';
+      result.content = noPayloadMessage;
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        result.deliveryOverride = noPayloadMessage;
+      } else {
+        result.skipDelivery = true;
+      }
+      log('warn', `Completion watcher produced no deliverable stdout: ${job.name}`, {
+        runId: ctx.run.id,
+        shellStatus: shellResult.status,
+        exitCode: shellResult.exitCode,
+        stderrExcerpt: watcherStderr.slice(0, 500),
+        skippedOrDisabled: /\b(?:skipped|disabled)\b/i.test(watcherStderr),
+      });
+    }
   } else {
-    result.skipDelivery = true;
+    // Shell delivery logic: announce-always sends on all results, announce sends on error only
+    const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
+    if (job.delivery_mode === 'announce-always' && announcePayload) {
+      const prefix = shellResult.status === 'ok' ? '' : `\u26a0\ufe0f Shell job failed: ${job.name}\n\n`;
+      result.deliveryOverride = `${prefix}${announcePayload}`;
+    } else if (job.delivery_mode === 'announce' && shellResult.status !== 'ok' && announcePayload) {
+      result.deliveryOverride = announcePayload;
+    } else {
+      result.skipDelivery = true;
+    }
   }
 
-  log('info', `Shell ${shellResult.status}: ${job.name}`, {
+  log('info', `Shell ${result.status}: ${job.name}`, {
     runId: ctx.run.id,
     exitCode: shellResult.exitCode,
     signal: shellResult.signal,

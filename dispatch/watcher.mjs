@@ -816,10 +816,17 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
       ? completion.deliveryText.slice(0, maxLen) + '\n\n..[truncated]'
       : completion.deliveryText;
     process.stdout.write(`🌶️ *dispatch* [${label}] completed:\n\n${reply}\n`);
-  } else {
-    process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
+    process.exit(0);
   }
-  process.exit(0);
+
+  const failureSummary = 'completed without a clean user-facing completion';
+  process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
+  markLabelError(label, failureSummary);
+  process.stdout.write(
+    `⚠️ dispatch [${label}] completed, but no clean user-facing completion was captured. ` +
+    `Internal diagnostics were suppressed; check scheduler run logs for details.\n`
+  );
+  process.exit(1);
 }
 
 function emitInterruptedOutcome(label, summary, result = null) {

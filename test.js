@@ -5562,8 +5562,9 @@ if (sub === 'status') {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    assert((trivialRun.status ?? 1) === 0, 'trivial completion: watcher still exits 0');
-    assert((trivialRun.stdout || '').trim() === '', 'trivial completion: watcher emits no delivery body');
+    assert((trivialRun.status ?? 0) !== 0, 'trivial completion: watcher exits non-zero instead of reporting success');
+    assert((trivialRun.stdout || '').includes('no clean user-facing completion was captured'), 'trivial completion: watcher emits explicit failure body');
+    assert(!(trivialRun.stdout || '').includes('completion delivery suppressed'), 'trivial completion: suppressed diagnostic does not become stdout delivery');
     assert((trivialRun.stderr || '').includes('completion delivery suppressed'), 'trivial completion: watcher logs suppression to stderr');
   }
 
@@ -8558,7 +8559,11 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
 
     const stdout = watcherRun.stdout || '';
     const stderr = watcherRun.stderr || '';
-    assert(watcherRun.status === 0, `dispatch completion ${slug}: watcher exits 0 for completed label`);
+    if (expectEnqueued) {
+      assert(watcherRun.status === 0, `dispatch completion ${slug}: watcher exits 0 for completed label with deliverable text`);
+    } else {
+      assert(watcherRun.status !== 0, `dispatch completion ${slug}: watcher exits non-zero when no deliverable text exists`);
+    }
 
     const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=?").get(jobName).cnt;
     if (stdout.trim()) {
@@ -8588,9 +8593,13 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
         assert(!msg.body.includes(unexpectedDeliveryText), `dispatch completion ${slug}: queued post-office message suppresses internal transport status text`);
       }
     } else {
-      assert(stdout.trim() === '', `dispatch completion ${slug}: watcher emits no delivery body when no meaningful completion text exists`);
+      assert(stdout.includes('no clean user-facing completion was captured'), `dispatch completion ${slug}: watcher emits explicit failure body when no meaningful completion text exists`);
+      assert(!stdout.includes('completion delivery suppressed'), `dispatch completion ${slug}: suppressed diagnostic does not become stdout delivery`);
       assert(stderr.includes('completion delivery suppressed'), `dispatch completion ${slug}: watcher logs suppressed delivery to stderr`);
-      assert(after === before, `dispatch completion ${slug}: announce path skips post-office enqueue when watcher stdout is empty`);
+      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one warning post-office message`);
+      const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
+      assert(msg.body.includes('no clean user-facing completion was captured'), `dispatch completion ${slug}: queued post-office message contains explicit warning`);
+      assert(!msg.body.includes('completion delivery suppressed'), `dispatch completion ${slug}: queued post-office message suppresses internal diagnostic text`);
     }
 
     rmSync(tempDir, { recursive: true, force: true });

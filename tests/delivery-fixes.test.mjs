@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
-import { executeMain, executeWatchdog } from '../dispatcher-strategies.js';
+import { executeMain, executeShell, executeWatchdog } from '../dispatcher-strategies.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'cli.js');
@@ -146,6 +146,89 @@ test('main fire-and-forget delivery instructions use the scheduler post office, 
   assert.match(prompts[0], /--delivery-to 'chat-123'/);
   assert.doesNotMatch(prompts[0], /send your results using the message tool/i);
   assert.equal(result.skipDelivery, true);
+});
+
+test('completion watcher shell jobs deliver stdout only and keep stderr diagnostics internal', async () => {
+  const result = await executeShell({
+    id: 'job-deliver-ok',
+    name: 'dispatch-deliver:clean-result',
+    payload_message: 'node watcher.mjs',
+    delivery_mode: 'announce-always',
+    run_timeout_ms: 30_000,
+  }, { run: { id: 'run-deliver-ok' } }, {
+    runShellCommand: async () => ({
+      stdout: '🌶️ *dispatch* [clean-result] completed:\n\nReal worker result',
+      stderr: '[watcher] debug line that must stay internal',
+      error: null,
+    }),
+    normalizeShellResult: (shellExec) => ({
+      status: 'ok',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: shellExec.stdout,
+      stderr: shellExec.stderr,
+      stdoutPath: null,
+      stderrPath: null,
+      stdoutBytes: shellExec.stdout.length,
+      stderrBytes: shellExec.stderr.length,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      summary: `stdout:\n${shellExec.stdout}\n\nstderr:\n${shellExec.stderr}`,
+      deliveryText: `stdout:\n${shellExec.stdout}\n\nstderr:\n${shellExec.stderr}`,
+      imageAttachments: [],
+      errorMessage: null,
+      contextSummary: {},
+    }),
+    log: noop,
+  });
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.deliveryOverride, '🌶️ *dispatch* [clean-result] completed:\n\nReal worker result');
+  assert.doesNotMatch(result.deliveryOverride, /debug line/);
+});
+
+test('completion watcher stderr-only success is treated as delivery failure, not a completion', async () => {
+  const logs = [];
+  const result = await executeShell({
+    id: 'job-deliver-empty',
+    name: 'chilisaus-deliver:empty-result',
+    payload_message: 'node watcher.mjs',
+    delivery_mode: 'announce-always',
+    run_timeout_ms: 30_000,
+  }, { run: { id: 'run-deliver-empty' } }, {
+    runShellCommand: async () => ({
+      stdout: '',
+      stderr: '[watcher] [empty-result] completion delivery suppressed (no meaningful reply or summary)',
+      error: null,
+    }),
+    normalizeShellResult: (shellExec) => ({
+      status: 'ok',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: shellExec.stdout,
+      stderr: shellExec.stderr,
+      stdoutPath: null,
+      stderrPath: null,
+      stdoutBytes: 0,
+      stderrBytes: shellExec.stderr.length,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      summary: `stderr:\n${shellExec.stderr}`,
+      deliveryText: `stderr:\n${shellExec.stderr}`,
+      imageAttachments: [],
+      errorMessage: null,
+      contextSummary: {},
+    }),
+    log: (level, msg, meta) => logs.push({ level, msg, meta }),
+  });
+
+  assert.equal(result.status, 'error');
+  assert.match(result.deliveryOverride, /Completion delivery watcher/);
+  assert.match(result.deliveryOverride, /without a deliverable result/i);
+  assert.doesNotMatch(result.deliveryOverride, /completion delivery suppressed/);
+  assert.ok(logs.some(entry => entry.level === 'warn' && /no deliverable stdout/.test(entry.msg)));
 });
 
 test('messages send accepts channel and delivery-to overrides for durable delivery', async (t) => {
