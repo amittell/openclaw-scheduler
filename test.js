@@ -6375,6 +6375,60 @@ console.log('\n-- Completion payload helpers --');
   assert(alreadyHumanTechnical.deliveryText === 'Updated the completion watcher so structured summaries survive handoff and users now get one clean final report.', 'completion helper: already-human technical summary passes through unchanged');
   assert(!alreadyHumanTechnical.deliveryText.includes('Technical details:'), 'completion helper: already-human technical summary does not grow a technical footer');
 
+  const observedBadCaseReport = [
+    'Implemented root cause fix for chilisaus completion delivery:',
+    '',
+    'Files changed:',
+    '- watcher-delivery.mjs: added plain-human completion summary detection.',
+    '- tests/watcher-delivery.test.mjs: added regression coverage for a >3-line section/bullet human summary delivered via done.',
+    '- tests/watcher.test.mjs: aligned existing failure-path assertions with the watcher exit-code contract.',
+    '',
+    'Validation:',
+    '- npm test -- watcher-delivery.test.mjs',
+    '- npm test -- watcher.test.mjs',
+    '',
+    'Highlights:',
+    '- The final agent report is now treated as authoritative human text.',
+    '- Fallback synthesized summaries are only used when no actual final report exists.',
+  ].join('\n');
+  const observedBadCasePayload = buildTerminalCompletionPayload({
+    summary: observedBadCaseReport,
+    checklist: { work_complete: true, tests_passed: true },
+  });
+  assert(observedBadCasePayload.summary_human === observedBadCaseReport, 'completion helper: multi-section done summary is preserved before delivery');
+  const observedBadCaseDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: observedBadCasePayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(observedBadCaseDelivery.deliveryText === observedBadCaseReport, 'completion helper: exact observed section/bullet report is passed through');
+  assert(!observedBadCaseDelivery.deliveryText.includes('Files changed: Validation:'), 'completion helper: section headings are not collapsed into fragments');
+  assert(!observedBadCaseDelivery.deliveryText.includes('Highlights: watcher-delivery.mjs'), 'completion helper: bullet details are not rewritten as synthetic highlights');
+
+  const terminalHumanReport = [
+    'Root cause:',
+    '- The watcher was summarizing the final assistant report instead of delivering it.',
+    '',
+    'Tests run:',
+    '- npm test',
+  ].join('\n');
+  const terminalHumanDelivery = resolveCompletionDelivery({
+    lastReply: terminalHumanReport,
+    completion: null,
+    fallbackSummary: null,
+  });
+  assert(terminalHumanDelivery.deliveryText === terminalHumanReport, 'completion helper: terminal assistant final report is preserved without synthesis');
+
+  const technicalMetadataOnly = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      summary: 'completed (agent signal)',
+      checklist: { work_complete: true, tests_passed: true },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(technicalMetadataOnly.source === 'technical-synthesis', 'completion helper: synthesized fallback is explicit when no human final report exists');
+
   const technicalCommitSummary = 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary';
   const humanizedTechnicalPayload = buildTerminalCompletionPayload({
     summary: technicalCommitSummary,

@@ -39,6 +39,8 @@ const HUMAN_SUMMARY_SECTION_RE = /(?:^|\n)\s*(?:Human-readable summary|Human sum
 const TECHNICAL_DETAILS_SECTION_RE = /(?:^|\n)\s*(?:Technical details?|Details(?:_technical)?)\s*:\s*/i;
 const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*/i;
 const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
+const FINAL_REPORT_HEADING_RE = /^(?:#{1,6}\s*)?(?:root cause|files? changed|changes|validation|tests?(?: run| passed)?|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|result|results|summary|highlights?|notes?|follow[- ]ups?|next steps?|blockers?|implementation|what changed|verification)\s*:?$/i;
+const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validation|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|final report|human-readable report|files changed|tests passed)\b/i;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -74,6 +76,56 @@ function cleanMarkdown(text) {
     .replace(/__([^_]+)__/g, '$1')
     .replace(/^#{1,6}\s+/gm, '')
     .replace(/^>\s?/gm, '');
+}
+
+function normalizeReportLineEndings(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return null;
+  return stripAnsi(normalized)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+$/g, ''))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function isLikelyHumanFinalReport(text) {
+  const normalized = normalizeReportLineEndings(text);
+  if (!normalized) return false;
+  if (isGenericOrTrivial(normalized)) return false;
+  if (isInternalTransportNoiseText(normalized)) return false;
+  if (looksLikeRawPayloadText(normalized)) return false;
+  if (looksLikeGunbrokerReport(normalized)) return false;
+
+  const rawLines = normalized
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !/^```/.test(line));
+  if (rawLines.length < 3) return false;
+
+  const cleanedLines = rawLines.map(line => cleanMarkdown(line).replace(/\s+/g, ' ').trim());
+  const headingCount = cleanedLines.filter(line => FINAL_REPORT_HEADING_RE.test(line)).length;
+  const itemCount = rawLines.filter(isItemLine).length;
+  const hasCue = FINAL_REPORT_CUE_RE.test(normalized);
+  const hasSectionLabel = /^#{1,6}\s+\S|^[A-Za-z][A-Za-z0-9 /_-]{2,60}:$/m.test(normalized);
+
+  // This is the key path for real completion reports from agents: multiple
+  // human-readable sections plus bullets. Those reports are already the final
+  // answer and must not be collapsed into "Files changed: Validation: ...".
+  if (hasCue && headingCount >= 2 && (itemCount >= 1 || rawLines.length >= 5)) return true;
+
+  // Allow slightly shorter reports with an explicit root cause / validation shape.
+  if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
+
+  return false;
+}
+
+function getPassThroughHumanFinalReport(text) {
+  const normalized = normalizeReportLineEndings(text);
+  if (!normalized) return null;
+  return isLikelyHumanFinalReport(normalized) ? normalized : null;
 }
 
 function isGenericOrTrivial(text) {
@@ -758,6 +810,9 @@ export function humanizeCompletionText(value) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
+  const passThroughReport = getPassThroughHumanFinalReport(raw);
+  if (passThroughReport) return passThroughReport;
+
   const structuredSections = extractStructuredSummarySections(raw);
   const summarySource = normalizeCompletionText(structuredSections?.summary || raw);
   if (!summarySource) return null;
@@ -893,6 +948,9 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
 export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
+
+  const passThroughReport = getPassThroughHumanFinalReport(raw);
+  if (passThroughReport) return passThroughReport;
 
   if (!skipEmbeddedObject) {
     const parsed = extractEmbeddedCompletionObject(raw);
