@@ -4982,8 +4982,10 @@ console.log('\n-- Dispatch Spawn Failure Detection --');
   assert(indexSrc.includes('Synced as spawn failure'), 'cmdSync can reconcile local bootstrap failures as errors');
   assert(indexSrc.includes('never produced transcript/history within'), 'cmdEnqueue escalates silent bootstrap failures');
   // post-spawn poll code exists
-  assert(indexSrc.includes('spawn-warning'), 'Fix 3: legacy spawn-warning marker remains in source for compatibility');
+  assert(indexSrc.includes("status: 'error'"), 'Fix 3: post-spawn poll escalates missing startup signal to error');
   assert(indexSrc.includes('SPAWN_POLL_MAX'), 'Fix 3: post-spawn poll loop present');
+  assert(indexSrc.includes('hasStartedSignal'), 'Fix 3: post-spawn poll accepts session start signal');
+  assert(indexSrc.includes('signal.hasStartedSignal || signal.hasActivitySignal'), 'Fix 3: post-spawn poll does not require transcript/history during startup');
 
   // 2. Status/sync bootstrap reconciliation: session entered sessions store but
   // never produced transcript/history, so dispatch should mark it as a spawn failure

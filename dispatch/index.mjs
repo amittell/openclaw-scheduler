@@ -352,7 +352,17 @@ function getSessionJsonlPath(agent = 'main', sessionId) {
 
 function inspectSessionActivitySignal(sessionKey, sessionsStore) {
   if (!sessionKey || !sessionsStore?.[sessionKey]) {
-    return { found: false, hasActivitySignal: false, messageCount: null, jsonlExists: false, hasTokens: false, updatedAtMs: null };
+    return {
+      found: false,
+      hasStartedSignal: false,
+      hasActivitySignal: false,
+      messageCount: null,
+      jsonlExists: false,
+      hasTokens: false,
+      updatedAtMs: null,
+      sessionStartedAtMs: null,
+      sessionId: null,
+    };
   }
 
   const agent = agentFromSessionKey(sessionKey) || 'main';
@@ -360,6 +370,9 @@ function inspectSessionActivitySignal(sessionKey, sessionsStore) {
   const jsonlPath = getSessionJsonlPath(agent, entry.sessionId);
   const jsonlExists = jsonlPath ? existsSync(jsonlPath) : false;
   const hasTokens = typeof entry.totalTokens === 'number' && entry.totalTokens > 0;
+  const sessionStartedAtMs = toTimestampMs(entry.sessionStartedAt || entry.startedAt);
+  const updatedAtMs = toTimestampMs(entry.updatedAt);
+  const hasStartedSignal = Boolean(entry.sessionId) || sessionStartedAtMs !== null || updatedAtMs !== null;
   let messageCount = null;
 
   try {
@@ -371,11 +384,14 @@ function inspectSessionActivitySignal(sessionKey, sessionsStore) {
 
   return {
     found: true,
+    hasStartedSignal,
     hasActivitySignal: jsonlExists || hasTokens || (typeof messageCount === 'number' && messageCount > 0),
     messageCount,
     jsonlExists,
     hasTokens,
-    updatedAtMs: toTimestampMs(entry.updatedAt),
+    updatedAtMs,
+    sessionStartedAtMs,
+    sessionId: entry.sessionId || null,
   };
 }
 
@@ -1204,9 +1220,10 @@ async function cmdEnqueue(flags) {
 
     // -- Post-spawn verification (Fix 3) --------------------------------
     // Canary: poll sessions.json up to 3 times at 10s intervals to confirm the
-    // session appeared in the store. Non-fatal -- output is already written above.
-    // If the session never shows up, stderr gets a loud warning and ledger status
-    // is set to 'spawn-warning'. The watcher provides the definitive error path.
+    // session appeared in the store. A session store entry with sessionId or
+    // startedAt/sessionStartedAt is enough: long first turns may not flush JSONL,
+    // token counts, or chat.history until the model call completes. The delivery
+    // watcher owns later completion/failure handling.
     const SPAWN_POLL_MAX = 3;
     const SPAWN_POLL_DELAY_MS = 10_000;
     let spawnConfirmed = false;
@@ -1214,7 +1231,7 @@ async function cmdEnqueue(flags) {
       await sleep(SPAWN_POLL_DELAY_MS);
       const spawnStore = readSessionsStore(agent);
       const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
-      if (signal.hasActivitySignal) {
+      if (signal.hasStartedSignal || signal.hasActivitySignal) {
         spawnConfirmed = true;
         break;
       }
