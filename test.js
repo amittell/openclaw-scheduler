@@ -4987,10 +4987,10 @@ console.log('\n-- Dispatch Spawn Failure Detection --');
   assert(indexSrc.includes('hasStartedSignal'), 'Fix 3: post-spawn poll accepts session start signal');
   assert(indexSrc.includes('signal.hasStartedSignal || signal.hasActivitySignal'), 'Fix 3: post-spawn poll does not require transcript/history during startup');
 
-  // 2. Status/sync bootstrap reconciliation: session entered sessions store but
-  // never produced transcript/history, so dispatch should mark it as a spawn failure
-  // instead of an interrupted idle session. Use an age inside the bootstrap
-  // reconciliation window (> startupGrace, < startupGrace * 2).
+  // 2. Status/sync bootstrap reconciliation: a Codex session can enter
+  // sessions.json before chat.history, JSONL, or token counters are written.
+  // PR #10 keeps that state running unless the gateway lane recorded an
+  // explicit startup error; the watcher/job timeout owns later failure handling.
   const bootstrapDir = mkdtempSync(join(tmpdir(), 'dispatch-bootstrap-'));
   const bootstrapHome = join(bootstrapDir, 'home');
   const bootstrapBin = join(bootstrapDir, 'bin');
@@ -5050,10 +5050,10 @@ process.exit(1);
   });
   const statusJson = JSON.parse(statusOut);
   const statusLabels = JSON.parse(readFileSync(bootstrapStatusLabels, 'utf8'));
-  assert(statusJson.status === 'error', 'bootstrap status: auto-resolves local startup failure to error');
-  assert((statusJson.syncAction || '').includes('spawn failure'), 'bootstrap status: reports spawn-failure syncAction');
-  assert((statusJson.error || '').includes('spawn-failure: session entered sessions store but never wrote transcript/history'), 'bootstrap status: preserves spawn-failure diagnostic');
-  assert(statusLabels['bootstrap-status']?.status === 'error', 'bootstrap status: labels.json updated to error');
+  assert(statusJson.status === 'running', 'bootstrap status: session with no transcript remains running while booting');
+  assert(!statusJson.syncAction, 'bootstrap status: no spawn-failure syncAction without explicit lane error');
+  assert(!statusJson.error, 'bootstrap status: no spawn-failure diagnostic without explicit lane error');
+  assert(statusLabels['bootstrap-status']?.status === 'running', 'bootstrap status: labels.json remains running');
 
   const bootstrapSyncLabels = join(bootstrapDir, 'labels-sync.json');
   writeFileSync(bootstrapSyncLabels, JSON.stringify({
@@ -5079,10 +5079,10 @@ process.exit(1);
   });
   const syncJson = JSON.parse(syncOut);
   const syncLabels = JSON.parse(readFileSync(bootstrapSyncLabels, 'utf8'));
-  assert(syncJson.changes === 1, 'bootstrap sync: reports one reconciled label');
-  assert(syncJson.details?.[0]?.to === 'error', 'bootstrap sync: reconciles running label to error');
-  assert(syncLabels['bootstrap-sync']?.status === 'error', 'bootstrap sync: labels.json updated to error');
-  assert((syncLabels['bootstrap-sync']?.summary || '').includes('Synced as spawn failure'), 'bootstrap sync: stores spawn-failure summary');
+  assert(syncJson.changes === 0, 'bootstrap sync: does not reconcile booting session without explicit lane error');
+  assert((syncJson.details || []).length === 0, 'bootstrap sync: reports no bootstrap failure detail');
+  assert(syncLabels['bootstrap-sync']?.status === 'running', 'bootstrap sync: labels.json remains running');
+  assert(!(syncLabels['bootstrap-sync']?.summary || '').includes('Synced as spawn failure'), 'bootstrap sync: stores no spawn-failure summary');
 
   // 3. Spawn-failure path: watcher exits non-zero when session never appears in gateway
   //    We use a mock dispatch that always returns status=done with liveness error,
@@ -6164,16 +6164,18 @@ if (sub === 'status') {
   rmSync(tmpDir, { recursive: true, force: true });
 }
 
-// -- Watcher run_timeout_ms covers MAX_DEADLINE_EXTENSION --
-console.log('\n-- Watcher run_timeout_ms ceiling --');
+// -- Watcher jobs quick-poll instead of blocking dispatcher --
+console.log('\n-- Watcher quick-poll scheduler jobs --');
 {
   const indexSrc = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'index.mjs'),
     'utf8'
   );
-  // The run_timeout_ms formula must use Math.max to cover the rolling extension cap
-  assert(indexSrc.includes('Math.max(watcherTimeoutS, 4 * 3600)'), 'run_timeout_ms: uses Math.max to cover MAX_DEADLINE_EXTENSION (4h) ceiling');
-  assert(indexSrc.includes('420 * 1000'), 'run_timeout_ms: includes 7min headroom (2*FLAT_WINDOW + slop)');
+  assert(indexSrc.includes('--once'), 'watcher job: invokes watcher.mjs in one-shot quick-poll mode');
+  assert(indexSrc.includes("schedule_kind:            'cron'"), 'watcher job: uses cron schedule, not long-running at-job');
+  assert(indexSrc.includes("schedule_cron:            config.deliver_watcher_cron || '* * * * *'"), 'watcher job: polls every minute by default');
+  assert(indexSrc.includes('next_run_at:              nowUtc'), 'watcher job: first quick-poll tick is due immediately');
+  assert(indexSrc.includes('run_timeout_ms:           120_000'), 'watcher job: has a short per-tick timeout');
 }
 
 // ===========================================================

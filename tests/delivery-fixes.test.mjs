@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -120,6 +120,16 @@ test('dispatch watchdog checks terminal result output, not stuck-list stdout', (
   assert.match(dispatchIndexSrc, /result --label/);
 });
 
+test('delivery watcher jobs are non-blocking cron quick-poll jobs', () => {
+  const dispatchIndexSrc = readFileSync(join(__dirname, '..', 'dispatch', 'index.mjs'), 'utf8');
+  assert.match(dispatchIndexSrc, /--once/);
+  assert.match(dispatchIndexSrc, /schedule_kind:\s+'cron'/);
+  assert.match(dispatchIndexSrc, /schedule_cron:\s+config\.deliver_watcher_cron \|\| '\* \* \* \* \*'/);
+  assert.match(dispatchIndexSrc, /next_run_at:\s+nowUtc/);
+  assert.match(dispatchIndexSrc, /run_timeout_ms:\s+120_000/);
+  assert.doesNotMatch(dispatchIndexSrc, /schedule_kind:\s+'at'[\s\S]{0,400}watcherCmd/);
+});
+
 test('main fire-and-forget delivery instructions use the scheduler post office, not the message tool', async () => {
   const prompts = [];
 
@@ -229,6 +239,191 @@ test('completion watcher stderr-only success is treated as delivery failure, not
   assert.match(result.deliveryOverride, /without a deliverable result/i);
   assert.doesNotMatch(result.deliveryOverride, /completion delivery suppressed/);
   assert.ok(logs.some(entry => entry.level === 'warn' && /no deliverable stdout/.test(entry.msg)));
+});
+
+test('completion watcher pending quick-poll tick is skipped without delivery failure', async () => {
+  const logs = [];
+  const result = await executeShell({
+    id: 'job-deliver-pending',
+    name: 'chilisaus-deliver:pending-result',
+    payload_message: 'node watcher.mjs --once',
+    delivery_mode: 'announce-always',
+    run_timeout_ms: 30_000,
+  }, { run: { id: 'run-deliver-pending' } }, {
+    runShellCommand: async () => ({
+      stdout: '',
+      stderr: '[watcher] WATCHER_PENDING label=pending-result reason=target still running',
+      error: null,
+    }),
+    normalizeShellResult: (shellExec) => ({
+      status: 'ok',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: shellExec.stdout,
+      stderr: shellExec.stderr,
+      stdoutPath: null,
+      stderrPath: null,
+      stdoutBytes: 0,
+      stderrBytes: shellExec.stderr.length,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      summary: `stderr:\n${shellExec.stderr}`,
+      deliveryText: `stderr:\n${shellExec.stderr}`,
+      imageAttachments: [],
+      errorMessage: null,
+      contextSummary: {},
+    }),
+    log: (level, msg, meta) => logs.push({ level, msg, meta }),
+  });
+
+  assert.equal(result.status, 'skipped');
+  assert.equal(result.skipDelivery, true);
+  assert.equal(result.deliveryOverride, null);
+  assert.equal(result.idemAction, 'release');
+  assert.equal(logs.some(entry => /no deliverable stdout/.test(entry.msg)), false);
+});
+
+test('watcher --once exits quickly while target session is incomplete', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-incomplete-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'quick-poll-incomplete';
+  const sessionKey = 'agent:main:subagent:quick-poll';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+
+  try {
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 600,
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: 5000 }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const started = Date.now();
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '600', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const elapsedMs = Date.now() - started;
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0);
+    assert.equal((run.stdout || '').trim(), '');
+    assert.match(run.stderr || '', /WATCHER_PENDING/);
+    assert.ok(elapsedMs < 2000, `watcher --once should exit quickly, elapsed=${elapsedMs}ms`);
+    assert.equal(labels[label].status, 'running');
+    assert.ok(labels[label].lastPing, 'watcher --once records one lastPing');
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once detects stale sessions despite fresh watcher lastPing', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-stale-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'quick-poll-stale';
+  const sessionKey = 'agent:main:subagent:stale-session';
+  const sessionId = 'stale-jsonl-id';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: new Date(Date.now() - 77 * 60 * 1000).toISOString(),
+        model: 'test',
+      },
+    }) + '\n');
+    const jsonlPath = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(jsonlPath, JSON.stringify({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Still working.' }],
+    }) + '\n');
+    const staleDate = new Date(Date.now() - 77 * 60 * 1000);
+    utimesSync(jsonlPath, staleDate, staleDate);
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
+        timeoutSeconds: 7200,
+        lastPing: new Date().toISOString(),
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: ${77 * 60 * 1000} }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '7200', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0);
+    assert.match(run.stdout || '', /agent session stalled/);
+    assert.equal(labels[label].status, 'error');
+    assert.match(labels[label].error, /agent session stalled/);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('messages send accepts channel and delivery-to overrides for durable delivery', async (t) => {

@@ -1099,6 +1099,11 @@ function isCompletionDeliveryWatcherJob(job) {
   return /^(?:dispatch|chilisaus)-deliver:/.test(String(job?.name || ''));
 }
 
+function isCompletionWatcherPendingTick(shellResult) {
+  return !(shellResult.stdout || '').trim()
+    && /\bWATCHER_PENDING\b/.test(shellResult.stderr || '');
+}
+
 function buildCompletionWatcherNoPayloadMessage(job, shellResult) {
   const statusLabel = shellResult.status === 'ok'
     ? 'completed without a deliverable result'
@@ -1147,7 +1152,14 @@ export async function executeShell(job, ctx, deps) {
     const watcherStdout = (shellResult.stdout || '').trim();
     const watcherStderr = (shellResult.stderr || '').trim();
 
-    if (watcherStdout) {
+    if (isCompletionWatcherPendingTick(shellResult)) {
+      result.status = 'skipped';
+      result.summary = 'Completion delivery watcher pending; target session is still running';
+      result.content = '';
+      result.errorMessage = null;
+      result.idemAction = 'release';
+      result.skipDelivery = true;
+    } else if (watcherStdout) {
       // Completion watcher stdout is the only user-facing contract.  Stderr is
       // diagnostics-only and must never be repackaged as a "successful" final
       // completion if the watcher suppressed the real payload.

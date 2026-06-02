@@ -685,6 +685,112 @@ function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
 }
 
 /**
+ * Check the JSONL tail for a pending tool handoff without requiring recent
+ * file activity. Long-running tool calls can leave the transcript flat for
+ * minutes, so stale mtime alone is not enough to declare the agent stuck.
+ *
+ * @param {string} sessionId - Internal session UUID
+ * @param {string} agentDir - Agent directory (default: 'main')
+ * @returns {string|null} reason string if a tool handoff appears pending
+ */
+function getJsonlPendingToolReason(sessionId, agentDir = 'main') {
+  const lastLines = readJsonlLastLines(sessionId, agentDir, 3);
+  if (!lastLines || lastLines.length === 0) return null;
+
+  const last = lastLines[lastLines.length - 1];
+
+  if (last?.role === 'assistant') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    const toolUse = content.find(c => c?.type === 'tool_use');
+    if (toolUse) {
+      return `last assistant entry has tool_use (${toolUse.name || 'unknown'}) -- awaiting tool result`;
+    }
+    if (last.type === 'tool_use') {
+      return `last entry is tool_use (${last.name || 'unknown'}) -- awaiting tool result`;
+    }
+  }
+
+  if (last?.role === 'user') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    if (content.some(c => c?.type === 'tool_result')) {
+      return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+    }
+  }
+
+  if (last?.type === 'tool_result') {
+    return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+  }
+
+  return null;
+}
+
+function parseTimestampMs(value) {
+  if (!value) return null;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (value instanceof Date) {
+    const timestamp = value.getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Detect an agent session that has stopped making progress even though the
+ * watcher process itself is still alive and writing lastPing.
+ *
+ * This closes the failure mode where OpenClaw's Codex app-server retires a
+ * timed-out turn, but dispatch status keeps reporting "running" because the
+ * delivery watcher is still polling.
+ */
+function getRunningSessionStallReason(status, thresholdMs) {
+  if (!status?.sessionKey) return null;
+
+  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const entry = getSessionStoreEntry(status.sessionKey);
+  if (!entry) return null;
+
+  const sessionId = entry.sessionId || null;
+  const now = Date.now();
+  const activityTimes = [
+    parseTimestampMs(entry.updatedAt),
+    parseTimestampMs(entry.lastActivityAt),
+    parseTimestampMs(entry.sessionStartedAt),
+    parseTimestampMs(entry.startedAt),
+  ].filter(t => typeof t === 'number');
+
+  const jsonlMtime = sessionId ? getSessionJsonlMtime(sessionId, sessionAgent) : null;
+  if (typeof jsonlMtime === 'number') activityTimes.push(jsonlMtime);
+
+  if (typeof status?.liveness?.ageMs === 'number' && status.liveness.ageMs < thresholdMs) {
+    return null;
+  }
+
+  const lastActivityMs = activityTimes.length ? Math.max(...activityTimes) : null;
+  if (lastActivityMs !== null && now - lastActivityMs < thresholdMs) {
+    return null;
+  }
+
+  const pendingToolReason = sessionId ? getJsonlPendingToolReason(sessionId, sessionAgent) : null;
+  if (pendingToolReason) {
+    process.stderr.write(
+      `[watcher] ${status.label || 'session'} stale telemetry but pending tool handoff detected: ${pendingToolReason}\n`
+    );
+    return null;
+  }
+
+  const idleMinutes = lastActivityMs === null
+    ? Math.ceil(thresholdMs / 60000)
+    : Math.max(1, Math.floor((now - lastActivityMs) / 60000));
+  return (
+    `agent session stalled: no session/jsonl activity for ~${idleMinutes}min ` +
+    `while delivery watcher remained alive; likely app-server turn retired or stopped producing events`
+  );
+}
+
+/**
  * Read the last assistant entry's stop_reason from the session JSONL.
  * Returns the stop_reason string (e.g. 'end_turn', 'tool_use') or null if unavailable.
  *
@@ -754,12 +860,15 @@ function markLabelError(label, errorSummary) {
     updateExistingLabel(label, (entry) => {
       if (entry.status === 'done') return false;
       entry.status = 'error';
+      entry.error = errorSummary || 'failed without result';
       entry.summary = errorSummary || 'failed without result';
     });
   } catch (e) {
     process.stderr.write(`[watcher] markLabelError failed: ${e.message}\n`);
   }
 }
+
+let exitZeroOnTerminal = false;
 
 /**
  * Format and output the delivery message, then exit 0.
@@ -794,7 +903,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
           `**Error:** ${stderr || 'non-zero exit'}\n\n` +
           `Job marked as \`error\`. The agent may have reported done without completing the actual work.\n`
         );
-        process.exit(1);
+        process.exit(exitZeroOnTerminal ? 0 : 1);
       }
     }
   } catch (loadErr) {
@@ -826,7 +935,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     `⚠️ dispatch [${label}] completed, but no clean user-facing completion was captured. ` +
     `Internal diagnostics were suppressed; check scheduler run logs for details.\n`
   );
-  process.exit(1);
+  process.exit(exitZeroOnTerminal ? 0 : 1);
 }
 
 function emitInterruptedOutcome(label, summary, result = null) {
@@ -836,12 +945,12 @@ function emitInterruptedOutcome(label, summary, result = null) {
     `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
     `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
   );
-  process.exit(1);
+  process.exit(exitZeroOnTerminal ? 0 : 1);
 }
 
 function emitTimeoutOutcome(label, message, result = null) {
   process.stdout.write(`${message}${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`);
-  process.exit(1);
+  process.exit(exitZeroOnTerminal ? 0 : 1);
 }
 
 // -- Watcher heartbeat interval ref --------------------------------------
@@ -876,6 +985,8 @@ const flags = parseFlags(process.argv.slice(2));
 const label       = flags.label;
 const timeoutS    = parseInt(flags.timeout || '600', 10);
 const pollS       = parseInt(flags['poll-interval'] || '20', 10);
+const once        = flags.once === true || flags.once === 'true';
+exitZeroOnTerminal = once;
 
 // How long a session must be idle before we proactively check result
 const IDLE_RESULT_CHECK_MS = 60000;
@@ -883,6 +994,144 @@ const IDLE_RESULT_CHECK_MS = 60000;
 if (!label) {
   process.stderr.write('[watcher] --label is required\n');
   process.exit(2);
+}
+
+function touchWatcherPing(label) {
+  updateExistingLabel(label, (entry) => {
+    if (entry.status !== 'running') return false;
+    entry.lastPing = new Date().toISOString();
+  });
+}
+
+function markWatcherPending(label, reason = 'target still running') {
+  process.stderr.write(`[watcher] WATCHER_PENDING label=${label} reason=${reason}\n`);
+  process.exit(0);
+}
+
+function clearWatcherRetryAfter(label) {
+  updateExistingLabel(label, (entry) => {
+    if (!entry.watcherRetryAfter) return false;
+    delete entry.watcherRetryAfter;
+  });
+}
+
+function handleOnce529(label, errorMsg) {
+  const labels = loadLabels();
+  const entry = labels[label] || {};
+  const retryCount = getRetryCount(label);
+
+  if (retryCount >= MAX_529_RETRIES) {
+    markLabelError(label, `max_retries_exceeded (${retryCount}x 529): ${errorMsg}`);
+    process.stdout.write(
+      `🌶️ *dispatch* [${label}] failed after ${MAX_529_RETRIES} retries (529 overload)\n` +
+      `Error: ${errorMsg}\n`
+    );
+    process.exit(0);
+  }
+
+  const retryAfterMs = parseTimestampMs(entry.watcherRetryAfter);
+  if (!retryAfterMs) {
+    const retryResult = attempt529Retry(label, retryCount, errorMsg);
+    if (!retryResult.retry) return handleOnce529(label, errorMsg);
+    updateExistingLabel(label, (current) => {
+      current.watcherRetryAfter = new Date(Date.now() + retryResult.delayMs).toISOString();
+    });
+    markWatcherPending(label, `529 retry scheduled for future tick (${retryResult.delayMs / 1000}s)`);
+  }
+
+  if (Date.now() < retryAfterMs) {
+    markWatcherPending(label, '529 retry backoff active');
+  }
+
+  if (respawnSession(label)) {
+    clearWatcherRetryAfter(label);
+    markWatcherPending(label, '529 retry dispatched');
+  }
+
+  markLabelError(label, `529 retry failed -- could not respawn session: ${errorMsg}`);
+  process.stdout.write(
+    `🌶️ *dispatch* [${label}] 529 retry failed -- could not respawn session\n` +
+    `Error: ${errorMsg}\n`
+  );
+  process.exit(0);
+}
+
+function runOnceAndExit() {
+  try {
+    touchWatcherPing(label);
+  } catch {
+    // Best-effort -- a quick-poll tick must not fail because heartbeat metadata raced.
+  }
+
+  const status = dispatch('status', ['--label', label]);
+  if (!status?.ok) {
+    markWatcherPending(label, 'status unavailable');
+  }
+
+  if (status.status === 'error') {
+    const errorMsg = status.error || status.summary || '';
+    if (is529Error(errorMsg)) {
+      handleOnce529(label, errorMsg);
+    }
+  }
+
+  if (status.status !== 'running') {
+    const terminalResult = dispatch('result', ['--label', label]);
+    const terminalCompletion = terminalResult?.completion || status?.completion || null;
+
+    if (status.status === 'done') {
+      const currentRetryCount = getRetryCount(label);
+      if (currentRetryCount > 0) setRetryCount(label, 0);
+      const gwRetryCount = getGwRestartRetryCount(label);
+      if (gwRetryCount > 0) setGwRestartRetryCount(label, 0);
+      deliverResult(label, terminalResult?.lastReply, status.summary, terminalCompletion);
+    }
+
+    if (status.status === 'interrupted') {
+      emitInterruptedOutcome(label, status.summary, terminalResult);
+    }
+
+    const summary = status.error || status.summary || `terminal failure (${status.status || 'unknown'})`;
+    markLabelError(label, summary);
+    process.stdout.write(`🌶️ *dispatch* [${label}] failed\nSummary: ${summary}\n`);
+    process.exit(0);
+  }
+
+  if (status.sessionKey) {
+    const entry = getSessionStoreEntry(status.sessionKey);
+    const sessionId = entry?.sessionId || null;
+    const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+    const terminalJsonlReply = sessionId ? getSessionTerminalReply(sessionId, sessionAgent) : null;
+    if (sessionId && terminalJsonlReply && isSessionCleanlyFinished(sessionId, sessionAgent)) {
+      const result = dispatch('result', ['--label', label]);
+      deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
+    }
+  }
+
+  const ageMs = status.liveness?.ageMs;
+  if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
+    const result = dispatch('result', ['--label', label]);
+    if (result?.lastReply || hasCompletionSignal(result?.completion)) {
+      deliverResult(label, result?.lastReply || null, null, result?.completion || null);
+    }
+
+    const stallReason = getRunningSessionStallReason(status, IDLE_RESULT_CHECK_MS);
+    if (stallReason) {
+      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+      markLabelError(label, stallReason);
+      process.stdout.write(
+        `❌ *dispatch* [${label}] failed\n` +
+        `Summary: ${stallReason}\n`
+      );
+      process.exit(0);
+    }
+  }
+
+  markWatcherPending(label);
+}
+
+if (once) {
+  runOnceAndExit();
 }
 
 // -- Start heartbeat -----------------------------------------------------
@@ -1244,6 +1493,17 @@ while (Date.now() < deadline) {
     const result = dispatch('result', ['--label', label]);
     if (result?.lastReply || hasCompletionSignal(result?.completion)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
+    }
+
+    const stallReason = getRunningSessionStallReason(status, IDLE_RESULT_CHECK_MS);
+    if (stallReason) {
+      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+      markLabelError(label, stallReason);
+      process.stdout.write(
+        `❌ *dispatch* [${label}] failed\n` +
+        `Summary: ${stallReason}\n`
+      );
+      process.exit(1);
     }
   }
 

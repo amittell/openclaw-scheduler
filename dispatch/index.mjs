@@ -205,6 +205,19 @@ function setLabel(name, data) {
   return labels[name];
 }
 
+function setLabelDone(name, data) {
+  const labels = mutateLabels((current) => {
+    current[name] = {
+      ...current[name],
+      ...data,
+      status: 'done',
+      updatedAt: new Date().toISOString(),
+    };
+    delete current[name].error;
+  });
+  return labels[name];
+}
+
 // -- Gateway Calls --------------------------------------------
 
 /**
@@ -401,12 +414,7 @@ function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, 
   }
 
   const ageMs = spawnedAtMs ? Date.now() - spawnedAtMs : Infinity;
-  if (ageMs < startupGraceMs || ageMs > startupGraceMs * 2) {
-    return { shouldResolve: false, reason: null, errorMsg: null };
-  }
-
-  const signal = inspectSessionActivitySignal(sessionKey, sessionsStore);
-  if (signal.hasActivitySignal) {
+  if (ageMs < startupGraceMs) {
     return { shouldResolve: false, reason: null, errorMsg: null };
   }
 
@@ -419,22 +427,10 @@ function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, 
     };
   }
 
-  if (signal.messageCount === 0) {
-    return {
-      shouldResolve: true,
-      reason: 'session entered sessions store but never wrote transcript/history',
-      errorMsg: 'spawn-failure: session entered sessions store but never wrote transcript/history',
-    };
-  }
-
-  if (signal.updatedAtMs !== null && spawnedAtMs && signal.updatedAtMs <= spawnedAtMs + 5000) {
-    return {
-      shouldResolve: true,
-      reason: 'session entered sessions store but never showed any activity',
-      errorMsg: 'spawn-failure: session entered sessions store but never showed any activity',
-    };
-  }
-
+  // A Codex session can enter the sessions store before chat.history, JSONL, or
+  // token counters are written. Treat that as "still booting"; the watcher and
+  // job timeout own later failure handling. Only fail fast when the gateway has
+  // recorded an explicit lane error above.
   return { shouldResolve: false, reason: null, errorMsg: null };
 }
 
@@ -699,7 +695,7 @@ function quoteForSingleQuotedShell(value) {
 }
 
 /**
- * Schedule a one-shot delivery watcher shell job for a dispatch label.
+ * Schedule a quick-poll delivery watcher shell job for a dispatch label.
  * Used both for the initial watcher registration and SIGTERM handoffs.
  */
 function scheduleDeliveryWatcherJob({
@@ -720,13 +716,19 @@ function scheduleDeliveryWatcherJob({
   const watcherTimeoutS = Number(timeoutSeconds) + 120;
   const idleThresholdS = Number(idleThresholdSeconds) || 300;
   const sq = quoteForSingleQuotedShell;
-  const watcherCmd = `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' '${sq(process.execPath)}' '${sq(watcherPath)}' --label '${sq(label)}' --timeout ${watcherTimeoutS} --poll-interval 20 --idle-threshold ${idleThresholdS}`;
+  const watcherCmd =
+    `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
+    `DISPATCH_INDEX_PATH='${sq(join(__dirname, 'index.mjs'))}' ` +
+    `'${sq(process.execPath)}' '${sq(watcherPath)}' ` +
+    `--label '${sq(label)}' --timeout ${watcherTimeoutS} ` +
+    `--poll-interval 20 --idle-threshold ${idleThresholdS} --once`;
 
   const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const jobSpec = {
     name:                     `${agentBrand}-deliver:${label}${nameSuffix}`,
-    schedule_kind:            'at',
-    schedule_at:              nowUtc,
+    schedule_kind:            'cron',
+    schedule_cron:            config.deliver_watcher_cron || '* * * * *',
+    next_run_at:              nowUtc,
     session_target:           'shell',
     payload_kind:             'shellCommand',
     payload_message:          watcherCmd,
@@ -736,8 +738,7 @@ function scheduleDeliveryWatcherJob({
     delivery_guarantee:       'at-least-once',
     ttl_hours:                config.deliver_watcher_ttl_hours ?? 48,
     overlap_policy:           'skip',
-    run_timeout_ms:           Math.max(watcherTimeoutS, 4 * 3600) * 1000
-                              + 420 * 1000,
+    run_timeout_ms:           120_000,
     delete_after_run:         1,
     origin:                   origin || 'system',
   };
@@ -1104,9 +1105,10 @@ async function cmdEnqueue(flags) {
     }
 
     // -- Register scheduler watcher for delivery ---------------
-    // Creates a one-shot shell job that runs watcher.mjs (blocks until session
-    // completes, outputs result). The scheduler's handleDelivery delivers with
-    // retry, alias resolution, and audit trail in scheduler.db.
+    // Creates a quick-poll shell job that runs watcher.mjs once per tick. Empty
+    // stdout means "still running" and advances the next tick without delivery.
+    // Terminal stdout goes through the scheduler's handleDelivery with retry,
+    // alias resolution, and audit trail in scheduler.db.
     // The watcher is the only final-delivery path for dispatched jobs.
     const sq = s => String(s).replace(/'/g, "'\\''");
     let schedulerWatcherOk = false;
@@ -1989,7 +1991,7 @@ async function cmdDone(flags) {
     // Label was never registered (e.g. direct subagent spawn, not via enqueue).
     // This is not an error -- the work completed, the label just wasn't tracked.
     process.stderr.write(`[${BRAND}] warn: no session found for label "${label}" -- registering as done\n`);
-    setLabel(label, { status: 'done', summary, completion, ...(sha ? { sha } : {}) });
+    setLabelDone(label, { summary, completion, ...(sha ? { sha } : {}) });
 
     // No watcher is polling for this label, so actively notify via the gateway
     // post office using delivery config from config.json as fallback target.
@@ -2018,8 +2020,7 @@ async function cmdDone(flags) {
     return;
   }
 
-  setLabel(label, {
-    status:  'done',
+  setLabelDone(label, {
     summary,
     completion,
     ...(sha ? { sha } : {}),
