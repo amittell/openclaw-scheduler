@@ -3625,12 +3625,27 @@ console.log('\n-- Sync Auth Store Integration with executeAgent --');
   const strategiesSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher-strategies.js'), 'utf-8');
   const syncCallIdx = strategiesSrc.indexOf('syncAuthStoreToSession: syncAuth');
   assert(syncCallIdx > -1, 'dispatcher-strategies.js destructures syncAuthStoreToSession');
-  // Find the actual syncAuth() invocation and the actual turnResult = await runAgentTurnWithActivityTimeout() call
+  // Find the actual syncAuth() invocation and the dispatch-primitive invocation.
+  // executeAgent calls the sanctioned isolated dispatch primitive via a local
+  // alias `dispatchAgentTurn` that resolves to runIsolatedAgentTurn (or its
+  // legacy alias runAgentTurnWithActivityTimeout) -- accept either name so the
+  // ordering invariant stays meaningful as the helper is renamed.
   const syncInvokeIdx = strategiesSrc.indexOf('syncAuth(job.agent_id');
-  const turnInvokeIdx = strategiesSrc.indexOf('await runAgentTurnWithActivityTimeout(');
+  const turnInvokeIdx = (() => {
+    const candidates = [
+      'await dispatchAgentTurn(',
+      'await runIsolatedAgentTurn(',
+      'await runAgentTurnWithActivityTimeout(',
+    ];
+    for (const needle of candidates) {
+      const idx = strategiesSrc.indexOf(needle);
+      if (idx > -1) return idx;
+    }
+    return -1;
+  })();
   assert(syncInvokeIdx > -1, 'syncAuth invocation found');
-  assert(turnInvokeIdx > -1, 'runAgentTurnWithActivityTimeout invocation found');
-  assert(turnInvokeIdx > syncInvokeIdx, 'syncAuth is called before runAgentTurnWithActivityTimeout');
+  assert(turnInvokeIdx > -1, 'isolated dispatch primitive invocation found');
+  assert(turnInvokeIdx > syncInvokeIdx, 'syncAuth is called before the isolated dispatch primitive');
 
   // Verify the sync call is NOT inside an if(resolvedAuthProfile) guard
   // Extract the syncAuth call context (the ~20 lines around it)
@@ -3645,6 +3660,148 @@ console.log('\n-- Sync Auth Store Integration with executeAgent --');
   assert(indent <= 6, `syncAuth call indentation (${indent}) suggests it is unconditional (not inside if block)`);
 
   console.log('  sync auth store integration with executeAgent: pass');
+}
+
+console.log('\n-- Isolated dispatch primitive: no subprocess spawn --');
+{
+  // Regression guard. The session_target=isolated cron dispatch path must
+  // reach the gateway via the HTTP /v1/chat/completions endpoint only. A
+  // prior variant forked a sibling `openclaw` CLI to spawn the session and
+  // SIGTERM'd the launchd-tracked gateway parent (rh-bot.lan zombie-on-port
+  // outage, ~30 cascades per week). This test pins the no-fork contract two
+  // ways:
+  //   1. Source check -- the isolated dispatch primitive defined in
+  //      gateway.js (runIsolatedAgentTurn) and the executeAgent strategy
+  //      neither import nor reference child_process.
+  //   2. Behavior check -- executeAgent dispatched against the real gateway
+  //      HTTP client hits /v1/chat/completions via fetch and surfaces the
+  //      stubbed assistant reply.
+
+  const { executeAgent } = await import('./dispatcher-strategies.js');
+  const gateway = await import('./gateway.js');
+
+  // 1. Source-level check: the isolated dispatch primitive must not pull in
+  // child_process. Note: gateway.js still imports execFileSync for the
+  // legacy executeMain/fire-and-forget sendSystemEvent path, so the assertion
+  // narrows to the primitive's own definition rather than the whole module.
+  const gatewaySrc = readFileSync(join(import.meta.dirname || '.', 'gateway.js'), 'utf-8');
+  const strategiesSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher-strategies.js'), 'utf-8');
+
+  const isolatedFnStart = gatewaySrc.indexOf('export async function runIsolatedAgentTurn');
+  assert(isolatedFnStart > -1, 'runIsolatedAgentTurn is defined in gateway.js');
+  // Capture the function body bounded by the next top-level export so the
+  // check is local to the primitive rather than the surrounding module.
+  const isolatedFnEnd = (() => {
+    const after = gatewaySrc.indexOf('\nexport ', isolatedFnStart + 1);
+    return after === -1 ? gatewaySrc.length : after;
+  })();
+  const isolatedFnSrc = gatewaySrc.slice(isolatedFnStart, isolatedFnEnd);
+  for (const banned of ['child_process', 'execFile', 'spawn(', 'fork(', 'execSync']) {
+    assert(!isolatedFnSrc.includes(banned),
+      `runIsolatedAgentTurn body does not reference ${banned}`);
+  }
+
+  const executeAgentStart = strategiesSrc.indexOf('export async function executeAgent');
+  assert(executeAgentStart > -1, 'executeAgent is defined in dispatcher-strategies.js');
+  const executeAgentEnd = (() => {
+    const after = strategiesSrc.indexOf('\nexport ', executeAgentStart + 1);
+    return after === -1 ? strategiesSrc.length : after;
+  })();
+  const executeAgentSrc = strategiesSrc.slice(executeAgentStart, executeAgentEnd);
+  for (const banned of ['child_process', 'execFile', 'spawn(', 'fork(', 'execSync']) {
+    assert(!executeAgentSrc.includes(banned),
+      `executeAgent body does not reference ${banned}`);
+  }
+
+  // 2. Behavior check: stub global fetch so the dispatch primitive can run
+  // without contacting a real gateway. The stub records every URL so we can
+  // assert /v1/chat/completions was hit and no other dispatch transport was
+  // used. Set a sentinel gateway token before triggering the first fetch so
+  // gateway.js seeds its module-level token cache with a real value rather
+  // than null; otherwise downstream tests that swap globalThis.fetch later
+  // see the cached null token and stop emitting the auth/scope headers they
+  // assert on.
+  if (!process.env.OPENCLAW_GATEWAY_TOKEN) {
+    process.env.OPENCLAW_GATEWAY_TOKEN = 'isolated-dispatch-test-token';
+  }
+  const fetchCalls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url: String(url), method: init?.method || 'GET' });
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: 'isolated-ok' } }],
+        usage: { total_tokens: 7 },
+      }),
+      text: async () => '',
+    };
+  };
+
+  let executionError = null;
+  let executionResult = null;
+  try {
+    const job = {
+      id: 'isolated-no-spawn',
+      name: 'isolated-no-spawn',
+      agent_id: 'main',
+      session_target: 'isolated',
+      payload_kind: 'agentTurn',
+      payload_message: 'noop',
+      delivery_mode: 'none',
+      run_timeout_ms: 10_000,
+      payload_timeout_seconds: 5,
+    };
+    const ctx = {
+      run: { id: 'run-isolated-no-spawn', started_at: new Date().toISOString() },
+      dispatchRecord: null,
+      idemKey: null,
+      v02Outcomes: null,
+    };
+    const deps = {
+      waitForGateway: async () => true,
+      updateRunSession: () => {},
+      setAgentStatus: () => {},
+      buildJobPrompt: () => ({ prompt: 'noop', contextMeta: {} }),
+      // Using the real exported helper proves the production code path goes
+      // through HTTP, not a test-local mock.
+      runIsolatedAgentTurn: gateway.runIsolatedAgentTurn,
+      runAgentTurnWithActivityTimeout: gateway.runAgentTurnWithActivityTimeout,
+      updateContextSummary: () => {},
+      releaseDispatch: () => {},
+      releaseIdempotencyKey: () => {},
+      updateJob: () => {},
+      matchesSentinel: () => false,
+      detectTransientError: () => false,
+      listSessions: async () => ({ result: { sessions: [] } }),
+      sqliteNow: (offsetMs = 0) => new Date(Date.now() + offsetMs).toISOString(),
+      log: () => {},
+      finishRun: () => {},
+      syncAuthStoreToSession: () => ({ ok: true }),
+      applyAuthProfileToSessionStore: () => ({ ok: true }),
+    };
+    executionResult = await executeAgent(job, ctx, deps);
+  } catch (err) {
+    executionError = err;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert(executionError === null, `executeAgent ran without error (got: ${executionError?.message || 'none'})`);
+  const chatCall = fetchCalls.find(c => c.url.includes('/v1/chat/completions'));
+  assert(chatCall !== undefined, 'isolated dispatch primitive hit /v1/chat/completions via HTTP');
+  assert(chatCall?.method === 'POST', 'isolated dispatch primitive used HTTP POST');
+  assert(executionResult?.content === 'isolated-ok', 'executeAgent surfaced the assistant reply');
+  assert(executionResult?.status === 'ok', 'executeAgent reported ok status for the stubbed reply');
+
+  // Module-level contract marker is exported and stable so reviewers grepping
+  // for the primitive name find the dispatch path quickly.
+  assert(gateway.ISOLATED_DISPATCH_PRIMITIVE === 'http-chat-completions',
+    'gateway.ISOLATED_DISPATCH_PRIMITIVE names the HTTP primitive');
+  assert(typeof gateway.runIsolatedAgentTurn === 'function',
+    'gateway.runIsolatedAgentTurn is exported as the sanctioned isolated dispatch helper');
 }
 
 console.log('\n-- Migration Guard --');
