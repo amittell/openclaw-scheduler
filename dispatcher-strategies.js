@@ -1206,11 +1206,16 @@ export async function executeAgent(job, ctx, deps) {
   const {
     waitForGateway, updateRunSession, setAgentStatus,
     buildJobPrompt, runAgentTurnWithActivityTimeout,
+    // Sanctioned isolated dispatch primitive. Falls back to the activity-aware
+    // runner when callers (e.g. tests) wire only the older name -- both helpers
+    // share the same HTTP-only contract, no subprocess spawn.
+    runIsolatedAgentTurn,
     updateContextSummary, releaseDispatch, releaseIdempotencyKey,
     updateJob, matchesSentinel, detectTransientError,
     listSessions,
     sqliteNow, log,
   } = deps;
+  const dispatchAgentTurn = runIsolatedAgentTurn || runAgentTurnWithActivityTimeout;
   const result = makeDefaultResult();
 
   // Gateway health check
@@ -1304,7 +1309,12 @@ export async function executeAgent(job, ctx, deps) {
     }
   }
 
-  const turnResult = await runAgentTurnWithActivityTimeout({
+  // Isolated dispatch primitive: HTTP-only chat completions call. The
+  // scheduler must never fork a sibling `openclaw` process to spawn an
+  // isolated session -- that variant has historically SIGTERM'd the
+  // launchd-tracked gateway parent and orphaned a node process on port
+  // 18789 (see ISOLATED_DISPATCH_PRIMITIVE in gateway.js).
+  const turnResult = await dispatchAgentTurn({
     message: prompt,
     agentId: job.agent_id || 'main',
     sessionKey,

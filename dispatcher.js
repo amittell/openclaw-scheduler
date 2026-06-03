@@ -51,7 +51,8 @@ import {
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus } from './agents.js';
 import {
-  runAgentTurnWithActivityTimeout, sendSystemEvent, getAllSubAgentSessions, listSessions,
+  runAgentTurnWithActivityTimeout, runIsolatedAgentTurn,
+  sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
   applyAuthProfileToSessionStore,
   syncAuthStoreToSession,
@@ -306,6 +307,10 @@ function buildDispatchDeps() {
     // Agent
     waitForGateway, updateRunSession, setAgentStatus,
     buildJobPrompt, runAgentTurnWithActivityTimeout,
+    // Isolated cron-dispatch primitive: HTTP-only wrapper around the
+    // chat-completions API; never forks a sibling openclaw process that
+    // could SIGTERM the launchd-tracked gateway parent.
+    runIsolatedAgentTurn,
     updateContextSummary, releaseIdempotencyKey,
     matchesSentinel, detectTransientError,
     listSessions,

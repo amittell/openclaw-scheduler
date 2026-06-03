@@ -9,6 +9,22 @@ const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789'
 const HOME_DIR = process.env.HOME || homedir();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
+// -- Isolated dispatch primitive contract --------------------
+//
+// Cron jobs with session_target=isolated must reach the gateway via the
+// public HTTP API only. Forking a sibling `openclaw` process to spawn the
+// session is rejected: in production that primitive has SIGTERM'd the
+// launchd-tracked gateway parent (the child inherits the parent's listening
+// socket on port 18789 and the parent dies), leaving an orphan node process
+// holding the port. See rh-bot.lan zombie-cascade incident report.
+//
+// runIsolatedAgentTurn is the only sanctioned dispatch primitive for
+// session_target=isolated cron jobs. It MUST NOT spawn, fork, or exec any
+// child process. Any future change that needs subprocess execution belongs
+// behind a different, explicitly-named helper so reviewers can keep this
+// contract intact.
+export const ISOLATED_DISPATCH_PRIMITIVE = 'http-chat-completions';
+
 let _cachedToken;
 let _tokenLoaded = false;
 
@@ -244,6 +260,29 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     clearTimeout(absoluteTimer);
     clearInterval(pollTimer);
   }
+}
+
+// -- Isolated dispatch primitive -----------------------------
+
+/**
+ * Sanctioned dispatch primitive for session_target=isolated cron jobs.
+ *
+ * This is a thin wrapper around runAgentTurnWithActivityTimeout that names
+ * the contract: HTTP-only request to the gateway, no child process spawn.
+ * The scheduler routes every session_target=isolated job through this
+ * helper so the no-fork invariant is reviewable at one call site and
+ * testable in isolation (see the no-subprocess regression test in test.js).
+ *
+ * Why a named wrapper instead of calling runAgentTurnWithActivityTimeout
+ * directly: the dispatch primitive is the load-bearing surface that the
+ * rh-bot.lan zombie-on-port outage cascaded through. A named entry point
+ * gives operators and reviewers a single grep target ("runIsolatedAgentTurn")
+ * to audit the no-spawn invariant.
+ *
+ * Accepts the same options as runAgentTurnWithActivityTimeout.
+ */
+export async function runIsolatedAgentTurn(opts) {
+  return await runAgentTurnWithActivityTimeout(opts);
 }
 
 // -- System Events (main session) ----------------------------
