@@ -12224,6 +12224,15 @@ console.log('\n-- Dispatch labels durable state path --');
   }
 }
 
+console.log('\n-- Package file allowlist includes dispatch imports --');
+{
+  const packageJson = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'));
+  assert(
+    packageJson.files.includes('dispatch/paths.mjs'),
+    'package files include dispatch/paths.mjs helper imported by dispatch entrypoints',
+  );
+}
+
 closeDb();
 console.log(`\n${'='.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

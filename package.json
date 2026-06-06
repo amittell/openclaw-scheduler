@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "SQLite-backed job scheduler and workflow engine for OpenClaw agents",
   "type": "module",
   "main": "./index.js",
@@ -44,6 +44,7 @@
     "dispatch/index.mjs",
     "dispatch/liveness.mjs",
     "dispatch/message-input.mjs",
+    "dispatch/paths.mjs",
     "dispatch/README.md",
     "dispatch/watcher.mjs",
     "scripts/dispatch-cli-utils.mjs",
