@@ -40,6 +40,7 @@ import {
   hasCompletionSignal,
   taskRequiresGitSha,
 } from './completion.mjs';
+import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
@@ -211,9 +212,9 @@ function setLabelDone(name, data) {
       ...current[name],
       ...data,
       status: 'done',
+      error: null,
       updatedAt: new Date().toISOString(),
     };
-    delete current[name].error;
   });
   return labels[name];
 }
@@ -1311,16 +1312,17 @@ function cmdStatus(flags) {
       //
       // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard from the
       //                  watcher in 3 min, it's probably dead; fall through to check.
-      // hardCeilingMs:   job timeout * 1.5 -- absolute max regardless of ping age.
-      //                  Catches zombie watchers (watcher alive but session is stuck).
-      // idleThresholdMs: max(job timeout, 10 min) -- replaces the old hardcoded 10-min
-      //                  threshold so longer jobs aren't killed at exactly 10 min.
-      const PING_STALE_MS  = 3 * 60 * 1000;
-      const idleThresholdMs = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
-      // hardCeilingMs must be >= idleThresholdMs to avoid the ceiling undercutting the
-      // idle floor (e.g. timeoutSeconds=300 -> ceiling=7.5 min < idle=10 min would force
-      // zombie-guard threshold for sessions that should still use idleThresholdMs).
-      const hardCeilingMs  = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMs * 1.5);
+      // hardCeilingMs:   timeout/reasoning-aware hard ceiling. High-thinking
+      //                  work gets a larger quiet window before hard failure.
+      // idleThresholdMs: timeout/reasoning-aware quiet threshold. Ambiguous or
+      //                  missing liveness stays running until these thresholds.
+      const livenessPolicy = getDispatchLivenessPolicy(entry, {
+        startupGraceMs: STARTUP_GRACE_MS,
+        defaultTimeoutSeconds: 600,
+      });
+      const PING_STALE_MS = livenessPolicy.pingStaleMs;
+      const idleThresholdMs = livenessPolicy.idleFailureMs;
+      const hardCeilingMs = livenessPolicy.hardCeilingMs;
 
       let check;
       if (ageMs < STARTUP_GRACE_MS) {
@@ -1333,13 +1335,13 @@ function cmdStatus(flags) {
           check = { shouldResolve: false };
         } else {
           // Ping stale OR past hard ceiling: fall through to session store check
-          const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
+          const thresh = ageMs >= hardCeilingMs ? livenessPolicy.hardTimeoutIdleMs : idleThresholdMs;
           check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
         }
       } else {
         // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
         // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
-        const thresh = ageMs >= hardCeilingMs ? 2 * 60 * 1000 : idleThresholdMs;
+        const thresh = ageMs >= hardCeilingMs ? livenessPolicy.hardTimeoutIdleMs : idleThresholdMs;
         check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
       }
 
@@ -1616,10 +1618,13 @@ function cmdSync(flags) {
     // -- Heartbeat-based liveness guard (mirrors cmdStatus logic) ---------
     // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
     // See cmdStatus for full commentary on PING_STALE_MS / hardCeilingMs.
-    const PING_STALE_MS_SYNC  = 3 * 60 * 1000;
-    const idleThresholdMsSync = Math.max((entry.timeoutSeconds || 600) * 1000, 10 * 60 * 1000);
-    // hardCeilingMsSync must be >= idleThresholdMsSync (mirrors cmdStatus fix).
-    const hardCeilingMsSync   = Math.max((entry.timeoutSeconds || 600) * 1000 * 1.5, idleThresholdMsSync * 1.5);
+    const syncPolicy = getDispatchLivenessPolicy(entry, {
+      startupGraceMs: STARTUP_GRACE_MS_SYNC,
+      defaultTimeoutSeconds: 600,
+    });
+    const PING_STALE_MS_SYNC = syncPolicy.pingStaleMs;
+    const idleThresholdMsSync = syncPolicy.idleFailureMs;
+    const hardCeilingMsSync = syncPolicy.hardCeilingMs;
 
     if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
@@ -1629,7 +1634,7 @@ function cmdSync(flags) {
       }
     }
 
-    const syncThresh = elapsedMs >= hardCeilingMsSync ? 2 * 60 * 1000 : idleThresholdMsSync;
+    const syncThresh = elapsedMs >= hardCeilingMsSync ? syncPolicy.hardTimeoutIdleMs : idleThresholdMsSync;
     const check = checkSessionDone(entry.sessionKey, syncStore, syncThresh, true, spawnedAtMs);
 
     if (check.shouldResolve) {

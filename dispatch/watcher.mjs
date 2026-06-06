@@ -36,6 +36,7 @@ import {
   hasCompletionSignal,
   resolveCompletionDelivery,
 } from './completion.mjs';
+import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -988,8 +989,14 @@ const pollS       = parseInt(flags['poll-interval'] || '20', 10);
 const once        = flags.once === true || flags.once === 'true';
 exitZeroOnTerminal = once;
 
-// How long a session must be idle before we proactively check result
-const IDLE_RESULT_CHECK_MS = 60000;
+function getCurrentLivenessPolicy() {
+  const entry = loadLabels()[label] || { timeoutSeconds: timeoutS };
+  return getDispatchLivenessPolicy(entry, { defaultTimeoutSeconds: timeoutS });
+}
+
+function hasStructuredCompletion(result) {
+  return hasCompletionSignal(result?.completion);
+}
 
 if (!label) {
   process.stderr.write('[watcher] --label is required\n');
@@ -1104,18 +1111,22 @@ function runOnceAndExit() {
     const terminalJsonlReply = sessionId ? getSessionTerminalReply(sessionId, sessionAgent) : null;
     if (sessionId && terminalJsonlReply && isSessionCleanlyFinished(sessionId, sessionAgent)) {
       const result = dispatch('result', ['--label', label]);
-      deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
+      if (hasStructuredCompletion(result)) {
+        deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
+      }
+      process.stderr.write(`[watcher] stop_reason=end_turn observed without completion signal -- continuing to monitor\n`);
     }
   }
 
   const ageMs = status.liveness?.ageMs;
-  if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
+  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
-    if (result?.lastReply || hasCompletionSignal(result?.completion)) {
+    if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, IDLE_RESULT_CHECK_MS);
+    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1477,8 +1488,11 @@ while (Date.now() < deadline) {
     if (_sid2a && terminalJsonlReply && isSessionCleanlyFinished(_sid2a, _adir2a)) {
       process.stderr.write(`[watcher] stop_reason=end_turn detected -- delivering early\n`);
       const result = dispatch('result', ['--label', label]);
-      deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
-      // deliverResult exits
+      if (hasStructuredCompletion(result)) {
+        deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
+        // deliverResult exits
+      }
+      process.stderr.write(`[watcher] stop_reason=end_turn observed without completion signal -- continuing to monitor\n`);
     }
   }
 
@@ -1489,13 +1503,14 @@ while (Date.now() < deadline) {
   // while this watcher's lastPing heartbeat is fresh (written every 60s);
   // this path handles normal completion before the ping goes stale.
   const ageMs = status.liveness?.ageMs;
-  if (ageMs != null && ageMs >= IDLE_RESULT_CHECK_MS) {
+  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
-    if (result?.lastReply || hasCompletionSignal(result?.completion)) {
+    if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, IDLE_RESULT_CHECK_MS);
+    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1577,7 +1592,7 @@ if (sessionInternalId) {
 // If the session already completed (gateway pruned it -> null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
-  if (r?.lastReply || hasCompletionSignal(r?.completion)) {
+  if (hasStructuredCompletion(r)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r?.lastReply || null, statusAtDeadline?.summary || null, r?.completion || null);
   }
@@ -1616,7 +1631,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
     deliverResult(label, r?.lastReply || null, st.summary, r?.completion || st?.completion || null);
   }
   const r2 = dispatch('result', ['--label', label]);
-  if (r2?.lastReply || hasCompletionSignal(r2?.completion)) {
+  if (hasStructuredCompletion(r2)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r2?.lastReply || null, null, r2?.completion || null);
   }
@@ -1710,7 +1725,7 @@ if (sessionInternalId) {
         deliverResult(label, rExt?.lastReply || null, stExt.summary, rExt?.completion || stExt?.completion || null);
       }
       const rExt2 = dispatch('result', ['--label', label]);
-      if (rExt2?.lastReply || hasCompletionSignal(rExt2?.completion)) {
+      if (hasStructuredCompletion(rExt2)) {
         // deliverResult calls process.exit(0) internally
         deliverResult(label, rExt2?.lastReply || null, null, rExt2?.completion || null);
       }
@@ -1767,7 +1782,7 @@ for (const round of steerRounds) {
     deliverResult(label, r3?.lastReply || null, st2.summary, r3?.completion || st2?.completion || null);
   }
   const r3 = dispatch('result', ['--label', label]);
-  if (r3?.lastReply || hasCompletionSignal(r3?.completion)) {
+  if (hasStructuredCompletion(r3)) {
     // deliverResult calls process.exit(0) internally
     deliverResult(label, r3?.lastReply || null, null, r3?.completion || null);
   }
@@ -1782,7 +1797,7 @@ for (const round of steerRounds) {
       if (st3?.status === 'done') {
         // Check if a result was captured before marking as error
         const r4 = dispatch('result', ['--label', label]);
-        if (r4?.lastReply || hasCompletionSignal(r4?.completion)) {
+        if (hasStructuredCompletion(r4)) {
           deliverResult(label, r4?.lastReply || null, st3.summary, r4?.completion || st3?.completion || null); // deliverResult calls process.exit(0)
         }
         markLabelError(label, 'timed out -- killed after steer attempts (no result captured)');

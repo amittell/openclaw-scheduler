@@ -64,6 +64,7 @@ import {
   hasCompletionSignal,
   resolveCompletionDelivery,
 } from './dispatch/completion.mjs';
+import { getDispatchLivenessPolicy } from './dispatch/liveness.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
@@ -6115,6 +6116,8 @@ console.log('\n-- Watcher stop_reason early delivery --');
   assert(watcherSrc.includes('isSessionCleanlyFinished'), 'stop_reason: isSessionCleanlyFinished function present');
   assert(watcherSrc.includes('stop_reason=end_turn detected'), 'stop_reason: Path 2a log message present');
   assert(watcherSrc.includes('completed (stop_reason=end_turn)'), 'stop_reason: Path 2a delivery fallback summary present');
+  assert(watcherSrc.includes('if (hasStructuredCompletion(result))'), 'stop_reason: Path 2a requires structured completion signal before delivery');
+  assert(watcherSrc.includes('without completion signal'), 'stop_reason: Path 2a keeps plain replies in monitoring state');
 
   // isSessionCleanlyFinished behavioral tests using real JSONL files
   const tmpDir = mkdtempSync(join(tmpdir(), 'watcher-stopreason-'));
@@ -6135,11 +6138,11 @@ console.log('\n-- Watcher stop_reason early delivery --');
   // Since they're not exported, we replicate the logic inline for unit tests.
   // But we also verify the source-level guards below via functional watcher invocations.
 
-  // --- Functional test: end_turn triggers early delivery via watcher binary ---
+  // --- Functional test: end_turn + structured completion triggers early delivery via watcher binary ---
   const watcherPath = join(dirname(fileURLToPath(import.meta.url)), 'dispatch', 'watcher.mjs');
 
-  // Test 1: last assistant entry has stop_reason=end_turn, no tool_use
-  // -> isSessionCleanlyFinished returns true -> watcher delivers early
+  // Test 1: last assistant entry has stop_reason=end_turn, no tool_use, and
+  // result includes a done payload -> watcher delivers early.
   {
     const sessionId = 'sr-end-turn-test';
     writeJsonl(sessionId, [
@@ -6173,7 +6176,16 @@ if (sub === 'status') {
     liveness: { ageMs: 5000, sessionId: ${JSON.stringify(sessionId)} },
   }) + '\\n');
 } else if (sub === 'result') {
-  process.stdout.write(JSON.stringify({ ok: true, lastReply: 'Final report: delivered via end_turn fast path.', status: 'done' }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    lastReply: 'Final report: delivered via end_turn fast path.',
+    status: 'running',
+    completion: {
+      summary: 'Final report: delivered via end_turn fast path.',
+      deliveryText: 'Final report: delivered via end_turn fast path.',
+      checklist: { work_complete: true }
+    }
+  }) + '\\n');
 } else {
   process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
 }
@@ -6197,8 +6209,8 @@ if (sub === 'status') {
     const etExitCode = etResult.status;
     const etStdout = etResult.stdout || '';
     const etStderr = etResult.stderr || '';
-    assert(etExitCode === 0, 'stop_reason end_turn: watcher exits 0 (early delivery)');
-    assert(etStdout.includes('Final report: delivered via end_turn fast path.'), 'stop_reason end_turn: watcher delivers lastReply via early delivery');
+    assert(etExitCode === 0, 'stop_reason end_turn: watcher exits 0 when structured completion is present');
+    assert(etStdout.includes('Final report: delivered via end_turn fast path.'), 'stop_reason end_turn: watcher delivers structured completion via early delivery');
     assert(etStderr.includes('stop_reason=end_turn detected'), 'stop_reason end_turn: watcher logs early delivery to stderr');
   }
 
@@ -6684,6 +6696,24 @@ console.log('\n-- Completion payload helpers --');
   });
   assert(preservedAppleHealthLead.deliveryText === expectedFitnessLead, 'completion helper: already-good Apple Health lead is preserved without extra blocks');
 
+  const deploymentArrowSummary = [
+    'Updated the marketing AI summary copy and promoted the same build from scratch -> staging -> public.',
+    'That should make the public marketing metadata complete and consistent for future AI crawlers.',
+  ].join(' ');
+  const deploymentArrowPayload = buildTerminalCompletionPayload({
+    summary: deploymentArrowSummary,
+    checklist: { work_complete: true, tests_passed: true },
+  });
+  assert(deploymentArrowPayload.summary_human === deploymentArrowSummary, 'completion helper: deployment-arrow prose is preserved as coherent human summary');
+  assert(!deploymentArrowPayload.summary_human.startsWith('Staging.'), 'completion helper: deployment-arrow prose is not reduced to an arbitrary fragment');
+  const deploymentArrowDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: deploymentArrowPayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(deploymentArrowDelivery.deliveryText === deploymentArrowSummary, 'completion helper: deployment-arrow delivery preserves complete prose');
+  assert(!deploymentArrowDelivery.deliveryText.includes('Technical details:'), 'completion helper: deployment-arrow prose does not grow spurious technical details');
+
   const rawPayloadReply = resolveCompletionDelivery({
     lastReply: JSON.stringify({
       ok: true,
@@ -6973,6 +7003,37 @@ console.log('\n-- Done Subcommand --');
   assert(updatedLabels['my-task'].completion?.checklist?.work_complete === true, 'done subcommand: completion payload stores checklist metadata');
   assert(doneObj.completion?.summary_human === 'all done!', 'done subcommand: JSON response includes summary_human');
   assert(doneObj.completion?.deliveryText === 'all done!', 'done subcommand: JSON response includes completion payload');
+
+  writeFileSync(doneLabels, JSON.stringify({
+    'stale-error-task': {
+      sessionKey: 'agent:main:subagent:stale-error-uuid',
+      status: 'error',
+      error: 'watcher timed out before completion signal',
+      summary: 'stale watcher failure',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      timeoutSeconds: 1200,
+      thinking: 'high',
+    },
+  }) + '\n');
+
+  const staleDoneOut = execFileSync(process.execPath, [
+    indexPath, 'done', '--label', 'stale-error-task',
+    '--summary', 'Finished after the watcher reported a stale failure.',
+    '--checklist', '{"work_complete":true,"tests_passed":true}',
+    '--skip-activity-check',
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const staleDoneObj = JSON.parse(staleDoneOut.trim());
+  const staleDoneLabels = JSON.parse(readFileSync(doneLabels, 'utf8'));
+  assert(staleDoneObj.status === 'done', 'done subcommand: later completion overrides stale watcher error response');
+  assert(staleDoneLabels['stale-error-task'].status === 'done', 'done subcommand: later completion overrides stale watcher error label state');
+  assert(staleDoneLabels['stale-error-task'].error === null, 'done subcommand: stale watcher error is cleared after successful completion');
 
   // done with unregistered label -> exits 0 and marks as done (not an error)
   // NOTE: Changed from exits-1 in 07838b6: unregistered labels are valid for
@@ -8571,6 +8632,58 @@ console.log('\n-- Watchdog Heartbeat Guard --');
     const result = runStatus(labelsPath, tmpDir, 'wdg-t4b');
     assert(result.status === 'running', 'watchdog guard t4b: no lastPing + idle < idleThreshold -> stays running');
   }
+
+  // 5: high-thinking runs get a larger quiet window. A stale sessions.json
+  // entry 15 minutes old should still be treated as running for a 1200s task.
+  {
+    const tmpDir = join(tmpBase, 't5-high-thinking');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t5': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 15 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking:       'high',
+        lastPing:       new Date(Date.now() - 4 * 60 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t5');
+    assert(result.status === 'running', 'watchdog guard t5: high-thinking stale ping + 15min quiet stays running');
+  }
+
+  // 6: the same high-thinking run is still allowed to fail after the hard
+  // ceiling, preserving real timeout behavior.
+  {
+    const tmpDir = join(tmpBase, 't6-high-thinking-hard-timeout');
+    mkdirSync(tmpDir);
+    const { labelsPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t6': {
+        sessionKey:     fakeSessionKey,
+        status:         'running',
+        agent:          'main',
+        mode:           'fresh',
+        spawnedAt:      new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking:       'high',
+        lastPing:       new Date(Date.now() - 30 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t6');
+    assert(result.status === 'interrupted', 'watchdog guard t6: high-thinking past hard ceiling still resolves interrupted');
+  }
+
+  const highPolicy = getDispatchLivenessPolicy({ timeoutSeconds: 1200, thinking: 'high' });
+  assert(highPolicy.idleProbeMs >= 10 * 60 * 1000, 'watchdog guard: high-thinking idle result probe waits at least 10min');
+  assert(highPolicy.idleFailureMs >= 20 * 60 * 1000, 'watchdog guard: high-thinking idle failure waits at least 20min');
 
   rmSync(tmpBase, { recursive: true, force: true });
 }

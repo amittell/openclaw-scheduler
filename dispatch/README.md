@@ -291,8 +291,8 @@ No manual token configuration needed on a standard OpenClaw install.
 
 When `--deliver-to` is set, dispatch registers a **scheduler watcher job**
 after dispatching the session. The watcher polls the session result every
-minute until the agent produces a reply, then delivers via the scheduler's
-`handleDelivery` pipeline.
+minute until the agent sends the structured `done` completion signal, then
+delivers via the scheduler's `handleDelivery` pipeline.
 
 ```
 dispatch enqueue --deliver-to <telegram-user-id>
@@ -315,6 +315,20 @@ dispatch enqueue --deliver-to <telegram-user-id>
 `deliver-watcher.sh` checks the session result. Exit 0 with output = deliver.
 Exit 1 with no output = retry on next cron tick (no spam — `announce-always`
 only delivers when `output.trim()` is truthy).
+
+Quiet sessions are treated conservatively. The watcher does not mark a running
+job failed just because `sessions.json` or the JSONL transcript has been quiet
+for 60 seconds. For high/xhigh reasoning work, the first idle result probe waits
+at least 10 minutes, idle auto-resolution waits at least 20 minutes, and the hard
+failure ceiling is longer than the requested task timeout. Missing or ambiguous
+gateway/session liveness fails open to "still monitoring" until the hard timeout
+window or a clear terminal error.
+
+While a label is still `running`, a plain assistant reply is diagnostic only.
+Successful final delivery requires the agent-side `done` signal and its
+structured completion payload. If an older watcher records an error and the
+worker later sends a valid `done`, the later completion is authoritative and the
+stale error is cleared from the label.
 
 ### Progress check-ins from subagent sessions
 
