@@ -37,11 +37,12 @@ import {
   resolveCompletionDelivery,
 } from './completion.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
+import { resolveLabelsPath } from './paths.mjs';
 import { sendMessage } from '../messages.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
-const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
+const LABELS_PATH = resolveLabelsPath({ legacyCandidates: [join(__dirname, 'labels.json')] });
 const HOME_DIR = process.env.HOME || homedir();
 let labelsCache = null;
 let labelsCacheSignature = null;

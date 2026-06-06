@@ -65,6 +65,7 @@ import {
   resolveCompletionDelivery,
 } from './dispatch/completion.mjs';
 import { getDispatchLivenessPolicy } from './dispatch/liveness.mjs';
+import { resolveLabelsPath } from './dispatch/paths.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
@@ -12184,6 +12185,43 @@ console.log('\n-- ORIGIN_CHAT_ID auto-inject (runtime behavior) --');
     resultD === 'Do the work.',
     'ORIGIN_CHAT_ID: Case D — not injected when deliverTo is empty string',
   );
+}
+
+console.log('\n-- Dispatch labels durable state path --');
+{
+  const oldHome = process.env.HOME;
+  const oldSchedulerHome = process.env.OPENCLAW_SCHEDULER_HOME;
+  const oldStateDir = process.env.DISPATCH_STATE_DIR;
+  const oldLabelsPath = process.env.DISPATCH_LABELS_PATH;
+  const tmpHome = mkdtempSync(join(tmpdir(), 'dispatch-labels-home-'));
+  const legacyDir = mkdtempSync(join(tmpdir(), 'dispatch-labels-legacy-'));
+  const legacyPath = join(legacyDir, 'labels.json');
+  writeFileSync(legacyPath, JSON.stringify({ carried: { status: 'running' } }, null, 2) + '\n');
+  try {
+    process.env.HOME = tmpHome;
+    delete process.env.OPENCLAW_SCHEDULER_HOME;
+    delete process.env.DISPATCH_STATE_DIR;
+    delete process.env.DISPATCH_LABELS_PATH;
+
+    const labelsPath = resolveLabelsPath({ legacyCandidates: [legacyPath] });
+    assert(
+      labelsPath === join(tmpHome, '.openclaw', 'scheduler', 'dispatch', 'labels.json'),
+      'dispatch labels default to durable scheduler state directory',
+    );
+    assert(
+      JSON.parse(readFileSync(labelsPath, 'utf8')).carried?.status === 'running',
+      'dispatch labels path migrates existing legacy labels on first use',
+    );
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    if (oldSchedulerHome === undefined) delete process.env.OPENCLAW_SCHEDULER_HOME;
+    else process.env.OPENCLAW_SCHEDULER_HOME = oldSchedulerHome;
+    if (oldStateDir === undefined) delete process.env.DISPATCH_STATE_DIR;
+    else process.env.DISPATCH_STATE_DIR = oldStateDir;
+    if (oldLabelsPath === undefined) delete process.env.DISPATCH_LABELS_PATH;
+    else process.env.DISPATCH_LABELS_PATH = oldLabelsPath;
+  }
 }
 
 closeDb();

@@ -41,6 +41,7 @@ import {
   taskRequiresGitSha,
 } from './completion.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
+import { resolveLabelsPath } from './paths.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
@@ -67,7 +68,9 @@ const INVOKE_DIR = (() => {
 
 // -- Config ---------------------------------------------------
 
-const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(INVOKE_DIR, 'labels.json');
+const LABELS_PATH = resolveLabelsPath({
+  legacyCandidates: [join(INVOKE_DIR, 'labels.json'), join(__dirname, 'labels.json')],
+});
 
 /** Load dispatch config from config.json.
  *  Resolution order:

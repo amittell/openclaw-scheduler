@@ -23,9 +23,10 @@ import { readFileSync, writeFileSync, renameSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveLabelsPath } from './paths.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LABELS_PATH = process.env.DISPATCH_LABELS_PATH || join(__dirname, 'labels.json');
+const LABELS_PATH = resolveLabelsPath({ legacyCandidates: [join(__dirname, 'labels.json')] });
 const INDEX_PATH  = process.env.DISPATCH_INDEX_PATH  || join(__dirname, 'index.mjs');
 
 const MAX_RETRIES = 3;

@@ -23,7 +23,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 | `chilisaus.mjs` | Branded wrapper |
 | `config.example.json` | Example config |
 | `test-done-postoffice.mjs` | Done handler test |
-| `labels.json` | Local label→session ledger (gitignored) |
+| `~/.openclaw/scheduler/dispatch/labels.json` | Durable label→session ledger |
 | `README.md` | This file |
 
 ---
@@ -45,7 +45,7 @@ Orchestrator calls:
   → Patches session with model/thinking/spawnDepth
   → Calls gateway `agent` method with the task
   → Session starts immediately (no scheduler tick delay)
-  → Tracks label→sessionKey in labels.json
+  → Tracks label→sessionKey in the durable labels ledger
   → Agent auto-announces results on completion
   → hooks.mjs fires dispatch.started to Loki
 ```
@@ -117,7 +117,7 @@ node dispatch/index.mjs stuck --threshold-min 15
 Exit 0 = nothing stuck (silent).
 Exit 1 = stuck sessions found (triggers announce delivery).
 
-Checks labels.json for sessions marked `running`, cross-references gateway
+Checks the labels ledger for sessions marked `running`, cross-references gateway
 session store for last activity timestamp.
 
 ### `result` — last assistant reply from a session
@@ -206,7 +206,7 @@ Shows all labels in the ledger, sorted by most recent. Filter by status.
 node dispatch/index.mjs sync
 ```
 
-Reconciles `labels.json` with the gateway sessions store. Sessions that no
+Reconciles the labels ledger with the gateway sessions store. Sessions that no
 longer exist on the gateway are marked stale, and sessions present on the
 gateway but missing from the ledger are imported. Useful after gateway restarts
 or manual session cleanup.
