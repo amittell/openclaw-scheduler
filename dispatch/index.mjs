@@ -123,6 +123,23 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function resolveSchedulerCliPath() {
+  const candidates = [
+    process.env.OPENCLAW_SCHEDULER_CLI,
+    process.env.SCHEDULER_CLI,
+    join(__dirname, '..', 'cli.js'),
+    join(HOME_DIR, '.openclaw', 'packages', 'openclaw-scheduler', 'node_modules', 'openclaw-scheduler', 'cli.js'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+
+  return join(__dirname, '..', 'cli.js');
+}
+
 function toTimestampMs(value) {
   if (value == null) return null;
   if (typeof value === 'number') {
@@ -681,7 +698,7 @@ function disarmWatchdog(label) {
   const entry = getLabel(label);
   if (!entry?.watchdogJobId) return;
   try {
-    const schedulerCli = join(__dirname, '..', 'cli.js');
+    const schedulerCli = resolveSchedulerCliPath();
     execFileSync(process.execPath, [schedulerCli, 'jobs', 'delete', entry.watchdogJobId], {
       encoding: 'utf-8',
       timeout:  5000,
@@ -715,7 +732,7 @@ function scheduleDeliveryWatcherJob({
   if (!label) throw new Error('label is required');
   if (!deliverTo) throw new Error('deliverTo is required');
 
-  const schedulerCli = join(__dirname, '..', 'cli.js');
+  const schedulerCli = resolveSchedulerCliPath();
   const watcherPath = join(__dirname, 'watcher.mjs');
   const watcherTimeoutS = Number(timeoutSeconds) + 120;
   const idleThresholdS = Number(idleThresholdSeconds) || 300;
@@ -962,7 +979,7 @@ async function cmdEnqueue(flags) {
   // -- Checkpoint notify command (mid-run status messages) -----
   // Agents can call this command at logical checkpoints to send status updates
   // that will be delivered to the inbox consumer (and ultimately Telegram).
-  const schedulerCliPath = join(__dirname, '..', 'cli.js');
+  const schedulerCliPath = resolveSchedulerCliPath();
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
   // TODO: Inject CHECKPOINT_NOTIFY_CMD as an env var into the agent session so
   // agents can discover the checkpoint command programmatically (not just from
@@ -1164,7 +1181,7 @@ async function cmdEnqueue(flags) {
           delete_after_run:         1,             // auto-delete after watchdog fires
           origin:                   origin || 'system',
         });
-        const schedulerCli = join(__dirname, '..', 'cli.js');
+        const schedulerCli = resolveSchedulerCliPath();
         const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
           encoding: 'utf-8',
           timeout:  10000,

@@ -19,13 +19,15 @@
  *   1 -- error
  */
 
-import { readFileSync, writeFileSync, renameSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
 import { resolveLabelsPath } from './paths.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const HOME_DIR = process.env.HOME || homedir();
 const LABELS_PATH = resolveLabelsPath({ legacyCandidates: [join(__dirname, 'labels.json')] });
 const INDEX_PATH  = process.env.DISPATCH_INDEX_PATH  || join(__dirname, 'index.mjs');
 
@@ -64,9 +66,26 @@ function saveLabels(labels) {
   renameSync(tmp, LABELS_PATH);
 }
 
+function resolveSchedulerCliPath() {
+  const candidates = [
+    process.env.OPENCLAW_SCHEDULER_CLI,
+    process.env.SCHEDULER_CLI,
+    join(__dirname, '..', 'cli.js'),
+    join(HOME_DIR, '.openclaw', 'packages', 'openclaw-scheduler', 'node_modules', 'openclaw-scheduler', 'cli.js'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+
+  return join(__dirname, '..', 'cli.js');
+}
+
 function notify(message) {
   try {
-    const cliPath = join(__dirname, '..', 'cli.js');
+    const cliPath = resolveSchedulerCliPath();
     execFileSync(process.execPath, [cliPath, 'msg', 'send', 'scheduler', 'main', message], {
       encoding: 'utf-8',
       timeout: 10000,
