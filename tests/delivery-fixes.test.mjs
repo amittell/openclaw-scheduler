@@ -130,6 +130,19 @@ test('delivery watcher jobs are non-blocking cron quick-poll jobs', () => {
   assert.doesNotMatch(dispatchIndexSrc, /schedule_kind:\s+'at'[\s\S]{0,400}watcherCmd/);
 });
 
+test('dispatch monitor jobs resolve stable scheduler paths from branded wrappers', () => {
+  const dispatchIndexSrc = readFileSync(join(__dirname, '..', 'dispatch', 'index.mjs'), 'utf8');
+  assert.match(dispatchIndexSrc, /function resolveSchedulerCliPath\(\)/);
+  assert.match(dispatchIndexSrc, /function resolveDispatchScriptPath\(fileName\)/);
+  assert.match(dispatchIndexSrc, /function resolvePersistentNodePath\(\)/);
+  assert.match(dispatchIndexSrc, /DISPATCH_CONFIG_DIR='\$\{sq\(dispatchConfigDirForChild\(\)\)\}'/);
+  assert.match(dispatchIndexSrc, /DISPATCH_INDEX_PATH='\$\{sq\(dispatchIndexPath\)\}'/);
+  assert.match(dispatchIndexSrc, /'\$\{sq\(nodePath\)\}' '\$\{sq\(watcherPath\)\}'/);
+  assert.match(dispatchIndexSrc, /'\$\{sq\(resolvePersistentNodePath\(\)\)\}' '\$\{sq\(resolveDispatchScriptPath\('index\.mjs'\)\)\}' result --label/);
+  assert.doesNotMatch(dispatchIndexSrc, /'\$\{sq\(process\.execPath\)\}' '\$\{sq\(watcherPath\)\}'/);
+  assert.doesNotMatch(dispatchIndexSrc, /'\$\{sq\(process\.execPath\)\}' '\$\{sq\(join\(__dirname, 'index\.mjs'\)\)\}' result --label/);
+});
+
 test('main fire-and-forget delivery instructions use the scheduler post office, not the message tool', async () => {
   const prompts = [];
 

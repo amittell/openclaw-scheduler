@@ -11,7 +11,7 @@ If you just want the fastest path to a working local install, start with the npm
 | Requirement | Notes |
 |-------------|-------|
 | macOS or Linux | Tested on macOS arm64 |
-| Node.js 22 or 24 LTS | `node --version` |
+| Node.js 22 LTS, 24 LTS, or 26 Current | `node --version` |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |
 
