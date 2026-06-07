@@ -559,6 +559,62 @@ function agentFromSessionKey(sessionKey) {
   return 'main';
 }
 
+function getSessionJsonlMtimeMs(agent, sessionId) {
+  const jsonlPath = getSessionJsonlPath(agent, sessionId);
+  if (!jsonlPath) return null;
+  try {
+    return statSync(jsonlPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function getJsonlPendingToolReason(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const last = entries[entries.length - 1];
+
+  if (last?.role === 'assistant') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    const toolUse = content.find(c => c?.type === 'tool_use');
+    if (toolUse) {
+      return `last assistant entry has tool_use (${toolUse.name || 'unknown'}) -- awaiting tool result`;
+    }
+    if (last.type === 'tool_use') {
+      return `last entry is tool_use (${last.name || 'unknown'}) -- awaiting tool result`;
+    }
+  }
+
+  if (last?.role === 'user') {
+    const content = Array.isArray(last.content) ? last.content : [];
+    if (content.some(c => c?.type === 'tool_result')) {
+      return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+    }
+  }
+
+  if (last?.type === 'tool_result') {
+    return 'last entry is tool_result (tool executed, awaiting assistant reply)';
+  }
+
+  return null;
+}
+
+function getJsonlTerminalReplyReason(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const terminalReply = extractTerminalAssistantReplyFromEntries(entries);
+  if (!terminalReply) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.role === 'assistant') {
+      return entry.stop_reason === 'end_turn'
+        ? 'terminal assistant reply observed in JSONL'
+        : null;
+    }
+  }
+
+  return null;
+}
+
 // -- Gateway Session State Check ------------------------------
 
 /**
@@ -647,9 +703,35 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   }
 
   // 2. Session exists in store, check idle time.
-  const entry        = sessionsStore[sessionKey];
-  const lastActivity = entry.updatedAt || 0;
-  const silenceMs    = Date.now() - lastActivity;
+  const entry = sessionsStore[sessionKey];
+  const agent = agentFromSessionKey(sessionKey) || 'main';
+  const updatedAtMs = toTimestampMs(entry.updatedAt);
+  const lastActivityAtMs = toTimestampMs(entry.lastActivityAt);
+  const jsonlMtimeMs = getSessionJsonlMtimeMs(agent, entry.sessionId);
+  const activityTimes = [updatedAtMs, lastActivityAtMs, jsonlMtimeMs].filter(t => typeof t === 'number');
+  const lastActivity = activityTimes.length ? Math.max(...activityTimes) : null;
+  const silenceMs = lastActivity === null ? Infinity : Date.now() - lastActivity;
+
+  if (entry.sessionId) {
+    const entries = readJsonlTailEntries(entry.sessionId, agent, 20);
+    const pendingToolReason = getJsonlPendingToolReason(entries);
+    if (pendingToolReason) {
+      return {
+        shouldResolve: false,
+        reason:       `session JSONL shows pending work: ${pendingToolReason}`,
+        lastActivity,
+      };
+    }
+
+    const terminalReplyReason = getJsonlTerminalReplyReason(entries);
+    if (terminalReplyReason) {
+      return {
+        shouldResolve: false,
+        reason:       `${terminalReplyReason}; watcher/result path should deliver completion`,
+        lastActivity,
+      };
+    }
+  }
 
   if (silenceMs >= thresholdMs) {
     return {

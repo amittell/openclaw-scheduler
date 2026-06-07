@@ -1120,14 +1120,18 @@ function runOnceAndExit() {
   }
 
   const ageMs = status.liveness?.ageMs;
-  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  const livenessPolicy = getCurrentLivenessPolicy();
+  const idleResultCheckMs = livenessPolicy.idleProbeMs;
+  const idleFailureMs = livenessPolicy.idleFailureMs;
   if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
+    const stallReason = ageMs >= idleFailureMs
+      ? getRunningSessionStallReason(status, idleFailureMs)
+      : null;
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1504,14 +1508,18 @@ while (Date.now() < deadline) {
   // while this watcher's lastPing heartbeat is fresh (written every 60s);
   // this path handles normal completion before the ping goes stale.
   const ageMs = status.liveness?.ageMs;
-  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  const livenessPolicy = getCurrentLivenessPolicy();
+  const idleResultCheckMs = livenessPolicy.idleProbeMs;
+  const idleFailureMs = livenessPolicy.idleFailureMs;
   if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
+    const stallReason = ageMs >= idleFailureMs
+      ? getRunningSessionStallReason(status, idleFailureMs)
+      : null;
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1530,6 +1538,14 @@ while (Date.now() < deadline) {
 // Timed out -- try one last result check
 const finalResult = dispatch('result', ['--label', label]);
 const finalStatus = dispatch('status', ['--label', label]);
+if (hasStructuredCompletion(finalResult)) {
+  deliverResult(
+    label,
+    finalResult?.lastReply || null,
+    finalStatus?.summary || null,
+    finalResult?.completion || finalStatus?.completion || null,
+  );
+}
 if (finalStatus?.status === 'done') {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);
