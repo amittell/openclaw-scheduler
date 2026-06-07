@@ -39,6 +39,7 @@ const HUMAN_SUMMARY_SECTION_RE = /(?:^|\n)\s*(?:Human-readable summary|Human sum
 const TECHNICAL_DETAILS_SECTION_RE = /(?:^|\n)\s*(?:Technical details?|Details(?:_technical)?)\s*:\s*/i;
 const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*/i;
 const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
+const FORMATTER_META_SUMMARY_RE = /^Final completion updates now (?:start with a short plain-English summary|arrive as one clean plain-English summary)\./i;
 const FINAL_REPORT_HEADING_RE = /^(?:#{1,6}\s*)?(?:root cause|files? changed|changes|validation|tests?(?: run| passed)?|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|result|results|summary|highlights?|notes?|follow[- ]ups?|next steps?|blockers?|implementation|what changed|verification)\s*:?$/i;
 const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validation|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|final report|human-readable report|files changed|tests passed)\b/i;
 
@@ -751,6 +752,42 @@ function buildCompletionLeadFromThemes(themes) {
   return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
 }
 
+function looksLikeFormatterMetaSummary(text) {
+  const normalized = normalizeCompletionText(text);
+  return Boolean(normalized && FORMATTER_META_SUMMARY_RE.test(normalized));
+}
+
+function getCompletionRawSummary(completion) {
+  const details = getCompletionTechnicalDetails(completion);
+  if (!details || typeof details !== 'object') return null;
+  return normalizeCompletionText(details.raw_summary ?? details.rawSummary);
+}
+
+function looksLikeCompletionFormatterImplementation(text) {
+  const normalized = normalizeCompletionText(text);
+  if (!normalized) return false;
+
+  const fragments = extractTechnicalFragments(normalized);
+  const themes = detectTechnicalThemes(normalized, fragments);
+  if (!themes.completionFlow) return false;
+
+  return TECHNICAL_COMMIT_PREFIX_RE.test(cleanMarkdown(normalized).replace(/\s+/g, ' ').trim())
+    || /\b(?:completion|deliveryText|summary_human|summaryHuman|details_technical|resolveCompletionDelivery|buildTerminalCompletionPayload|payload-precedence|watcher path|completion watcher|final completion updates?)\b/i.test(normalized);
+}
+
+function getRawSummaryOverrideForFormatterMeta(completion, structuredTexts) {
+  if (!structuredTexts.some(looksLikeFormatterMetaSummary)) return null;
+
+  const rawSummary = getCompletionRawSummary(completion);
+  if (!rawSummary) return null;
+  if (isGenericOrTrivial(rawSummary)) return null;
+  if (isInternalTransportNoiseText(rawSummary)) return null;
+  if (looksLikeRawPayloadText(rawSummary)) return null;
+  if (looksLikeCompletionFormatterImplementation(rawSummary)) return null;
+
+  return truncateText(rawSummary, MAX_DELIVERY_CHARS);
+}
+
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const cleanedRaw = normalizeCompletionText(rawText);
   const fallback = normalizeCompletionText(fallbackSummary);
@@ -1306,6 +1343,18 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const authoritativeStructuredSummary = completionDeliverySource && completionDeliverySource !== 'technical-synthesis'
     ? preferredSummary
     : null;
+  const rawSummaryOverride = getRawSummaryOverrideForFormatterMeta(completion, [
+    rawCompletionSummaryHuman,
+    rawCompletionSummary,
+    rawCompletionDelivery,
+  ]);
+  if (rawSummaryOverride) {
+    return {
+      deliveryText: rawSummaryOverride,
+      summary: rawSummaryOverride,
+      source: 'raw-summary',
+    };
+  }
   const noisyTexts = [
     rawReply,
     rawCompletionSummaryHuman,

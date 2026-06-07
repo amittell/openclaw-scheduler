@@ -6643,6 +6643,32 @@ console.log('\n-- Completion payload helpers --');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes(`\n\nTechnical details:\n- ${weakTechnicalLeadSummary}`), 'completion helper: stripped technical specifics remain available in the technical details block');
 
+  const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+  const sportsBacktestMetaDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: expectedTechnicalLead,
+      summary: expectedTechnicalLead,
+      deliveryText: expectedTechnicalLead,
+      prose: expectedTechnicalLead,
+      details_technical: {
+        checklist: { work_complete: true, tests_passed: true },
+        raw_summary: sportsBacktestRawSummary,
+      },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: {
+        rawSummary: sportsBacktestRawSummary,
+        normalizedSummary: expectedTechnicalLead,
+        deliverySource: 'summary_human',
+      },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(sportsBacktestMetaDelivery.source === 'raw-summary', 'completion helper: raw task result beats formatter-meta summary');
+  assert(sportsBacktestMetaDelivery.deliveryText.startsWith('Ran one-year sports betting model validation'), 'completion helper: delivered text leads with the real raw task result');
+  assert(!sportsBacktestMetaDelivery.deliveryText.startsWith('Final completion updates now'), 'completion helper: formatter-meta summary does not replace the real task result');
+
   const fitnessStyleWeakSummary = 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.';
   const expectedFitnessLead = "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.";
   const fitnessStylePayload = buildTerminalCompletionPayload({
