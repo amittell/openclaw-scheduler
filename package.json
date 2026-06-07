@@ -17,7 +17,7 @@
     "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=22"
+    "node": "22.x || 24.x"
   },
   "scripts": {
     "start": "node dispatcher.js",
@@ -123,7 +123,7 @@
   },
   "homepage": "https://github.com/amittell/openclaw-scheduler#readme",
   "dependencies": {
-    "better-sqlite3": "^11.10.0",
+    "better-sqlite3": "^12.10.0",
     "croner": "^10.0.1"
   },
   "devDependencies": {

@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Smoke + Tests (${{ matrix.os }} / Node 22)
+    name: Smoke + Tests (${{ matrix.os }} / Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -29,6 +29,9 @@ jobs:
           - macos-latest
           # windows-latest: disabled until test suite path handling is
           # cross-platform. Windows installs use WSL2 (see INSTALL-WINDOWS.md).
+        node:
+          - '22'
+          - '24'
 
     steps:
       - name: Checkout
@@ -37,7 +40,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
