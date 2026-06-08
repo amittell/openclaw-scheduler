@@ -123,6 +123,86 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function deployedSchedulerDispatchPath(fileName) {
+  return join(
+    HOME_DIR,
+    '.openclaw',
+    'packages',
+    'openclaw-scheduler',
+    'node_modules',
+    'openclaw-scheduler',
+    'dispatch',
+    fileName,
+  );
+}
+
+function resolveSchedulerCliPath() {
+  const candidates = [
+    process.env.OPENCLAW_SCHEDULER_CLI,
+    process.env.SCHEDULER_CLI,
+    join(__dirname, '..', 'cli.js'),
+    join(HOME_DIR, '.openclaw', 'packages', 'openclaw-scheduler', 'node_modules', 'openclaw-scheduler', 'cli.js'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+
+  return join(__dirname, '..', 'cli.js');
+}
+
+function currentDirLooksLikeBrandWrapper() {
+  return !existsSync(join(__dirname, '..', 'cli.js'));
+}
+
+function resolveDispatchScriptPath(fileName) {
+  const localPath = join(__dirname, fileName);
+  const deployedPath = deployedSchedulerDispatchPath(fileName);
+  const preferDeployed = currentDirLooksLikeBrandWrapper();
+  const candidates = [
+    fileName === 'index.mjs' ? process.env.DISPATCH_INDEX_PATH : null,
+    preferDeployed ? deployedPath : localPath,
+    preferDeployed ? localPath : deployedPath,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+
+  return localPath;
+}
+
+function resolvePersistentNodePath() {
+  const explicit = process.env.OPENCLAW_NODE_PATH ||
+    process.env.OPENCLAW_NODE ||
+    process.env.NODE_BINARY;
+  if (explicit) return explicit;
+
+  const execPath = process.execPath || 'node';
+  const homebrewNode = execPath.startsWith('/opt/homebrew/')
+    ? '/opt/homebrew/bin/node'
+    : execPath.startsWith('/usr/local/')
+      ? '/usr/local/bin/node'
+      : null;
+  const isVersionedHomebrewPath = /\/(?:Cellar|opt)\/node(?:@[^/]+)?\//.test(execPath);
+
+  if (homebrewNode && isVersionedHomebrewPath) {
+    try {
+      if (existsSync(homebrewNode)) return homebrewNode;
+    } catch {}
+  }
+
+  return execPath;
+}
+
+function dispatchConfigDirForChild() {
+  return process.env.DISPATCH_CONFIG_DIR || INVOKE_DIR;
+}
+
 function toTimestampMs(value) {
   if (value == null) return null;
   if (typeof value === 'number') {
@@ -681,7 +761,7 @@ function disarmWatchdog(label) {
   const entry = getLabel(label);
   if (!entry?.watchdogJobId) return;
   try {
-    const schedulerCli = join(__dirname, '..', 'cli.js');
+    const schedulerCli = resolveSchedulerCliPath();
     execFileSync(process.execPath, [schedulerCli, 'jobs', 'delete', entry.watchdogJobId], {
       encoding: 'utf-8',
       timeout:  5000,
@@ -715,15 +795,18 @@ function scheduleDeliveryWatcherJob({
   if (!label) throw new Error('label is required');
   if (!deliverTo) throw new Error('deliverTo is required');
 
-  const schedulerCli = join(__dirname, '..', 'cli.js');
-  const watcherPath = join(__dirname, 'watcher.mjs');
+  const schedulerCli = resolveSchedulerCliPath();
+  const watcherPath = resolveDispatchScriptPath('watcher.mjs');
+  const dispatchIndexPath = resolveDispatchScriptPath('index.mjs');
+  const nodePath = resolvePersistentNodePath();
   const watcherTimeoutS = Number(timeoutSeconds) + 120;
   const idleThresholdS = Number(idleThresholdSeconds) || 300;
   const sq = quoteForSingleQuotedShell;
   const watcherCmd =
+    `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
     `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
-    `DISPATCH_INDEX_PATH='${sq(join(__dirname, 'index.mjs'))}' ` +
-    `'${sq(process.execPath)}' '${sq(watcherPath)}' ` +
+    `DISPATCH_INDEX_PATH='${sq(dispatchIndexPath)}' ` +
+    `'${sq(nodePath)}' '${sq(watcherPath)}' ` +
     `--label '${sq(label)}' --timeout ${watcherTimeoutS} ` +
     `--poll-interval 20 --idle-threshold ${idleThresholdS} --once`;
 
@@ -962,7 +1045,7 @@ async function cmdEnqueue(flags) {
   // -- Checkpoint notify command (mid-run status messages) -----
   // Agents can call this command at logical checkpoints to send status updates
   // that will be delivered to the inbox consumer (and ultimately Telegram).
-  const schedulerCliPath = join(__dirname, '..', 'cli.js');
+  const schedulerCliPath = resolveSchedulerCliPath();
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
   // TODO: Inject CHECKPOINT_NOTIFY_CMD as an env var into the agent session so
   // agents can discover the checkpoint command programmatically (not just from
@@ -1142,7 +1225,10 @@ async function cmdEnqueue(flags) {
     let watchdogJobId = null;
     if (monitorEnabled && deliverTo) {
       try {
-        const checkCmd = `'${sq(process.execPath)}' '${sq(join(__dirname, 'index.mjs'))}' result --label '${sq(label)}'`;
+        const checkCmd =
+          `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
+          `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
+          `'${sq(resolvePersistentNodePath())}' '${sq(resolveDispatchScriptPath('index.mjs'))}' result --label '${sq(label)}'`;
         const alertChannel = deliverChannel || 'telegram';
         const alertTarget  = deliverTo;
         const watchdogSpec = JSON.stringify({
@@ -1164,7 +1250,7 @@ async function cmdEnqueue(flags) {
           delete_after_run:         1,             // auto-delete after watchdog fires
           origin:                   origin || 'system',
         });
-        const schedulerCli = join(__dirname, '..', 'cli.js');
+        const schedulerCli = resolveSchedulerCliPath();
         const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
           encoding: 'utf-8',
           timeout:  10000,

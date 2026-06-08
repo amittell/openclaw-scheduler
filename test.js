@@ -4996,11 +4996,14 @@ console.log('\n-- Dispatcher Integration --');
     },
     exercise: async ({ probeDb, context }) => {
       const crashedRun = await waitFor(
-        () => probeDb.prepare(`
-          SELECT status, finished_at
-          FROM runs
-          WHERE id = ?
-        `).get(context.orphanedRunId),
+        () => {
+          const run = probeDb.prepare(`
+            SELECT status, finished_at
+            FROM runs
+            WHERE id = ?
+          `).get(context.orphanedRunId);
+          return run?.status === 'crashed' ? run : null;
+        },
         { timeoutMs: 5000, intervalMs: 100, label: 'orphaned run replay mark crashed' }
       );
       assert(crashedRun.status === 'crashed', 'dispatcher replay marks orphaned run as crashed');
