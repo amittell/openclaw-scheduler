@@ -9,7 +9,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { setDbPath, initDb, closeDb, getDb } from './db.js';
-import { resolveSchedulerDbPath, resolveSchedulerHome } from './paths.js';
+import { resolveSchedulerDbPath, resolveSchedulerHome, resolveServiceWorkingDirectory } from './paths.js';
 import {
   createJob, getJob, listJobs, updateJob, deleteJob,
   getDueJobs, getDueAtJobs, hasRunningRun, nextRunFromCron,
@@ -72,7 +72,7 @@ import {
   TRUST_LEVELS, compareTrustLevels,
 } from './v02-runtime.js';
 import { runShellCommand } from './dispatcher-shell.js';
-import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence } from './dispatcher-strategies.js';
+import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence, executeAgent } from './dispatcher-strategies.js';
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
@@ -169,20 +169,21 @@ assert(jobCols.includes('output_offload_threshold_bytes'), 'jobs.output_offload_
 
 // -- Paths ---------------------------------------------------
 console.log('\nPaths:');
-const fakeEnv = { HOME: '/home/tester' };
-assert(resolveSchedulerHome(fakeEnv) === '/home/tester/.openclaw/scheduler', 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
+const fakeHome = mkdtempSync(join(tmpdir(), 'scheduler-home-'));
+const fakeEnv = { HOME: fakeHome };
+assert(resolveSchedulerHome(fakeEnv) === join(fakeHome, '.openclaw', 'scheduler'), 'resolveSchedulerHome defaults to ~/.openclaw/scheduler');
 assert(
   resolveSchedulerDbPath({
     env: fakeEnv,
     moduleDir: '/home/tester/.openclaw/scheduler/node_modules/openclaw-scheduler'
-  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  }) === join(fakeHome, '.openclaw', 'scheduler', 'scheduler.db'),
   'npm installs default DB path to scheduler home, not node_modules'
 );
 assert(
   resolveSchedulerDbPath({
     env: fakeEnv,
     moduleDir: '/home/tester/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler'
-  }) === '/home/tester/.openclaw/scheduler/scheduler.db',
+  }) === join(fakeHome, '.openclaw', 'scheduler', 'scheduler.db'),
   'installed package layout resolves DB path to scheduler home'
 );
 const writableSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-src-'));
@@ -191,6 +192,20 @@ assert(
   'writable source checkout defaults DB path to package directory'
 );
 rmSync(writableSourceDir, { recursive: true, force: true });
+assert(
+  resolveServiceWorkingDirectory({
+    env: fakeEnv,
+    moduleDir: '/home/tester/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler'
+  }) === join(fakeHome, '.openclaw', 'scheduler'),
+  'installed package layout resolves service cwd to scheduler home'
+);
+const serviceSourceDir = mkdtempSync(join(tmpdir(), 'scheduler-service-src-'));
+assert(
+  resolveServiceWorkingDirectory({ env: fakeEnv, moduleDir: serviceSourceDir }) === serviceSourceDir,
+  'source checkout resolves service cwd to install root'
+);
+rmSync(serviceSourceDir, { recursive: true, force: true });
+rmSync(fakeHome, { recursive: true, force: true });
 
 // -- Prompt context -----------------------------------------
 console.log('\nPrompt Context:');
@@ -3475,6 +3490,75 @@ console.log('\n-- Auth Profile --');
   deleteJob(explicitNullJob.id);
 }
 
+console.log('\n-- Fallback Model/Auth Fields --');
+{
+  const fallbackJob = createJob({
+    name: 'Test Fallback Fields',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'test fallback fields',
+    session_target: 'isolated',
+    payload_model: 'gpt-5-mini',
+    payload_model_fallback: 'openclaw:main',
+    auth_profile: 'anthropic:gmail',
+    auth_profile_fallback: 'openai:work',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000, origin: 'system',
+  });
+  assert(fallbackJob.payload_model_fallback === 'openclaw:main', 'payload_model_fallback stored correctly');
+  assert(fallbackJob.auth_profile_fallback === 'openai:work', 'auth_profile_fallback stored correctly');
+
+  const fetchedFallback = getJob(fallbackJob.id);
+  assert(fetchedFallback.payload_model_fallback === 'openclaw:main', 'getJob returns payload_model_fallback');
+  assert(fetchedFallback.auth_profile_fallback === 'openai:work', 'getJob returns auth_profile_fallback');
+
+  const updatedFallback = updateJob(fallbackJob.id, {
+    payload_model_fallback: 'gpt-4.1-mini',
+    auth_profile_fallback: 'anthropic:backup',
+  });
+  assert(updatedFallback.payload_model_fallback === 'gpt-4.1-mini', 'payload_model_fallback updates correctly');
+  assert(updatedFallback.auth_profile_fallback === 'anthropic:backup', 'auth_profile_fallback updates correctly');
+
+  const clearedFallback = updateJob(fallbackJob.id, {
+    payload_model_fallback: null,
+    auth_profile_fallback: null,
+  });
+  assert(clearedFallback.payload_model_fallback === null, 'payload_model_fallback clears back to null');
+  assert(clearedFallback.auth_profile_fallback === null, 'auth_profile_fallback clears back to null');
+
+  const wsFallback = validateJobSpec({
+    name: 'Fallback whitespace',
+    schedule_cron: '0 0 * * *',
+    payload_message: 'x',
+    payload_model_fallback: '  ',
+    auth_profile_fallback: '  ',
+    delivery_mode: 'none', delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000, origin: 'system',
+  }, null, 'create');
+  assert(wsFallback.payload_model_fallback === null, 'payload_model_fallback whitespace normalizes to null');
+  assert(wsFallback.auth_profile_fallback === null, 'auth_profile_fallback whitespace normalizes to null');
+
+  let caught = false;
+  try {
+    validateJobSpec({ payload_model_fallback: 123, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('payload_model_fallback must be a string');
+  }
+  assert(caught, 'payload_model_fallback rejects non-string types');
+
+  caught = false;
+  try {
+    validateJobSpec({ auth_profile_fallback: true, name: 'bad', schedule_cron: '0 0 * * *', payload_message: 'x', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' }, null, 'create');
+  } catch (e) {
+    caught = e.message.includes('auth_profile_fallback must be a string');
+  }
+  assert(caught, 'auth_profile_fallback rejects non-string types');
+
+  const version = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get();
+  assert(version.v >= 24, 'schema_migrations has v24');
+
+  deleteJob(fallbackJob.id);
+}
+
 console.log('\n-- Auth Profile Session Store Propagation --');
 {
   // Test applyAuthProfileToSessionStore writes authProfileOverride to sessions.json
@@ -3616,52 +3700,55 @@ console.log('\n-- Sync Auth Store to Session --');
   console.log('  sync auth store to session: pass');
 }
 
-console.log('\n-- Sync Auth Store Integration with executeAgent --');
+console.log('\n-- executeAgent fallback selection --');
 {
-  // Verify that syncAuthStoreToSession is in the dispatcher deps bag
-  const dispatcherSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher.js'), 'utf-8');
-  assert(dispatcherSrc.includes('syncAuthStoreToSession'), 'dispatcher.js imports syncAuthStoreToSession');
-  assert(dispatcherSrc.includes('syncAuthStoreToSession,'), 'dispatcher.js passes syncAuthStoreToSession in deps');
+  const turnAttempts = [];
+  const appliedSelections = [];
+  const syncCalls = [];
+  const logs = [];
 
-  // Verify dispatcher-strategies.js calls syncAuth unconditionally before agent turn
-  const strategiesSrc = readFileSync(join(import.meta.dirname || '.', 'dispatcher-strategies.js'), 'utf-8');
-  const syncCallIdx = strategiesSrc.indexOf('syncAuthStoreToSession: syncAuth');
-  assert(syncCallIdx > -1, 'dispatcher-strategies.js destructures syncAuthStoreToSession');
-  // Find the actual syncAuth() invocation and the dispatch-primitive invocation.
-  // executeAgent calls the sanctioned isolated dispatch primitive via a local
-  // alias `dispatchAgentTurn` that resolves to runIsolatedAgentTurn (or its
-  // legacy alias runAgentTurnWithActivityTimeout) -- accept either name so the
-  // ordering invariant stays meaningful as the helper is renamed.
-  const syncInvokeIdx = strategiesSrc.indexOf('syncAuth(job.agent_id');
-  const turnInvokeIdx = (() => {
-    const candidates = [
-      'await dispatchAgentTurn(',
-      'await runIsolatedAgentTurn(',
-      'await runAgentTurnWithActivityTimeout(',
-    ];
-    for (const needle of candidates) {
-      const idx = strategiesSrc.indexOf(needle);
-      if (idx > -1) return idx;
-    }
-    return -1;
-  })();
-  assert(syncInvokeIdx > -1, 'syncAuth invocation found');
-  assert(turnInvokeIdx > -1, 'isolated dispatch primitive invocation found');
-  assert(turnInvokeIdx > syncInvokeIdx, 'syncAuth is called before the isolated dispatch primitive');
+  const result = await executeAgent({
+    id: 'fallback-runtime-job',
+    name: 'Fallback Runtime Job',
+    agent_id: 'main',
+    payload_model: 'gpt-5-mini',
+    payload_model_fallback: 'gpt-4.1-mini',
+    auth_profile: 'anthropic:primary',
+    auth_profile_fallback: 'openai:backup',
+    payload_timeout_seconds: 120,
+    run_timeout_ms: 300_000,
+  }, { run: { id: 'fallback-runtime-run' } }, {
+    waitForGateway: async () => true,
+    updateRunSession: () => {},
+    setAgentStatus: () => {},
+    buildJobPrompt: () => ({ prompt: 'do the thing', contextMeta: {} }),
+    updateContextSummary: () => {},
+    releaseDispatch: () => {},
+    releaseIdempotencyKey: () => {},
+    updateJob: () => {},
+    matchesSentinel: () => false,
+    detectTransientError: () => false,
+    sqliteNow,
+    log: (...args) => logs.push(args),
+    syncAuthStoreToSession: () => { syncCalls.push('sync'); return { ok: true }; },
+    applySessionOverridesToSessionStore: (_sessionKey, overrides) => { appliedSelections.push(overrides); return { ok: true }; },
+    runIsolatedAgentTurn: async ({ model, authProfile }) => {
+      turnAttempts.push({ model: model || null, authProfile: authProfile || null });
+      if (turnAttempts.length === 1) throw new Error('primary selection failed');
+      return { content: 'Fallback path succeeded' };
+    },
+  });
 
-  // Verify the sync call is NOT inside an if(resolvedAuthProfile) guard
-  // Extract the syncAuth call context (the ~20 lines around it)
-  const lines = strategiesSrc.split('\n');
-  const syncLine = lines.findIndex(l => l.includes('syncAuthStoreToSession: syncAuth'));
-  assert(syncLine > -1, 'found syncAuth destructuring line');
-  // Check that the syncAuth call is at function body level (not inside an if block)
-  const syncCallLine = lines.findIndex((l, i) => i > syncLine && l.includes('syncAuth('));
-  assert(syncCallLine > -1, 'found syncAuth() call');
-  // The line should not be deeply indented (inside an if) -- it should be at the same level as other unconditional calls
-  const indent = lines[syncCallLine].match(/^(\s*)/)[1].length;
-  assert(indent <= 6, `syncAuth call indentation (${indent}) suggests it is unconditional (not inside if block)`);
-
-  console.log('  sync auth store integration with executeAgent: pass');
+  assert(result.status === 'ok', 'executeAgent fallback: returns ok after fallback turn succeeds');
+  assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
+  assert(turnAttempts[0].model === null && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary dispatch uses primary auth profile and keeps model in session overrides');
+  assert(turnAttempts[1].model === null && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry dispatch uses fallback auth profile and keeps model in session overrides');
+  assert(syncCalls.length === 2, 'executeAgent fallback: syncAuthStoreToSession runs before both attempts');
+  assert(JSON.stringify(appliedSelections) === JSON.stringify([
+    { authProfile: 'anthropic:primary', modelRef: 'gpt-5-mini' },
+    { authProfile: 'openai:backup', modelRef: 'gpt-4.1-mini' },
+  ]), 'executeAgent fallback: applies primary then fallback model/auth selections to session store');
+  assert(logs.some(entry => String(entry[1] || '').includes('retrying with configured fallback')), 'executeAgent fallback: logs fallback retry');
 }
 
 console.log('\n-- Isolated dispatch primitive: no subprocess spawn --');
@@ -4232,11 +4319,13 @@ console.log('\n-- Partial Current Schema Consolidation --');
     process.stderr.write = originalStderrWrite;
   }
   const migratedDb = getDb();
+  const migratedJobCols = migratedDb.prepare('PRAGMA table_info(jobs)').all().map(c => c.name);
   const migratedRunCols = migratedDb.prepare('PRAGMA table_info(runs)').all().map(c => c.name);
   const migratedMsgCols = migratedDb.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
   const migratedTtaCols = migratedDb.prepare('PRAGMA table_info(task_tracker_agents)').all().map(c => c.name);
   assert(!migrationLogs.includes('migrate-consolidate error'), 'partial current-schema migration completes without consolidate errors');
   assert(!migrationLogs.includes('Schema apply warning'), 'partial current-schema migration completes without schema warnings');
+  assert(migratedJobCols.includes('payload_model_fallback') && migratedJobCols.includes('auth_profile_fallback'), 'partial current-schema migration backfills jobs fallback selection columns');
   assert(migratedRunCols.includes('idempotency_key'), 'partial current-schema migration backfills runs.idempotency_key');
   assert(migratedMsgCols.includes('team_id'), 'partial current-schema migration backfills messages.team_id');
   assert(migratedTtaCols.includes('tracker_id'), 'partial current-schema migration backfills task_tracker_agents.tracker_id');
@@ -6642,6 +6731,32 @@ console.log('\n-- Completion payload helpers --');
   });
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes(`\n\nTechnical details:\n- ${weakTechnicalLeadSummary}`), 'completion helper: stripped technical specifics remain available in the technical details block');
+
+  const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+  const sportsBacktestMetaDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: expectedTechnicalLead,
+      summary: expectedTechnicalLead,
+      deliveryText: expectedTechnicalLead,
+      prose: expectedTechnicalLead,
+      details_technical: {
+        checklist: { work_complete: true, tests_passed: true },
+        raw_summary: sportsBacktestRawSummary,
+      },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: {
+        rawSummary: sportsBacktestRawSummary,
+        normalizedSummary: expectedTechnicalLead,
+        deliverySource: 'summary_human',
+      },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(sportsBacktestMetaDelivery.source === 'raw-summary', 'completion helper: raw task result beats formatter-meta summary');
+  assert(sportsBacktestMetaDelivery.deliveryText.startsWith('Ran one-year sports betting model validation'), 'completion helper: delivered text leads with the real raw task result');
+  assert(!sportsBacktestMetaDelivery.deliveryText.startsWith('Final completion updates now'), 'completion helper: formatter-meta summary does not replace the real task result');
 
   const fitnessStyleWeakSummary = 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.';
   const expectedFitnessLead = "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.";
@@ -10645,7 +10760,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 23, 'capabilities: schema_version is 23');
+  assert(capsOut.schema_version === 24, 'capabilities: schema_version is 24');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

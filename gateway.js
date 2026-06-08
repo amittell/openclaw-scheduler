@@ -144,6 +144,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
+ * @param {string[]} [opts.sessionKinds]  - Optional session kinds to track for activity polling
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
   const {
@@ -155,10 +156,46 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
+    sessionKinds,
   } = opts;
 
   const controller = new AbortController();
   let abortReason = null;
+  const normalizedAgentId = (agentId || 'main').toLowerCase();
+  const normalizedSessionKey = String(sessionKey || '').toLowerCase();
+
+  const inferSessionKinds = () => {
+    if (Array.isArray(sessionKinds) && sessionKinds.length > 0) {
+      return [...new Set(sessionKinds.map(k => String(k).toLowerCase()).filter(Boolean))];
+    }
+
+    // Explicitly isolated/subagent sessions should not be pinned to main session
+    // so they can report idleness based on their own active session records.
+    if (
+      normalizedSessionKey === 'isolated' ||
+      normalizedSessionKey.startsWith('isolated:') ||
+      normalizedSessionKey.endsWith(':isolated') ||
+      normalizedSessionKey.includes(':isolated:') ||
+      normalizedAgentId === 'subagent'
+    ) {
+      return ['subagent', 'isolated'];
+    }
+
+    // Default to including main unless we can clearly infer this is an isolated run.
+    if (
+      normalizedAgentId === 'main' ||
+      normalizedSessionKey === 'main' ||
+      normalizedSessionKey.startsWith('main:') ||
+      normalizedSessionKey.includes(':main:') ||
+      normalizedSessionKey.endsWith(':main')
+    ) {
+      return ['main', 'subagent', 'isolated'];
+    }
+
+    return ['main', 'subagent', 'isolated'];
+  };
+
+  const resolvedSessionKinds = inferSessionKinds();
 
   // Hard absolute ceiling -- always fires regardless of activity
   const absoluteTimer = setTimeout(() => {
@@ -171,7 +208,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 
   const checkActivity = async () => {
     try {
-      const result = await listSessions({ kinds: ['subagent', 'isolated'], activeMinutes: 60 });
+      const result = await listSessions({ kinds: resolvedSessionKinds, activeMinutes: 60 });
       // Normalise: gateway wraps result in several layers
       const sessions =
         result?.result?.details?.sessions ||
@@ -551,20 +588,55 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
  * @param {string} [agentId='main'] - Agent ID for store path resolution
  * @returns {{ ok: boolean, error?: string }}
  */
-export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
-  if (!sessionKey || !authProfile) {
-    return { ok: false, error: 'sessionKey and authProfile are required' };
-  }
-
-  // The gateway may persist session state under either the canonical agent-scoped
-  // key or the flat transport key, depending on which path created the session.
-  // Keep both aliases in sync so isolated scheduler jobs cannot miss the override.
+function resolveSessionKeyAliases(sessionKey, agentId = 'main') {
   const canonicalMatch = sessionKey.match(/^agent:[^:]+:(.+)$/);
   const canonicalKey = sessionKey.startsWith('agent:')
     ? sessionKey
     : `agent:${agentId}:${sessionKey}`;
   const flatSessionKey = canonicalMatch?.[1] || sessionKey;
-  const keyAliases = Array.from(new Set([canonicalKey, flatSessionKey]));
+  return Array.from(new Set([canonicalKey, flatSessionKey]));
+}
+
+function parseSessionModelRef(modelRef) {
+  const trimmed = typeof modelRef === 'string' ? modelRef.trim() : '';
+  if (!trimmed) {
+    return { providerOverride: undefined, modelOverride: undefined };
+  }
+  const slashIndex = trimmed.indexOf('/');
+  if (slashIndex <= 0 || slashIndex >= trimmed.length - 1) {
+    return { providerOverride: undefined, modelOverride: trimmed };
+  }
+  const providerOverride = trimmed.slice(0, slashIndex).trim();
+  const modelOverride = trimmed.slice(slashIndex + 1).trim();
+  return {
+    providerOverride: providerOverride || undefined,
+    modelOverride: modelOverride || undefined,
+  };
+}
+
+/**
+ * Write scheduler-managed session overrides directly to the gateway's sessions.json store.
+ *
+ * The gateway reads sessions.json on each agent turn (with mtime-based cache
+ * invalidation), so writing here before dispatch ensures the embedded runner
+ * picks up the correct auth profile and model selection.
+ *
+ * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
+ * @param {{ authProfile?: string | null, modelRef?: string | null }} overrides - Desired session overrides
+ * @param {string} [agentId='main'] - Agent ID for store path resolution
+ * @returns {{ ok: boolean, error?: string }}
+ */
+export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, agentId = 'main') {
+  if (!sessionKey) {
+    return { ok: false, error: 'sessionKey is required' };
+  }
+
+  const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
+  const shouldSetAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
+  const { providerOverride, modelOverride } = parseSessionModelRef(overrides.modelRef);
+  const shouldSetModelOverride = Boolean(modelOverride);
+
+  const keyAliases = resolveSessionKeyAliases(sessionKey, agentId);
   const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
 
   try {
@@ -579,28 +651,59 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
     let changed = false;
 
     for (const key of keyAliases) {
-      const entry = store[key];
-      if (!entry) {
-        // Session doesn't exist yet -- create a minimal entry.
-        // The gateway will populate the rest on the first agent turn.
-        store[key] = {
-          updatedAt: now,
-          authProfileOverride: authProfile,
-          authProfileOverrideSource: 'user',
-        };
-        changed = true;
+      const existingEntry = store[key];
+      if (!existingEntry && !shouldSetAuthProfile && !shouldSetModelOverride) {
         continue;
       }
 
-      if (entry.authProfileOverride !== authProfile || entry.authProfileOverrideSource !== 'user') {
-        // Update existing entry
-        entry.authProfileOverride = authProfile;
-        entry.authProfileOverrideSource = 'user';
-        entry.updatedAt = now;
-        // Clear compaction count so the override sticks across compactions
+      const entry = existingEntry || { updatedAt: now };
+      let entryChanged = false;
+
+      if (shouldSetAuthProfile) {
+        if (entry.authProfileOverride !== authProfile || entry.authProfileOverrideSource !== 'user') {
+          entry.authProfileOverride = authProfile;
+          entry.authProfileOverrideSource = 'user';
+          delete entry.authProfileOverrideCompactionCount;
+          entryChanged = true;
+        }
+      } else if (
+        entry.authProfileOverride !== undefined ||
+        entry.authProfileOverrideSource !== undefined ||
+        entry.authProfileOverrideCompactionCount !== undefined
+      ) {
+        delete entry.authProfileOverride;
+        delete entry.authProfileOverrideSource;
         delete entry.authProfileOverrideCompactionCount;
-        changed = true;
+        entryChanged = true;
       }
+
+      if (shouldSetModelOverride) {
+        if (entry.modelOverride !== modelOverride) {
+          entry.modelOverride = modelOverride;
+          entryChanged = true;
+        }
+        if (providerOverride) {
+          if (entry.providerOverride !== providerOverride) {
+            entry.providerOverride = providerOverride;
+            entryChanged = true;
+          }
+        } else if (entry.providerOverride !== undefined) {
+          delete entry.providerOverride;
+          entryChanged = true;
+        }
+      } else if (entry.modelOverride !== undefined || entry.providerOverride !== undefined) {
+        delete entry.modelOverride;
+        delete entry.providerOverride;
+        entryChanged = true;
+      }
+
+      if (!entryChanged) {
+        continue;
+      }
+
+      entry.updatedAt = now;
+      store[key] = entry;
+      changed = true;
     }
 
     if (!changed) {
@@ -614,9 +717,16 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
   }
 }
 
+export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
+  if (!sessionKey || !authProfile) {
+    return { ok: false, error: 'sessionKey and authProfile are required' };
+  }
+  return applySessionOverridesToSessionStore(sessionKey, { authProfile }, agentId);
+}
+
 /**
- * Sync the live auth-profiles.json from ~/.openclaw/credentials/ to the agent's
- * auth store at ~/.openclaw/agents/<agentId>/agent/auth-profiles.json.
+ * Sync the live auth-profiles.json from the main agent store to the target
+ * agent store at ~/.openclaw/agents/<agentId>/agent/auth-profiles.json.
  *
  * This ensures scheduler sessions always use fresh credentials (tokens, order,
  * default profile) even when no explicit auth_profile is set on the job.
@@ -630,7 +740,7 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
  * @returns {{ ok: boolean, error?: string }}
  */
 export function syncAuthStoreToSession(agentId = 'main') {
-  const livePath = join(HOME_DIR, '.openclaw', 'credentials', 'auth-profiles.json');
+  const livePath = join(HOME_DIR, '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
   const agentStorePath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent', 'auth-profiles.json');
 
   try {

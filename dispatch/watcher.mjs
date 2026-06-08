@@ -39,6 +39,7 @@ import {
 import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { sendMessage } from '../messages.js';
+import { ensureArtifactsDir, resolveArtifactsDir } from '../paths.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
@@ -54,12 +55,68 @@ const MAX_GW_RESTART_RETRIES = 2; // Max retries for gateway-restart-kill recove
 
 const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
 const ACTIVITY_POLL_MS = 30_000;
+const COMPLETION_INLINE_LIMIT_BYTES = parsePositiveEnvInt('DISPATCH_COMPLETION_INLINE_LIMIT_BYTES', 60 * 1024);
 
 /** How often the watcher writes lastPing to labels.json (heartbeat signal).
  *  The watchdog guard in index.mjs treats pings older than 3x this as stale,
  *  so PING_INTERVAL_MS must stay well below PING_STALE_MS (3 * 60_000). */
 const PING_INTERVAL_MS = 60_000; // 60 seconds
 
+function parsePositiveEnvInt(name, fallback) {
+  const value = Number.parseInt(String(process.env[name] ?? ''), 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function byteLength(text) {
+  return Buffer.byteLength(String(text ?? ''), 'utf8');
+}
+
+function sliceUtf8Bytes(text, maxBytes) {
+  const source = String(text ?? '');
+  if (byteLength(source) <= maxBytes) return source;
+
+  let usedBytes = 0;
+  let endIndex = 0;
+  for (const char of source) {
+    const charBytes = byteLength(char);
+    if (usedBytes + charBytes > maxBytes) break;
+    usedBytes += charBytes;
+    endIndex += char.length;
+  }
+  return source.slice(0, endIndex).trimEnd();
+}
+
+function completionArtifactPath(label) {
+  const safeLabel = String(label || 'completion')
+    .replace(/[^a-z0-9._-]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'completion';
+  const dir = ensureArtifactsDir(join(resolveArtifactsDir({ env: process.env }), 'dispatch-completions'));
+  return join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}.txt`);
+}
+
+function formatCompletionStdout(label, deliveryText) {
+  const header = `🌶️ *dispatch* [${label}] completed:\n\n`;
+  const body = String(deliveryText ?? '');
+  const bodyBytes = byteLength(body);
+
+  if (bodyBytes <= COMPLETION_INLINE_LIMIT_BYTES) {
+    return `${header}${body}\n`;
+  }
+
+  let artifactNote;
+  try {
+    const artifactPath = completionArtifactPath(label);
+    writeFileSync(artifactPath, body, 'utf8');
+    artifactNote = `\n\nFull completion report saved to ${artifactPath} (${bodyBytes} bytes). Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes to avoid dumping an oversized report.`;
+  } catch (err) {
+    artifactNote = `\n\nFull completion report was ${bodyBytes} bytes, but saving the oversized report failed: ${err.message}. Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes.`;
+  }
+
+  const bodyBudget = Math.max(0, COMPLETION_INLINE_LIMIT_BYTES - byteLength(artifactNote));
+  const inlineBody = sliceUtf8Bytes(body, bodyBudget);
+  return `${header}${inlineBody}${artifactNote}\n`;
+}
 
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -922,11 +979,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   markLabelDone(label, completion.summary);
 
   if (completion.deliveryText) {
-    const maxLen = 3500;
-    const reply = completion.deliveryText.length > maxLen
-      ? completion.deliveryText.slice(0, maxLen) + '\n\n..[truncated]'
-      : completion.deliveryText;
-    process.stdout.write(`🌶️ *dispatch* [${label}] completed:\n\n${reply}\n`);
+    process.stdout.write(formatCompletionStdout(label, completion.deliveryText));
     process.exit(0);
   }
 
@@ -1120,14 +1173,18 @@ function runOnceAndExit() {
   }
 
   const ageMs = status.liveness?.ageMs;
-  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  const livenessPolicy = getCurrentLivenessPolicy();
+  const idleResultCheckMs = livenessPolicy.idleProbeMs;
+  const idleFailureMs = livenessPolicy.idleFailureMs;
   if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
+    const stallReason = ageMs >= idleFailureMs
+      ? getRunningSessionStallReason(status, idleFailureMs)
+      : null;
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1504,14 +1561,18 @@ while (Date.now() < deadline) {
   // while this watcher's lastPing heartbeat is fresh (written every 60s);
   // this path handles normal completion before the ping goes stale.
   const ageMs = status.liveness?.ageMs;
-  const idleResultCheckMs = getCurrentLivenessPolicy().idleProbeMs;
+  const livenessPolicy = getCurrentLivenessPolicy();
+  const idleResultCheckMs = livenessPolicy.idleProbeMs;
+  const idleFailureMs = livenessPolicy.idleFailureMs;
   if (ageMs != null && ageMs >= idleResultCheckMs) {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
     }
 
-    const stallReason = getRunningSessionStallReason(status, idleResultCheckMs);
+    const stallReason = ageMs >= idleFailureMs
+      ? getRunningSessionStallReason(status, idleFailureMs)
+      : null;
     if (stallReason) {
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
@@ -1530,6 +1591,14 @@ while (Date.now() < deadline) {
 // Timed out -- try one last result check
 const finalResult = dispatch('result', ['--label', label]);
 const finalStatus = dispatch('status', ['--label', label]);
+if (hasStructuredCompletion(finalResult)) {
+  deliverResult(
+    label,
+    finalResult?.lastReply || null,
+    finalStatus?.summary || null,
+    finalResult?.completion || finalStatus?.completion || null,
+  );
+}
 if (finalStatus?.status === 'done') {
   const rc = getRetryCount(label);
   if (rc > 0) setRetryCount(label, 0);

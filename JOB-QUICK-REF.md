@@ -196,6 +196,8 @@ openclaw-scheduler jobs reject <id> "not ready yet"
 | `payload_kind` | string | yes | `shellCommand`, `systemEvent`, or `agentTurn` |
 | `payload_message` | string | yes | Shell command or agent prompt |
 | `payload_model` | string | no | Model override for agent tasks |
+| `payload_model_fallback` | string | no | Optional fallback model override for same-run retry after primary selection failure |
+| `auth_profile_fallback` | string | no | Optional fallback auth profile for same-run retry after primary selection failure |
 | `run_timeout_ms` | integer | yes | Max run duration in ms (no default) |
 | `delivery_mode` | string | no | `none`, `announce`, `announce-always` |
 | `delivery_channel` | string | no | Channel name (telegram, discord, etc.) |
