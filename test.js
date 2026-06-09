@@ -6619,6 +6619,25 @@ console.log('\n-- Completion payload helpers --');
   assert(structuredFirst.source === 'summary_human', 'completion helper: summary_human is the primary structured delivery field');
   assert(structuredFirst.deliveryText === 'Human-ready summary from structured completion.', 'completion helper: summary_human beats raw transcript fallback');
 
+  const explicitHumanBeatsRawDelivery = resolveCompletionDelivery({
+    lastReply: 'Legacy transcript summary should not beat structured completion.',
+    completion: {
+      summary_human: 'The new human-readable completion summary wins.',
+      summary: 'Compressed internal summary should not be delivered.',
+      deliveryText: 'Old clean summarized report should not be delivered.',
+      details_technical: {
+        raw_summary: 'Raw diagnostic artifact should not be delivered.',
+      },
+      checklist: { work_complete: true },
+      debug: { deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'fallback summary should not be delivered',
+  });
+  assert(explicitHumanBeatsRawDelivery.source === 'summary_human', 'completion helper: explicit human summary wins over legacy/raw delivery fields');
+  assert(explicitHumanBeatsRawDelivery.deliveryText === 'The new human-readable completion summary wins.', 'completion helper: explicit human summary is the only delivered text when present');
+  assert(!explicitHumanBeatsRawDelivery.deliveryText.includes('Old clean summarized report'), 'completion helper: legacy deliveryText is suppressed behind summary_human');
+  assert(!explicitHumanBeatsRawDelivery.deliveryText.includes('Raw diagnostic artifact'), 'completion helper: raw diagnostic summary is suppressed behind summary_human');
+
   const summaryFallback = resolveCompletionDelivery({
     lastReply: null,
     completion: {
@@ -6711,9 +6730,8 @@ console.log('\n-- Completion payload helpers --');
     completion: humanizedTechnicalPayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('\n\nTechnical details:\n- '), 'completion helper: humanized technical summary keeps a separate technical details block underneath');
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes(`- ${technicalCommitSummary}`), 'completion helper: technical details retain the original technical summary');
-  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('- Checks: tests passed; pushed deadbee.'), 'completion helper: technical details preserve structured verification metadata');
+  assert(humanizedTechnicalDelivery.deliveryText === expectedTechnicalLead, 'completion helper: humanized technical summary delivers only the human-facing lead');
+  assert(!humanizedTechnicalDelivery.deliveryText.includes(technicalCommitSummary), 'completion helper: raw technical summary is kept out when summary_human exists');
 
   const weakTechnicalLeadSummary = 'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions';
   const weakTechnicalLeadPayload = buildTerminalCompletionPayload({
@@ -6730,7 +6748,7 @@ console.log('\n-- Completion payload helpers --');
     fallbackSummary: 'completed (agent signal)',
   });
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
-  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes(`\n\nTechnical details:\n- ${weakTechnicalLeadSummary}`), 'completion helper: stripped technical specifics remain available in the technical details block');
+  assert(!weakTechnicalLeadDelivery.deliveryText.includes(weakTechnicalLeadSummary), 'completion helper: stripped technical specifics stay out of delivery when summary_human exists');
 
   const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
   const sportsBacktestMetaDelivery = resolveCompletionDelivery({
@@ -6754,9 +6772,9 @@ console.log('\n-- Completion payload helpers --');
     },
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(sportsBacktestMetaDelivery.source === 'raw-summary', 'completion helper: raw task result beats formatter-meta summary');
-  assert(sportsBacktestMetaDelivery.deliveryText.startsWith('Ran one-year sports betting model validation'), 'completion helper: delivered text leads with the real raw task result');
-  assert(!sportsBacktestMetaDelivery.deliveryText.startsWith('Final completion updates now'), 'completion helper: formatter-meta summary does not replace the real task result');
+  assert(sportsBacktestMetaDelivery.source === 'summary_human', 'completion helper: explicit summary_human beats raw task artifact');
+  assert(sportsBacktestMetaDelivery.deliveryText === expectedTechnicalLead, 'completion helper: explicit summary_human is delivered instead of raw_summary');
+  assert(!sportsBacktestMetaDelivery.deliveryText.includes('Ran one-year sports betting model validation'), 'completion helper: raw task artifact is suppressed when summary_human exists');
 
   const fitnessStyleWeakSummary = 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.';
   const expectedFitnessLead = "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.";
@@ -6772,8 +6790,8 @@ console.log('\n-- Completion payload helpers --');
     completion: fitnessStylePayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.startsWith(expectedFitnessLead), 'completion helper: mixed human-plus-technical fitness summary keeps the plain-English lead first');
-  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('\n\nTechnical details:\n- mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness summary moves the implementation details underneath');
+  assert(fitnessStyleDelivery.deliveryText === expectedFitnessLead, 'completion helper: mixed human-plus-technical fitness summary delivers the plain-English lead');
+  assert(!fitnessStyleDelivery.deliveryText.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness raw details stay out when summary_human exists');
   assert(fitnessStyleDelivery.deliveryText && !fitnessStyleDelivery.deliveryText.includes('Technically:'), 'completion helper: mixed human-plus-technical fitness summary removes the inline Technically marker from delivery text');
 
   const brokenAppleHealthShape = [
@@ -9205,7 +9223,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
     expectedDeliveryText: 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.',
-    expectedTechnicalDetailsText: 'Technical details:\n- fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
+    unexpectedDeliveryText: 'fix(dispatch): normalize completion delivery',
     expectEnqueued: true,
   });
 
@@ -9214,7 +9232,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     summary: 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.',
     checklist: { work_complete: true },
     expectedDeliveryText: "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.",
-    expectedTechnicalDetailsText: 'Technical details:\n- mapped imported Tonal workoutId values back to tonal_program_schedule',
+    unexpectedDeliveryText: 'mapped imported Tonal workoutId values back to tonal_program_schedule',
     expectEnqueued: true,
   });
 
