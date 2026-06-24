@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.13] -- 2026-06-24
+
+### Fixed
+- fix(dispatch): prefer structured completion payloads for chilisaus status/result/list summaries before falling back to generic label summaries or transcript text
+
 ## [0.2.12] -- 2026-06-23
 
 ### Changed
