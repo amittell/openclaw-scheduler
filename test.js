@@ -7017,16 +7017,18 @@ console.log('\n-- cmdResult conservative transcript recovery --');
   const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
   mkdirSync(sessionsDir, { recursive: true });
 
-  function seedResultCase({ label, sessionKey, sessionId, entries }) {
+  function seedResultCase({ label, sessionKey, sessionId, entries, status = 'running', summary = null, completion = null }) {
     writeFileSync(labelsPath, JSON.stringify({
       [label]: {
         sessionKey,
         sessionId,
-        status: 'running',
+        status,
         agent: 'main',
         mode: 'fresh',
         spawnedAt: new Date(Date.now() - 90_000).toISOString(),
         timeoutSeconds: 300,
+        summary,
+        completion,
       },
     }) + '\n');
     writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
@@ -7075,6 +7077,130 @@ console.log('\n-- cmdResult conservative transcript recovery --');
   assert(guardedResult.lastReply === null, 'cmdResult: mid-task chatter is not promoted to lastReply');
   assert(guardedResult.diagnosticReply === 'I am starting by reading files.', 'cmdResult: mid-task chatter remains available only as diagnosticReply');
   assert(guardedResult.recovery?.source === 'jsonl-diagnostic', 'cmdResult: mid-task chatter recovery source recorded as diagnostic only');
+
+  const structuredCompletion = {
+    summary_human: 'Recovered the scheduler completion summary and verified commit abc1234.',
+    summary: 'Recovered the scheduler completion summary and verified commit abc1234.',
+    deliveryText: 'Recovered the scheduler completion summary and verified commit abc1234.',
+    checklist: { work_complete: true, tests_passed: true },
+    sha: 'abc1234',
+    debug: { deliverySource: 'summary_human' },
+  };
+  seedResultCase({
+    label: 'result-structured-summary',
+    sessionKey: 'agent:main:subagent:result-structured-summary',
+    sessionId: 'result-structured-summary-sid',
+    status: 'done',
+    summary: 'completed (agent signal)',
+    completion: structuredCompletion,
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'I am starting by reading files.' }], stop_reason: 'end_turn' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    ],
+  });
+
+  const structuredStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-structured-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(structuredStatus.summary === structuredCompletion.summary_human, 'cmdStatus: structured completion summary beats generic label summary');
+
+  const structuredResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-structured-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(structuredResult.summary === structuredCompletion.summary_human, 'cmdResult: structured completion summary beats generic label summary');
+
+  const structuredList = JSON.parse(execFileSync(process.execPath, [indexPath, 'list', '--limit', '1'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(structuredList.labels[0].summary === structuredCompletion.summary_human, 'cmdList: structured completion summary beats generic label summary');
+
+  const explicitDoneSummary = 'Finished the recovery, kept the watcher local, and verified commit def5678.';
+  seedResultCase({
+    label: 'result-explicit-summary',
+    sessionKey: 'agent:main:subagent:result-explicit-summary',
+    sessionId: 'result-explicit-summary-sid',
+    status: 'done',
+    summary: explicitDoneSummary,
+    completion: buildTerminalCompletionPayload({
+      summary: explicitDoneSummary,
+      checklist: { work_complete: true, tests_passed: true },
+      sha: 'def5678',
+    }),
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Stale terminal transcript text that should not become the summary.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const explicitResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-explicit-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(explicitResult.lastReply === 'Stale terminal transcript text that should not become the summary.', 'cmdResult: stale terminal transcript remains visible as lastReply');
+  assert(explicitResult.summary === explicitDoneSummary, 'cmdResult: explicit done summary beats stale lastReply');
+
+  const legacyExplicitSummary = 'Legacy label finished with a real stored summary.';
+  seedResultCase({
+    label: 'result-legacy-explicit-summary',
+    sessionKey: 'agent:main:subagent:result-legacy-explicit-summary',
+    sessionId: 'result-legacy-explicit-summary-sid',
+    status: 'done',
+    summary: legacyExplicitSummary,
+    completion: null,
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Stale terminal transcript text that should not become the summary.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const legacyExplicitResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-legacy-explicit-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(legacyExplicitResult.summary === legacyExplicitSummary, 'cmdResult: legacy stored summary beats stale lastReply when no completion payload exists');
+
+  seedResultCase({
+    label: 'result-fallback-summary',
+    sessionKey: 'agent:main:subagent:result-fallback-summary',
+    sessionId: 'result-fallback-summary-sid',
+    status: 'done',
+    summary: 'completed old task',
+    completion: null,
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Done.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const fallbackStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-fallback-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(fallbackStatus.summary === 'completed old task', 'cmdStatus: stored summary fallback remains when no useful completion payload exists');
+
+  const fallbackResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-fallback-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(fallbackResult.summary === 'completed old task', 'cmdResult: stored summary fallback remains when no useful completion payload exists');
 
   rmSync(tempDir, { recursive: true, force: true });
 }

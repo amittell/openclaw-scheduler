@@ -38,6 +38,7 @@ import {
   extractLastMeaningfulAssistantReplyFromEntries,
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
+  resolveCompletionDelivery,
   taskRequiresGitSha,
 } from './completion.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
@@ -300,6 +301,33 @@ function setLabelDone(name, data) {
     };
   });
   return labels[name];
+}
+
+function effectiveCompletionSummary(entry, lastReply = null) {
+  if (!entry || typeof entry !== 'object') return null;
+
+  if (hasCompletionSignal(entry.completion)) {
+    const resolved = resolveCompletionDelivery({
+      lastReply,
+      completion: entry.completion || null,
+      fallbackSummary: entry.summary || null,
+    });
+    if (resolved?.summary) return resolved.summary;
+  }
+
+  if (entry.summary) return entry.summary;
+
+  if (lastReply) {
+    const resolved = resolveCompletionDelivery({
+      lastReply,
+      completion: null,
+      fallbackSummary: null,
+    });
+    if (resolved?.summary) return resolved.summary;
+    return lastReply.slice(0, 500);
+  }
+
+  return null;
 }
 
 // -- Gateway Calls --------------------------------------------
@@ -1573,7 +1601,7 @@ function cmdStatus(flags) {
     status:     current.status,
     spawnedAt:  current.spawnedAt,
     updatedAt:  current.updatedAt,
-    summary:    current.summary || null,
+    summary:    effectiveCompletionSummary(current),
     completion: current.completion || null,
     delivery:   buildDispatchDeliverySurface(current),
     error:      current.error || null,
@@ -1919,7 +1947,7 @@ function cmdResult(flags) {
     sessionKey: entry.sessionKey,
     status:     entry.status,
     spawnedAt:  entry.spawnedAt,
-    summary:    entry.summary || (lastReply ? lastReply.slice(0, 500) : null),
+    summary:    effectiveCompletionSummary(entry, lastReply),
     completion: entry.completion || null,
     delivery:   buildDispatchDeliverySurface(entry),
     lastReply:  lastReply || null,
@@ -2349,6 +2377,7 @@ function cmdList(flags) {
   let entries = Object.entries(labels).map(([name, data]) => ({
     label: name,
     ...data,
+    summary: effectiveCompletionSummary(data),
     delivery: buildDispatchDeliverySurface(data),
   }));
 
