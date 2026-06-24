@@ -139,7 +139,10 @@ node dispatch/index.mjs done \
 ```
 
 Marks the label as `done` immediately so the watcher can resolve the run without
-waiting for timeout polling.
+waiting for timeout polling. Run this command from the same local dispatch shell
+that created the label. Do not run it from inside `ssh`, Docker, tmux, or another
+nested shell unless that shell intentionally points at the originating dispatch
+host and `labels.json`; otherwise it can update a different label store.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -291,8 +294,11 @@ No manual token configuration needed on a standard OpenClaw install.
 
 When `--deliver-to` is set, dispatch registers a **scheduler watcher job**
 after dispatching the session. The watcher polls the session result every
-minute until the agent sends the structured `done` completion signal, then
-delivers via the scheduler's `handleDelivery` pipeline.
+minute until the agent sends the structured local `done` completion signal, then
+delivers via the scheduler's `handleDelivery` pipeline. If the structured signal
+is missed but the transcript has strict clean terminal completion evidence, the
+watcher may deliver that terminal assistant report; arbitrary mid-task replies
+remain diagnostics.
 
 ```
 dispatch enqueue --deliver-to <telegram-user-id>
@@ -325,10 +331,12 @@ gateway/session liveness fails open to "still monitoring" until the hard timeout
 window or a clear terminal error.
 
 While a label is still `running`, a plain assistant reply is diagnostic only.
-Successful final delivery requires the agent-side `done` signal and its
-structured completion payload. If an older watcher records an error and the
-worker later sends a valid `done`, the later completion is authoritative and the
-stale error is cleared from the label.
+Successful final delivery prefers the agent-side local `done` signal and its
+structured completion payload. The terminal-assistant fallback is intentionally
+narrow: it requires clean completion evidence from the transcript, not just the
+latest assistant text. If an older watcher records an error and the worker later
+sends a valid local `done`, the later completion is authoritative and the stale
+error is cleared from the label.
 
 ### Progress check-ins from subagent sessions
 

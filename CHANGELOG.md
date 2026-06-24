@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.12] -- 2026-06-23
+
+### Changed
+- docs(dispatch): document that `dispatch done` must run from the originating local dispatch shell and that terminal-output watcher fallback requires strict clean completion evidence
+
 ## [0.2.11] -- 2026-06-23
 
 ### Fixed
