@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.11] -- 2026-06-23
+
+### Fixed
+- fix(dispatch): clarify that completion markers must run in the originating local dispatch shell, and allow watcher delivery from clean terminal `stop_reason=end_turn` replies without broadening plain `lastReply` success detection
+- fix(watcher): use the fatal idle threshold for stalled-session errors while keeping quiet high-thinking sessions pending at the probe threshold
+
 ## [0.2.5] -- 2026-04-27
 
 ### Fixed

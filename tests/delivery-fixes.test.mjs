@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
 import { executeMain, executeShell, executeWatchdog } from '../dispatcher-strategies.js';
+import { buildCompletionSignalInstructions } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'cli.js');
@@ -520,7 +521,259 @@ if (sub === 'status') {
   }
 });
 
-test('watcher --once detects stale sessions despite fresh watcher lastPing', () => {
+test('watcher --once probes quiet high-thinking sessions without failing at probe threshold', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-high-thinking-probe-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'quick-poll-high-thinking';
+  const sessionKey = 'agent:main:subagent:high-thinking-session';
+  const sessionId = 'high-thinking-jsonl-id';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+        model: 'test',
+      },
+    }) + '\n');
+    const jsonlPath = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(jsonlPath, JSON.stringify({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Still thinking.' }],
+    }) + '\n');
+    const staleDate = new Date(Date.now() - 11 * 60 * 1000);
+    utimesSync(jsonlPath, staleDate, staleDate);
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date().toISOString(),
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: ${11 * 60 * 1000} }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '1200', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0);
+    assert.equal((run.stdout || '').trim(), '');
+    assert.match(run.stderr || '', /WATCHER_PENDING/);
+    assert.equal(labels[label].status, 'running');
+    assert.equal(labels[label].error, undefined);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once delivers clean terminal assistant reply without done marker', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-terminal-reply-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'terminal-jsonl-no-done';
+  const sessionKey = 'agent:main:subagent:terminal-jsonl-no-done';
+  const sessionId = 'terminal-jsonl-no-done-sid';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+        model: 'test',
+      },
+    }) + '\n');
+    writeFileSync(join(sessionsDir, `${sessionId}.jsonl`), [
+      JSON.stringify({ role: 'user', content: [{ type: 'text', text: 'Do the work' }] }),
+      JSON.stringify({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Final report: implemented the label-store fix.' }],
+        stop_reason: 'end_turn',
+      }),
+    ].join('\n') + '\n');
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date().toISOString(),
+        deliverTo: '123',
+        deliverChannel: 'telegram',
+        deliveryMode: 'announce',
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: ${12 * 60 * 1000} }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    status: 'running',
+    lastReply: 'Final report: implemented the label-store fix.'
+  }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '1200', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0);
+    assert.match(run.stdout || '', /Final report: implemented the label-store fix\./);
+    assert.doesNotMatch(run.stdout || '', /agent session stalled/);
+    assert.equal(labels[label].status, 'done');
+    assert.equal(labels[label].error, undefined);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once does not deliver plain lastReply without clean terminal JSONL proof', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-lastreply-no-proof-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'lastreply-no-terminal-proof';
+  const sessionKey = 'agent:main:subagent:lastreply-no-terminal-proof';
+  const sessionId = 'lastreply-no-terminal-proof-sid';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+        model: 'test',
+      },
+    }) + '\n');
+    writeFileSync(join(sessionsDir, `${sessionId}.jsonl`), [
+      JSON.stringify({ role: 'user', content: [{ type: 'text', text: 'Do the work' }] }),
+      JSON.stringify({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Final report: this should stay diagnostic only.' }],
+      }),
+    ].join('\n') + '\n');
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date().toISOString(),
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: ${11 * 60 * 1000} }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    status: 'running',
+    lastReply: 'Final report: this should stay diagnostic only.'
+  }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '1200', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0);
+    assert.equal((run.stdout || '').trim(), '');
+    assert.match(run.stderr || '', /WATCHER_PENDING/);
+    assert.equal(labels[label].status, 'running');
+    assert.equal(labels[label].error, undefined);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once detects stale sessions after the fatal idle threshold despite fresh watcher lastPing', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-stale-'));
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
@@ -552,7 +805,7 @@ test('watcher --once detects stale sessions despite fresh watcher lastPing', () 
         status: 'running',
         agent: 'main',
         spawnedAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
-        timeoutSeconds: 7200,
+        timeoutSeconds: 600,
         lastPing: new Date().toISOString(),
       },
     }) + '\n');
@@ -575,7 +828,7 @@ const sub = process.argv[2];
 `);
 
     const run = spawnSync(process.execPath, [
-      watcherPath, '--label', label, '--timeout', '7200', '--poll-interval', '20', '--once',
+      watcherPath, '--label', label, '--timeout', '600', '--poll-interval', '20', '--once',
     ], {
       env: {
         ...process.env,
@@ -733,6 +986,17 @@ test('dispatch status keeps running when JSONL is fresher than sessions store', 
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('completion signal instructions require local dispatch shell', () => {
+  const instructions = buildCompletionSignalInstructions({
+    label: 'remote-work',
+    taskPrompt: 'SSH to another host, fix the repo, and push the result.',
+    doneScriptPath: '/Users/alexm/.openclaw/chilisaus/index.mjs',
+  });
+
+  assert.match(instructions, /dispatch session shell on this host/);
+  assert.match(instructions, /Do not run it inside ssh, docker, tmux, or any remote shell/);
 });
 
 test('messages send accepts channel and delivery-to overrides for durable delivery', async (t) => {

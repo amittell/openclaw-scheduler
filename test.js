@@ -6209,8 +6209,8 @@ console.log('\n-- Watcher stop_reason early delivery --');
   assert(watcherSrc.includes('isSessionCleanlyFinished'), 'stop_reason: isSessionCleanlyFinished function present');
   assert(watcherSrc.includes('stop_reason=end_turn detected'), 'stop_reason: Path 2a log message present');
   assert(watcherSrc.includes('completed (stop_reason=end_turn)'), 'stop_reason: Path 2a delivery fallback summary present');
-  assert(watcherSrc.includes('if (hasStructuredCompletion(result))'), 'stop_reason: Path 2a requires structured completion signal before delivery');
-  assert(watcherSrc.includes('without completion signal'), 'stop_reason: Path 2a keeps plain replies in monitoring state');
+  assert(watcherSrc.includes('function getStrictTerminalReply'), 'stop_reason: watcher limits plain lastReply delivery to clean terminal JSONL proof');
+  assert(watcherSrc.includes('deliverResult(label, terminalJsonlReply'), 'stop_reason: Path 2a delivers clean terminal replies even without done marker');
 
   // isSessionCleanlyFinished behavioral tests using real JSONL files
   const tmpDir = mkdtempSync(join(tmpdir(), 'watcher-stopreason-'));

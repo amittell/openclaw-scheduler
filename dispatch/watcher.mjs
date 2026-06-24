@@ -1052,6 +1052,22 @@ function hasStructuredCompletion(result) {
   return hasCompletionSignal(result?.completion);
 }
 
+function getCleanTerminalReply(status) {
+  if (!status?.sessionKey) return null;
+  const entry = getSessionStoreEntry(status.sessionKey);
+  const sessionId = entry?.sessionId || null;
+  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const terminalJsonlReply = sessionId ? getSessionTerminalReply(sessionId, sessionAgent) : null;
+  if (!sessionId || !terminalJsonlReply) return null;
+  return isSessionCleanlyFinished(sessionId, sessionAgent) ? terminalJsonlReply : null;
+}
+
+function getStrictTerminalReply(result, status) {
+  const terminalJsonlReply = getCleanTerminalReply(status);
+  if (!terminalJsonlReply) return null;
+  return result?.lastReply || terminalJsonlReply;
+}
+
 if (!label) {
   process.stderr.write('[watcher] --label is required\n');
   process.exit(2);
@@ -1159,16 +1175,13 @@ function runOnceAndExit() {
   }
 
   if (status.sessionKey) {
-    const entry = getSessionStoreEntry(status.sessionKey);
-    const sessionId = entry?.sessionId || null;
-    const sessionAgent = status.sessionKey.split(':')[1] || 'main';
-    const terminalJsonlReply = sessionId ? getSessionTerminalReply(sessionId, sessionAgent) : null;
-    if (sessionId && terminalJsonlReply && isSessionCleanlyFinished(sessionId, sessionAgent)) {
+    const terminalJsonlReply = getCleanTerminalReply(status);
+    if (terminalJsonlReply) {
       const result = dispatch('result', ['--label', label]);
       if (hasStructuredCompletion(result)) {
         deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
       }
-      process.stderr.write(`[watcher] stop_reason=end_turn observed without completion signal -- continuing to monitor\n`);
+      deliverResult(label, terminalJsonlReply, 'completed (stop_reason=end_turn)', null);
     }
   }
 
@@ -1180,6 +1193,10 @@ function runOnceAndExit() {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
+    }
+    const terminalReply = getStrictTerminalReply(result, status);
+    if (terminalReply) {
+      deliverResult(label, terminalReply, 'completed (stop_reason=end_turn)', null);
     }
 
     const stallReason = ageMs >= idleFailureMs
@@ -1550,7 +1567,7 @@ while (Date.now() < deadline) {
         deliverResult(label, result?.lastReply || terminalJsonlReply, 'completed (stop_reason=end_turn)', result?.completion || null);
         // deliverResult exits
       }
-      process.stderr.write(`[watcher] stop_reason=end_turn observed without completion signal -- continuing to monitor\n`);
+      deliverResult(label, terminalJsonlReply, 'completed (stop_reason=end_turn)', null);
     }
   }
 
@@ -1568,6 +1585,10 @@ while (Date.now() < deadline) {
     const result = dispatch('result', ['--label', label]);
     if (hasStructuredCompletion(result)) {
       deliverResult(label, result?.lastReply || null, null, result?.completion || null);
+    }
+    const terminalReply = getStrictTerminalReply(result, status);
+    if (terminalReply) {
+      deliverResult(label, terminalReply, 'completed (stop_reason=end_turn)', null);
     }
 
     const stallReason = ageMs >= idleFailureMs

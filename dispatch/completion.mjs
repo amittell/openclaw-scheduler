@@ -1134,6 +1134,7 @@ export function buildCompletionSignalInstructions({ label, taskPrompt, doneScrip
   readinessChecks.forEach((line, idx) => lines.push(`  ${idx + 1}. ${line}`));
   lines.push('');
   lines.push('Call this as your ABSOLUTE FINAL action -- nothing else runs after this:');
+  lines.push('  IMPORTANT: run this command in the dispatch session shell on this host. Do not run it inside ssh, docker, tmux, or any remote shell; remote label stores cannot mark this dispatch complete.');
   lines.push(`  node '${doneScriptPath}' done --label '${escapedLabel}' \\`);
   lines.push('    --summary "<human-readable summary of what you actually did>" \\');
   lines.push(`    --checklist '${checklistExample}' \\`);
