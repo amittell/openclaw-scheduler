@@ -1,0 +1,10 @@
+{
+  "_comment": "Chilisaus branding config. Copy to config.json next to dispatch/chilisaus.mjs for a branded deployment.",
+
+  "name": "chilisaus",
+  "brand": "chilisaus 🌶️",
+
+  "startupGraceMs": 90000,
+  "stuckThresholdMs": 600000,
+  "maxWatcherAgeMs": 7200000
+}

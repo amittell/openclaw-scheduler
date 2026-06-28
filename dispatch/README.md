@@ -20,8 +20,9 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 | `watcher.mjs` | Delivery monitoring process |
 | `529-recovery.mjs` | Transient error recovery |
 | `deliver-watcher.sh` | Shell wrapper for result retrieval |
-| `chilisaus.mjs` | Branded wrapper |
+| `chilisaus.mjs` | Branded chilisaus wrapper over this dispatch engine |
 | `config.example.json` | Example config |
+| `chilisaus.config.example.json` | Chilisaus branding config example |
 | `test-done-postoffice.mjs` | Done handler test |
 | `~/.openclaw/scheduler/dispatch/labels.json` | Durable label→session ledger |
 | `README.md` | This file |
@@ -49,6 +50,20 @@ Orchestrator calls:
   → Agent auto-announces results on completion
   → hooks.mjs fires dispatch.started to Loki
 ```
+
+### Chilisaus branding
+
+Chilisaus is not a separate implementation. It is the branded entrypoint in this
+directory:
+
+```bash
+node dispatch/chilisaus.mjs enqueue --label ticket-42 --message "Fix it"
+```
+
+`chilisaus.mjs` sets `DISPATCH_CONFIG_DIR` to this dispatch directory, then loads
+`index.mjs`. To use the historical chilisaus branding, copy
+`chilisaus.config.example.json` to `config.json` in the same directory. Runtime
+changes belong in this `openclaw-scheduler/dispatch` tree.
 
 ---
 

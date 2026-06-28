@@ -39,6 +39,7 @@
     "dispatch/529-recovery.mjs",
     "dispatch/completion.mjs",
     "dispatch/config.example.json",
+    "dispatch/chilisaus.config.example.json",
     "dispatch/default-model.mjs",
     "dispatch/deliver-watcher.sh",
     "dispatch/hooks.mjs",
