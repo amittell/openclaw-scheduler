@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.14] -- 2026-06-28
+
+### Fixed
+- fix(dispatch): honor configured dispatch default models from wrapper config, `DISPATCH_DEFAULT_MODEL`, and OpenClaw agent defaults before falling back to the static default
+- fix(dispatch): verify interrupted sessions before marking watcher failures
+- fix(dispatch): prefer human completion summaries in delivery flows
+
+### Changed
+- chore: upgrade coord to v0.35.0
+- docs(dispatch): retire old chilisaus fork paths and document migrated dispatch configuration
+
 ## [0.2.13] -- 2026-06-24
 
 ### Fixed
