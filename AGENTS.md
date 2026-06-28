@@ -35,7 +35,7 @@ Check-in messages are delivered asynchronously. By the time they appear, the job
 
 ```bash
 # For chilisaus-dispatched jobs:
-node ~/.openclaw/chilisaus/index.mjs status --label <label>
+node ~/.openclaw/worktrees/openclaw-scheduler/dispatch/chilisaus.mjs status --label <label>
 
 # For scheduler jobs:
 openclaw-scheduler runs list <job-id> --json

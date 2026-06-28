@@ -368,7 +368,7 @@ Check-in messages (from `agent-checkin.mjs` or similar) are delivered asynchrono
 
 ```bash
 # Always do this before reporting job status:
-node ~/.openclaw/chilisaus/index.mjs status --label <label>
+node ~/.openclaw/worktrees/openclaw-scheduler/dispatch/chilisaus.mjs status --label <label>
 ```
 
 The `status` output gives you the authoritative `status` field (`accepted` / `running` / `done` / `error`), the last `updatedAt` timestamp, and the final `summary`. Use that — not the most recent check-in message.

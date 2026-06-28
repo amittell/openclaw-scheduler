@@ -992,7 +992,7 @@ test('completion signal instructions require local dispatch shell', () => {
   const instructions = buildCompletionSignalInstructions({
     label: 'remote-work',
     taskPrompt: 'SSH to another host, fix the repo, and push the result.',
-    doneScriptPath: '/Users/alexm/.openclaw/chilisaus/index.mjs',
+    doneScriptPath: '/Users/alexm/.openclaw/worktrees/openclaw-scheduler/dispatch/chilisaus.mjs',
   });
 
   assert.match(instructions, /dispatch session shell on this host/);
