@@ -86,7 +86,7 @@ cat prompt.md | node dispatch/index.mjs enqueue \
 | `--mode` | `fresh` | `fresh` = new session; `reuse` = continue last session for this label |
 | `--session-key` | — | Explicit session key (bypasses ledger lookup) |
 | `--agent` | `main` | Agent ID |
-| `--model` | — | Model override (e.g. `anthropic/claude-sonnet-4-6`) |
+| `--model` | configured dispatch default | Model override (e.g. `anthropic/claude-sonnet-4-6`). When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
 | `--thinking` | — | Reasoning level: `low`, `high`, `xhigh` |
 | `--timeout` | `300` | Seconds before run times out |
 | `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |

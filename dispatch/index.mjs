@@ -45,6 +45,7 @@ import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
+import { resolveDefaultDispatchModel } from './default-model.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -96,7 +97,11 @@ function loadConfig() {
 
 const config = loadConfig();
 const BRAND = config.name ?? 'dispatch';
-const DEFAULT_DISPATCH_MODEL = config.defaultModel || process.env.DISPATCH_DEFAULT_MODEL || 'openai/gpt-5.5';
+const DEFAULT_DISPATCH_MODEL = resolveDefaultDispatchModel({
+  dispatchConfig: config,
+  env: process.env,
+  homeDir: HOME_DIR,
+});
 
 /** Load gateway auth token from config or env */
 function getGatewayToken() {

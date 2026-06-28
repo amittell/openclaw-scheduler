@@ -1767,7 +1767,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `--message-stdin` | -- | Read the prompt from stdin explicitly. If stdin is piped and no explicit prompt source is set, dispatch auto-reads stdin. |
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
-| `--model` | -- | Model override, e.g. `anthropic/claude-sonnet-4-6`. |
+| `--model` | configured dispatch default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
 | `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher job for durable final delivery. The gateway spawn itself stays fire-and-forget so raw tool output and internal done payloads cannot leak directly to chat. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
 | `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
 | `--timeout` | `300` | Session timeout in seconds. |
