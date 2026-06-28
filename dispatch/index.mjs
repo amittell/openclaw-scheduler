@@ -96,6 +96,7 @@ function loadConfig() {
 
 const config = loadConfig();
 const BRAND = config.name ?? 'dispatch';
+const DEFAULT_DISPATCH_MODEL = config.defaultModel || process.env.DISPATCH_DEFAULT_MODEL || 'openai/gpt-5.5';
 
 /** Load gateway auth token from config or env */
 function getGatewayToken() {
@@ -1096,7 +1097,7 @@ async function cmdEnqueue(flags) {
 
   // Dynamic branding: resolve per-agent brand name
   const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
-  const model       = flags.model            || null;
+  const model       = flags.model            || DEFAULT_DISPATCH_MODEL;
 
   // -- Session key resolution ----------------------------------
   let sessionKey = flags['session-key'] || null;

@@ -5973,6 +5973,72 @@ if (sub === 'status') {
     rmSync(missedTempDir, { recursive: true, force: true });
   }
 
+  // 3d. Interrupted but verified: if the session missed the done signal but the
+  //     caller supplied a verify command and it passes, deliver as completed.
+  {
+    const verifiedTempDir = mkdtempSync(join(tmpdir(), 'watcher-interrupted-verified-'));
+    const mockVerifiedPath = join(verifiedTempDir, 'mock-interrupted-verified.mjs');
+    const mockLabelsVerified = join(verifiedTempDir, 'labels-interrupted-verified.json');
+    const verifiedArtifact = join(verifiedTempDir, 'artifact.txt');
+    writeFileSync(verifiedArtifact, 'ok\n');
+
+    const verifiedLabel = 'test-interrupted-verified';
+    writeFileSync(mockVerifiedPath, `
+const [,,sub] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(verifiedLabel)},
+    status: 'interrupted',
+    summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete.',
+    sessionKey: 'agent:main:subagent:interrupted-verified-uuid',
+    liveness: { ageMs: 900000, updatedAt: Date.now() - 900000 },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    lastReply: 'Final report: artifact was written and validated.',
+    status: 'interrupted'
+  }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    writeFileSync(mockLabelsVerified, JSON.stringify({
+      [verifiedLabel]: {
+        sessionKey: 'agent:main:subagent:interrupted-verified-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+        verifyCmd: `test -s '${verifiedArtifact}'`,
+      },
+    }) + '\n');
+
+    const verifiedRun = spawnSync(process.execPath, [watcherPath, '--label', verifiedLabel, '--timeout', '5', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        DISPATCH_INDEX_PATH: mockVerifiedPath,
+        DISPATCH_LABELS_PATH: mockLabelsVerified,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 15000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    assert(verifiedRun.status === 0, 'interrupted+verify: watcher exits zero when verify-cmd passes');
+    assert((verifiedRun.stdout || '').includes('completed:'), 'interrupted+verify: watcher delivers successful completion');
+    assert((verifiedRun.stdout || '').includes('Final report: artifact was written and validated.'), 'interrupted+verify: watcher preserves recovered final report');
+
+    const verifiedLabels = JSON.parse(readFileSync(mockLabelsVerified, 'utf-8'));
+    assert(verifiedLabels[verifiedLabel].status === 'done', 'interrupted+verify: watcher marks label done');
+
+    rmSync(verifiedTempDir, { recursive: true, force: true });
+  }
+
   rmSync(tempDir, { recursive: true, force: true });
 }
 

@@ -927,6 +927,32 @@ function markLabelError(label, errorSummary) {
   }
 }
 
+function getLabelEntry(label) {
+  try {
+    const labels = loadLabels();
+    return labels[label] || null;
+  } catch (err) {
+    process.stderr.write(`[watcher] label load failed for ${label}: ${err.message}\n`);
+    return null;
+  }
+}
+
+function runVerifyCmd(label, entry) {
+  if (!entry?.verifyCmd) return { configured: false, ok: false };
+
+  process.stderr.write(`[watcher] running verify-cmd for ${label}: ${entry.verifyCmd}\n`);
+  try {
+    execSync(entry.verifyCmd, { stdio: 'pipe', timeout: 60000, shell: true });
+    process.stderr.write(`[watcher] verify-cmd passed for ${label}\n`);
+    return { configured: true, ok: true };
+  } catch (verifyErr) {
+    const stderr = verifyErr.stderr ? verifyErr.stderr.toString().trim() : verifyErr.message;
+    const message = stderr || `exit code ${verifyErr.status ?? 1}`;
+    process.stderr.write(`[watcher] verify-cmd failed: ${message}\n`);
+    return { configured: true, ok: false, message };
+  }
+}
+
 let exitZeroOnTerminal = false;
 
 /**
@@ -941,33 +967,20 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   // -- verify-cmd check -----------------------------------------------------
   // Run the stored verify-cmd (if any) before declaring the job done.
   // A non-zero exit flips the job to error state and sends an alert instead.
-  try {
-    const labels = loadLabels();
-    const entry = labels[label];
-    if (entry?.verifyCmd) {
-      process.stderr.write(`[watcher] running verify-cmd for ${label}: ${entry.verifyCmd}\n`);
-      try {
-        execSync(entry.verifyCmd, { stdio: 'pipe', timeout: 60000, shell: true });
-        process.stderr.write(`[watcher] verify-cmd passed for ${label}\n`);
-      } catch (verifyErr) {
-        const stderr = verifyErr.stderr ? verifyErr.stderr.toString().trim() : verifyErr.message;
-        const errMsg = `verify-cmd failed: ${stderr || 'exit code ' + (verifyErr.status ?? 1)}`;
-        process.stderr.write(`[watcher] ${errMsg}\n`);
-        markLabelError(label, errMsg);
-        // Output failure notice -- scheduler delivers this to the delivery target
-        process.stdout.write(
-          `🌶️ *dispatch* [${label}] ⚠️ VERIFICATION FAILED\n\n` +
-          `The agent session completed but the post-completion verify-cmd exited non-zero.\n\n` +
-          `**Verify command:** \`${entry.verifyCmd}\`\n` +
-          `**Error:** ${stderr || 'non-zero exit'}\n\n` +
-          `Job marked as \`error\`. The agent may have reported done without completing the actual work.\n`
-        );
-        process.exit(exitZeroOnTerminal ? 0 : 1);
-      }
-    }
-  } catch (loadErr) {
-    // Non-fatal -- if labels can't be read, skip verify check and proceed normally
-    process.stderr.write(`[watcher] verify-cmd check skipped (labels load error): ${loadErr.message}\n`);
+  const entry = getLabelEntry(label);
+  const verify = runVerifyCmd(label, entry);
+  if (verify.configured && !verify.ok) {
+    const errMsg = `verify-cmd failed: ${verify.message || 'non-zero exit'}`;
+    markLabelError(label, errMsg);
+    // Output failure notice -- scheduler delivers this to the delivery target
+    process.stdout.write(
+      `🌶️ *dispatch* [${label}] ⚠️ VERIFICATION FAILED\n\n` +
+      `The agent session completed but the post-completion verify-cmd exited non-zero.\n\n` +
+      `**Verify command:** \`${entry.verifyCmd}\`\n` +
+      `**Error:** ${verify.message || 'non-zero exit'}\n\n` +
+      `Job marked as \`error\`. The agent may have reported done without completing the actual work.\n`
+    );
+    process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
   // Update labels.json before exiting -- prevents stuck detector false positives
@@ -995,6 +1008,27 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
 
 function emitInterruptedOutcome(label, summary, result = null) {
   process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
+  const entry = getLabelEntry(label);
+  const verify = runVerifyCmd(label, entry);
+  if (verify.configured && verify.ok) {
+    const recoveredReply = result?.lastReply || result?.diagnosticReply || null;
+    const completionPayload = result?.completion || (recoveredReply ? null : {
+      summary_human: summary
+        ? `The session stopped before sending the done signal, but verification passed. ${summary}`
+        : 'The session stopped before sending the done signal, but verification passed.',
+      details: {
+        interrupted: true,
+        verify_cmd: entry.verifyCmd,
+      },
+    });
+    deliverResult(
+      label,
+      recoveredReply,
+      'completed after interrupted session; verify-cmd passed',
+      completionPayload,
+    );
+  }
+
   markLabelError(label, summary || 'interrupted: session went idle without calling done');
   process.stdout.write(
     `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
