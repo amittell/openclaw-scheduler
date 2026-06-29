@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.15] -- 2026-06-29
+
+### Fixed
+- Ensure npm install scripts run for the scheduler package so native dependencies such as `better-sqlite3` build correctly during host installs.
+
 ## [0.2.14] -- 2026-06-28
 
 ### Fixed
