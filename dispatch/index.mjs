@@ -41,7 +41,11 @@ import {
   resolveCompletionDelivery,
   taskRequiresGitSha,
 } from './completion.mjs';
-import { getDispatchLivenessPolicy } from './liveness.mjs';
+import {
+  buildAutoResolvedIncompleteSummary,
+  getDispatchGatewayTimeoutSeconds,
+  getDispatchLivenessPolicy,
+} from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { onStarted, onFinished, onStuck } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
@@ -949,6 +953,19 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   const activityTimes = [updatedAtMs, lastActivityAtMs, jsonlMtimeMs].filter(t => typeof t === 'number');
   const lastActivity = activityTimes.length ? Math.max(...activityTimes) : null;
   const silenceMs = lastActivity === null ? Infinity : Date.now() - lastActivity;
+  const sessionStatus = typeof entry.status === 'string' ? entry.status.trim().toLowerCase() : '';
+
+  if (sessionStatus && sessionStatus !== 'running') {
+    const terminalReason = entry.abortedLastRun === true
+      ? `gateway sessions store status=${sessionStatus} (abortedLastRun=true)`
+      : `gateway sessions store status=${sessionStatus}`;
+    return {
+      shouldResolve: true,
+      reason: terminalReason,
+      lastActivity,
+      sessionStatus,
+    };
+  }
 
   if (entry.sessionId) {
     const entries = readJsonlTailEntries(entry.sessionId, agent, 20);
@@ -989,6 +1006,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
       lastActivity,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
+      sessionStatus,
     };
   }
 
@@ -997,7 +1015,14 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     shouldResolve: false,
     reason:       'session has recent activity in sessions store',
     lastActivity,
+    sessionStatus,
   };
+}
+
+function hasTerminalSessionStoreStatus(sessionEntry) {
+  const sessionStatus =
+    typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '';
+  return !!sessionStatus && sessionStatus !== 'running';
 }
 
 // -- Watchdog Helpers -----------------------------------------
@@ -1154,6 +1179,17 @@ async function cmdEnqueue(flags) {
   if (!flags.timeout) {
     process.stderr.write(`[${BRAND}] WARNING: --timeout not specified, defaulting to 300s. ` +
       `Pass --timeout explicitly (≥1200 for thinking=high tasks) to avoid premature watcher kills.\n`);
+  }
+  const gatewayTimeoutS = getDispatchGatewayTimeoutSeconds({
+    timeoutSeconds: timeoutS,
+    thinking,
+    lane: 'subagent',
+  });
+  if (gatewayTimeoutS !== timeoutS) {
+    process.stderr.write(
+      `[${BRAND}] elevating gateway agent timeout from ${timeoutS}s to ${gatewayTimeoutS}s ` +
+      `for ${thinking || 'high'}-thinking subagent work; dispatch liveness stays at ${timeoutS}s.\n`,
+    );
   }
   const explicitOrigin = flags.origin || null;
   const explicitDeliverTo = flags['deliver-to'] || null;
@@ -1366,7 +1402,7 @@ async function cmdEnqueue(flags) {
       idempotencyKey: idem,
       deliver:        false,
       lane:           'subagent',
-      timeout:        timeoutS,
+      timeout:        gatewayTimeoutS,
       label:          label,
       thinking:       thinking || undefined,
       ...(deliverTo ? {
@@ -1398,6 +1434,7 @@ async function cmdEnqueue(flags) {
       verifyCmd:      verifyCmd || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
+      gatewayTimeoutSeconds: gatewayTimeoutS,
       idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
       // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.
       timeout:        timeoutS,
@@ -1647,7 +1684,9 @@ function cmdStatus(flags) {
       if (turnAbortCheck.shouldResolve) {
         setLabel(label, {
           status:  'interrupted',
-          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            reason: turnAbortCheck.reason,
+          }),
         });
         syncAction = `auto-resolved as interrupted: ${turnAbortCheck.reason}`;
         disarmWatchdog(label);
@@ -1672,9 +1711,14 @@ function cmdStatus(flags) {
         const PING_STALE_MS = livenessPolicy.pingStaleMs;
         const idleThresholdMs = livenessPolicy.idleFailureMs;
         const hardCeilingMs = livenessPolicy.hardCeilingMs;
+        const sessionEntry = sessionsStore?.[entry.sessionKey];
 
         let check;
-        if (ageMs < STARTUP_GRACE_MS) {
+        if (hasTerminalSessionStoreStatus(sessionEntry)) {
+          // A gateway-recorded terminal status should win immediately, even if
+          // the watcher heartbeat is still fresh from just before the abort.
+          check = checkSessionDone(entry.sessionKey, sessionsStore, idleThresholdMs, true, spawnedAtMs);
+        } else if (ageMs < STARTUP_GRACE_MS) {
           // Within startup grace -- never auto-resolve
           check = { shouldResolve: false };
         } else if (entry.lastPing) {
@@ -1705,7 +1749,10 @@ function cmdStatus(flags) {
           } else {
             setLabel(label, {
               status:  'interrupted',
-              summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+              summary: buildAutoResolvedIncompleteSummary({
+                sessionStatus: check.sessionStatus,
+                reason: check.reason,
+              }),
             });
             syncAction = `auto-resolved as interrupted: ${check.reason}`;
           }
@@ -1729,6 +1776,9 @@ function cmdStatus(flags) {
           ? Date.now() - (typeof sessionEntry.updatedAt === 'number' ? sessionEntry.updatedAt : new Date(sessionEntry.updatedAt).getTime())
           : null,
         sessionId: sessionEntry.sessionId,
+        status:    sessionEntry.status || null,
+        abortedLastRun:
+          typeof sessionEntry.abortedLastRun === 'boolean' ? sessionEntry.abortedLastRun : undefined,
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
       };
@@ -1754,6 +1804,7 @@ function cmdStatus(flags) {
     updatedAt:  current.updatedAt,
     summary:    effectiveCompletionSummary(current),
     completion: current.completion || null,
+    gatewayTimeoutSeconds: Number(current.gatewayTimeoutSeconds ?? current.timeoutSeconds) || null,
     delivery:   buildDispatchDeliverySurface(current),
     error:      current.error || null,
     liveness,
@@ -1852,7 +1903,10 @@ async function cmdStuck(flags) {
       } else {
         setLabel(name, {
           status:  'interrupted',
-          summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: check.sessionStatus,
+            reason: check.reason,
+          }),
         });
         autoResolved.push({ label: name, reason: check.reason });
       }
@@ -1988,6 +2042,33 @@ function cmdSync(flags) {
     const PING_STALE_MS_SYNC = syncPolicy.pingStaleMs;
     const idleThresholdMsSync = syncPolicy.idleFailureMs;
     const hardCeilingMsSync = syncPolicy.hardCeilingMs;
+    const sessionEntry = syncStore?.[entry.sessionKey];
+
+    if (hasTerminalSessionStoreStatus(sessionEntry)) {
+      const check = checkSessionDone(entry.sessionKey, syncStore, idleThresholdMsSync, true, spawnedAtMs);
+      if (!check.shouldResolve) continue;
+      const newStatus = check.is529 ? 'error' : 'interrupted';
+      changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
+      if (!dryRun) {
+        if (check.is529) {
+          setLabel(name, {
+            status:  'error',
+            error:   check.errorMsg || `529/overload: ${check.reason}`,
+            summary: `Synced as error: ${check.reason}`,
+          });
+        } else {
+          setLabel(name, {
+            status:  'interrupted',
+            summary: buildAutoResolvedIncompleteSummary({
+              sessionStatus: check.sessionStatus,
+              reason: check.reason,
+            }),
+          });
+        }
+        disarmWatchdog(name);
+      }
+      continue;
+    }
 
     if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
@@ -2013,7 +2094,10 @@ function cmdSync(flags) {
         } else {
           setLabel(name, {
             status:  'interrupted',
-            summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+            summary: buildAutoResolvedIncompleteSummary({
+              sessionStatus: check.sessionStatus,
+              reason: check.reason,
+            }),
           });
         }
         // Disarm watchdog when session is synced as interrupted
