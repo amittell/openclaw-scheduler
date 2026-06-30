@@ -64,7 +64,11 @@ import {
   hasCompletionSignal,
   resolveCompletionDelivery,
 } from './dispatch/completion.mjs';
-import { getDispatchLivenessPolicy } from './dispatch/liveness.mjs';
+import {
+  buildAutoResolvedIncompleteSummary,
+  getDispatchGatewayTimeoutSeconds,
+  getDispatchLivenessPolicy,
+} from './dispatch/liveness.mjs';
 import { resolveLabelsPath } from './dispatch/paths.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
@@ -9013,6 +9017,68 @@ console.log('\n-- Watchdog Heartbeat Guard --');
   const highPolicy = getDispatchLivenessPolicy({ timeoutSeconds: 1200, thinking: 'high' });
   assert(highPolicy.idleProbeMs >= 10 * 60 * 1000, 'watchdog guard: high-thinking idle result probe waits at least 10min');
   assert(highPolicy.idleFailureMs >= 20 * 60 * 1000, 'watchdog guard: high-thinking idle failure waits at least 20min');
+  assert(
+    getDispatchGatewayTimeoutSeconds({ timeoutSeconds: 1200, thinking: 'high', lane: 'subagent' }) === 3600,
+    'watchdog guard: high-thinking subagent gateway timeout is elevated to 1h floor',
+  );
+  assert(
+    getDispatchGatewayTimeoutSeconds({ timeoutSeconds: 1200, thinking: 'high', lane: 'main' }) === 1200,
+    'watchdog guard: non-subagent high-thinking timeout is unchanged',
+  );
+  assert(
+    buildAutoResolvedIncompleteSummary({
+      sessionStatus: 'timeout',
+      reason: 'gateway sessions store status=timeout',
+    }).includes('gateway session timeout without done signal'),
+    'watchdog guard: timeout auto-resolve summary names gateway timeout explicitly',
+  );
+  assert(
+    buildAutoResolvedIncompleteSummary({
+      sessionStatus: 'failed',
+      reason: 'gateway sessions store status=failed',
+    }).includes('gateway session failure without done signal'),
+    'watchdog guard: failed auto-resolve summary names gateway failure explicitly',
+  );
+
+  // 7: if the gateway sessions store already recorded a terminal timeout,
+  // cmdStatus should surface that directly rather than collapsing it to an
+  // "idle without done" diagnosis.
+  {
+    const tmpDir = join(tmpBase, 't7-terminal-timeout');
+    mkdirSync(tmpDir);
+    const { labelsPath, sessionsJsonPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+    writeFileSync(sessionsJsonPath, JSON.stringify({
+      [fakeSessionKey]: {
+        sessionId: 'fake-sid-wdg',
+        updatedAt: Date.now() - 15_000,
+        status: 'timeout',
+        abortedLastRun: true,
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t7': {
+        sessionKey: fakeSessionKey,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 25 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date(Date.now() - 30 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t7');
+    assert(result.status === 'interrupted', 'watchdog guard t7: terminal timeout still resolves interrupted');
+    assert(
+      String(result.summary || '').includes('gateway session timeout without done signal'),
+      'watchdog guard t7: status summary reports gateway timeout instead of generic idle wording',
+    );
+    assert(result.liveness?.status === 'timeout', 'watchdog guard t7: liveness exposes terminal session status');
+    assert(result.liveness?.abortedLastRun === true, 'watchdog guard t7: liveness exposes abortedLastRun');
+  }
 
   rmSync(tmpBase, { recursive: true, force: true });
 }
