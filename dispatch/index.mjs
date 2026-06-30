@@ -729,6 +729,130 @@ function getJsonlTerminalReplyReason(entries) {
   return null;
 }
 
+function contentHasTurnAbortMarker(content) {
+  if (!content) return false;
+  if (typeof content === 'string') return content.includes('<turn_aborted>');
+  if (!Array.isArray(content)) return false;
+  return content.some(part => {
+    const text = part?.text || part?.input_text || part?.content || '';
+    return typeof text === 'string' && text.includes('<turn_aborted>');
+  });
+}
+
+function entryRole(entry) {
+  return entry?.role
+    || entry?.message?.role
+    || entry?.payload?.role
+    || entry?.payload?.message?.role
+    || null;
+}
+
+function entryHasTurnAborted(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'turn_aborted') return true;
+  if (entry.payload?.type === 'turn_aborted') return true;
+
+  const role = entryRole(entry);
+  if (role !== 'user') return false;
+  return contentHasTurnAbortMarker(entry.content)
+    || contentHasTurnAbortMarker(entry.message?.content)
+    || contentHasTurnAbortMarker(entry.payload?.content)
+    || contentHasTurnAbortMarker(entry.payload?.message?.content);
+}
+
+function entryStartsPostAbortActivity(entry) {
+  if (!entry || typeof entry !== 'object' || entryHasTurnAborted(entry)) return false;
+  const role = entryRole(entry);
+  if (role === 'assistant' || role === 'user') return true;
+
+  const payloadType = entry.payload?.type || null;
+  return entry.type === 'response_item' && [
+    'message',
+    'function_call',
+    'function_call_output',
+    'custom_tool_call',
+    'custom_tool_call_output',
+  ].includes(payloadType);
+}
+
+function getJsonlTurnAbortReason(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entryHasTurnAborted(entry)) {
+      const reason = entry?.payload?.reason || entry?.reason || 'interrupted';
+      return `turn_aborted observed in session JSONL (${reason})`;
+    }
+    if (entryStartsPostAbortActivity(entry)) return null;
+  }
+
+  return null;
+}
+
+function entryArtifactEvidenceReason(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+
+  if (entry.role === 'toolResult' && entry.isError !== true) {
+    return 'successful tool result observed in JSONL';
+  }
+  if (entry.type === 'tool_result' && entry.isError !== true) {
+    return 'successful tool result observed in JSONL';
+  }
+
+  const payload = entry.payload || {};
+  if (payload.type === 'patch_apply_end' && payload.success === true) {
+    return 'successful patch/tool event observed in JSONL';
+  }
+  if (payload.type === 'function_call_output') {
+    return 'completed tool output observed in JSONL';
+  }
+  if (payload.type === 'custom_tool_call' && payload.status === 'completed') {
+    return `completed tool call observed in JSONL${payload.name ? ` (${payload.name})` : ''}`;
+  }
+  if (payload.type === 'custom_tool_call_output') {
+    const output = typeof payload.output === 'string' ? payload.output : '';
+    if (!/aborted by user/i.test(output)) return 'completed tool output observed in JSONL';
+  }
+
+  if (Array.isArray(entry.content)) {
+    const toolResult = entry.content.find(part => part?.type === 'tool_result' || part?.type === 'toolResult');
+    if (toolResult && toolResult.isError !== true) return 'successful tool result observed in JSONL';
+  }
+
+  return null;
+}
+
+function getJsonlArtifactEvidence(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const reason = entryArtifactEvidenceReason(entries[i]);
+    if (reason) return { found: true, reason };
+  }
+
+  return null;
+}
+
+function checkSessionTurnAborted(labelEntry, sessionsStore) {
+  if (!labelEntry?.sessionKey) return { shouldResolve: false };
+
+  const agent = labelEntry.agent || agentFromSessionKey(labelEntry.sessionKey) || 'main';
+  const sessionEntry = sessionsStore?.[labelEntry.sessionKey] || null;
+  const sessionId = sessionEntry?.sessionId || labelEntry.sessionId || null;
+  if (!sessionId) return { shouldResolve: false };
+
+  const entries = readJsonlTailEntries(sessionId, agent, 80);
+  const reason = getJsonlTurnAbortReason(entries);
+  if (!reason) return { shouldResolve: false };
+
+  return {
+    shouldResolve: true,
+    reason,
+    lastActivity: getSessionJsonlMtimeMs(agent, sessionId),
+  };
+}
+
 // -- Gateway Session State Check ------------------------------
 
 /**
@@ -828,6 +952,15 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
 
   if (entry.sessionId) {
     const entries = readJsonlTailEntries(entry.sessionId, agent, 20);
+    const turnAbortReason = getJsonlTurnAbortReason(entries);
+    if (turnAbortReason) {
+      return {
+        shouldResolve: true,
+        reason:       turnAbortReason,
+        lastActivity,
+      };
+    }
+
     const pendingToolReason = getJsonlPendingToolReason(entries);
     if (pendingToolReason) {
       return {
@@ -1510,63 +1643,75 @@ function cmdStatus(flags) {
       syncAction = `auto-resolved as spawn failure: ${bootstrapFailure.reason}`;
       disarmWatchdog(label);
     } else {
-      // -- Heartbeat-based liveness guard ----------------------------------
-      // The watcher process writes lastPing every 60s while the session is live.
-      // If the ping is fresh, the watcher is alive and working -- defer auto-resolve
-      // to avoid killing sessions during slow tool calls, docker builds, etc.
-      //
-      // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard from the
-      //                  watcher in 3 min, it's probably dead; fall through to check.
-      // hardCeilingMs:   timeout/reasoning-aware hard ceiling. High-thinking
-      //                  work gets a larger quiet window before hard failure.
-      // idleThresholdMs: timeout/reasoning-aware quiet threshold. Ambiguous or
-      //                  missing liveness stays running until these thresholds.
-      const livenessPolicy = getDispatchLivenessPolicy(entry, {
-        startupGraceMs: STARTUP_GRACE_MS,
-        defaultTimeoutSeconds: 600,
-      });
-      const PING_STALE_MS = livenessPolicy.pingStaleMs;
-      const idleThresholdMs = livenessPolicy.idleFailureMs;
-      const hardCeilingMs = livenessPolicy.hardCeilingMs;
+      const turnAbortCheck = checkSessionTurnAborted(entry, sessionsStore);
+      if (turnAbortCheck.shouldResolve) {
+        setLabel(label, {
+          status:  'interrupted',
+          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+        });
+        syncAction = `auto-resolved as interrupted: ${turnAbortCheck.reason}`;
+        disarmWatchdog(label);
+      } else {
+        // -- Heartbeat-based liveness guard --------------------------------
+        // The watcher process writes lastPing every 60s while the session is
+        // live. If the ping is fresh, the watcher is alive and working --
+        // defer auto-resolve to avoid killing sessions during slow tool calls,
+        // docker builds, etc.
+        //
+        // PING_STALE_MS:   3x the 60s ping interval -- if we haven't heard
+        //                  from the watcher in 3 min, it's probably dead; fall
+        //                  through to check.
+        // hardCeilingMs:   timeout/reasoning-aware hard ceiling. High-thinking
+        //                  work gets a larger quiet window before hard failure.
+        // idleThresholdMs: timeout/reasoning-aware quiet threshold. Ambiguous
+        //                  or missing liveness stays running until these thresholds.
+        const livenessPolicy = getDispatchLivenessPolicy(entry, {
+          startupGraceMs: STARTUP_GRACE_MS,
+          defaultTimeoutSeconds: 600,
+        });
+        const PING_STALE_MS = livenessPolicy.pingStaleMs;
+        const idleThresholdMs = livenessPolicy.idleFailureMs;
+        const hardCeilingMs = livenessPolicy.hardCeilingMs;
 
-      let check;
-      if (ageMs < STARTUP_GRACE_MS) {
-        // Within startup grace -- never auto-resolve
-        check = { shouldResolve: false };
-      } else if (entry.lastPing) {
-        const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
-        if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
-          // Watcher alive and within job ceiling -- defer auto-resolve
+        let check;
+        if (ageMs < STARTUP_GRACE_MS) {
+          // Within startup grace -- never auto-resolve
           check = { shouldResolve: false };
+        } else if (entry.lastPing) {
+          const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
+          if (pingAgeMs < PING_STALE_MS && ageMs < hardCeilingMs) {
+            // Watcher alive and within job ceiling -- defer auto-resolve
+            check = { shouldResolve: false };
+          } else {
+            // Ping stale OR past hard ceiling: fall through to session store check
+            const thresh = ageMs >= hardCeilingMs ? livenessPolicy.hardTimeoutIdleMs : idleThresholdMs;
+            check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
+          }
         } else {
-          // Ping stale OR past hard ceiling: fall through to session store check
+          // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
+          // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
           const thresh = ageMs >= hardCeilingMs ? livenessPolicy.hardTimeoutIdleMs : idleThresholdMs;
           check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
         }
-      } else {
-        // No lastPing -- backward compat (sessions dispatched before heartbeat feature).
-        // Use idleThresholdMs (job-aware) instead of the old hardcoded 10 min.
-        const thresh = ageMs >= hardCeilingMs ? livenessPolicy.hardTimeoutIdleMs : idleThresholdMs;
-        check = checkSessionDone(entry.sessionKey, sessionsStore, thresh, true, spawnedAtMs);
-      }
 
-      if (check.shouldResolve) {
-        if (check.is529) {
-          setLabel(label, {
-            status:  'error',
-            error:   check.errorMsg || `529/overload: ${check.reason}`,
-            summary: `Auto-resolved as error: ${check.reason}`,
-          });
-          syncAction = `auto-resolved as 529 error: ${check.reason}`;
-        } else {
-          setLabel(label, {
-            status:  'interrupted',
-            summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
-          });
-          syncAction = `auto-resolved as interrupted: ${check.reason}`;
+        if (check.shouldResolve) {
+          if (check.is529) {
+            setLabel(label, {
+              status:  'error',
+              error:   check.errorMsg || `529/overload: ${check.reason}`,
+              summary: `Auto-resolved as error: ${check.reason}`,
+            });
+            syncAction = `auto-resolved as 529 error: ${check.reason}`;
+          } else {
+            setLabel(label, {
+              status:  'interrupted',
+              summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+            });
+            syncAction = `auto-resolved as interrupted: ${check.reason}`;
+          }
+          // Disarm watchdog when session is auto-resolved
+          disarmWatchdog(label);
         }
-        // Disarm watchdog when session is auto-resolved
-        disarmWatchdog(label);
       }
     }
   }
@@ -1820,6 +1965,19 @@ function cmdSync(flags) {
       continue;
     }
 
+    const turnAbortCheck = checkSessionTurnAborted(entry, syncStore);
+    if (turnAbortCheck.shouldResolve) {
+      changes.push({ label: name, from: 'running', to: 'interrupted', reason: turnAbortCheck.reason });
+      if (!dryRun) {
+        setLabel(name, {
+          status:  'interrupted',
+          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+        });
+        disarmWatchdog(name);
+      }
+      continue;
+    }
+
     // -- Heartbeat-based liveness guard (mirrors cmdStatus logic) ---------
     // Skip auto-resolve when the watcher's lastPing heartbeat is fresh.
     // See cmdStatus for full commentary on PING_STALE_MS / hardCeilingMs.
@@ -1895,6 +2053,7 @@ function cmdResult(flags) {
   let diagnosticReply = null;
   let recoverySource = null;
   let recoverySessionId = entry.sessionId || null;
+  let artifactEvidence = null;
   const resultAgent = entry.agent || agentFromSessionKey(entry.sessionKey) || 'main';
   const resultStore = entry.sessionKey ? readSessionsStore(resultAgent) : null;
   const resultSessionEntry = entry.sessionKey && resultStore ? resultStore[entry.sessionKey] : null;
@@ -1910,6 +2069,7 @@ function cmdResult(flags) {
     const jsonlEntries = readJsonlTailEntries(recoverySessionId, resultAgent, 200);
     const terminalReply = extractTerminalAssistantReplyFromEntries(jsonlEntries);
     const jsonlDiagnostic = extractLastMeaningfulAssistantReplyFromEntries(jsonlEntries);
+    artifactEvidence = getJsonlArtifactEvidence(jsonlEntries);
 
     if (terminalReply) {
       lastReply = terminalReply;
@@ -1962,6 +2122,7 @@ function cmdResult(flags) {
       source: recoverySource || null,
       sessionId: recoverySessionId || null,
     } : null,
+    artifactEvidence: artifactEvidence || null,
     error:      entry.error || null,
   });
 }

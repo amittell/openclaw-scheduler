@@ -671,6 +671,111 @@ function formatDiagnosticSnippet(reply) {
   return `\n\nLast assistant report observed:\n${clipped}`;
 }
 
+function contentHasTurnAbortMarker(content) {
+  if (!content) return false;
+  if (typeof content === 'string') return content.includes('<turn_aborted>');
+  if (!Array.isArray(content)) return false;
+  return content.some(part => {
+    const text = part?.text || part?.input_text || part?.content || '';
+    return typeof text === 'string' && text.includes('<turn_aborted>');
+  });
+}
+
+function entryRole(entry) {
+  return entry?.role
+    || entry?.message?.role
+    || entry?.payload?.role
+    || entry?.payload?.message?.role
+    || null;
+}
+
+function entryHasTurnAborted(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'turn_aborted') return true;
+  if (entry.payload?.type === 'turn_aborted') return true;
+
+  const role = entryRole(entry);
+  if (role !== 'user') return false;
+  return contentHasTurnAbortMarker(entry.content)
+    || contentHasTurnAbortMarker(entry.message?.content)
+    || contentHasTurnAbortMarker(entry.payload?.content)
+    || contentHasTurnAbortMarker(entry.payload?.message?.content);
+}
+
+function entryStartsPostAbortActivity(entry) {
+  if (!entry || typeof entry !== 'object' || entryHasTurnAborted(entry)) return false;
+  const role = entryRole(entry);
+  if (role === 'assistant' || role === 'user') return true;
+
+  const payloadType = entry.payload?.type || null;
+  return entry.type === 'response_item' && [
+    'message',
+    'function_call',
+    'function_call_output',
+    'custom_tool_call',
+    'custom_tool_call_output',
+  ].includes(payloadType);
+}
+
+function getJsonlTurnAbortReasonFromEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entryHasTurnAborted(entry)) {
+      const reason = entry?.payload?.reason || entry?.reason || 'interrupted';
+      return `turn_aborted observed in session JSONL (${reason})`;
+    }
+    if (entryStartsPostAbortActivity(entry)) return null;
+  }
+
+  return null;
+}
+
+function entryArtifactEvidenceReason(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+
+  if (entry.role === 'toolResult' && entry.isError !== true) {
+    return 'successful tool result observed in JSONL';
+  }
+  if (entry.type === 'tool_result' && entry.isError !== true) {
+    return 'successful tool result observed in JSONL';
+  }
+
+  const payload = entry.payload || {};
+  if (payload.type === 'patch_apply_end' && payload.success === true) {
+    return 'successful patch/tool event observed in JSONL';
+  }
+  if (payload.type === 'function_call_output') {
+    return 'completed tool output observed in JSONL';
+  }
+  if (payload.type === 'custom_tool_call' && payload.status === 'completed') {
+    return `completed tool call observed in JSONL${payload.name ? ` (${payload.name})` : ''}`;
+  }
+  if (payload.type === 'custom_tool_call_output') {
+    const output = typeof payload.output === 'string' ? payload.output : '';
+    if (!/aborted by user/i.test(output)) return 'completed tool output observed in JSONL';
+  }
+
+  if (Array.isArray(entry.content)) {
+    const toolResult = entry.content.find(part => part?.type === 'tool_result' || part?.type === 'toolResult');
+    if (toolResult && toolResult.isError !== true) return 'successful tool result observed in JSONL';
+  }
+
+  return null;
+}
+
+function getJsonlArtifactEvidenceFromEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const reason = entryArtifactEvidenceReason(entries[i]);
+    if (reason) return { found: true, reason };
+  }
+
+  return null;
+}
+
 /**
  * Check if a session is currently mid-turn by inspecting its JSONL tail.
  * Returns a reason string if mid-turn is detected, null if safe to proceed.
@@ -849,6 +954,32 @@ function getRunningSessionStallReason(status, thresholdMs) {
   );
 }
 
+function getSessionJsonlEntriesFromStatus(status, maxLines = 200) {
+  if (!status?.sessionKey) return null;
+
+  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const entry = getSessionStoreEntry(status.sessionKey);
+  const sessionId = entry?.sessionId || status?.liveness?.sessionId || null;
+  return sessionId ? readJsonlTailEntries(sessionId, sessionAgent, maxLines) : null;
+}
+
+function getSessionTurnAbortReason(status) {
+  return getJsonlTurnAbortReasonFromEntries(getSessionJsonlEntriesFromStatus(status, 80));
+}
+
+function getSessionArtifactEvidence(status) {
+  return getJsonlArtifactEvidenceFromEntries(getSessionJsonlEntriesFromStatus(status, 200));
+}
+
+function getInterruptedArtifactEvidence(result, status, verify = null) {
+  if (verify?.configured && verify.ok) {
+    return { found: true, reason: `verify-cmd passed (${verify.command || 'configured verification'})` };
+  }
+  if (result?.artifactEvidence?.found) return result.artifactEvidence;
+  if (status?.artifactEvidence?.found) return status.artifactEvidence;
+  return getSessionArtifactEvidence(status);
+}
+
 /**
  * Read the last assistant entry's stop_reason from the session JSONL.
  * Returns the stop_reason string (e.g. 'end_turn', 'tool_use') or null if unavailable.
@@ -927,6 +1058,19 @@ function markLabelError(label, errorSummary) {
   }
 }
 
+function markLabelInterrupted(label, summary) {
+  try {
+    updateExistingLabel(label, (entry) => {
+      if (entry.status === 'done') return false;
+      entry.status = 'interrupted';
+      entry.summary = summary || 'interrupted before clean completion';
+      delete entry.error;
+    });
+  } catch (e) {
+    process.stderr.write(`[watcher] markLabelInterrupted failed: ${e.message}\n`);
+  }
+}
+
 function getLabelEntry(label) {
   try {
     const labels = loadLabels();
@@ -944,12 +1088,12 @@ function runVerifyCmd(label, entry) {
   try {
     execSync(entry.verifyCmd, { stdio: 'pipe', timeout: 60000, shell: true });
     process.stderr.write(`[watcher] verify-cmd passed for ${label}\n`);
-    return { configured: true, ok: true };
+    return { configured: true, ok: true, command: entry.verifyCmd };
   } catch (verifyErr) {
     const stderr = verifyErr.stderr ? verifyErr.stderr.toString().trim() : verifyErr.message;
     const message = stderr || `exit code ${verifyErr.status ?? 1}`;
     process.stderr.write(`[watcher] verify-cmd failed: ${message}\n`);
-    return { configured: true, ok: false, message };
+    return { configured: true, ok: false, message, command: entry.verifyCmd };
   }
 }
 
@@ -1010,6 +1154,14 @@ function emitInterruptedOutcome(label, summary, result = null) {
   process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
   const entry = getLabelEntry(label);
   const verify = runVerifyCmd(label, entry);
+  const statusLike = result?.sessionKey
+    ? {
+        sessionKey: result.sessionKey,
+        artifactEvidence: result?.artifactEvidence || null,
+        liveness: result?.recovery?.sessionId ? { sessionId: result.recovery.sessionId } : null,
+      }
+    : null;
+  const artifactEvidence = getInterruptedArtifactEvidence(result, statusLike, verify);
   if (verify.configured && verify.ok) {
     const recoveredReply = result?.lastReply || result?.diagnosticReply || null;
     const completionPayload = result?.completion || (recoveredReply ? null : {
@@ -1027,6 +1179,18 @@ function emitInterruptedOutcome(label, summary, result = null) {
       'completed after interrupted session; verify-cmd passed',
       completionPayload,
     );
+  }
+
+  if (artifactEvidence?.found) {
+    const artifactSummary = `interrupted after producing artifacts: ${artifactEvidence.reason}`;
+    markLabelInterrupted(label, artifactSummary);
+    process.stdout.write(
+      `⚠️ dispatch [${label}] interrupted after producing artifacts -- work may be incomplete\n` +
+      `Summary: ${artifactEvidence.reason}` +
+      `${summary ? `\nContext: ${summary}` : ''}` +
+      `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
+    );
+    process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
   markLabelError(label, summary || 'interrupted: session went idle without calling done');
@@ -1233,10 +1397,27 @@ function runOnceAndExit() {
       deliverResult(label, terminalReply, 'completed (stop_reason=end_turn)', null);
     }
 
+    const turnAbortReason = getSessionTurnAbortReason(status);
+    if (turnAbortReason) {
+      emitInterruptedOutcome(label, turnAbortReason, {
+        ...result,
+        sessionKey: status.sessionKey,
+        artifactEvidence: result?.artifactEvidence || getSessionArtifactEvidence(status),
+      });
+    }
+
     const stallReason = ageMs >= idleFailureMs
       ? getRunningSessionStallReason(status, idleFailureMs)
       : null;
     if (stallReason) {
+      const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
+      if (artifactEvidence?.found) {
+        emitInterruptedOutcome(label, stallReason, {
+          ...result,
+          sessionKey: status.sessionKey,
+          artifactEvidence,
+        });
+      }
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
       process.stdout.write(
@@ -1625,10 +1806,27 @@ while (Date.now() < deadline) {
       deliverResult(label, terminalReply, 'completed (stop_reason=end_turn)', null);
     }
 
+    const turnAbortReason = getSessionTurnAbortReason(status);
+    if (turnAbortReason) {
+      emitInterruptedOutcome(label, turnAbortReason, {
+        ...result,
+        sessionKey: status.sessionKey,
+        artifactEvidence: result?.artifactEvidence || getSessionArtifactEvidence(status),
+      });
+    }
+
     const stallReason = ageMs >= idleFailureMs
       ? getRunningSessionStallReason(status, idleFailureMs)
       : null;
     if (stallReason) {
+      const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
+      if (artifactEvidence?.found) {
+        emitInterruptedOutcome(label, stallReason, {
+          ...result,
+          sessionKey: status.sessionKey,
+          artifactEvidence,
+        });
+      }
       process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
       markLabelError(label, stallReason);
       process.stdout.write(

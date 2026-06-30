@@ -988,6 +988,215 @@ test('dispatch status keeps running when JSONL is fresher than sessions store', 
   }
 });
 
+test('dispatch status treats turn_aborted JSONL as interrupted despite fresh watcher ping', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'dispatch-jsonl-aborted-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const sessionKey = 'agent:main:subagent:jsonl-aborted';
+  const sessionId = 'jsonl-aborted-session';
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+  const dispatchIndex = join(__dirname, '..', 'dispatch', 'index.mjs');
+  const oldIso = new Date(Date.now() - 20 * 60_000).toISOString();
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(labelsPath, JSON.stringify({
+      'jsonl-aborted': {
+        sessionKey,
+        runId: 'run-jsonl-aborted',
+        agent: 'main',
+        status: 'running',
+        spawnedAt: oldIso,
+        timeoutSeconds: 600,
+        updatedAt: oldIso,
+        lastPing: new Date().toISOString(),
+      },
+    }, null, 2) + '\n');
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: Date.now() - 20 * 60_000,
+        sessionStartedAt: oldIso,
+      },
+    }, null, 2) + '\n');
+    writeFileSync(join(sessionsDir, `${sessionId}.jsonl`), [
+      JSON.stringify({ role: 'assistant', content: [{ type: 'tool_use', name: 'exec' }], stop_reason: 'tool_use' }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'turn_aborted', reason: 'interrupted' } }),
+    ].join('\n') + '\n');
+
+    const run = spawnSync(process.execPath, [dispatchIndex, 'status', '--label', 'jsonl-aborted'], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    const result = JSON.parse(run.stdout);
+    assert.equal(result.status, 'interrupted');
+    assert.match(result.syncAction, /turn_aborted observed/);
+
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    assert.equal(labels['jsonl-aborted'].status, 'interrupted');
+    assert.match(labels['jsonl-aborted'].summary, /turn_aborted observed/);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once reports interrupted after producing artifacts for interrupted status evidence', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-interrupted-artifacts-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'interrupted-artifacts';
+  const sessionKey = 'agent:main:subagent:interrupted-artifacts';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+
+  try {
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+        timeoutSeconds: 600,
+        lastPing: new Date().toISOString(),
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'interrupted',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    summary: 'Auto-resolved: turn_aborted observed in session JSONL (interrupted)'
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    status: 'interrupted',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    diagnosticReply: 'Downloaded four rendered images before the interruption.',
+    artifactEvidence: { found: true, reason: 'completed tool output observed in JSONL' }
+  }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '600', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    assert.match(run.stdout || '', /interrupted after producing artifacts/);
+    assert.match(run.stdout || '', /Downloaded four rendered images/);
+    assert.equal(labels[label].status, 'interrupted');
+    assert.equal(labels[label].error, undefined);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('watcher --once reports stalled sessions with tool output as interrupted after artifacts', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'watcher-stalled-artifacts-'));
+  const labelsPath = join(tempDir, 'labels.json');
+  const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
+  const label = 'stalled-artifacts';
+  const sessionKey = 'agent:main:subagent:stalled-artifacts';
+  const sessionId = 'stalled-artifacts-session';
+  const watcherPath = join(__dirname, '..', 'dispatch', 'watcher.mjs');
+  const sessionsDir = join(tempDir, '.openclaw', 'agents', 'main', 'sessions');
+
+  try {
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      [sessionKey]: {
+        sessionId,
+        updatedAt: new Date(Date.now() - 130 * 60 * 1000).toISOString(),
+        model: 'test',
+      },
+    }) + '\n');
+    const jsonlPath = join(sessionsDir, `${sessionId}.jsonl`);
+    writeFileSync(jsonlPath, JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        call_id: 'call-artifact',
+        output: 'Wrote /tmp/rendered-video.mp4 (9.3 MB)',
+      },
+    }) + '\n');
+    const staleDate = new Date(Date.now() - 130 * 60 * 1000);
+    utimesSync(jsonlPath, staleDate, staleDate);
+    writeFileSync(labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey,
+        status: 'running',
+        agent: 'main',
+        spawnedAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
+        timeoutSeconds: 600,
+        lastPing: new Date().toISOString(),
+      },
+    }) + '\n');
+    writeFileSync(mockDispatch, `
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: ${JSON.stringify(label)},
+    status: 'running',
+    sessionKey: ${JSON.stringify(sessionKey)},
+    agent: 'main',
+    liveness: { ageMs: ${130 * 60 * 1000} }
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, status: 'running' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+}
+`);
+
+    const run = spawnSync(process.execPath, [
+      watcherPath, '--label', label, '--timeout', '600', '--poll-interval', '20', '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        DISPATCH_INDEX_PATH: mockDispatch,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    assert.match(run.stdout || '', /interrupted after producing artifacts/);
+    assert.doesNotMatch(run.stdout || '', /^❌ \*dispatch\* \[stalled-artifacts\] failed/m);
+    assert.equal(labels[label].status, 'interrupted');
+    assert.equal(labels[label].error, undefined);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('completion signal instructions require local dispatch shell', () => {
   const instructions = buildCompletionSignalInstructions({
     label: 'remote-work',
