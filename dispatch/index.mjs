@@ -37,6 +37,7 @@ import {
   buildTerminalCompletionPayload,
   extractLastMeaningfulAssistantReplyFromEntries,
   extractTerminalAssistantReplyFromEntries,
+  getCompletionAuthoritativeSummary,
   hasCompletionSignal,
   resolveCompletionDelivery,
   taskRequiresGitSha,
@@ -317,12 +318,8 @@ function effectiveCompletionSummary(entry, lastReply = null) {
   if (!entry || typeof entry !== 'object') return null;
 
   if (hasCompletionSignal(entry.completion)) {
-    const resolved = resolveCompletionDelivery({
-      lastReply,
-      completion: entry.completion || null,
-      fallbackSummary: entry.summary || null,
-    });
-    if (resolved?.summary) return resolved.summary;
+    const authoritativeSummary = getCompletionAuthoritativeSummary(entry.completion);
+    if (authoritativeSummary) return authoritativeSummary;
   }
 
   if (entry.summary) return entry.summary;

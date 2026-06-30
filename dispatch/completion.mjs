@@ -712,8 +712,11 @@ function extractTechnicalFragments(text) {
 function detectTechnicalThemes(rawText, fragments = []) {
   const raw = cleanMarkdown(normalizeCompletionText(rawText) || '').toLowerCase();
   const combined = [raw, fragments.join(' ').toLowerCase()].filter(Boolean).join(' ');
+  const completionTransportTerms = /\b(?:completion|deliver(?:y|ed)?|notification|chat|user-facing)\b/.test(combined);
+  const summarySurfaceTerms = /\b(?:summary|summaries|message|messages|report|reports|human(?:-|\s)?readable|plain english)\b/.test(combined);
   return {
-    completionFlow: /\b(?:completion|deliver(?:y|ed)?|notification|message|report|chat|summary|summaries|human(?:-|\s)?readable|plain english|user-facing)\b/.test(combined),
+    completionFlow: (completionTransportTerms && summarySurfaceTerms)
+      || /\b(?:summary_human|deliverytext|details_technical|payload-precedence|completion delivery)\b/.test(combined),
     detailSeparation: /\b(?:technical details?|details_technical|debug|underneath|below|separate|separated|split|move|moved)\b/.test(combined),
     duplicatePrevention: /\b(?:duplicate|double[- ]delivery|single final|dedupe|deduplicat|one clean)\b/.test(combined),
     contextPreservation: /\b(?:structured|context|preserve|kept|retain|survive)\b/.test(combined),
@@ -755,6 +758,17 @@ function getCompletionRawSummary(completion) {
   const details = getCompletionTechnicalDetails(completion);
   if (!details || typeof details !== 'object') return null;
   return normalizeCompletionText(details.raw_summary ?? details.rawSummary);
+}
+
+function getCompletionSummaryStyle(completion) {
+  const style = normalizeCompletionText(completion?.debug?.summaryStyle);
+  if (!style) return null;
+  if (['verbatim', 'humanized', 'technical-synthesis', 'none'].includes(style)) return style;
+  return null;
+}
+
+function completionUsesHumanizedLead(completion) {
+  return getCompletionSummaryStyle(completion) === 'humanized';
 }
 
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
@@ -1264,7 +1278,12 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
   const summaryHuman = normalizedSummary || synthesizedReply || null;
-  const effectiveSummary = summaryHuman || rawSummary || null;
+  const summaryStyle = normalizedSummary
+    ? (rawSummary && normalizedSummary === rawSummary ? 'verbatim' : 'humanized')
+    : synthesizedReply ? 'technical-synthesis' : 'none';
+  const effectiveSummary = summaryStyle === 'technical-synthesis'
+    ? summaryHuman || rawSummary || null
+    : rawSummary || summaryHuman || null;
   const deliveryText = summaryHuman || null;
   const detailsTechnical = buildTechnicalDetails({
     checklist: normalizedChecklist,
@@ -1287,9 +1306,25 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
       rawSummary,
       normalizedSummary,
       synthesizedReply,
+      summaryStyle,
       deliverySource: normalizedSummary ? 'summary_human' : synthesizedReply ? 'technical-synthesis' : 'none',
     },
   };
+}
+
+export function getCompletionAuthoritativeSummary(completion) {
+  if (!completion || typeof completion !== 'object' || Array.isArray(completion)) return null;
+
+  const rawSummary = getCompletionRawSummary(completion);
+  const storedSummary = normalizeCompletionText(completion?.summary);
+  const summaryHuman = getCompletionSummaryHuman(completion);
+  const summaryStyle = getCompletionSummaryStyle(completion);
+
+  if (summaryStyle === 'humanized') {
+    return rawSummary || storedSummary || summaryHuman || null;
+  }
+
+  return storedSummary || summaryHuman || rawSummary || null;
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
@@ -1310,6 +1345,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     checklist: completion?.checklist,
     sha: completion?.sha,
   });
+  const summaryUsesHumanizedLead = completionUsesHumanizedLead(completion);
   const completionDeliverySource = normalizeCompletionText(completion?.debug?.deliverySource);
   const preferredSummary = completionSummaryHuman || completionSummary || fallback || synthesizedFromTechnical || null;
   const authoritativeStructuredSummary = completionDeliverySource && completionDeliverySource !== 'technical-synthesis'
@@ -1355,7 +1391,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       rawText: candidate.rawText,
       summaryText: candidate.text,
       completion,
-      includeRawSummaryDetails: false,
+      includeRawSummaryDetails: summaryUsesHumanizedLead && candidate.source === 'summary_human',
     });
     return {
       deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),

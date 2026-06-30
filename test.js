@@ -6797,16 +6797,19 @@ console.log('\n-- Completion payload helpers --');
   });
   const expectedTechnicalLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
   assert(humanizedTechnicalPayload.summary_human === expectedTechnicalLead, 'completion helper: technical commit-style summary gets a plain-English lead');
+  assert(humanizedTechnicalPayload.summary === technicalCommitSummary, 'completion helper: technical commit-style payload preserves the authoritative raw summary');
   assert(!humanizedTechnicalPayload.summary_human.includes('fix(dispatch):'), 'completion helper: humanized summary does not leak commit-style prefix');
   assert(humanizedTechnicalPayload.details_technical?.raw_summary === technicalCommitSummary, 'completion helper: technical raw summary is preserved in details');
+  assert(humanizedTechnicalPayload.debug?.summaryStyle === 'humanized', 'completion helper: technical commit-style payload records that the delivery lead was humanized');
 
   const humanizedTechnicalDelivery = resolveCompletionDelivery({
     lastReply: null,
     completion: humanizedTechnicalPayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(humanizedTechnicalDelivery.deliveryText === expectedTechnicalLead, 'completion helper: humanized technical summary delivers only the human-facing lead');
-  assert(!humanizedTechnicalDelivery.deliveryText.includes(technicalCommitSummary), 'completion helper: raw technical summary is kept out when summary_human exists');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.startsWith(expectedTechnicalLead), 'completion helper: humanized technical summary keeps the human-facing lead first');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Technical details:'), 'completion helper: humanized technical summary appends a technical-details block');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('normalize completion delivery'), 'completion helper: humanized technical summary keeps key technical details visible');
 
   const weakTechnicalLeadSummary = 'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions';
   const weakTechnicalLeadPayload = buildTerminalCompletionPayload({
@@ -6815,6 +6818,7 @@ console.log('\n-- Completion payload helpers --');
   });
   const expectedWeakLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to scan without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
   assert(weakTechnicalLeadPayload.summary_human === expectedWeakLead, 'completion helper: weak technical lead is rewritten into plain English first');
+  assert(weakTechnicalLeadPayload.summary === weakTechnicalLeadSummary, 'completion helper: weak technical lead payload preserves the authoritative raw summary');
   assert(!/dispatch\/completion\.mjs|summary_human|deliveryText|details_technical|payload-precedence/.test(weakTechnicalLeadPayload.summary_human), 'completion helper: plain-English lead strips filenames and internal implementation terms');
 
   const weakTechnicalLeadDelivery = resolveCompletionDelivery({
@@ -6823,7 +6827,8 @@ console.log('\n-- Completion payload helpers --');
     fallbackSummary: 'completed (agent signal)',
   });
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
-  assert(!weakTechnicalLeadDelivery.deliveryText.includes(weakTechnicalLeadSummary), 'completion helper: stripped technical specifics stay out of delivery when summary_human exists');
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes('Technical details:'), 'completion helper: rewritten plain-English lead keeps a separate technical-details block');
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes('make summary_human win over deliveryText'), 'completion helper: rewritten plain-English lead still surfaces the core technical fix');
 
   const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
   const sportsBacktestMetaDelivery = resolveCompletionDelivery({
@@ -6865,8 +6870,9 @@ console.log('\n-- Completion payload helpers --');
     completion: fitnessStylePayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(fitnessStyleDelivery.deliveryText === expectedFitnessLead, 'completion helper: mixed human-plus-technical fitness summary delivers the plain-English lead');
-  assert(!fitnessStyleDelivery.deliveryText.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness raw details stay out when summary_human exists');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.startsWith(expectedFitnessLead), 'completion helper: mixed human-plus-technical fitness summary keeps the plain-English lead first');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('Technical details:'), 'completion helper: mixed human-plus-technical fitness summary appends a technical-details block');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness summary keeps the core technical detail visible');
   assert(fitnessStyleDelivery.deliveryText && !fitnessStyleDelivery.deliveryText.includes('Technically:'), 'completion helper: mixed human-plus-technical fitness summary removes the inline Technically marker from delivery text');
 
   const brokenAppleHealthShape = [
@@ -7216,6 +7222,50 @@ console.log('\n-- cmdResult conservative transcript recovery --');
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
   assert(structuredList.labels[0].summary === structuredCompletion.summary_human, 'cmdList: structured completion summary beats generic label summary');
+
+  const authoritativeRawSummary = 'Committed dispatch liveness hardening on fix/dispatch-terminal-status-liveness: the real bug was fresh watcher pings masking terminal gateway timeout/failed/killed session states until the hard ceiling. Added the 1h gateway timeout floor for high-thinking subagent dispatches, immediate terminal-status resolution, and watchdog regression coverage.';
+  const humanizedStructuredCompletion = buildTerminalCompletionPayload({
+    summary: authoritativeRawSummary,
+    checklist: { work_complete: true, tests_passed: true },
+    sha: 'c4664fe5fd27d1c32287e641db4f5311d28a24dd',
+  });
+  seedResultCase({
+    label: 'result-humanized-technical-summary',
+    sessionKey: 'agent:main:subagent:result-humanized-technical-summary',
+    sessionId: 'result-humanized-technical-summary-sid',
+    status: 'done',
+    summary: humanizedStructuredCompletion.summary,
+    completion: humanizedStructuredCompletion,
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Stale terminal transcript text that should not become the summary.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const humanizedStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-humanized-technical-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(humanizedStatus.summary === authoritativeRawSummary, 'cmdStatus: humanized delivery lead does not replace the authoritative raw completion summary');
+
+  const humanizedResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-humanized-technical-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(humanizedResult.summary === authoritativeRawSummary, 'cmdResult: humanized delivery lead does not replace the authoritative raw completion summary');
+
+  const humanizedList = JSON.parse(execFileSync(process.execPath, [indexPath, 'list', '--limit', '10'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  const humanizedListEntry = humanizedList.labels.find((item) => item.label === 'result-humanized-technical-summary');
+  assert(humanizedListEntry?.summary === authoritativeRawSummary, 'cmdList: humanized delivery lead does not replace the authoritative raw completion summary');
 
   const explicitDoneSummary = 'Finished the recovery, kept the watcher local, and verified commit def5678.';
   seedResultCase({
@@ -9360,7 +9410,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
     expectedDeliveryText: 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.',
-    unexpectedDeliveryText: 'fix(dispatch): normalize completion delivery',
+    expectedTechnicalDetailsText: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     expectEnqueued: true,
   });
 
@@ -9369,7 +9419,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     summary: 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.',
     checklist: { work_complete: true },
     expectedDeliveryText: "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.",
-    unexpectedDeliveryText: 'mapped imported Tonal workoutId values back to tonal_program_schedule',
+    expectedTechnicalDetailsText: 'mapped imported Tonal workoutId values back to tonal_program_schedule',
     expectEnqueued: true,
   });
 
