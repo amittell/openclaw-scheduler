@@ -18,6 +18,7 @@
 
 import { hostname } from 'os';
 import { resolveCompletionDelivery } from './completion.mjs';
+import { getDb } from '../db.js';
 import { sendMessage } from '../messages.js';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
@@ -26,6 +27,131 @@ const HOST         = process.env.DISPATCH_HOST
   || hostname()
   || 'unknown-host';
 const TIMEOUT_MS   = 3000;
+
+function schedulerNow() {
+  return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+function safeJson(value) {
+  if (!value || typeof value !== 'object') return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
+function upsertCompletionDebt({
+  label,
+  sessionKey = null,
+  status,
+  openReason = null,
+  closeReason = null,
+  noReply = 0,
+  metadata = null,
+  finalReportedAt = null,
+  lastVisibleUpdateAt = null,
+}) {
+  if (!label) return null;
+  try {
+    const db = getDb();
+    const now = schedulerNow();
+    const metadataJson = safeJson(metadata);
+
+    db.prepare(`
+      INSERT INTO completion_debts (
+        task_label,
+        session_key,
+        source,
+        status,
+        open_reason,
+        close_reason,
+        opened_at,
+        closed_at,
+        last_visible_update_at,
+        final_reported_at,
+        no_reply,
+        metadata,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, 'dispatch', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_label) DO UPDATE SET
+        session_key = COALESCE(excluded.session_key, completion_debts.session_key),
+        source = 'dispatch',
+        status = excluded.status,
+        open_reason = COALESCE(excluded.open_reason, completion_debts.open_reason),
+        close_reason = COALESCE(excluded.close_reason, completion_debts.close_reason),
+        opened_at = CASE
+          WHEN excluded.status = 'open' THEN COALESCE(completion_debts.opened_at, excluded.opened_at)
+          ELSE completion_debts.opened_at
+        END,
+        closed_at = CASE
+          WHEN excluded.status = 'closed' THEN excluded.closed_at
+          ELSE completion_debts.closed_at
+        END,
+        last_visible_update_at = COALESCE(excluded.last_visible_update_at, completion_debts.last_visible_update_at),
+        final_reported_at = COALESCE(excluded.final_reported_at, completion_debts.final_reported_at),
+        no_reply = excluded.no_reply,
+        metadata = COALESCE(excluded.metadata, completion_debts.metadata),
+        updated_at = excluded.updated_at
+    `).run(
+      label,
+      sessionKey,
+      status,
+      openReason,
+      closeReason,
+      status === 'open' ? now : null,
+      status === 'closed' ? now : null,
+      lastVisibleUpdateAt,
+      finalReportedAt,
+      Number(Boolean(noReply)),
+      metadataJson,
+      now,
+      now,
+    );
+
+    return db.prepare('SELECT * FROM completion_debts WHERE task_label = ?').get(label);
+  } catch (err) {
+    process.stderr.write(`[dispatch-hooks] completion debt tracking skipped for ${label}: ${err.message}\n`);
+    return null;
+  }
+}
+
+export function recordCompletionDeliveryDebt({
+  label,
+  sessionKey = null,
+  openReason = 'no-clean-user-facing-completion',
+  noReply = false,
+  metadata = null,
+} = {}) {
+  return upsertCompletionDebt({
+    label,
+    sessionKey,
+    status: 'open',
+    openReason,
+    noReply,
+    metadata,
+  });
+}
+
+export function recordCompletionDelivered({
+  label,
+  sessionKey = null,
+  closeReason = 'confirmed-completion-delivered',
+  metadata = null,
+} = {}) {
+  const now = schedulerNow();
+  return upsertCompletionDebt({
+    label,
+    sessionKey,
+    status: 'closed',
+    closeReason,
+    metadata,
+    finalReportedAt: now,
+    lastVisibleUpdateAt: now,
+  });
+}
 
 // -- Loki push -----------------------------------------------
 
@@ -77,18 +203,53 @@ async function webhookPush(event, payload) {
  * @param {object} [completion=null] - Structured completion payload
  */
 async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram', completion = null) {
-  try {
-    const delivery = resolveCompletionDelivery({
-      completion,
-      fallbackSummary: summary,
+  return enqueueCompletionNotification({
+    label,
+    summary,
+    deliverTo,
+    deliveryChannel,
+    completion,
+  });
+}
+
+export async function enqueueCompletionNotification({
+  label,
+  summary = null,
+  deliverTo,
+  deliveryChannel = 'telegram',
+  completion = null,
+  sessionKey = null,
+  origin = null,
+  metadata = null,
+} = {}) {
+  const delivery = resolveCompletionDelivery({
+    completion,
+    fallbackSummary: summary,
+  });
+  const bodyText = delivery.deliveryText || null;
+  const baseMetadata = {
+    ...(metadata && typeof metadata === 'object' ? metadata : {}),
+    delivery_channel: deliveryChannel,
+    delivery_to: deliverTo,
+    origin: origin || null,
+    delivery_source: delivery.source || null,
+  };
+
+  if (!bodyText) {
+    recordCompletionDeliveryDebt({
+      label,
+      sessionKey,
+      openReason: 'no-clean-user-facing-completion',
+      noReply: true,
+      metadata: baseMetadata,
     });
-    const bodyText = delivery.deliveryText || null;
-    if (!bodyText) {
-      process.stderr.write(`[dispatch-hooks] completion delivery suppressed for ${label}: no meaningful structured summary\n`);
-      return;
-    }
+    process.stderr.write(`[dispatch-hooks] completion delivery suppressed for ${label}: no meaningful structured summary\n`);
+    return { ok: false, delivered: false, suppressed: true, reason: 'no-clean-user-facing-completion' };
+  }
+
+  try {
     const body = `✅ [${label}] done\n\n${bodyText}`;
-    await sendMessage({
+    const message = await sendMessage({
       from_agent:  'dispatch',
       to_agent:    'main',
       kind:        'result',
@@ -97,8 +258,28 @@ async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'teleg
       channel:     deliveryChannel,
       delivery_to: deliverTo,
     });
+    recordCompletionDelivered({
+      label,
+      sessionKey,
+      metadata: {
+        ...baseMetadata,
+        message_id: message?.id || null,
+      },
+    });
+    return { ok: true, delivered: true, bodyText, messageId: message?.id || null };
   } catch (e) {
+    recordCompletionDeliveryDebt({
+      label,
+      sessionKey,
+      openReason: 'completion-enqueue-failed',
+      noReply: false,
+      metadata: {
+        ...baseMetadata,
+        error: e.message,
+      },
+    });
     process.stderr.write(`[dispatch-hooks] post-office enqueue failed for ${label}: ${e.message}\n`);
+    return { ok: false, delivered: false, reason: 'completion-enqueue-failed', error: e.message };
   }
 }
 

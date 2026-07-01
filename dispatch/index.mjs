@@ -48,7 +48,7 @@ import {
   getDispatchLivenessPolicy,
 } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
-import { onStarted, onFinished, onStuck } from './hooks.mjs';
+import { onStarted, onFinished, onStuck, enqueueCompletionNotification } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
@@ -1044,6 +1044,23 @@ function disarmWatchdog(label) {
   }
 }
 
+function disarmDeliveryWatcher(label) {
+  const entry = getLabel(label);
+  if (!entry?.deliveryWatcherJobId) return;
+  try {
+    const schedulerCli = resolveSchedulerCliPath();
+    execFileSync(process.execPath, [schedulerCli, 'jobs', 'delete', entry.deliveryWatcherJobId], {
+      encoding: 'utf-8',
+      timeout:  5000,
+      stdio:    ['pipe', 'pipe', 'pipe'],
+    });
+    setLabel(label, { deliveryWatcherJobId: null });
+    process.stderr.write(`[${BRAND}] delivery watcher deleted for ${label}\n`);
+  } catch (err) {
+    process.stderr.write(`[${BRAND}] delivery watcher disarm failed for ${label}: ${err.message}\n`);
+  }
+}
+
 
 function quoteForSingleQuotedShell(value) {
   return String(value).replace(/'/g, "'\"'\"'");
@@ -1494,6 +1511,9 @@ async function cmdEnqueue(flags) {
           agentBrand,
         });
         schedulerWatcherOk = true;
+        if (watcherJob?.id) {
+          setLabel(label, { deliveryWatcherJobId: watcherJob.id });
+        }
         process.stderr.write(
           `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
           `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
@@ -2253,6 +2273,10 @@ function cmdWatcherHandoff(flags) {
     jobId: watcherJob?.id || null,
     reason,
   });
+
+  if (watcherJob?.id) {
+    setLabel(label, { deliveryWatcherJobId: watcherJob.id });
+  }
 }
 
 /**
@@ -2481,6 +2505,28 @@ async function cmdDone(flags) {
   // Disarm watchdog when agent signals done
   disarmWatchdog(label);
 
+  let completionDelivery = null;
+  if (existing.deliverTo && existing.deliveryMode !== 'none') {
+    completionDelivery = await enqueueCompletionNotification({
+      label,
+      summary,
+      completion,
+      deliverTo: existing.deliverTo,
+      deliveryChannel: existing.deliverChannel || 'telegram',
+      sessionKey: existing.sessionKey || null,
+      origin: existing.origin || null,
+      metadata: {
+        last_label_status: 'done',
+        timeout_seconds: Number(existing.timeoutSeconds ?? existing.timeout) || null,
+      },
+    });
+
+    if (completionDelivery?.ok) {
+      setLabel(label, { completionDeliveredAt: new Date().toISOString() });
+      disarmDeliveryWatcher(label);
+    }
+  }
+
   // Fire dispatch.finished hook (best-effort)
   const spawnedAtMs = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : Date.now();
   await onFinished({
@@ -2495,7 +2541,19 @@ async function cmdDone(flags) {
     completion,
   }).catch(() => {});
 
-  out({ ok: true, label, status: 'done', summary, completion, message: 'Label marked done via agent signal.' });
+  out({
+    ok: true,
+    label,
+    status: 'done',
+    summary,
+    completion,
+    delivery: completionDelivery ? {
+      attempted: true,
+      delivered: !!completionDelivery.ok,
+      reason: completionDelivery.reason || null,
+    } : null,
+    message: 'Label marked done via agent signal.',
+  });
 }
 
 /**

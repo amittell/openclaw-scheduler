@@ -9440,6 +9440,77 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
   });
 }
 
+console.log('\n-- Post-Office Routing: direct done-path delivery debt tracking --');
+{
+  const {
+    enqueueCompletionNotification,
+  } = await import('./dispatch/hooks.mjs');
+  const liveDb = getDb();
+  liveDb.exec(`
+    CREATE TABLE IF NOT EXISTS completion_debts (
+      task_label TEXT PRIMARY KEY,
+      session_key TEXT,
+      source TEXT NOT NULL DEFAULT 'dispatch',
+      status TEXT NOT NULL DEFAULT 'tracking',
+      open_reason TEXT,
+      close_reason TEXT,
+      opened_at TEXT,
+      closed_at TEXT,
+      last_checkin_at TEXT,
+      last_progress_at TEXT,
+      last_visible_update_at TEXT,
+      final_reported_at TEXT,
+      last_reminder_at TEXT,
+      reminder_count INTEGER NOT NULL DEFAULT 0,
+      awaiting_user INTEGER NOT NULL DEFAULT 0,
+      no_reply INTEGER NOT NULL DEFAULT 0,
+      metadata TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  const deliveredLabel = `delivery-debt-delivered-${Date.now()}`;
+  const delivered = await enqueueCompletionNotification({
+    label: deliveredLabel,
+    summary: 'Implemented the parent completion announce fix and added regression coverage.',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:delivery-debt-delivered',
+  });
+  assert(delivered.ok === true, 'done-path debt: direct completion enqueue succeeds when authoritative summary exists');
+
+  const deliveredDebt = liveDb.prepare(`
+    SELECT status, close_reason, final_reported_at
+    FROM completion_debts
+    WHERE task_label = ?
+  `).get(deliveredLabel);
+  assert(deliveredDebt?.status === 'closed', 'done-path debt: visible completion closes debt row');
+  assert(deliveredDebt?.close_reason === 'confirmed-completion-delivered', 'done-path debt: close_reason records confirmed delivery');
+  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(deliveredLabel);
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(deliveredLabel);
+
+  const debtLabel = `delivery-debt-open-${Date.now()}`;
+  const suppressed = await enqueueCompletionNotification({
+    label: debtLabel,
+    summary: 'done',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:delivery-debt-open',
+  });
+  assert(suppressed.ok === false && suppressed.reason === 'no-clean-user-facing-completion', 'done-path debt: non-deliverable completion returns explicit debt result');
+
+  const openDebt = liveDb.prepare(`
+    SELECT status, open_reason, no_reply
+    FROM completion_debts
+    WHERE task_label = ?
+  `).get(debtLabel);
+  assert(openDebt?.status === 'open', 'done-path debt: missing visible completion opens debt row');
+  assert(openDebt?.open_reason === 'no-clean-user-facing-completion', 'done-path debt: open_reason records missing user-facing completion');
+  assert(openDebt?.no_reply === 1, 'done-path debt: no_reply flag is set for missing visible completion');
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(debtLabel);
+}
+
 console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');
 {
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
