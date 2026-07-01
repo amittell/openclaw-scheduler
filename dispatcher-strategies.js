@@ -1104,6 +1104,11 @@ function isCompletionWatcherPendingTick(shellResult) {
     && /\bWATCHER_PENDING\b/.test(shellResult.stderr || '');
 }
 
+function isCompletionWatcherAlreadyDelivered(shellResult) {
+  return !(shellResult.stdout || '').trim()
+    && /\bWATCHER_ALREADY_DELIVERED\b/.test(shellResult.stderr || '');
+}
+
 function buildCompletionWatcherNoPayloadMessage(job, shellResult) {
   const statusLabel = shellResult.status === 'ok'
     ? 'completed without a deliverable result'
@@ -1158,6 +1163,12 @@ export async function executeShell(job, ctx, deps) {
       result.content = '';
       result.errorMessage = null;
       result.idemAction = 'release';
+      result.skipDelivery = true;
+    } else if (isCompletionWatcherAlreadyDelivered(shellResult)) {
+      result.status = 'ok';
+      result.summary = 'Completion already delivered via authoritative done path';
+      result.content = '';
+      result.errorMessage = null;
       result.skipDelivery = true;
     } else if (watcherStdout) {
       // Completion watcher stdout is the only user-facing contract.  Stderr is
