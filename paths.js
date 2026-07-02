@@ -53,12 +53,15 @@ export function resolveSchedulerDbPath(params = {}) {
 
   const moduleDir = firstNonEmpty(params.moduleDir) || __dirname;
   const moduleDbPath = join(moduleDir, 'scheduler.db');
+  const runtimeDbPath = join(resolveSchedulerHome(env), 'scheduler.db');
+  if (existsSync(runtimeDbPath)) return runtimeDbPath;
+
   const moduleDirWritable = !isNodeModulesInstall(moduleDir) && ensureWritableDir(moduleDir);
   if (!isNodeModulesInstall(moduleDir) && (existsSync(moduleDbPath) || moduleDirWritable)) {
     return moduleDbPath;
   }
 
-  return join(resolveSchedulerHome(env), 'scheduler.db');
+  return runtimeDbPath;
 }
 
 export function ensureSchedulerDbParent(dbPath) {

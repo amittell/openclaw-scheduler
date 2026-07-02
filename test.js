@@ -196,6 +196,18 @@ assert(
   'writable source checkout defaults DB path to package directory'
 );
 rmSync(writableSourceDir, { recursive: true, force: true });
+const runtimeHome = mkdtempSync(join(tmpdir(), 'scheduler-runtime-home-'));
+const runtimeEnv = { HOME: runtimeHome };
+const runtimeDbPathForSource = join(runtimeHome, '.openclaw', 'scheduler', 'scheduler.db');
+mkdirSync(dirname(runtimeDbPathForSource), { recursive: true });
+new Database(runtimeDbPathForSource).close();
+const writableSourceWithRuntimeDir = mkdtempSync(join(tmpdir(), 'scheduler-src-with-runtime-'));
+assert(
+  resolveSchedulerDbPath({ env: runtimeEnv, moduleDir: writableSourceWithRuntimeDir }) === runtimeDbPathForSource,
+  'writable source checkout uses scheduler home DB when a runtime DB already exists'
+);
+rmSync(writableSourceWithRuntimeDir, { recursive: true, force: true });
+rmSync(runtimeHome, { recursive: true, force: true });
 assert(
   resolveServiceWorkingDirectory({
     env: fakeEnv,
@@ -3126,7 +3138,7 @@ console.log('\n-- Installed Package DB Resolution --');
   rmSync(tempRoot, { recursive: true, force: true });
 }
 
-console.log('\n-- Source CLI DB Mismatch Guard --');
+console.log('\n-- Source CLI Runtime DB Preference --');
 {
   const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-db-guard-'));
   const homeDir = join(tempRoot, 'home');
@@ -3148,39 +3160,30 @@ console.log('\n-- Source CLI DB Mismatch Guard --');
   const guardEnv = { ...process.env, HOME: homeDir };
   delete guardEnv.SCHEDULER_DB;
 
-  let validateErr = null;
-  try {
-    execFileSync(process.execPath, [cliPath, 'jobs', 'validate', spec, '--json'], {
-      cwd: tempRoot,
-      env: guardEnv,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (err) {
-    validateErr = err;
-  }
-  assert(validateErr?.status !== 0, 'source checkout jobs validate fails on repo/runtime DB mismatch');
-  const validateJson = JSON.parse(String(validateErr?.stdout || '{}'));
-  assert(validateJson.ok === false, 'source checkout mismatch returns structured JSON error');
-  assert(validateJson.error.includes('Refusing to run validation.'), 'source checkout mismatch explains validation refusal');
-  assert(validateJson.error.includes(repoDbPath), 'source checkout mismatch reports repo-local DB path');
-  assert(validateJson.error.includes(runtimeDbPath), 'source checkout mismatch reports runtime DB path');
+  const statusOut = JSON.parse(execFileSync(process.execPath, [cliPath, 'status', '--json'], {
+    cwd: tempRoot,
+    env: guardEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  assert(statusOut.db_path === runtimeDbPath, 'source checkout status prefers existing runtime DB over repo-local DB');
+  assert(statusOut.db_path !== repoDbPath, 'source checkout status does not use repo-local DB when runtime DB exists');
 
-  let dryRunErr = null;
-  try {
-    execFileSync(process.execPath, [cliPath, 'jobs', 'add', spec, '--dry-run', '--json'], {
-      cwd: tempRoot,
-      env: guardEnv,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (err) {
-    dryRunErr = err;
-  }
-  assert(dryRunErr?.status !== 0, 'source checkout dry-run add fails on repo/runtime DB mismatch');
-  const dryRunJson = JSON.parse(String(dryRunErr?.stdout || '{}'));
-  assert(dryRunJson.ok === false, 'source checkout dry-run mismatch returns structured JSON error');
-  assert(dryRunJson.error.includes('Refusing to run validation.'), 'source checkout dry-run mismatch reuses validation refusal');
+  const validateJson = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'validate', spec, '--json'], {
+    cwd: tempRoot,
+    env: guardEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  assert(validateJson.ok === true, 'source checkout jobs validate succeeds against runtime DB');
+
+  const dryRunJson = JSON.parse(execFileSync(process.execPath, [cliPath, 'jobs', 'add', spec, '--dry-run', '--json'], {
+    cwd: tempRoot,
+    env: guardEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  assert(dryRunJson.ok === true, 'source checkout dry-run add succeeds against runtime DB');
 
   rmSync(tempRoot, { recursive: true, force: true });
 }
@@ -6646,6 +6649,8 @@ console.log('\n-- Sessions.json Detection --');
       ...process.env,
       DISPATCH_LABELS_PATH: testLabelsPath,
       HOME: testTmpDir,
+      // Keep this fallback test hermetic even on hosts with a live OpenClaw gateway.
+      PATH: '/usr/bin:/bin',
     },
     timeout: 15000,
     stdio: ['pipe', 'pipe', 'pipe'],
