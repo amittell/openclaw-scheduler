@@ -450,6 +450,37 @@ CREATE INDEX IF NOT EXISTS idx_team_events_team ON team_mailbox_events(team_id, 
 CREATE INDEX IF NOT EXISTS idx_team_events_task ON team_mailbox_events(team_id, task_id, created_at DESC) WHERE task_id IS NOT NULL;
 
 -- ============================================================
+-- COMPLETION DEBTS: durable record of dispatch completions that
+-- still owe the user a visible announce, plus an atomic delivery
+-- claim so the done-path and the watcher never both deliver (v25).
+-- Column set matches the historical live table so an already
+-- populated store upgrades cleanly.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS completion_debts (
+  task_label              TEXT PRIMARY KEY,
+  session_key             TEXT,
+  source                  TEXT NOT NULL DEFAULT 'dispatch',
+  status                  TEXT NOT NULL DEFAULT 'tracking',   -- tracking|open|delivering|closed
+  open_reason             TEXT,
+  close_reason            TEXT,
+  opened_at               TEXT,
+  closed_at               TEXT,
+  last_checkin_at         TEXT,
+  last_progress_at        TEXT,
+  last_visible_update_at  TEXT,
+  final_reported_at       TEXT,
+  last_reminder_at        TEXT,
+  reminder_count          INTEGER NOT NULL DEFAULT 0,
+  awaiting_user           INTEGER NOT NULL DEFAULT 0,
+  no_reply                INTEGER NOT NULL DEFAULT 0,
+  metadata                TEXT,
+  created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_completion_debts_status ON completion_debts(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_completion_debts_session ON completion_debts(session_key) WHERE session_key IS NOT NULL;
+
+-- ============================================================
 -- MIGRATION LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -457,8 +488,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-23 (all columns already in schema above).
--- Existing installs are brought up to v23 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-25 (all columns already in schema above).
+-- Existing installs are brought up to v25 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -483,3 +514,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (21);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (22);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (23);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (24);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (25);

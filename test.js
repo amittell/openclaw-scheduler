@@ -9135,6 +9135,44 @@ console.log('\n-- Watchdog Heartbeat Guard --');
     assert(result.liveness?.abortedLastRun === true, 'watchdog guard t7: liveness exposes abortedLastRun');
   }
 
+  // 8: a clean gateway 'done' session status is NOT an abnormal terminal state.
+  // With a fresh watcher ping it must defer to normal liveness rather than
+  // short-circuit to 'interrupted' -- short-circuiting 'done' would race a late
+  // cmdDone and emit a spurious incomplete announce.
+  {
+    const tmpDir = join(tmpBase, 't8-clean-done-not-terminal');
+    mkdirSync(tmpDir);
+    const { labelsPath, sessionsJsonPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+    writeFileSync(sessionsJsonPath, JSON.stringify({
+      [fakeSessionKey]: {
+        sessionId: 'fake-sid-wdg',
+        updatedAt: Date.now() - 15_000,
+        status: 'done',
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t8': {
+        sessionKey: fakeSessionKey,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 25 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date(Date.now() - 30 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t8');
+    assert(result.status === 'running', 'watchdog guard t8: clean done status does not force interrupted while the watcher ping is fresh');
+    assert(
+      !String(result.summary || '').includes('without done signal'),
+      'watchdog guard t8: clean done status is not narrated as an abnormal terminal resolution',
+    );
+  }
+
   rmSync(tmpBase, { recursive: true, force: true });
 }
 
@@ -9445,30 +9483,13 @@ console.log('\n-- Post-Office Routing: direct done-path delivery debt tracking -
   const {
     enqueueCompletionNotification,
   } = await import('./dispatch/hooks.mjs');
+  // completion_debts is provided by schema.sql (applied via initDb at the top
+  // of this suite); the table must exist without any ad-hoc CREATE here.
   const liveDb = getDb();
-  liveDb.exec(`
-    CREATE TABLE IF NOT EXISTS completion_debts (
-      task_label TEXT PRIMARY KEY,
-      session_key TEXT,
-      source TEXT NOT NULL DEFAULT 'dispatch',
-      status TEXT NOT NULL DEFAULT 'tracking',
-      open_reason TEXT,
-      close_reason TEXT,
-      opened_at TEXT,
-      closed_at TEXT,
-      last_checkin_at TEXT,
-      last_progress_at TEXT,
-      last_visible_update_at TEXT,
-      final_reported_at TEXT,
-      last_reminder_at TEXT,
-      reminder_count INTEGER NOT NULL DEFAULT 0,
-      awaiting_user INTEGER NOT NULL DEFAULT 0,
-      no_reply INTEGER NOT NULL DEFAULT 0,
-      metadata TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-  `);
+  assert(
+    !!liveDb.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_debts'`).get(),
+    'done-path debt: completion_debts table exists from canonical schema (no ad-hoc create)',
+  );
 
   const deliveredLabel = `delivery-debt-delivered-${Date.now()}`;
   const delivered = await enqueueCompletionNotification({
@@ -9509,6 +9530,59 @@ console.log('\n-- Post-Office Routing: direct done-path delivery debt tracking -
   assert(openDebt?.open_reason === 'no-clean-user-facing-completion', 'done-path debt: open_reason records missing user-facing completion');
   assert(openDebt?.no_reply === 1, 'done-path debt: no_reply flag is set for missing visible completion');
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(debtLabel);
+}
+
+console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) --');
+{
+  const {
+    claimCompletionDelivery,
+    recordCompletionDelivered,
+    resetCompletionDeliveryClaim,
+    enqueueCompletionNotification,
+  } = await import('./dispatch/hooks.mjs');
+  const liveDb = getDb();
+
+  // The claim is the single-writer guard shared by the done-path and the watcher.
+  const claimLabel = `delivery-claim-${Date.now()}`;
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === true,
+    'delivery claim: first claimant wins',
+  );
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === false,
+    'delivery claim: second claimant is blocked while delivery is in flight',
+  );
+  recordCompletionDelivered({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' });
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === false,
+    'delivery claim: a delivered (closed) completion is never re-claimed',
+  );
+  // Re-dispatching the same label must clear the prior-run debt so the new run
+  // can claim and deliver again.
+  resetCompletionDeliveryClaim({ label: claimLabel });
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === true,
+    'delivery claim: a re-dispatched label reclaims after the prior-run debt is reset',
+  );
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(claimLabel);
+
+  // End-to-end: two enqueues of the same completion produce exactly one message.
+  const dupLabel = `delivery-claim-enqueue-${Date.now()}`;
+  const enqueueArgs = {
+    label: dupLabel,
+    summary: 'Landed the terminal-status liveness fix and proved it with regression tests.',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:claim-enqueue',
+  };
+  const first = await enqueueCompletionNotification(enqueueArgs);
+  const second = await enqueueCompletionNotification(enqueueArgs);
+  assert(first.ok === true && first.delivered === true, 'delivery claim: first enqueue delivers');
+  assert(second.ok === false && second.deduped === true && second.reason === 'already-claimed', 'delivery claim: second enqueue is deduped, not re-delivered');
+  const dupMessages = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE subject = ?`).get(dupLabel);
+  assert(dupMessages.cnt === 1, 'delivery claim: exactly one completion message is enqueued across both attempts');
+  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(dupLabel);
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(dupLabel);
 }
 
 console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');
@@ -11162,7 +11236,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 24, 'capabilities: schema_version is 24');
+  assert(capsOut.schema_version === 25, 'capabilities: schema_version is 25');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

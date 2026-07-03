@@ -153,6 +153,54 @@ export function recordCompletionDelivered({
   });
 }
 
+// Clear any prior-run completion debt so a re-dispatched label starts with a
+// clean delivery claim. The debt row is keyed by task_label and durable across
+// runs; without this reset a stale 'closed' row from an earlier run would make
+// the next run's delivery claim fail and silently suppress its announce.
+export function resetCompletionDeliveryClaim({ label } = {}) {
+  if (!label) return;
+  try {
+    getDb().prepare('DELETE FROM completion_debts WHERE task_label = ?').run(label);
+  } catch (err) {
+    process.stderr.write(`[dispatch-hooks] completion debt reset skipped for ${label}: ${err.message}\n`);
+  }
+}
+
+const CLAIM_STALE_WINDOW = "-2 minutes";
+
+// Atomic single-writer delivery claim. The done-path (cmdDone) and the delivery
+// watcher can both observe a completed label and try to announce it; SQLite
+// serializes writers, so exactly one caller transitions the debt row into
+// 'delivering' and earns the right to send. A row already 'closed' (delivered)
+// or freshly 'delivering' (send in flight) blocks the claim. A 'delivering' row
+// older than the stale window is reclaimable so a crashed sender cannot wedge
+// delivery forever. Returns true when this caller owns delivery.
+export function claimCompletionDelivery({ label, sessionKey = null } = {}) {
+  if (!label) return true;
+  try {
+    const db = getDb();
+    const now = schedulerNow();
+    const res = db.prepare(`
+      INSERT INTO completion_debts (task_label, session_key, source, status, opened_at, created_at, updated_at)
+      VALUES (?, ?, 'dispatch', 'delivering', ?, ?, ?)
+      ON CONFLICT(task_label) DO UPDATE SET
+        status = 'delivering',
+        session_key = COALESCE(excluded.session_key, completion_debts.session_key),
+        opened_at = COALESCE(completion_debts.opened_at, excluded.opened_at),
+        updated_at = excluded.updated_at
+      WHERE completion_debts.status != 'closed'
+        AND (completion_debts.status != 'delivering'
+             OR completion_debts.updated_at <= datetime('now', '${CLAIM_STALE_WINDOW}'))
+    `).run(label, sessionKey, now, now, now);
+    return res.changes > 0;
+  } catch (err) {
+    // Missing table / DB error: preserve prior best-effort delivery rather than
+    // silently dropping the user's completion announce.
+    process.stderr.write(`[dispatch-hooks] completion delivery claim skipped for ${label}: ${err.message}\n`);
+    return true;
+  }
+}
+
 // -- Loki push -----------------------------------------------
 
 async function lokiPush(event, payload) {
@@ -245,6 +293,13 @@ export async function enqueueCompletionNotification({
     });
     process.stderr.write(`[dispatch-hooks] completion delivery suppressed for ${label}: no meaningful structured summary\n`);
     return { ok: false, delivered: false, suppressed: true, reason: 'no-clean-user-facing-completion' };
+  }
+
+  if (!claimCompletionDelivery({ label, sessionKey })) {
+    // The watcher (or a prior done-path enqueue) already owns this completion's
+    // delivery. Skip sending so the user gets exactly one announce.
+    process.stderr.write(`[dispatch-hooks] completion delivery deduped for ${label}: already claimed by another path\n`);
+    return { ok: false, delivered: false, deduped: true, reason: 'already-claimed' };
   }
 
   try {

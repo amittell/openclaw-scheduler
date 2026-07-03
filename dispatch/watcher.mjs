@@ -37,6 +37,7 @@ import {
   resolveCompletionDelivery,
 } from './completion.mjs';
 import {
+  claimCompletionDelivery,
   recordCompletionDelivered,
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
@@ -1140,6 +1141,13 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   markLabelDone(label, completion.summary);
 
   if (completion.deliveryText) {
+    // Atomic guard against the done-path (cmdDone) delivering the same
+    // completion. The preflight completionDeliveredAt check narrows the window;
+    // this claim closes it -- if the done-path already owns delivery, stand down.
+    const claimEntry = getLabelEntry(label);
+    if (!claimCompletionDelivery({ label, sessionKey: claimEntry?.sessionKey || null })) {
+      markWatcherAlreadyDelivered(label);
+    }
     updateExistingLabel(label, (entry) => {
       entry.completionDeliveredAt = new Date().toISOString();
       entry.completionDeliverySource = completion.source || 'watcher';

@@ -48,7 +48,13 @@ import {
   getDispatchLivenessPolicy,
 } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
-import { onStarted, onFinished, onStuck, enqueueCompletionNotification } from './hooks.mjs';
+import {
+  onStarted,
+  onFinished,
+  onStuck,
+  enqueueCompletionNotification,
+  resetCompletionDeliveryClaim,
+} from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
@@ -851,6 +857,8 @@ function checkSessionTurnAborted(labelEntry, sessionsStore) {
     shouldResolve: true,
     reason,
     lastActivity: getSessionJsonlMtimeMs(agent, sessionId),
+    sessionStatus:
+      typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '',
   };
 }
 
@@ -952,7 +960,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   const silenceMs = lastActivity === null ? Infinity : Date.now() - lastActivity;
   const sessionStatus = typeof entry.status === 'string' ? entry.status.trim().toLowerCase() : '';
 
-  if (sessionStatus && sessionStatus !== 'running') {
+  if (isTerminalAbnormalSessionStatus(sessionStatus)) {
     const terminalReason = entry.abortedLastRun === true
       ? `gateway sessions store status=${sessionStatus} (abortedLastRun=true)`
       : `gateway sessions store status=${sessionStatus}`;
@@ -1016,10 +1024,23 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   };
 }
 
+// openclaw's SessionEntry.status vocabulary is exactly
+// running|done|failed|killed|timeout (src/config/sessions/types.ts,
+// isTerminalSessionStatus). Only the abnormal terminal states mean the agent
+// stopped without signalling done, so only those may short-circuit liveness to
+// "interrupted". 'done' is a clean turn end handled by the done path / normal
+// idle liveness -- treating it as terminal here would race a late cmdDone and
+// emit a spurious "interrupted" announce.
+const TERMINAL_ABNORMAL_SESSION_STATUSES = new Set(['timeout', 'failed', 'killed']);
+
+function isTerminalAbnormalSessionStatus(status) {
+  return TERMINAL_ABNORMAL_SESSION_STATUSES.has(status);
+}
+
 function hasTerminalSessionStoreStatus(sessionEntry) {
   const sessionStatus =
     typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '';
-  return !!sessionStatus && sessionStatus !== 'running';
+  return isTerminalAbnormalSessionStatus(sessionStatus);
 }
 
 // -- Watchdog Helpers -----------------------------------------
@@ -1459,6 +1480,10 @@ async function cmdEnqueue(flags) {
       taskPrompt:     message.slice(0, 2000),
     });
 
+    // New run of this label -- clear any prior-run delivery debt so the fresh
+    // run's done-path/watcher claim is not blocked by a stale closed row.
+    resetCompletionDeliveryClaim({ label });
+
     // Fire dispatch.started hook (best-effort)
     await onStarted({
       label, job_id: idem, run_id: response?.runId || idem,
@@ -1702,6 +1727,7 @@ function cmdStatus(flags) {
         setLabel(label, {
           status:  'interrupted',
           summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: turnAbortCheck.sessionStatus,
             reason: turnAbortCheck.reason,
           }),
         });
@@ -2042,7 +2068,10 @@ function cmdSync(flags) {
       if (!dryRun) {
         setLabel(name, {
           status:  'interrupted',
-          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: turnAbortCheck.sessionStatus,
+            reason: turnAbortCheck.reason,
+          }),
         });
         disarmWatchdog(name);
       }

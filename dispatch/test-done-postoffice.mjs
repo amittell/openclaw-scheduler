@@ -88,29 +88,6 @@ function initSchedulerDb(dir) {
   const schema = readFileSync(SCHEMA_PATH, 'utf-8');
   const db = new Database(dbPath);
   db.exec(schema);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS completion_debts (
-      task_label TEXT PRIMARY KEY,
-      session_key TEXT,
-      source TEXT NOT NULL DEFAULT 'dispatch',
-      status TEXT NOT NULL DEFAULT 'tracking',
-      open_reason TEXT,
-      close_reason TEXT,
-      opened_at TEXT,
-      closed_at TEXT,
-      last_checkin_at TEXT,
-      last_progress_at TEXT,
-      last_visible_update_at TEXT,
-      final_reported_at TEXT,
-      last_reminder_at TEXT,
-      reminder_count INTEGER NOT NULL DEFAULT 0,
-      awaiting_user INTEGER NOT NULL DEFAULT 0,
-      no_reply INTEGER NOT NULL DEFAULT 0,
-      metadata TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-  `);
   db.close();
   return dbPath;
 }
