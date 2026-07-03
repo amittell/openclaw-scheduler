@@ -64,7 +64,11 @@ import {
   hasCompletionSignal,
   resolveCompletionDelivery,
 } from './dispatch/completion.mjs';
-import { getDispatchLivenessPolicy } from './dispatch/liveness.mjs';
+import {
+  buildAutoResolvedIncompleteSummary,
+  getDispatchGatewayTimeoutSeconds,
+  getDispatchLivenessPolicy,
+} from './dispatch/liveness.mjs';
 import { resolveLabelsPath } from './dispatch/paths.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
@@ -6793,16 +6797,19 @@ console.log('\n-- Completion payload helpers --');
   });
   const expectedTechnicalLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
   assert(humanizedTechnicalPayload.summary_human === expectedTechnicalLead, 'completion helper: technical commit-style summary gets a plain-English lead');
+  assert(humanizedTechnicalPayload.summary === technicalCommitSummary, 'completion helper: technical commit-style payload preserves the authoritative raw summary');
   assert(!humanizedTechnicalPayload.summary_human.includes('fix(dispatch):'), 'completion helper: humanized summary does not leak commit-style prefix');
   assert(humanizedTechnicalPayload.details_technical?.raw_summary === technicalCommitSummary, 'completion helper: technical raw summary is preserved in details');
+  assert(humanizedTechnicalPayload.debug?.summaryStyle === 'humanized', 'completion helper: technical commit-style payload records that the delivery lead was humanized');
 
   const humanizedTechnicalDelivery = resolveCompletionDelivery({
     lastReply: null,
     completion: humanizedTechnicalPayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(humanizedTechnicalDelivery.deliveryText === expectedTechnicalLead, 'completion helper: humanized technical summary delivers only the human-facing lead');
-  assert(!humanizedTechnicalDelivery.deliveryText.includes(technicalCommitSummary), 'completion helper: raw technical summary is kept out when summary_human exists');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.startsWith(expectedTechnicalLead), 'completion helper: humanized technical summary keeps the human-facing lead first');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('Technical details:'), 'completion helper: humanized technical summary appends a technical-details block');
+  assert(humanizedTechnicalDelivery.deliveryText && humanizedTechnicalDelivery.deliveryText.includes('normalize completion delivery'), 'completion helper: humanized technical summary keeps key technical details visible');
 
   const weakTechnicalLeadSummary = 'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions';
   const weakTechnicalLeadPayload = buildTerminalCompletionPayload({
@@ -6811,6 +6818,7 @@ console.log('\n-- Completion payload helpers --');
   });
   const expectedWeakLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to scan without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
   assert(weakTechnicalLeadPayload.summary_human === expectedWeakLead, 'completion helper: weak technical lead is rewritten into plain English first');
+  assert(weakTechnicalLeadPayload.summary === weakTechnicalLeadSummary, 'completion helper: weak technical lead payload preserves the authoritative raw summary');
   assert(!/dispatch\/completion\.mjs|summary_human|deliveryText|details_technical|payload-precedence/.test(weakTechnicalLeadPayload.summary_human), 'completion helper: plain-English lead strips filenames and internal implementation terms');
 
   const weakTechnicalLeadDelivery = resolveCompletionDelivery({
@@ -6819,7 +6827,8 @@ console.log('\n-- Completion payload helpers --');
     fallbackSummary: 'completed (agent signal)',
   });
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.startsWith(expectedWeakLead), 'completion helper: rewritten plain-English lead stays first in delivery text');
-  assert(!weakTechnicalLeadDelivery.deliveryText.includes(weakTechnicalLeadSummary), 'completion helper: stripped technical specifics stay out of delivery when summary_human exists');
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes('Technical details:'), 'completion helper: rewritten plain-English lead keeps a separate technical-details block');
+  assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes('make summary_human win over deliveryText'), 'completion helper: rewritten plain-English lead still surfaces the core technical fix');
 
   const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
   const sportsBacktestMetaDelivery = resolveCompletionDelivery({
@@ -6861,8 +6870,9 @@ console.log('\n-- Completion payload helpers --');
     completion: fitnessStylePayload,
     fallbackSummary: 'completed (agent signal)',
   });
-  assert(fitnessStyleDelivery.deliveryText === expectedFitnessLead, 'completion helper: mixed human-plus-technical fitness summary delivers the plain-English lead');
-  assert(!fitnessStyleDelivery.deliveryText.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness raw details stay out when summary_human exists');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.startsWith(expectedFitnessLead), 'completion helper: mixed human-plus-technical fitness summary keeps the plain-English lead first');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('Technical details:'), 'completion helper: mixed human-plus-technical fitness summary appends a technical-details block');
+  assert(fitnessStyleDelivery.deliveryText && fitnessStyleDelivery.deliveryText.includes('mapped imported Tonal workoutId values back to tonal_program_schedule'), 'completion helper: mixed human-plus-technical fitness summary keeps the core technical detail visible');
   assert(fitnessStyleDelivery.deliveryText && !fitnessStyleDelivery.deliveryText.includes('Technically:'), 'completion helper: mixed human-plus-technical fitness summary removes the inline Technically marker from delivery text');
 
   const brokenAppleHealthShape = [
@@ -7212,6 +7222,50 @@ console.log('\n-- cmdResult conservative transcript recovery --');
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
   assert(structuredList.labels[0].summary === structuredCompletion.summary_human, 'cmdList: structured completion summary beats generic label summary');
+
+  const authoritativeRawSummary = 'Committed dispatch liveness hardening on fix/dispatch-terminal-status-liveness: the real bug was fresh watcher pings masking terminal gateway timeout/failed/killed session states until the hard ceiling. Added the 1h gateway timeout floor for high-thinking subagent dispatches, immediate terminal-status resolution, and watchdog regression coverage.';
+  const humanizedStructuredCompletion = buildTerminalCompletionPayload({
+    summary: authoritativeRawSummary,
+    checklist: { work_complete: true, tests_passed: true },
+    sha: 'c4664fe5fd27d1c32287e641db4f5311d28a24dd',
+  });
+  seedResultCase({
+    label: 'result-humanized-technical-summary',
+    sessionKey: 'agent:main:subagent:result-humanized-technical-summary',
+    sessionId: 'result-humanized-technical-summary-sid',
+    status: 'done',
+    summary: humanizedStructuredCompletion.summary,
+    completion: humanizedStructuredCompletion,
+    entries: [
+      { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Stale terminal transcript text that should not become the summary.' }], stop_reason: 'end_turn' },
+    ],
+  });
+
+  const humanizedStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-humanized-technical-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(humanizedStatus.summary === authoritativeRawSummary, 'cmdStatus: humanized delivery lead does not replace the authoritative raw completion summary');
+
+  const humanizedResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-humanized-technical-summary'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  assert(humanizedResult.summary === authoritativeRawSummary, 'cmdResult: humanized delivery lead does not replace the authoritative raw completion summary');
+
+  const humanizedList = JSON.parse(execFileSync(process.execPath, [indexPath, 'list', '--limit', '10'], {
+    encoding: 'utf8',
+    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim());
+  const humanizedListEntry = humanizedList.labels.find((item) => item.label === 'result-humanized-technical-summary');
+  assert(humanizedListEntry?.summary === authoritativeRawSummary, 'cmdList: humanized delivery lead does not replace the authoritative raw completion summary');
 
   const explicitDoneSummary = 'Finished the recovery, kept the watcher local, and verified commit def5678.';
   seedResultCase({
@@ -9018,6 +9072,106 @@ console.log('\n-- Watchdog Heartbeat Guard --');
   const highPolicy = getDispatchLivenessPolicy({ timeoutSeconds: 1200, thinking: 'high' });
   assert(highPolicy.idleProbeMs >= 10 * 60 * 1000, 'watchdog guard: high-thinking idle result probe waits at least 10min');
   assert(highPolicy.idleFailureMs >= 20 * 60 * 1000, 'watchdog guard: high-thinking idle failure waits at least 20min');
+  assert(
+    getDispatchGatewayTimeoutSeconds({ timeoutSeconds: 1200, thinking: 'high', lane: 'subagent' }) === 3600,
+    'watchdog guard: high-thinking subagent gateway timeout is elevated to 1h floor',
+  );
+  assert(
+    getDispatchGatewayTimeoutSeconds({ timeoutSeconds: 1200, thinking: 'high', lane: 'main' }) === 1200,
+    'watchdog guard: non-subagent high-thinking timeout is unchanged',
+  );
+  assert(
+    buildAutoResolvedIncompleteSummary({
+      sessionStatus: 'timeout',
+      reason: 'gateway sessions store status=timeout',
+    }).includes('gateway session timeout without done signal'),
+    'watchdog guard: timeout auto-resolve summary names gateway timeout explicitly',
+  );
+  assert(
+    buildAutoResolvedIncompleteSummary({
+      sessionStatus: 'failed',
+      reason: 'gateway sessions store status=failed',
+    }).includes('gateway session failure without done signal'),
+    'watchdog guard: failed auto-resolve summary names gateway failure explicitly',
+  );
+
+  // 7: if the gateway sessions store already recorded a terminal timeout,
+  // cmdStatus should surface that directly rather than collapsing it to an
+  // "idle without done" diagnosis.
+  {
+    const tmpDir = join(tmpBase, 't7-terminal-timeout');
+    mkdirSync(tmpDir);
+    const { labelsPath, sessionsJsonPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+    writeFileSync(sessionsJsonPath, JSON.stringify({
+      [fakeSessionKey]: {
+        sessionId: 'fake-sid-wdg',
+        updatedAt: Date.now() - 15_000,
+        status: 'timeout',
+        abortedLastRun: true,
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t7': {
+        sessionKey: fakeSessionKey,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 25 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date(Date.now() - 30 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t7');
+    assert(result.status === 'interrupted', 'watchdog guard t7: terminal timeout still resolves interrupted');
+    assert(
+      String(result.summary || '').includes('gateway session timeout without done signal'),
+      'watchdog guard t7: status summary reports gateway timeout instead of generic idle wording',
+    );
+    assert(result.liveness?.status === 'timeout', 'watchdog guard t7: liveness exposes terminal session status');
+    assert(result.liveness?.abortedLastRun === true, 'watchdog guard t7: liveness exposes abortedLastRun');
+  }
+
+  // 8: a clean gateway 'done' session status is NOT an abnormal terminal state.
+  // With a fresh watcher ping it must defer to normal liveness rather than
+  // short-circuit to 'interrupted' -- short-circuiting 'done' would race a late
+  // cmdDone and emit a spurious incomplete announce.
+  {
+    const tmpDir = join(tmpBase, 't8-clean-done-not-terminal');
+    mkdirSync(tmpDir);
+    const { labelsPath, sessionsJsonPath, fakeSessionKey } = makeWdgEnv(tmpDir);
+    writeFileSync(sessionsJsonPath, JSON.stringify({
+      [fakeSessionKey]: {
+        sessionId: 'fake-sid-wdg',
+        updatedAt: Date.now() - 15_000,
+        status: 'done',
+        model: 'anthropic/test',
+      },
+    }) + '\n');
+
+    writeFileSync(labelsPath, JSON.stringify({
+      'wdg-t8': {
+        sessionKey: fakeSessionKey,
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 25 * 60 * 1000).toISOString(),
+        timeoutSeconds: 1200,
+        thinking: 'high',
+        lastPing: new Date(Date.now() - 30 * 1000).toISOString(),
+      },
+    }) + '\n');
+
+    const result = runStatus(labelsPath, tmpDir, 'wdg-t8');
+    assert(result.status === 'running', 'watchdog guard t8: clean done status does not force interrupted while the watcher ping is fresh');
+    assert(
+      !String(result.summary || '').includes('without done signal'),
+      'watchdog guard t8: clean done status is not narrated as an abnormal terminal resolution',
+    );
+  }
 
   rmSync(tmpBase, { recursive: true, force: true });
 }
@@ -9294,7 +9448,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
     expectedDeliveryText: 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.',
-    unexpectedDeliveryText: 'fix(dispatch): normalize completion delivery',
+    expectedTechnicalDetailsText: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     expectEnqueued: true,
   });
 
@@ -9303,7 +9457,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     summary: 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.',
     checklist: { work_complete: true },
     expectedDeliveryText: "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.",
-    unexpectedDeliveryText: 'mapped imported Tonal workoutId values back to tonal_program_schedule',
+    expectedTechnicalDetailsText: 'mapped imported Tonal workoutId values back to tonal_program_schedule',
     expectEnqueued: true,
   });
 
@@ -9322,6 +9476,113 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     expectedDeliveryText: null,
     expectEnqueued: false,
   });
+}
+
+console.log('\n-- Post-Office Routing: direct done-path delivery debt tracking --');
+{
+  const {
+    enqueueCompletionNotification,
+  } = await import('./dispatch/hooks.mjs');
+  // completion_debts is provided by schema.sql (applied via initDb at the top
+  // of this suite); the table must exist without any ad-hoc CREATE here.
+  const liveDb = getDb();
+  assert(
+    !!liveDb.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='completion_debts'`).get(),
+    'done-path debt: completion_debts table exists from canonical schema (no ad-hoc create)',
+  );
+
+  const deliveredLabel = `delivery-debt-delivered-${Date.now()}`;
+  const delivered = await enqueueCompletionNotification({
+    label: deliveredLabel,
+    summary: 'Implemented the parent completion announce fix and added regression coverage.',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:delivery-debt-delivered',
+  });
+  assert(delivered.ok === true, 'done-path debt: direct completion enqueue succeeds when authoritative summary exists');
+
+  const deliveredDebt = liveDb.prepare(`
+    SELECT status, close_reason, final_reported_at
+    FROM completion_debts
+    WHERE task_label = ?
+  `).get(deliveredLabel);
+  assert(deliveredDebt?.status === 'closed', 'done-path debt: visible completion closes debt row');
+  assert(deliveredDebt?.close_reason === 'confirmed-completion-delivered', 'done-path debt: close_reason records confirmed delivery');
+  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(deliveredLabel);
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(deliveredLabel);
+
+  const debtLabel = `delivery-debt-open-${Date.now()}`;
+  const suppressed = await enqueueCompletionNotification({
+    label: debtLabel,
+    summary: 'done',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:delivery-debt-open',
+  });
+  assert(suppressed.ok === false && suppressed.reason === 'no-clean-user-facing-completion', 'done-path debt: non-deliverable completion returns explicit debt result');
+
+  const openDebt = liveDb.prepare(`
+    SELECT status, open_reason, no_reply
+    FROM completion_debts
+    WHERE task_label = ?
+  `).get(debtLabel);
+  assert(openDebt?.status === 'open', 'done-path debt: missing visible completion opens debt row');
+  assert(openDebt?.open_reason === 'no-clean-user-facing-completion', 'done-path debt: open_reason records missing user-facing completion');
+  assert(openDebt?.no_reply === 1, 'done-path debt: no_reply flag is set for missing visible completion');
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(debtLabel);
+}
+
+console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) --');
+{
+  const {
+    claimCompletionDelivery,
+    recordCompletionDelivered,
+    resetCompletionDeliveryClaim,
+    enqueueCompletionNotification,
+  } = await import('./dispatch/hooks.mjs');
+  const liveDb = getDb();
+
+  // The claim is the single-writer guard shared by the done-path and the watcher.
+  const claimLabel = `delivery-claim-${Date.now()}`;
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === true,
+    'delivery claim: first claimant wins',
+  );
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === false,
+    'delivery claim: second claimant is blocked while delivery is in flight',
+  );
+  recordCompletionDelivered({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' });
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === false,
+    'delivery claim: a delivered (closed) completion is never re-claimed',
+  );
+  // Re-dispatching the same label must clear the prior-run debt so the new run
+  // can claim and deliver again.
+  resetCompletionDeliveryClaim({ label: claimLabel });
+  assert(
+    claimCompletionDelivery({ label: claimLabel, sessionKey: 'agent:main:subagent:claim' }) === true,
+    'delivery claim: a re-dispatched label reclaims after the prior-run debt is reset',
+  );
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(claimLabel);
+
+  // End-to-end: two enqueues of the same completion produce exactly one message.
+  const dupLabel = `delivery-claim-enqueue-${Date.now()}`;
+  const enqueueArgs = {
+    label: dupLabel,
+    summary: 'Landed the terminal-status liveness fix and proved it with regression tests.',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: 'agent:main:subagent:claim-enqueue',
+  };
+  const first = await enqueueCompletionNotification(enqueueArgs);
+  const second = await enqueueCompletionNotification(enqueueArgs);
+  assert(first.ok === true && first.delivered === true, 'delivery claim: first enqueue delivers');
+  assert(second.ok === false && second.deduped === true && second.reason === 'already-claimed', 'delivery claim: second enqueue is deduped, not re-delivered');
+  const dupMessages = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE subject = ?`).get(dupLabel);
+  assert(dupMessages.cnt === 1, 'delivery claim: exactly one completion message is enqueued across both attempts');
+  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(dupLabel);
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(dupLabel);
 }
 
 console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');
@@ -10975,7 +11236,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 24, 'capabilities: schema_version is 24');
+  assert(capsOut.schema_version === 25, 'capabilities: schema_version is 25');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

@@ -19,9 +19,11 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
+import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DISPATCH_INDEX = join(__dirname, 'index.mjs');
+const SCHEMA_PATH = join(dirname(__dirname), 'schema.sql');
 
 const verbose = process.argv.includes('-v') || process.argv.includes('--verbose');
 
@@ -79,6 +81,24 @@ function readLabels(dir) {
 
 function writeConfig(dir, data = {}) {
   writeFileSync(join(dir, 'config.json'), JSON.stringify(data, null, 2));
+}
+
+function initSchedulerDb(dir) {
+  const dbPath = join(dir, 'scheduler.db');
+  const schema = readFileSync(SCHEMA_PATH, 'utf-8');
+  const db = new Database(dbPath);
+  db.exec(schema);
+  db.close();
+  return dbPath;
+}
+
+function readDbRows(dbPath, sql, ...params) {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db.prepare(sql).all(...params);
+  } finally {
+    db.close();
+  }
 }
 
 // -- Mock Gateway Server --------------------------------------
@@ -154,6 +174,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
   const tmpDir = makeTempDir();
   let gw = null;
   try {
+    const schedulerDb = initSchedulerDb(tmpDir);
     writeLabels(tmpDir, {});
     writeConfig(tmpDir, {
       name: 'test-dispatch',
@@ -170,6 +191,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
       {
         DISPATCH_LABELS_PATH:   join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:    tmpDir,
+        SCHEDULER_DB:           schedulerDb,
         OPENCLAW_GATEWAY_TOKEN: 'test-gateway-token',
         OPENCLAW_GATEWAY_URL:   mockGatewayUrl,
       }
@@ -192,6 +214,21 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     // The done command enqueues a message via sendMessage() in hooks.mjs gatewayNotify.
     // Verify that stderr does NOT contain the "no deliverTo" warning (delivery was attempted).
     assert(!stderr.includes('completion not delivered'), 'Test 2: no "completion not delivered" warning');
+
+    const messages = readDbRows(
+      schedulerDb,
+      `SELECT subject, body, channel, delivery_to FROM messages WHERE subject = ? ORDER BY created_at DESC`,
+      'unregistered-with-deliver',
+    );
+    assert(messages.length === 1, 'Test 2: completion notification enqueued to messages table');
+    assert(messages[0].body.includes('agent finished work'), 'Test 2: queued completion keeps authoritative summary');
+
+    const debts = readDbRows(
+      schedulerDb,
+      `SELECT status, close_reason FROM completion_debts WHERE task_label = ?`,
+      'unregistered-with-deliver',
+    );
+    assert(debts.length === 1 && debts[0].status === 'closed', 'Test 2: completion debt closed after visible delivery');
   } finally {
     if (gw) await gw.close();
     rmSync(tmpDir, { recursive: true, force: true });
@@ -203,6 +240,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
   const tmpDir = makeTempDir();
   let gw = null;
   try {
+    const schedulerDb = initSchedulerDb(tmpDir);
     // Pre-register a label so it hits the existing path (not unregistered).
     // Backdate spawnedAt by 5 minutes to exceed the premature-done guard threshold.
     const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
@@ -214,6 +252,9 @@ console.log('\ndispatch done -- post-office delivery tests\n');
         status:      'running',
         spawnedAt:   fiveMinAgo,
         updatedAt:   fiveMinAgo,
+        deliverTo:   '1234567890',
+        deliverChannel: 'telegram',
+        deliveryMode: 'announce',
       }
     });
     writeConfig(tmpDir, {
@@ -230,6 +271,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
       {
         DISPATCH_LABELS_PATH:   join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:    tmpDir,
+        SCHEDULER_DB:           schedulerDb,
         OPENCLAW_GATEWAY_TOKEN: 'test-gateway-token',
         OPENCLAW_GATEWAY_URL:   mockGatewayUrl,
       }
@@ -245,12 +287,25 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     const labels = readLabels(tmpDir);
     assert(labels['registered-label']?.status === 'done', 'Test 3: label updated to done');
 
-    // Registered labels go through onFinished WITHOUT deliverTo (no config fallback needed)
-    // so gateway should NOT be called for delivery from the unregistered path
+    // Delivery still goes through the post-office (messages table), not a direct gateway call.
     await new Promise(r => setTimeout(r, 300));
     const invokeCalls = gw.calls.filter(c => c.url === '/tools/invoke');
-    // The registered path calls onFinished WITHOUT deliverTo -- gateway shouldn't be called
-    assert(invokeCalls.length === 0, 'Test 3: gateway NOT called for registered label (uses watcher)');
+    assert(invokeCalls.length === 0, 'Test 3: gateway NOT called for registered label (uses post-office queue)');
+
+    const messages = readDbRows(
+      schedulerDb,
+      `SELECT subject, body FROM messages WHERE subject = ? ORDER BY created_at DESC`,
+      'registered-label',
+    );
+    assert(messages.length === 1, 'Test 3: registered label enqueues completion notification immediately');
+    assert(messages[0].body.includes('registered completed'), 'Test 3: registered completion notification contains summary');
+
+    const debts = readDbRows(
+      schedulerDb,
+      `SELECT status, close_reason FROM completion_debts WHERE task_label = ?`,
+      'registered-label',
+    );
+    assert(debts.length === 1 && debts[0].status === 'closed', 'Test 3: registered label closes completion debt after enqueue');
 
     // No warn about unregistered
     assert(!stderr.includes('no session found for label'), 'Test 3: no unregistered warning for registered label');

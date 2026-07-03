@@ -36,6 +36,11 @@ import {
   hasCompletionSignal,
   resolveCompletionDelivery,
 } from './completion.mjs';
+import {
+  claimCompletionDelivery,
+  recordCompletionDelivered,
+  recordCompletionDeliveryDebt,
+} from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { sendMessage } from '../messages.js';
@@ -1136,6 +1141,26 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   markLabelDone(label, completion.summary);
 
   if (completion.deliveryText) {
+    // Atomic guard against the done-path (cmdDone) delivering the same
+    // completion. The preflight completionDeliveredAt check narrows the window;
+    // this claim closes it -- if the done-path already owns delivery, stand down.
+    const claimEntry = getLabelEntry(label);
+    if (!claimCompletionDelivery({ label, sessionKey: claimEntry?.sessionKey || null })) {
+      markWatcherAlreadyDelivered(label);
+    }
+    updateExistingLabel(label, (entry) => {
+      entry.completionDeliveredAt = new Date().toISOString();
+      entry.completionDeliverySource = completion.source || 'watcher';
+    });
+    const deliveredEntry = getLabelEntry(label);
+    recordCompletionDelivered({
+      label,
+      sessionKey: deliveredEntry?.sessionKey || null,
+      metadata: {
+        delivery_source: completion.source || 'watcher',
+        last_label_status: deliveredEntry?.status || 'done',
+      },
+    });
     process.stdout.write(formatCompletionStdout(label, completion.deliveryText));
     process.exit(0);
   }
@@ -1143,6 +1168,16 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   const failureSummary = 'completed without a clean user-facing completion';
   process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
   markLabelError(label, failureSummary);
+  const failedEntry = getLabelEntry(label);
+  recordCompletionDeliveryDebt({
+    label,
+    sessionKey: failedEntry?.sessionKey || null,
+    openReason: 'no-clean-user-facing-completion',
+    noReply: true,
+    metadata: {
+      last_label_status: failedEntry?.status || 'done',
+    },
+  });
   process.stdout.write(
     `⚠️ dispatch [${label}] completed, but no clean user-facing completion was captured. ` +
     `Internal diagnostics were suppressed; check scheduler run logs for details.\n`
@@ -1283,6 +1318,11 @@ function markWatcherPending(label, reason = 'target still running') {
   process.exit(0);
 }
 
+function markWatcherAlreadyDelivered(label) {
+  process.stderr.write(`[watcher] WATCHER_ALREADY_DELIVERED label=${label}\n`);
+  process.exit(0);
+}
+
 function clearWatcherRetryAfter(label) {
   updateExistingLabel(label, (entry) => {
     if (!entry.watcherRetryAfter) return false;
@@ -1336,6 +1376,11 @@ function runOnceAndExit() {
     touchWatcherPing(label);
   } catch {
     // Best-effort -- a quick-poll tick must not fail because heartbeat metadata raced.
+  }
+
+  const preflightEntry = getLabelEntry(label);
+  if (preflightEntry?.completionDeliveredAt) {
+    markWatcherAlreadyDelivered(label);
   }
 
   const status = dispatch('status', ['--label', label]);

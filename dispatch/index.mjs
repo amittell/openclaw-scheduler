@@ -37,13 +37,24 @@ import {
   buildTerminalCompletionPayload,
   extractLastMeaningfulAssistantReplyFromEntries,
   extractTerminalAssistantReplyFromEntries,
+  getCompletionAuthoritativeSummary,
   hasCompletionSignal,
   resolveCompletionDelivery,
   taskRequiresGitSha,
 } from './completion.mjs';
-import { getDispatchLivenessPolicy } from './liveness.mjs';
+import {
+  buildAutoResolvedIncompleteSummary,
+  getDispatchGatewayTimeoutSeconds,
+  getDispatchLivenessPolicy,
+} from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
-import { onStarted, onFinished, onStuck } from './hooks.mjs';
+import {
+  onStarted,
+  onFinished,
+  onStuck,
+  enqueueCompletionNotification,
+  resetCompletionDeliveryClaim,
+} from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
@@ -313,12 +324,8 @@ function effectiveCompletionSummary(entry, lastReply = null) {
   if (!entry || typeof entry !== 'object') return null;
 
   if (hasCompletionSignal(entry.completion)) {
-    const resolved = resolveCompletionDelivery({
-      lastReply,
-      completion: entry.completion || null,
-      fallbackSummary: entry.summary || null,
-    });
-    if (resolved?.summary) return resolved.summary;
+    const authoritativeSummary = getCompletionAuthoritativeSummary(entry.completion);
+    if (authoritativeSummary) return authoritativeSummary;
   }
 
   if (entry.summary) return entry.summary;
@@ -850,6 +857,8 @@ function checkSessionTurnAborted(labelEntry, sessionsStore) {
     shouldResolve: true,
     reason,
     lastActivity: getSessionJsonlMtimeMs(agent, sessionId),
+    sessionStatus:
+      typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '',
   };
 }
 
@@ -949,6 +958,19 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   const activityTimes = [updatedAtMs, lastActivityAtMs, jsonlMtimeMs].filter(t => typeof t === 'number');
   const lastActivity = activityTimes.length ? Math.max(...activityTimes) : null;
   const silenceMs = lastActivity === null ? Infinity : Date.now() - lastActivity;
+  const sessionStatus = typeof entry.status === 'string' ? entry.status.trim().toLowerCase() : '';
+
+  if (isTerminalAbnormalSessionStatus(sessionStatus)) {
+    const terminalReason = entry.abortedLastRun === true
+      ? `gateway sessions store status=${sessionStatus} (abortedLastRun=true)`
+      : `gateway sessions store status=${sessionStatus}`;
+    return {
+      shouldResolve: true,
+      reason: terminalReason,
+      lastActivity,
+      sessionStatus,
+    };
+  }
 
   if (entry.sessionId) {
     const entries = readJsonlTailEntries(entry.sessionId, agent, 20);
@@ -989,6 +1011,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
       lastActivity,
       is529:         logCheck.found,
       errorMsg:      logCheck.error || null,
+      sessionStatus,
     };
   }
 
@@ -997,7 +1020,27 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     shouldResolve: false,
     reason:       'session has recent activity in sessions store',
     lastActivity,
+    sessionStatus,
   };
+}
+
+// openclaw's SessionEntry.status vocabulary is exactly
+// running|done|failed|killed|timeout (src/config/sessions/types.ts,
+// isTerminalSessionStatus). Only the abnormal terminal states mean the agent
+// stopped without signalling done, so only those may short-circuit liveness to
+// "interrupted". 'done' is a clean turn end handled by the done path / normal
+// idle liveness -- treating it as terminal here would race a late cmdDone and
+// emit a spurious "interrupted" announce.
+const TERMINAL_ABNORMAL_SESSION_STATUSES = new Set(['timeout', 'failed', 'killed']);
+
+function isTerminalAbnormalSessionStatus(status) {
+  return TERMINAL_ABNORMAL_SESSION_STATUSES.has(status);
+}
+
+function hasTerminalSessionStoreStatus(sessionEntry) {
+  const sessionStatus =
+    typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '';
+  return isTerminalAbnormalSessionStatus(sessionStatus);
 }
 
 // -- Watchdog Helpers -----------------------------------------
@@ -1019,6 +1062,23 @@ function disarmWatchdog(label) {
     process.stderr.write(`[${BRAND}] watchdog deleted for ${label}\n`);
   } catch (err) {
     process.stderr.write(`[${BRAND}] watchdog disarm failed for ${label}: ${err.message}\n`);
+  }
+}
+
+function disarmDeliveryWatcher(label) {
+  const entry = getLabel(label);
+  if (!entry?.deliveryWatcherJobId) return;
+  try {
+    const schedulerCli = resolveSchedulerCliPath();
+    execFileSync(process.execPath, [schedulerCli, 'jobs', 'delete', entry.deliveryWatcherJobId], {
+      encoding: 'utf-8',
+      timeout:  5000,
+      stdio:    ['pipe', 'pipe', 'pipe'],
+    });
+    setLabel(label, { deliveryWatcherJobId: null });
+    process.stderr.write(`[${BRAND}] delivery watcher deleted for ${label}\n`);
+  } catch (err) {
+    process.stderr.write(`[${BRAND}] delivery watcher disarm failed for ${label}: ${err.message}\n`);
   }
 }
 
@@ -1154,6 +1214,17 @@ async function cmdEnqueue(flags) {
   if (!flags.timeout) {
     process.stderr.write(`[${BRAND}] WARNING: --timeout not specified, defaulting to 300s. ` +
       `Pass --timeout explicitly (≥1200 for thinking=high tasks) to avoid premature watcher kills.\n`);
+  }
+  const gatewayTimeoutS = getDispatchGatewayTimeoutSeconds({
+    timeoutSeconds: timeoutS,
+    thinking,
+    lane: 'subagent',
+  });
+  if (gatewayTimeoutS !== timeoutS) {
+    process.stderr.write(
+      `[${BRAND}] elevating gateway agent timeout from ${timeoutS}s to ${gatewayTimeoutS}s ` +
+      `for ${thinking || 'high'}-thinking subagent work; dispatch liveness stays at ${timeoutS}s.\n`,
+    );
   }
   const explicitOrigin = flags.origin || null;
   const explicitDeliverTo = flags['deliver-to'] || null;
@@ -1366,7 +1437,7 @@ async function cmdEnqueue(flags) {
       idempotencyKey: idem,
       deliver:        false,
       lane:           'subagent',
-      timeout:        timeoutS,
+      timeout:        gatewayTimeoutS,
       label:          label,
       thinking:       thinking || undefined,
       ...(deliverTo ? {
@@ -1398,6 +1469,7 @@ async function cmdEnqueue(flags) {
       verifyCmd:      verifyCmd || null,
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
+      gatewayTimeoutSeconds: gatewayTimeoutS,
       idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
       // Fix 4: Store timeout so cmdDone threshold logic can use it correctly.
       timeout:        timeoutS,
@@ -1407,6 +1479,10 @@ async function cmdEnqueue(flags) {
       // Store task prompt for gate checks in done (first 2000 chars)
       taskPrompt:     message.slice(0, 2000),
     });
+
+    // New run of this label -- clear any prior-run delivery debt so the fresh
+    // run's done-path/watcher claim is not blocked by a stale closed row.
+    resetCompletionDeliveryClaim({ label });
 
     // Fire dispatch.started hook (best-effort)
     await onStarted({
@@ -1460,6 +1536,9 @@ async function cmdEnqueue(flags) {
           agentBrand,
         });
         schedulerWatcherOk = true;
+        if (watcherJob?.id) {
+          setLabel(label, { deliveryWatcherJobId: watcherJob.id });
+        }
         process.stderr.write(
           `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
           `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
@@ -1647,7 +1726,10 @@ function cmdStatus(flags) {
       if (turnAbortCheck.shouldResolve) {
         setLabel(label, {
           status:  'interrupted',
-          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: turnAbortCheck.sessionStatus,
+            reason: turnAbortCheck.reason,
+          }),
         });
         syncAction = `auto-resolved as interrupted: ${turnAbortCheck.reason}`;
         disarmWatchdog(label);
@@ -1672,9 +1754,14 @@ function cmdStatus(flags) {
         const PING_STALE_MS = livenessPolicy.pingStaleMs;
         const idleThresholdMs = livenessPolicy.idleFailureMs;
         const hardCeilingMs = livenessPolicy.hardCeilingMs;
+        const sessionEntry = sessionsStore?.[entry.sessionKey];
 
         let check;
-        if (ageMs < STARTUP_GRACE_MS) {
+        if (hasTerminalSessionStoreStatus(sessionEntry)) {
+          // A gateway-recorded terminal status should win immediately, even if
+          // the watcher heartbeat is still fresh from just before the abort.
+          check = checkSessionDone(entry.sessionKey, sessionsStore, idleThresholdMs, true, spawnedAtMs);
+        } else if (ageMs < STARTUP_GRACE_MS) {
           // Within startup grace -- never auto-resolve
           check = { shouldResolve: false };
         } else if (entry.lastPing) {
@@ -1705,7 +1792,10 @@ function cmdStatus(flags) {
           } else {
             setLabel(label, {
               status:  'interrupted',
-              summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+              summary: buildAutoResolvedIncompleteSummary({
+                sessionStatus: check.sessionStatus,
+                reason: check.reason,
+              }),
             });
             syncAction = `auto-resolved as interrupted: ${check.reason}`;
           }
@@ -1729,6 +1819,9 @@ function cmdStatus(flags) {
           ? Date.now() - (typeof sessionEntry.updatedAt === 'number' ? sessionEntry.updatedAt : new Date(sessionEntry.updatedAt).getTime())
           : null,
         sessionId: sessionEntry.sessionId,
+        status:    sessionEntry.status || null,
+        abortedLastRun:
+          typeof sessionEntry.abortedLastRun === 'boolean' ? sessionEntry.abortedLastRun : undefined,
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
       };
@@ -1754,6 +1847,7 @@ function cmdStatus(flags) {
     updatedAt:  current.updatedAt,
     summary:    effectiveCompletionSummary(current),
     completion: current.completion || null,
+    gatewayTimeoutSeconds: Number(current.gatewayTimeoutSeconds ?? current.timeoutSeconds) || null,
     delivery:   buildDispatchDeliverySurface(current),
     error:      current.error || null,
     liveness,
@@ -1852,7 +1946,10 @@ async function cmdStuck(flags) {
       } else {
         setLabel(name, {
           status:  'interrupted',
-          summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: check.sessionStatus,
+            reason: check.reason,
+          }),
         });
         autoResolved.push({ label: name, reason: check.reason });
       }
@@ -1971,7 +2068,10 @@ function cmdSync(flags) {
       if (!dryRun) {
         setLabel(name, {
           status:  'interrupted',
-          summary: `Auto-resolved: session was interrupted before calling done. Work may be incomplete. (${turnAbortCheck.reason})`,
+          summary: buildAutoResolvedIncompleteSummary({
+            sessionStatus: turnAbortCheck.sessionStatus,
+            reason: turnAbortCheck.reason,
+          }),
         });
         disarmWatchdog(name);
       }
@@ -1988,6 +2088,33 @@ function cmdSync(flags) {
     const PING_STALE_MS_SYNC = syncPolicy.pingStaleMs;
     const idleThresholdMsSync = syncPolicy.idleFailureMs;
     const hardCeilingMsSync = syncPolicy.hardCeilingMs;
+    const sessionEntry = syncStore?.[entry.sessionKey];
+
+    if (hasTerminalSessionStoreStatus(sessionEntry)) {
+      const check = checkSessionDone(entry.sessionKey, syncStore, idleThresholdMsSync, true, spawnedAtMs);
+      if (!check.shouldResolve) continue;
+      const newStatus = check.is529 ? 'error' : 'interrupted';
+      changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
+      if (!dryRun) {
+        if (check.is529) {
+          setLabel(name, {
+            status:  'error',
+            error:   check.errorMsg || `529/overload: ${check.reason}`,
+            summary: `Synced as error: ${check.reason}`,
+          });
+        } else {
+          setLabel(name, {
+            status:  'interrupted',
+            summary: buildAutoResolvedIncompleteSummary({
+              sessionStatus: check.sessionStatus,
+              reason: check.reason,
+            }),
+          });
+        }
+        disarmWatchdog(name);
+      }
+      continue;
+    }
 
     if (entry.lastPing) {
       const pingAgeMs = Date.now() - new Date(entry.lastPing).getTime();
@@ -2013,7 +2140,10 @@ function cmdSync(flags) {
         } else {
           setLabel(name, {
             status:  'interrupted',
-            summary: `Auto-resolved: session went idle without calling done. Work may be incomplete. (${check.reason})`,
+            summary: buildAutoResolvedIncompleteSummary({
+              sessionStatus: check.sessionStatus,
+              reason: check.reason,
+            }),
           });
         }
         // Disarm watchdog when session is synced as interrupted
@@ -2172,6 +2302,10 @@ function cmdWatcherHandoff(flags) {
     jobId: watcherJob?.id || null,
     reason,
   });
+
+  if (watcherJob?.id) {
+    setLabel(label, { deliveryWatcherJobId: watcherJob.id });
+  }
 }
 
 /**
@@ -2400,6 +2534,28 @@ async function cmdDone(flags) {
   // Disarm watchdog when agent signals done
   disarmWatchdog(label);
 
+  let completionDelivery = null;
+  if (existing.deliverTo && existing.deliveryMode !== 'none') {
+    completionDelivery = await enqueueCompletionNotification({
+      label,
+      summary,
+      completion,
+      deliverTo: existing.deliverTo,
+      deliveryChannel: existing.deliverChannel || 'telegram',
+      sessionKey: existing.sessionKey || null,
+      origin: existing.origin || null,
+      metadata: {
+        last_label_status: 'done',
+        timeout_seconds: Number(existing.timeoutSeconds ?? existing.timeout) || null,
+      },
+    });
+
+    if (completionDelivery?.ok) {
+      setLabel(label, { completionDeliveredAt: new Date().toISOString() });
+      disarmDeliveryWatcher(label);
+    }
+  }
+
   // Fire dispatch.finished hook (best-effort)
   const spawnedAtMs = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : Date.now();
   await onFinished({
@@ -2414,7 +2570,19 @@ async function cmdDone(flags) {
     completion,
   }).catch(() => {});
 
-  out({ ok: true, label, status: 'done', summary, completion, message: 'Label marked done via agent signal.' });
+  out({
+    ok: true,
+    label,
+    status: 'done',
+    summary,
+    completion,
+    delivery: completionDelivery ? {
+      attempted: true,
+      delivered: !!completionDelivery.ok,
+      reason: completionDelivery.reason || null,
+    } : null,
+    message: 'Label marked done via agent signal.',
+  });
 }
 
 /**

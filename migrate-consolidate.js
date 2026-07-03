@@ -138,8 +138,9 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 24
+    current >= 25
     && hasLatestColumns
+    && hasTable('completion_debts')
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
@@ -564,9 +565,45 @@ export default function migrateConsolidate() {
       claimed_at      TEXT,
       processed_at    TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS completion_debts (
+      task_label              TEXT PRIMARY KEY,
+      session_key             TEXT,
+      source                  TEXT NOT NULL DEFAULT 'dispatch',
+      status                  TEXT NOT NULL DEFAULT 'tracking',
+      open_reason             TEXT,
+      close_reason            TEXT,
+      opened_at               TEXT,
+      closed_at               TEXT,
+      last_checkin_at         TEXT,
+      last_progress_at        TEXT,
+      last_visible_update_at  TEXT,
+      final_reported_at       TEXT,
+      last_reminder_at        TEXT,
+      reminder_count          INTEGER NOT NULL DEFAULT 0,
+      awaiting_user           INTEGER NOT NULL DEFAULT 0,
+      no_reply                INTEGER NOT NULL DEFAULT 0,
+      metadata                TEXT,
+      created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // -- Indexes that may be absent ----------------------------------------
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_completion_debts_status
+      ON completion_debts(status, updated_at)
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_completion_debts_session
+      ON completion_debts(session_key) WHERE session_key IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
 
   try {
     db.exec(`
@@ -679,7 +716,7 @@ export default function migrateConsolidate() {
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]) {
     stmt.run(v);
   }
 
@@ -692,7 +729,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v23'
-    : 'DB already at v23 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v25'
+    : 'DB already at v25 -- nothing to do'
   );
 }
