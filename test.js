@@ -42,6 +42,7 @@ import {
   splitMessageForChannel,
   TELEGRAM_MAX_MESSAGE_LENGTH,
   checkGatewayHealth,
+  deliverMessage,
   invokeGatewayTool,
   runAgentTurn,
   runAgentTurnWithActivityTimeout,
@@ -3898,6 +3899,39 @@ console.log('\n-- Isolated dispatch primitive: no subprocess spawn --');
     'gateway.ISOLATED_DISPATCH_PRIMITIVE names the HTTP primitive');
   assert(typeof gateway.runIsolatedAgentTurn === 'function',
     'gateway.runIsolatedAgentTurn is exported as the sanctioned isolated dispatch helper');
+}
+
+console.log('\n-- Gateway delivery in-band tool-failure detection --');
+{
+  const originalFetch = globalThis.fetch;
+  const makeResp = (body, httpOk = true) => ({
+    ok: httpOk,
+    status: httpOk ? 200 : 500,
+    text: async () => JSON.stringify(body),
+    json: async () => body,
+  });
+  try {
+    // Clean tool result -> delivery resolves.
+    globalThis.fetch = async () => makeResp({ ok: true, result: { ok: true } });
+    const okResult = await deliverMessage('telegram', '123', 'hello');
+    assert(okResult.ok === true && okResult.parts >= 1, 'deliverMessage resolves on a clean gateway tool result');
+
+    // HTTP 200 but the message tool reports an in-band failure -> must throw so
+    // the inbox consumer records a failed attempt instead of acking delivery.
+    globalThis.fetch = async () => makeResp({ ok: true, result: { isError: true, content: 'chat not found' } });
+    let inBandErr = null;
+    try { await deliverMessage('telegram', '123', 'hello'); } catch (e) { inBandErr = e; }
+    assert(inBandErr && /Gateway message failed/.test(inBandErr.message), 'deliverMessage throws on an in-band {result:{isError:true}} tool failure');
+    assert(/chat not found/.test(inBandErr.message), 'deliverMessage surfaces the in-band tool error detail');
+
+    // Envelope-level {ok:false} -> must throw.
+    globalThis.fetch = async () => makeResp({ ok: false, error: 'tool_error: send rejected' });
+    let envelopeErr = null;
+    try { await deliverMessage('telegram', '123', 'hello'); } catch (e) { envelopeErr = e; }
+    assert(envelopeErr && /Gateway message failed/.test(envelopeErr.message), 'deliverMessage throws on an {ok:false} gateway envelope');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 console.log('\n-- Migration Guard --');

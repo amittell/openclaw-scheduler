@@ -513,19 +513,67 @@ export async function deliverMessage(channel, target, message) {
 
   const parts = splitMessageForChannel(resolvedChannel, message);
   let lastResponse = null;
-  for (const part of parts) {
-    lastResponse = await invokeGatewayTool('message', {
-      action: 'send',
-      message: part,
-      ...(resolvedChannel ? { channel: resolvedChannel } : {}),
-      ...(resolvedTarget ? { target: resolvedTarget } : {}),
-    });
+  const responses = [];
+  for (const [index, part] of parts.entries()) {
+    try {
+      lastResponse = await invokeGatewayTool('message', {
+        action: 'send',
+        message: part,
+        ...(resolvedChannel ? { channel: resolvedChannel } : {}),
+        ...(resolvedTarget ? { target: resolvedTarget } : {}),
+      });
+      // The gateway returns HTTP 200 with an in-band {result:{isError:true}} (or
+      // {ok:false}) when the message tool fails to deliver -- only transport-level
+      // failures surface as non-2xx in invokeGatewayTool. Without this check a
+      // failed Telegram send would be recorded as delivered by the inbox consumer.
+      assertGatewayToolSuccess(lastResponse, 'message');
+      responses.push(lastResponse);
+    } catch (err) {
+      err.partIndex = index;
+      err.responses = responses;
+      err.lastResponse = lastResponse;
+      throw err;
+    }
   }
   return {
     ok: true,
+    channel: resolvedChannel,
+    target: resolvedTarget,
     parts: parts.length,
     lastResponse,
+    responses,
   };
+}
+
+// Detect an in-band gateway tool failure (HTTP 200 body that still reports an
+// error). Mirrors how openclaw's own probes treat result.isError === true.
+function assertGatewayToolSuccess(response, tool) {
+  const failure = gatewayToolFailure(response);
+  if (failure) {
+    throw new Error(`Gateway ${tool} failed: ${failure}`);
+  }
+}
+
+function gatewayToolFailure(response) {
+  if (response == null || typeof response !== 'object') return 'empty response';
+  if (response.ok === false) return stringifyGatewayError(response.error || response);
+  if (response.error) return stringifyGatewayError(response.error);
+
+  const result = response.result;
+  if (result && typeof result === 'object') {
+    if (result.ok === false) return stringifyGatewayError(result.error || result);
+    if (result.isError === true) return stringifyGatewayError(result.error || result.content || result);
+    if (result.error) return stringifyGatewayError(result.error);
+  }
+
+  return null;
+}
+
+function stringifyGatewayError(value) {
+  if (value == null) return 'unknown error';
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message;
+  try { return JSON.stringify(value).slice(0, 500); } catch { return String(value).slice(0, 500); }
 }
 
 /**

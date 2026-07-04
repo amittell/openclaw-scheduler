@@ -475,8 +475,11 @@ export interface AgentTurnResult {
 
 export interface DeliveryResult {
   ok: true;
+  channel?: string | null;
+  target?: string | null;
   parts: number;
   lastResponse: unknown;
+  responses?: unknown[];
 }
 
 // -- Module declarations --
