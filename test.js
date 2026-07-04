@@ -793,6 +793,20 @@ assert(teamMsg.member_id === 'writer', 'member_id stored');
 assert(teamMsg.task_id === 'task-001', 'task_id stored');
 assert(teamMsg.ack_required === 1, 'ack_required stored');
 
+// Idempotency key: a re-enqueue with the same key collapses to the original row.
+const idemKey = `test-idem-${Date.now()}`;
+const idemFirst = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'idem-1', idempotency_key: idemKey });
+const idemSecond = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'idem-2-should-be-dropped', idempotency_key: idemKey });
+assert(idemFirst.id === idemSecond.id, 'sendMessage idempotency: same key returns the original message id');
+assert(idemSecond.deduped === true, 'sendMessage idempotency: duplicate is flagged deduped');
+assert(getMessage(idemFirst.id).body === 'idem-1', 'sendMessage idempotency: original body is preserved, not overwritten');
+const idemRows = getDb().prepare('SELECT COUNT(*) AS c FROM messages WHERE idempotency_key = ?').get(idemKey);
+assert(idemRows.c === 1, 'sendMessage idempotency: exactly one row exists for the key');
+// Null/absent key never dedups (default behavior unchanged).
+const nullKeyA = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'x' });
+const nullKeyB = sendMessage({ from_agent: 'scheduler', to_agent: 'main', body: 'x' });
+assert(nullKeyA.id !== nullKeyB.id && !nullKeyA.deduped, 'sendMessage without an idempotency key inserts distinct rows');
+
 markDelivered(teamMsg.id);
 const teamDelivered = getMessage(teamMsg.id);
 assert(teamDelivered.delivery_attempts >= 1, 'delivery attempt incremented');
@@ -9633,6 +9647,29 @@ console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) 
   assert(dupMessages.cnt === 1, 'delivery claim: exactly one completion message is enqueued across both attempts');
   liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(dupLabel);
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(dupLabel);
+
+  // Message-level idempotency backstops the claim: even if the claim is no longer
+  // blocking (crash-recovery stale reclaim), re-enqueuing the same run's
+  // completion does not produce a second message row.
+  const idemLabel = `enqueue-idem-${Date.now()}`;
+  const idemSession = 'agent:main:subagent:enqueue-idem';
+  const idemKey = `dispatch-completion:${idemLabel}:${idemSession}`;
+  const idemArgs = {
+    label: idemLabel,
+    summary: 'Landed the completion-message idempotency backstop.',
+    deliverTo: '1234567890',
+    deliveryChannel: 'telegram',
+    sessionKey: idemSession,
+  };
+  const e1 = await enqueueCompletionNotification(idemArgs);
+  resetCompletionDeliveryClaim({ label: idemLabel }); // simulate the claim no longer blocking
+  const e2 = await enqueueCompletionNotification(idemArgs);
+  assert(e1.ok === true && e1.delivered === true && e1.deduped === false, 'enqueue idempotency: first enqueue delivers a fresh message');
+  assert(e2.ok === true && e2.deduped === true, 'enqueue idempotency: a re-enqueue past the claim is deduped by the message key');
+  const idemMsgRows = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE idempotency_key = ?`).get(idemKey);
+  assert(idemMsgRows.cnt === 1, 'enqueue idempotency: exactly one completion message row exists for the run');
+  liveDb.prepare(`DELETE FROM messages WHERE idempotency_key = ?`).run(idemKey);
+  liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(idemLabel);
 }
 
 console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does not enqueue --');
@@ -11286,7 +11323,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 25, 'capabilities: schema_version is 25');
+  assert(capsOut.schema_version === 26, 'capabilities: schema_version is 26');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

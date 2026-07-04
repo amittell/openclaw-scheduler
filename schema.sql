@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 24)
+-- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 26)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -267,9 +267,14 @@ CREATE TABLE IF NOT EXISTS messages (
   run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
 
   -- Typed message owner (v5)
-  owner           TEXT                                -- originator of typed message
+  owner           TEXT,                               -- originator of typed message
+
+  -- Deterministic dedup key for exactly-once enqueue (v26). NULL for messages
+  -- that do not opt into idempotency (the common case).
+  idempotency_key TEXT
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency ON messages(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_agent, status);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_agent);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
@@ -488,8 +493,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-25 (all columns already in schema above).
--- Existing installs are brought up to v25 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-26 (all columns already in schema above).
+-- Existing installs are brought up to v26 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -515,3 +520,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (22);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (23);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (24);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (25);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (26);

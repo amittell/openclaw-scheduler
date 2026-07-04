@@ -304,6 +304,11 @@ export async function enqueueCompletionNotification({
 
   try {
     const body = `✅ [${label}] done\n\n${bodyText}`;
+    // Run-scoped dedup key: a crash-retry (or a second delivery path) for the
+    // same run's completion collapses to the original message row. Keyed with
+    // sessionKey so a re-dispatched label (new session) is never suppressed by a
+    // prior run's row; omitted when no sessionKey is available.
+    const idempotencyKey = sessionKey ? `dispatch-completion:${label}:${sessionKey}` : null;
     const message = await sendMessage({
       from_agent:  'dispatch',
       to_agent:    'main',
@@ -312,6 +317,7 @@ export async function enqueueCompletionNotification({
       body,
       channel:     deliveryChannel,
       delivery_to: deliverTo,
+      idempotency_key: idempotencyKey,
     });
     recordCompletionDelivered({
       label,
@@ -321,7 +327,7 @@ export async function enqueueCompletionNotification({
         message_id: message?.id || null,
       },
     });
-    return { ok: true, delivered: true, bodyText, messageId: message?.id || null };
+    return { ok: true, delivered: true, deduped: message?.deduped === true, bodyText, messageId: message?.id || null };
   } catch (e) {
     recordCompletionDeliveryDebt({
       label,
