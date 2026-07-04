@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v24).
+ * Brings any DB from any prior version up to the current schema (v26).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -29,6 +29,12 @@ export default function migrateConsolidate() {
     SELECT 1
     FROM sqlite_master
     WHERE type = 'table' AND name = ?
+    LIMIT 1
+  `).get(name);
+  const hasIndex = (name) => !!db.prepare(`
+    SELECT 1
+    FROM sqlite_master
+    WHERE type = 'index' AND name = ?
     LIMIT 1
   `).get(name);
 
@@ -91,7 +97,7 @@ export default function migrateConsolidate() {
       'delivered_at', 'read_at', 'expires_at', 'created_at', 'job_id',
       'run_id', 'owner', 'team_id', 'member_id', 'task_id',
       'ack_required', 'ack_at', 'delivery_attempts', 'last_error',
-      'team_mapped_at',
+      'team_mapped_at', 'idempotency_key',
     ])
     && hasColumns(approvalColumns, [
       'job_id', 'run_id', 'dispatch_queue_id', 'status', 'requested_at',
@@ -138,9 +144,13 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 25
+    current >= 26
     && hasLatestColumns
     && hasTable('completion_debts')
+    // Verify the unique index exists, not just the column/version: sendMessage's
+    // ON CONFLICT(idempotency_key) target requires it, so a swallowed index
+    // creation must re-run rather than being masked by the version bump.
+    && hasIndex('idx_messages_idempotency')
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
@@ -261,6 +271,7 @@ export default function migrateConsolidate() {
     `ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE messages ADD COLUMN last_error TEXT`,
     `ALTER TABLE messages ADD COLUMN team_mapped_at TEXT`,
+    `ALTER TABLE messages ADD COLUMN idempotency_key TEXT`,
     // v11: durable non-cron dispatches
     `ALTER TABLE approvals ADD COLUMN dispatch_queue_id TEXT`,
     // v12: structured shell results
@@ -607,6 +618,13 @@ export default function migrateConsolidate() {
 
   try {
     db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency
+      ON messages(idempotency_key) WHERE idempotency_key IS NOT NULL
+    `);
+  } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency
       ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL
     `);
@@ -716,7 +734,7 @@ export default function migrateConsolidate() {
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) {
     stmt.run(v);
   }
 
@@ -729,7 +747,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v25'
-    : 'DB already at v25 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v26'
+    : 'DB already at v26 -- nothing to do'
   );
 }

@@ -23,13 +23,20 @@ export function sendMessage(opts) {
     throw new Error(`Invalid message kind '${kind}'. Valid: ${[...VALID_KINDS].join(', ')}`);
   }
 
-  db.prepare(`
+  const idempotencyKey = opts.idempotency_key || null;
+
+  // With an idempotency key, a re-enqueue of the same logical message (e.g. a
+  // crash-retry, or two delivery paths for one completion) collapses to the
+  // original row instead of creating a duplicate. Without one, behavior is
+  // unchanged (every call inserts a fresh row).
+  const info = db.prepare(`
     INSERT INTO messages (
       id, from_agent, to_agent, team_id, member_id, task_id, reply_to,
       kind, subject, body, metadata, priority, channel, delivery_to, status,
-      expires_at, job_id, run_id, owner, ack_required
+      expires_at, job_id, run_id, owner, ack_required, idempotency_key
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
   `).run(
     id,
     opts.from_agent,
@@ -49,8 +56,19 @@ export function sendMessage(opts) {
     opts.job_id || null,
     opts.run_id || null,
     opts.owner || null,
-    opts.ack_required ? 1 : 0
+    opts.ack_required ? 1 : 0,
+    idempotencyKey
   );
+
+  if (idempotencyKey && info.changes === 0) {
+    // Duplicate: an equivalent message already exists -- return it unchanged.
+    const existing = db.prepare('SELECT id FROM messages WHERE idempotency_key = ?').get(idempotencyKey);
+    if (existing) return { ...getMessage(existing.id), deduped: true };
+    // Conflict reported but the row is gone (deleted/compacted between the
+    // insert and this read). Surface a clear consistency error instead of
+    // falling through to return a phantom row for the never-inserted id.
+    throw new Error(`sendMessage: idempotency conflict for '${idempotencyKey}' but no existing row found`);
+  }
 
   return getMessage(id);
 }

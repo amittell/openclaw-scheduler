@@ -269,6 +269,11 @@ export interface MessageRecord {
   run_id?: string | null;
   owner?: string | null;
 
+  // Idempotency
+  idempotency_key?: string | null;
+  /** Set by sendMessage when an idempotency-key conflict returned the existing row. */
+  deduped?: boolean;
+
   [key: string]: unknown;
 }
 
@@ -367,6 +372,8 @@ export interface SendMessageOpts {
   owner?: string | null;
   ack_required?: number | boolean;
   delivery_to?: string | null;
+  /** Deterministic dedup key; a re-send with the same key returns the original row. */
+  idempotency_key?: string | null;
 }
 
 export interface CreateRunOpts {
