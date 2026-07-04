@@ -529,10 +529,19 @@ export async function deliverMessage(channel, target, message) {
       assertGatewayToolSuccess(lastResponse, 'message');
       responses.push(lastResponse);
     } catch (err) {
-      err.partIndex = index;
-      err.responses = responses;
-      err.lastResponse = lastResponse;
-      throw err;
+      // Normalize before decorating: a thrown non-Error primitive/nullish value
+      // would make property assignment throw and bury the original failure. Only
+      // set `cause` when wrapping, so an already-Error throw is not made
+      // self-referential (and keeps any cause it already carried).
+      const error = err instanceof Error ? err : new Error(String(err), { cause: err });
+      error.partIndex = index;
+      error.responses = responses;
+      error.lastResponse = lastResponse;
+      // A later part failing after earlier parts were sent throws here; the inbox
+      // consumer retries the whole message, so multi-part sends can resend an
+      // already-delivered leading part. Accepted retry semantics (pre-existing for
+      // transport failures); completion announces are effectively single-part.
+      throw error;
     }
   }
   return {
@@ -555,15 +564,18 @@ function assertGatewayToolSuccess(response, tool) {
 }
 
 function gatewayToolFailure(response) {
+  // Contract-precise: the gateway's authoritative failure signals are the
+  // envelope `ok: false` and the MCP tool result `isError: true`. A bare
+  // `error` field is only the detail source once a failure is known, never a
+  // trigger on its own -- otherwise a successful result carrying an
+  // informational `error`/`error: null`-adjacent field would false-positive.
   if (response == null || typeof response !== 'object') return 'empty response';
   if (response.ok === false) return stringifyGatewayError(response.error || response);
-  if (response.error) return stringifyGatewayError(response.error);
 
   const result = response.result;
   if (result && typeof result === 'object') {
     if (result.ok === false) return stringifyGatewayError(result.error || result);
     if (result.isError === true) return stringifyGatewayError(result.error || result.content || result);
-    if (result.error) return stringifyGatewayError(result.error);
   }
 
   return null;

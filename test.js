@@ -3923,12 +3923,28 @@ console.log('\n-- Gateway delivery in-band tool-failure detection --');
     try { await deliverMessage('telegram', '123', 'hello'); } catch (e) { inBandErr = e; }
     assert(inBandErr && /Gateway message failed/.test(inBandErr.message), 'deliverMessage throws on an in-band {result:{isError:true}} tool failure');
     assert(/chat not found/.test(inBandErr.message), 'deliverMessage surfaces the in-band tool error detail');
+    assert(inBandErr.cause !== inBandErr, 'deliverMessage does not set a self-referential cause on an already-Error throw');
+    assert(inBandErr.partIndex === 0, 'deliverMessage attaches partIndex to an already-Error throw');
 
     // Envelope-level {ok:false} -> must throw.
     globalThis.fetch = async () => makeResp({ ok: false, error: 'tool_error: send rejected' });
     let envelopeErr = null;
     try { await deliverMessage('telegram', '123', 'hello'); } catch (e) { envelopeErr = e; }
     assert(envelopeErr && /Gateway message failed/.test(envelopeErr.message), 'deliverMessage throws on an {ok:false} gateway envelope');
+
+    // Contract-precise: a successful send whose result carries a bare,
+    // informational error-ish field must NOT be treated as a failure.
+    globalThis.fetch = async () => makeResp({ ok: true, result: { content: 'sent', error: 'informational note' } });
+    const infoResult = await deliverMessage('telegram', '123', 'hello');
+    assert(infoResult.ok === true, 'deliverMessage does not false-positive on a successful result with a bare error field');
+
+    // A thrown non-Error primitive is normalized so diagnostics attach cleanly.
+    globalThis.fetch = async () => { throw 'transport-string-error'; };
+    let normalizedErr = null;
+    try { await deliverMessage('telegram', '123', 'hello'); } catch (e) { normalizedErr = e; }
+    assert(normalizedErr instanceof Error, 'deliverMessage normalizes a thrown non-Error into an Error');
+    assert(normalizedErr.cause === 'transport-string-error', 'deliverMessage preserves the original thrown value as cause');
+    assert(normalizedErr.partIndex === 0, 'deliverMessage attaches partIndex diagnostics to the normalized error');
   } finally {
     globalThis.fetch = originalFetch;
   }
