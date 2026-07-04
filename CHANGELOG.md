@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.16] -- 2026-07-03
+
+### Fixed
+- fix(dispatch): treat gateway terminal session status (`timeout`/`failed`/`killed`) as authoritative for liveness so interrupted sessions resolve immediately instead of waiting out the watcher heartbeat ceiling; a clean `done` status is left to the normal completion path
+- fix(dispatch): preserve the agent-authored completion summary via `summaryStyle` so archived status/result/list views keep the real words while delivery still leads with a humanized summary
+- fix(dispatch): guarantee a completion announce from the done payload through the post-office, backed by a durable `completion_debts` table and an atomic single-writer delivery claim so the done-path and watcher never double-deliver
+- fix(dispatch): define `completion_debts` in the canonical schema and migration (schema v25) so completion-debt tracking works on fresh and upgraded installs instead of silently no-oping
+- fix(gateway): detect in-band tool failures (`result.isError` / `ok:false`) on message delivery so a failed send is recorded as a failed attempt and retried instead of being silently acked
+- fix: prefer the runtime scheduler DB path
+- fix(dispatch): classify aborted watcher artifacts
+
 ## [0.2.15] -- 2026-06-29
 
 ### Fixed
