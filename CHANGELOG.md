@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.17] -- 2026-07-04
+
+### Fixed
+- fix(gateway): detect in-band tool failures (`result.isError` / `ok:false`) on message delivery so a failed send is recorded as a failed attempt and retried instead of being silently acked; normalize non-Error throws and keep failure detection to the verified gateway contract
+- feat(messages): idempotent completion enqueue via a deterministic `idempotency_key` (schema v26) so a crash-retry or a second delivery path for the same run's completion collapses to one message row instead of a duplicate announce
+
 ## [0.2.16] -- 2026-07-03
 
 ### Fixed
