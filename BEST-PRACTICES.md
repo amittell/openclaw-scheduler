@@ -2,6 +2,12 @@
 
 Guidance on choosing the right job type, writing effective prompts, structuring workflows, and making your OpenClaw agent scheduler-aware.
 
+Current OpenClaw already provides durable cron, command execution, retries, run
+history, Task Flow, and approval tooling. Prefer native OpenClaw for one
+scheduled command or agent turn. Use this sidecar when shell execution must
+survive Gateway downtime, a separate scheduler failure domain matters, or a
+workflow requires direct conditional job graphs and governed execution.
+
 ---
 
 ## Table of Contents
@@ -48,6 +54,10 @@ Use `shell` when:
 - You want to minimize API cost
 
 `payload_message` is passed directly to the shell (`/bin/zsh` on macOS, `/bin/bash` on Linux). Override with `SCHEDULER_SHELL` environment variable.
+
+Fresh jobs use `shell_env_policy: "minimal"`, which exposes only a small
+operating-system allowlist plus task credentials. Use `inherit` only for a
+reviewed job that intentionally depends on the dispatcher environment.
 
 **Examples:**
 
@@ -226,7 +236,7 @@ Use `main` sparingly. It injects directly into your active agent session — the
 
 | Job type | Recommended `run_timeout_ms` | Notes |
 |----------|------------------------------|-------|
-| Simple shell script | 60,000 (60s) | Default 300s is usually too generous |
+| Simple shell script | 60,000 (60s) | Every job must set a timeout explicitly |
 | LLM job, single tool | 120,000 (120s) | |
 | LLM job, multi-tool (k8s + files + analysis) | 240,000 (240s) | |
 | Long-running agent work | 600,000 (600s) | |
@@ -234,6 +244,21 @@ Use `main` sparingly. It injects directly into your active agent session — the
 Set `max_retries: 1` or `max_retries: 2` for any job that hits external services (APIs, databases, GitHub, etc.) — transient failures happen, especially at cron-job-o'clock when everything runs at once.
 
 **Retry tip:** Failure chain children don't fire until all retries are exhausted. This prevents false failure alerts on transient errors. Set retries before worrying about failure notifications.
+
+Timeout and cancellation terminate the tracked shell process group and then
+commit a fenced terminal state. For agent jobs, the scheduler also requests a
+Gateway abort when it has a session key. Confirm the result with `runs get` or
+`status`; a chat update may be stale. No timeout can reverse an external side
+effect that already completed, so destructive jobs need idempotency checks.
+
+External channel output is committed to `delivery_outbox`, not the agent inbox.
+Outbox and dispatch claims have expirations and recovery. Attachments are
+retained with size and SHA-256 metadata.
+
+Governance fields are fail-closed controls. The default host executor rejects
+requested sandbox, restricted network, allowed-path, or agent-cost policies
+because it cannot enforce them. Do not treat a stored contract as proof that
+operating-system isolation exists.
 
 ---
 
@@ -305,10 +330,13 @@ For watchdog and health-check jobs, instruct the agent to reply `HEARTBEAT_OK` w
   "name": "Disk Usage Check",
   "schedule_cron": "0 * * * *",
   "session_target": "isolated",
+  "payload_kind": "agentTurn",
   "payload_message": "Check disk usage on all mounted filesystems. If all mounts are under 80% full, reply with exactly: HEARTBEAT_OK\nIf any mount is 80% or more, describe the affected mounts and their usage.",
+  "run_timeout_ms": 120000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID"
+  "delivery_to": "YOUR_CHAT_ID",
+  "origin": "system"
 }
 ```
 

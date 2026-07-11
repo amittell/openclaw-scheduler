@@ -19,7 +19,11 @@ const env = {
   NODE_V8_COVERAGE: tempDir,
 };
 
-const run = spawnSync(process.execPath, ['test.js'], {
+const run = spawnSync(process.execPath, [
+  'scripts/test-all.mjs',
+  '--skip-docs',
+  '--skip-agentcli',
+], {
   cwd: rootDir,
   env,
   stdio: 'inherit',

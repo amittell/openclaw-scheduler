@@ -1,3 +1,6 @@
+export const SCHEDULER_SCHEMA_VERSION = 27;
+export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.3.0';
+
 export const SCHEDULER_SCHEMAS = {
   jobs: {
     type: 'object',
@@ -5,6 +8,8 @@ export const SCHEDULER_SCHEMAS = {
     fields: {
       name: { type: 'string', maxLength: 200 },
       enabled: { type: 'boolean', default: true },
+      schedule_kind: { type: 'string', enum: ['cron', 'at'], default: 'cron' },
+      schedule_at: { type: 'string', nullable: true, description: 'UTC SQLite timestamp for one-shot jobs' },
       schedule_cron: { type: 'string', requiredFor: 'root jobs' },
       schedule_tz: { type: 'string', default: 'UTC' },
       session_target: { type: 'string', enum: ['main', 'isolated', 'shell'], default: 'isolated' },
@@ -14,8 +19,9 @@ export const SCHEDULER_SCHEMAS = {
       payload_model_fallback: { type: 'string', nullable: true, description: 'Optional fallback model override for a same-run retry after primary selection failure' },
       payload_thinking: { type: 'string', nullable: true },
       payload_timeout_seconds: { type: 'integer', min: 1, default: 120 },
-      execution_intent: { type: 'string', enum: ['execute', 'plan'], default: 'execute' },
+      execution_intent: { type: 'string', enum: ['execute', 'plan', 'fire-and-forget'], default: 'execute' },
       execution_read_only: { type: 'boolean', default: false },
+      shell_env_policy: { type: 'string', enum: ['minimal', 'inherit'], default: 'minimal', description: 'Fresh jobs default to a minimal environment; migrated jobs retain inherit semantics' },
       overlap_policy: { type: 'string', enum: ['skip', 'allow', 'queue'], default: 'skip' },
       run_timeout_ms: { type: 'integer', min: 1, required: true, description: 'Required: max ms a run may execute before timeout (no default -- caller must be explicit)' },
       max_queued_dispatches: { type: 'integer', min: 1, default: 25 },
@@ -48,6 +54,7 @@ export const SCHEDULER_SCHEMAS = {
       auth_profile: { type: 'string', nullable: true, description: 'Auth profile override: null=default, "inherit"=main session profile, or "provider:label"' },
       auth_profile_fallback: { type: 'string', nullable: true, description: 'Optional fallback auth profile for a same-run retry after primary selection failure' },
       delivery_opt_out_reason: { type: 'string', nullable: true, maxLength: 256 },
+      origin: { type: 'string', requiredFor: 'root jobs', description: 'Request source or system identity' },
       delete_after_run: { type: 'boolean', default: false },
       run_now: { type: 'boolean', default: false, note: 'create-time convenience flag' },
 
@@ -86,20 +93,30 @@ export const SCHEDULER_SCHEMAS = {
     },
   },
   runs: {
-    statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary'],
+    statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed', 'recovery_blocked'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary'],
   },
   approvals: {
-    statuses: ['pending', 'approved', 'rejected', 'timed_out', 'dispatched'],
-    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes'],
+    statuses: ['pending', 'approved', 'dispatching', 'dispatched', 'rejected', 'timed_out', 'cancelled'],
+    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes', 'decision_version', 'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at', 'dispatched_at'],
   },
   dispatches: {
-    kinds: ['manual', 'chain', 'retry'],
-    statuses: ['pending', 'claimed', 'awaiting_approval', 'done', 'cancelled'],
-    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'source_run_id', 'retry_of_run_id'],
+    kinds: ['schedule', 'at', 'manual', 'chain', 'retry'],
+    statuses: ['pending', 'claimed', 'awaiting_approval', 'done', 'cancelled', 'failed'],
+    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'source_run_id', 'retry_of_run_id', 'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count', 'last_error', 'replay_of_run_id'],
   },
   messages: {
     kinds: ['text', 'task', 'result', 'status', 'system', 'spawn', 'decision', 'constraint', 'fact', 'preference'],
-    statuses: ['pending', 'delivered', 'read', 'expired', 'failed'],
+    statuses: ['pending', 'prompt_claimed', 'delivered', 'read', 'expired', 'failed'],
+  },
+  dispatcher_leases: {
+    key_fields: ['name', 'owner_id', 'fencing_token', 'acquired_at', 'renewed_at', 'expires_at'],
+  },
+  delivery_outbox: {
+    statuses: ['pending', 'claimed', 'delivered', 'failed', 'cancelled'],
+    key_fields: ['message_id', 'job_id', 'run_id', 'channel', 'target', 'status', 'idempotency_key', 'attempt_count', 'max_attempts', 'next_attempt_at', 'claim_owner', 'claim_token', 'claim_expires_at', 'last_error', 'delivered_at'],
+  },
+  delivery_attachments: {
+    key_fields: ['outbox_id', 'message_id', 'ordinal', 'name', 'mime_type', 'source_path', 'content_blob', 'size_bytes', 'sha256'],
   },
 };

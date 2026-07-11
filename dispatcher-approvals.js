@@ -1,96 +1,92 @@
+import {
+  cancelUnavailableJobApprovals,
+  recoverInterruptedApprovalDispatches,
+} from './approval-state.js';
+
 export async function checkApprovals({
   log,
-  getDb,
   getTimedOutApprovals,
   getJob,
   resolveApproval,
-  dispatchJob,
-  getDispatch,
-  setDispatchStatus,
+  cancelUnavailableJobApprovalsFn = cancelUnavailableJobApprovals,
+  recoverInterruptedApprovalDispatchesFn = recoverInterruptedApprovalDispatches,
 }) {
   try {
-    const timedOut = getTimedOutApprovals();
-    for (const approval of timedOut) {
-      const job = getJob(approval.job_id);
-      if (!job) continue;
-
-      if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
-        resolveApproval(approval.id, 'approved', 'timeout');
-        getDb().prepare(`
-          UPDATE approvals
-          SET status = 'dispatched',
-              notes = COALESCE(notes, 'Auto-approved and dispatched by scheduler')
-          WHERE id = ? AND status = 'approved'
-        `).run(approval.id);
-        log('info', `Approval auto-approved (timeout): ${approval.job_name || job.name}`, { approvalId: approval.id });
-        if (approval.run_id) {
-          getDb().prepare(`
-            UPDATE runs
-            SET status = 'approved',
-                finished_at = datetime('now'),
-                duration_ms = CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER),
-                summary = COALESCE(summary, 'Approval granted (timeout auto-approve)')
-            WHERE id = ? AND status IN ('awaiting_approval', 'pending')
-          `).run(approval.run_id);
-        }
-        await dispatchJob(job, {
-          approvalBypass: true,
-          dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
-        });
-      } else {
-        resolveApproval(approval.id, 'timed_out', 'timeout');
-        if (approval.dispatch_queue_id) setDispatchStatus(approval.dispatch_queue_id, 'cancelled');
-        if (approval.run_id) {
-          getDb().prepare(`
-            UPDATE runs
-            SET status = 'cancelled', finished_at = datetime('now')
-            WHERE id = ? AND status = 'awaiting_approval'
-          `).run(approval.run_id);
-        }
-        log('info', `Approval timed out (rejected): ${approval.job_name || job.name}`, { approvalId: approval.id });
-      }
+    const recovered = recoverInterruptedApprovalDispatchesFn();
+    if (recovered?.recovered > 0) {
+      log('warn', `Recovered ${recovered.recovered} interrupted approval dispatch(es)`);
     }
   } catch (err) {
-    log('error', `Approval timeout check error: ${err.message}`);
+    log('error', `Approval dispatch recovery error: ${err.message}`);
   }
 
   try {
-    const db = getDb();
-    const approved = db.prepare(`
-      SELECT a.*, j.name as job_name
-      FROM approvals a
-      JOIN jobs j ON a.job_id = j.id
-      LEFT JOIN runs r ON a.run_id = r.id
-      WHERE a.status = 'approved'
-        AND (a.run_id IS NULL OR r.status IN ('awaiting_approval', 'pending'))
-    `).all();
-
-    for (const approval of approved) {
-      const job = getJob(approval.job_id);
-      if (!job) continue;
-      if (approval.run_id) {
-        db.prepare(`
-          UPDATE runs
-          SET status = 'approved',
-              finished_at = datetime('now'),
-              duration_ms = CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER),
-              summary = COALESCE(summary, 'Approved by operator')
-          WHERE id = ? AND status IN ('awaiting_approval', 'pending')
-        `).run(approval.run_id);
-      }
-      log('info', `Dispatching approved job: ${approval.job_name}`, { approvalId: approval.id });
-      await dispatchJob(job, {
-        approvalBypass: true,
-        dispatchRecord: approval.dispatch_queue_id ? getDispatch(approval.dispatch_queue_id) : null,
-      });
-      db.prepare(`
-        UPDATE approvals
-        SET status = 'dispatched',
-            notes = COALESCE(notes, 'Approved and dispatched by scheduler')
-        WHERE id = ? AND status = 'approved'
-      `).run(approval.id);
+    const cancelled = cancelUnavailableJobApprovalsFn();
+    if (cancelled?.changed > 0) {
+      log('info', `Cancelled ${cancelled.changed} approval(s) for unavailable jobs`);
     }
   } catch (err) {
-    log('error', `Approval dispatch error: ${err.message}`);
+    log('error', `Unavailable-job approval cancellation error: ${err.message}`);
+  }
+
+  let timedOut;
+  try {
+    timedOut = getTimedOutApprovals();
+  } catch (err) {
+    log('error', `Approval timeout query error: ${err.message}`);
+    return;
+  }
+
+  for (const approval of timedOut) {
+    try {
+      const job = getJob(approval.job_id);
+      if (!job || job.enabled !== 1) {
+        const result = resolveApproval(
+          approval.id,
+          'cancelled',
+          'scheduler',
+          !job ? 'Job deleted before approval timeout' : 'Job disabled before approval timeout'
+        );
+        if (result?.status === 'cancelled') {
+          log('info', `Approval cancelled for unavailable job: ${approval.job_name || approval.job_id}`, {
+            approvalId: approval.id,
+          });
+        }
+        continue;
+      }
+
+      if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
+        const result = resolveApproval(
+          approval.id,
+          'approved',
+          'timeout',
+          'Approval granted by timeout auto-approve policy'
+        );
+        if (result?.status === 'approved') {
+          log('info', `Approval auto-approved after timeout: ${approval.job_name || job.name}`, {
+            approvalId: approval.id,
+            dispatchId: approval.dispatch_queue_id || null,
+          });
+        }
+      } else {
+        const result = resolveApproval(
+          approval.id,
+          'timed_out',
+          'timeout',
+          'Approval timed out and was rejected by policy'
+        );
+        if (result?.status === 'timed_out') {
+          log('info', `Approval timed out and was rejected: ${approval.job_name || job.name}`, {
+            approvalId: approval.id,
+            dispatchId: approval.dispatch_queue_id || null,
+          });
+        }
+      }
+    } catch (err) {
+      log('error', `Approval timeout transition failed: ${err.message}`, {
+        approvalId: approval.id,
+        jobId: approval.job_id,
+      });
+    }
   }
 }

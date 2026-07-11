@@ -1231,7 +1231,14 @@ const runP = createJob({ name: 'RunP', schedule_cron: '0 7 * * *', payload_messa
 const runR = createRun(runP.id, { run_timeout_ms: 300000 });
 assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'running', 'run is running');
 cancelJob(runP.id);
-assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'cancelled', 'running run cancelled');
+const cancellationRequested = db.prepare(`
+  SELECT status, cancel_requested_at, cancel_requested_by, cancel_reason
+  FROM runs WHERE id = ?
+`).get(runR.id);
+assert(cancellationRequested.status === 'running', 'running cancellation remains active until the worker stops');
+assert(cancellationRequested.cancel_requested_at !== null, 'running cancellation records a durable request');
+finishRun(runR.id, 'ok', { summary: 'late completion after cancellation request' });
+assert(db.prepare('SELECT status FROM runs WHERE id = ?').get(runR.id).status === 'cancelled', 'cancellation wins the terminal transition');
 
 // ===========================================================
 // SECTION 6: Queue overlap policy
@@ -5016,7 +5023,7 @@ console.log('\n-- Dispatcher Integration --');
       );
       assert(timeoutRun.status === 'timeout', 'dispatcher integration: shell timeout stored as timeout');
       assert(timeoutRun.shell_timed_out === 1, 'dispatcher integration: shell timeout sets shell_timed_out');
-      assert(timeoutRun.shell_signal === 'SIGTERM', 'dispatcher integration: shell timeout preserves signal');
+      assert(['SIGTERM', 'SIGKILL'].includes(timeoutRun.shell_signal), 'dispatcher integration: shell timeout preserves termination signal');
     },
   });
 
@@ -9324,7 +9331,7 @@ console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table 
   });
 }
 
-console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to messages table --');
+console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to delivery outbox --');
 {
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
 
@@ -9336,7 +9343,7 @@ console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to mes
     resolveDeliveryAlias: () => null,
   });
 
-  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
+  const before = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get();
 
   const announceJob = {
     name: 'PostOfficeShellJob',
@@ -9344,21 +9351,19 @@ console.log('\n-- Post-Office Routing: handleDelivery (announce) enqueues to mes
     delivery_channel: 'telegram',
     delivery_to: '1234567890',
   };
-  await handleDelivery(announceJob, 'shell job done -- all tests passed');
+  const queued = await handleDelivery(announceJob, 'shell job done -- all tests passed');
 
-  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result'").get();
-  assert(after.cnt === before.cnt + 1, 'handleDelivery(announce): enqueues one message');
+  const after = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get();
+  assert(after.cnt === before.cnt + 1, 'handleDelivery(announce): enqueues one outbox item');
 
-  const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject='PostOfficeShellJob'").get();
-  assert(msg !== undefined,                             'handleDelivery(announce): message exists');
-  assert(msg.from_agent === 'scheduler',                'handleDelivery(announce): from_agent=scheduler');
-  assert(msg.to_agent === 'main',                       'handleDelivery(announce): to_agent=main');
-  assert(msg.kind === 'result',                         'handleDelivery(announce): kind=result');
-  assert(msg.subject === 'PostOfficeShellJob',          'handleDelivery(announce): subject=job name');
+  const msg = liveDb.prepare('SELECT * FROM delivery_outbox WHERE id = ?').get(queued.id);
+  assert(msg !== undefined,                             'handleDelivery(announce): outbox item exists');
+  assert(msg.channel === 'telegram',                    'handleDelivery(announce): channel stored');
+  assert(msg.target === '1234567890',                   'handleDelivery(announce): target stored');
   assert(msg.body.includes('shell job done'),           'handleDelivery(announce): body=content');
   assert(msg.status === 'pending',                      'handleDelivery(announce): status=pending');
 
-  assert(logs.some(l => l.msg.includes('Enqueued')),   'handleDelivery(announce): logs Enqueued');
+  assert(logs.some(l => l.msg.includes('Delivery enqueued')), 'handleDelivery(announce): logs durable enqueue');
 }
 
 console.log('\n-- Post-Office Routing: dispatch completion watcher + announce path --');
@@ -9445,16 +9450,17 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       assert(watcherRun.status !== 0, `dispatch completion ${slug}: watcher exits non-zero when no deliverable text exists`);
     }
 
-    const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=?").get(jobName).cnt;
+    const before = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get().cnt;
+    let queuedDelivery = null;
     if (stdout.trim()) {
-      await handleDelivery({
+      queuedDelivery = await handleDelivery({
         name: jobName,
         delivery_mode: 'announce',
         delivery_channel: 'telegram',
         delivery_to: '1234567890',
       }, stdout.trim());
     }
-    const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=?").get(jobName).cnt;
+    const after = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get().cnt;
 
     if (expectEnqueued) {
       assert(stdout.includes(expectedDeliveryText), `dispatch completion ${slug}: watcher stdout contains expected completion text`);
@@ -9462,8 +9468,8 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       if (unexpectedDeliveryText) {
         assert(!stdout.includes(unexpectedDeliveryText), `dispatch completion ${slug}: watcher stdout suppresses internal transport status text`);
       }
-      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one post-office message`);
-      const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
+      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one durable outbox item`);
+      const msg = liveDb.prepare('SELECT * FROM delivery_outbox WHERE id = ?').get(queuedDelivery.id);
       assert(msg.body.includes(expectedDeliveryText), `dispatch completion ${slug}: queued post-office message contains completion text`);
       if (expectedTechnicalDetailsText) {
         assert(stdout.includes(expectedTechnicalDetailsText), `dispatch completion ${slug}: watcher stdout includes concise technical details`);
@@ -9476,8 +9482,8 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       assert(stdout.includes('no clean user-facing completion was captured'), `dispatch completion ${slug}: watcher emits explicit failure body when no meaningful completion text exists`);
       assert(!stdout.includes('completion delivery suppressed'), `dispatch completion ${slug}: suppressed diagnostic does not become stdout delivery`);
       assert(stderr.includes('completion delivery suppressed'), `dispatch completion ${slug}: watcher logs suppressed delivery to stderr`);
-      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one warning post-office message`);
-      const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(jobName);
+      assert(after === before + 1, `dispatch completion ${slug}: announce path enqueues one warning outbox item`);
+      const msg = liveDb.prepare('SELECT * FROM delivery_outbox WHERE id = ?').get(queuedDelivery.id);
       assert(msg.body.includes('no clean user-facing completion was captured'), `dispatch completion ${slug}: queued post-office message contains explicit warning`);
       assert(!msg.body.includes('completion delivery suppressed'), `dispatch completion ${slug}: queued post-office message suppresses internal diagnostic text`);
     }
@@ -9683,7 +9689,7 @@ console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does 
     resolveDeliveryAlias: () => null,
   });
 
-  const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main'").get();
+  const before = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get();
 
   const noneJob = {
     name: 'SilentJob',
@@ -9693,8 +9699,8 @@ console.log('\n-- Post-Office Routing: handleDelivery (delivery_mode=none) does 
   };
   await handleDelivery(noneJob, 'should not be enqueued');
 
-  const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='scheduler' AND to_agent='main'").get();
-  assert(after.cnt === before.cnt, 'handleDelivery(none): does not enqueue any message');
+  const after = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get();
+  assert(after.cnt === before.cnt, 'handleDelivery(none): does not enqueue any outbox item');
 }
 
 // ===========================================================
@@ -9801,8 +9807,7 @@ console.log('\n-- inbox-consumer per-message delivery_to routing --');
     assert(msgChannel === 'whatsapp', 'routing: uses msg.channel (whatsapp) not default (telegram)');
   }
 
-  // Test 8: dispatcher-delivery.js sendMessage includes delivery_to (integration check)
-  // handleDelivery already calls sendMessage with delivery_to -- verify it's stored
+  // Test 8: dispatcher-delivery.js persists the resolved external route in the outbox
   const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
   const deliveryLogs = [];
   const { handleDelivery: handleDeliveryV21 } = createDeliveryHelpers({
@@ -9819,10 +9824,10 @@ console.log('\n-- inbox-consumer per-message delivery_to routing --');
   await handleDeliveryV21(jobV21, 'group job done');
 
   const groupMsg = liveDb.prepare(
-    "SELECT * FROM messages WHERE from_agent='scheduler' AND to_agent='main' AND subject='GroupChatJob' ORDER BY created_at DESC LIMIT 1"
+    "SELECT * FROM delivery_outbox WHERE body = 'group job done' ORDER BY created_at DESC, id DESC LIMIT 1"
   ).get();
-  assert(groupMsg !== undefined, 'dispatcher-delivery: message created for group chat job');
-  assert(groupMsg.delivery_to === '-100000000', 'dispatcher-delivery: delivery_to stored on message from handleDelivery');
+  assert(groupMsg !== undefined, 'dispatcher-delivery: outbox item created for group chat job');
+  assert(groupMsg.target === '-100000000', 'dispatcher-delivery: target stored on outbox item');
   assert(groupMsg.channel === 'telegram', 'dispatcher-delivery: channel stored on message from handleDelivery');
 
   // Clean up
@@ -11323,7 +11328,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 26, 'capabilities: schema_version is 26');
+  assert(capsOut.schema_version === 27, 'capabilities: schema_version is 27');
   assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

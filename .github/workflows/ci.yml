@@ -48,10 +48,5 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Smoke verification
+      - name: Repository verification gate
         run: npm run verify:smoke
-
-      - name: Test suite
-        run: node test.js
-        env:
-          SCHEDULER_DB: ':memory:'

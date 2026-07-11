@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v26).
+ * Brings any DB from any prior version up to the current schema (v27).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -54,11 +54,12 @@ export default function migrateConsolidate() {
   const agentColumns = columnsFor('agents');
   const msgColumns = columnsFor('messages');
   const approvalColumns = columnsFor('approvals');
+  const queueColumns = columnsFor('job_dispatch_queue');
   const trackerColumns = columnsFor('task_tracker');
   const trackerAgentColumns = columnsFor('task_tracker_agents');
   const hasLatestColumns =
     hasColumns(jobColumns, [
-      'job_type', 'execution_intent', 'execution_read_only',
+      'job_type', 'execution_intent', 'execution_read_only', 'shell_env_policy',
       'agent_id', 'payload_model', 'payload_thinking', 'payload_timeout_seconds',
       'overlap_policy', 'max_queued_dispatches', 'max_pending_approvals',
       'max_trigger_fanout', 'output_store_limit_bytes',
@@ -89,6 +90,11 @@ export default function migrateConsolidate() {
       'identity_resolved', 'trust_evaluation', 'authorization_decision',
       'authorization_proof_verification', 'evidence_record',
       'credential_handoff_summary',
+      'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at',
+      'cancel_requested_at', 'cancel_requested_by', 'cancel_reason',
+      'process_pid', 'process_pgid', 'process_identity', 'process_started_at',
+      'process_terminated_at', 'agent_cancel_requested_at',
+      'terminal_transition_at',
     ])
     && hasColumns(agentColumns, ['delivery_channel', 'delivery_to', 'brand_name'])
     && hasColumns(msgColumns, [
@@ -101,7 +107,13 @@ export default function migrateConsolidate() {
     ])
     && hasColumns(approvalColumns, [
       'job_id', 'run_id', 'dispatch_queue_id', 'status', 'requested_at',
-      'resolved_at', 'resolved_by', 'notes',
+      'resolved_at', 'resolved_by', 'notes', 'decision_version',
+      'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at',
+      'dispatched_at',
+    ])
+    && hasColumns(queueColumns, [
+      'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count',
+      'last_error', 'replay_of_run_id',
     ])
     && hasColumns(trackerColumns, [
       'name', 'created_at', 'created_by', 'expected_agents', 'timeout_s',
@@ -144,9 +156,12 @@ export default function migrateConsolidate() {
       `).get()?.cnt ?? 0)
     : 0;
   if (
-    current >= 26
+    current >= 27
     && hasLatestColumns
     && hasTable('completion_debts')
+    && hasTable('dispatcher_leases')
+    && hasTable('delivery_outbox')
+    && hasTable('delivery_attachments')
     // Verify the unique index exists, not just the column/version: sendMessage's
     // ON CONFLICT(idempotency_key) target requires it, so a swallowed index
     // creation must re-run rather than being masked by the version bump.
@@ -296,13 +311,28 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN max_pending_approvals INTEGER NOT NULL DEFAULT 10`,
     `ALTER TABLE jobs ADD COLUMN max_trigger_fanout INTEGER NOT NULL DEFAULT 25`,
     `ALTER TABLE jobs ADD COLUMN output_store_limit_bytes INTEGER NOT NULL DEFAULT 65536`,
-    `ALTER TABLE jobs ADD COLUMN output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 2000`,
-    `ALTER TABLE jobs ADD COLUMN output_summary_limit_bytes INTEGER NOT NULL DEFAULT 5000`,
+    `ALTER TABLE jobs ADD COLUMN output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 65536`,
+    `ALTER TABLE jobs ADD COLUMN output_summary_limit_bytes INTEGER NOT NULL DEFAULT 65536`,
     `ALTER TABLE jobs ADD COLUMN output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536`,
+    `ALTER TABLE jobs ADD COLUMN shell_env_policy TEXT NOT NULL DEFAULT 'inherit'`,
     `ALTER TABLE runs ADD COLUMN shell_stdout_path TEXT`,
     `ALTER TABLE runs ADD COLUMN shell_stderr_path TEXT`,
     `ALTER TABLE runs ADD COLUMN shell_stdout_bytes INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN shell_stderr_bytes INTEGER NOT NULL DEFAULT 0`,
+    // v27: dispatcher ownership, cancellation, and child-process tracking
+    `ALTER TABLE runs ADD COLUMN dispatcher_owner TEXT`,
+    `ALTER TABLE runs ADD COLUMN dispatcher_token INTEGER`,
+    `ALTER TABLE runs ADD COLUMN dispatch_started_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN cancel_requested_by TEXT`,
+    `ALTER TABLE runs ADD COLUMN cancel_reason TEXT`,
+    `ALTER TABLE runs ADD COLUMN process_pid INTEGER`,
+    `ALTER TABLE runs ADD COLUMN process_pgid INTEGER`,
+    `ALTER TABLE runs ADD COLUMN process_identity TEXT`,
+    `ALTER TABLE runs ADD COLUMN process_started_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN process_terminated_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN agent_cancel_requested_at TEXT`,
+    `ALTER TABLE runs ADD COLUMN terminal_transition_at TEXT`,
     // v15: TTL-based auto-deletion
     `ALTER TABLE jobs ADD COLUMN ttl_hours INTEGER DEFAULT NULL`,
     // v16: auth profile override
@@ -361,6 +391,20 @@ export default function migrateConsolidate() {
     // v24: explicit fallback model/auth selection
     `ALTER TABLE jobs ADD COLUMN payload_model_fallback TEXT`,
     `ALTER TABLE jobs ADD COLUMN auth_profile_fallback TEXT DEFAULT NULL`,
+    // v27: leased queue claims and replay diagnostics
+    `ALTER TABLE job_dispatch_queue ADD COLUMN claim_owner TEXT`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN claim_token TEXT`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN claim_expires_at TEXT`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN last_error TEXT`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL`,
+    // v27: atomic approval decisions and audit timestamps
+    `ALTER TABLE approvals ADD COLUMN decision_version INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE approvals ADD COLUMN cancelled_reason TEXT`,
+    `ALTER TABLE approvals ADD COLUMN expires_at TEXT`,
+    `ALTER TABLE approvals ADD COLUMN approved_at TEXT`,
+    `ALTER TABLE approvals ADD COLUMN rejected_at TEXT`,
+    `ALTER TABLE approvals ADD COLUMN dispatched_at TEXT`,
   ];
 
   for (const sql of alters) {
@@ -479,7 +523,13 @@ export default function migrateConsolidate() {
       requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
       resolved_at     TEXT,
       resolved_by     TEXT,
-      notes           TEXT
+      notes           TEXT,
+      decision_version INTEGER NOT NULL DEFAULT 0,
+      cancelled_reason TEXT,
+      expires_at      TEXT,
+      approved_at     TEXT,
+      rejected_at     TEXT,
+      dispatched_at   TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
@@ -574,7 +624,58 @@ export default function migrateConsolidate() {
       retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
       claimed_at      TEXT,
-      processed_at    TEXT
+      processed_at    TEXT,
+      claim_owner     TEXT,
+      claim_token     TEXT,
+      claim_expires_at TEXT,
+      attempt_count   INTEGER NOT NULL DEFAULT 0,
+      last_error      TEXT,
+      replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS dispatcher_leases (
+      name            TEXT PRIMARY KEY,
+      owner_id        TEXT NOT NULL,
+      fencing_token   INTEGER NOT NULL,
+      acquired_at     TEXT NOT NULL,
+      renewed_at      TEXT NOT NULL,
+      expires_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS delivery_outbox (
+      id              TEXT PRIMARY KEY,
+      message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+      job_id          TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+      run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      channel         TEXT NOT NULL,
+      target          TEXT NOT NULL,
+      body            TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      idempotency_key TEXT,
+      attempt_count   INTEGER NOT NULL DEFAULT 0,
+      max_attempts    INTEGER NOT NULL DEFAULT 5,
+      next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+      claim_owner     TEXT,
+      claim_token     TEXT,
+      claim_expires_at TEXT,
+      last_error      TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      delivered_at    TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS delivery_attachments (
+      id              TEXT PRIMARY KEY,
+      outbox_id       TEXT NOT NULL REFERENCES delivery_outbox(id) ON DELETE CASCADE,
+      message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+      ordinal         INTEGER NOT NULL,
+      name            TEXT NOT NULL,
+      mime_type       TEXT,
+      source_path     TEXT,
+      content_blob    BLOB,
+      size_bytes      INTEGER NOT NULL,
+      sha256          TEXT NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(outbox_id, ordinal)
     );
 
     CREATE TABLE IF NOT EXISTS completion_debts (
@@ -731,10 +832,66 @@ export default function migrateConsolidate() {
     `);
   } catch { /* index may already exist */ }
 
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dispatch_queue_claim_expiry
+      ON job_dispatch_queue(status, claim_expires_at) WHERE status = 'claimed';
+      CREATE INDEX IF NOT EXISTS idx_runs_dispatcher_owner
+      ON runs(dispatcher_owner, status) WHERE dispatcher_owner IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_runs_cancel_requested
+      ON runs(cancel_requested_at, status) WHERE cancel_requested_at IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_dispatcher_leases_expiry
+      ON dispatcher_leases(expires_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_idempotency
+      ON delivery_outbox(idempotency_key) WHERE idempotency_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_delivery_outbox_due
+      ON delivery_outbox(status, next_attempt_at);
+      CREATE INDEX IF NOT EXISTS idx_delivery_outbox_claim_expiry
+      ON delivery_outbox(status, claim_expires_at) WHERE status = 'claimed';
+      CREATE INDEX IF NOT EXISTS idx_delivery_attachments_message
+      ON delivery_attachments(message_id) WHERE message_id IS NOT NULL;
+    `);
+  } catch { /* indexes may already exist */ }
+
+  // Fail closed if any required v27 object was not created. Earlier releases
+  // treated index creation as best effort; a missing uniqueness or due-work
+  // index changes correctness, not just performance.
+  const requiredTables = [
+    'approvals',
+    'job_dispatch_queue',
+    'dispatcher_leases',
+    'delivery_outbox',
+    'delivery_attachments',
+    'completion_debts',
+  ];
+  for (const table of requiredTables) {
+    if (!hasTable(table)) throw new Error(`Migration v27 failed to create required table ${table}`);
+  }
+  const requiredIndexes = [
+    'idx_messages_idempotency',
+    'idx_runs_idempotency',
+    'idx_runs_dispatch_queue',
+    'idx_approvals_dispatch_queue',
+    'idx_dispatch_queue_due',
+    'idx_dispatch_queue_job',
+    'idx_dispatch_queue_source_run',
+    'idx_dispatch_queue_claim_expiry',
+    'idx_runs_dispatcher_owner',
+    'idx_runs_cancel_requested',
+    'idx_dispatcher_leases_expiry',
+    'idx_delivery_outbox_idempotency',
+    'idx_delivery_outbox_due',
+    'idx_delivery_outbox_claim_expiry',
+    'idx_delivery_attachments_message',
+  ];
+  for (const index of requiredIndexes) {
+    if (!hasIndex(index)) throw new Error(`Migration v27 failed to create required index ${index}`);
+  }
+
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]) {
     stmt.run(v);
   }
 
@@ -747,7 +904,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v26'
-    : 'DB already at v26 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v27'
+    : 'DB already at v27 -- nothing to do'
   );
 }

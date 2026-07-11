@@ -4,6 +4,8 @@
 import {
   db, jobs, runs, messages, approvals, agents, dispatchQueue, gateway,
   paths, promptContext, retrieval, shellResults, idempotency, taskTracker, teamAdapter,
+  shellRuntime, runtimeLease, dispatcherRuntime, runState, runCompletion,
+  governance, deliveryOutbox, deliveryAttachments, approvalState,
   SCHEDULER_SCHEMAS, v02Runtime,
   type JobSpec, type JobRecord, type RunRecord, type MessageRecord,
   type ApprovalRecord, type AgentRecord, type DispatchRecord,
@@ -203,7 +205,7 @@ const dueDispatches = dispatchQueue.getDueDispatches(10);
 if (dueDispatches.length) { void dueDispatches[0].job_name; }
 const claimed: DispatchRecord | null = dispatchQueue.claimDispatch('id');
 const released: DispatchRecord | null = dispatchQueue.releaseDispatch('id', '2026-01-01 00:00:00');
-const statusUpdated: DispatchRecord = dispatchQueue.setDispatchStatus('id', 'done');
+const statusUpdated: DispatchRecord | null = dispatchQueue.setDispatchStatus('id', 'done');
 const jobDispatches: DispatchRecord[] = dispatchQueue.listDispatchesForJob('job-1', 20);
 
 // ---- gateway ----

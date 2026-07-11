@@ -2,8 +2,8 @@
 
 Two levels of removal:
 
-1. **Stop the scheduler** and re-enable OpenClaw's built-in cron/heartbeat — reversible
-2. **Full removal** — delete all scheduler files and data — irreversible
+1. **Stop the scheduler** and re-enable any native jobs that it replaced: reversible
+2. **Full removal**: delete all scheduler files and data: irreversible
 
 ---
 
@@ -46,19 +46,20 @@ pm2 save   # persist the removal
 
 ---
 
-## Step 2: Re-enable OpenClaw Built-ins
+## Step 2: Re-enable Replaced Native Jobs
 
 ### Re-enable cron (if you had OC cron jobs before)
 
 ```bash
-openclaw config set cron.enabled true
 openclaw cron list
 openclaw cron edit <job-id> --enable   # repeat for each job you want back
 ```
 
-Also remove `OPENCLAW_SKIP_CRON=1` from your OpenClaw gateway service environment, then restart the gateway.
+Re-enable only jobs that were disabled after a verified scheduler import. Leave
+unrelated native jobs unchanged. Run each restored job or inspect its next-run
+state before removing the scheduler database.
 
-### Re-enable heartbeat (if you had one)
+### Re-enable heartbeat only if the scheduler replaced it
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "5m"
@@ -71,12 +72,15 @@ openclaw gateway restart
 
 ## Step 3: Full Removal (optional)
 
-> ⚠️ **This permanently deletes your job definitions, run history, log files, and all scheduler data. This cannot be undone.**
+> **Warning:** This permanently deletes job definitions, run history, approval
+> audit, delivery outbox and attachment state, log files, and all scheduler data.
+> This cannot be undone.
 
 **Export your jobs first (optional):**
 
 ```bash
-node ~/.openclaw/scheduler/cli.js jobs list > ~/scheduler-jobs-backup.txt
+openclaw-scheduler jobs list --json > ~/scheduler-jobs-backup.json
+sqlite3 ~/.openclaw/scheduler/scheduler.db ".backup '$HOME/scheduler.db.uninstall-backup'"
 ```
 
 **Remove the scheduler directory:**

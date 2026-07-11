@@ -2,9 +2,11 @@
 
 ## Purpose
 
-`openclaw-scheduler` is the durable orchestration runtime for OpenClaw agents
-and shell workflows. It manages scheduling, retries, approvals, delivery, and
-persistent state.
+`openclaw-scheduler` is the continuity and governed-workflow sidecar for
+OpenClaw agents and shell workflows. Current OpenClaw already provides durable
+cron state, command jobs, retries, run history, and flow tooling. Use this
+runtime when shell work must survive Gateway downtime, a separate failure
+domain matters, or direct conditional job graphs are required.
 
 Use this tool when the task is about:
 
@@ -15,7 +17,7 @@ Use this tool when the task is about:
 - inspecting run history and job status
 
 For manifest authoring, validation, and identity/authorization profiles, use
-`agentcli`. The scheduler is the runtime; agentcli is the control plane.
+`@amittell/agentcli`. The scheduler is the runtime; agentcli is the control plane.
 
 ## Working Rules
 
@@ -23,11 +25,15 @@ For manifest authoring, validation, and identity/authorization profiles, use
 - `run_timeout_ms` is required on every job. There is no default -- this
   prevents jobs from running indefinitely.
 - Use `jobs validate` to check a spec before `jobs add`.
+- Prefer `--file` or `--stdin` for non-trivial JSON specs.
 - Prefer `delivery_to` with an alias (`@team_room`) over hardcoded chat IDs.
 - Shell jobs (`session_target: "shell"`) run without the gateway. Agent jobs
   (`session_target: "isolated"` or `"main"`) require a running gateway.
+- Poll run state after cancellation. A chat notification is never authoritative.
+- Run `doctor --json` when schema, dispatcher ownership, queue, delivery, or
+  approval state is in doubt.
 
-## Checking Job Status — Always Poll, Never Infer
+## Checking Job Status: Always Poll, Never Infer
 
 When reporting on whether a dispatched job is running, done, or stuck, **always call the status command directly** — never infer from check-in messages or notifications that appeared in your conversation.
 
@@ -54,7 +60,7 @@ CLI errors exit non-zero. In plain-text mode, the message goes to stderr. With
 `--json`, the structured error object goes to stdout:
 
 ```json
-{ "ok": false, "error": "Human-readable error message" }
+{ "ok": false, "error": "Human-readable error message", "code": "NOT_FOUND" }
 ```
 
 Successful operations return:
@@ -68,10 +74,12 @@ Successful operations return:
 When first interacting with `openclaw-scheduler`, use this sequence:
 
 1. `openclaw-scheduler` -- show usage (plain-text help output)
-2. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
-3. `openclaw-scheduler agents list --json` -- see registered agents
-4. `openclaw-scheduler schema jobs` -- get the job field schema
-5. `openclaw-scheduler capabilities --json` -- check runtime feature support
+2. `openclaw-scheduler doctor --json` -- verify schema 27 and live diagnostics
+3. `openclaw-scheduler status --json` -- inspect lease, queue, outbox, approvals, and runs
+4. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
+5. `openclaw-scheduler agents list --json` -- see registered agents
+6. `openclaw-scheduler schema jobs` -- get the job schema without opening the DB
+7. `openclaw-scheduler capabilities --json` -- inspect package capabilities without opening the DB
 
 ## Creating Jobs
 
@@ -87,13 +95,20 @@ Every job needs at minimum:
   "payload_kind": "shellCommand",
   "payload_message": "echo hello",
   "run_timeout_ms": 300000,
-  "delivery_to": "YOUR_CHAT_ID",
-  "origin": "YOUR_CHAT_ID"
+  "delivery_mode": "none",
+  "origin": "system"
 }
 ```
 
 For agent jobs, use `"session_target": "isolated"` and
-`"payload_kind": "systemEvent"`.
+`"payload_kind": "agentTurn"`.
+
+For longer specs:
+
+```bash
+openclaw-scheduler jobs validate --file job.json
+openclaw-scheduler jobs add --file job.json
+```
 
 ### One-shot jobs (run once)
 
@@ -123,6 +138,18 @@ openclaw-scheduler jobs run <id>             # trigger immediate run
 openclaw-scheduler jobs delete <id>          # delete job
 openclaw-scheduler jobs cancel <id>          # cancel job + children
 ```
+
+Cancellation is a durable fenced request. Shell cancellation and timeout
+terminate the tracked process group; agent cancellation records and sends the
+Gateway request. Only the owning dispatcher fence may commit completion or
+trigger children. Always poll `runs get`, `runs running`, or `status` afterward.
+
+External delivery uses `delivery_outbox`, not the agent inbox. Dispatch and
+outbox claims have expirations and stale-claim recovery. Approval decisions are
+atomic. Governance declarations fail closed when the requested sandbox, path,
+network, credential, trust, proof, or cost constraint cannot be enforced.
+Agent prompt messages use the distinct `prompt_claimed` state while a dispatcher
+owns their injection; they are never reused for external channel delivery.
 
 ## Inspecting Runs
 
@@ -174,7 +201,7 @@ openclaw-scheduler alias add ops_team telegram -100200000000
   "schedule_cron": "0 8 * * 1-5",
   "session_target": "isolated",
   "agent_id": "main",
-  "payload_kind": "systemEvent",
+  "payload_kind": "agentTurn",
   "payload_message": "Prepare the morning briefing. Summarize overnight alerts.",
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
@@ -213,25 +240,30 @@ scheduler serves all agents through one shared gateway.
 
 ## Migrating from Built-in Cron/Heartbeat
 
-OpenClaw's built-in `cron/jobs.json` and heartbeat work for simple tasks. The
-scheduler replaces them when jobs need run history, retries, chains, approvals,
-or delivery.
+Native OpenClaw cron is the default for one scheduled command or agent turn.
+Migrate when Gateway-independent shell execution, a separate failure domain,
+or this scheduler's conditional graph semantics are required.
 
 ### Import existing cron jobs
 
 ```bash
-openclaw-scheduler migrate    # imports from ~/.openclaw/cron/jobs.json
-openclaw-scheduler jobs list  # verify imported jobs
+openclaw-scheduler migrate --dry-run --json
+openclaw-scheduler migrate --json
+openclaw-scheduler jobs list --json
 ```
+
+The default source is `openclaw cron list/get --json`. Use
+`--legacy-json ~/.openclaw/cron/jobs.json` only for an old export. Inexact
+`every` schedules are rejected unless `--allow-inexact-every` is explicitly
+selected.
 
 ### Disable the old cron system
 
-After importing, disable the built-in cron so jobs do not run in both systems:
+After successful test runs, disable the corresponding native jobs so work does
+not run in both systems:
 
 ```bash
 openclaw cron edit <job-id> --disable    # for each job
-openclaw config set cron.enabled false
-openclaw config set agents.defaults.heartbeat.every "0m"
 ```
 
 ### Heartbeat replacement
@@ -266,7 +298,7 @@ complex workflows.
 ### Installing alongside the scheduler (same time)
 
 ```bash
-npm install -g agentcli
+npm install -g @amittell/agentcli
 agentcli validate manifest.json
 agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db --dry-run
 agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db
@@ -308,10 +340,10 @@ reorganized without losing job mapping.
 
 ### Full migration path: OOB cron -> scheduler -> agentcli
 
-1. Import OOB cron jobs: `openclaw-scheduler migrate`
+1. Preview and import native jobs: `openclaw-scheduler migrate --dry-run --json`, then `openclaw-scheduler migrate --json`
 2. Disable built-in cron (see "Migrating from Built-in Cron" above)
 3. Verify jobs run correctly in the scheduler
-4. Install agentcli: `npm install -g agentcli`
+4. Install agentcli: `npm install -g @amittell/agentcli`
 5. Write a manifest covering the imported jobs
 6. Adopt by name: `agentcli apply manifest.json --adopt-by name`
 7. Future updates: `agentcli apply manifest.json` (stable IDs)

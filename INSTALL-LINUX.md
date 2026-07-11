@@ -84,7 +84,7 @@ npm rebuild better-sqlite3
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 ```
 
 **All tests must pass before proceeding.**
@@ -115,39 +115,41 @@ Expected: `200`
 ## Step 5: Migrate Jobs from OC Cron
 
 ```bash
-cd ~/.openclaw/scheduler
-node migrate.js
+openclaw-scheduler migrate --dry-run --json > migration-report.json
+openclaw-scheduler migrate --json
 ```
 
-This imports jobs from `~/.openclaw/cron/jobs.json` → SQLite, converting schedule formats:
-- `cron` → direct expression
-- `every` → approximate cron (e.g., 30min → `*/30 * * * *`)
-- `at` → one-shot with `delete_after_run=true`
+The default source is `openclaw cron list/get --json`. Cron and one-shot
+schedules stay exact. Inexact `every` schedules fail unless
+`--allow-inexact-every` is explicitly selected. Use
+`--legacy-json ~/.openclaw/cron/jobs.json` only for an old export.
 
 Verify:
 ```bash
-node cli.js jobs list
-node cli.js status
+openclaw-scheduler jobs list --json
+openclaw-scheduler doctor --json
 ```
 
 ---
 
-## Step 6: Disable OC Built-in Cron
+## Step 6: Disable Migrated Native Jobs
 
 ```bash
 openclaw cron list
 # For each enabled job:
 openclaw cron edit <job-id> --disable
-openclaw config set cron.enabled false
 ```
 
-Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway service environment (systemd/pm2), then restart the gateway.
-
-Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
+Disable only imported jobs after successful scheduler test runs. Leave unrelated
+native jobs enabled. Rollback by stopping the scheduler, disabling its copies,
+and re-enabling the native jobs.
 
 ---
 
-## Step 7: Disable OC Heartbeat
+## Step 7: Optionally Move a Heartbeat
+
+Leave native heartbeat enabled unless you intentionally replace it with a
+verified scheduler job. To disable it after that verification:
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "0m"
@@ -400,7 +402,7 @@ For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
+- [ ] `npm run verify:local` -- all checks passing
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `systemctl --user status openclaw-scheduler` → active (running)
 - [ ] Log file has startup lines, no errors

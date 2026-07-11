@@ -1,73 +1,58 @@
-# ADR: Schedule Ownership Between OpenClaw and openclaw-scheduler
+# ADR: Schedule Ownership Between OpenClaw and OpenClaw Scheduler
 
 Date: 2026-03-28
-Status: Accepted
+
+Status: Superseded on 2026-07-10
 
 ## Context
 
-Three systems have scheduling-adjacent capabilities:
+The original decision assumed native OpenClaw cron had no durable SQLite state, command jobs, retries, run history, task flows, or resumable approval tooling. That assumption is no longer true. Current OpenClaw provides those capabilities and stores cron state and history in its shared SQLite database.
 
-- OpenClaw provides native heartbeat and cron for personal assistant automation. These are product-level features built into the OpenClaw runtime for simple recurring prompts and periodic health signals.
-- openclaw-scheduler provides durable orchestration with queueing, retries, approvals, chaining, audit, and recovery. It backs all of this with SQLite and supports mixed shell and agent workflows in the same chain.
-- agentcli compiles manifest workflows toward openclaw-scheduler. It is the control plane for manifest authoring, validation, and compilation, but it does not execute prompt tasks locally and does not own a queue, retry engine, or approval state.
+Three layers remain relevant:
 
-Without an explicit boundary, new work risks duplicating scheduling features across layers with slightly different semantics. OpenClaw's built-in cron might gain retry logic, agentcli might accumulate scheduling state, or openclaw-scheduler might start interpreting raw manifest schemas -- each case eroding the separation that keeps the three layers manageable.
+- OpenClaw owns native cron, command and agent execution inside the Gateway, Task Flow, and Lobster approval checkpoints.
+- OpenClaw Scheduler is a separate continuity and governed-workflow sidecar. Shell jobs run outside Gateway availability, and direct parent/child graphs can trigger on outcome or output content.
+- `@amittell/agentcli` owns declarative manifests, validation, stable task identity, and identity/authorization profiles. It may compile to OpenClaw Scheduler when that runtime is selected.
+
+Duplicating all native OpenClaw scheduling features would add operational cost without a clear boundary. Treating repository documentation as evidence of live capability would also be unsafe, so operators must query both live systems before migration or incident decisions.
 
 ## Decision
 
-1. OpenClaw native cron/heartbeat is for product-level personal assistant automation. These jobs are non-durable: they have no retry, no approval gate, no chaining, and no guaranteed delivery. If the gateway is down when a cron job fires, the execution is silently skipped.
-2. openclaw-scheduler is for manifest-native durable workflows that need queueing, retries, approvals, audit, chaining, and guaranteed delivery. It owns run history, failure recovery, overlap policies, and the full lifecycle of shell and agent jobs.
-3. agentcli NEVER targets OpenClaw native cron directly. All recurring prompt tasks in agentcli manifests compile toward openclaw-scheduler via `compileManifestToScheduler`. The `TARGETS` registry in agentcli has no OpenClaw-cron target and should not gain one.
-4. OpenClaw native cron remains intentionally non-durable compared to openclaw-scheduler. This is a deliberate tradeoff, not a gap to close. Native cron optimizes for simplicity and zero configuration; openclaw-scheduler optimizes for reliability and auditability.
+1. Native OpenClaw cron is the default for a single scheduled command or agent turn, including jobs that need native history and retry behavior.
+2. OpenClaw Task Flow or Lobster is the default when its restart-safe flow and resumable checkpoint model fits the workflow.
+3. OpenClaw Scheduler is selected when at least one sidecar property is required:
+   - shell execution must continue while the Gateway is stopped or unhealthy;
+   - scheduler state must be a separate failure domain;
+   - a job graph must directly trigger children on success, failure, completion, or output matching;
+   - the workflow requires the OpenClaw Scheduler target emitted by `@amittell/agentcli`;
+   - local operators require this runtime's fenced cancellation, transactional delivery outbox, and governance contract in one SQLite system.
+4. `@amittell/agentcli` remains a control plane, not a scheduler. It does not own run queues, retry execution, or approval runtime state.
+5. Native and sidecar jobs may coexist, but the same side effect must not remain enabled in both runtimes.
 
-## Decision Rule
+## Runtime Contract
 
-If the automation needs any of the following, it belongs in openclaw-scheduler:
+OpenClaw Scheduler version 0.3.0 and schema 27 provide these ownership rules:
 
-- Retry on failure
-- Approval gates
-- Workflow chaining (parent/child task relationships)
-- Audit trail with queryable run history
-- Guaranteed delivery (at-least-once semantics)
-- Crash recovery and durable state
-- Overlap policies (skip, queue, allow)
-- Conditional triggers based on parent task outcome or output content
+- One live dispatcher holds a named lease and monotonically fenced token.
+- Active runs and queue claims carry ownership. A stale owner cannot finalize work or create downstream dispatches.
+- Shell cancellation and timeout terminate the tracked process group before a terminal transition is committed.
+- Completion, job state, and child enqueue commit atomically.
+- External delivery is written to a transactional outbox separate from agent prompt messages.
+- Approval decisions are atomic, versioned, and audited.
+- Governance requirements fail closed when they cannot be enforced.
+- Schema and migration errors abort startup.
 
-If the automation is a simple personal assistant convenience that can tolerate silent failure and does not need delivery confirmation, run history, or post-failure logic -- OpenClaw native cron is appropriate.
+These rules reduce duplicate execution but do not make an arbitrary external side effect idempotent.
+
+## Migration Rule
+
+The default importer reads supported live OpenClaw output through `openclaw cron list --json` and `openclaw cron get <id> --json`. It preserves cron expressions and one-shot timestamps. It rejects interval schedules that five-field cron cannot represent exactly unless the operator explicitly opts into approximation.
+
+An old `jobs.json` export is accepted only through `--legacy-json`. Operators dry-run, inspect the structured report, run representative imported jobs, and only then disable the matching native jobs. Rollback stops or disables the imported copies and re-enables the native jobs. The sidecar database is retained until verification is complete.
 
 ## Consequences
 
-- agentcli manifests remain the single authoring surface for durable scheduled work. Users do not need to learn two scheduling APIs.
-- OpenClaw native cron stays simple. It does not need to grow retry, approval, or chaining features because those concerns live in openclaw-scheduler.
-- Operators can distinguish scheduler-dispatched runs from native cron jobs inside OpenClaw. Scheduler runs carry origin metadata (`origin: "system"`) and are visible through the scheduler's runs API.
-- Triggered tasks in agentcli use the sentinel cron pattern `0 0 31 2 *` (February 31, which never fires) to satisfy the scheduler schema requirement for a cron field. Actual dispatch for triggered tasks is controlled by parent task outcome and the scheduler runtime queue, not by the sentinel cron.
-- Adding new scheduling features (e.g., rate limiting, cost budgets, SLA monitoring) should happen in openclaw-scheduler, not in OpenClaw native cron or agentcli.
-- Users who currently rely on OpenClaw native cron for simple automations do not need to migrate. The two systems coexist, and the decision rule above clarifies when to use each one.
-
-## Examples
-
-### Example 1: Daily Status Summary
-
-**As OpenClaw native cron:**
-- Configure a cron job in OpenClaw that sends "summarize today's activity" to the assistant every day at 9am
-- If the gateway is down at 9am, the job is silently skipped
-- No retry, no delivery confirmation, no audit record
-
-**As agentcli manifest via openclaw-scheduler:**
-- Define a manifest with a scheduled task: cron "0 9 * * *", delivery_mode "announce", delivery_guarantee "at-least-once"
-- If the first attempt fails, the scheduler retries (max_retries: 2)
-- Result is delivered to the configured channel with guaranteed delivery
-- Audit record tracks execution time, status, and output summary
-
-### Example 2: Shell Health Check Every 5 Minutes
-
-**As OpenClaw native cron:**
-- Heartbeat fires a shell command every 5 minutes
-- Output is not captured or delivered
-- If the host is rebooting, checks are silently missed
-
-**As agentcli manifest via openclaw-scheduler:**
-- Define a manifest with session_target "shell", cron "*/5 * * * *", overlap_policy "skip"
-- On failure, the scheduler can trigger a child alert task (trigger_on: "failure")
-- Watchdog monitors the health check job itself
-- Shell output stored and queryable via runs API
+- The public value proposition is continuity and governed conditional graphs, not a claim that native OpenClaw scheduling is primitive.
+- Operators have a clear reason to avoid an additional service when native OpenClaw is sufficient.
+- The scheduler can evolve its sidecar invariants without forcing OpenClaw or agentcli to adopt its storage model.
+- New features belong where their execution state naturally lives. Manifest syntax belongs in agentcli, Gateway-native behavior belongs in OpenClaw, and sidecar lease/queue/outbox behavior belongs in OpenClaw Scheduler.

@@ -133,7 +133,7 @@ ssh "$HOST" 'command -v node && node -v'
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 ```
 
 **All tests must pass before proceeding.**
@@ -164,14 +164,20 @@ Expected: `200`
 ## Step 5: Migrate Jobs from OC Cron
 
 ```bash
-cd ~/.openclaw/scheduler
-node migrate.js
+openclaw-scheduler migrate --dry-run --json > migration-report.json
+openclaw-scheduler migrate --json
 ```
 
-This imports jobs from `~/.openclaw/cron/jobs.json` → SQLite, converting schedule formats:
-- `cron` → direct expression
-- `every` → approximate cron (e.g., 30min → `*/30 * * * *`)
-- `at` → one-shot with `delete_after_run=true`
+The default importer reads supported live data through `openclaw cron list --json`
+and `openclaw cron get <id> --json`. Cron expressions and `at` timestamps remain
+exact. An `every` interval that five-field cron cannot represent exactly is
+rejected unless you explicitly pass `--allow-inexact-every`.
+
+For a pre-SQLite export only:
+
+```bash
+openclaw-scheduler migrate --legacy-json ~/.openclaw/cron/jobs.json --dry-run --json
+```
 
 Good default approach:
 - if the old job was just a script, keep it as a `shell` job
@@ -182,28 +188,32 @@ For copy-paste examples, see [Starter Recipes in the README](README.md#starter-r
 
 Verify:
 ```bash
-node cli.js jobs list
-node cli.js status
+openclaw-scheduler jobs list --json
+openclaw-scheduler doctor --json
 ```
 
 ---
 
-## Step 6: Disable OC Built-in Cron
+## Step 6: Disable Migrated Native Jobs
 
 ```bash
 openclaw cron list
 # For each enabled job:
 openclaw cron edit <job-id> --disable
-openclaw config set cron.enabled false
 ```
 
-Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway service environment (launchctl/systemd/pm2), then restart the gateway.
-
-Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
+Disable only jobs that were imported and test-run successfully. Native OpenClaw
+cron may continue serving unrelated jobs. Rollback by stopping the scheduler,
+disabling its imported copies, and re-enabling the native jobs. Keep the
+scheduler database until rollback verification is complete.
 
 ---
 
-## Step 7: Disable OC Heartbeat
+## Step 7: Optionally Move a Heartbeat
+
+Leave native heartbeat enabled unless you intentionally replace it with a
+scheduler job and have verified that replacement. To disable it after that
+verification:
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "0m"
@@ -375,7 +385,7 @@ Already have the scheduler installed and need to update to a newer version? See 
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
+- [ ] `npm run verify:local` -- all checks passing
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl print gui/$UID/ai.openclaw.scheduler` or `sudo launchctl print system/ai.openclaw.scheduler` → running
 - [ ] Log file has startup lines, no errors

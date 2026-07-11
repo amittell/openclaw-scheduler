@@ -209,29 +209,144 @@ export function redactOutcomesForPersistence(outcomes, deps) {
   return redacted;
 }
 
+export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
+  if (!ctx) return true;
+  if (ctx.materializationCleanupResult) return ctx.materializationCleanupResult.cleaned;
+  if (ctx.materializationCleanupInProgress) return false;
+  ctx.materializationCleanupInProgress = true;
+
+  const configuredRetryDelays = Array.isArray(deps.materializationCleanupRetryDelaysMs)
+    ? deps.materializationCleanupRetryDelaysMs
+    : [0, 250, 1000];
+  const retryDelays = configuredRetryDelays.length > 0 ? configuredRetryDelays : [0];
+  let attempts = 0;
+  let lastError = null;
+  try {
+    if (ctx.materializationCleanup) {
+      const { provider, cleanupState } = ctx.materializationCleanup;
+      if (typeof provider.cleanup === 'function') {
+        for (const retryDelay of retryDelays) {
+          if (retryDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+          attempts += 1;
+          try {
+            const outcome = await provider.cleanup(cleanupState, {
+              env: process.env,
+              cwd: process.cwd(),
+            });
+            if (outcome?.cleaned === false) {
+              throw new Error(outcome.error || 'provider reported cleaned=false');
+            }
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error;
+            deps.log?.('error', `Provider cleanup attempt ${attempts} failed for ${job.name}: ${error.message}`, {
+              jobId: job.id,
+              runId: ctx.run?.id || null,
+              attempts,
+            });
+          }
+        }
+      } else {
+        lastError = new Error('provider requires cleanup but does not implement cleanup()');
+      }
+    }
+  } finally {
+    deps.clearMaterializedEnvironment?.(ctx.materializedEnv);
+    deps.clearMaterializedEnvironment?.(ctx.executionEnv);
+    ctx.materializationCleanupInProgress = false;
+  }
+
+  if (ctx.credentialCleanupTracked && typeof deps.recordRunCredentialCleanupState === 'function') {
+    const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
+    if (fence) {
+      const status = lastError
+        ? 'failed'
+        : ctx.materializationCleanup
+          ? 'cleaned'
+          : 'not_required';
+      try {
+        const recorded = deps.recordRunCredentialCleanupState(ctx.run.id, {
+          status,
+          attempts,
+          error: lastError?.message || null,
+        }, {
+          ...fence,
+          allowAfterLeaseLoss: true,
+        });
+        if (!recorded) {
+          deps.log?.('warn', `Credential cleanup state was not recorded for ${job.name}`, {
+            jobId: job.id,
+            runId: ctx.run.id,
+            status,
+          });
+        }
+      } catch (error) {
+        deps.log?.('error', `Credential cleanup state persistence failed for ${job.name}: ${error.message}`, {
+          jobId: job.id,
+          runId: ctx.run.id,
+          status,
+        });
+      }
+    }
+  }
+
+  ctx.materializationCleanupResult = {
+    cleaned: lastError == null,
+    attempts,
+    error: lastError?.message || null,
+  };
+  return ctx.materializationCleanupResult.cleaned;
+}
+
 function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
   const {
     finishRun, persistV02Outcomes, releaseIdempotencyKey, updateJobAfterRun,
-    setDispatchStatus, handleTriggeredChildren, dequeueJob, log,
+    setDispatchStatus, handleTriggeredChildren, dequeueJob, log, getDb, updateJob,
+    transitionRunTerminal, completeRunFenced, commitCompletionBookkeeping,
+    shouldRunPostCompletionEffects,
   } = deps;
 
-  finishRun(run.id, 'error', {
-    summary,
-    error_message: summary,
-  });
-  persistV02Outcomes(run.id, redactOutcomesForPersistence(outcomes, deps));
-  if (state.idemKey) releaseIdempotencyKey(state.idemKey);
-  updateJobAfterRun(job, 'error');
-  if (state.dispatchRecord) setDispatchStatus(state.dispatchRecord.id, 'done');
-  // Security-related aborts (identity/trust/auth/proof/credential failures)
-  // should not fire child jobs -- a parent that failed a security gate must
-  // not trigger downstream work that may have weaker security requirements.
-  if (!opts.skipChildren) {
-    handleTriggeredChildren(job.id, 'error', summary, run.id);
-  }
-  if (dequeueJob(job.id)) {
-    log('info', `Dequeued pending dispatch for ${job.name}`);
-  }
+  const applyAbort = () => {
+    const fence = deps.dispatcherFence || null;
+    const completion = completeRunFenced && transitionRunTerminal
+      ? completeRunFenced({
+        runId: run.id,
+        status: 'error',
+        fields: { summary, error_message: summary },
+        ownerId: fence?.ownerId || null,
+        fencingToken: fence?.fencingToken || null,
+        transitionRunTerminal,
+      })
+      : (() => {
+        const finished = finishRun(run.id, 'error', { summary, error_message: summary });
+        return { changed: true, run: finished, cancelled: false, fenced: false };
+      })();
+    const allowEffects = shouldRunPostCompletionEffects
+      ? shouldRunPostCompletionEffects(completion)
+      : completion.changed && !completion.cancelled;
+    if (state.idemKey && !completion.fenced) releaseIdempotencyKey(state.idemKey);
+    if (!allowEffects) {
+      if (state.dispatchRecord) {
+        setDispatchStatus(state.dispatchRecord.id, completion.cancelled ? 'cancelled' : 'failed');
+      }
+      return { completion, dequeued: false };
+    }
+    persistV02Outcomes(run.id, redactOutcomesForPersistence(outcomes, deps));
+    updateJobAfterRun(job, 'error');
+    if (opts.disableJob && typeof updateJob === 'function') {
+      updateJob(job.id, { enabled: 0 });
+    }
+    if (state.dispatchRecord) setDispatchStatus(state.dispatchRecord.id, 'done');
+    if (!opts.skipChildren) handleTriggeredChildren(job.id, 'error', summary, run.id);
+    return { completion, dequeued: dequeueJob(job.id) };
+  };
+  const outcome = commitCompletionBookkeeping
+    ? commitCompletionBookkeeping(getDb(), applyAbort)
+    : applyAbort();
+  if (outcome.dequeued) log('info', `Dequeued pending dispatch for ${job.name}`);
   return null;
 }
 
@@ -248,121 +363,233 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     finishRun, updateIdempotencyResultHash, releaseIdempotencyKey,
     setAgentStatus, handleDelivery, shouldRetry, scheduleRetry,
     getDb, updateJobAfterRun, setDispatchStatus, handleTriggeredChildren,
-    dequeueJob, log,
+    dequeueJob, log, transitionRunTerminal, completeRunFenced,
+    commitCompletionBookkeeping, shouldRunPostCompletionEffects,
+    enqueueDispatch, getJob, getDispatchBacklogCount, sqliteNow,
+    releaseDispatch, updateJob,
   } = deps;
 
-  if (result.earlyReturn) return;
+  if (result.earlyReturn) {
+    await cleanupDispatchMaterialization(job, ctx, deps);
+    return;
+  }
 
-  // 1. Finish the run
-  finishRun(ctx.run.id, result.status, {
+  const materializationCleaned = await cleanupDispatchMaterialization(job, ctx, deps);
+  if (!materializationCleaned) {
+    const attempts = ctx.materializationCleanupResult?.attempts || 1;
+    const cleanupSummary = `Credential cleanup failed after ${attempts} attempt${attempts === 1 ? '' : 's'}`;
+    const existingContext = result.runFinishFields?.context_summary;
+    result = {
+      ...result,
+      status: 'error',
+      summary: cleanupSummary,
+      content: cleanupSummary,
+      errorMessage: cleanupSummary,
+      cleanupFailed: true,
+      skipChildren: true,
+      idemAction: 'release',
+      runFinishFields: {
+        ...result.runFinishFields,
+        context_summary: {
+          ...(existingContext && typeof existingContext === 'object' && !Array.isArray(existingContext)
+            ? existingContext
+            : {}),
+          credential_cleanup: {
+            status: 'failed',
+            attempts,
+            operator_action_required: true,
+          },
+        },
+      },
+    };
+  }
+
+  const finishFields = {
     summary: result.summary,
     error_message: result.errorMessage,
     ...result.runFinishFields,
-  });
-
-  // 1b. v0.2 evidence and outcome persistence
-  if (ctx.v02Outcomes) {
-    const { generateEvidence, persistV02Outcomes } = deps;
-    if (job.evidence || job.evidence_ref) {
-      const runMetadata = { id: ctx.run.id, status: result.status };
-      const evidence = generateEvidence(job, runMetadata, ctx.v02Outcomes);
-      if (evidence) ctx.v02Outcomes.evidence_record = evidence;
-    }
-    persistV02Outcomes(ctx.run.id, redactOutcomesForPersistence(ctx.v02Outcomes, deps));
-  }
-
-  // 1c. Provider cleanup
-  if (ctx.materializationCleanup) {
-    try {
-      const { provider, cleanupState } = ctx.materializationCleanup;
-      if (typeof provider.cleanup === 'function') {
-        await provider.cleanup(cleanupState, { env: process.env, cwd: process.cwd() });
-      }
-    } catch (err) {
-      log('warn', `Provider cleanup failed for ${job.name}: ${err.message}`, { jobId: job.id });
-    }
-  }
-
-  // 2. Idempotency key management
-  if (ctx.idemKey) {
-    if (result.idemAction === 'keep') {
-      updateIdempotencyResultHash(ctx.idemKey, result.content);
-    } else if (result.idemAction === 'release') {
-      releaseIdempotencyKey(ctx.idemKey);
-    }
-    // 'noop' -- leave key claimed without writing result hash
-  }
-
-  // 3. Agent status cleanup (only for strategies that set busy)
-  if (!result.skipAgentCleanup && job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
-
-  // 4. Delivery
-  if (!result.skipDelivery) {
+  };
+  const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
+  const enqueueCompletionDelivery = (retryScheduled) => {
+    if (result.skipDelivery) return null;
     const deliveryContent = result.deliveryOverride ?? result.content;
     const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
       && deliveryContent?.trim();
+    if (!shouldAnnounce) return null;
+    const jobWillBeDeleted = result.status === 'ok' && Boolean(job.delete_after_run);
+    const deliveryJob = jobWillBeDeleted ? { ...job, id: null } : job;
+    const deliveryOpts = {
+      ...(jobWillBeDeleted ? { eventId: `run:${ctx.run.id}` } : { runId: ctx.run.id }),
+      ...(result.imageAttachments?.length > 0
+        ? { imageAttachments: result.imageAttachments }
+        : {}),
+    };
+    if (result.deliveryOverride) {
+      return handleDelivery(deliveryJob, result.deliveryOverride, deliveryOpts);
+    }
+    if (result.status === 'error') {
+      const retryLabel = retryScheduled ? 'will retry' : 'no retry scheduled';
+      return handleDelivery(
+        deliveryJob,
+        `\u26a0\ufe0f Job soft-failed (${retryLabel}): ${job.name}\n\n${deliveryContent}`,
+        deliveryOpts,
+      );
+    }
+    return handleDelivery(deliveryJob, deliveryContent, deliveryOpts);
+  };
 
-    const deliveryOpts = result.imageAttachments?.length > 0
-      ? { imageAttachments: result.imageAttachments }
-      : {};
+  const performBookkeeping = () => {
+    const completion = completeRunFenced && transitionRunTerminal
+      ? completeRunFenced({
+        runId: ctx.run.id,
+        status: result.status,
+        fields: finishFields,
+        ownerId: fence?.ownerId || null,
+        fencingToken: fence?.fencingToken || null,
+        transitionRunTerminal,
+      })
+      : (() => {
+        const run = finishRun(ctx.run.id, result.status, finishFields);
+        return { changed: true, run, status: run?.status || result.status, cancelled: false, fenced: false };
+      })();
+    const runPostCompletionEffects = shouldRunPostCompletionEffects
+      ? shouldRunPostCompletionEffects(completion)
+      : completion.changed && !completion.cancelled;
 
-    if (shouldAnnounce) {
-      if (result.deliveryOverride) {
-        await handleDelivery(job, result.deliveryOverride, deliveryOpts);
-      } else if (result.status === 'error') {
-        const willRetry = (job.max_retries ?? 0) > 0 && (ctx.run.retry_count || 0) < job.max_retries;
-        const retryLabel = willRetry ? 'will retry' : 'no retries configured';
-        await handleDelivery(job, `\u26a0\ufe0f Job soft-failed (${retryLabel}): ${job.name}\n\n${deliveryContent}`, deliveryOpts);
-      } else {
-        await handleDelivery(job, deliveryContent, deliveryOpts);
+    if (!runPostCompletionEffects) {
+      if (ctx.idemKey && !completion.fenced) releaseIdempotencyKey(ctx.idemKey);
+      if (!completion.fenced && !result.skipAgentCleanup && job.agent_id) {
+        setAgentStatus(job.agent_id, 'idle', null);
+      }
+      if (ctx.dispatchRecord) {
+        setDispatchStatus(ctx.dispatchRecord.id, completion.cancelled ? 'cancelled' : 'failed', {
+          lastError: completion.cancelled ? 'Run cancelled' : 'Run completion lost dispatcher fence',
+        });
+      }
+      return { completion, suppressed: true, retry: null, drainDispatch: null, dequeued: false };
+    }
+
+    if (ctx.v02Outcomes) {
+      const { generateEvidence, persistV02Outcomes } = deps;
+      if (job.evidence || job.evidence_ref) {
+        const runMetadata = { id: ctx.run.id, status: result.status };
+        const evidence = generateEvidence(job, runMetadata, ctx.v02Outcomes);
+        if (evidence) ctx.v02Outcomes.evidence_record = evidence;
+      }
+      persistV02Outcomes(ctx.run.id, redactOutcomesForPersistence(ctx.v02Outcomes, deps));
+    }
+
+    if (ctx.idemKey) {
+      if (result.idemAction === 'keep') updateIdempotencyResultHash(ctx.idemKey, result.content);
+      else if (result.idemAction === 'release') releaseIdempotencyKey(ctx.idemKey);
+    }
+    if (!result.skipAgentCleanup && job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
+
+    if (result.deferUntil) {
+      if (ctx.dispatchRecord) releaseDispatch(ctx.dispatchRecord.id, result.deferUntil);
+      else updateJob(job.id, { next_run_at: result.deferUntil });
+      return {
+        completion,
+        suppressed: false,
+        retry: null,
+        drainDispatch: null,
+        dequeued: false,
+        delivery: null,
+        deferred: true,
+      };
+    }
+
+    if (result.drainRetry) {
+      const freshJob = getJob(job.id);
+      const canDrainRetry = freshJob && freshJob.enabled
+        && (ctx.run.retry_count || 0) < 1
+        && !(freshJob.overlap_policy === 'skip' && getDispatchBacklogCount(job.id) > 0);
+      let drainDispatch = null;
+      if (canDrainRetry) {
+        drainDispatch = enqueueDispatch(job.id, {
+          kind: 'retry',
+          scheduled_for: sqliteNow(90000),
+          source_run_id: ctx.run.id,
+          retry_of_run_id: ctx.run.id,
+        });
+        getDb().prepare('UPDATE runs SET retry_count = 1 WHERE id = ?').run(ctx.run.id);
+      }
+      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
+      return {
+        completion,
+        suppressed: false,
+        retry: null,
+        drainDispatch,
+        dequeued: !result.skipDequeue && dequeueJob(job.id),
+        delivery: null,
+      };
+    }
+
+    if (result.status === 'error' && !result.cleanupFailed && shouldRetry(job, ctx.run.id)) {
+      const retry = scheduleRetry(job, ctx.run.id);
+      if (retry.dispatch) {
+        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
+        if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
+        const dequeued = !result.skipDequeue && dequeueJob(job.id);
+        if (result.retryFiresChildren && !result.skipChildren) {
+          handleTriggeredChildren(job.id, 'error', result.content, ctx.run.id, ' on soft failure');
+        }
+        const delivery = enqueueCompletionDelivery(true);
+        return { completion, suppressed: false, retry, drainDispatch: null, dequeued, delivery };
       }
     }
+
+    if (!result.skipJobUpdate) updateJobAfterRun(job, result.status);
+    if (result.cleanupFailed) {
+      updateJob(job.id, { enabled: 0 });
+    }
+    if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
+    if (!result.skipChildren) {
+      handleTriggeredChildren(job.id, result.status, result.content, ctx.run.id);
+    }
+    const dequeued = !result.skipDequeue && dequeueJob(job.id);
+    const delivery = enqueueCompletionDelivery(false);
+    return { completion, suppressed: false, retry: null, drainDispatch: null, dequeued, delivery };
+  };
+
+  const bookkeeping = commitCompletionBookkeeping
+    ? commitCompletionBookkeeping(getDb(), performBookkeeping)
+    : performBookkeeping();
+
+  if (bookkeeping.suppressed) {
+    log(bookkeeping.completion.cancelled ? 'info' : 'warn',
+      bookkeeping.completion.cancelled
+        ? `Suppressed post-run effects for cancelled job: ${job.name}`
+        : `Suppressed post-run effects after completion fence loss: ${job.name}`,
+      { runId: ctx.run.id, jobId: job.id });
+    await cleanupDispatchMaterialization(job, ctx, deps);
+    return;
   }
 
-  // 5. Retry on error
-  if (result.status === 'error' && shouldRetry(job, ctx.run.id)) {
-    const retry = scheduleRetry(job, ctx.run.id);
-    if (retry.dispatch) {
-      log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
-        jobId: job.id, runId: ctx.run.id,
-      });
-      getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
-      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-      if (!result.skipDequeue && dequeueJob(job.id)) {
-        log('info', `Dequeued pending dispatch for ${job.name}`);
-      }
-      if (result.retryFiresChildren && !result.skipChildren) {
-        handleTriggeredChildren(job.id, 'error', result.content, ctx.run.id, ' on soft failure');
-      }
-      log('info', `Failed: ${job.name} (retry scheduled)`, { runId: ctx.run.id });
-      return; // retry path handles everything
-    }
+  if (bookkeeping.dequeued) log('info', `Dequeued pending dispatch for ${job.name}`);
+  if (bookkeeping.drainDispatch) {
+    log('info', `[drain-retry] scheduling retry for ${job.name} in 90s`, {
+      jobId: job.id,
+      runId: ctx.run.id,
+      dispatchId: bookkeeping.drainDispatch.id,
+    });
+  } else if (result.drainRetry) {
+    log('info', `[drain-retry] retry not scheduled for ${job.name}`, {
+      jobId: job.id,
+      runId: ctx.run.id,
+    });
+  } else if (bookkeeping.retry) {
+    log('info', `Scheduling retry ${bookkeeping.retry.retryCount}/${job.max_retries} in ${bookkeeping.retry.delaySec}s`, {
+      jobId: job.id, runId: ctx.run.id,
+    });
+    log('info', `Failed: ${job.name} (retry scheduled)`, { runId: ctx.run.id });
+  } else if (result.status === 'error' && !result.cleanupFailed && shouldRetry(job, ctx.run.id)) {
     log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
       jobId: job.id, runId: ctx.run.id,
       maxQueuedDispatches: job.max_queued_dispatches || 25,
     });
-    // Fall through to steps 6-9: updateJobAfterRun, dispatch status, children, dequeue
   }
-
-  // 6. Update job state
-  if (!result.skipJobUpdate) {
-    updateJobAfterRun(job, result.status);
-  }
-
-  // 7. Complete dispatch
-  if (ctx.dispatchRecord) {
-    setDispatchStatus(ctx.dispatchRecord.id, 'done');
-  }
-
-  // 8. Triggered children
-  if (!result.skipChildren) {
-    handleTriggeredChildren(job.id, result.status, result.content, ctx.run.id);
-  }
-
-  // 9. Dequeue overlap
-  if (!result.skipDequeue && dequeueJob(job.id)) {
-    log('info', `Dequeued pending dispatch for ${job.name}`);
-  }
+  await cleanupDispatchMaterialization(job, ctx, deps);
 }
 
 // -- Phase 1: Guards + run creation --------------------------
@@ -391,7 +618,9 @@ export async function prepareDispatch(job, opts, deps) {
   const {
     claimDispatch, releaseDispatch, setDispatchStatus,
     countPendingApprovalsForJob, getPendingApproval,
-    createApproval, createRun, getRun,
+    createApproval, getApprovalForDispatch, beginApprovalDispatch,
+    markApprovalDispatched, cancelApprovalForDispatch,
+    createRun, getRun,
     hasRunningRunForPool, hasRunningRun,
     enqueueJob, getDispatchBacklogCount,
     generateIdempotencyKey, generateChainIdempotencyKey,
@@ -399,12 +628,17 @@ export async function prepareDispatch(job, opts, deps) {
     finishRun, getDb,
     sqliteNow, adaptiveDeferralMs,
     handleDelivery, advanceNextRun,
+    updateJobAfterRun,
     TICK_INTERVAL_MS,
     log,
+    evaluateGovernance = () => ({ allowed: true, violations: [], warnings: [] }),
+    buildShellEnvironment = (_job, materializedEnv) => materializedEnv || null,
+    summarizeGovernance = () => null,
   } = deps;
 
-  const approvalBypass = opts.approvalBypass === true;
+  let approvalBypass = opts.approvalBypass === true;
   let dispatchRecord = opts.dispatchRecord || null;
+  let approvedGate = null;
 
   // Claim pending dispatch
   if (dispatchRecord && dispatchRecord.status === 'pending') {
@@ -415,9 +649,26 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
+  if (dispatchRecord && getApprovalForDispatch) {
+    approvedGate = getApprovalForDispatch(dispatchRecord.id);
+    if (approvedGate?.status === 'approved') approvalBypass = true;
+  }
+
   const completeCurrentDispatch = (status = 'done') => {
     if (!dispatchRecord) return null;
     return setDispatchStatus(dispatchRecord.id, status);
+  };
+
+  const hasCurrentDispatchClaim = () => {
+    if (!dispatchRecord) return true;
+    const current = getDb().prepare(`
+      SELECT status, claim_owner, claim_token
+      FROM job_dispatch_queue
+      WHERE id = ?
+    `).get(dispatchRecord.id);
+    if (!current || current.status !== 'claimed') return false;
+    return (current.claim_owner ?? null) === (dispatchRecord.claim_owner ?? null)
+      && (current.claim_token ?? null) === (dispatchRecord.claim_token ?? null);
   };
 
   const dispatchKind = dispatchRecord?.dispatch_kind || null;
@@ -446,18 +697,41 @@ export async function prepareDispatch(job, opts, deps) {
       });
       return null;
     }
-    const run = createRun(job.id, {
-      run_timeout_ms: job.run_timeout_ms,
-      status: 'awaiting_approval',
-      dispatch_queue_id: dispatchRecord?.id || null,
-      triggered_by_run: dispatchRecord?.source_run_id || null,
-      retry_of: dispatchRecord?.retry_of_run_id || null,
-    });
-    const approval = createApproval(job.id, run.id, dispatchRecord?.id || null);
-    if (dispatchRecord) setDispatchStatus(dispatchRecord.id, 'awaiting_approval');
+    const pendingGate = getDb().transaction(() => {
+      if (!hasCurrentDispatchClaim()) return null;
+      const run = createRun(job.id, {
+        run_timeout_ms: job.run_timeout_ms,
+        status: 'awaiting_approval',
+        dispatch_queue_id: dispatchRecord?.id || null,
+        triggered_by_run: dispatchRecord?.source_run_id || null,
+        retry_of: dispatchRecord?.retry_of_run_id || null,
+      });
+      const approval = createApproval(job.id, run.id, dispatchRecord?.id || null);
+      if (dispatchRecord && !setDispatchStatus(dispatchRecord.id, 'awaiting_approval')) {
+        throw new Error('Dispatch claim changed before approval gate creation');
+      }
+      return { run, approval };
+    }).immediate();
+    if (!pendingGate) {
+      log('info', `Skipping ${job.name} -- dispatch was cancelled before approval gate creation`, {
+        jobId: job.id,
+        dispatchId: dispatchRecord?.id || null,
+      });
+      return null;
+    }
+    const { run, approval } = pendingGate;
     log('info', `Approval required for ${job.name} -- awaiting operator`, { approvalId: approval.id, runId: run.id });
     const msg = `\u26a0\ufe0f Job '${job.name}' requires approval.\nApprove: openclaw-scheduler jobs approve ${job.id}\nReject: openclaw-scheduler jobs reject ${job.id}`;
-    await handleDelivery({ ...job, delivery_mode: 'announce-always' }, msg);
+    const notification = getDb().transaction(() => {
+      const currentApproval = getDb().prepare('SELECT status FROM approvals WHERE id = ?').get(approval.id);
+      if (currentApproval?.status !== 'pending') return null;
+      return handleDelivery(
+        { ...job, delivery_mode: 'announce-always' },
+        msg,
+        { db: getDb(), eventId: approval.id },
+      );
+    }).immediate();
+    await notification;
     return null;
   }
 
@@ -477,13 +751,27 @@ export async function prepareDispatch(job, opts, deps) {
     if (job.overlap_policy === 'skip') {
       log('info', `Skipping ${job.name} -- previous run still active`, { jobId: job.id });
       if (dispatchRecord) {
-        completeCurrentDispatch('cancelled');
+        if (approvedGate && cancelApprovalForDispatch) {
+          cancelApprovalForDispatch(dispatchRecord.id, 'Approved dispatch skipped because a previous run is still active');
+        } else {
+          completeCurrentDispatch('cancelled');
+        }
+        if (dispatchKind === 'schedule') advanceNextRun(job);
+        if (dispatchKind === 'at') updateJobAfterRun(job, 'skipped');
       } else {
         advanceNextRun(job);
       }
       return null;
     }
     if (job.overlap_policy === 'queue') {
+      if (dispatchRecord) {
+        releaseDispatch(dispatchRecord.id, sqliteNow(adaptiveDeferralMs(dispatchBacklogDepth)));
+        log('info', `Deferring durable dispatch for ${job.name} until the active run completes`, {
+          jobId: job.id,
+          dispatchId: dispatchRecord.id,
+        });
+        return null;
+      }
       const queueResult = enqueueJob(job.id);
       if (!queueResult.queued) {
         log('warn', `Queue limit reached for ${job.name} -- dropping overlap dispatch`, {
@@ -513,7 +801,7 @@ export async function prepareDispatch(job, opts, deps) {
   }
 
   // Idempotency key generation
-  const scheduledTime = job.schedule_at || job.next_run_at;
+  const scheduledTime = dispatchRecord?.scheduled_for || job.schedule_at || job.next_run_at;
   let idemKey;
   if (dispatchKind === 'chain') {
     idemKey = generateChainIdempotencyKey(dispatchRecord.source_run_id || dispatchRecord.id, job.id);
@@ -531,7 +819,17 @@ export async function prepareDispatch(job, opts, deps) {
     if (existing) {
       log('info', `Idempotency skip: ${job.name} (key ${idemKey.slice(0,8)}... already claimed by run ${existing.run_id.slice(0,8)}...)`);
       if (dispatchRecord) {
+        if (approvedGate && beginApprovalDispatch && markApprovalDispatched) {
+          const begun = beginApprovalDispatch(dispatchRecord.id);
+          if (begun.changed) {
+            markApprovalDispatched(dispatchRecord.id, { notes: 'Dispatch deduplicated by idempotency key' });
+          } else if (cancelApprovalForDispatch) {
+            cancelApprovalForDispatch(dispatchRecord.id, 'Approved dispatch deduplicated by idempotency key');
+          }
+        }
         completeCurrentDispatch('done');
+        if (dispatchKind === 'schedule') advanceNextRun(job);
+        if (dispatchKind === 'at') updateJobAfterRun(job, 'skipped');
       } else {
         advanceNextRun(job);
       }
@@ -545,7 +843,8 @@ export async function prepareDispatch(job, opts, deps) {
     ? (getRun(dispatchRecord.retry_of_run_id)?.retry_count || 0)
     : 0;
 
-  const run = createRun(job.id, {
+  let run;
+  const createExecutionRun = () => createRun(job.id, {
     run_timeout_ms: job.run_timeout_ms,
     idempotency_key: idemKey,
     retry_count: retryCount,
@@ -553,6 +852,74 @@ export async function prepareDispatch(job, opts, deps) {
     triggered_by_run: dispatchRecord?.source_run_id || null,
     retry_of: dispatchRecord?.retry_of_run_id || null,
   });
+
+  if (approvedGate && dispatchRecord) {
+    try {
+      run = getDb().transaction(() => {
+        if (!hasCurrentDispatchClaim()) {
+          throw new Error('Approved dispatch claim changed before execution run creation');
+        }
+        const begin = beginApprovalDispatch(dispatchRecord.id, { db: getDb() });
+        if (!begin.changed) {
+          throw new Error(`Approval dispatch could not begin: ${begin.reason}`);
+        }
+        const currentJob = getDb().prepare('SELECT enabled FROM jobs WHERE id = ?').get(job.id);
+        if (!currentJob || currentJob.enabled !== 1) {
+          throw new Error('Approved job became unavailable before execution run creation');
+        }
+        const created = createExecutionRun();
+        const marked = markApprovalDispatched(dispatchRecord.id, {
+          db: getDb(),
+          notes: `Execution run ${created.id} created`,
+        });
+        if (!marked.changed && marked.reason !== 'already_dispatched') {
+          throw new Error(`Approval dispatch could not be finalized: ${marked.reason}`);
+        }
+        return created;
+      }).immediate();
+    } catch (err) {
+      releaseDispatch(
+        dispatchRecord.id,
+        sqliteNow(adaptiveDeferralMs(dispatchBacklogDepth)),
+        { lastError: err.message },
+      );
+      log('warn', `Approved dispatch deferred for ${job.name}: ${err.message}`, {
+        jobId: job.id,
+        dispatchId: dispatchRecord.id,
+      });
+      return null;
+    }
+  } else if (dispatchRecord) {
+    run = getDb().transaction(() => {
+      if (!hasCurrentDispatchClaim()) return null;
+      return createExecutionRun();
+    }).immediate();
+  } else {
+    run = createExecutionRun();
+  }
+
+  if (!run) {
+    log('info', `Skipping ${job.name} -- dispatch was cancelled before execution run creation`, {
+      jobId: job.id,
+      dispatchId: dispatchRecord?.id || null,
+    });
+    return null;
+  }
+
+  if (deps.dispatcherFence) {
+    const ownedRun = deps.claimRunForDispatch(run.id, deps.dispatcherFence);
+    if (!ownedRun) {
+      log('warn', `Run ownership claim failed for ${job.name}`, { runId: run.id, jobId: job.id });
+      finishRun(run.id, 'error', {
+        summary: 'Run ownership claim failed',
+        error_message: 'Run ownership claim failed',
+      });
+      if (dispatchRecord) completeCurrentDispatch('failed');
+      return null;
+    }
+    run = ownedRun;
+  }
+  deps.onRunPrepared?.(run);
 
   // Claim idempotency key
   if (idemKey) {
@@ -570,6 +937,42 @@ export async function prepareDispatch(job, opts, deps) {
       }
       return null;
     }
+  }
+
+  const abortPreparationIfCancelled = (outcomes = {}) => {
+    if (!deps.isRunCancellationRequested?.(run.id)) return false;
+    const currentRun = getRun(run.id);
+    const reason = currentRun?.cancel_reason || 'Run cancelled during preparation';
+    abortPreparedRun(
+      job,
+      run,
+      reason,
+      outcomes,
+      { dispatchRecord, idemKey },
+      deps,
+      { skipChildren: true },
+    );
+    return true;
+  };
+
+  if (abortPreparationIfCancelled()) return null;
+
+  // Governance fields are execution contracts, not annotations. Reject any
+  // policy the runtime cannot enforce before credentials or user code run.
+  const governanceDecision = evaluateGovernance(job);
+  if (!governanceDecision.allowed) {
+    return abortPreparedRun(
+      job,
+      run,
+      `Governance policy denied execution: ${governanceDecision.violations.join('; ')}`,
+      { evidence_record: { governance: summarizeGovernance(governanceDecision) } },
+      { dispatchRecord, idemKey },
+      deps,
+      { skipChildren: true },
+    );
+  }
+  for (const warning of governanceDecision.warnings) {
+    log('warn', `Governance warning for ${job.name}: ${warning}`, { jobId: job.id, runId: run.id });
   }
 
   // v0.2 runtime evaluation
@@ -595,6 +998,7 @@ export async function prepareDispatch(job, opts, deps) {
 
   if (shouldResolveIdentity) {
     v02Outcomes.identity_resolved = await resolveIdentity(job, providerCtx);
+    if (abortPreparationIfCancelled(v02Outcomes)) return null;
   }
 
   if (hasV02Identity) {
@@ -772,6 +1176,8 @@ export async function prepareDispatch(job, opts, deps) {
     );
   }
 
+  if (abortPreparationIfCancelled(v02Outcomes)) return null;
+
   if (hasV02Identity || hasV02Contract || v02Outcomes.identity_resolved != null) {
     v02Outcomes.trust_evaluation = evaluateTrust(job, v02Outcomes.identity_resolved);
     if (v02Outcomes.trust_evaluation?.decision === 'warn') {
@@ -795,6 +1201,7 @@ export async function prepareDispatch(job, opts, deps) {
 
   if (job.authorization_proof || job.authorization_proof_ref) {
     v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
+    if (abortPreparationIfCancelled(v02Outcomes)) return null;
     if (v02Outcomes.authorization_proof_verification?.verified === false) {
       const proofError = v02Outcomes.authorization_proof_verification.error || 'verification returned false';
       // Proof verification failure is blocking: the job declared a proof
@@ -815,6 +1222,7 @@ export async function prepareDispatch(job, opts, deps) {
     v02Outcomes.authorization_decision = await evaluateAuthorization(
       job, v02Outcomes.identity_resolved, v02Outcomes.trust_evaluation, providerCtx
     );
+    if (abortPreparationIfCancelled(v02Outcomes)) return null;
 
     if (v02Outcomes.authorization_decision?.decision === 'deny') {
       return abortPreparedRun(
@@ -845,9 +1253,12 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
+  if (abortPreparationIfCancelled(v02Outcomes)) return null;
+
   // Materialization phase
   let materializedEnv = null;
   let materializationCleanup = null;
+  let credentialCleanupTracked = false;
 
   if (v02Outcomes.identity_resolved?.source === 'provider' && v02Outcomes.identity_resolved.session) {
     const providerName = v02Outcomes.identity_resolved.provider;
@@ -857,6 +1268,24 @@ export async function prepareDispatch(job, opts, deps) {
     const hasPresentation = presentation && Object.keys(presentation).length > 0;
 
     if (provider && typeof provider.materialize === 'function') {
+      if (typeof deps.recordRunCredentialCleanupState === 'function' && deps.dispatcherFence) {
+        const tracked = deps.recordRunCredentialCleanupState(run.id, {
+          status: 'pending',
+          attempts: 0,
+        }, deps.dispatcherFence);
+        if (!tracked) {
+          return abortPreparedRun(
+            job,
+            run,
+            'Dispatcher ownership changed before credential materialization',
+            v02Outcomes,
+            { dispatchRecord, idemKey },
+            deps,
+            { skipChildren: true },
+          );
+        }
+        credentialCleanupTracked = true;
+      }
       try {
         const matResult = await provider.materialize(
           v02Outcomes.identity_resolved.session,
@@ -883,25 +1312,36 @@ export async function prepareDispatch(job, opts, deps) {
             v02Outcomes,
             { dispatchRecord, idemKey },
             deps,
-            { skipChildren: true },
+            { skipChildren: true, disableJob: true },
           );
         }
       } catch (err) {
-        if (hasPresentation) {
-          return abortPreparedRun(
-            job,
-            run,
-            `Credential materialization error for provider ${providerName}: ${err.message}`,
-            v02Outcomes,
-            { dispatchRecord, idemKey },
-            deps,
-            { skipChildren: true },
-          );
+        if (credentialCleanupTracked) {
+          try {
+            deps.recordRunCredentialCleanupState(run.id, {
+              status: 'failed',
+              attempts: 1,
+              error: err.message,
+            }, {
+              ...deps.dispatcherFence,
+              allowAfterLeaseLoss: true,
+            });
+          } catch (recordError) {
+            log('error', `Credential materialization failure state could not be persisted for ${job.name}: ${recordError.message}`, {
+              jobId: job.id,
+              runId: run.id,
+            });
+          }
         }
-        // No presentation declared: provider materializes opportunistically.
-        // Warn and continue -- the shell job can still run without injected
-        // credentials when the identity blob has no presentation block.
-        log('warn', `Materialization failed for ${job.name}: ${err.message}`, { jobId: job.id });
+        return abortPreparedRun(
+          job,
+          run,
+          `Credential materialization error for provider ${providerName}: ${err.message}`,
+          v02Outcomes,
+          { dispatchRecord, idemKey },
+          deps,
+          { skipChildren: true, disableJob: true },
+        );
       }
     } else if (hasPresentation) {
       // Job declared credential presentation but provider has no materialize method
@@ -917,16 +1357,41 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
-  return { dispatchRecord, idemKey, run, retryCount, dispatchKind, isChainDispatch, v02Outcomes, materializedEnv, materializationCleanup };
+  const executionEnv = job.session_target === 'shell' || job.job_type === 'watchdog'
+    ? buildShellEnvironment(job, materializedEnv)
+    : null;
+
+  return {
+    dispatchRecord,
+    idemKey,
+    run,
+    retryCount,
+    dispatchKind,
+    isChainDispatch,
+    v02Outcomes,
+    materializedEnv,
+    materializationCleanup,
+    credentialCleanupTracked,
+    executionEnv,
+    governanceDecision,
+    dispatcherFence: deps.dispatcherFence || null,
+  };
 }
 
 // -- Strategy: Watchdog --------------------------------------
 
 export async function executeWatchdog(job, ctx, deps) {
-  const { runShellCommand, handleDelivery, updateJob, deleteJob, log } = deps;
+  const {
+    runShellCommand, handleDelivery, updateJob, deleteJob, log,
+    summarizeGovernance = () => null,
+    recordRunProcess, recordRunProcessTerminated, isRunCancellationRequested,
+  } = deps;
   const result = makeDefaultResult();
   result.skipChildren = true;
   result.skipDequeue = true;
+  result.runFinishFields = {
+    context_summary: { governance: summarizeGovernance(ctx.governanceDecision) },
+  };
 
   const checkCmd = job.watchdog_check_cmd;
   if (!checkCmd) {
@@ -936,7 +1401,27 @@ export async function executeWatchdog(job, ctx, deps) {
     return result;
   }
 
-  const shellExec = await runShellCommand(checkCmd, Math.min(job.run_timeout_ms || 300000, 60000));
+  if (isRunCancellationRequested?.(ctx.run.id)) {
+    throw new Error('Run cancelled before watchdog process start');
+  }
+  const shellExec = await runShellCommand(
+    checkCmd,
+    Math.min(job.run_timeout_ms || 300000, 60000),
+    ctx.executionEnv || null,
+    {
+      signal: ctx.abortSignal || null,
+      envPolicy: job.shell_env_policy || 'minimal',
+      onProcess: processInfo => {
+        if (!recordRunProcess) return;
+        const recorded = recordRunProcess(ctx.run.id, processInfo, ctx.dispatcherFence || {});
+        if (!recorded) throw new Error('Run ownership or cancellation changed before watchdog process start');
+      },
+      onProcessTerminated: () => recordRunProcessTerminated?.(
+        ctx.run.id,
+        ctx.dispatcherFence || {},
+      ),
+    },
+  );
   const exitCode = shellExec.exitCode;
   const stdout = (shellExec.stdout || '').trim();
   const stderr = (shellExec.stderr || '').trim();
@@ -979,7 +1464,7 @@ export async function executeWatchdog(job, ctx, deps) {
         delivery_mode: 'announce-always',
         delivery_channel: job.watchdog_alert_channel,
         delivery_to: job.watchdog_alert_target,
-      }, completionMsg);
+      }, completionMsg, ctx.run?.id ? { runId: ctx.run.id } : {});
     }
     result.skipDelivery = true;
 
@@ -1016,7 +1501,7 @@ export async function executeWatchdog(job, ctx, deps) {
         delivery_mode: 'announce-always',
         delivery_channel: job.watchdog_alert_channel,
         delivery_to: job.watchdog_alert_target,
-      }, alertMsg);
+      }, alertMsg, ctx.run?.id ? { runId: ctx.run.id } : {});
     }
     result.skipDelivery = true;
 
@@ -1120,10 +1605,33 @@ function buildCompletionWatcherNoPayloadMessage(job, shellResult) {
 }
 
 export async function executeShell(job, ctx, deps) {
-  const { runShellCommand, normalizeShellResult, log } = deps;
+  const {
+    runShellCommand, normalizeShellResult, log, summarizeGovernance = () => null,
+    recordRunProcess, recordRunProcessTerminated, isRunCancellationRequested,
+  } = deps;
   const result = makeDefaultResult();
 
-  const shellExec = await runShellCommand(job.payload_message, job.run_timeout_ms, ctx.materializedEnv || null);
+  if (isRunCancellationRequested?.(ctx.run.id)) {
+    throw new Error('Run cancelled before shell process start');
+  }
+  const shellExec = await runShellCommand(
+    job.payload_message,
+    job.run_timeout_ms,
+    ctx.executionEnv || null,
+    {
+      signal: ctx.abortSignal || null,
+      envPolicy: job.shell_env_policy || 'minimal',
+      onProcess: processInfo => {
+        if (!recordRunProcess) return;
+        const recorded = recordRunProcess(ctx.run.id, processInfo, ctx.dispatcherFence || {});
+        if (!recorded) throw new Error('Run ownership or cancellation changed before shell process start');
+      },
+      onProcessTerminated: () => recordRunProcessTerminated?.(
+        ctx.run.id,
+        ctx.dispatcherFence || {},
+      ),
+    },
+  );
   const shellResult = normalizeShellResult(shellExec, {
     runId: ctx.run.id,
     timeoutMs: job.run_timeout_ms,
@@ -1141,7 +1649,10 @@ export async function executeShell(job, ctx, deps) {
     result.imageAttachments = shellResult.imageAttachments;
   }
   result.runFinishFields = {
-    context_summary: shellResult.contextSummary,
+    context_summary: {
+      ...shellResult.contextSummary,
+      governance: summarizeGovernance(ctx.governanceDecision),
+    },
     shell_exit_code: shellResult.exitCode,
     shell_signal: shellResult.signal,
     shell_timed_out: shellResult.timedOut,
@@ -1266,7 +1777,7 @@ async function resolveConfiguredAuthProfile(authProfile, deps, jobId, fieldName 
   return resolvedAuthProfile;
 }
 
-async function runAgentTurnForSelection(job, deps, prompt, sessionKey, selection, dispatchAgentTurn) {
+async function runAgentTurnForSelection(job, deps, prompt, sessionKey, selection, dispatchAgentTurn, signal = null) {
   const { log } = deps;
   const { syncAuthStoreToSession: syncAuth, applySessionOverridesToSessionStore: applySessionOverrides } = deps;
 
@@ -1309,38 +1820,44 @@ async function runAgentTurnForSelection(job, deps, prompt, sessionKey, selection
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
     pollIntervalMs: 60000,
     absoluteTimeoutMs: job.run_timeout_ms || 300000,
+    signal,
+    cancelOnAbort: false,
   });
 }
 
 export async function executeAgent(job, ctx, deps) {
   const {
     waitForGateway, updateRunSession, setAgentStatus,
-    buildJobPrompt, runAgentTurnWithActivityTimeout,
+    buildJobPrompt,
+    ackClaimedInboxForRun = (_runId, ids) => ({ acked: ids.length, messages: [] }),
+    runAgentTurnWithActivityTimeout,
     // Sanctioned isolated dispatch primitive. Falls back to the activity-aware
     // runner when callers (e.g. tests) wire only the older name -- both helpers
     // share the same HTTP-only contract, no subprocess spawn.
     runIsolatedAgentTurn,
-    updateContextSummary, releaseDispatch, releaseIdempotencyKey,
-    updateJob, matchesSentinel, detectTransientError,
-    sqliteNow, log,
+    updateContextSummary, matchesSentinel, detectTransientError,
+    sqliteNow, log, summarizeGovernance = () => null,
+    isRunCancellationRequested,
   } = deps;
   const dispatchAgentTurn = runIsolatedAgentTurn || runAgentTurnWithActivityTimeout;
   const result = makeDefaultResult();
+
+  if (isRunCancellationRequested?.(ctx.run.id)) {
+    throw new Error('Run cancelled before agent dispatch');
+  }
 
   // Gateway health check
   const gatewayReady = await waitForGateway(30000, 2000);
   if (!gatewayReady) {
     log('warn', `Gateway unavailable after 30s -- deferring: ${job.name}`, { jobId: job.id });
-    // Strategy handles everything for the gateway-down case
-    deps.finishRun(ctx.run.id, 'error', { error_message: 'Gateway unavailable -- deferred' });
-    if (ctx.idemKey) releaseIdempotencyKey(ctx.idemKey);
-    const deferredAt = sqliteNow(60000);
-    if (ctx.dispatchRecord) {
-      releaseDispatch(ctx.dispatchRecord.id, deferredAt);
-    } else {
-      updateJob(job.id, { next_run_at: deferredAt });
-    }
-    result.earlyReturn = true;
+    result.status = 'error';
+    result.summary = 'Gateway unavailable -- deferred';
+    result.errorMessage = 'Gateway unavailable -- deferred';
+    result.idemAction = 'release';
+    result.skipDelivery = true;
+    result.skipJobUpdate = true;
+    result.skipChildren = true;
+    result.deferUntil = sqliteNow(60000);
     return result;
   }
 
@@ -1358,7 +1875,9 @@ export async function executeAgent(job, ctx, deps) {
   if (job.agent_id) setAgentStatus(job.agent_id, 'busy', sessionKey);
 
   // Build prompt and collect context metadata
-  const { prompt, contextMeta } = buildJobPrompt(job, ctx.run);
+  const { prompt, contextMeta, injectedMessageIds = [] } = buildJobPrompt(job, ctx.run);
+  ctx.promptClaimedMessageIds = injectedMessageIds;
+  contextMeta.governance = summarizeGovernance(ctx.governanceDecision);
   try { updateContextSummary(ctx.run.id, contextMeta); } catch (_e) { /* column may not exist yet */ }
 
   const primarySelection = {
@@ -1380,7 +1899,18 @@ export async function executeAgent(job, ctx, deps) {
 
   let turnResult;
   try {
-    turnResult = await runAgentTurnForSelection(job, deps, prompt, sessionKey, primarySelection, dispatchAgentTurn);
+    if (isRunCancellationRequested?.(ctx.run.id)) {
+      throw new Error('Run cancelled before agent turn start');
+    }
+    turnResult = await runAgentTurnForSelection(
+      job,
+      deps,
+      prompt,
+      sessionKey,
+      primarySelection,
+      dispatchAgentTurn,
+      ctx.abortSignal || null,
+    );
   } catch (primaryError) {
     const canTryConfiguredFallback = fallbackSelection && !sameAgentSelection(primarySelection, fallbackSelection);
     if (!canTryConfiguredFallback) throw primaryError;
@@ -1393,11 +1923,31 @@ export async function executeAgent(job, ctx, deps) {
     });
 
     try {
-      turnResult = await runAgentTurnForSelection(job, deps, prompt, sessionKey, fallbackSelection, dispatchAgentTurn);
+      turnResult = await runAgentTurnForSelection(
+        job,
+        deps,
+        prompt,
+        sessionKey,
+        fallbackSelection,
+        dispatchAgentTurn,
+        ctx.abortSignal || null,
+      );
       log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });
     } catch (fallbackError) {
       throw new Error(`Primary agent selection failed: ${primaryError.message}; configured fallback also failed: ${fallbackError.message}`, { cause: fallbackError });
     }
+  }
+
+  // Acknowledge inbox messages only after the gateway accepted and completed
+  // the turn. Failed turns leave them pending for a later retry.
+  if (injectedMessageIds.length > 0) {
+    const acknowledged = ackClaimedInboxForRun(ctx.run.id, injectedMessageIds);
+    if (acknowledged.acked !== injectedMessageIds.length) {
+      throw new Error(
+        `Inbox claim acknowledgement mismatch: expected ${injectedMessageIds.length}, acknowledged ${acknowledged.acked}`,
+      );
+    }
+    ctx.promptClaimedMessageIds = [];
   }
 
   const content = turnResult.content || '';
@@ -1449,106 +1999,31 @@ export async function executeAgent(job, ctx, deps) {
 // -- Strategy dispatcher with error-catch wrapper ------------
 
 export async function executeStrategy(job, ctx, deps) {
-  const { handleDelivery, log } = deps;
+  const { log } = deps;
   try {
+    if (deps.isRunCancellationRequested?.(ctx.run.id)) {
+      throw new Error('Run cancelled before execution');
+    }
     if (job.job_type === 'watchdog') return await executeWatchdog(job, ctx, deps);
     if (job.session_target === 'main')  return await executeMain(job, ctx, deps);
     if (job.session_target === 'shell') return await executeShell(job, ctx, deps);
     return await executeAgent(job, ctx, deps);
   } catch (err) {
-    const {
-      finishRun, releaseIdempotencyKey, setAgentStatus,
-      isDrainError, enqueueDispatch, getJob, getDispatchBacklogCount,
-      shouldRetry, scheduleRetry, getDb, updateJobAfterRun,
-      setDispatchStatus, handleTriggeredChildren, dequeueJob,
-      sqliteNow,
-    } = deps;
-
     log('error', `Failed: ${job.name}: ${err.message}`, { jobId: job.id });
-
-    // -- Drain-error retry for isolated agentTurn jobs ----------
-    // Gateway drain errors are transient infra noise -- the job never ran.
-    // Don't increment consecutive_errors, and schedule a single retry after 90s.
     const isIsolatedAgent = job.session_target !== 'main' && job.session_target !== 'shell' && job.job_type !== 'watchdog';
-    if (isIsolatedAgent && isDrainError(err.message)) {
-      finishRun(ctx.run.id, 'error', { error_message: err.message });
-      if (ctx.idemKey) releaseIdempotencyKey(ctx.idemKey);
-      if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
-
-      // Check: max 1 drain retry per run, job must still be enabled, and respect overlap_policy:skip
-      const freshJob = getJob(job.id);
-      const canDrainRetry = freshJob && freshJob.enabled
-        && (ctx.run.retry_count || 0) < 1
-        && !(freshJob.overlap_policy === 'skip' && getDispatchBacklogCount(job.id) > 0);
-
-      if (canDrainRetry) {
-        const drainDispatch = enqueueDispatch(job.id, {
-          kind: 'retry',
-          scheduled_for: sqliteNow(90000),
-          source_run_id: ctx.run.id,
-          retry_of_run_id: ctx.run.id,
-        });
-        getDb().prepare('UPDATE runs SET retry_count = 1 WHERE id = ?').run(ctx.run.id);
-        log('info', `[drain-retry] scheduling retry for ${job.name} in 90s (run ${ctx.run.id})`, {
-          jobId: job.id, dispatchId: drainDispatch.id,
-        });
-      } else {
-        log('info', `[drain-retry] skipping retry for ${job.name} (enabled=${freshJob?.enabled}, retry_count=${ctx.run.retry_count || 0}, overlap_backlog=${getDispatchBacklogCount(job.id)})`, {
-          jobId: job.id, runId: ctx.run.id,
-        });
-      }
-
-      // Do NOT call updateJobAfterRun -- avoid incrementing consecutive_errors for drain noise
-      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-      return { ...makeDefaultResult(), status: 'error', earlyReturn: true };
-    }
-
-    finishRun(ctx.run.id, 'error', { error_message: err.message });
-    if (ctx.idemKey) releaseIdempotencyKey(ctx.idemKey);
-    if (job.agent_id) setAgentStatus(job.agent_id, 'idle', null);
-
-    if (shouldRetry(job, ctx.run.id)) {
-      const retry = scheduleRetry(job, ctx.run.id);
-      if (retry.dispatch) {
-        log('info', `Scheduling retry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`, {
-          jobId: job.id, runId: ctx.run.id,
-        });
-        if (job.delivery_mode === 'announce' || job.delivery_mode === 'announce-always') {
-          const retryMsg = `Job "${job.name}" failed with exception, retry ${retry.retryCount}/${job.max_retries} scheduled`;
-          await handleDelivery(job, retryMsg);
-        }
-        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
-        if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-        if (dequeueJob(job.id)) {
-          log('info', `Dequeued pending dispatch for ${job.name} (after exception-retry)`);
-        }
-      } else {
-        log('warn', `Retry skipped for ${job.name} -- dispatch backlog limit reached`, {
-          jobId: job.id, runId: ctx.run.id,
-          maxQueuedDispatches: job.max_queued_dispatches || 25,
-        });
-        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-          await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
-        }
-        handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on exception-retry-skipped');
-        if (dequeueJob(job.id)) {
-          log('info', `Dequeued pending dispatch for ${job.name} (after exception-retry-skipped)`);
-        }
-        updateJobAfterRun(job, 'error');
-        if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-      }
-    } else {
-      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-        await handleDelivery(job, `\u26a0\ufe0f Job failed: ${job.name}\n\n${err.message}`);
-      }
-      handleTriggeredChildren(job.id, 'error', err.message, ctx.run.id, ' on failure');
-      if (dequeueJob(job.id)) {
-        log('info', `Dequeued pending dispatch for ${job.name} (after failure)`);
-      }
-      updateJobAfterRun(job, 'error');
-      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
-    }
-
-    return { ...makeDefaultResult(), status: 'error', earlyReturn: true };
+    const drainRetry = isIsolatedAgent && deps.isDrainError(err.message);
+    return {
+      ...makeDefaultResult(),
+      status: 'error',
+      summary: err.message,
+      content: err.message,
+      errorMessage: err.message,
+      idemAction: 'release',
+      skipAgentCleanup: !isIsolatedAgent,
+      skipDelivery: drainRetry,
+      skipJobUpdate: drainRetry,
+      skipChildren: drainRetry,
+      drainRetry,
+    };
   }
 }

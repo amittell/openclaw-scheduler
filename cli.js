@@ -1,18 +1,22 @@
 #!/usr/bin/env node
 // Scheduler CLI -- manage jobs, runs, messages, agents
-import { existsSync, readFileSync } from 'fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
-import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, finishRun } from './runs.js';
+import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
-  ackMessage, listMessageReceipts, getTeamMessages,
+  ackMessage, getMessage, listMessageReceipts, getTeamMessages,
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
 import { resolveSchedulerHome } from './paths.js';
-import { SCHEDULER_SCHEMAS } from './scheduler-schema.js';
+import {
+  SCHEDULER_PRODUCT_SCHEMA_LABEL,
+  SCHEDULER_SCHEMAS,
+  SCHEDULER_SCHEMA_VERSION,
+} from './scheduler-schema.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliArgs = process.argv.slice(2);
@@ -36,6 +40,13 @@ function isValidationOnlyCommand(cmd, subcommand, rest) {
     subcommand === 'validate'
     || (subcommand === 'add' && rest.includes('--dry-run'))
   );
+}
+
+function commandRequiresDb(cmd, subcommand, rest) {
+  if (!cmd || ['help', '--help', '-h', 'version', '--version', '-v'].includes(cmd)) return false;
+  if (cmd === 'schema' || cmd === 'capabilities') return false;
+  if (isValidationOnlyCommand(cmd, subcommand, rest)) return false;
+  return true;
 }
 
 function getDbPathMismatchNotice(env = process.env) {
@@ -69,18 +80,19 @@ Jobs:
   jobs list [--type watchdog]        List all jobs (optionally filter by type)
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
-  jobs add <json> [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
+  jobs add <json>|--file <path>|--stdin [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
                                      Add a job (--watchdog sets defaults for watchdog type)
                                      run_timeout_ms is REQUIRED (no default -- prevents indefinite runs)
                                      --at: one-shot schedule, e.g. '2026-03-10T16:47:00-04:00'
                                      --in: one-shot sugar, e.g. '15m', '2h', '30s', '1d'
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')
-  jobs validate <json>               Validate a job spec without writing it
+  jobs validate <json>|--file <path>|--stdin
+                                     Validate a job spec without writing it
   jobs enable <id>                   Enable a job
   jobs disable <id>                  Disable a job
   jobs delete <id>                   Delete a job
   jobs cancel <id> [--no-cascade]   Cancel a job (+ children by default)
-  jobs update <id> <json> [--profile <id>]
+  jobs update <id> <json>|--file <path>|--stdin [--profile <id>]
                                      Update job fields
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')
   jobs run <id>                      Trigger immediate run (sets next_run_at to now)
@@ -151,24 +163,25 @@ Aliases:
 
 Status:
   status                             Overall scheduler status
+  doctor                             Validate DB/schema/runtime health and diagnostics
 
 Schema:
-  schema [jobs|runs|messages|approvals|dispatches|all]
+  schema [jobs|runs|messages|approvals|dispatches|dispatcher_leases|delivery_outbox|delivery_attachments|all]
 
 Capabilities:
-  capabilities                       Report v0.2 feature support
+  capabilities                       Report runtime feature support without opening the DB
 `);
 }
 
-const dbPathMismatchNotice = getDbPathMismatchNotice(process.env);
+const requiresDb = commandRequiresDb(command, sub, args);
+const shouldCheckDbPath = requiresDb || isValidationOnlyCommand(command, sub, args);
+const dbPathMismatchNotice = shouldCheckDbPath ? getDbPathMismatchNotice(process.env) : null;
 if (dbPathMismatchNotice) {
   if (isValidationOnlyCommand(command, sub, args)) {
     fail(formatDbPathMismatchNotice(dbPathMismatchNotice, { validation: true }));
   }
   process.stderr.write(`${formatDbPathMismatchNotice(dbPathMismatchNotice)}\n`);
 }
-
-await initDb();
 
 function fmt(obj) { return JSON.stringify(obj, null, 2); }
 
@@ -188,16 +201,190 @@ function emit(data, human = null) {
   console.log(typeof data === 'string' ? data : fmt(data));
 }
 
-function fail(message, code = 1) {
+function fail(message, code = 1, errorCode = 'CLI_ERROR', details = null) {
   if (jsonMode) {
-    console.log(fmt({ ok: false, error: message }));
+    console.log(fmt({ ok: false, error: message, code: errorCode, ...(details ? { details } : {}) }));
   } else {
     console.error(message);
   }
   process.exit(code);
 }
 
+function commandPositionals(argv, { valueFlags = [], booleanFlags = [] } = {}) {
+  const values = new Set([...valueFlags, '--file']);
+  const booleans = new Set([...booleanFlags, '--stdin']);
+  const positionals = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (values.has(arg)) {
+      i++;
+      continue;
+    }
+    if (booleans.has(arg)) continue;
+    if (arg.startsWith('--')) continue;
+    positionals.push(arg);
+  }
+  return positionals;
+}
+
+function readJsonPayload(argv, {
+  skipPositionals = 0,
+  valueFlags = [],
+  booleanFlags = [],
+  usage: commandUsage,
+} = {}) {
+  const fileIndexes = argv.reduce((indexes, arg, index) => {
+    if (arg === '--file') indexes.push(index);
+    return indexes;
+  }, []);
+  if (fileIndexes.length > 1) fail(`Only one --file payload may be provided. ${commandUsage}`, 1, 'INVALID_ARGUMENT');
+  const fileIndex = fileIndexes[0] ?? -1;
+  const filePath = fileIndex >= 0 ? argv[fileIndex + 1] : null;
+  if (fileIndex >= 0 && (!filePath || filePath.startsWith('--'))) {
+    fail(`--file requires a path. ${commandUsage}`, 1, 'INVALID_ARGUMENT');
+  }
+  const stdinRequested = argv.includes('--stdin') || filePath === '-';
+  const positionals = commandPositionals(argv, { valueFlags, booleanFlags });
+  const inline = positionals.slice(skipPositionals);
+  const sourceCount = Number(fileIndex >= 0 && filePath !== '-') + Number(stdinRequested) + Number(inline.length > 0);
+  if (sourceCount !== 1 || inline.length > 1) {
+    fail(`Provide exactly one JSON payload using an inline value, --file <path>, or --stdin. ${commandUsage}`, 1, 'INVALID_ARGUMENT');
+  }
+
+  let raw;
+  let source;
+  try {
+    if (stdinRequested) {
+      source = 'stdin';
+      raw = readFileSync(0, 'utf8');
+    } else if (fileIndex >= 0) {
+      source = filePath;
+      raw = readFileSync(filePath, 'utf8');
+    } else {
+      source = 'inline JSON';
+      raw = inline[0];
+    }
+  } catch (err) {
+    fail(`Unable to read JSON payload from ${source || filePath}: ${err.message}`, 1, 'PAYLOAD_READ_FAILED');
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      fail(`JSON payload from ${source} must be an object`, 1, 'INVALID_JSON');
+    }
+    return parsed;
+  } catch (err) {
+    if (err?.code === 'INVALID_JSON') throw err;
+    fail(`Invalid JSON from ${source}: ${err.message}`, 1, 'INVALID_JSON');
+  }
+}
+
+function tableExists(db, name) {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1
+  `).get(name));
+}
+
+function countByStatus(db, table) {
+  if (!tableExists(db, table)) return {};
+  return Object.fromEntries(db.prepare(
+    `SELECT status, COUNT(*) AS count FROM ${table} GROUP BY status ORDER BY status`
+  ).all().map(row => [row.status, row.count]));
+}
+
+function getOperationalDiagnostics(db) {
+  const lease = tableExists(db, 'dispatcher_leases')
+    ? db.prepare(`
+        SELECT *, CASE WHEN julianday(expires_at) > julianday('now') THEN 1 ELSE 0 END AS active
+        FROM dispatcher_leases WHERE name = 'scheduler-dispatcher'
+      `).get() || null
+    : null;
+  const queue = tableExists(db, 'job_dispatch_queue')
+    ? {
+        statuses: countByStatus(db, 'job_dispatch_queue'),
+        expired_claims: db.prepare(`
+          SELECT COUNT(*) AS count FROM job_dispatch_queue
+          WHERE status = 'claimed' AND claim_expires_at IS NOT NULL
+            AND julianday(claim_expires_at) <= julianday('now')
+        `).get().count,
+      }
+    : { statuses: {}, expired_claims: null };
+  const outbox = tableExists(db, 'delivery_outbox')
+    ? {
+        statuses: countByStatus(db, 'delivery_outbox'),
+        due: db.prepare(`
+          SELECT COUNT(*) AS count FROM delivery_outbox
+          WHERE status = 'pending' AND julianday(next_attempt_at) <= julianday('now')
+        `).get().count,
+        expired_claims: db.prepare(`
+          SELECT COUNT(*) AS count FROM delivery_outbox
+          WHERE status = 'claimed' AND claim_expires_at IS NOT NULL
+            AND julianday(claim_expires_at) <= julianday('now')
+        `).get().count,
+      }
+    : { statuses: {}, due: null, expired_claims: null };
+  const approvals = tableExists(db, 'approvals')
+    ? {
+        statuses: countByStatus(db, 'approvals'),
+        expired_pending: db.prepare(`
+          SELECT COUNT(*) AS count FROM approvals
+          WHERE status = 'pending' AND expires_at IS NOT NULL
+            AND julianday(expires_at) <= julianday('now')
+        `).get().count,
+      }
+    : { statuses: {}, expired_pending: null };
+  const cancellation = tableExists(db, 'runs')
+    ? db.prepare(`
+        SELECT COUNT(*) AS count FROM runs
+        WHERE cancel_requested_at IS NOT NULL
+          AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
+      `).get().count
+    : null;
+  const recoveryBlocked = tableExists(db, 'runs')
+    ? db.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'recovery_blocked'").get().count
+    : null;
+  const cleanupFailures = tableExists(db, 'runs')
+    ? db.prepare(`
+        SELECT COUNT(*) AS count FROM runs
+        WHERE json_valid(context_summary) = 1
+          AND json_extract(context_summary, '$.credential_cleanup.status') = 'failed'
+      `).get().count
+    : null;
+  return {
+    dispatcher_lease: lease,
+    dispatch_queue: queue,
+    delivery_outbox: outbox,
+    approvals,
+    cancellation_pending_runs: cancellation,
+    recovery_blocked_runs: recoveryBlocked,
+    credential_cleanup_failures: cleanupFailures,
+  };
+}
+
+function getSchemaVersion(db) {
+  if (!tableExists(db, 'schema_migrations')) return null;
+  return db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()?.version ?? null;
+}
+
+async function main() {
+  if (requiresDb) await initDb();
+
 switch (command) {
+  case 'help':
+  case '--help':
+  case '-h':
+    usage();
+    break;
+
+  case 'version':
+  case '--version':
+  case '-v': {
+    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    emit({ name: pkg.name, version: pkg.version }, `${pkg.name} ${pkg.version}`);
+    break;
+  }
+
   // -- Jobs ------------------------------------------------
   case 'jobs':
     switch (sub) {
@@ -265,7 +452,13 @@ switch (command) {
         });
         break;
       }
-      case 'get': emit(getJob(args[0])); break;
+      case 'get': {
+        if (!args[0]) fail('Usage: jobs get <id>', 1, 'INVALID_ARGUMENT');
+        const job = getJob(args[0]);
+        if (!job) fail(`Job not found: ${args[0]}`, 1, 'NOT_FOUND');
+        emit(job);
+        break;
+      }
       case 'add': {
         const dryRun = args.includes('--dry-run');
         const isWatchdog = args.includes('--watchdog');
@@ -277,15 +470,12 @@ switch (command) {
         const atValue = atIdx >= 0 ? args[atIdx + 1] : undefined;
         const inIdx = args.indexOf('--in');
         const inValue = inIdx >= 0 ? args[inIdx + 1] : undefined;
-        const skipArgs = new Set(['--dry-run', '--watchdog']);
-        if (profileIdx >= 0) { skipArgs.add(args[profileIdx]); skipArgs.add(args[profileIdx + 1]); }
-        if (fallbackProfileIdx >= 0) { skipArgs.add(args[fallbackProfileIdx]); skipArgs.add(args[fallbackProfileIdx + 1]); }
-        if (atIdx >= 0) { skipArgs.add(args[atIdx]); skipArgs.add(args[atIdx + 1]); }
-        if (inIdx >= 0) { skipArgs.add(args[inIdx]); skipArgs.add(args[inIdx + 1]); }
-        const payload = args.find(a => !skipArgs.has(a));
-        if (!payload) fail('Usage: jobs add <json> [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>] [--fallback-profile <id>]');
-        let spec;
-        try { spec = JSON.parse(payload); } catch { fail('Invalid JSON. Usage: jobs add \'{"name":"..."}\''); }
+        const addUsage = 'Usage: jobs add <json>|--file <path>|--stdin [--dry-run] [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>] [--fallback-profile <id>]';
+        const spec = readJsonPayload(args, {
+          valueFlags: ['--profile', '--fallback-profile', '--at', '--in'],
+          booleanFlags: ['--dry-run', '--watchdog'],
+          usage: addUsage,
+        });
         if (profileValue !== undefined) spec.auth_profile = profileValue;
         if (fallbackProfileValue !== undefined) spec.auth_profile_fallback = fallbackProfileValue;
 
@@ -333,20 +523,37 @@ switch (command) {
         break;
       }
       case 'validate': {
-        if (!args[0]) fail('Usage: jobs validate <json>');
-        let spec;
-        try { spec = JSON.parse(args[0]); } catch { fail('Invalid JSON. Usage: jobs validate \'{"name":"..."}\''); }
+        const spec = readJsonPayload(args, { usage: 'Usage: jobs validate <json>|--file <path>|--stdin' });
         const normalized = validateJobSpec(spec, null, 'create');
         emit({ ok: true, valid: true, normalized });
         break;
       }
-      case 'enable': updateJob(args[0], { enabled: 1 }); emit({ ok: true, job_id: args[0], enabled: true }, 'Enabled'); break;
-      case 'disable': updateJob(args[0], { enabled: 0 }); emit({ ok: true, job_id: args[0], enabled: false }, 'Disabled'); break;
-      case 'delete': deleteJob(args[0]); emit({ ok: true, job_id: args[0], deleted: true }, 'Deleted'); break;
+      case 'enable': {
+        if (!args[0]) fail('Usage: jobs enable <id>', 1, 'INVALID_ARGUMENT');
+        const job = updateJob(args[0], { enabled: 1 });
+        if (!job) fail(`Job not found: ${args[0]}`, 1, 'NOT_FOUND');
+        emit({ ok: true, job_id: args[0], enabled: true }, 'Enabled');
+        break;
+      }
+      case 'disable': {
+        if (!args[0]) fail('Usage: jobs disable <id>', 1, 'INVALID_ARGUMENT');
+        const job = updateJob(args[0], { enabled: 0 });
+        if (!job) fail(`Job not found: ${args[0]}`, 1, 'NOT_FOUND');
+        emit({ ok: true, job_id: args[0], enabled: false }, 'Disabled');
+        break;
+      }
+      case 'delete': {
+        if (!args[0]) fail('Usage: jobs delete <id>', 1, 'INVALID_ARGUMENT');
+        if (!getJob(args[0])) fail(`Job not found: ${args[0]}`, 1, 'NOT_FOUND');
+        deleteJob(args[0]);
+        emit({ ok: true, job_id: args[0], deleted: true }, 'Deleted');
+        break;
+      }
       case 'cancel': {
         const noCascade = args.includes('--no-cascade');
         const id = args.find(a => !a.startsWith('--'));
         if (!id) fail('Usage: jobs cancel <id> [--no-cascade]');
+        if (!getJob(id)) fail(`Job not found: ${id}`, 1, 'NOT_FOUND');
         const cancelled = cancelJob(id, { cascade: !noCascade });
         emit({ ok: true, cancelled }, `Cancelled ${cancelled.length} job(s): ${cancelled.map(c => c.slice(0, 8) + '..').join(', ')}`);
         break;
@@ -357,14 +564,20 @@ switch (command) {
         const updateProfileValue = updateProfileIdx >= 0 ? args[updateProfileIdx + 1] : undefined;
         const updateFallbackProfileIdx = args.indexOf('--fallback-profile');
         const updateFallbackProfileValue = updateFallbackProfileIdx >= 0 ? args[updateFallbackProfileIdx + 1] : undefined;
-        const updateFilterArgs = new Set(['--dry-run']);
-        if (updateProfileIdx >= 0) { updateFilterArgs.add(args[updateProfileIdx]); updateFilterArgs.add(args[updateProfileIdx + 1]); }
-        if (updateFallbackProfileIdx >= 0) { updateFilterArgs.add(args[updateFallbackProfileIdx]); updateFilterArgs.add(args[updateFallbackProfileIdx + 1]); }
-        const updateArgs = args.filter(a => !updateFilterArgs.has(a));
-        const current = getJob(updateArgs[0]);
-        if (!current) fail(`Job not found: ${updateArgs[0]}`);
-        let patch;
-        try { patch = JSON.parse(updateArgs[1]); } catch { fail('Invalid JSON. Usage: jobs update <id> \'{"key":"value"}\''); }
+        const updatePositionals = commandPositionals(args, {
+          valueFlags: ['--profile', '--fallback-profile'],
+          booleanFlags: ['--dry-run'],
+        });
+        const jobId = updatePositionals[0];
+        if (!jobId) fail('Usage: jobs update <id> <json>|--file <path>|--stdin [--dry-run] [--profile <id>] [--fallback-profile <id>]', 1, 'INVALID_ARGUMENT');
+        const current = getJob(jobId);
+        if (!current) fail(`Job not found: ${jobId}`, 1, 'NOT_FOUND');
+        const patch = readJsonPayload(args, {
+          skipPositionals: 1,
+          valueFlags: ['--profile', '--fallback-profile'],
+          booleanFlags: ['--dry-run'],
+          usage: 'Usage: jobs update <id> <json>|--file <path>|--stdin [--dry-run] [--profile <id>] [--fallback-profile <id>]',
+        });
         if (updateProfileValue !== undefined) patch.auth_profile = updateProfileValue;
         if (updateFallbackProfileValue !== undefined) patch.auth_profile_fallback = updateFallbackProfileValue;
         const normalized = validateJobSpec(patch, current, 'update');
@@ -372,13 +585,13 @@ switch (command) {
           emit({ ok: true, dry_run: true, valid: true, normalized });
           break;
         }
-        const job = updateJob(updateArgs[0], patch);
+        const job = updateJob(jobId, patch);
         emit({ ok: true, job }, `Updated: ${fmt(job)}`);
         break;
       }
       case 'run': {
         const job = runJobNow(args[0]);
-        if (!job) fail(`Job not found: ${args[0]}`);
+        if (!job) fail(`Job not found: ${args[0]}`, 1, 'NOT_FOUND');
         emit(
           { ok: true, job_id: job.id, name: job.name, dispatch_id: job.dispatch_id, dispatch_kind: job.dispatch_kind },
           `Scheduled for immediate run: ${job.name} (dispatch: ${job.dispatch_id})`
@@ -389,8 +602,11 @@ switch (command) {
         if (!args[0]) fail('Usage: jobs approve <job-id>');
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
-        if (!approval) fail(`No pending approval for job: ${args[0]}`);
-        resolveApproval(approval.id, 'approved', 'operator');
+        if (!approval) fail(`No pending approval for job: ${args[0]}`, 1, 'NOT_FOUND');
+        const resolved = resolveApproval(approval.id, 'approved', 'operator');
+        if (!resolved || resolved.status !== 'approved') {
+          fail(`Approval could not be granted; current status is ${resolved?.status || 'unknown'}`, 1, 'APPROVAL_CONFLICT');
+        }
         emit({ ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'approved' }, `Approved: ${approval.job_id}`);
         break;
       }
@@ -398,11 +614,11 @@ switch (command) {
         if (!args[0]) fail('Usage: jobs reject <job-id> [reason]');
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
         const approval = getPendingApproval(args[0]);
-        if (!approval) fail(`No pending approval for job: ${args[0]}`);
+        if (!approval) fail(`No pending approval for job: ${args[0]}`, 1, 'NOT_FOUND');
         const reason = args.slice(1).join(' ') || null;
-        resolveApproval(approval.id, 'rejected', 'operator', reason);
-        if (approval.run_id) {
-          finishRun(approval.run_id, 'cancelled', { error_message: reason || 'Rejected by operator' });
+        const resolved = resolveApproval(approval.id, 'rejected', 'operator', reason);
+        if (!resolved || resolved.status !== 'rejected') {
+          fail(`Approval could not be rejected; current status is ${resolved?.status || 'unknown'}`, 1, 'APPROVAL_CONFLICT');
         }
         emit(
           { ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'rejected', reason },
@@ -433,14 +649,14 @@ switch (command) {
       }
       case 'get': {
         const run = getRun(args[0]);
-        if (!run) fail(`Run not found: ${args[0]}`);
+        if (!run) fail(`Run not found: ${args[0]}`, 1, 'NOT_FOUND');
         emit(run);
         break;
       }
       case 'output': {
         if (!args[0]) fail('Usage: runs output <run-id> [stdout|stderr]');
         const run = getRun(args[0]);
-        if (!run) fail(`Run not found: ${args[0]}`);
+        if (!run) fail(`Run not found: ${args[0]}`, 1, 'NOT_FOUND');
         const kind = (args[1] || 'stdout').toLowerCase();
         if (kind !== 'stdout' && kind !== 'stderr') fail('Usage: runs output <run-id> [stdout|stderr]');
         const pathField = kind === 'stderr' ? 'shell_stderr_path' : 'shell_stdout_path';
@@ -568,7 +784,7 @@ switch (command) {
         const actor = args[1] || 'operator';
         const detail = args.slice(2).join(' ') || null;
         const msg = ackMessage(args[0], actor, detail);
-        if (!msg) fail('Message not found: ' + args[0]);
+        if (!msg) fail('Message not found: ' + args[0], 1, 'NOT_FOUND');
         emit(
           { ok: true, id: msg.id, status: msg.status, ack_at: msg.ack_at, read_at: msg.read_at },
           `Acknowledged: ${fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at, read_at: msg.read_at })}`
@@ -590,7 +806,13 @@ switch (command) {
         emit(jsonMode ? receipts : rows, () => console.table(rows));
         break;
       }
-      case 'read': { if (!args[0]) fail('Usage: msg read <message-id>'); markRead(args[0]); emit({ ok: true, message_id: args[0], read: true }, 'Marked read'); break; }
+      case 'read': {
+        if (!args[0]) fail('Usage: msg read <message-id>');
+        if (!getMessage(args[0])) fail(`Message not found: ${args[0]}`, 1, 'NOT_FOUND');
+        markRead(args[0]);
+        emit({ ok: true, message_id: args[0], read: true }, 'Marked read');
+        break;
+      }
       case 'readall': { if (!args[0]) fail('Usage: msg readall <agent-id>'); const r = markAllRead(args[0]); emit({ ok: true, agent: args[0], changes: r.changes }, `Marked ${r.changes} read`); break; }
       case 'unread': { if (!args[0]) fail('Usage: msg unread <agent-id>'); const count = getUnreadCount(args[0]); emit({ agent: args[0], unread: count }, `Unread: ${count}`); break; }
       default: usage();
@@ -693,7 +915,13 @@ switch (command) {
         emit(jsonMode ? agents : rows, () => console.table(rows));
         break;
       }
-      case 'get': emit(getAgent(args[0])); break;
+      case 'get': {
+        if (!args[0]) fail('Usage: agents get <id>', 1, 'INVALID_ARGUMENT');
+        const agent = getAgent(args[0]);
+        if (!agent) fail(`Agent not found: ${args[0]}`, 1, 'NOT_FOUND');
+        emit(agent);
+        break;
+      }
       case 'register': {
         if (!args[0]) fail('Usage: agents register <agent-id> [name]');
         const a = upsertAgent(args[0], { name: args[1] || args[0] });
@@ -734,7 +962,7 @@ switch (command) {
       case 'status': {
         const { getTaskGroupStatus } = await import('./task-tracker.js');
         const status = getTaskGroupStatus(args[0]);
-        if (!status) fail('Task group not found: ' + args[0]);
+        if (!status) fail('Task group not found: ' + args[0], 1, 'NOT_FOUND');
         emit(status, () => {
           console.log(`\nTask Group: ${status.name}`);
           console.log(`Status:     ${status.status}`);
@@ -877,7 +1105,7 @@ switch (command) {
       case 'release': {
         if (!args[0]) fail('Usage: idem release <key>');
         const before = getIdempotencyEntry(args[0]);
-        if (!before) fail('Key not found in ledger');
+        if (!before) fail('Key not found in ledger', 1, 'NOT_FOUND');
         if (before.status === 'released') { emit({ ok: true, key: args[0], already_released: true }, 'Key already released'); break; }
         releaseIdempotencyKey(args[0]);
         emit({ ok: true, key: args[0], released: true }, `Released idempotency key: ${args[0].slice(0, 12)}..`);
@@ -965,7 +1193,7 @@ switch (command) {
         const actor = args[1] || 'team-member';
         const detail = args.slice(2).join(' ') || null;
         const msg = ackTeamMessage(args[0], actor, detail);
-        if (!msg) fail('Team message not found: ' + args[0]);
+        if (!msg) fail('Team message not found: ' + args[0], 1, 'NOT_FOUND');
         emit(
           { ok: true, id: msg.id, status: msg.status, ack_at: msg.ack_at },
           `Team ACK: ${fmt({ id: msg.id, status: msg.status, ack_at: msg.ack_at })}`
@@ -1008,7 +1236,7 @@ switch (command) {
         if (!args[0]) fail('Usage: alias remove <name>');
         const result = db.prepare('DELETE FROM delivery_aliases WHERE alias = ?').run(args[0]);
         if (result.changes > 0) emit({ ok: true, alias: args[0], removed: true }, `Removed alias: ${args[0]}`);
-        else fail(`Alias not found: ${args[0]}`);
+        else fail(`Alias not found: ${args[0]}`, 1, 'NOT_FOUND');
         break;
       }
       default: usage();
@@ -1020,6 +1248,8 @@ switch (command) {
   case 'status': {
     const db = getDb();
     const dbPath = getResolvedDbPath();
+    const schemaVersion = getSchemaVersion(db);
+    const operational = getOperationalDiagnostics(db);
     const jobs = listJobs();
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
@@ -1050,6 +1280,10 @@ switch (command) {
       .sort((a, b) => a.next_run_at.localeCompare(b.next_run_at))[0] || null;
     const payload = {
       db_path: dbPath,
+      db_init_ok: true,
+      schema_version: schemaVersion,
+      latest_schema_version: SCHEDULER_SCHEMA_VERSION,
+      product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
       jobs_total: jobs.length,
       jobs_enabled: jobs.filter(j => j.enabled).length,
       running_runs: runningRuns.length,
@@ -1062,10 +1296,12 @@ switch (command) {
         unread: getUnreadCount(a.id),
       })),
       next_job: nextJob ? { id: nextJob.id, name: nextJob.name, next_run_at: nextJob.next_run_at } : null,
+      diagnostics: operational,
     };
     emit(payload, () => {
       console.log('=== OpenClaw Scheduler Status ===');
       console.log(`DB:       ${dbPath}`);
+      console.log(`Schema:   ${schemaVersion ?? 'unknown'} / ${SCHEDULER_SCHEMA_VERSION}`);
       console.log(`Jobs:     ${jobs.length} total, ${jobs.filter(j => j.enabled).length} enabled`);
       console.log(`Running:  ${runningRuns.length}`);
       console.log(`Stale:    ${stale.length}`);
@@ -1073,6 +1309,12 @@ switch (command) {
       console.log(`Approvals:${budget.pending_approvals} pending`);
       console.log(`Output:   ${budget.shell_output_bytes} bytes stored/offloaded across runs (${budget.offloaded_shell_runs} offloaded runs)`);
       console.log(`Agents:   ${agents.length}`);
+      const lease = operational.dispatcher_lease;
+      console.log(`Lease:    ${lease ? `${lease.active ? 'active' : 'expired'} owner=${lease.owner_id} fence=${lease.fencing_token}` : 'not held'}`);
+      console.log(`Queue:    ${fmt(operational.dispatch_queue.statuses)} (${operational.dispatch_queue.expired_claims ?? 0} expired claims)`);
+      console.log(`Outbox:   ${fmt(operational.delivery_outbox.statuses)} (${operational.delivery_outbox.due ?? 0} due, ${operational.delivery_outbox.expired_claims ?? 0} expired claims)`);
+      console.log(`Approval: ${fmt(operational.approvals.statuses)} (${operational.approvals.expired_pending ?? 0} expired pending)`);
+      console.log(`Cancel:   ${operational.cancellation_pending_runs ?? 0} active runs with cancellation requested`);
       for (const a of agents) {
         const unread = getUnreadCount(a.id);
         console.log(`  ${a.id}: ${a.status}${unread ? ` (${unread} unread)` : ''}`);
@@ -1090,6 +1332,88 @@ switch (command) {
       }
       if (nextJob) console.log(`\nNext:     ${nextJob.name} at ${nextJob.next_run_at}`);
     });
+    break;
+  }
+
+  case 'doctor': {
+    const db = getDb();
+    const dbPath = getResolvedDbPath();
+    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    const requiredTables = [
+      'jobs', 'runs', 'messages', 'approvals', 'job_dispatch_queue',
+      'dispatcher_leases', 'delivery_outbox', 'delivery_attachments', 'schema_migrations',
+    ];
+    const missingTables = requiredTables.filter(name => !tableExists(db, name));
+    const schemaVersion = getSchemaVersion(db);
+    const dbParent = dbPath === ':memory:' ? null : dirname(dbPath);
+    let dbParentWritable = dbPath === ':memory:';
+    if (dbParent) {
+      try {
+        accessSync(dbParent, fsConstants.W_OK);
+        dbParentWritable = true;
+      } catch {
+        dbParentWritable = false;
+      }
+    }
+    const diagnostics = getOperationalDiagnostics(db);
+    const integrityRows = db.pragma('quick_check');
+    const integrityMessages = integrityRows.map(row => String(Object.values(row)[0]));
+    const integrityOk = integrityMessages.length === 1 && integrityMessages[0].toLowerCase() === 'ok';
+    const foreignKeyViolations = db.pragma('foreign_key_check');
+    const warnings = [];
+    if (!diagnostics.dispatcher_lease?.active) warnings.push('No active scheduler-dispatcher lease; the dispatcher may be stopped.');
+    if ((diagnostics.dispatch_queue.expired_claims || 0) > 0) warnings.push('Expired dispatch claims are awaiting recovery.');
+    if ((diagnostics.delivery_outbox.expired_claims || 0) > 0) warnings.push('Expired delivery claims are awaiting recovery.');
+    if ((diagnostics.approvals.expired_pending || 0) > 0) warnings.push('Expired pending approvals are awaiting resolution.');
+    if ((diagnostics.cancellation_pending_runs || 0) > 0) warnings.push('Active runs have pending cancellation requests.');
+    if ((diagnostics.recovery_blocked_runs || 0) > 0) warnings.push('One or more runs are recovery-blocked; affected jobs were disabled for operator review.');
+    if ((diagnostics.credential_cleanup_failures || 0) > 0) warnings.push('Credential cleanup failures require operator remediation; affected jobs were disabled.');
+    if (!integrityOk) warnings.push('SQLite quick_check reported database integrity errors.');
+    if (foreignKeyViolations.length > 0) warnings.push('SQLite foreign-key violations require repair before safe operation.');
+    const healthy = missingTables.length === 0
+      && schemaVersion === SCHEDULER_SCHEMA_VERSION
+      && dbParentWritable
+      && integrityOk
+      && foreignKeyViolations.length === 0
+      && (diagnostics.recovery_blocked_runs || 0) === 0
+      && (diagnostics.credential_cleanup_failures || 0) === 0;
+    const result = {
+      ok: healthy,
+      package: { name: pkg.name, version: pkg.version, node: process.version },
+      paths: {
+        scheduler_home: resolveSchedulerHome(process.env),
+        db_path: dbPath,
+        db_exists: dbPath === ':memory:' || existsSync(dbPath),
+        db_parent: dbParent,
+        db_parent_exists: dbParent === null || existsSync(dbParent),
+        db_parent_writable: dbParentWritable,
+        db_path_mismatch: getDbPathMismatchNotice(process.env),
+      },
+      database: {
+        init_ok: true,
+        schema_version: schemaVersion,
+        latest_schema_version: SCHEDULER_SCHEMA_VERSION,
+        product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
+        required_tables: requiredTables,
+        missing_tables: missingTables,
+        integrity_check: integrityMessages,
+        foreign_key_violations: foreignKeyViolations.length,
+        foreign_key_violation_samples: foreignKeyViolations.slice(0, 20),
+      },
+      diagnostics,
+      warnings,
+    };
+    emit(result, () => {
+      console.log(`Scheduler doctor: ${healthy ? 'healthy' : 'unhealthy'}`);
+      console.log(`Package: ${pkg.name} ${pkg.version} on ${process.version}`);
+      console.log(`Database: ${dbPath}`);
+      console.log(`Schema: ${schemaVersion ?? 'unknown'} / ${SCHEDULER_SCHEMA_VERSION}`);
+      console.log(`Required tables: ${missingTables.length === 0 ? 'present' : `missing ${missingTables.join(', ')}`}`);
+      console.log(`Integrity: ${integrityOk ? 'ok' : integrityMessages.join('; ')}`);
+      console.log(`Foreign keys: ${foreignKeyViolations.length === 0 ? 'ok' : `${foreignKeyViolations.length} violation(s)`}`);
+      for (const warning of warnings) console.log(`Warning: ${warning}`);
+    });
+    if (!healthy) process.exitCode = 1;
     break;
   }
 
@@ -1115,10 +1439,13 @@ switch (command) {
   // -- Capabilities ----------------------------------------
   case 'capabilities': {
     const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
-    const schemaVersion = getDb().prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? null;
     const capabilities = {
       scheduler_version: pkg.version,
-      schema_version: schemaVersion,
+      schema_version: SCHEDULER_SCHEMA_VERSION,
+      latest_schema_version: SCHEDULER_SCHEMA_VERSION,
+      product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
+      schema_version_source: 'package',
+      schema_version_note: 'Run status or doctor to inspect the initialized database schema.',
       handoff_version: '2',
       features: {
         approvals: 'runtime',
@@ -1137,6 +1464,13 @@ switch (command) {
         delegation_validation: false,
         credential_handoff: true,
         audit_export: true,
+        dispatcher_fencing: true,
+        process_tree_cancellation: true,
+        leased_dispatch_recovery: true,
+        transactional_delivery_outbox: true,
+        durable_delivery_attachments: true,
+        atomic_approval_state: true,
+        governance_enforcement: true,
       },
     };
     emit(capabilities);
@@ -1150,3 +1484,15 @@ switch (command) {
     usage();
     process.exit(0);
 }
+}
+
+main().catch(err => {
+  const errorCode = typeof err?.code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(err.code)
+    ? err.code
+    : 'COMMAND_FAILED';
+  const details = {
+    ...(err?.phase ? { phase: err.phase } : {}),
+    ...(err?.dbPath ? { db_path: err.dbPath } : {}),
+  };
+  fail(err?.message || String(err), 1, errorCode, Object.keys(details).length ? details : null);
+});

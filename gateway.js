@@ -1,5 +1,5 @@
 // Gateway API client -- independent dispatch via chat completions + system events
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -54,6 +54,93 @@ function authHeaders(scopes = null) {
     : {};
 }
 
+function linkExternalAbort(controller, signal, onAbort) {
+  if (!signal) return () => {};
+  if (typeof signal.addEventListener !== 'function') {
+    throw new Error('signal must be an AbortSignal');
+  }
+  const handler = () => {
+    onAbort?.();
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  if (signal.aborted) handler();
+  else signal.addEventListener('abort', handler, { once: true });
+  return () => signal.removeEventListener('abort', handler);
+}
+
+function parseGatewayCliJson(stdout) {
+  const text = String(stdout || '');
+  const objectStart = text.indexOf('{');
+  const arrayStart = text.indexOf('[');
+  const starts = [objectStart, arrayStart].filter(index => index >= 0);
+  if (starts.length === 0) return null;
+  return JSON.parse(text.slice(Math.min(...starts)));
+}
+
+/**
+ * Return true only when chat.abort supplied positive evidence that the target
+ * agent run stopped. A generic successful RPC response is not enough to make
+ * replay safe because older or incompatible gateways may omit abort details.
+ */
+export function isAgentCancellationConfirmed(outcome) {
+  return Boolean(
+    outcome?.ok === true
+      && (
+        outcome.aborted === true
+        || (
+          outcome.runIdsReported === true
+          && Array.isArray(outcome.runIds)
+          && outcome.runIds.length === 0
+        )
+      )
+  );
+}
+
+/** Best-effort active-session cancellation through the Gateway RPC API. */
+export function cancelAgentSession(sessionKey, opts = {}) {
+  if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) {
+    return Promise.resolve({ ok: false, aborted: false, error: 'sessionKey is required' });
+  }
+  const timeoutMs = Number.isInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 5_000;
+  const params = {
+    sessionKey,
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.runId ? { runId: opts.runId } : {}),
+  };
+
+  return new Promise(resolve => {
+    execFile(
+      'openclaw',
+      [
+        'gateway', 'call', 'chat.abort',
+        '--params', JSON.stringify(params),
+        '--json',
+        '--timeout', String(timeoutMs),
+      ],
+      { encoding: 'utf8', timeout: timeoutMs + 1_000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          resolve({ ok: false, aborted: false, error: error.message });
+          return;
+        }
+        try {
+          const result = parseGatewayCliJson(stdout);
+          const runIdsReported = Array.isArray(result?.runIds);
+          resolve({
+            ok: result?.ok !== false,
+            aborted: Boolean(result?.aborted),
+            runIds: runIdsReported ? result.runIds : [],
+            runIdsReported,
+            result,
+          });
+        } catch (err) {
+          resolve({ ok: false, aborted: false, error: `Invalid gateway response: ${err.message}` });
+        }
+      },
+    );
+  });
+}
+
 // -- Chat Completions (independent dispatch) -----------------
 
 /**
@@ -79,10 +166,17 @@ export async function runAgentTurn(opts) {
     model,
     authProfile,
     timeoutMs = 300000,
+    signal,
+    cancelOnAbort = true,
   } = opts;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let abortReason = null;
+  const unlinkExternalAbort = linkExternalAbort(controller, signal, () => { abortReason = 'external'; });
+  const timer = setTimeout(() => {
+    abortReason = 'timeout';
+    controller.abort();
+  }, timeoutMs);
 
   try {
     const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
@@ -116,12 +210,22 @@ export async function runAgentTurn(opts) {
       raw: data,
     };
   } catch (err) {
-    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    if (controller.signal.aborted) {
+      if (cancelOnAbort && sessionKey) {
+        await cancelAgentSession(sessionKey, { agentId, timeoutMs: Math.min(timeoutMs, 5_000) });
+      }
+      if (abortReason === 'external') {
+        const aborted = new Error('Agent turn aborted by caller', { cause: err });
+        aborted.name = 'AbortError';
+        aborted.code = 'ABORT_ERR';
+        throw aborted;
+      }
       throw new Error(`Agent turn timed out after ${Math.round(timeoutMs / 1000)}s`, { cause: err });
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    unlinkExternalAbort();
   }
 }
 
@@ -157,10 +261,13 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
     sessionKinds,
+    signal,
+    cancelOnAbort = true,
   } = opts;
 
   const controller = new AbortController();
   let abortReason = null;
+  const unlinkExternalAbort = linkExternalAbort(controller, signal, () => { abortReason = 'external'; });
   const normalizedAgentId = (agentId || 'main').toLowerCase();
   const normalizedSessionKey = String(sessionKey || '').toLowerCase();
 
@@ -199,6 +306,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 
   // Hard absolute ceiling -- always fires regardless of activity
   const absoluteTimer = setTimeout(() => {
+    if (controller.signal.aborted) return;
     abortReason = 'absolute_timeout';
     controller.abort();
   }, absoluteTimeoutMs);
@@ -234,6 +342,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       const idleDuration = Date.now() - lastSeenActivity;
       if (idleDuration >= idleTimeoutMs * 2) {
         // Two full idle windows elapsed -- session is truly idle
+        if (controller.signal.aborted) return;
         abortReason = 'idle_timeout';
         controller.abort();
       }
@@ -278,7 +387,19 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     };
   } catch (err) {
     // Translate AbortError into descriptive messages
-    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    if (controller.signal.aborted) {
+      if (cancelOnAbort && sessionKey) {
+        await cancelAgentSession(sessionKey, {
+          agentId,
+          timeoutMs: Math.min(absoluteTimeoutMs, 5_000),
+        });
+      }
+      if (abortReason === 'external') {
+        const aborted = new Error('Agent turn aborted by caller', { cause: err });
+        aborted.name = 'AbortError';
+        aborted.code = 'ABORT_ERR';
+        throw aborted;
+      }
       if (abortReason === 'idle_timeout') {
         throw new Error(
           `Session idle for ${Math.round((idleTimeoutMs * 2) / 1000)}s -- aborted (activity-based timeout)`,
@@ -296,6 +417,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   } finally {
     clearTimeout(absoluteTimer);
     clearInterval(pollTimer);
+    unlinkExternalAbort();
   }
 }
 

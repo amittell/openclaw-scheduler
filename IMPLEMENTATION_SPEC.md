@@ -1,170 +1,155 @@
-# Implementation Spec — Scheduler v5 Features
+# Implementation Specification: Scheduler 0.3.0
 
-## New Schema (consolidated into schema baseline)
+This document records the current runtime contract. The executable schema is
+`schema.sql`; the idempotent upgrade path is `migrate-consolidate.js`.
 
-### Jobs table — new columns:
-```sql
-ALTER TABLE jobs ADD COLUMN delivery_guarantee TEXT DEFAULT 'at-most-once';  -- 'at-most-once'|'at-least-once'
-ALTER TABLE jobs ADD COLUMN job_class TEXT DEFAULT 'standard';               -- 'standard'|'pre_compaction_flush'
-ALTER TABLE jobs ADD COLUMN approval_required INTEGER DEFAULT 0;             -- HITL gate
-ALTER TABLE jobs ADD COLUMN approval_timeout_s INTEGER DEFAULT 3600;
-ALTER TABLE jobs ADD COLUMN approval_auto TEXT DEFAULT 'reject';             -- 'approve'|'reject'
-ALTER TABLE jobs ADD COLUMN context_retrieval TEXT DEFAULT 'none';           -- 'none'|'recent'|'hybrid'
-ALTER TABLE jobs ADD COLUMN context_retrieval_limit INTEGER DEFAULT 5;
+## Database Contract
+
+Schema version: 27
+
+Initialization is fail closed:
+
+1. Open SQLite with WAL, a busy timeout, and foreign keys enabled.
+2. For a fresh database, apply `schema.sql` transactionally.
+3. For an existing database, run the idempotent consolidation transaction
+   before reapplying the current schema.
+4. Throw `DB_INIT_FAILED` on open, schema, or consolidation failure. Do not run
+   the dispatcher against a partial schema.
+
+The v27 ownership and delivery tables are:
+
+- `dispatcher_leases`: named owner, monotonically increasing fencing token,
+  acquisition, renewal, and expiry times.
+- `job_dispatch_queue`: owner/token/expiry for claims plus attempt, replay, and
+  error state.
+- `runs`: dispatcher fence, cancellation fields, process identity and lifecycle,
+  agent-abort audit, and one terminal transition timestamp.
+- `approvals`: versioned decisions and explicit approved, rejected, cancelled,
+  expired, dispatching, and dispatched timestamps/state.
+- `delivery_outbox`: externally addressed output, retry budget, due time, and
+  leased claim state.
+- `delivery_attachments`: ordered durable content/path, size, MIME type, and
+  SHA-256 integrity metadata.
+
+Agent prompt messages remain in `messages`. `prompt_claimed` means a dispatcher
+owns prompt injection. An external delivery never enters that route.
+
+## Dispatcher Ownership
+
+`runtime-lease.js` performs atomic acquire, renew, assert, and release operations.
+An expired lease can be taken over only with a higher fencing token.
+
+`dispatcher-runtime.js` owns the lease and a bounded in-process worker queue.
+The tick loop may enqueue independent work without waiting for a long job to
+finish. A worker must assert the live lease before committing owned state.
+
+`run-state.js` compares dispatcher owner and token on active and terminal run
+transitions. A stale dispatcher cannot finalize a run after takeover.
+
+## Dispatch Queue Recovery
+
+Queue claims have an owner, random claim token, and expiry. Recovery moves an
+expired claim to pending only when no active run references it. Disabled jobs'
+non-manual pending dispatches are cancelled before execution. Claim attempts and
+last errors remain queryable.
+
+## Completion Transaction
+
+`run-completion.js` commits one terminal state through a compare-and-swap. In
+the same SQLite transaction it updates job counters/timestamps and enqueues
+eligible retry or child dispatches. If cancellation already won, effective
+status is `cancelled` and no delivery or child side effect is created.
+
+## Cancellation
+
+Cancellation records requester, reason, and timestamp before acting on active
+work.
+
+- Pending, awaiting-approval, and approved runs may transition directly to
+  `cancelled` before execution.
+- Shell execution records PID and process-group ID. Timeout or cancellation
+  terminates the group, waits for escalation when needed, and records process
+  termination before completion.
+- Agent execution links abort signals and calls OpenClaw Gateway `chat.abort`
+  when a session key exists. The request is best effort and is audited.
+- Only the owning fence can commit the final run state.
+
+Cancellation cannot reverse an external side effect that already completed.
+Destructive jobs still require idempotent command design.
+
+## Approval State
+
+`approval-state.js` performs versioned atomic transitions. Only one caller can
+claim approved work for dispatch. Rejection, timeout, cancellation, disabled
+job state, or a cancelled linked run prevents later dispatch. The approval and
+linked queue/run state are updated together where required.
+
+## Delivery and Attachments
+
+`delivery-outbox.js` is the only durable route for external channel output.
+Completion enqueues an idempotent outbox row. The consumer claims due rows with
+an expiry, retries within `max_attempts`, and records delivered or failed state.
+
+`attachment-store.js` stages attachments, validates size, computes SHA-256, and
+stores either durable content or a controlled artifact path. Failed enqueue
+cleans staged artifacts. Agent prompt consumption cannot claim outbox rows.
+
+## Governance
+
+`governance.js` evaluates every job before execution.
+
+- Fresh shell jobs default to `shell_env_policy: "minimal"`.
+- Migrated shell jobs explicitly retain `shell_env_policy: "inherit"` and emit
+  a warning.
+- A requested sandbox, restricted network, allowed-path boundary, or agent cost
+  cap is denied unless the executor reports real enforcement.
+- Identity, trust, proof, authorization, and credential handoff failures remain
+  fail closed.
+- Materialized credential values are cleared during cleanup paths.
+
+The default host executor does not claim container, namespace, firewall,
+filesystem, or agent-cost isolation.
+
+## CLI Contract
+
+`help`, `version`, `schema`, `capabilities`, `jobs validate`, and `jobs add
+--dry-run` do not initialize the database. Stateful commands initialize schema
+first.
+
+JSON errors use a nonzero exit and one object on stdout:
+
+```json strict
+{
+  "ok": false,
+  "error": "Job not found: example-id",
+  "code": "NOT_FOUND"
+}
 ```
 
-### Runs table — new columns:
-```sql
-ALTER TABLE runs ADD COLUMN context_summary TEXT;   -- JSON: {messages_injected,scope,aliases_resolved,...}
-ALTER TABLE runs ADD COLUMN replay_of TEXT;          -- run id if this is a crash replay
-```
+Job specs may be inline, read with `--file`, or read with `--stdin`. `doctor`
+and `status` expose schema, live lease, queue, outbox, approval, and cancellation
+diagnostics.
 
-### Messages table — new column:
-```sql
-ALTER TABLE messages ADD COLUMN owner TEXT;          -- originator of typed message
-```
-(kind enum extends to include: 'decision','constraint','fact','preference' alongside existing)
+## OpenClaw Import Contract
 
-### New table: approvals
-```sql
-CREATE TABLE IF NOT EXISTS approvals (
-  id              TEXT PRIMARY KEY,
-  job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|rejected|timed_out
-  requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  resolved_at     TEXT,
-  resolved_by     TEXT,                               -- 'operator'|'timeout'|'api'
-  notes           TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
-```
+The default source is `openclaw cron list --json` followed by `openclaw cron get
+<id> --json`. Cron expressions are preserved verbatim. One-shot timestamps
+remain `schedule_kind: "at"`. Interval schedules import automatically only when
+their cadence and phase are exactly representable by five-field cron.
 
-### schema_migrations: baseline includes these fields/tables
+`--allow-inexact-every` opts into approximation and emits a warning.
+`--legacy-json` explicitly selects an old file export. The command emits a
+per-job structured report and exits nonzero when any job fails.
 
----
+## Verification Contract
 
-## Function Signatures (contracts between modules)
+`npm test` runs:
 
-### approval.js (NEW FILE) exports:
-```js
-export function createApproval(jobId, runId)           // returns approval record
-export function getApproval(id)                         // by approval id
-export function getPendingApproval(jobId)               // latest pending for a job
-export function listPendingApprovals()                  // all pending
-export function resolveApproval(id, status, resolvedBy, notes)  // approve/reject/timed_out
-export function getTimedOutApprovals()                  // pending approvals past timeout
-export function pruneApprovals(retentionDays)           // clean old resolved approvals
-```
+1. the legacy integration suite;
+2. every `tests/*.test.mjs` file in its own process and isolated database,
+   sequentially;
+3. documentation example validation;
+4. the sibling agentcli scheduler integration when that checkout is present.
 
-### retrieval.js (NEW FILE) exports:
-```js
-export function getRecentRunSummaries(jobId, limit)     // last N run summaries (non-null)
-export function searchRunSummaries(jobId, query, limit) // hybrid: substring + TF-IDF scoring
-export function buildRetrievalContext(job)               // returns string to inject into prompt (or '')
-```
-
-### jobs.js — add to createJob/updateJob allowed fields:
-delivery_guarantee, job_class, approval_required, approval_timeout_s, approval_auto, context_retrieval, context_retrieval_limit
-
-### runs.js — new export:
-```js
-export function updateContextSummary(runId, summaryObj) // store JSON context_summary
-```
-
-### messages.js — update:
-- sendMessage: accept `owner` field
-- getInbox: sort by typed priority (constraint > decision > fact > task > preference > text/other)
-- New kinds accepted: 'decision','constraint','fact','preference'
-
-### dispatcher.js — new functions:
-```js
-async function replayOrphanedRuns()        // called from main() after initDb, before tick loop
-async function checkApprovals()            // called from tick(), checks timeouts + approved gates
-// Note: context metadata is built inline within buildJobPrompt() and returned as contextMeta
-```
-
-### cli.js — new commands:
-- `jobs approve <job-id>` — resolve pending approval as approved
-- `jobs reject <job-id> [reason]` — resolve as rejected
-- `approvals list` — list pending
-- `approvals pending` — alias
-
----
-
-## Feature Details
-
-### F1: Delivery Semantics Contract
-- New field `delivery_guarantee` on jobs ('at-most-once' default | 'at-least-once')
-- at-most-once: current behavior. On crash, orphaned runs marked 'crashed'.
-- at-least-once: on startup, orphaned runs are replayed (new run with replay_of set).
-- Document in job creation. Expose in CLI `jobs list` table.
-
-### F2: Flush-Before-Compaction Hook
-- New field `job_class` on jobs ('standard' default | 'pre_compaction_flush')
-- In buildJobPrompt: if job_class === 'pre_compaction_flush', prepend:
-  ```
-  [SYSTEM: Pre-compaction flush required]
-  Write a structured summary of: active decisions, constraints, task owners, open questions.
-  Format as labeled sections. If nothing needs flushing, respond with exactly: NO_FLUSH
-  [END SYSTEM]
-  ```
-- In dispatch result handling: if content.trim() === 'NO_FLUSH', skip delivery and log 'Flush: nothing to flush'
-
-### F3: Context Summary / Memory Observability
-- New field `context_summary` on runs (TEXT, stores JSON)
-- In buildJobPrompt: collect metadata into an object: { messages_injected: N, scope: 'own'|'global', aliases_resolved: [...], job_class, delivery_guarantee, context_retrieval, retrieval_results: N }
-- After creating the run, store the summary via updateContextSummary()
-- Expose in `runs list` and `runs get` CLI output (note: CLI exposure is deferred)
-
-### F4: Typed Message Contract
-- New message kinds: 'decision', 'constraint', 'fact', 'preference'
-- New field `owner` on messages
-- In sendMessage: validate kind against full enum, accept owner
-- In getInbox: sort results by typed priority order:
-  1. constraint (highest)
-  2. decision
-  3. fact
-  4. task
-  5. preference
-  6. text, result, status, system, spawn (lowest)
-- In buildJobPrompt: display kind and owner for typed messages:
-  ```
-  [constraint] (owner: ops-agent) Never deploy during business hours
-  ```
-
-### F5: HITL Approval Gates
-- New fields on jobs: approval_required (int 0/1), approval_timeout_s (int), approval_auto (text)
-- New run status: 'awaiting_approval'
-- New table: approvals
-- Flow:
-  1. In dispatchJob: if job.approval_required AND job is chain-triggered (has parent_id):
-     - Create run with status 'awaiting_approval'
-     - Create approval record
-     - Send notification: "⚠️ Job '{name}' requires approval. Approve: `node cli.js jobs approve {job_id}`"
-     - Return (don't dispatch yet)
-  2. In tick: call checkApprovals():
-     - For each pending approval: check if resolved or timed out
-     - If approved: change run status to 'pending', dispatch the job
-     - If timed_out: apply approval_auto policy
-     - If rejected: mark run as 'cancelled'
-- CLI: approve/reject commands resolve the approval record
-
-### F6: Run Replay on Startup
-- New field `replay_of` on runs
-- In main(), after initDb(), before starting tick loop:
-  - Query: SELECT r.*, j.delivery_guarantee, j.name FROM runs r JOIN jobs j ON r.job_id = j.id WHERE r.status = 'running'
-  - For each orphaned run:
-    - If delivery_guarantee = 'at-least-once': create new run with replay_of = old run id, set old run status = 'crashed', queue for dispatch
-    - If delivery_guarantee = 'at-most-once': set old run status = 'crashed', advance job schedule
-  - Log all actions
-
-### F7: Hybrid Retrieval for Job Context
-- New fields on jobs: context_retrieval ('none'|'recent'|'hybrid'), context_retrieval_limit (int)
-- In buildJobPrompt: if context_retrieval !== 'none', call buildRetrievalContext(job) and append to prompt
-- retrieval.js implements:
-  - getRecentRunSummaries: SELECT summary FROM runs WHERE job_id=? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT ?
-  - searchRunSummaries: combine substring matching + simple TF-IDF scoring
-  - TF-IDF: tokenize query and summaries, compute term frequency * inverse document frequency, rank by score
-  - buildRetrievalContext: format results as "--- Prior Run Context ---\n[date] summary\n..."
+`npm run verify:local` adds lint, type checking, coverage, and a package dry run.
+CI uses the same smoke gate without the extra coverage pass.

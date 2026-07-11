@@ -2,15 +2,15 @@
 /**
  * inbox-consumer.mjs
  *
- * Drains pending scheduler messages for an agent and delivers them to a channel target.
- * Intended for signal-only queue patterns where scripts enqueue actionable messages.
+ * Drains the durable external delivery outbox and then consumes legacy externally
+ * routed message rows. Internal agent messages are never delivered by this script.
  *
  * Usage:
- *   node scripts/inbox-consumer.mjs --to <target-id> [--channel telegram] [--agent main] [--limit 50]
- *   node scripts/inbox-consumer.mjs --to <target-id> --watch
+ *   node scripts/inbox-consumer.mjs [--to <legacy-fallback-target>] [--channel telegram] [--agent main] [--limit 50]
+ *   node scripts/inbox-consumer.mjs --watch
  *
  * Env fallbacks:
- *   INBOX_DELIVERY_TO
+ *   INBOX_DELIVERY_TO (optional legacy fallback)
  *   INBOX_DELIVERY_CHANNEL (default: telegram)
  *   INBOX_AGENT (default: main)
  *   INBOX_LIMIT (default: 50)
@@ -19,10 +19,18 @@
 import { dirname, basename, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { watch } from 'fs';
+import { hostname } from 'os';
 import { getDb } from '../db.js';
 import { resolveSchedulerDbPath } from '../paths.js';
-import { deliverMessage } from '../gateway.js';
+import { deliverMessage, invokeGatewayTool } from '../gateway.js';
 import { ackMessage, recordMessageAttempt } from '../messages.js';
+import {
+  claimDueDeliveries,
+  markDeliveryDelivered,
+  renewDeliveryClaim,
+  retryDelivery,
+} from '../delivery-outbox.js';
+import { materializeDeliveryAttachment } from '../attachment-store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -98,7 +106,7 @@ function cleanShellOutput(text) {
  * Env config:
  *   INBOX_BRAND: display name for the header (default: "Scheduler")
  */
-function formatMessageForDelivery(msg, { brand = 'Scheduler' } = {}) {
+export function formatMessageForDelivery(msg, { brand = 'Scheduler' } = {}) {
   let body = (msg.body || '').trim();
 
   // Strip sentinel tokens from the end of the body
@@ -136,18 +144,16 @@ function _formatMessagesDebug(msgs, agentId) {
   return lines.join('\n').trim();
 }
 
-function selectPendingMessages(db, agentId, limit) {
-  // Only fetch 'pending' messages for user-facing delivery.
-  // Messages with status='delivered' have already been injected into an AI
-  // agent's context prompt (by buildJobPrompt/markDelivered in dispatcher.js)
-  // and must NOT be re-delivered to the user via Telegram — doing so causes
-  // duplicate notifications on every inbox-consumer run.
+export function selectPendingMessages(db, agentId, limit) {
+  // Compatibility path for rows created before delivery_outbox existed. Route
+  // fields are mandatory here so internal agent messages remain agent context.
   return db.prepare(`
     SELECT id, from_agent, to_agent, subject, body, kind, created_at, priority,
            delivery_to, channel
     FROM messages
     WHERE (to_agent = ? OR to_agent = 'broadcast')
       AND status = 'pending'
+      AND (channel IS NOT NULL OR delivery_to IS NOT NULL)
     ORDER BY
       CASE kind
         WHEN 'constraint' THEN 0
@@ -163,33 +169,192 @@ function selectPendingMessages(db, agentId, limit) {
   `).all(agentId, limit);
 }
 
-async function drainOnce(db, { to, channel, agentId, limit, brand }) {
-  const msgs = selectPendingMessages(db, agentId, limit);
-  if (msgs.length === 0) {
-    return 0;
+function gatewayFailure(response) {
+  if (response == null || typeof response !== 'object') return 'empty response';
+  if (response.ok === false) return String(response.error || 'gateway delivery failed');
+  if (response.result?.ok === false) return String(response.result.error || 'gateway delivery failed');
+  if (response.result?.isError === true) {
+    const detail = response.result.error || response.result.content || 'gateway delivery failed';
+    return typeof detail === 'string' ? detail : JSON.stringify(detail).slice(0, 500);
+  }
+  return null;
+}
+
+async function deliverPersistedAttachment(delivery, attachment, invokeTool = invokeGatewayTool, db = null) {
+  const mediaPath = materializeDeliveryAttachment(attachment, db ? { db } : {});
+  const response = await invokeTool('message', {
+    action: 'send',
+    channel: delivery.channel,
+    target: delivery.target,
+    message: attachment.name,
+    media: mediaPath,
+  });
+  const failure = gatewayFailure(response);
+  if (failure) throw new Error(`Gateway message failed for attachment '${attachment.name}': ${failure}`);
+  return response;
+}
+
+function startDeliveryClaimHeartbeat(delivery, opts = {}) {
+  const leaseMs = parsePositiveInt(opts.leaseMs, 120_000);
+  const defaultIntervalMs = Math.max(100, Math.floor(leaseMs / 3));
+  const intervalMs = parsePositiveInt(opts.heartbeatIntervalMs, defaultIntervalMs);
+  if (intervalMs >= leaseMs) {
+    throw new Error('delivery claim heartbeat interval must be shorter than the claim lease');
   }
 
+  let stopped = false;
+  let definitiveLoss = null;
+  let transientError = null;
+  const renew = () => {
+    if (stopped || definitiveLoss) return false;
+    try {
+      const outcome = renewDeliveryClaim(delivery.id, delivery.claim_token, {
+        db: opts.db,
+        leaseMs,
+      });
+      if (!outcome?.renewed) {
+        definitiveLoss = new Error(`Delivery ${delivery.id} lost its claim during processing`);
+        return false;
+      }
+      transientError = null;
+      return true;
+    } catch (err) {
+      transientError = err;
+      return false;
+    }
+  };
+  const assertOwned = () => {
+    if (stopped) throw new Error(`Delivery ${delivery.id} claim heartbeat is stopped`);
+    if (definitiveLoss) throw definitiveLoss;
+    if (!renew()) {
+      if (definitiveLoss) throw definitiveLoss;
+      throw new Error(`Delivery ${delivery.id} claim heartbeat failed: ${transientError?.message || 'unknown error'}`, {
+        cause: transientError || undefined,
+      });
+    }
+  };
+
+  assertOwned();
+  const timer = setInterval(renew, intervalMs);
+  timer.unref?.();
+  return {
+    assertOwned,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
+export async function drainDeliveryOutbox(db, opts) {
+  const {
+    limit,
+    brand,
+    owner = `inbox-consumer:${hostname()}:${process.pid}`,
+    leaseMs = 120_000,
+    interDeliveryDelayMs = 1500,
+    deliverText = deliverMessage,
+    invokeTool = invokeGatewayTool,
+    heartbeatIntervalMs,
+  } = opts;
+  const deliveryLimit = parsePositiveInt(limit, 50);
+  let delivered = 0;
+  let attempted = 0;
+  const deliveryErrors = [];
+
+  while (attempted < deliveryLimit) {
+    const delivery = claimDueDeliveries({ db, owner, limit: 1, leaseMs })[0];
+    if (!delivery) break;
+    attempted += 1;
+    let heartbeat = null;
+    try {
+      heartbeat = startDeliveryClaimHeartbeat(delivery, {
+        db,
+        leaseMs,
+        heartbeatIntervalMs,
+      });
+      if (attempted > 1 && interDeliveryDelayMs > 0) {
+        await new Promise(resolveDelay => setTimeout(resolveDelay, interDeliveryDelayMs));
+      }
+      heartbeat.assertOwned();
+      const text = formatMessageForDelivery({
+        body: delivery.body,
+        subject: delivery.job_name || 'Notification',
+        created_at: delivery.created_at,
+      }, { brand });
+      if (text) await deliverText(delivery.channel, delivery.target, text);
+      heartbeat.assertOwned();
+
+      for (const attachment of delivery.attachments || []) {
+        await deliverPersistedAttachment(delivery, attachment, invokeTool, db);
+        heartbeat.assertOwned();
+      }
+
+      heartbeat.assertOwned();
+      heartbeat.stop();
+      const completed = markDeliveryDelivered(delivery.id, delivery.claim_token, { db });
+      if (!completed?.transitioned) {
+        throw new Error(`Delivery ${delivery.id} lost its claim before completion`);
+      }
+      delivered += 1;
+    } catch (err) {
+      heartbeat?.stop();
+      const outcome = retryDelivery(delivery.id, delivery.claim_token, err, { db });
+      if (outcome?.reason !== 'claim_mismatch') {
+        deliveryErrors.push(err);
+      } else {
+        deliveryErrors.push(new Error(`${err.message}; delivery claim no longer belongs to this consumer`));
+      }
+    } finally {
+      heartbeat?.stop();
+    }
+  }
+
+  return { delivered, attempted, errors: deliveryErrors };
+}
+
+export async function drainLegacyMessages(db, opts) {
+  const {
+    to,
+    channel,
+    agentId,
+    limit,
+    brand,
+    interDeliveryDelayMs = 1500,
+    deliverText = deliverMessage,
+  } = opts;
+  const msgs = selectPendingMessages(db, agentId, limit);
   let delivered = 0;
   const deliveryErrors = [];
 
-  // Deliver each message individually with clean user-facing formatting.
-  // Messages are sent one at a time so a failure on one doesn't block others.
   for (const msg of msgs) {
     const msgTarget = msg.delivery_to || to;
     const msgChannel = msg.channel || channel;
     const text = formatMessageForDelivery(msg, { brand });
 
+    if (!msgTarget || !msgChannel) {
+      const error = new Error(`Legacy message ${msg.id} has no complete external delivery route`);
+      recordMessageAttempt(msg.id, {
+        ok: false,
+        actor: 'inbox-consumer',
+        error: error.message,
+      });
+      deliveryErrors.push(error);
+      continue;
+    }
+
     if (!text) {
-      // Empty after stripping sentinels -- ack without delivering
       ackMessage(msg.id, 'inbox-consumer', 'Suppressed (empty after sentinel strip)');
       delivered += 1;
       continue;
     }
 
     try {
-      // Small delay between deliveries to avoid gateway rate/concurrency issues
-      if (delivered > 0) await new Promise(r => setTimeout(r, 1500));
-      await deliverMessage(msgChannel, msgTarget, text);
+      if (delivered > 0 && interDeliveryDelayMs > 0) {
+        await new Promise(resolveDelay => setTimeout(resolveDelay, interDeliveryDelayMs));
+      }
+      await deliverText(msgChannel, msgTarget, text);
       recordMessageAttempt(msg.id, { ok: true, actor: 'inbox-consumer' });
       ackMessage(msg.id, 'inbox-consumer', `Delivered to ${msgChannel}:${msgTarget}`);
       delivered += 1;
@@ -203,16 +368,26 @@ async function drainOnce(db, { to, channel, agentId, limit, brand }) {
     }
   }
 
+  return { delivered, attempted: msgs.length, errors: deliveryErrors };
+}
+
+export async function drainOnce(db, opts) {
+  const outbox = await drainDeliveryOutbox(db, opts);
+  const legacy = await drainLegacyMessages(db, opts);
+  const delivered = outbox.delivered + legacy.delivered;
+  const deliveryErrors = [...outbox.errors, ...legacy.errors];
+
   if (delivered > 0) {
-    process.stdout.write(`[inbox-consumer] delivered ${delivered} message(s)\n`);
+    process.stdout.write(`[inbox-consumer] delivered ${delivered} item(s) (${outbox.delivered} outbox, ${legacy.delivered} legacy)\n`);
   }
   if (deliveryErrors.length > 0) {
-    throw new Error(`Delivery failed for ${deliveryErrors.length} message(s): ${deliveryErrors.map(e => e.message).join('; ')}`);
+    throw new Error(`Delivery failed for ${deliveryErrors.length} item(s): ${deliveryErrors.map(error => error.message).join('; ')}`);
   }
   return delivered;
 }
 
-const args = parseArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)) {
+const args = parseArgs(argv);
 const deliveryTo = args.to || process.env.INBOX_DELIVERY_TO || '';
 const channel = args.channel || process.env.INBOX_DELIVERY_CHANNEL || 'telegram';
 const agentId = args.agent || process.env.INBOX_AGENT || 'main';
@@ -229,11 +404,6 @@ if (!brand) {
 }
 if (!brand) brand = 'Scheduler';
 const watchMode = Boolean(args.watch);
-
-if (!deliveryTo) {
-  process.stderr.write('[inbox-consumer] missing delivery target; pass --to or set INBOX_DELIVERY_TO\n');
-  process.exit(1);
-}
 
 const dbPath = resolve(resolveSchedulerDbPath({ env: process.env }));
 const watchDir = dirname(dbPath);
@@ -313,3 +483,8 @@ try {
   process.stderr.write(`[inbox-consumer] error: ${err.stack || err.message}\n`);
   process.exit(1);
 }
+}
+
+const isMainModule = process.argv[1]
+  && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (isMainModule) await main();

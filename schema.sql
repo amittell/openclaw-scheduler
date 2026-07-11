@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v1.7.0, schema version: 26)
+-- OpenClaw Scheduler Schema (current: v0.3.0, schema version: 27)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -26,8 +26,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   payload_model_fallback TEXT,
   payload_thinking TEXT,
   payload_timeout_seconds INTEGER DEFAULT 120,
-  execution_intent TEXT NOT NULL DEFAULT 'execute',   -- 'execute' | 'plan'
+  execution_intent TEXT NOT NULL DEFAULT 'execute',   -- 'execute' | 'plan' | 'fire-and-forget'
   execution_read_only INTEGER NOT NULL DEFAULT 0,
+  shell_env_policy TEXT NOT NULL DEFAULT 'minimal',   -- 'minimal' | 'inherit'; existing installs migrate to 'inherit'
 
   -- Overlap & timeout
   overlap_policy  TEXT NOT NULL DEFAULT 'skip',       -- 'skip' | 'allow' | 'queue'
@@ -168,7 +169,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_id) WHERE parent_id IS
 CREATE TABLE IF NOT EXISTS runs (
   id              TEXT PRIMARY KEY,
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|running|ok|error|timeout|skipped|awaiting_approval|approved|cancelled|crashed
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|running|ok|error|timeout|skipped|awaiting_approval|approved|cancelled|crashed|recovery_blocked
   
   started_at      TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at     TEXT,
@@ -196,6 +197,21 @@ CREATE TABLE IF NOT EXISTS runs (
   dispatched_at   TEXT,
   run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
 
+  -- Dispatcher ownership and cancellation fencing (v27)
+  dispatcher_owner TEXT,
+  dispatcher_token INTEGER,
+  dispatch_started_at TEXT,
+  cancel_requested_at TEXT,
+  cancel_requested_by TEXT,
+  cancel_reason TEXT,
+  process_pid INTEGER,
+  process_pgid INTEGER,
+  process_identity TEXT,
+  process_started_at TEXT,
+  process_terminated_at TEXT,
+  agent_cancel_requested_at TEXT,
+  terminal_transition_at TEXT,
+
   -- Retry tracking (v3b)
   retry_count     INTEGER DEFAULT 0,
   retry_of        TEXT,                             -- original run id if this is a retry
@@ -222,6 +238,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status) WHERE status = 'running';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runs_dispatch_queue ON runs(dispatch_queue_id) WHERE dispatch_queue_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_runs_dispatcher_owner ON runs(dispatcher_owner, status) WHERE dispatcher_owner IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_runs_cancel_requested ON runs(cancel_requested_at, status) WHERE cancel_requested_at IS NOT NULL;
 
 -- ============================================================
 -- MESSAGES: inter-agent message queue
@@ -249,7 +267,7 @@ CREATE TABLE IF NOT EXISTS messages (
   delivery_to     TEXT,                               -- optional: target chat/user id for outbound delivery
   
   -- Status
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|delivered|read|expired|failed
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|prompt_claimed|delivered|read|expired|failed
   delivered_at    TEXT,
   read_at         TEXT,
   ack_required    INTEGER NOT NULL DEFAULT 0,         -- message requires explicit ACK
@@ -326,11 +344,17 @@ CREATE TABLE IF NOT EXISTS approvals (
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
   dispatch_queue_id TEXT REFERENCES job_dispatch_queue(id) ON DELETE SET NULL,
-  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|rejected|timed_out|dispatched
+  status          TEXT NOT NULL DEFAULT 'pending',    -- pending|approved|dispatching|dispatched|rejected|timed_out|cancelled
   requested_at    TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at     TEXT,
   resolved_by     TEXT,                               -- 'operator'|'timeout'|'api'
-  notes           TEXT
+  notes           TEXT,
+  decision_version INTEGER NOT NULL DEFAULT 0,
+  cancelled_reason TEXT,
+  expires_at      TEXT,
+  approved_at     TEXT,
+  rejected_at     TEXT,
+  dispatched_at   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
@@ -343,18 +367,82 @@ CREATE INDEX IF NOT EXISTS idx_approvals_dispatch_queue ON approvals(dispatch_qu
 CREATE TABLE IF NOT EXISTS job_dispatch_queue (
   id              TEXT PRIMARY KEY,
   job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-  dispatch_kind   TEXT NOT NULL,                   -- manual|chain|retry
-  status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled
+  dispatch_kind   TEXT NOT NULL,                   -- schedule|at|manual|chain|retry
+  status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled|failed
   scheduled_for   TEXT NOT NULL,
   source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
   retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   claimed_at      TEXT,
-  processed_at    TEXT
+  processed_at    TEXT,
+  claim_owner     TEXT,
+  claim_token     TEXT,
+  claim_expires_at TEXT,
+  attempt_count   INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_due ON job_dispatch_queue(status, scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job ON job_dispatch_queue(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_source_run ON job_dispatch_queue(source_run_id) WHERE source_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dispatch_queue_claim_expiry ON job_dispatch_queue(status, claim_expires_at) WHERE status = 'claimed';
+
+-- ============================================================
+-- DISPATCHER LEASES: singleton leadership with fencing (v27)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dispatcher_leases (
+  name            TEXT PRIMARY KEY,
+  owner_id        TEXT NOT NULL,
+  fencing_token   INTEGER NOT NULL,
+  acquired_at     TEXT NOT NULL,
+  renewed_at      TEXT NOT NULL,
+  expires_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispatcher_leases_expiry ON dispatcher_leases(expires_at);
+
+-- ============================================================
+-- DELIVERY OUTBOX: durable external delivery, separate from
+-- the agent inbox (v27)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+  id              TEXT PRIMARY KEY,
+  message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  job_id          TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+  run_id          TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  channel         TEXT NOT NULL,
+  target          TEXT NOT NULL,
+  body            TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|delivered|failed|cancelled
+  idempotency_key TEXT,
+  attempt_count   INTEGER NOT NULL DEFAULT 0,
+  max_attempts    INTEGER NOT NULL DEFAULT 5,
+  next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+  claim_owner     TEXT,
+  claim_token     TEXT,
+  claim_expires_at TEXT,
+  last_error      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  delivered_at    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_idempotency ON delivery_outbox(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_due ON delivery_outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_claim_expiry ON delivery_outbox(status, claim_expires_at) WHERE status = 'claimed';
+
+CREATE TABLE IF NOT EXISTS delivery_attachments (
+  id              TEXT PRIMARY KEY,
+  outbox_id       TEXT NOT NULL REFERENCES delivery_outbox(id) ON DELETE CASCADE,
+  message_id      TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  ordinal         INTEGER NOT NULL,
+  name            TEXT NOT NULL,
+  mime_type       TEXT,
+  source_path     TEXT,
+  content_blob    BLOB,
+  size_bytes      INTEGER NOT NULL,
+  sha256          TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(outbox_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_attachments_message ON delivery_attachments(message_id) WHERE message_id IS NOT NULL;
 
 -- ============================================================
 -- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
@@ -493,8 +581,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-26 (all columns already in schema above).
--- Existing installs are brought up to v26 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-27 (all columns already in schema above).
+-- Existing installs are brought up to v27 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -521,3 +609,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (23);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (24);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (25);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (26);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (27);

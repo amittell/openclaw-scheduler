@@ -3,6 +3,9 @@ import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { getDb } from './db.js';
 import { enqueueDispatch } from './dispatch-queue.js';
+import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js';
+import { cancelApprovalsForJob } from './approval-state.js';
+import { cancelDeliveriesForJob } from './delivery-outbox.js';
 
 const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
@@ -14,7 +17,8 @@ const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
 const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
-const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan']);
+const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan', 'fire-and-forget']);
+const VALID_SHELL_ENV_POLICIES = new Set(['minimal', 'inherit']);
 const VALID_SCHEDULE_KINDS = new Set(['cron', 'at']);
 
 /**
@@ -37,6 +41,7 @@ const PATCHABLE_COLUMNS = new Set([
   'enabled', 'name', 'schedule_cron', 'schedule_tz', 'schedule_at', 'schedule_kind',
   'next_run_at', 'last_run_at', 'last_status', 'payload_message', 'payload_model', 'payload_model_fallback',
   'payload_thinking', 'payload_timeout_seconds', 'session_target', 'run_timeout_ms',
+  'shell_env_policy',
   'max_retries', 'consecutive_errors',
   'delivery_mode', 'delivery_channel', 'delivery_to', 'delivery_opt_out_reason',
   'delete_after_run', 'ttl_hours', 'auth_profile', 'auth_profile_fallback', 'origin',
@@ -378,6 +383,10 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
   assertEnum('job_type', merged.job_type || 'standard', VALID_JOB_TYPES);
   assertEnum('execution_intent', merged.execution_intent || 'execute', VALID_EXECUTION_INTENTS);
+  assertEnum('shell_env_policy', merged.shell_env_policy || 'minimal', VALID_SHELL_ENV_POLICIES);
+  if (merged.execution_intent === 'fire-and-forget' && (merged.session_target || 'isolated') !== 'main') {
+    throw new Error('execution_intent "fire-and-forget" is only supported for session_target "main"');
+  }
 
   if (merged.trigger_on != null) {
     assertEnum('trigger_on', merged.trigger_on, VALID_TRIGGERS);
@@ -665,7 +674,7 @@ export function createJob(opts) {
       id, name, enabled, schedule_kind, schedule_at, schedule_cron, schedule_tz,
       session_target, agent_id, payload_kind, payload_message,
       payload_model, payload_model_fallback, payload_thinking, payload_timeout_seconds,
-      execution_intent, execution_read_only,
+      execution_intent, execution_read_only, shell_env_policy,
       overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals, max_trigger_fanout,
       delivery_mode, delivery_channel, delivery_to,
       delete_after_run, next_run_at,
@@ -698,7 +707,7 @@ export function createJob(opts) {
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?,
+      ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
@@ -746,6 +755,7 @@ export function createJob(opts) {
     normalized.payload_timeout_seconds ?? 120,
     normalized.execution_intent || 'execute',
     normalized.execution_read_only ? 1 : 0,
+    normalized.shell_env_policy || 'minimal',
     normalized.overlap_policy || 'skip',
     normalized.run_timeout_ms ?? 300000,
     normalized.max_queued_dispatches || 25,
@@ -771,8 +781,8 @@ export function createJob(opts) {
     normalized.context_retrieval || 'none',
     normalized.context_retrieval_limit || 5,
     normalized.output_store_limit_bytes || 65536,
-    normalized.output_excerpt_limit_bytes || 2000,
-    normalized.output_summary_limit_bytes || 5000,
+    normalized.output_excerpt_limit_bytes || 65536,
+    normalized.output_summary_limit_bytes || 65536,
     normalized.output_offload_threshold_bytes || 65536,
     normalized.preferred_session_key || null,
     normalized.job_type || 'standard',
@@ -846,7 +856,7 @@ export function updateJob(id, patch) {
     'name', 'enabled', 'schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz',
     'session_target', 'agent_id', 'payload_kind', 'payload_message',
     'payload_model', 'payload_model_fallback', 'payload_thinking', 'payload_timeout_seconds',
-    'execution_intent', 'execution_read_only',
+    'execution_intent', 'execution_read_only', 'shell_env_policy',
     'overlap_policy', 'run_timeout_ms', 'max_queued_dispatches', 'max_pending_approvals', 'max_trigger_fanout',
     'delivery_mode', 'delivery_channel', 'delivery_to',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
@@ -902,29 +912,47 @@ export function updateJob(id, patch) {
   sets.push("updated_at = datetime('now')");
   values.push(id);
 
-  db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  const applyUpdate = () => {
+    db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
-  const schedulingFieldsChanged = ['schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz', 'parent_id']
-    .some((key) => key in normalized);
-  const reenabledRootJob = 'enabled' in normalized
-    && !!normalized.enabled
-    && !current.enabled;
-  if ((schedulingFieldsChanged || reenabledRootJob) && !('next_run_at' in normalized)) {
-    const refreshed = getJob(id);
-    if (refreshed) {
-      const nextRun = deriveNextRunAt(refreshed);
-      db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
+    if ('enabled' in normalized && !normalized.enabled && current.enabled) {
+      cancelApprovalsForJob(id, 'Job disabled before approval completed', {
+        db,
+        resolvedBy: 'scheduler',
+      });
     }
-  }
 
-  return getJob(id);
+    const schedulingFieldsChanged = ['schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz', 'parent_id']
+      .some((key) => key in normalized);
+    const reenabledRootJob = 'enabled' in normalized
+      && !!normalized.enabled
+      && !current.enabled;
+    if ((schedulingFieldsChanged || reenabledRootJob) && !('next_run_at' in normalized)) {
+      const refreshed = getJob(id);
+      if (refreshed) {
+        const nextRun = deriveNextRunAt(refreshed);
+        db.prepare('UPDATE jobs SET next_run_at = ? WHERE id = ?').run(nextRun, id);
+      }
+    }
+
+    return getJob(id);
+  };
+  return db.inTransaction ? applyUpdate() : db.transaction(applyUpdate).immediate();
 }
 
 /**
  * Delete a job and its runs.
  */
 export function deleteJob(id) {
-  getDb().prepare('DELETE FROM jobs WHERE id = ?').run(id);
+  const db = getDb();
+  const remove = () => {
+    cancelApprovalsForJob(id, 'Job deleted before approval completed', {
+      db,
+      resolvedBy: 'scheduler',
+    });
+    return db.prepare('DELETE FROM jobs WHERE id = ?').run(id).changes > 0;
+  };
+  return db.inTransaction ? remove() : db.transaction(remove).immediate();
 }
 
 /**
@@ -1208,38 +1236,74 @@ export function canEnqueueDispatch(jobId, maxQueuedDispatches = 25) {
 
 /**
  * Cancel a job and optionally cascade to children.
- * Sets status to disabled and cancels any running runs.
+ *
+ * Pending dispatches and approval waits are terminalized immediately. Active
+ * work receives a durable cancellation request and remains non-terminal until
+ * the dispatcher has actually stopped the shell process or agent turn.
  */
 export function cancelJob(jobId, opts = {}) {
   const db = getDb();
-  const cascade = opts.cascade !== false; // default: cascade
+  const cascade = opts.cascade !== false;
+  const requestedBy = typeof opts.requestedBy === 'string' && opts.requestedBy.trim()
+    ? opts.requestedBy.trim()
+    : 'operator';
+  const reason = typeof opts.reason === 'string' && opts.reason.trim()
+    ? opts.reason.trim()
+    : 'Job cancelled';
 
-  // Disable the job
-  db.prepare('UPDATE jobs SET enabled = 0 WHERE id = ?').run(jobId);
-
-  // Cancel any running runs
-  const runningRuns = db.prepare(`
-    SELECT id FROM runs WHERE job_id = ? AND status = 'running'
-  `).all(jobId);
-  for (const run of runningRuns) {
-    db.prepare(`
-      UPDATE runs SET status = 'cancelled', finished_at = datetime('now')
-      WHERE id = ?
-    `).run(run.id);
-  }
-
-  const cancelled = [jobId];
-
-  // Cascade to children
-  if (cascade) {
-    const children = getChildJobs(jobId);
-    for (const child of children) {
-      const childCancelled = cancelJob(child.id, { cascade: true });
-      cancelled.push(...childCancelled);
+  const cancel = db.transaction(() => {
+    const cancelled = [];
+    const pending = [jobId];
+    const seen = new Set();
+    while (pending.length > 0) {
+      const currentId = pending.shift();
+      if (!currentId || seen.has(currentId)) continue;
+      const exists = db.prepare('SELECT id FROM jobs WHERE id = ?').get(currentId);
+      if (!exists) continue;
+      seen.add(currentId);
+      cancelled.push(currentId);
+      if (cascade) {
+        const children = db.prepare('SELECT id FROM jobs WHERE parent_id = ? ORDER BY id').all(currentId);
+        pending.push(...children.map(child => child.id));
+      }
     }
-  }
 
-  return cancelled;
+    for (const cancelledJobId of cancelled) {
+      db.prepare('UPDATE jobs SET enabled = 0 WHERE id = ?').run(cancelledJobId);
+
+      db.prepare(`
+        UPDATE job_dispatch_queue
+        SET status = 'cancelled',
+            processed_at = COALESCE(processed_at, datetime('now')),
+            claim_expires_at = NULL,
+            last_error = COALESCE(last_error, ?)
+        WHERE job_id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+      `).run(reason, cancelledJobId);
+
+      cancelApprovalsForJob(cancelledJobId, reason, {
+        db,
+        resolvedBy: requestedBy,
+      });
+      cancelDeliveriesForJob(cancelledJobId, reason, { db });
+
+      const activeRuns = db.prepare(`
+        SELECT id, status
+        FROM runs
+        WHERE job_id = ?
+          AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
+      `).all(cancelledJobId);
+      for (const run of activeRuns) {
+        if (run.status === 'running') {
+          requestRunCancellation(run.id, { requestedBy, reason });
+        } else {
+          cancelRunBeforeExecution(run.id, { requestedBy, reason });
+        }
+      }
+    }
+    return cancelled;
+  });
+
+  return cancel();
 }
 
 /**

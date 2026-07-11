@@ -8,6 +8,61 @@ const VALID_KINDS = new Set([
   'decision', 'constraint', 'fact', 'preference',
 ]);
 
+// Rows with either external route field belong to the legacy delivery queue.
+// They remain readable by the compatibility consumer, but must never enter an
+// agent prompt or any agent-facing unread count.
+const INTERNAL_ROUTE_SQL = 'channel IS NULL AND delivery_to IS NULL';
+const PROMPT_CLAIM_PATH = '$._scheduler_prompt_claim';
+const PROMPT_WRAPPER_PATH = '$._scheduler_prompt_claim.metadata_wrapped';
+const PROMPT_ORIGINAL_JSON_PATH = '$._scheduler_prompt_original_metadata';
+const PROMPT_ORIGINAL_RAW_PATH = '$._scheduler_prompt_original_metadata_raw';
+
+function immediate(db, fn) {
+  const transaction = db.transaction(fn);
+  return db.inTransaction ? transaction() : transaction.immediate();
+}
+
+function requiredId(value, name) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
+  return value.trim();
+}
+
+function normalizeMessageIds(messageIds) {
+  if (!Array.isArray(messageIds)) throw new Error('messageIds must be an array');
+  const ids = [...new Set(messageIds.map(id => requiredId(id, 'messageId')))];
+  if (ids.length > 1000) throw new Error('messageIds may contain at most 1000 unique IDs');
+  return ids;
+}
+
+function claimableMetadataSql() {
+  return `CASE
+    WHEN metadata IS NULL OR trim(metadata) = '' THEN '{}'
+    WHEN json_valid(metadata) AND json_type(metadata) = 'object' THEN metadata
+    WHEN json_valid(metadata) THEN json_object(
+      '_scheduler_prompt_original_metadata', json(metadata)
+    )
+    ELSE json_object(
+      '_scheduler_prompt_original_metadata_raw', metadata
+    )
+  END`;
+}
+
+function removePromptClaimSql() {
+  return `CASE
+    WHEN json_valid(metadata)
+      AND json_extract(metadata, '${PROMPT_WRAPPER_PATH}') = 1
+    THEN CASE
+      WHEN json_type(metadata, '${PROMPT_ORIGINAL_JSON_PATH}') IS NOT NULL
+      THEN metadata -> '${PROMPT_ORIGINAL_JSON_PATH}'
+      ELSE json_extract(metadata, '${PROMPT_ORIGINAL_RAW_PATH}')
+    END
+    ELSE NULLIF(json_remove(
+      CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+      '${PROMPT_CLAIM_PATH}'
+    ), '{}')
+  END`;
+}
+
 /**
  * Send a message from one agent to another.
  */
@@ -15,6 +70,12 @@ export function sendMessage(opts) {
   if (!opts.from_agent) throw new Error('from_agent is required');
   if (!opts.to_agent) throw new Error('to_agent is required');
   if (opts.body == null) throw new Error('body is required');
+  if (opts.attachments != null) {
+    if (!Array.isArray(opts.attachments)) throw new Error('attachments must be an array');
+    if (opts.attachments.length > 0) {
+      throw new Error('sendMessage does not accept external attachments; use enqueueDelivery so files are persisted');
+    }
+  }
   const db = getDb();
   const id = randomUUID();
   const kind = opts.kind || 'text';
@@ -129,6 +190,7 @@ export function getInbox(agentId, opts = {}) {
     return getDb().prepare(`
       SELECT * FROM messages
       WHERE ${whereSql}
+        AND ${INTERNAL_ROUTE_SQL}
         AND status IN ('pending', 'delivered', 'read')
       ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
       LIMIT ?
@@ -139,6 +201,7 @@ export function getInbox(agentId, opts = {}) {
     return getDb().prepare(`
       SELECT * FROM messages
       WHERE ${whereSql}
+        AND ${INTERNAL_ROUTE_SQL}
         AND status IN ('pending', 'delivered')
       ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
       LIMIT ?
@@ -148,10 +211,235 @@ export function getInbox(agentId, opts = {}) {
   return getDb().prepare(`
     SELECT * FROM messages
     WHERE ${whereSql}
+      AND ${INTERNAL_ROUTE_SQL}
       AND status = 'pending'
     ORDER BY ${kindOrder} ASC, priority DESC, created_at ASC
     LIMIT ?
   `).all(...whereParams, limit).map(parseMetadata);
+}
+
+/**
+ * Atomically reserve pending internal messages for one scheduler run. Repeated
+ * calls by the same run return its existing reservations, while competing runs
+ * cannot observe or claim them.
+ */
+export function claimInboxForRun(agentId, runId, opts = {}) {
+  const db = opts.db || getDb();
+  const normalizedAgentId = requiredId(agentId, 'agentId');
+  const normalizedRunId = requiredId(runId, 'runId');
+  const limit = opts.limit == null ? 5 : Number(opts.limit);
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1000) {
+    throw new Error('limit must be an integer between 1 and 1000');
+  }
+
+  return immediate(db, () => {
+    const alreadyClaimed = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM messages
+      WHERE (to_agent = ? OR to_agent = 'broadcast')
+        AND ${INTERNAL_ROUTE_SQL}
+        AND status = 'prompt_claimed'
+        AND json_valid(metadata)
+        AND json_extract(metadata, '${PROMPT_CLAIM_PATH}.run_id') = ?
+    `).get(normalizedAgentId, normalizedRunId).count;
+    const remaining = Math.max(0, limit - alreadyClaimed);
+
+    if (remaining > 0) {
+      const candidates = db.prepare(`
+        SELECT id
+        FROM messages
+        WHERE (to_agent = ? OR to_agent = 'broadcast')
+          AND ${INTERNAL_ROUTE_SQL}
+          AND status = 'pending'
+        ORDER BY
+          CASE kind
+            WHEN 'constraint' THEN 0
+            WHEN 'decision'   THEN 1
+            WHEN 'fact'       THEN 2
+            WHEN 'task'       THEN 3
+            WHEN 'preference' THEN 4
+            ELSE 5
+          END ASC,
+          priority DESC,
+          created_at ASC,
+          id ASC
+        LIMIT ?
+      `).all(normalizedAgentId, remaining);
+      const claim = db.prepare(`
+        UPDATE messages
+        SET status = 'prompt_claimed',
+            metadata = json_set(
+              ${claimableMetadataSql()},
+              '${PROMPT_CLAIM_PATH}',
+              json_object(
+                'run_id', ?,
+                'claimed_at', datetime('now'),
+                'metadata_wrapped', CASE
+                  WHEN metadata IS NULL OR trim(metadata) = '' THEN 0
+                  WHEN json_valid(metadata) AND json_type(metadata) = 'object' THEN 0
+                  ELSE 1
+                END
+              )
+            ),
+            last_error = NULL
+        WHERE id = ?
+          AND status = 'pending'
+          AND ${INTERNAL_ROUTE_SQL}
+          AND (to_agent = ? OR to_agent = 'broadcast')
+      `);
+      for (const candidate of candidates) {
+        claim.run(normalizedRunId, candidate.id, normalizedAgentId);
+      }
+    }
+
+    return db.prepare(`
+      SELECT *
+      FROM messages
+      WHERE (to_agent = ? OR to_agent = 'broadcast')
+        AND ${INTERNAL_ROUTE_SQL}
+        AND status = 'prompt_claimed'
+        AND json_valid(metadata)
+        AND json_extract(metadata, '${PROMPT_CLAIM_PATH}.run_id') = ?
+      ORDER BY
+        CASE kind
+          WHEN 'constraint' THEN 0
+          WHEN 'decision'   THEN 1
+          WHEN 'fact'       THEN 2
+          WHEN 'task'       THEN 3
+          WHEN 'preference' THEN 4
+          ELSE 5
+        END ASC,
+        priority DESC,
+        created_at ASC,
+        id ASC
+      LIMIT ?
+    `).all(normalizedAgentId, normalizedRunId, limit).map(parseMetadata);
+  });
+}
+
+/** Mark prompt reservations as consumed only after their owning turn completes. */
+export function ackClaimedInboxForRun(runId, messageIds, opts = {}) {
+  const db = opts.db || getDb();
+  const normalizedRunId = requiredId(runId, 'runId');
+  const ids = normalizeMessageIds(messageIds);
+  if (ids.length === 0) return { acked: 0, messages: [] };
+
+  return immediate(db, () => {
+    const update = db.prepare(`
+      UPDATE messages
+      SET status = 'delivered',
+          delivered_at = COALESCE(delivered_at, datetime('now')),
+          delivery_attempts = COALESCE(delivery_attempts, 0) + 1,
+          metadata = ${removePromptClaimSql()},
+          last_error = NULL
+      WHERE id = ?
+        AND status = 'prompt_claimed'
+        AND ${INTERNAL_ROUTE_SQL}
+        AND json_valid(metadata)
+        AND json_extract(metadata, '${PROMPT_CLAIM_PATH}.run_id') = ?
+      RETURNING *
+    `);
+    const messages = [];
+    for (const id of ids) {
+      const row = update.get(id, normalizedRunId);
+      if (!row) continue;
+      messages.push(parseMetadata(row));
+      addReceipt(
+        row.id,
+        'attempt',
+        row.delivery_attempts,
+        'dispatcher',
+        `Injected into completed run ${normalizedRunId}`,
+        db
+      );
+    }
+    return { acked: messages.length, messages };
+  });
+}
+
+/** Release prompt reservations after a failed/deferred turn so another run can retry. */
+export function releaseClaimedInboxForRun(runId, messageIds, opts = {}) {
+  const db = opts.db || getDb();
+  const normalizedRunId = requiredId(runId, 'runId');
+  const ids = normalizeMessageIds(messageIds);
+  if (ids.length === 0) return { released: 0, messages: [] };
+  const reason = opts.reason ? String(opts.reason).slice(0, 4000) : null;
+
+  return immediate(db, () => {
+    const update = db.prepare(`
+      UPDATE messages
+      SET status = 'pending',
+          metadata = ${removePromptClaimSql()},
+          last_error = ?
+      WHERE id = ?
+        AND status = 'prompt_claimed'
+        AND ${INTERNAL_ROUTE_SQL}
+        AND json_valid(metadata)
+        AND json_extract(metadata, '${PROMPT_CLAIM_PATH}.run_id') = ?
+      RETURNING *
+    `);
+    const messages = [];
+    for (const id of ids) {
+      const row = update.get(reason, id, normalizedRunId);
+      if (row) messages.push(parseMetadata(row));
+    }
+    return { released: messages.length, messages };
+  });
+}
+
+/** Recover abandoned prompt reservations whose owning run is no longer active. */
+export function recoverStaleInboxClaims(opts = {}) {
+  const db = opts.db || getDb();
+  const olderThanSeconds = opts.olderThanSeconds == null ? 300 : Number(opts.olderThanSeconds);
+  if (!Number.isSafeInteger(olderThanSeconds) || olderThanSeconds < 0) {
+    throw new Error('olderThanSeconds must be a non-negative integer');
+  }
+
+  return immediate(db, () => {
+    const candidates = db.prepare(`
+      SELECT id,
+             CASE WHEN json_valid(metadata)
+               THEN json_extract(metadata, '${PROMPT_CLAIM_PATH}.run_id')
+               ELSE NULL
+             END AS prompt_run_id
+      FROM messages
+      WHERE status = 'prompt_claimed'
+        AND ${INTERNAL_ROUTE_SQL}
+        AND (
+          NOT json_valid(metadata)
+          OR json_extract(metadata, '${PROMPT_CLAIM_PATH}.claimed_at') IS NULL
+          OR json_extract(metadata, '${PROMPT_CLAIM_PATH}.claimed_at')
+             <= datetime('now', '-' || ? || ' seconds')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runs r
+          WHERE r.id = CASE WHEN json_valid(messages.metadata)
+            THEN json_extract(messages.metadata, '${PROMPT_CLAIM_PATH}.run_id')
+            ELSE NULL
+          END
+            AND r.status IN ('pending', 'running', 'awaiting_approval', 'approved')
+        )
+      ORDER BY created_at ASC, id ASC
+    `).all(olderThanSeconds);
+    const update = db.prepare(`
+      UPDATE messages
+      SET status = 'pending',
+          metadata = ${removePromptClaimSql()},
+          last_error = ?
+      WHERE id = ? AND status = 'prompt_claimed'
+      RETURNING *
+    `);
+    const messages = [];
+    for (const candidate of candidates) {
+      const detail = candidate.prompt_run_id
+        ? `Recovered stale prompt claim from run ${candidate.prompt_run_id}`
+        : 'Recovered malformed stale prompt claim';
+      const row = update.get(detail, candidate.id);
+      if (row) messages.push(parseMetadata(row));
+    }
+    return { recovered: messages.length, messages };
+  });
 }
 
 /**
@@ -173,6 +461,7 @@ export function getTeamMessages(teamId, opts = {}) {
     where.push('task_id = ?');
     params.push(taskId);
   }
+  where.push(INTERNAL_ROUTE_SQL);
 
   if (!includeRead) {
     where.push("status IN ('pending', 'delivered')");
@@ -265,6 +554,7 @@ export function markAllRead(agentId) {
         read_at = datetime('now'),
         ack_at = COALESCE(ack_at, datetime('now'))
     WHERE (to_agent = ? OR to_agent = 'broadcast') AND status IN ('pending', 'delivered')
+      AND ${INTERNAL_ROUTE_SQL}
   `).run(agentId);
 }
 
@@ -275,6 +565,7 @@ export function getUnreadCount(agentId) {
   const row = getDb().prepare(`
     SELECT COUNT(*) as cnt FROM messages
     WHERE (to_agent = ? OR to_agent = 'broadcast')
+      AND ${INTERNAL_ROUTE_SQL}
       AND status IN ('pending', 'delivered')
   `).get(agentId);
   return row.cnt;
@@ -354,9 +645,9 @@ export function listMessageReceipts(messageId, limit = 50) {
   `).all(messageId, limit);
 }
 
-function addReceipt(messageId, eventType, attempt = null, actor = 'system', detail = null) {
+function addReceipt(messageId, eventType, attempt = null, actor = 'system', detail = null, db = getDb()) {
   try {
-    getDb().prepare(`
+    db.prepare(`
       INSERT INTO message_receipts (id, message_id, event_type, attempt, actor, detail)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(randomUUID(), messageId, eventType, attempt, actor, detail);

@@ -35,22 +35,43 @@ export function getResolvedDbPath() {
   return _dbPath || resolveSchedulerDbPath({ env: process.env });
 }
 
+function dbInitError(phase, err) {
+  const wrapped = new Error(`Database initialization failed during ${phase}: ${err.message}`, { cause: err });
+  wrapped.code = 'DB_INIT_FAILED';
+  wrapped.phase = phase;
+  wrapped.dbPath = getResolvedDbPath();
+  return wrapped;
+}
+
 export async function initDb() {
-  const db = getDb();
-  const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-  const hasUserTables = (db.prepare(`
-    SELECT COUNT(*) AS cnt
-    FROM sqlite_master
-    WHERE type = 'table'
-      AND name NOT LIKE 'sqlite_%'
-  `).get()?.cnt ?? 0) > 0;
+  let db;
+  try {
+    db = getDb();
+  } catch (err) {
+    throw dbInitError('database open', err);
+  }
+  let schema;
+  try {
+    schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
+  } catch (err) {
+    throw dbInitError('schema read', err);
+  }
+  let hasUserTables;
+  try {
+    hasUserTables = (db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM sqlite_master
+      WHERE type = 'table'
+        AND name NOT LIKE 'sqlite_%'
+    `).get()?.cnt ?? 0) > 0;
+  } catch (err) {
+    throw dbInitError('database inspect', err);
+  }
   const applySchema = (label) => {
     try {
-      db.exec(schema);
-      return true;
+      db.transaction(() => db.exec(schema))();
     } catch (err) {
-      process.stderr.write(`${new Date().toISOString()} [db] ${label}: ${err.message}\n`);
-      return false;
+      throw dbInitError(label, err);
     }
   };
   const runConsolidate = async () => {
@@ -61,7 +82,7 @@ export async function initDb() {
         process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
       }
     } catch (err) {
-      process.stderr.write(`${new Date().toISOString()} [db] migrate-consolidate error: ${err.message}\n`);
+      throw dbInitError('consolidation migration', err);
     }
   };
 
@@ -69,17 +90,17 @@ export async function initDb() {
     // Existing installs: normalize via migration first so schema re-apply doesn't
     // trip over legacy partial tables/indexes.
     await runConsolidate();
-    applySchema('Schema apply warning');
+    applySchema('schema apply');
     return db;
   }
 
   // Net-new installs: create the baseline schema, then run consolidation in case
   // a package upgrade adds idempotent backfills the base schema doesn't need.
-  applySchema('Initial schema apply warning');
+  applySchema('initial schema apply');
   await runConsolidate();
 
   // Re-apply schema so indexes/table defs are fully aligned after consolidation.
-  applySchema('Schema re-apply warning');
+  applySchema('schema re-apply');
 
   return db;
 }

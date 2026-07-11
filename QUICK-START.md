@@ -1,256 +1,174 @@
-# Quick Start -- OpenClaw Scheduler
+# Quick Start: OpenClaw Scheduler
 
-This guide gets you from zero to a running scheduler with real jobs in under 10 minutes. It covers:
+OpenClaw Scheduler is a continuity and governed-workflow sidecar for OpenClaw. Current OpenClaw already has SQLite cron state, command jobs, retries, run history, Task Flow, and approval tooling. Add this scheduler when shell work must survive Gateway downtime, when a separate failure domain matters, or when a workflow needs direct conditional job graphs and the `@amittell/agentcli` runtime contract.
 
-1. Installing and starting the scheduler
-2. Converting your existing OpenClaw cron jobs
-3. Building your first workflow chain
-
-For the full reference manual, see [README.md](README.md).
-
----
-
-## Why switch from built-in cron?
-
-OpenClaw's built-in `cron/jobs.json` and heartbeat are fine for simple tasks. The scheduler replaces them when you need:
-
-- **Run history** -- know what ran, when, and whether it succeeded
-- **Shell jobs** -- scripts that run even when the gateway is down
-- **Retries** -- automatic retry with exponential backoff on failure
-- **Chains** -- parent/child jobs that trigger on success, failure, or output patterns
-- **Approval gates** -- human-in-the-loop before risky steps execute
-- **Delivery** -- send results to Telegram, Discord, WhatsApp, Signal, iMessage, or Slack, with alias routing and chunking
-- **Audit trail** -- every dispatch, retry, and delivery is recorded in SQLite
-
-| Before (built-in) | After (scheduler) |
-|---|---|
-| `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with full run history |
-| No run tracking | Status, duration, summary for every run |
-| No retry | Configurable retries with exponential backoff |
-| No chains | Parent/child jobs with trigger conditions |
-| Shell scripts are manual | Shell jobs with cron, delivery, and audit |
-
----
+For the complete reference, see [README.md](README.md).
 
 ## 1. Install
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
 npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
-```
-
-Create a shell alias for convenience:
-
-```bash
 alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
-```
-
-Add this line to your `~/.zshrc` or `~/.bashrc` to make it permanent.
-
-## 2. Run setup
-
-```bash
 ocs setup
 ```
 
-The wizard will:
-- Create or migrate `scheduler.db`
-- Install a system service (macOS launchd or Linux systemd)
-- Create built-in helper jobs (Inbox Consumer, Stuck Run Detector)
+The setup wizard creates or upgrades the database and installs the selected macOS launchd or Linux systemd service.
 
-## 3. Verify
+## 2. Diagnose the runtime
 
 ```bash
-ocs status
+ocs doctor
+ocs status --json
 ```
 
-You should see the scheduler running with at least the built-in jobs.
+`doctor` verifies schema version 27, required tables, database writability, the singleton dispatcher lease, dispatch queue claims, delivery outbox claims, approval state, and pending cancellations. A missing active lease is a warning when the dispatcher is intentionally stopped.
 
----
+## 3. Create a shell job
 
-## Converting existing OpenClaw crons
+Save this as `queue-probe.json`:
 
-### Automatic import
-
-If you have jobs in `~/.openclaw/cron/jobs.json`:
-
-```bash
-ocs migrate
-ocs jobs list
-```
-
-This imports all existing cron jobs into the scheduler's SQLite database.
-
-Then disable the old cron system:
-
-```bash
-openclaw cron edit <job-id> --disable    # for each job
-openclaw config set cron.enabled false
-openclaw config set agents.defaults.heartbeat.every "0m"
-```
-
-### Manual conversion
-
-Here is how each type of OpenClaw cron entry maps to a scheduler job:
-
-#### Simple cron line (shell)
-
-**Before:** `*/5 * * * * /usr/local/bin/check-api.sh`
-
-**After:**
-```bash
-ocs jobs add '{
-  "name": "API Check",
-  "schedule_cron": "*/5 * * * *",
+```json strict
+{
+  "name": "Hourly queue probe",
+  "schedule_cron": "0 * * * *",
+  "schedule_tz": "UTC",
   "session_target": "shell",
-  "payload_message": "/usr/local/bin/check-api.sh",
+  "payload_kind": "shellCommand",
+  "payload_message": "scripts/check-queue.sh",
+  "shell_env_policy": "minimal",
   "run_timeout_ms": 60000,
-  "delivery_mode": "announce",
-  "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID",
+  "delivery_mode": "none",
   "origin": "system"
-}'
+}
 ```
 
-Key fields:
-- `session_target: "shell"` -- runs a shell command directly, no AI needed
-- `payload_message` -- the command to execute
-- `delivery_mode: "announce"` -- sends output only on failure
+Validate before writing, add the job, then trigger a manual run:
 
-#### Heartbeat / AI prompt
-
-**Before:** `heartbeat.every: "30m"` with a prompt
-
-**After:**
 ```bash
-ocs jobs add '{
-  "name": "Daily Status Summary",
-  "schedule_cron": "0 8 * * *",
+ocs jobs validate --file queue-probe.json
+ocs jobs add --file queue-probe.json
+ocs jobs list --json
+ocs jobs run <job-id>
+ocs runs list <job-id> --json
+```
+
+Every job needs an explicit positive `run_timeout_ms`. Fresh shell jobs default to `shell_env_policy: "minimal"`. Choose `inherit` only when the job intentionally depends on the service environment.
+
+## 4. Create an isolated agent job
+
+Save this as `morning-briefing.json`:
+
+```json strict
+{
+  "name": "Morning briefing",
+  "schedule_cron": "0 8 * * 1-5",
   "schedule_tz": "America/New_York",
   "session_target": "isolated",
-  "payload_message": "Summarize the most important errors and follow-ups from the last 24 hours.",
+  "agent_id": "main",
+  "payload_kind": "agentTurn",
+  "payload_message": "Summarize overnight alerts and list the three highest-priority follow-ups.",
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
-}'
-```
-
-Key fields:
-- `session_target: "isolated"` -- runs in its own agent session
-- `delivery_mode: "announce-always"` -- always sends output, not just on failure
-
-#### Two sequential tasks
-
-**Before:** two cron entries with manual timing
-
-**After:** a parent/child chain:
-
-```bash
-# Step 1: parent job
-ocs jobs add '{
-  "name": "Nightly Backup",
-  "schedule_cron": "0 2 * * *",
-  "session_target": "shell",
-  "payload_message": "/usr/local/bin/nightly-backup.sh",
-  "run_timeout_ms": 300000,
-  "delivery_mode": "announce",
-  "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
-}'
+  "delivery_to": "123456789",
+  "origin": "telegram:123456789"
+}
 ```
 
 ```bash
-# Step 2: child job (runs after parent succeeds)
-ocs jobs add '{
-  "name": "Verify Backup",
-  "parent_id": "BACKUP_JOB_ID",
-  "trigger_on": "success",
-  "trigger_delay_s": 60,
-  "session_target": "shell",
-  "payload_message": "/usr/local/bin/verify-backup.sh",
-  "run_timeout_ms": 60000,
-  "delivery_mode": "announce",
-  "delivery_channel": "telegram",
-  "delivery_to": "YOUR_CHAT_ID",
-  "origin": "system"
-}'
+ocs jobs validate --file morning-briefing.json
+ocs jobs add --file morning-briefing.json
 ```
 
-The second job only runs when the first one succeeds. No more hoping the timing is right.
+Agent jobs require a reachable Gateway. Shell jobs do not.
 
----
+## 5. Build a conditional chain
 
-## Common operations
+Create the parent job first. Copy its returned `job.id` into a child spec as `parent_id`, omit the child's cron schedule, and set one trigger:
+
+- `trigger_on: "success"`
+- `trigger_on: "failure"`
+- `trigger_on: "complete"`
+
+Add `trigger_condition: "contains:ALERT"` or `trigger_condition: "regex:ERROR.*critical"` when output must also match. Add `approval_required: true` to a risky child. Approval decisions are atomic and audited; rejected, expired, disabled, or cancelled work cannot be dispatched later by a stale approval record.
+
+For larger graphs, install the control-plane companion:
 
 ```bash
-# List all jobs
-ocs jobs list
-
-# Run a job immediately
-ocs jobs run <job-id>
-
-# View recent runs for a job
-ocs runs list <job-id> 10
-
-# View a specific run's details
-ocs runs get <run-id>
-
-# Disable a job
-ocs jobs update <job-id> '{"enabled": false}'
-
-# Enable a job
-ocs jobs update <job-id> '{"enabled": true}'
-
-# Delete a job
-ocs jobs delete <job-id>
-
-# Check scheduler health
-ocs status
-
-# View logs
-tail -f /tmp/openclaw-scheduler.log
+npm install -g @amittell/agentcli
+agentcli validate manifest.json
+agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db --dry-run
+agentcli apply manifest.json --db ~/.openclaw/scheduler/scheduler.db
 ```
 
----
+## 6. Migrate current OpenClaw cron jobs
 
-## Session targets explained
+The default importer uses the supported OpenClaw CLI. It reads `openclaw cron list --json`, then fetches each stored definition with `openclaw cron get <id> --json`.
 
-| Target | When to use | Gateway needed? |
-|---|---|---|
-| `shell` | Deterministic commands, scripts, health checks | No |
-| `isolated` | AI reasoning, summarization, writing, tool use | Yes |
-| `main` | Inject into the main session (system events) | Yes |
+Always inspect a dry run first:
 
-**Rule of thumb:** if the task has a predictable answer, use `shell`. If it needs thinking, use `isolated`.
+```bash
+ocs migrate --dry-run --json > migration-report.json
+ocs migrate --json
+ocs jobs list --json
+```
 
----
+Dry-run conversion does not open, create, or migrate the target scheduler
+database. Because it intentionally avoids that state, an existing scheduler job
+with the same ID is reported as `skipped` only during the real import.
 
-## Delivery modes explained
+Cron expressions and one-shot `at` timestamps are preserved. An `every` interval is imported automatically only when five-field cron can represent its cadence and phase exactly. Other intervals fail the migration report. Approximation requires an explicit choice:
 
-| Mode | Behavior |
-|---|---|
-| `announce` | Send output only on failure |
-| `announce-always` | Send output on every run (success and failure) |
-| `none` | Never send output |
+```bash
+ocs migrate --allow-inexact-every --dry-run --json
+```
 
-For `announce` and `announce-always`, you must set `delivery_channel` and `delivery_to`.
+For an old pre-SQLite export, select legacy mode explicitly:
 
----
+```bash
+ocs migrate --legacy-json ~/.openclaw/cron/jobs.json --dry-run --json
+ocs migrate --legacy-json ~/.openclaw/cron/jobs.json --json
+```
 
-## Next steps
+Do not disable native OpenClaw jobs until the report is successful and representative imported jobs have completed test runs. Then disable only the migrated native jobs so the same side effect cannot run in both systems:
 
-- [INSTALL.md](INSTALL.md) -- detailed macOS launchd setup
-- [INSTALL-LINUX.md](INSTALL-LINUX.md) -- Linux/WSL2 systemd setup
-- [BEST-PRACTICES.md](BEST-PRACTICES.md) -- operational patterns and anti-patterns
-- [README.md](README.md) -- full reference manual (chains, retries, approvals, messaging, etc.)
-- [UNINSTALL.md](UNINSTALL.md) -- how to remove the scheduler and restore built-in cron
+```bash
+openclaw cron edit <job-id> --disable
+```
 
-### Optional: agentcli
+Rollback is the reverse: stop the scheduler, disable its imported jobs, and re-enable the corresponding native jobs. Keep the scheduler database until rollback verification is complete.
 
-For declarative workflow manifests, stable job IDs, and v0.2 identity support,
-install [agentcli](https://github.com/amittell/agentcli) and use `agentcli apply`
-to manage jobs. See [Working with agentcli](README.md#working-with-agentcli) in
-the README.
+## 7. Operate safely
+
+```bash
+ocs jobs disable <job-id>
+ocs jobs enable <job-id>
+ocs jobs cancel <job-id>
+ocs runs get <run-id> --json
+ocs runs output <run-id> stdout
+ocs approvals list --json
+ocs doctor --json
+```
+
+Cancellation is fenced against dispatcher ownership. Shell cancellation and timeout terminate the tracked process group before a terminal transition is committed. Agent cancellation records the Gateway cancellation request. Always confirm the authoritative run state with `runs get`, `runs running`, or `status`; asynchronous chat updates can be stale.
+
+External delivery is committed through a transactional outbox that is separate from agent prompt messages. Attachments are retained with size and SHA-256 metadata. Delivery is retried under a claim lease and cannot be consumed as another agent's prompt context.
+
+Governance fields are execution controls in version 0.3.0. If a requested sandbox, path, network, credential, trust, proof, or cost policy cannot be enforced, execution fails closed. These controls do not make a destructive command idempotent, so the command itself must still detect prior completion safely.
+
+## 8. Run the complete repository gate
+
+```bash
+npm run verify:local
+```
+
+The gate runs linting, type checking, the legacy integration suite, every focused `tests/*.test.mjs` file sequentially with an isolated database, documentation example validation, the sibling `agentcli` integration suite when that checkout is available, coverage, and a package dry run.
+
+## Next references
+
+- [JOB-QUICK-REF.md](JOB-QUICK-REF.md) for job fields and recipes
+- [BEST-PRACTICES.md](BEST-PRACTICES.md) for production patterns
+- [UPGRADING.md](UPGRADING.md) for schema migration and rollback
+- [UNINSTALL.md](UNINSTALL.md) for removal and native-job restoration
+- [docs/trust-architecture.md](docs/trust-architecture.md) for enforcement boundaries

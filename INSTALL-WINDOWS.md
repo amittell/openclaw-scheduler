@@ -104,7 +104,7 @@ npm rebuild better-sqlite3
 ### Step 3: Run Tests
 
 ```powershell
-$env:SCHEDULER_DB=":memory:"; node test.js
+npm run verify:local
 ```
 
 All tests must pass before continuing.
@@ -131,32 +131,34 @@ $body = '{"model":"openclaw:main","messages":[{"role":"user","content":"reply OK
 ### Step 5: Migrate Jobs from OC Cron
 
 ```powershell
-node migrate.js
+openclaw-scheduler migrate --dry-run --json | Out-File migration-report.json
+openclaw-scheduler migrate --json
 ```
+
+The default source is `openclaw cron list/get --json`. Use
+`--legacy-json ~/.openclaw/cron/jobs.json` only for an old export. Intervals
+that cannot be represented exactly require the explicit
+`--allow-inexact-every` option.
 
 Verify:
 ```powershell
-node cli.js jobs list
-node cli.js status
+openclaw-scheduler jobs list --json
+openclaw-scheduler doctor --json
 ```
 
 ---
 
-### Step 6: Disable OC Built-in Cron and Heartbeat
+### Step 6: Disable Migrated Native Jobs
 
 ```powershell
 openclaw cron list
 # For each enabled job:
 openclaw cron edit <job-id> --disable
-openclaw config set cron.enabled false
-
-openclaw config set agents.defaults.heartbeat.every "0m"
-# If you have per-agent heartbeat overrides, set/remove those too:
-# agents.list[].heartbeat.every = "0m"
-openclaw gateway restart
 ```
 
-Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway process environment (service wrapper/PM2 ecosystem), then restart the gateway.
+Disable only imported jobs after successful scheduler test runs. Leave unrelated
+native jobs and heartbeat settings unchanged. Rollback by stopping the
+scheduler, disabling its imported copies, and re-enabling the native jobs.
 
 ---
 
@@ -294,7 +296,7 @@ Already have the scheduler installed and need to update to a newer version? See 
 
 ## Validation Checklist
 
-- [ ] `$env:SCHEDULER_DB=":memory:"; node test.js` -- all passing, 0 failed
+- [ ] `npm run verify:local` -- all checks passing
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `pm2 status` → openclaw-scheduler is `online`
 - [ ] PM2 log has startup lines, no errors

@@ -31,8 +31,10 @@ Commands:
   setup [--service-mode agent|daemon|skip]
                    Run interactive setup wizard
   start            Start dispatcher loop
-  migrate          Import OC cron jobs from ~/.openclaw/cron/jobs.json
-  status           Show scheduler health
+  migrate          Import jobs through the OpenClaw cron CLI
+                   Use --legacy-json [path] only for pre-SQLite jobs.json exports
+  status           Show live scheduler state and queue/outbox diagnostics
+  doctor           Validate DB schema, lease, queue, outbox, and approval health
   webhook-check    Run Telegram webhook health check / repair utility
   help             Show this help
 
@@ -50,6 +52,7 @@ Dispatch subcommands (routed to dispatch/index.mjs):
 
 All other commands are forwarded to scheduler CLI (cli.js):
   openclaw-scheduler jobs list
+  openclaw-scheduler jobs validate --file job.json
   openclaw-scheduler runs running
   openclaw-scheduler msg send system main "hello"
 
@@ -101,36 +104,48 @@ function runDispatch(args) {
 }
 
 const args = process.argv.slice(2);
-const cmd = args[0] || '';
+const commandIndex = args[0] === '--json' ? 1 : 0;
+const cmd = args[commandIndex] || '';
+const commandArgs = [
+  ...args.slice(0, commandIndex),
+  ...args.slice(commandIndex + 1),
+];
+const dispatchCommandArgs = commandArgs[0] === '--json'
+  ? [...commandArgs.slice(1), '--json']
+  : commandArgs;
 
 if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
   printUsage();
   process.exit(0);
 } else if (cmd === 'setup') {
-  runScript('setup.mjs', args.slice(1));
+  runScript('setup.mjs', commandArgs);
 } else if (cmd === 'start' || cmd === 'dispatcher') {
-  runScript('dispatcher.js', args.slice(1));
+  runScript('dispatcher.js', commandArgs);
 } else if (cmd === 'migrate') {
-  runScript('migrate.js', args.slice(1));
+  runScript('migrate.js', commandArgs);
 } else if (cmd === 'webhook-check') {
-  runScript('scripts/telegram-webhook-check.mjs', args.slice(1));
+  runScript('scripts/telegram-webhook-check.mjs', commandArgs);
 } else if (cmd === 'version' || cmd === '--version' || cmd === '-v') {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  process.stdout.write(`${pkg.name} ${pkg.version}\n`);
+  if (commandArgs.includes('--json')) {
+    process.stdout.write(`${JSON.stringify({ name: pkg.name, version: pkg.version }, null, 2)}\n`);
+  } else {
+    process.stdout.write(`${pkg.name} ${pkg.version}\n`);
+  }
   process.exit(0);
-} else if (cmd === 'status' && hasDispatchStatusLabel(args.slice(1))) {
+} else if (cmd === 'status' && hasDispatchStatusLabel(commandArgs)) {
   // Preserve the historical dispatch convenience alias:
   //   openclaw-scheduler status --label <name>
   // Without --label, "status" means scheduler health via cli.js.
-  runDispatch(args);
+  runDispatch([cmd, ...commandArgs]);
 } else if (DISPATCH_SUBCOMMANDS.has(cmd)) {
   // Route dispatch subcommands to dispatch/index.mjs
   // If the command is 'dispatch', strip it and pass the rest
   // If it's a convenience alias (enqueue, status, etc.), pass everything as-is
   if (cmd === 'dispatch') {
-    runDispatch(args.slice(1));
+    runDispatch(dispatchCommandArgs);
   } else {
-    runDispatch(args);
+    runDispatch([cmd, ...commandArgs]);
   }
 } else {
   // All other commands forwarded to scheduler CLI (cli.js)

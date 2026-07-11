@@ -162,6 +162,7 @@ export function resetCompletionDeliveryClaim({ label } = {}) {
   try {
     getDb().prepare('DELETE FROM completion_debts WHERE task_label = ?').run(label);
   } catch (err) {
+    if (/no such table:\s*completion_debts/i.test(err.message || '')) return;
     process.stderr.write(`[dispatch-hooks] completion debt reset skipped for ${label}: ${err.message}\n`);
   }
 }

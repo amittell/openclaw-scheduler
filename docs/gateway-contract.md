@@ -2,6 +2,8 @@
 
 Date: 2026-03-28
 
+Updated: 2026-07-11 for scheduler 0.3.0 and schema 27
+
 ## Purpose
 
 This document defines the gateway API surface that openclaw-scheduler depends on.
@@ -215,6 +217,13 @@ Each session object is expected to have at minimum: `key` (or `sessionKey`),
 Used for delivering job results, check-in updates, and notifications to
 Telegram or other channels. Messages exceeding `TELEGRAM_MAX_MESSAGE_LENGTH`
 (4096 chars) are split into numbered chunks by `splitMessageForChannel`.
+
+Scheduler run delivery is not stored in the agent prompt inbox. Completion
+commits an entry in `delivery_outbox` and optional `delivery_attachments` rows.
+A claimed outbox row carries an owner, token, and expiry; expired claims are
+recovered before retry. Only the outbox consumer invokes the gateway `message`
+tool for that row. This separation prevents externally addressed output from
+being injected into a later agent prompt.
 
 **Also used directly in dispatch/index.mjs** `cmdEnqueue()` via raw `fetch` to
 `POST /tools/invoke` for the "Starting..." notification when spawning a
@@ -564,10 +573,15 @@ The scheduler targets a specific agent by setting `agent_id` on the job:
 ```json
 {
   "name": "Beta Agent Daily Task",
+  "schedule_cron": "0 8 * * *",
   "agent_id": "beta",
   "session_target": "isolated",
   "payload_kind": "agentTurn",
-  "payload_message": "perform daily check"
+  "payload_message": "perform daily check",
+  "run_timeout_ms": 300000,
+  "delivery_mode": "none",
+  "delivery_opt_out_reason": "gateway contract example",
+  "origin": "system"
 }
 ```
 
@@ -803,27 +817,26 @@ Reference:
 
 ### Current State
 
-There is no explicit cancel API. Cancellation is achieved exclusively through
-timeout-based abort:
+Run cancellation is durable and fenced in scheduler state. A cancellation
+request records the requester and reason. Only the run's dispatcher owner and
+fencing token can commit its terminal transition.
 
-- **`runAgentTurn`**: Hard `AbortController` timeout on the fetch request.
-- **`runAgentTurnWithActivityTimeout`**: Two-tier abort (idle + absolute).
-- **Watchdog jobs**: `dispatch/index.mjs` registers watchdog cron jobs that run
-  the `stuck` subcommand. Stuck sessions are reported but not actively
-  cancelled -- they are auto-resolved as `interrupted` in the labels ledger
-  when the sessions store confirms they are idle.
+- `runAgentTurn` and `runAgentTurnWithActivityTimeout` link their local abort
+  signal to the active request.
+- When a session key exists, `gateway.js` calls
+  `openclaw gateway call chat.abort --params <json> --json` as a best-effort
+  active-session cancellation request.
+- The run records `agent_cancel_requested_at` for audit even when the Gateway
+  is unavailable or rejects the abort.
+- Completion checks cancellation state before delivery or child creation, so a
+  stale agent response cannot win after cancellation.
+- Watchdog status remains observational. Operators confirm the authoritative
+  outcome through scheduler run state, not a chat notification.
 
-When a session is auto-resolved (via `cmdStatus`, `cmdStuck`, or `cmdSync`),
-the label is marked `interrupted` with a summary noting that work may be
-incomplete. The associated watchdog job is disarmed via the scheduler CLI
-(`jobs disable`).
-
-### Proposed: Explicit Cancel API
-
-A `sessions.cancel` method or `sessions.patch` with a cancel flag would allow
-the scheduler to actively terminate a session rather than waiting for the
-timeout to expire. This would reduce resource waste from abandoned sessions and
-provide faster feedback to delivery targets.
+The Gateway abort call is best effort because network failure can prevent
+confirmation. Scheduler fencing still prevents the abandoned result from
+committing side effects inside the scheduler, but it cannot reverse an
+external side effect already performed by the agent.
 
 ---
 
@@ -918,6 +931,7 @@ request headers.
 | `openclaw gateway call agent` | CLI | `dispatch/index.mjs` | Subagent session dispatch |
 | `openclaw gateway call chat.history` | CLI | `dispatch/index.mjs` | Session transcript retrieval |
 | `openclaw gateway call sessions.list` | CLI | `dispatch/index.mjs` | Session existence verification (fallback) |
+| `openclaw gateway call chat.abort` | CLI | `gateway.js` | Best-effort active agent-session cancellation |
 | `x-openclaw-agent-id` | Header | `gateway.js` | Route request to correct agent |
 | `x-openclaw-session-key` | Header (req) | `gateway.js` | Session continuity |
 | `x-openclaw-session-key` | Header (resp) | `gateway.js` | Session key propagation |

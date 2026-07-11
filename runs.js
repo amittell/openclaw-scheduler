@@ -1,6 +1,7 @@
 // Run lifecycle management
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
+import { transitionRunTerminal } from './run-state.js';
 
 /**
  * Create a new run for a job.
@@ -8,14 +9,22 @@ import { getDb } from './db.js';
 export function createRun(jobId, opts = {}) {
   const db = getDb();
   const id = randomUUID();
+  const dispatcherOwner = opts.dispatcher_owner ?? opts.ownerId ?? null;
+  const dispatcherToken = opts.dispatcher_token ?? opts.fencingToken ?? null;
+  const hasDispatcherOwner = typeof dispatcherOwner === 'string' && dispatcherOwner.trim().length > 0;
+  const hasDispatcherToken = Number.isInteger(dispatcherToken) && dispatcherToken > 0;
+  if (hasDispatcherOwner !== hasDispatcherToken) {
+    throw new Error('dispatcher owner and fencing token must be provided together');
+  }
 
   db.prepare(`
     INSERT INTO runs (
       id, job_id, status, run_timeout_ms, session_key, session_id,
       dispatched_at, context_summary, replay_of, idempotency_key, retry_count,
-      retry_of, triggered_by_run, dispatch_queue_id
+      retry_of, triggered_by_run, dispatch_queue_id,
+      dispatcher_owner, dispatcher_token, dispatch_started_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -29,7 +38,10 @@ export function createRun(jobId, opts = {}) {
     opts.retry_count ?? 0,
     opts.retry_of || null,
     opts.triggered_by_run || null,
-    opts.dispatch_queue_id || null
+    opts.dispatch_queue_id || null,
+    hasDispatcherOwner ? dispatcherOwner : null,
+    hasDispatcherToken ? dispatcherToken : null,
+    opts.dispatch_started_at || (hasDispatcherOwner ? new Date().toISOString() : null)
   );
 
   return getRun(id);
@@ -55,53 +67,20 @@ export function getRunsForJob(jobId, limit = 50) {
  * Update run status to finished (ok/error/timeout).
  */
 export function finishRun(id, status, opts = {}) {
-  const db = getDb();
-  const run = getRun(id);
-  if (!run) return null;
+  return finishRunCas(id, status, opts).run;
+}
 
-  const iso = run.started_at
-    ? (run.started_at.includes('T') ? run.started_at : run.started_at.replace(' ', 'T') + 'Z')
-    : null;
-  const startedAt = iso ? new Date(iso).getTime() : Date.now();
-  const durationMs = Date.now() - startedAt;
-
-  db.prepare(`
-    UPDATE runs SET
-      status = ?,
-      finished_at = datetime('now'),
-      duration_ms = ?,
-      summary = COALESCE(?, summary),
-      error_message = COALESCE(?, error_message),
-      context_summary = COALESCE(?, context_summary),
-      shell_exit_code = COALESCE(?, shell_exit_code),
-      shell_signal = COALESCE(?, shell_signal),
-      shell_timed_out = COALESCE(?, shell_timed_out),
-      shell_stdout = COALESCE(?, shell_stdout),
-      shell_stderr = COALESCE(?, shell_stderr),
-      shell_stdout_path = COALESCE(?, shell_stdout_path),
-      shell_stderr_path = COALESCE(?, shell_stderr_path),
-      shell_stdout_bytes = COALESCE(?, shell_stdout_bytes),
-      shell_stderr_bytes = COALESCE(?, shell_stderr_bytes)
-    WHERE id = ? AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
-  `).run(
-    status,
-    durationMs,
-    opts.summary ?? null,
-    opts.error_message ?? null,
-    opts.context_summary ? JSON.stringify(opts.context_summary) : null,
-    opts.shell_exit_code ?? null,
-    opts.shell_signal ?? null,
-    opts.shell_timed_out != null ? Number(Boolean(opts.shell_timed_out)) : null,
-    opts.shell_stdout ?? null,
-    opts.shell_stderr ?? null,
-    opts.shell_stdout_path ?? null,
-    opts.shell_stderr_path ?? null,
-    opts.shell_stdout_bytes ?? null,
-    opts.shell_stderr_bytes ?? null,
-    id
-  );
-
-  return getRun(id);
+/**
+ * Fenced terminal compare-and-swap. Unlike finishRun, this exposes whether the
+ * transition won so dispatch finalization can suppress delivery, retries, and
+ * child triggers after cancellation or lease takeover.
+ */
+export function finishRunCas(id, status, opts = {}, fencing = {}) {
+  return transitionRunTerminal(id, status, opts, {
+    ownerId: fencing.ownerId ?? fencing.dispatcher_owner ?? opts.dispatcher_owner ?? opts.ownerId,
+    fencingToken: fencing.fencingToken ?? fencing.dispatcher_token ?? opts.dispatcher_token ?? opts.fencingToken,
+    leaseName: fencing.leaseName ?? opts.leaseName,
+  });
 }
 
 /**
@@ -146,7 +125,7 @@ export function getStaleRuns(thresholdSeconds = 90) {
         -- Shell jobs: stale only if they exceed their absolute run_timeout_ms
         (j.session_target = 'shell'
           AND r.run_timeout_ms IS NOT NULL
-          AND (julianday('now') - julianday(r.started_at)) * 86400000 > r.run_timeout_ms)
+          AND (julianday('now') - julianday(COALESCE(r.dispatch_started_at, r.started_at))) * 86400000 > r.run_timeout_ms)
         OR
         -- Session-based jobs: stale if last_heartbeat not updated within threshold,
         -- or if they never heartbeated and started_at is past the threshold (startup grace)
@@ -179,7 +158,7 @@ export function getTimedOutRuns() {
     JOIN jobs j ON r.job_id = j.id
     WHERE r.status = 'running'
       AND r.run_timeout_ms IS NOT NULL
-      AND (julianday('now') - julianday(r.started_at)) * 86400000 > r.run_timeout_ms
+      AND (julianday('now') - julianday(COALESCE(r.dispatch_started_at, r.started_at))) * 86400000 > r.run_timeout_ms
   `).all();
 }
 
@@ -226,7 +205,29 @@ export function getRunningRunsByPool(poolName) {
  * Store or update the context_summary JSON for a run.
  */
 export function updateContextSummary(runId, summaryObj) {
-  const json = typeof summaryObj === 'string' ? summaryObj : JSON.stringify(summaryObj);
+  let nextSummary = summaryObj;
+  const current = getRun(runId);
+  if (current?.context_summary) {
+    try {
+      const existing = JSON.parse(current.context_summary);
+      const incoming = typeof summaryObj === 'string' ? JSON.parse(summaryObj) : summaryObj;
+      if (
+        existing?.credential_cleanup
+        && incoming
+        && typeof incoming === 'object'
+        && !Array.isArray(incoming)
+        && incoming.credential_cleanup == null
+      ) {
+        nextSummary = {
+          ...incoming,
+          credential_cleanup: existing.credential_cleanup,
+        };
+      }
+    } catch {
+      // Preserve historical behavior for non-JSON summaries.
+    }
+  }
+  const json = typeof nextSummary === 'string' ? nextSummary : JSON.stringify(nextSummary);
   getDb().prepare(`
     UPDATE runs SET context_summary = ? WHERE id = ?
   `).run(json, runId);

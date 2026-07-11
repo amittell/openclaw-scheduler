@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] -- 2026-07-11
+
+### Added
+
+- schema v27 dispatcher leases, fencing tokens, run ownership, durable cancellation fields, leased dispatch claims, atomic approval audit fields, a transactional delivery outbox, and durable attachment integrity metadata
+- bounded dispatcher worker ownership so one long run does not block scheduler maintenance or unrelated dispatches
+- independent lease renewal during slow gateway, delivery, provider, and recovery operations
+- process-group identity tracking and confirmed termination for shell timeout, cancellation, and crash recovery, plus OpenClaw `chat.abort` confirmation for active agent sessions
+- fail-closed `recovery_blocked` quarantine when crash recovery cannot prove the original process or agent turn stopped
+- execution-time governance decisions and a minimal-by-default shell environment; migrated jobs retain explicit `shell_env_policy: "inherit"`
+- `doctor` and expanded `status` diagnostics for live lease, queue, outbox, approval, cancellation, cleanup debt, SQLite integrity, foreign keys, and schema state
+- job JSON input through `--file` or `--stdin`
+- a current OpenClaw CLI importer with structured dry-run reports, exact cron and one-shot preservation, explicit legacy JSON mode, and opt-in interval approximation
+
+### Changed
+
+- repositioned the project as an OpenClaw continuity and governed-workflow sidecar; native OpenClaw remains the default for ordinary cron, command, history, retry, Task Flow, and approval needs
+- database schema and consolidation failures now stop initialization
+- external delivery is separated from agent prompt messages and committed through the outbox
+- delivery claims heartbeat throughout slow chunked sends; idempotency collisions are rejected unless payloads are equivalent
+- terminal delivery and attachment retention is bounded, including filesystem artifact cleanup and outer-transaction rollback safety
+- run completion, job state, and child dispatch enqueue are committed atomically
+- cancellation closes claimed dispatches atomically before run creation, while preparing runs are protected from concurrent health finalization
+- approval resolution uses versioned atomic transitions and rechecks disabled or cancelled state before dispatch
+- credential cleanup is retried, persisted as an operator-visible failure on exhaustion, and disables the affected job without repeating user work
+- `npm test` now runs the legacy suite, every focused test file sequentially with isolated databases, documentation validation, and sibling `agentcli` integration when available
+- package and documentation references use `@amittell/agentcli`
+
+### Migration Notes
+
+- the default job importer now calls `openclaw cron list/get --json`; pass `--legacy-json` only for an old export
+- interval schedules that five-field cron cannot represent exactly fail unless `--allow-inexact-every` is explicitly selected
+- run `openclaw-scheduler doctor --json` after upgrading and before restarting destructive workflows
+- keep a pre-upgrade database backup until scheduler and rollback verification are complete
+
 ## [0.2.17] -- 2026-07-04
 
 ### Fixed

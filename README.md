@@ -2,24 +2,25 @@
 
 [![CI](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Node](https://img.shields.io/badge/node-22%20%7C%2024%20%7C%2026-green)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-22%20%7C%2024%20%7C%2025%20%7C%2026-green)](https://nodejs.org)
 
-A durable orchestration runtime for [OpenClaw](https://openclaw.ai) agents and shell workflows. Use it when built-in cron and heartbeat stop being enough: jobs fail and disappear into logs, shell scripts depend on gateway uptime, multi-step workflows need retries and approvals, and you want a real audit trail for what ran, what failed, and what triggered what.
+A durable continuity and governed-workflow sidecar for [OpenClaw](https://openclaw.ai) agents and shell workflows. Current OpenClaw already provides [SQLite cron state, command jobs, retries, and run history](https://docs.openclaw.ai/cli/cron), plus [background tasks](https://docs.openclaw.ai/automation/tasks), [Task Flow](https://docs.openclaw.ai/automation/taskflow), and [Lobster approval checkpoints](https://docs.openclaw.ai/tools/lobster). Use this scheduler when shell jobs must survive Gateway downtime, the scheduler needs a separate failure domain, workflows need direct conditional job graphs, or `@amittell/agentcli` needs its durable runtime target.
 
-It replaces OpenClaw's built-in cron/heartbeat with a SQLite-backed scheduler that keeps full run history, supports shell and agent steps in the same workflow, and lets you build chains like `shell check -> agent diagnosis -> human approval -> remediation`.
+It can coexist with native OpenClaw cron. Do not run the same job in both systems.
 
 **Repo:** `github.com/amittell/openclaw-scheduler`
 **Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
-**Runtime:** Node.js 22 LTS, 24 LTS, or 26 Current (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Tests:** run with `npm test` (full suite, in-memory SQLite)
+**Runtime:** Node.js 22, 24, 25, or 26 (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
+**Schema:** version 27
+**Tests:** run with `npm test` (legacy suite, isolated focused tests, docs, and sibling agentcli integration when available)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 In practice, this gives you:
-- scheduled jobs with real run history instead of “it probably ran”
-- shell jobs that still work when the gateway is unhealthy
+- shell jobs that still work when the Gateway is unhealthy
+- a scheduler failure domain separate from the Gateway
 - AI jobs that stay isolated from your personal chats
-- chains, retries, and approval gates for workflows that are bigger than one cron line
+- conditional chains, fenced cancellation, atomic approvals, and transactional external delivery
 
 ---
 
@@ -28,7 +29,7 @@ In practice, this gives you:
 1. [Why This Exists](#why-this-exists)
 2. [Concrete Use Cases](#concrete-use-cases)
 3. [When To Use It](#when-to-use-it)
-4. [What Replaced What](#what-replaced-what)
+4. [Choosing a Runtime](#choosing-a-runtime)
 5. [Quick Start](#quick-start)
 6. [Five-Minute Setup](#five-minute-setup)
 7. [Starter Recipes](#starter-recipes)
@@ -71,17 +72,16 @@ In practice, this gives you:
 
 ## Why This Exists
 
-OpenClaw's built-in cron and heartbeat are fine until your workflows stop being simple.
+OpenClaw's built-in cron and Task Flow are the right default for many automations. This project addresses a narrower operator need: continuity outside the Gateway process and one local runtime for conditional shell and agent graphs.
 
 The pain usually looks like this:
 
-- A scheduled agent run fails, but the only record is a log line or a chat reply.
 - A shell script is operationally important, but it should keep running even if the gateway is unhealthy.
 - One step should trigger another, but only on success, only on failure, or only if the output contains a specific signal.
 - A risky action needs a human in the loop instead of firing immediately.
 - An agent needs to hand work to another agent or process, and you want that handoff tracked and auditable.
 
-`openclaw-scheduler` exists to solve those problems without making you build a second application stack. It gives OpenClaw a durable runtime for workflows: jobs, runs, chains, retries, shell execution, approvals, and message routing all backed by SQLite.
+`openclaw-scheduler` exists to solve those problems without replacing the native runtime for ordinary cron work. It provides jobs, runs, chains, shell execution, approvals, a delivery outbox, and message routing backed by a separate SQLite database.
 
 ## Concrete Use Cases
 
@@ -102,27 +102,41 @@ The differentiator is not just "better cron". It is mixed shell + agent workflow
 
 Use it when you want:
 
-- reliable scheduled execution with history and retries
 - shell jobs that do not depend on OpenClaw gateway availability
+- an independently operated scheduler and database
 - parent/child workflow chains
 - approval gates before risky steps
 - auditable inter-agent or agent-to-shell handoffs
 
-Do not use it if simple cron is enough. If all you need is “run one thing every hour” and you do not care about retries, chains, approvals, or run history, this is probably more system than you need.
+Do not use it merely to obtain run history, command jobs, or basic retries. Native OpenClaw provides those capabilities. If all you need is one scheduled command or agent turn, this is probably more system than you need.
 
-## What Replaced What
+## Choosing a Runtime
 
 > If you have never used OpenClaw's built-in cron, skip migration and go directly to [Five-Minute Setup](#five-minute-setup).
 
-| Before (OC built-in) | After (scheduler) |
-|----------------------|-------------------|
-| `~/.openclaw/cron/jobs.json` | SQLite `jobs` table with full run history |
-| `heartbeat.every: "5m"` | Scheduled jobs (e.g., "Daily Workspace Audit") |
-| No run tracking | Full run lifecycle with status, duration, summary |
-| No chain support | Parent/child jobs with trigger-on-completion |
-| No retry | Auto-retry with configurable attempts and delay |
-| No inter-agent comms | Message queue with priority, threading, broadcast |
-| Shell scripts (manual) | Shell job target — cron-scheduled scripts, no gateway needed |
+| Requirement | Recommended owner |
+|-------------|-------------------|
+| One command or agent turn on a schedule | Native OpenClaw cron |
+| Native restart-safe flow or resumable approval checkpoint | OpenClaw Task Flow or Lobster |
+| Shell execution while the Gateway is unavailable | OpenClaw Scheduler |
+| Direct parent/child triggers on result or output content | OpenClaw Scheduler |
+| Declarative governed runbook manifest | `@amittell/agentcli` targeting OpenClaw Scheduler |
+
+---
+
+## Version 0.3.0 Runtime Safety
+
+- A singleton dispatcher lease and fencing token prevent a second dispatcher from taking ownership of live work.
+- Active runs carry dispatcher ownership. Only the owning fence can commit the terminal transition or trigger downstream work.
+- Cancellation is a durable request. Shell jobs terminate their tracked process group; agent jobs record and send the Gateway cancellation request. Check `runs get` or `status` for authoritative state.
+- Expired dispatch claims return to the pending queue only when no active run owns them.
+- Run completion, job state, and child dispatch creation commit atomically.
+- External delivery uses a transactional outbox that is separate from agent prompt messages. Attachments retain size and SHA-256 metadata.
+- Approval decisions use atomic versioned transitions and cannot dispatch disabled, rejected, expired, or cancelled work.
+- Governance declarations are enforced at execution time. Unsupported sandbox, path, network, credential, trust, proof, or cost requirements fail closed.
+- Database schema and consolidation failures stop startup. `openclaw-scheduler doctor --json` reports schema, lease, queue, outbox, approval, and cancellation diagnostics.
+
+These controls do not make arbitrary side effects idempotent. Destructive commands must still detect prior completion and be safe to retry.
 
 ---
 
@@ -204,7 +218,7 @@ npm run verify:local                 # full local maintainer gate
 npm run verify:smoke                 # lightweight smoke gate used by GitHub Actions
 ```
 
-GitHub Actions runs the smoke gate plus the in-memory test suite on Linux and macOS with the supported Node.js lines: Node 22, Node 24, and Node 26. Publishing uses Node 24 for OIDC trusted publisher support. The full release gate still runs locally via `npm run verify:local` and is enforced again by `prepublishOnly`.
+GitHub Actions runs `npm run verify:smoke` on Linux and macOS across the supported Node.js lines. That gate includes lint, type checking, every repository test, documentation validation, and a package dry run. `npm run verify:local` adds coverage and is enforced again by `prepublishOnly`. Focused test files run sequentially with isolated databases; the sibling agentcli integration also runs when that checkout is available.
 
 ### Option C: local npm pack (simulate the published package from source)
 
@@ -416,25 +430,32 @@ ocs jobs reject <job-id> "Not today"
 
 If you already have cron jobs, OpenClaw cron entries, or shell scripts, this is the simplest way to think about the conversion.
 
-### 1. OpenClaw built-in cron -> import first, then clean up
+### 1. OpenClaw built-in cron -> inspect, import, test, then disable duplicates
 
-If your jobs already live in `~/.openclaw/cron/jobs.json`, start with the importer:
+The default importer reads the supported OpenClaw CLI rather than an internal storage file. It calls `openclaw cron list --json` and `openclaw cron get <id> --json`:
 
 ```bash
-cd ~/.openclaw/scheduler
-node migrate.js
-node cli.js jobs list
+openclaw-scheduler migrate --dry-run --json > migration-report.json
+openclaw-scheduler migrate --json
+openclaw-scheduler jobs list --json
 ```
 
-Then disable the old scheduler path:
+The dry run never opens, creates, or migrates the target scheduler database.
+Existing-ID duplicate checks therefore occur during the real import.
+
+Cron expressions and one-shot timestamps are preserved exactly. Intervals that five-field cron cannot represent exactly are rejected unless the operator explicitly passes `--allow-inexact-every`. A pre-SQLite export is opt-in:
+
+```bash
+openclaw-scheduler migrate --legacy-json ~/.openclaw/cron/jobs.json --dry-run --json
+```
+
+After representative imported jobs complete successfully, disable only the corresponding native jobs:
 
 ```bash
 openclaw cron edit <job-id> --disable
-openclaw config set cron.enabled false
-openclaw config set agents.defaults.heartbeat.every "0m"
 ```
 
-Use this path when the existing jobs are already OpenClaw-native. It gets you into SQLite quickly, then you can refine the imported jobs later.
+Rollback by stopping the scheduler, disabling its imported copies, and re-enabling the native jobs. Retain the scheduler database until rollback verification is complete.
 
 ### 2. Plain shell cron line -> `session_target: "shell"`
 
@@ -729,7 +750,7 @@ channel-specific target (chat ID, channel ID, phone number, handle, etc.).
 | `announce` | Agent jobs: delivers when run status is not `ok`. Shell jobs: non-zero exit only. Silently skipped for `main` session jobs (use `announce-always` instead) |
 | `announce-always` | Always delivers output (LLM or shell), including `main` session jobs |
 
-> **Note:** delivery is suppressed if `delivery_channel` or `delivery_to` are absent, regardless of `delivery_mode`.
+> **Note:** non-exempt jobs using `announce` or `announce-always` are rejected at validation time when `delivery_to` is absent. Runtime delivery is written to a transactional outbox, separate from agent prompt messages. Outbox claims expire and recover safely; attachment rows retain size and SHA-256 metadata.
 >
 > Examples in this document use Telegram for delivery_channel since it is the
 > most common configuration. Replace with your channel of choice.
@@ -1110,10 +1131,10 @@ This retry ladder now applies uniformly to shell jobs, isolated agent jobs, and 
 
 ```bash
 openclaw-scheduler jobs cancel <job-id>
-# Cancels all running runs for this job + every descendant
+# Requests cancellation for active runs on this job and its descendants
 ```
 
-Sets `status = 'cancelled'` on all running runs in the chain. No-op on finished runs.
+Cancellation is fenced against dispatcher ownership. Pending work is cancelled atomically. A running shell job receives process-group termination and cannot finalize or trigger children after cancellation wins. Agent work records and sends a Gateway cancellation request. Finished runs are unchanged. Poll `runs get`, `runs running`, or `status`; chat notifications are asynchronous and can be stale.
 
 ---
 
@@ -1229,7 +1250,7 @@ openclaw-scheduler agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 23 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 27 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -1237,14 +1258,17 @@ openclaw-scheduler agents register <id> [name]
 |-------|-------------|
 | `jobs` | Job definitions (schedule, payload, chain config, delivery) |
 | `runs` | Execution history (status, timing, summaries, retry lineage) |
-| `messages` | Inter-agent message queue (priority, TTL, typed) |
+| `messages` | Inter-agent prompt queue (`pending`, `prompt_claimed`, delivered/read terminal states) |
 | `agents` | Agent registry (status, capabilities, last seen) |
-| `approvals` | HITL gate records (pending/approved/rejected/expired) |
+| `approvals` | Atomic, versioned HITL decisions and dispatch state |
 | `task_tracker` | Multi-agent task group definitions |
 | `task_tracker_agents` | Per-agent status within a task group |
 | `idempotency_ledger` | Dispatch deduplication and at-least-once tracking |
 | `delivery_aliases` | Named delivery targets (channel + target pairs) |
-| `job_dispatch_queue` | Pending and delivered dispatch entries per job |
+| `job_dispatch_queue` | Leased durable dispatch claims and replay state |
+| `dispatcher_leases` | Singleton dispatcher ownership and fencing tokens |
+| `delivery_outbox` | Transactional external delivery queue |
+| `delivery_attachments` | Durable attachment content/path and integrity metadata |
 | `message_receipts` | Delivery receipt tracking for messages |
 | `team_tasks` | Team-scoped task definitions and status |
 | `team_mailbox_events` | Projected events from team mailbox activity |
@@ -1308,9 +1332,9 @@ delivery_channel, delivery_to, brand_name, created_at
 # ── Jobs ──────────────────────────────────────────
 openclaw-scheduler jobs list                     # List all (shows agent, parent, trigger; supports --type <type>)
 openclaw-scheduler jobs get <id>                 # Full details as JSON
-openclaw-scheduler jobs add '<json>'             # Create a job (supports --dry-run)
-openclaw-scheduler jobs update <id> '<json>'     # Partial update (supports --dry-run)
-openclaw-scheduler jobs validate '<json>'        # Validate a job spec without creating it
+openclaw-scheduler jobs add --file job.json      # Inline JSON and --stdin are also supported
+openclaw-scheduler jobs update <id> --stdin      # Partial update from standard input
+openclaw-scheduler jobs validate --file job.json # Validate without DB initialization
 openclaw-scheduler jobs enable <id>
 openclaw-scheduler jobs disable <id>              # NOTE: one-shot at-jobs with delete_after_run: true are auto-pruned after 24h (ordinary disabled cron jobs are kept indefinitely)
 openclaw-scheduler jobs delete <id>              # Cascades to runs
@@ -1377,6 +1401,10 @@ openclaw-scheduler idem prune                    # Force prune expired entries
 openclaw-scheduler alias list                 # List all aliases
 openclaw-scheduler alias add <name> <channel> <target> [description]
 openclaw-scheduler alias remove <name>
+
+# ── Runtime Diagnostics ──────────────────────────
+openclaw-scheduler status --json              # Live DB, lease, queue, outbox, approval state
+openclaw-scheduler doctor --json              # Fail-closed schema and operational checks
 
 # ── Schema Introspection ─────────────────────────
 openclaw-scheduler schema jobs              # JSON schema for job fields (types, defaults, enums)
@@ -1540,48 +1568,30 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 
 ## Migration & History
 
-### Importing from OC cron (first host only)
+### Importing from current OpenClaw
 
 ```bash
-node migrate.js   # imports from ~/.openclaw/cron/jobs.json
+openclaw-scheduler migrate --dry-run --json
+openclaw-scheduler migrate --json
 ```
+
+Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old export.
 
 ### Schema baseline
 
-As of public release `v0.1.0`, the schema is consolidated in `schema.sql` (baseline `v14`, now `v23`).
+Version 0.3.0 uses schema version 27.
 
-- Net-new installs: `initDb()` applies `schema.sql` directly.
-- Existing/pre-release DBs: `initDb()` runs `migrate-consolidate.js` to backfill missing columns/tables/indexes.
+- Net-new installs apply `schema.sql` transactionally.
+- Existing databases run the idempotent consolidation migration, then reapply the current schema.
+- Any schema or consolidation error aborts startup. It is never logged and ignored.
 
-### What was disabled in OpenClaw
+### Native-job ownership and release history
 
-| System | How disabled | Revert |
-|--------|-------------|--------|
-| Built-in cron | Jobs disabled (`openclaw cron edit <id> --disable`) + global cron off (`cron.enabled=false`) + gateway env `OPENCLAW_SKIP_CRON=1` | Re-enable jobs + `cron.enabled=true` + unset `OPENCLAW_SKIP_CRON` |
-| Heartbeat | `agents.defaults.heartbeat.every: "0m"` and disable/remove any per-agent `agents.list[].heartbeat` overrides | Set defaults/per-agent heartbeat cadence back (for example `"5m"`) |
-| Chat completions | Enabled for scheduler | Can leave enabled |
-
-### Public release
-
-| Version | Date | Schema | Key changes |
-|---------|------|--------|-------------|
-| 0.2.0 | 2026-03-11 | v21 | Dispatch `done` hardening, auth profile support, one-shot `at` scheduling, expanded type coverage, UTC scheduling defaults, and portability/runtime fixes |
-| 0.1.0 | 2026-03-08 | v14 | First public release: workflow engine, structured shell failure triage, watchdog jobs, output offloading, execution-intent controls, safer migration checks, and public-release cleanup |
-
-### Pre-public development milestones
-
-| Date | Former internal tag | Schema | Key changes |
-|------|----------------------|--------|-------------|
-| 2026-02-21 | 0.1.0 | v1 | Initial: jobs, runs, messages, agents, standalone dispatch |
-| 2026-02-22 | 0.4.0 | v3 | Workflow chains, cycle detection, spawn messages, multi-agent |
-| 2026-02-23 | 0.5.0 | v3b | Retry logic, max chain depth, chain cancellation, queue overlap |
-| 2026-02-24 | 0.6.0 | v5 | Shell jobs, announce-always, MinIO backup, resource pools, delivery aliases |
-| 2026-02-25 | 0.7.0 | v6/v7 | Idempotency, at-least-once, context retrieval, approval gates, task tracker, typed messages |
-| 2026-02-26 | 1.0.0 | v6 | Docs, LICENSE, CHANGELOG, package metadata |
-| 2026-03-02 | 1.0.1 | v9 | Consolidated schema + migration path, task tracker heartbeat/session baseline columns, session reuse field, Windows shell default fix (`cmd.exe`) |
-| 2026-03-03 | 1.0.2 | v10 | Team-aware routing fields on messages, explicit message receipt events, team adapter projection + task completion gates |
-| 2026-03-05 | 1.0.3 | v10 | Dispatch hardening: seeded 529 recovery job reconciliation, watcher token-telemetry safeguards, robust home-path resolution, and watcher DB checks without external `sqlite3` CLI |
-| 2026-03-08 | 1.1.0 | v13 | Structured shell failure triage, watchdog job type, safer migration skip checks, and public-release cleanup for docs/examples |
+Disable only native jobs that have a verified scheduler replacement. Native
+OpenClaw cron and heartbeat may continue serving unrelated work. Rollback stops
+or disables the scheduler copies and re-enables those native jobs. See
+[CHANGELOG.md](CHANGELOG.md) for release and schema history instead of relying
+on duplicated version tables in this reference.
 
 ---
 
@@ -1593,7 +1603,7 @@ Already have the scheduler running and need to update? See [UPGRADING.md](UPGRAD
 ```bash
 cd ~/.openclaw/scheduler
 git pull && npm install
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```
 
@@ -1601,7 +1611,7 @@ launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```bash
 cd ~/.openclaw/scheduler
 git pull && npm install
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 systemctl --user restart openclaw-scheduler
 ```
 
@@ -1610,7 +1620,7 @@ systemctl --user restart openclaw-scheduler
 cd $env:USERPROFILE\.openclaw\scheduler
 git pull
 npm install
-$env:SCHEDULER_DB=":memory:"; node test.js
+npm run verify:local
 pm2 restart openclaw-scheduler
 ```
 
@@ -1653,24 +1663,32 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── dispatcher-approvals.js   # Approval timeout resolution and auto-approve/reject
 ├── dispatcher-delivery.js    # Post-run delivery pipeline (announce, announce-always)
 ├── dispatcher-shell.js       # Shell job execution and result normalization
+├── dispatcher-runtime.js     # Singleton lease and bounded worker ownership
 ├── dispatcher-utils.js       # Shared dispatcher helpers and dependency wiring
-├── dispatch-queue.js         # Durable dispatch queue (manual runs, retries, chain triggers)
-├── db.js                  # SQLite connection (WAL, FK ON, WAL checkpoint)
-├── schema.sql             # Complete schema (v23) -- all tables and columns, no incremental DDL
-├── migrate-consolidate.js # Single migration for existing DBs: brings any prior version to v23
+├── dispatch-queue.js         # Leased durable dispatch queue and stale-claim recovery
+├── runtime-lease.js          # Dispatcher lease and fencing token persistence
+├── run-state.js              # Fenced cancellation and terminal run transitions
+├── run-completion.js         # Atomic completion, job update, and child enqueue
+├── delivery-outbox.js        # Transactional external delivery queue
+├── attachment-store.js       # Durable attachment staging and integrity metadata
+├── governance.js             # Execution-time governance enforcement
+├── db.js                  # SQLite connection, fail-closed schema init, WAL checkpoints
+├── schema.sql             # Complete schema (v27)
+├── migrate-consolidate.js # Single migration for existing DBs through v27
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
 ├── agents.js              # Agent registry
 ├── gateway.js             # OpenClaw API client (chat completions, events, delivery, aliases)
-├── approval.js            # HITL approval gates
+├── approval.js            # HITL approval queries
+├── approval-state.js      # Atomic approval decisions and dispatch claims
 ├── idempotency.js         # Idempotency ledger (at-least-once delivery dedup)
 ├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
 ├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
 ├── team-adapter.js        # Team mailbox/task projection and task completion gates
 ├── backup.js              # MinIO snapshot/rollup/restore (requires `mc` CLI)
 ├── cli.js                 # CLI management tool
-├── migrate.js             # Import from OC jobs.json
+├── migrate.js             # Import through OpenClaw cron CLI or explicit legacy JSON
 ├── scripts/
 │   ├── dispatch-cli-utils.mjs       # Dispatch CLI path resolution helpers
 │   ├── inbox-consumer.mjs           # Drains queue messages and delivers to Telegram
@@ -1698,12 +1716,15 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run all tests (in-memory SQLite; expect 0 failed)
-SCHEDULER_DB=:memory: node test.js
-
-# Or via npm:
+# Run the legacy suite, isolated focused tests, docs, and sibling integration
 npm test
+
+# Add lint, types, coverage, and package verification
+npm run verify:local
 ```
+
+Focused `tests/*.test.mjs` files run sequentially in separate processes and
+databases so shared module state cannot contaminate another file.
 
 ### Test categories
 
@@ -1900,7 +1921,7 @@ workflows that outgrow ad-hoc job creation.
 ### Installing agentcli
 
 ```bash
-npm install -g agentcli
+npm install -g @amittell/agentcli
 ```
 
 ### Starting fresh with both tools
@@ -2121,13 +2142,13 @@ All dates must be SQLite format (`YYYY-MM-DD HH:MM:SS`, UTC). `nextRunFromCron()
 ### Force a job to run now
 
 ```bash
-sqlite3 scheduler.db "UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = '<job-id>'"
+openclaw-scheduler jobs run <job-id>
 ```
 
 ### Check schema version
 
 ```bash
-sqlite3 scheduler.db "SELECT * FROM schema_migrations"
+openclaw-scheduler doctor --json
 ```
 
 ### Service won't start

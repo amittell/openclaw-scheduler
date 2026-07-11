@@ -81,6 +81,11 @@ export function normalizeShellResult(
     stdout = '',
     stderr = '',
     error = null,
+    exitCode: structuredExitCode = null,
+    signal: structuredSignal = null,
+    timedOut: structuredTimedOut = false,
+    aborted = false,
+    maxBufferExceeded = false,
   },
   {
     runId = null,
@@ -125,16 +130,18 @@ export function normalizeShellResult(
   const stdoutExcerpt = truncateText(stdoutText, excerptLimit);
   const stderrExcerpt = truncateText(stderrText, excerptLimit);
 
-  const exitCode = Number.isInteger(error?.code) ? error.code : null;
-  const signal = error?.signal || null;
+  const exitCode = Number.isInteger(structuredExitCode)
+    ? structuredExitCode
+    : (Number.isInteger(error?.code) ? error.code : null);
+  const signal = structuredSignal || error?.signal || null;
   const timedOut = Boolean(
-    error && (
+    structuredTimedOut || (error && (
       error.code === 'ETIMEDOUT'
       || error.killed === true
       || /timed out/i.test(error?.message || '')
       || /exceeded absolute timeout/i.test(error?.message || '')
       || /idle.*timeout/i.test(error?.message || '')
-    )
+    ))
   );
   const status = timedOut ? 'timeout' : error ? 'error' : 'ok';
   const errorMessage = deriveErrorMessage({ status, timedOut, exitCode, signal, rawError: error }, timeoutMs);
@@ -168,6 +175,8 @@ export function normalizeShellResult(
         exit_code: exitCode,
         signal,
         timed_out: timedOut,
+        aborted: Boolean(aborted),
+        max_buffer_exceeded: Boolean(maxBufferExceeded),
         error_message: errorMessage,
         stdout_excerpt: stdoutExcerpt.text,
         stderr_excerpt: stderrExcerpt.text,

@@ -3,11 +3,34 @@
 Date: 2026-03-30
 Status: Accepted
 
+Updated: 2026-07-11 for scheduler 0.3.0 and schema 27
+
 ## Purpose
 
 This document describes the trust architecture of the scheduler/sub-agent
 execution model: what the boundary guarantees, what it does not, and how
 operators reason about the security properties of scheduled workflows.
+
+## Version 0.3.0 Enforcement Status
+
+Governance fields are no longer treated as prompt-only metadata. Every dispatch
+evaluates the stored policy before execution. The runtime currently enforces a
+minimal or inherited shell environment directly. A job that requests sandbox
+isolation, restricted network access, allowed-path isolation, or agent cost
+limits is denied unless the selected executor reports that control as actually
+enforced. The default host executor does not claim those controls.
+
+This is deliberate fail-closed behavior, not an assertion that the host process
+has container, namespace, firewall, filesystem, or cost-metering isolation.
+`contract_audit` is parsed and recorded, while identity, trust, authorization
+proof, credential handoff, and evidence checks retain their provider-specific
+runtime enforcement.
+
+Fresh shell jobs use `shell_env_policy: "minimal"`, which passes only a small
+operating-system allowlist plus explicitly materialized task credentials.
+Migrated jobs use `inherit` to preserve legacy behavior and emit a warning.
+Materialized credential objects are cleared during cleanup, including error and
+cancellation paths.
 
 ## The Core Design: Scheduler as Broker, Child as Bounded Actor
 
@@ -38,11 +61,13 @@ child is narrower than the parent in at least one of these dimensions:
 - **Credentials** -- downscoped key, narrower OAuth scope, shorter-lived
   token. With dynamic RAK minting, each child gets a per-task restricted
   API key that is revoked on cleanup.
-- **Tools** -- different tool set, different sandbox mode, spawn depth cap.
+- **Tools** -- different tool set, an executor that enforces the declared
+  sandbox mode, or a spawn depth cap.
 - **State** -- isolated session with no access to parent's memory or
   conversation history.
-- **Network/filesystem scope** -- different `allowed_paths`, different
-  network policy (`unrestricted` / `restricted` / `none`).
+- **Network/filesystem scope** -- an executor that actually enforces different
+  `allowed_paths` or network policy. The default host executor rejects these
+  restrictions because it cannot enforce them.
 
 When the child is meaningfully narrower, the boundary limits blast radius:
 a compromised or misbehaving child cannot access the parent's full
@@ -112,11 +137,11 @@ in the credential-scoping or access-control sense.
 
 **Does not guarantee:**
 
-- Network isolation between parent and child. They run on the same host,
-  same gateway, same network unless the contract's `network` policy adds
-  OS-level restrictions.
-- Filesystem isolation beyond what the contract declares in
-  `allowed_paths`. There is no container or namespace boundary.
+- Network isolation between parent and child under the default host executor.
+  A restrictive `contract_network` is denied instead of being simulated.
+- Filesystem isolation under the default host executor. A non-empty
+  `contract_allowed_paths` is denied unless a path-isolating executor is
+  configured. There is no implicit container or namespace boundary.
 - That an inherited credential is narrower than the parent's. `inherit`
   passes through verbatim.
 - That a child cannot observe side effects of the parent's execution

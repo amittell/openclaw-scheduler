@@ -14,7 +14,7 @@ This guide covers both git-clone and npm-based installs. Each host is independen
 cd ~/.openclaw/scheduler
 git pull
 npm install
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 sleep 3 && tail -5 /tmp/openclaw-scheduler.log
 node cli.js status
@@ -26,7 +26,7 @@ node cli.js status
 cd ~/.openclaw/scheduler
 git pull
 npm install
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 systemctl --user restart openclaw-scheduler
 sleep 3 && systemctl --user --no-pager --full status openclaw-scheduler
 node cli.js status
@@ -38,7 +38,7 @@ node cli.js status
 cd $env:USERPROFILE\.openclaw\scheduler
 git pull
 npm install
-$env:SCHEDULER_DB=":memory:"; node test.js
+npm run verify:local
 pm2 restart openclaw-scheduler
 Start-Sleep 3
 pm2 logs openclaw-scheduler --lines 5 --nostream
@@ -61,7 +61,14 @@ That is the whole process for a routine update. The rest of this document explai
    ```
 3. **Check current schema version:**
    ```bash
-   node -e "const db=require('better-sqlite3')('scheduler.db');console.log(db.prepare('SELECT MAX(version) as v FROM schema_migrations').get());db.close()"
+   openclaw-scheduler doctor --json
+   ```
+   Releases before 0.3.0 do not provide `doctor`; use
+   `openclaw-scheduler status --json` and continue with the backup step.
+4. **Create a consistent SQLite backup before installing new code:**
+   ```bash
+   cd ~/.openclaw/scheduler
+   sqlite3 scheduler.db ".backup 'scheduler.db.pre-upgrade'"
    ```
 
 ---
@@ -160,14 +167,14 @@ Common triggers for needing a rebuild:
 
 ```bash
 cd ~/.openclaw/scheduler
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 ```
 
 ### Windows native (PowerShell)
 
 ```powershell
 cd $env:USERPROFILE\.openclaw\scheduler
-$env:SCHEDULER_DB=":memory:"; node test.js
+npm run verify:local
 ```
 
 All tests must pass before restarting the service. If tests fail, do not restart -- investigate the failure first and check the CHANGELOG for any required manual steps.
@@ -176,9 +183,14 @@ All tests must pass before restarting the service. If tests fail, do not restart
 
 ## Step 4: Schema Migrations
 
-The dispatcher runs pending schema migrations automatically on startup. No manual migration step is needed.
+The dispatcher runs pending schema migrations automatically on startup. No
+manual schema command is needed. Schema application and consolidation fail
+closed: a migration error stops startup instead of continuing on a partial
+schema.
 
-Note: `migrate.js` is the OC cron importer (for importing jobs from the old OC cron system), not the schema migrator. Do not run it expecting schema changes.
+`migrate.js` imports OpenClaw cron definitions through `openclaw cron list/get
+--json`; it is not the schema migrator. `--legacy-json` is only for an old
+export. Do not run either importer expecting schema changes.
 
 To verify the current schema version:
 
@@ -186,14 +198,41 @@ To verify the current schema version:
 
 ```bash
 cd ~/.openclaw/scheduler
-node -e "const db=require('better-sqlite3')('scheduler.db');console.log(db.prepare('SELECT MAX(version) as v FROM schema_migrations').get());db.close()"
+openclaw-scheduler doctor --json
 ```
+
+`doctor` also runs SQLite `quick_check` and `foreign_key_check`. It exits
+nonzero for structural corruption, orphan foreign keys, recovery-blocked runs,
+or failed credential cleanup. Do not treat these as cosmetic warnings.
+
+Older installations can contain historical runs or dispatch rows whose jobs
+were deleted while foreign-key enforcement was disabled. Preserve them in the
+pre-upgrade backup before removing the orphan rows:
+
+```bash
+sqlite3 scheduler.db "PRAGMA foreign_key_check;"
+sqlite3 scheduler.db ".backup 'scheduler.db.before-fk-repair'"
+sqlite3 scheduler.db <<'SQL'
+BEGIN IMMEDIATE;
+DELETE FROM runs
+WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = runs.job_id);
+DELETE FROM job_dispatch_queue
+WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = job_dispatch_queue.job_id);
+COMMIT;
+PRAGMA foreign_key_check;
+PRAGMA integrity_check;
+SQL
+```
+
+Only run that repair when the reported violations are those two orphan forms.
+Investigate any other parent table or integrity error instead of deleting data
+generically.
 
 ### Windows native (PowerShell)
 
 ```powershell
 cd $env:USERPROFILE\.openclaw\scheduler
-node -e "const db=require('better-sqlite3')('scheduler.db');console.log(db.prepare('SELECT MAX(version) as v FROM schema_migrations').get());db.close()"
+openclaw-scheduler doctor --json
 ```
 
 ---
@@ -262,7 +301,7 @@ node cli.js status
 A healthy startup log looks like:
 
 ```
-[scheduler] [info] Starting OpenClaw Scheduler v0.2.0 {"tickMs":10000,...}
+[scheduler] [info] Starting OpenClaw Scheduler v0.3.0 {"tickMs":10000,...}
 [scheduler] [info] Database initialized
 [scheduler] [info] Pruned old runs + messages
 ```
@@ -289,7 +328,7 @@ There is no required upgrade order. Hosts do not share state and can run differe
 HOST=youruser@your-mac-host.lan
 
 ssh $HOST "cd ~/.openclaw/scheduler && git pull && npm install"
-ssh $HOST "cd ~/.openclaw/scheduler && SCHEDULER_DB=:memory: node test.js" 2>&1 | tail -5
+ssh $HOST "cd ~/.openclaw/scheduler && npm run verify:smoke" 2>&1 | tail -20
 ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
 sleep 3
 ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && cd ~/.openclaw/scheduler && node cli.js status"
@@ -314,7 +353,7 @@ ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && launchctl print gui/\$(id -u)/
 HOST=youruser@your-linux-host.lan
 
 ssh $HOST "cd ~/.openclaw/scheduler && git pull && npm install"
-ssh $HOST "cd ~/.openclaw/scheduler && SCHEDULER_DB=:memory: node test.js" 2>&1 | tail -5
+ssh $HOST "cd ~/.openclaw/scheduler && npm run verify:smoke" 2>&1 | tail -20
 ssh $HOST "systemctl --user restart openclaw-scheduler"
 sleep 3
 ssh $HOST "systemctl --user --no-pager --full status openclaw-scheduler && cd ~/.openclaw/scheduler && node cli.js status"
@@ -330,7 +369,7 @@ Invoke-Command -ComputerName $HOST -ScriptBlock {
   git pull
   npm install
   $env:SCHEDULER_DB=":memory:"
-  node test.js
+  npm run verify:smoke
   pm2 restart openclaw-scheduler
   Start-Sleep 3
   pm2 logs openclaw-scheduler --lines 5 --nostream
@@ -399,7 +438,13 @@ npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@<pr
 pm2 restart openclaw-scheduler
 ```
 
-**Schema rollback:** Downgrading the code does not undo schema migrations. New columns added by migrations are ignored by older code -- they use `DEFAULT` values and do not cause errors. If a migration added a new table, older code simply does not reference it. In practice, schema changes are forward-compatible and do not require manual rollback.
+**Schema rollback:** Do not assume an older package can safely use a schema 27
+database. Stop the service before changing database files. If the previous
+version fails its startup checks, preserve the failed database, restore
+`scheduler.db.pre-upgrade` to `scheduler.db`, remove stale `scheduler.db-wal`
+and `scheduler.db-shm` files only while the service is stopped, then start the
+previous package and run its status check. Restoring the backup loses writes
+made after the backup, so export or inspect those rows first when they matter.
 
 ---
 

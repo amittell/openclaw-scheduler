@@ -1,14 +1,36 @@
-import { sendMessage } from './messages.js';
+import { enqueueDelivery } from './delivery-outbox.js';
 
-export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
+export function createDeliveryHelpers({
+  log,
+  resolveDeliveryAlias,
+  enqueueDeliveryFn = enqueueDelivery,
+}) {
   function resolveAlias(target) {
     if (!target) return null;
     return resolveDeliveryAlias(target);
   }
 
-  async function handleDelivery(job, content, opts = {}) {
-    if (!['announce', 'announce-always'].includes(job.delivery_mode)) return;
-    if (!job.delivery_channel && !job.delivery_to) return;
+  function normalizeRoute(channel, target) {
+    let normalizedChannel = typeof channel === 'string' ? channel.trim() : '';
+    let normalizedTarget = typeof target === 'string' ? target.trim() : '';
+    if (!normalizedChannel && normalizedTarget) {
+      const prefixed = normalizedTarget.match(/^([a-z0-9_-]+)[:/](.+)$/i);
+      if (prefixed) {
+        normalizedChannel = prefixed[1];
+        normalizedTarget = prefixed[2];
+      }
+    }
+    if (normalizedChannel && normalizedTarget.startsWith(`${normalizedChannel}:`)) {
+      normalizedTarget = normalizedTarget.slice(normalizedChannel.length + 1);
+    } else if (normalizedChannel && normalizedTarget.startsWith(`${normalizedChannel}/`)) {
+      normalizedTarget = normalizedTarget.slice(normalizedChannel.length + 1);
+    }
+    return { channel: normalizedChannel, target: normalizedTarget };
+  }
+
+  function handleDelivery(job, content, opts = {}) {
+    if (!['announce', 'announce-always'].includes(job.delivery_mode)) return null;
+    if (!job.delivery_channel && !job.delivery_to) return null;
 
     let channel = job.delivery_channel;
     let target = job.delivery_to;
@@ -22,27 +44,39 @@ export function createDeliveryHelpers({ log, resolveDeliveryAlias }) {
       }
     }
 
+    ({ channel, target } = normalizeRoute(channel, target));
+    if (!channel || !target) {
+      log('error', `Delivery route is incomplete: ${job.name}`, { channel: channel || null, to: target || null });
+      throw new Error(`Delivery route for '${job.name || job.id || 'job'}' requires both channel and target`);
+    }
+
     try {
-      const subject = (job.name || '').slice(0, 100);
-      const msg = {
-        from_agent: 'scheduler',
-        to_agent:   'main',
-        kind:       'result',
-        subject,
-        body:       content,
+      const idempotencyKey = opts.idempotencyKey
+        || (opts.runId ? `run:${opts.runId}:delivery:${channel}:${target}` : null)
+        || (opts.eventId ? `event:${opts.eventId}:delivery:${channel}:${target}` : null);
+      const delivery = enqueueDeliveryFn({
+        db: opts.db,
+        messageId: opts.messageId || null,
+        jobId: job.id || null,
+        runId: opts.runId || null,
         channel,
-        delivery_to: target,
-      };
-      // Pass image attachment paths so the message consumer can deliver them
-      // as photo/file attachments instead of plain text. Scripts signal this
-      // by writing [IMAGE:/path/to/file] markers to stdout.
-      if (opts.imageAttachments?.length > 0) {
-        msg.attachments = opts.imageAttachments;
-      }
-      sendMessage(msg);
-      log('info', `Enqueued: ${job.name}`, { channel, to: target, attachments: opts.imageAttachments?.length || 0 });
+        target,
+        body: String(content ?? ''),
+        attachments: opts.imageAttachments || opts.attachments || [],
+        idempotencyKey,
+        maxAttempts: opts.maxAttempts,
+      });
+      log('info', `Delivery enqueued: ${job.name}`, {
+        deliveryId: delivery.id,
+        deduped: delivery.deduped,
+        channel,
+        to: target,
+        attachments: delivery.attachments?.length || 0,
+      });
+      return delivery;
     } catch (err) {
       log('error', `Delivery enqueue failed: ${job.name}: ${err.message}`);
+      throw err;
     }
   }
 

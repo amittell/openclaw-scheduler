@@ -107,7 +107,7 @@ ssh "$HOST" 'command -v node && node -v'
 ## Step 3: Run Tests
 
 ```bash
-SCHEDULER_DB=:memory: node test.js
+npm run verify:local
 ```
 
 **All tests must pass before proceeding.**
@@ -135,26 +135,28 @@ Expected: `200`
 
 ---
 
-## Step 5: Disable OC Built-in Cron
+## Step 5: Migrate and Disable Only Duplicate Native Jobs
 
-If this host had OC built-in cron jobs enabled, disable them so they don't conflict with the scheduler.
+If this host has native jobs that need sidecar semantics, inspect a migration
+before changing either runtime:
 
 ```bash
-openclaw cron list
-# For each enabled job:
+openclaw-scheduler migrate --dry-run --json > migration-report.json
+openclaw-scheduler migrate --json
+openclaw-scheduler doctor --json
 openclaw cron edit <job-id> --disable
-openclaw config set cron.enabled false
 ```
 
-Also set `OPENCLAW_SKIP_CRON=1` in your OpenClaw gateway service environment (launchctl/systemd/pm2), then restart the gateway.
-
-Verify: `openclaw cron list` shows no enabled jobs (or "No cron jobs").
+The importer uses `openclaw cron list/get --json`. Use `--legacy-json` only for
+an old export. Disable a native job only after its imported copy passes a test
+run. Keep unrelated native jobs enabled.
 
 ---
 
-## Step 6: Disable OC Heartbeat
+## Step 6: Optionally Move a Heartbeat
 
-If this host had OC heartbeat enabled, disable it:
+Leave native heartbeat enabled unless a verified scheduler job replaces it.
+To disable it after that verification:
 
 ```bash
 openclaw config set agents.defaults.heartbeat.every "0m"
@@ -315,7 +317,7 @@ openclaw gateway restart
 
 ## Validation Checklist
 
-- [ ] `SCHEDULER_DB=:memory: node test.js` -- all passing, 0 failed
+- [ ] `npm run verify:local` -- all checks passing
 - [ ] `node cli.js status` → shows jobs, 0 stale
 - [ ] `launchctl print gui/$UID/ai.openclaw.scheduler` or `sudo launchctl print system/ai.openclaw.scheduler` → running
 - [ ] Log file has startup lines, no errors

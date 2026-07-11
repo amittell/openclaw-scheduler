@@ -1,6 +1,7 @@
 # Job Quick Reference
 
-Copy-paste patterns for common scheduler jobs.
+Copy-paste patterns for scheduler 0.3.0 and schema 27. Validate a saved spec
+with `openclaw-scheduler jobs validate --file job.json` before adding it.
 
 ## Shell job with cron schedule
 
@@ -12,6 +13,7 @@ Copy-paste patterns for common scheduler jobs.
   "session_target": "shell",
   "payload_kind": "shellCommand",
   "payload_message": "/usr/local/bin/backup.sh",
+  "shell_env_policy": "minimal",
   "run_timeout_ms": 600000,
   "delivery_mode": "announce",
   "delivery_channel": "telegram",
@@ -29,7 +31,7 @@ Copy-paste patterns for common scheduler jobs.
   "schedule_tz": "America/New_York",
   "session_target": "isolated",
   "agent_id": "main",
-  "payload_kind": "systemEvent",
+  "payload_kind": "agentTurn",
   "payload_message": "Prepare the morning briefing with overnight alerts.",
   "run_timeout_ms": 300000,
   "delivery_mode": "announce-always",
@@ -47,7 +49,7 @@ Copy-paste patterns for common scheduler jobs.
   "schedule_cron": "*/30 * * * *",
   "session_target": "main",
   "agent_id": "main",
-  "payload_kind": "systemEvent",
+  "payload_kind": "agentTurn",
   "payload_message": "Check for unacknowledged messages and follow up.",
   "run_timeout_ms": 120000,
   "delivery_mode": "none",
@@ -197,6 +199,8 @@ openclaw-scheduler jobs reject <id> "not ready yet"
 | `payload_message` | string | yes | Shell command or agent prompt |
 | `payload_model` | string | no | Model override for agent tasks |
 | `payload_model_fallback` | string | no | Optional fallback model override for same-run retry after primary selection failure |
+| `execution_intent` | string | no | `execute`, `plan`, or `fire-and-forget` |
+| `shell_env_policy` | string | no | `minimal` for fresh jobs or explicit legacy-compatible `inherit` |
 | `auth_profile_fallback` | string | no | Optional fallback auth profile for same-run retry after primary selection failure |
 | `run_timeout_ms` | integer | yes | Max run duration in ms (no default) |
 | `delivery_mode` | string | no | `none`, `announce`, `announce-always` |
@@ -214,6 +218,12 @@ openclaw-scheduler jobs reject <id> "not ready yet"
 | `enabled` | integer | no | 1 (enabled) or 0 (disabled) |
 
 For the full field list, run `openclaw-scheduler schema jobs`.
+
+Cancellation and timeout are fenced against dispatcher ownership. Shell jobs
+terminate the tracked process group before terminal completion. External
+delivery uses the transactional `delivery_outbox`, separate from agent prompt
+messages. Use `openclaw-scheduler doctor --json` for schema, lease, queue,
+outbox, approval, and cancellation diagnostics.
 
 ## Delivery channels
 

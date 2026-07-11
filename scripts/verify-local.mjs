@@ -12,6 +12,7 @@ const steps = smokeOnly
   ? [
       { name: 'lint', cmd: [npmExec, ['run', 'lint']] },
       { name: 'typecheck', cmd: [npmExec, ['run', 'typecheck']] },
+      { name: 'test', cmd: [npmExec, ['test']] },
       { name: 'pack', cmd: [npmExec, ['pack', '--dry-run']] },
     ]
   : [

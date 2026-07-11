@@ -1,10 +1,42 @@
+import { transitionRunTerminal } from './run-state.js';
+import { pruneTerminalDeliveries } from './delivery-outbox.js';
+
+export function pruneDeliveryHistory({
+  log,
+  getDb,
+  retentionDays,
+  limit,
+  artifactsDir,
+  pruneDeliveries = pruneTerminalDeliveries,
+}) {
+  if (typeof getDb !== 'function') throw new Error('getDb is required');
+  const result = pruneDeliveries({
+    db: getDb(),
+    retentionDays,
+    limit,
+    artifactsDir,
+  });
+  if (result.pruned > 0 && typeof log === 'function') {
+    log('info', `Pruned ${result.pruned} terminal delivery outbox row(s)`, {
+      attachmentRowsPruned: result.attachmentRowsPruned,
+      attachmentBytesPruned: result.attachmentBytesPruned,
+      filesRemoved: result.filesRemoved,
+      directoriesRemoved: result.directoriesRemoved,
+      cutoff: result.cutoff,
+    });
+  }
+  if (result.skippedUnsafePaths > 0 && typeof log === 'function') {
+    log('warn', `Skipped ${result.skippedUnsafePaths} unsafe delivery attachment path(s) during pruning`);
+  }
+  return result;
+}
+
 export async function checkRunHealth({
   log,
   getDb,
   getRunningRuns,
   getStaleRuns,
   getTimedOutRuns,
-  finishRun,
   getJob,
   updateJobAfterRun,
   handleDelivery,
@@ -12,7 +44,18 @@ export async function checkRunHealth({
   shouldRetry,
   scheduleRetry,
   staleThresholdSeconds,
+  dispatcherOwnerId = null,
+  dispatcherFencingToken = null,
+  transitionRunTerminalFn = transitionRunTerminal,
+  activeRunIds = [],
 }) {
+  if (!(activeRunIds instanceof Set) && !Array.isArray(activeRunIds)) {
+    throw new Error('activeRunIds must be a Set or array');
+  }
+  const activeRunIdSet = activeRunIds instanceof Set ? activeRunIds : new Set(activeRunIds);
+  const fencing = dispatcherOwnerId && dispatcherFencingToken
+    ? { ownerId: dispatcherOwnerId, fencingToken: dispatcherFencingToken }
+    : {};
   const runningRuns = getRunningRuns();
   if (runningRuns.length === 0) return;
 
@@ -20,10 +63,23 @@ export async function checkRunHealth({
 
   const staleRuns = getStaleRuns(staleThresholdSeconds);
   for (const run of staleRuns) {
+    if (activeRunIdSet.has(run.id)) {
+      log('debug', `Deferring stale-run finalization to active execution: ${run.job_name}`, {
+        runId: run.id,
+      });
+      continue;
+    }
     log('warn', `Stale run: ${run.job_name}`, { runId: run.id });
-    finishRun(run.id, 'timeout', {
+    const transition = transitionRunTerminalFn(run.id, 'timeout', {
       error_message: `No activity for ${staleThresholdSeconds}s`,
-    });
+    }, fencing);
+    if (!transition?.changed || transition.run?.status !== 'timeout') {
+      log('debug', `Skipped stale timeout side effects after losing terminal transition: ${run.job_name}`, {
+        runId: run.id,
+        status: transition?.run?.status || null,
+      });
+      continue;
+    }
     const job = getJob(run.job_id);
     if (!job) continue;
     if (shouldRetry(job, run.id)) {
@@ -33,7 +89,8 @@ export async function checkRunHealth({
         if (['announce', 'announce-always'].includes(job.delivery_mode)) {
           await handleDelivery(
             job,
-            `[timeout] Job timed out (stale, will retry): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`
+            `[timeout] Job timed out (stale, will retry): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
+            { runId: run.id }
           );
         }
         if (dequeueJob(job.id)) {
@@ -45,7 +102,11 @@ export async function checkRunHealth({
     }
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-      await handleDelivery(job, `[timeout] Job timed out (stale): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s`);
+      await handleDelivery(
+        job,
+        `[timeout] Job timed out (stale): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s`,
+        { runId: run.id }
+      );
     }
     if (dequeueJob(job.id)) {
       log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout)`);
@@ -56,10 +117,23 @@ export async function checkRunHealth({
   const timedOut = getTimedOutRuns();
   for (const run of timedOut) {
     if (staleRunIds.has(run.id)) continue; // already handled above
+    if (activeRunIdSet.has(run.id)) {
+      log('debug', `Deferring timeout finalization to active execution: ${run.job_name}`, {
+        runId: run.id,
+      });
+      continue;
+    }
     log('warn', `Timed out: ${run.job_name}`, { runId: run.id, timeoutMs: run.run_timeout_ms });
-    finishRun(run.id, 'timeout', {
+    const transition = transitionRunTerminalFn(run.id, 'timeout', {
       error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,
-    });
+    }, fencing);
+    if (!transition?.changed || transition.run?.status !== 'timeout') {
+      log('debug', `Skipped timeout side effects after losing terminal transition: ${run.job_name}`, {
+        runId: run.id,
+        status: transition?.run?.status || null,
+      });
+      continue;
+    }
     const job = getJob(run.job_id);
     if (!job) continue;
     if (shouldRetry(job, run.id)) {
@@ -69,7 +143,8 @@ export async function checkRunHealth({
         if (['announce', 'announce-always'].includes(job.delivery_mode)) {
           await handleDelivery(
             job,
-            `[timeout] Job timed out (will retry): ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`
+            `[timeout] Job timed out (will retry): ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
+            { runId: run.id }
           );
         }
         if (dequeueJob(job.id)) {
@@ -81,7 +156,11 @@ export async function checkRunHealth({
     }
     updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-      await handleDelivery(job, `[timeout] Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`);
+      await handleDelivery(
+        job,
+        `[timeout] Job timed out: ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout`,
+        { runId: run.id }
+      );
     }
     if (dequeueJob(job.id)) {
       log('info', `Dequeued pending dispatch for ${job.name} (after absolute timeout)`);
