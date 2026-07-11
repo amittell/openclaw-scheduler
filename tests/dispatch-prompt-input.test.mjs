@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
 const INDEX_PATH = join(REPO_DIR, 'dispatch', 'index.mjs');
+const TEST_SHELL = process.platform === 'darwin' ? '/bin/zsh' : '/bin/sh';
 
 function buildFixture() {
   const tmpBase = mkdtempSync(join(tmpdir(), 'dispatch-msgsafe-'));
@@ -107,7 +108,7 @@ function runDispatchWithStub({ subcommand, args = [], env = {}, input } = {}) {
 function runShellDispatchWithStub({ shellScript }) {
   const fixture = buildFixture();
   try {
-    const run = spawnSync('zsh', ['-fc', shellScript], {
+    const run = spawnSync(TEST_SHELL, ['-fc', shellScript], {
       cwd: REPO_DIR,
       encoding: 'utf8',
       env: {
@@ -258,7 +259,7 @@ test('dispatch enqueue/send accept literal-safe prompt sources without executing
   }
 });
 
-test('dispatch recommended stdin path stays quiet under zsh while enqueue still succeeds', () => {
+test(`dispatch recommended stdin path stays quiet under ${TEST_SHELL} while enqueue still succeeds`, () => {
   const sideEffectDir = mkdtempSync(join(tmpdir(), 'dispatch-msgsafe-shell-sideeffects-'));
   try {
     const markerBacktick = join(sideEffectDir, 'backtick-ran');
@@ -273,7 +274,7 @@ test('dispatch recommended stdin path stays quiet under zsh while enqueue still 
     const shellScript = `cat <<'PROMPT' | "${process.execPath}" "${INDEX_PATH}" enqueue --label literal-shell --message-stdin --origin system --timeout 300 --delivery-mode none --no-monitor --session-key agent:main:subagent:literal-safe-test\n${hazardPayload}\nPROMPT`;
     const result = runShellDispatchWithStub({ shellScript });
 
-    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.status, 0, result.error?.message || result.stderr || result.stdout);
     assert.equal(result.stderr, '', 'safe stdin shell invocation emits no shell warnings');
     assert.match(result.stdout, /"label":\s*"literal-shell"/);
     assert.ok(result.agentCall?.message?.includes(hazardPayload), 'safe stdin shell invocation still enqueues the literal payload');
