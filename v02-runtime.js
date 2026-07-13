@@ -796,6 +796,10 @@ export function buildEvidenceExecutionSnapshot(job) {
     run_timeout_ms: job.run_timeout_ms ?? null,
     shell_env_policy: job.shell_env_policy || null,
     output_format: job.output_format || null,
+    verification_declared: Boolean(job.verify_shell),
+    verify_shell_sha256: hashEvidenceText(job.verify_shell),
+    verify_timeout_s: job.verify_shell ? job.verify_timeout_s ?? 30 : null,
+    verify_on_failure: job.verify_shell ? job.verify_on_failure || 'error' : null,
     auth_profile: job.auth_profile || null,
     auth_profile_fallback: job.auth_profile_fallback || null,
     job_type: job.job_type || 'standard',
@@ -939,7 +943,7 @@ export function generateEvidence(job, runResult, outcomes) {
 
   const createdAt = new Date().toISOString();
   const effectiveRef = (blob && blob.ref) || evidenceRef
-    || 'urn:openclaw-scheduler:evidence:checksum-v2';
+    || 'urn:openclaw-scheduler:evidence:checksum-v3';
   const payloadSummary = {};
 
   const retention = normalizeEvidenceRetention(blob?.retention, createdAt);
@@ -1062,12 +1066,26 @@ export function generateEvidence(job, runResult, outcomes) {
     exit_code: collected.has('exit_code') ? runResult?.exit_code ?? null : null,
     signal: collected.has('exit_code') ? runResult?.signal || null : null,
     timed_out: collected.has('exit_code') && runResult?.timed_out === true,
-    structured_output_sha256: collected.has('result') ? hashText(runResult?.structured_output) : null,
+    structured_output_sha256: collected.has('result')
+      ? runResult?.structured_output_sha256 || hashText(runResult?.structured_output)
+      : null,
+    structured_output_bytes: collected.has('result') ? runResult?.structured_output_bytes ?? null : null,
+    verification_sha256: collected.has('result')
+      ? hashText(typeof runResult?.verification_result === 'string'
+        ? runResult.verification_result
+        : JSON.stringify(canonicalize(runResult?.verification_result ?? null)))
+      : null,
   });
+  const verificationResult = typeof runResult?.verification_result === 'string'
+    ? safeParse(runResult.verification_result)
+    : runResult?.verification_result;
   const postcondition = canonicalize({
     terminal_status: runResult?.status || null,
     succeeded: runResult?.status === 'ok',
     structured_output_valid: runResult?.structured_output_valid ?? null,
+    structured_output_warning: runResult?.structured_output_warning ?? null,
+    verification_status: verificationResult?.status || null,
+    verification_passed: verificationResult?.passed ?? null,
   });
   const requestedBindings = Array.isArray(blob?.payload?.bind) ? [...blob.payload.bind].sort() : [];
   const contextKeys = blob?.payload?.context && typeof blob.payload.context === 'object'
@@ -1119,7 +1137,7 @@ export function generateEvidence(job, runResult, outcomes) {
     .sort();
 
   const payload = canonicalize({
-    version: 2,
+    version: 3,
     kind: 'openclaw-scheduler-checksum-evidence',
     created_at: createdAt,
     job_id: job.id || null,
@@ -1225,7 +1243,7 @@ export function verifyEvidenceRecord(record) {
   }
   if (actualHash !== parsed.hash) errors.push('evidence payload hash mismatch');
   if (!sha256Pattern.test(parsed.hash)) errors.push('evidence hash must be a sha256 digest');
-  if (parsed.payload.version !== 2) errors.push('unsupported evidence payload version');
+  if (![2, 3].includes(parsed.payload.version)) errors.push('unsupported evidence payload version');
   if (parsed.payload.kind !== 'openclaw-scheduler-checksum-evidence') {
     errors.push('unsupported evidence payload kind');
   }
@@ -1321,6 +1339,10 @@ export function verifyEvidenceRecord(record) {
       'allowed_paths_sha256', 'network_sha256', 'max_cost_usd',
       'audit_sha256', 'child_credential_policy',
     ], 'execution contract declaration');
+    const verificationSnapshotFields = [
+      'verification_declared', 'verify_shell_sha256',
+      'verify_timeout_s', 'verify_on_failure',
+    ];
     exactKeys(parsed.payload.execution_contract.job_snapshot, [
       'job_id', 'agent_id', 'payload_model', 'payload_model_fallback',
       'payload_thinking', 'payload_timeout_seconds', 'run_timeout_ms',
@@ -1332,8 +1354,8 @@ export function verifyEvidenceRecord(record) {
       'approval_approver_scope', 'identity_ref', 'identity_sha256',
       'authorization_proof_ref', 'authorization_proof_sha256',
       'authorization_ref', 'authorization_sha256',
-      'evidence_declaration_sha256',
-    ], 'execution job snapshot');
+      'evidence_declaration_sha256', ...verificationSnapshotFields,
+    ], 'execution job snapshot', parsed.payload.version === 2 ? verificationSnapshotFields : []);
     if (!Number.isSafeInteger(parsed.payload.execution_contract.command.payload_bytes)
       || parsed.payload.execution_contract.command.payload_bytes < 0) {
       errors.push('execution command payload_bytes must be a non-negative integer');
@@ -1345,9 +1367,34 @@ export function verifyEvidenceRecord(record) {
     for (const field of [
       'watchdog_check_sha256', 'trigger_condition_sha256', 'identity_sha256',
       'authorization_proof_sha256', 'authorization_sha256',
-      'evidence_declaration_sha256',
+      'evidence_declaration_sha256', 'verify_shell_sha256',
     ]) {
       nullableSha256(parsed.payload.execution_contract.job_snapshot[field], `execution job snapshot ${field}`);
+    }
+    if (parsed.payload.version === 3) {
+      const verificationDeclared = parsed.payload.execution_contract.job_snapshot.verification_declared;
+      const verifyTimeout = parsed.payload.execution_contract.job_snapshot.verify_timeout_s;
+      const verifyPolicy = parsed.payload.execution_contract.job_snapshot.verify_on_failure;
+      if (typeof verificationDeclared !== 'boolean') {
+        errors.push('execution job snapshot verification_declared must be boolean');
+      }
+      if (verificationDeclared) {
+        if (!Number.isSafeInteger(verifyTimeout) || verifyTimeout < 1) {
+          errors.push('execution job snapshot verify_timeout_s must be a positive integer');
+        }
+        if (!['error', 'warn'].includes(verifyPolicy)) {
+          errors.push('execution job snapshot verify_on_failure must be error or warn');
+        }
+        if (parsed.payload.execution_contract.job_snapshot.verify_shell_sha256 === null) {
+          errors.push('execution job snapshot verify_shell_sha256 is required');
+        }
+      } else if (
+        parsed.payload.execution_contract.job_snapshot.verify_shell_sha256 !== null
+        || verifyTimeout !== null
+        || verifyPolicy !== null
+      ) {
+        errors.push('execution job snapshot verification fields must be null when verification is not declared');
+      }
     }
     if (parsed.payload.execution_contract.job_snapshot.job_id !== parsed.payload.job_id) {
       errors.push('execution job snapshot job_id does not match evidence job_id');
@@ -1379,18 +1426,30 @@ export function verifyEvidenceRecord(record) {
   if (!parsed.payload.result || !parsed.payload.postcondition) {
     errors.push('evidence payload is missing result or postcondition');
   } else {
-    exactKeys(parsed.payload.result, [
+    const resultKeys = [
       'status', 'summary_sha256', 'stdout_sha256', 'stderr_sha256',
       'stdout_bytes', 'stderr_bytes', 'exit_code', 'signal', 'timed_out',
       'structured_output_sha256',
-    ], 'evidence result');
-    exactKeys(parsed.payload.postcondition, [
+      ...(parsed.payload.version >= 3 ? ['structured_output_bytes', 'verification_sha256'] : []),
+    ];
+    const postconditionKeys = [
       'terminal_status', 'succeeded', 'structured_output_valid',
-    ], 'evidence postcondition');
-    for (const field of ['summary_sha256', 'stdout_sha256', 'stderr_sha256', 'structured_output_sha256']) {
+      ...(parsed.payload.version >= 3
+        ? ['structured_output_warning', 'verification_status', 'verification_passed']
+        : []),
+    ];
+    exactKeys(parsed.payload.result, resultKeys, 'evidence result');
+    exactKeys(parsed.payload.postcondition, postconditionKeys, 'evidence postcondition');
+    for (const field of [
+      'summary_sha256', 'stdout_sha256', 'stderr_sha256', 'structured_output_sha256',
+      ...(parsed.payload.version >= 3 ? ['verification_sha256'] : []),
+    ]) {
       nullableSha256(parsed.payload.result[field], `evidence result ${field}`);
     }
-    for (const field of ['stdout_bytes', 'stderr_bytes']) {
+    for (const field of [
+      'stdout_bytes', 'stderr_bytes',
+      ...(parsed.payload.version >= 3 ? ['structured_output_bytes'] : []),
+    ]) {
       const value = parsed.payload.result[field];
       if (value != null && (!Number.isSafeInteger(value) || value < 0)) {
         errors.push(`evidence result ${field} must be null or a non-negative integer`);
@@ -1398,6 +1457,22 @@ export function verifyEvidenceRecord(record) {
     }
     if (typeof parsed.payload.result.timed_out !== 'boolean') {
       errors.push('evidence result timed_out must be boolean');
+    }
+    if (parsed.payload.version >= 3) {
+      const verificationStatus = parsed.payload.postcondition.verification_status;
+      if (verificationStatus != null && !['passed', 'failed', 'timed_out', 'cancelled', 'interrupted'].includes(verificationStatus)) {
+        errors.push('evidence postcondition verification_status is invalid');
+      }
+      const verificationPassed = parsed.payload.postcondition.verification_passed;
+      if (verificationPassed != null && typeof verificationPassed !== 'boolean') {
+        errors.push('evidence postcondition verification_passed must be null or boolean');
+      }
+      if (verificationStatus === 'passed' && verificationPassed !== true) {
+        errors.push('evidence postcondition verification result is inconsistent');
+      }
+      if (verificationStatus != null && verificationStatus !== 'passed' && verificationPassed !== false) {
+        errors.push('evidence postcondition verification failure is inconsistent');
+      }
     }
     if (parsed.payload.result.status !== parsed.payload.run.status
       || parsed.payload.postcondition.terminal_status !== parsed.payload.run.status) {

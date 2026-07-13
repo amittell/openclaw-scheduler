@@ -609,10 +609,10 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
           approval: {
             policy: 'manual',
             risk_level: 'high',
-            approver_scope: 'user:alex',
             timeout_s: 1800,
           },
           output: { format: 'json' },
+          verify: { shell: 'test -n "$PATH"', timeout_seconds: 7, on_failure: 'warn' },
           delivery: { mode: 'none' },
         }],
       }],
@@ -625,11 +625,11 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
     const storedPositive = positive.applied.jobs[0];
 
     assert(compiledPositive?.approval_risk_level === 'high', 'handoff-v3 compiles approval risk');
-    assert(
-      compiledPositive?.approval_approver_scope === 'user:alex',
-      'handoff-v3 compiles approval scope',
-    );
+    assert(compiledPositive?.approval_approver_scope == null, 'handoff-v3 preserves an unscoped approval');
     assert(compiledPositive?.output_format === 'json', 'handoff-v3 compiles structured output');
+    assert(compiledPositive?.verify_shell === 'test -n "$PATH"', 'handoff-v3 compiles verification command');
+    assert(compiledPositive?.verify_timeout_s === 7, 'handoff-v3 compiles verification timeout');
+    assert(compiledPositive?.verify_on_failure === 'warn', 'handoff-v3 compiles verification failure policy');
     assert(positive.applied.result.ok === true, 'handoff-v3 producer applies through scheduler CLI');
     assert(
       positive.applied.result.handoff?.field_version === '3',
@@ -640,11 +640,23 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
       'handoff-v3 producer projects the expanded scheduler field set',
     );
     assert(storedPositive.approval_risk_level === 'high', 'scheduler stores v3 approval risk');
-    assert(
-      storedPositive.approval_approver_scope === 'user:alex',
-      'scheduler stores v3 approval scope',
-    );
+    assert(storedPositive.approval_approver_scope == null, 'scheduler stores an unscoped v3 approval');
     assert(storedPositive.output_format === 'json', 'scheduler stores v3 structured output');
+    assert(storedPositive.verify_shell === 'test -n "$PATH"', 'scheduler stores verification command');
+    assert(storedPositive.verify_timeout_s === 7, 'scheduler stores verification timeout');
+    assert(storedPositive.verify_on_failure === 'warn', 'scheduler stores verification failure policy');
+
+    const scopedManifest = structuredClone(supportedManifest);
+    scopedManifest.workflows[0].tasks[0].approval.approver_scope = 'domain:example.com';
+    const scopedFailure = withManifestFile(
+      scopedManifest,
+      manifestPath => applyManifestExpectingFailure(manifestPath),
+    );
+    assert(scopedFailure?.ok === false, 'scoped handoff fails capability negotiation');
+    assert(
+      JSON.stringify(scopedFailure).includes('approval_scope_enforcement'),
+      'scoped handoff rejection names approval_scope_enforcement',
+    );
   } else if (expectedAgentcliContract === 'handoff-v2') {
     const applyOutput = applyManifest(resolve(agentcliExamples, 'flyctl-ops.json')).result;
     assert(applyOutput.ok === true, 'handoff-v2 producer remains applicable to scheduler v3');

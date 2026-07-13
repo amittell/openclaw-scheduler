@@ -63,21 +63,23 @@ export function enqueueDispatch(jobId, opts = {}) {
 
   const existing = opts.id ? getDispatch(id) : null;
   if (existing) return verifyIdempotentDispatch(existing, jobId, kind);
+  const scheduledFor = opts.scheduled_for || sqliteNow(-1000);
 
   db.prepare(`
     INSERT INTO job_dispatch_queue (
-      id, job_id, dispatch_kind, status, scheduled_for,
+      id, job_id, dispatch_kind, status, scheduled_for, binding_scheduled_for,
       source_run_id, retry_of_run_id, created_at, claimed_at, processed_at,
       claim_owner, claim_token, claim_expires_at, attempt_count, last_error,
       replay_of_run_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO NOTHING
   `).run(
     id,
     jobId,
     kind,
     status,
-    opts.scheduled_for || sqliteNow(-1000),
+    scheduledFor,
+    scheduledFor,
     opts.source_run_id || null,
     opts.retry_of_run_id || null,
     opts.claimed_at || null,
@@ -111,7 +113,7 @@ export function getDueDispatches(limit = 100) {
     JOIN jobs j ON q.job_id = j.id
     WHERE q.status = 'pending'
       AND q.scheduled_for <= datetime('now')
-      AND (j.enabled = 1 OR q.dispatch_kind = 'manual')
+      AND j.enabled = 1
     ORDER BY q.scheduled_for ASC, q.created_at ASC
     LIMIT ?
   `).all(limit);
@@ -129,10 +131,7 @@ export function claimDispatch(id, opts = {}) {
           attempt_count = attempt_count + 1,
           last_error = NULL
       WHERE id = ? AND status = 'pending'
-        AND (
-          dispatch_kind = 'manual'
-          OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = job_id AND j.enabled = 1)
-        )
+        AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = job_id AND j.enabled = 1)
     `).run(modifier, id);
     return result.changes > 0 ? getDispatch(id) : null;
   }
@@ -148,10 +147,7 @@ export function claimDispatch(id, opts = {}) {
         attempt_count = attempt_count + 1,
         last_error = NULL
     WHERE id = ? AND status = 'pending'
-      AND (
-        dispatch_kind = 'manual'
-        OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = job_id AND j.enabled = 1)
-      )
+      AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = job_id AND j.enabled = 1)
     RETURNING *
   `).get(identity.owner, identity.token, modifier, id) || null;
 }
@@ -259,7 +255,6 @@ export function cancelDisabledDispatches() {
         claim_expires_at = NULL,
         last_error = COALESCE(last_error, 'Job disabled before dispatch')
     WHERE status = 'pending'
-      AND dispatch_kind != 'manual'
       AND EXISTS (
         SELECT 1 FROM jobs j
         WHERE j.id = job_dispatch_queue.job_id AND j.enabled = 0

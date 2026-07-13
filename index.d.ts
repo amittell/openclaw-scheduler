@@ -108,6 +108,9 @@ export interface JobSpec {
   output_summary_limit_bytes?: number;
   output_offload_threshold_bytes?: number;
   output_format?: 'json' | 'ndjson' | 'text' | null;
+  verify_shell?: string | null;
+  verify_timeout_s?: number | null;
+  verify_on_failure?: 'warn' | 'error' | null;
 
   // Session continuity
   preferred_session_key?: string | null;
@@ -260,6 +263,12 @@ export interface RunRecord {
   output_format?: 'json' | 'ndjson' | 'text' | null;
   structured_output?: string | null;
   structured_output_valid?: number | boolean | null;
+  structured_output_warning?: string | null;
+  structured_output_bytes?: number | null;
+  structured_output_sha256?: string | null;
+  structured_output_path?: string | null;
+  verification_result?: string | null;
+  approval_used?: string | null;
 
   // Dispatcher ownership, cancellation, and process tracking
   dispatcher_owner?: string | null;
@@ -394,6 +403,7 @@ export interface DispatchRecord {
   dispatch_kind: 'schedule' | 'at' | 'manual' | 'chain' | 'retry';
   status: string;
   scheduled_for: string;
+  binding_scheduled_for: string;
   source_run_id?: string | null;
   retry_of_run_id?: string | null;
   created_at?: string;
@@ -479,6 +489,7 @@ export interface CreateRunOpts {
   triggered_by_run?: string | null;
   dispatch_queue_id?: string | null;
   evidence_required?: number | boolean;
+  approval_used?: JsonValue | string | null;
   ownerId?: string | null;
   fencingToken?: number | null;
 }
@@ -508,6 +519,11 @@ export interface FinishRunOpts {
   output_format?: 'json' | 'ndjson' | 'text' | null;
   structured_output?: string | null;
   structured_output_valid?: number | boolean | null;
+  structured_output_warning?: string | null;
+  structured_output_bytes?: number | null;
+  structured_output_sha256?: string | null;
+  structured_output_path?: string | null;
+  verification_result?: string | object | null;
   ownerId?: string;
   fencingToken?: number;
 }
@@ -1038,6 +1054,7 @@ export const shellResults: {
   DEFAULT_EXCERPT_LIMIT: number;
   DEFAULT_SUMMARY_LIMIT: number;
   DEFAULT_OFFLOAD_THRESHOLD: number;
+  storeRunArtifact(kind: string, runId: string, text: unknown, artifactsDir?: string): string | null;
   normalizeShellResult(result: { stdout?: string; stderr?: string; error?: unknown }, opts?: NormalizeShellOpts): ShellResult;
   extractShellResultFromRun(run: RunRecord): PartialShellResult | null;
 };

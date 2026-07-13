@@ -58,6 +58,13 @@ That is the whole process for a routine update. The rest of this document explai
    sqlite3 scheduler.db ".backup 'scheduler.db.pre-upgrade'"
    ```
 
+### Approval note for 0.4.0
+
+Version 0.4.0 strengthens approval bindings with immutable dispatch and lineage
+identity. A pending approval created by an earlier version cannot authorize the
+new binding contract and is cancelled when resolved. After the upgrade,
+retrigger that work to create a fresh approval rather than reusing the old ID.
+
 ---
 
 ## Step 1: Pull or Install the Update
@@ -83,7 +90,7 @@ git stash pop
 #### macOS / Linux / Windows WSL2
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 ```
 
 ### Local source tarball upgrade (`npm pack`)
@@ -99,7 +106,7 @@ npm run verify:local
 npm pack
 
 mkdir -p ~/.openclaw/packages/openclaw-scheduler
-npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
 Keep `SCHEDULER_HOME=~/.openclaw/scheduler` and `SCHEDULER_DB=~/.openclaw/scheduler/scheduler.db`, and point the service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`.
@@ -118,7 +125,7 @@ npm install
 If you upgraded Node.js since the last install, also rebuild the native module:
 
 ```bash
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 Common triggers for needing a rebuild:
@@ -287,7 +294,7 @@ HOST=youruser@your-mac-host.lan
 TARBALL=./openclaw-scheduler-*.tgz
 
 scp $TARBALL $HOST:~/.openclaw/
-ssh $HOST "mkdir -p ~/.openclaw/packages/openclaw-scheduler && npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
+ssh $HOST "mkdir -p ~/.openclaw/packages/openclaw-scheduler && npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
 ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
 sleep 3
 ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && launchctl print gui/\$(id -u)/ai.openclaw.scheduler | sed -n '1,20p'"
@@ -338,14 +345,14 @@ systemctl --user restart openclaw-scheduler
 #### macOS (launchd)
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```
 
 #### Linux / Windows WSL2 (systemd)
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
 systemctl --user restart openclaw-scheduler
 ```
 
@@ -382,7 +389,7 @@ for detailed examples.
 
 - Check the CHANGELOG for breaking changes or new prerequisites.
 - Make sure `npm install` completed without errors.
-- If `better-sqlite3` fails to load, run `npm rebuild better-sqlite3`.
+- If `better-sqlite3` fails to load, run `npm rebuild better-sqlite3 --ignore-scripts=false`.
 
 ### Service won't start after update
 
@@ -405,7 +412,7 @@ If Node was upgraded alongside the scheduler (e.g., `brew upgrade` updated both)
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```
 
@@ -413,6 +420,6 @@ launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 systemctl --user restart openclaw-scheduler
 ```

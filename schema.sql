@@ -90,6 +90,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
   output_format TEXT DEFAULT NULL,                    -- NULL|'json'|'ndjson'|'text'
 
+  -- Post-success verification contract (agentcli handoff v2)
+  verify_shell TEXT DEFAULT NULL,
+  verify_timeout_s INTEGER DEFAULT NULL,
+  verify_on_failure TEXT DEFAULT NULL,                 -- NULL|'warn'|'error'
+
   -- Session continuity (v9)
   preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
 
@@ -240,11 +245,19 @@ CREATE TABLE IF NOT EXISTS runs (
   evidence_record                  TEXT DEFAULT NULL,
   credential_handoff_summary       TEXT DEFAULT NULL,
   delegation_validation            TEXT DEFAULT NULL,
+  approval_used                     TEXT DEFAULT NULL,
 
   -- Structured output contract result (v28)
   output_format                     TEXT DEFAULT NULL,
   structured_output                TEXT DEFAULT NULL,
-  structured_output_valid          INTEGER DEFAULT NULL
+  structured_output_valid          INTEGER DEFAULT NULL,
+  structured_output_warning        TEXT DEFAULT NULL,
+  structured_output_bytes          INTEGER DEFAULT NULL,
+  structured_output_sha256         TEXT DEFAULT NULL,
+  structured_output_path           TEXT DEFAULT NULL,
+
+  -- Post-success verification outcome (agentcli handoff v2)
+  verification_result              TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
@@ -388,6 +401,7 @@ CREATE TABLE IF NOT EXISTS job_dispatch_queue (
   dispatch_kind   TEXT NOT NULL,                   -- schedule|at|manual|chain|retry
   status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled|failed
   scheduled_for   TEXT NOT NULL,
+  binding_scheduled_for TEXT NOT NULL,              -- immutable occurrence timestamp used by approval bindings
   source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
   retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -488,6 +502,7 @@ CREATE TABLE IF NOT EXISTS evidence_records (
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_records_job ON evidence_records(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_evidence_records_hash ON evidence_records(algorithm, hash);
+CREATE INDEX IF NOT EXISTS idx_evidence_records_created_run ON evidence_records(created_at DESC, run_id DESC);
 
 -- ============================================================
 -- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
@@ -615,8 +630,7 @@ CREATE TABLE IF NOT EXISTS completion_debts (
   no_reply                INTEGER NOT NULL DEFAULT 0,
   metadata                TEXT,
   created_at              TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at              TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE(task_label, delivery_scope)
+  updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_completion_debts_status ON completion_debts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_completion_debts_session ON completion_debts(session_key) WHERE session_key IS NOT NULL;

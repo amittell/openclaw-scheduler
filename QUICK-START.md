@@ -8,10 +8,14 @@ For the complete reference, see [README.md](README.md).
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
 ocs setup
 ```
+
+The explicit `--ignore-scripts=false` lets the trusted `better-sqlite3`
+dependency install its native binding. If an earlier install disabled lifecycle
+scripts, rebuild it with `npm rebuild --ignore-scripts=false better-sqlite3`.
 
 The setup wizard creates or upgrades the database and installs the selected macOS launchd or Linux systemd service.
 

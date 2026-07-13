@@ -67,11 +67,9 @@ jobs:
       matrix:
         include:
           - contract: handoff-v3
-            ref: 38980ad8f1b8a31bb6757579fc5e0e60c280a718
-            stale_v2_assertion: '1'
+            ref: f1fed6d7d451196bda316b82d6567b174012a4ba
           - contract: handoff-v2
             ref: 317cc0eea8b4c65bc3213f5f329124a45c958bd3
-            stale_v2_assertion: '0'
     defaults:
       run:
         working-directory: scheduler
@@ -105,8 +103,45 @@ jobs:
         env:
           AGENTCLI_PATH: ${{ github.workspace }}/agentcli
           AGENTCLI_CONTRACT: ${{ matrix.contract }}
-          AGENTCLI_STALE_V2_FIELD_ASSERTION: ${{ matrix.stale_v2_assertion }}
         run: npm run test:agentcli
+
+  published-agentcli:
+    name: Published agentcli 0.4.1 black-box (Ubuntu / Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install scheduler dependencies
+        run: npm ci
+
+      - name: Install exact published agentcli package
+        run: |
+          mkdir -p "$RUNNER_TEMP/agentcli-published"
+          cd "$RUNNER_TEMP/agentcli-published"
+          npm init -y
+          npm install --save-exact --no-audit --no-fund @amittell/agentcli@0.4.1
+
+      - name: Verify published package signatures and provenance
+        working-directory: ${{ runner.temp }}/agentcli-published
+        run: npm audit signatures --include-attestations
+
+      - name: Run published-package compile, apply, approve, restart, execute, and inspect conformance
+        env:
+          AGENTCLI_BIN: ${{ runner.temp }}/agentcli-published/node_modules/@amittell/agentcli/bin/agentcli.js
+        run: npm run verify:agentcli-published
 
   package:
     name: Published package contract (Ubuntu / Node 24)

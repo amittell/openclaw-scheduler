@@ -36,7 +36,7 @@ scp -r user@source-host:~/.openclaw/scheduler ~/.openclaw/scheduler
 Or npm-first install (no git clone):
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- help
 ```
 
@@ -61,7 +61,7 @@ If Node changes later on this host, rebuild the native binding before restarting
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 This is especially common after `brew upgrade node` on macOS or any major Node version switch.

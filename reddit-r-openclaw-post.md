@@ -77,7 +77,7 @@ The split is deliberately simple:
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- doctor --json
 ```

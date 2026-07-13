@@ -274,6 +274,8 @@ void shellResults.DEFAULT_STORE_LIMIT;
 void shellResults.DEFAULT_EXCERPT_LIMIT;
 void shellResults.DEFAULT_SUMMARY_LIMIT;
 void shellResults.DEFAULT_OFFLOAD_THRESHOLD;
+const storedArtifact: string | null = shellResults.storeRunArtifact('verification', 'run-id', 'output');
+void storedArtifact;
 const normalized: ShellResult = shellResults.normalizeShellResult(
   { stdout: 'ok', stderr: '', error: null },
   { runId: 'r-1', storeLimit: 1024 },

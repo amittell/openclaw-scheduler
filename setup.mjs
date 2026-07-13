@@ -213,11 +213,10 @@ if (ignoreScripts === 'true') {
   warn('Detected npm config: ignore-scripts=true');
   warn('better-sqlite3 requires install scripts to build/load native bindings.');
   warn('Recommended fix:');
-  warn('  npm config set ignore-scripts false');
-  warn('  npm install --ignore-scripts=false');
+  warn(`  npm rebuild --prefix ${JSON.stringify(schedulerInstallRoot)} better-sqlite3 --ignore-scripts=false`);
   const continueAnyway = await confirm('Continue setup anyway?');
   if (!continueAnyway) {
-    print('Setup aborted. Fix npm config, then rerun: node setup.mjs');
+    print('Setup aborted. Run the scoped rebuild command, then rerun setup.');
     rl.close();
     process.exit(1);
   }

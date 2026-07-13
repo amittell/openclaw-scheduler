@@ -152,7 +152,7 @@ For the full reference, use the npm-first path below and then jump straight to [
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup
 ```
 
@@ -162,13 +162,18 @@ This installs the package without cloning the repo. The launcher command maps to
 - `openclaw-scheduler webhook-check` → `scripts/telegram-webhook-check.mjs`
 - `openclaw-scheduler <anything-else>` → `cli.js`
 
+The explicit `--ignore-scripts=false` is required because `better-sqlite3`
+builds or installs its trusted native binding during the npm lifecycle. If a
+prior install used `ignore-scripts=true`, rerun the install command above or
+run `npm rebuild --ignore-scripts=false better-sqlite3` before starting.
+
 For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather than `node_modules/openclaw-scheduler/`, so upgrades do not trample the database path.
 
 If your Node runtime changes later, rebuild the native SQLite binding before restarting the scheduler:
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 This is commonly needed after a Homebrew Node upgrade on macOS or any major Node ABI change.
@@ -234,7 +239,7 @@ npm run verify:local
 npm pack
 
 mkdir -p ~/.openclaw/packages/openclaw-scheduler
-npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
 Point your service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`, and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
@@ -284,7 +289,7 @@ This is the shortest path from "I installed it" to "I have a real job running."
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
 ocs setup
 ocs status
@@ -873,6 +878,11 @@ openclaw-scheduler approvals reject APPROVAL_ID --reason "Postponing until the n
 - `approval_approver_scope` accepts an unprefixed exact identity or
   `exact:`, `user:`, `uid:`, or `principal:` matching for the local OS account.
   Domain scopes are not supported.
+- AgentCLI handoff v3 exposes approval-scope enforcement as one coarse capability
+  while its manifests may contain domain scopes. The scheduler therefore
+  advertises `approval_scope_enforcement: false` so scoped agentcli manifests
+  fail capability negotiation instead of being partially enforced. Direct
+  scheduler jobs may still use the supported local scopes above.
 - The scheduler derives the approver from the invoking operating-system user
   and UID. CLI flags and environment variables cannot select another identity.
 - Prefer `approvals approve/reject APPROVAL_ID`; `jobs approve/reject JOB_ID`
@@ -893,10 +903,32 @@ openclaw-scheduler approvals reject APPROVAL_ID --reason "Postponing until the n
 Set `output_format` to `json`, `ndjson`, or `text` when downstream work requires
 a validated result shape. Successful JSON output must parse as one JSON value;
 each nonblank NDJSON line must parse independently; text is stored on the
-normalized text path. The scheduler persists `structured_output` and
-`structured_output_valid` on the run. Invalid declared output changes the run
-to `error`, prevents success children from firing, and remains visible through
-normal error delivery.
+normalized text path. The scheduler persists validity, byte count, SHA-256
+digest, and either the parsed value or an artifact reference on the run.
+Malformed JSON or NDJSON remains a successful execution with
+`structured_output_valid: 0`, a `structured_output_warning`, and a null parsed
+value; success children may still run because transport success is distinct
+from output-shape validation.
+
+### Post-success verification
+
+Any synchronous job can declare a separate local shell verification command
+that runs after its primary execution and structured-output parsing, but before
+terminal evidence, delivery, and child dispatch:
+
+```json
+{
+  "verify_shell": "test -f /srv/app/healthy",
+  "verify_timeout_s": 30,
+  "verify_on_failure": "error"
+}
+```
+
+`verify_on_failure` accepts `error` or `warn`. An error policy converts a failed
+verification to a terminal error and blocks success children; a warning policy
+preserves primary success and records the warning. Verification stores only
+status, timing, exit metadata, byte counts, and SHA-256 digests, never raw
+verification output. Fire-and-forget jobs cannot declare verification.
 
 ---
 
@@ -1328,6 +1360,7 @@ parent_id, trigger_on, trigger_delay_s, trigger_condition,
 resource_pool, auth_profile, auth_profile_fallback,
 approval_required, approval_timeout_s, approval_auto,
 approval_risk_level, approval_approver_scope, output_format,
+verify_shell, verify_timeout_s, verify_on_failure,
 context_retrieval, context_retrieval_limit,
 preferred_session_key, job_type, watchdog_target_label,
 watchdog_check_cmd, watchdog_timeout_min, watchdog_alert_channel,
@@ -1345,10 +1378,12 @@ error_message, shell_exit_code, shell_signal, shell_timed_out,
 shell_stdout, shell_stderr, shell_stdout_path, shell_stderr_path,
 shell_stdout_bytes, shell_stderr_bytes, dispatched_at, run_timeout_ms,
 triggered_by_run, retry_of, retry_count, replay_of,
-delegation_validation, output_format, structured_output, structured_output_valid
+delegation_validation, output_format, structured_output, structured_output_valid,
+structured_output_warning, structured_output_bytes, structured_output_sha256,
+structured_output_path, verification_result, approval_used
 ```
 
-**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`, `awaiting_approval`, `approved`
+**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`, `recovery_blocked`, `awaiting_approval`, `approved`
 
 ### Messages (key columns)
 
@@ -2158,12 +2193,13 @@ to agentcli and fails capability negotiation for agentcli evidence declarations.
 This is intentionally distinct from the scheduler-native checksum facility.
 
 `openclaw-scheduler capabilities --json` reports `handoff_version: "3"` and
-the enforcement features `root_approval_gate`, `approval_scope_enforcement`,
+the enforcement features `root_approval_gate`,
+`approval_scope_enforcement: false`,
 `structured_output_format`, `delegation_validation`,
 `authorization_ref_resolution`, `evidence_generation: false`,
 `checksum_evidence_generation: true`,
-`evidence_integrity: "checksum-sha256-v2"`,
-`evidence_contract: "openclaw-scheduler-checksum-v2"`,
+`evidence_integrity: "checksum-sha256-v3"`,
+`evidence_contract: "openclaw-scheduler-checksum-v3"`,
 `gateway_capability_discovery`, `gateway_env_injection_negotiation`,
 `multipart_delivery_checkpoints: true`, and
 `completion_delivery_scope: "run"`.

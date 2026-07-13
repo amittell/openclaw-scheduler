@@ -31,6 +31,7 @@
     "coverage": "SCHEDULER_DB=:memory: node scripts/coverage.mjs",
     "typecheck": "tsc --project tsconfig.json",
     "verify:smoke": "node scripts/verify-local.mjs --smoke",
+    "verify:agentcli-published": "node scripts/verify-published-agentcli.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:local": "node scripts/verify-local.mjs",
     "prepublishOnly": "npm run verify:local"
@@ -65,6 +66,7 @@
     "scripts/coverage.mjs",
     "scripts/verify-local.mjs",
     "scripts/verify-package.mjs",
+    "scripts/verify-published-agentcli.mjs",
     "skills/durable-scheduler/SKILL.md",
     "test.js",
     "test-integration-agentcli.js",

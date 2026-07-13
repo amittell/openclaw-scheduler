@@ -72,6 +72,33 @@ function approvalExecutionSummary(job, approval, extra = {}) {
   ].filter(Boolean).join('\n');
 }
 
+function approvalUseSnapshot(approval) {
+  if (!approval) return null;
+  const decisionReason = approval.status === 'cancelled' || approval.status === 'timed_out'
+    ? approval.cancelled_reason || approval.notes || null
+    : approval.notes || (approval.status === 'approved' ? 'Approval granted' : null);
+  return canonicalizeForHash({
+    approval_id: approval.id,
+    status: approval.status || null,
+    decision_status: ['approved', 'dispatching', 'dispatched'].includes(approval.status)
+      ? 'approved'
+      : approval.status || null,
+    gate_kind: approval.gate_kind || 'job',
+    dispatch_queue_id: approval.dispatch_queue_id || null,
+    approver: approval.resolved_by || null,
+    resolved_by: approval.resolved_by || null,
+    reason: decisionReason,
+    notes: approval.notes || null,
+    risk_level: approval.risk_level || null,
+    approver_scope: approval.approver_scope || null,
+    binding_hash: approval.binding_hash || null,
+    requested_at: approval.requested_at || null,
+    expires_at: approval.expires_at || null,
+    resolved_at: approval.resolved_at || null,
+    approved_at: approval.approved_at || null,
+  });
+}
+
 function canonicalizeForHash(value) {
   if (Array.isArray(value)) return value.map(canonicalizeForHash);
   if (value && typeof value === 'object') {
@@ -512,14 +539,19 @@ function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
   return null;
 }
 
-export function applyStructuredOutputContract(job, result) {
+export function applyStructuredOutputContract(job, result, opts = {}) {
   const format = job.output_format || null;
   const { structuredOutputSource, ...publicResult } = result;
   if (!format) return publicResult;
-  const rawOutput = structuredOutputSource ?? result.runFinishFields?.shell_stdout ?? result.content ?? '';
+  const rawOutput = String(structuredOutputSource ?? result.runFinishFields?.shell_stdout ?? result.content ?? '');
+  const rawBytes = Buffer.byteLength(rawOutput, 'utf8');
+  const rawSha256 = `sha256:${createHash('sha256').update(rawOutput, 'utf8').digest('hex')}`;
   const runFinishFields = {
     ...result.runFinishFields,
     output_format: format,
+    structured_output_bytes: rawBytes,
+    structured_output_sha256: rawSha256,
+    structured_output_path: null,
   };
   if (result.status !== 'ok') {
     return {
@@ -528,21 +560,28 @@ export function applyStructuredOutputContract(job, result) {
         ...runFinishFields,
         structured_output: null,
         structured_output_valid: null,
+        structured_output_warning: null,
       },
     };
   }
 
+  let structuredOutput;
   try {
-    let structuredOutput;
-    if (format === 'json') {
-      structuredOutput = JSON.stringify(JSON.parse(String(rawOutput)));
+    if ((format === 'json' || format === 'ndjson') && String(rawOutput).trim() === '') {
+      structuredOutput = null;
+    } else if (format === 'json') {
+      try {
+        structuredOutput = JSON.stringify(JSON.parse(String(rawOutput)));
+      } catch (error) {
+        throw new Error('invalid JSON', { cause: error });
+      }
     } else if (format === 'ndjson') {
       const lines = String(rawOutput).split(/\r?\n/).filter(line => line.trim().length > 0);
       structuredOutput = JSON.stringify(lines.map((line, index) => {
         try {
           return JSON.parse(line);
         } catch (error) {
-          throw new Error(`line ${index + 1}: ${error.message}`, { cause: error });
+          throw new Error(`invalid JSON on line ${index + 1}`, { cause: error });
         }
       }));
     } else if (format === 'text') {
@@ -550,32 +589,191 @@ export function applyStructuredOutputContract(job, result) {
     } else {
       throw new Error(`unsupported output format ${format}`);
     }
-    return {
-      ...publicResult,
-      runFinishFields: {
-        ...runFinishFields,
-        structured_output: structuredOutput,
-        structured_output_valid: 1,
-      },
-    };
   } catch (error) {
     const message = `Output format validation failed for ${format}: ${error.message}`;
     return {
       ...publicResult,
-      status: 'error',
-      summary: message,
-      content: message,
-      errorMessage: message,
-      idemAction: 'release',
-      skipChildren: true,
-      skipDelivery: false,
       runFinishFields: {
         ...runFinishFields,
         structured_output: null,
         structured_output_valid: 0,
+        structured_output_warning: message,
       },
     };
   }
+
+  const structuredBytes = structuredOutput == null ? 0 : Buffer.byteLength(structuredOutput, 'utf8');
+  let structuredOutputPath = null;
+  let persistedStructuredOutput = structuredOutput;
+  if (structuredBytes > (job.output_store_limit_bytes || 65536)) {
+    try {
+      structuredOutputPath = opts.storeRunArtifact?.('structured-output', opts.runId, rawOutput) || null;
+    } catch (error) {
+      const storageError = new Error('Structured output artifact storage failed', { cause: error });
+      return {
+        ...publicResult,
+        status: 'error',
+        summary: storageError.message,
+        content: storageError.message,
+        errorMessage: storageError.message,
+        skipChildren: true,
+        idemAction: 'release',
+        runFinishFields: {
+          ...runFinishFields,
+          structured_output: null,
+          structured_output_valid: 1,
+          structured_output_warning: storageError.message,
+          structured_output_path: null,
+        },
+      };
+    }
+    if (!structuredOutputPath) {
+      const storageError = 'Structured output artifact storage returned no reference';
+      return {
+        ...publicResult,
+        status: 'error',
+        summary: storageError,
+        content: storageError,
+        errorMessage: storageError,
+        skipChildren: true,
+        idemAction: 'release',
+        runFinishFields: {
+          ...runFinishFields,
+          structured_output: null,
+          structured_output_valid: 1,
+          structured_output_warning: storageError,
+          structured_output_path: null,
+        },
+      };
+    }
+    persistedStructuredOutput = null;
+  }
+  return {
+    ...publicResult,
+    runFinishFields: {
+      ...runFinishFields,
+      structured_output: persistedStructuredOutput,
+      structured_output_valid: 1,
+      structured_output_warning: null,
+      structured_output_path: structuredOutputPath,
+    },
+  };
+}
+
+/** Execute an agentcli post-success verification contract before terminal effects. */
+export async function applyVerificationContract(job, ctx, result, deps) {
+  if (result.status !== 'ok' || !job.verify_shell) return result;
+  const startedAt = Date.now();
+  const timeoutMs = (job.verify_timeout_s ?? 30) * 1000;
+  deps.onVerificationStart?.(ctx.run.id, timeoutMs);
+  let shellExec;
+  try {
+    shellExec = await deps.runShellCommand(
+      job.verify_shell,
+      timeoutMs,
+      ctx.executionEnv || null,
+      {
+        signal: ctx.abortSignal || null,
+        envPolicy: job.shell_env_policy || 'minimal',
+        maxBuffer: 1024 * 1024,
+        onProcess: processInfo => {
+          if (!deps.recordRunProcess) return;
+          const recorded = deps.recordRunProcess(ctx.run.id, processInfo, ctx.dispatcherFence || {});
+          if (!recorded) throw new Error('Run ownership or cancellation changed before verification process start');
+        },
+        onProcessTerminated: () => deps.recordRunProcessTerminated?.(
+          ctx.run.id,
+          ctx.dispatcherFence || {},
+        ),
+      },
+    );
+  } finally {
+    deps.onVerificationEnd?.(ctx.run.id);
+  }
+  const stdout = String(shellExec.stdout || '');
+  const stderr = String(shellExec.stderr || '');
+  const verification = {
+    passed: shellExec.exitCode === 0 && !shellExec.timedOut && !shellExec.aborted && !shellExec.error,
+    status: shellExec.aborted
+      ? 'cancelled'
+      : shellExec.timedOut
+        ? 'timed_out'
+        : shellExec.exitCode === 0 && !shellExec.error
+          ? 'passed'
+          : 'failed',
+    on_failure: job.verify_on_failure || 'error',
+    exit_code: shellExec.exitCode ?? null,
+    signal: shellExec.signal || null,
+    timed_out: Boolean(shellExec.timedOut),
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    stdout_bytes: Buffer.byteLength(stdout, 'utf8'),
+    stderr_bytes: Buffer.byteLength(stderr, 'utf8'),
+    stdout_sha256: `sha256:${createHash('sha256').update(stdout, 'utf8').digest('hex')}`,
+    stderr_sha256: `sha256:${createHash('sha256').update(stderr, 'utf8').digest('hex')}`,
+    error: shellExec.error?.message || null,
+  };
+  const runFinishFields = {
+    ...result.runFinishFields,
+    verification_result: verification,
+  };
+  if (verification.passed) return { ...result, runFinishFields };
+  if (verification.status === 'cancelled') {
+    if (!deps.isRunCancellationRequested?.(ctx.run.id)) {
+      return {
+        ...result,
+        preserveForRecovery: true,
+        runFinishFields: {
+          ...runFinishFields,
+          verification_result: {
+            ...verification,
+            status: 'interrupted',
+            error: ctx.abortKind
+              ? `Verification interrupted by dispatcher lifecycle (${ctx.abortKind})`
+              : 'Verification interrupted by dispatcher lifecycle',
+          },
+        },
+      };
+    }
+    return {
+      ...result,
+      status: 'cancelled',
+      summary: 'Run cancelled during post-execution verification',
+      content: 'Run cancelled during post-execution verification',
+      errorMessage: 'Run cancelled during post-execution verification',
+      skipDelivery: true,
+      skipChildren: true,
+      idemAction: 'release',
+      runFinishFields,
+    };
+  }
+  const failure = verification.timed_out
+    ? `Verification timed out after ${timeoutMs}ms`
+    : `Verification failed${verification.exit_code == null ? '' : ` with exit code ${verification.exit_code}`}`;
+  if ((job.verify_on_failure || 'error') === 'warn') {
+    const existingContext = result.runFinishFields?.context_summary;
+    return {
+      ...result,
+      runFinishFields: {
+        ...runFinishFields,
+        context_summary: {
+          ...(existingContext && typeof existingContext === 'object' && !Array.isArray(existingContext)
+            ? existingContext
+            : {}),
+          verification_warning: failure,
+        },
+      },
+    };
+  }
+  return {
+    ...result,
+    status: 'error',
+    summary: failure,
+    content: failure,
+    errorMessage: failure,
+    skipChildren: true,
+    idemAction: 'release',
+    runFinishFields,
+  };
 }
 
 /**
@@ -598,6 +796,17 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   } = deps;
 
   if (result.earlyReturn) {
+    await cleanupDispatchMaterialization(job, ctx, deps);
+    return;
+  }
+
+  result = applyStructuredOutputContract(job, result, {
+    runId: ctx.run.id,
+    storeRunArtifact: deps.storeRunArtifact,
+  });
+  result = await applyVerificationContract(job, ctx, result, deps);
+  if (result.preserveForRecovery) {
+    ctx.preserveForRecovery = true;
     await cleanupDispatchMaterialization(job, ctx, deps);
     return;
   }
@@ -632,12 +841,28 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     };
   }
 
-  result = applyStructuredOutputContract(job, result);
-
+  const currentRunContext = getDb
+    ? safeParse(getDb().prepare('SELECT context_summary FROM runs WHERE id = ?').get(ctx.run.id)?.context_summary)
+    : null;
+  const resultRunContext = typeof result.runFinishFields?.context_summary === 'string'
+    ? safeParse(result.runFinishFields.context_summary)
+    : result.runFinishFields?.context_summary;
+  const mergedRunContext = {
+    ...(currentRunContext && typeof currentRunContext === 'object' && !Array.isArray(currentRunContext)
+      ? currentRunContext
+      : {}),
+    ...(resultRunContext && typeof resultRunContext === 'object' && !Array.isArray(resultRunContext)
+      ? resultRunContext
+      : {}),
+    ...(currentRunContext?.credential_cleanup
+      ? { credential_cleanup: currentRunContext.credential_cleanup }
+      : {}),
+  };
   const finishFields = {
     summary: result.summary,
     error_message: result.errorMessage,
     ...result.runFinishFields,
+    ...(Object.keys(mergedRunContext).length > 0 ? { context_summary: mergedRunContext } : {}),
   };
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
   const enqueueCompletionDelivery = (retryScheduled) => {
@@ -707,6 +932,11 @@ export async function finalizeDispatch(job, ctx, result, deps) {
           timed_out: result.runFinishFields?.shell_timed_out === 1 || completion.status === 'timeout',
           structured_output: result.runFinishFields?.structured_output ?? null,
           structured_output_valid: result.runFinishFields?.structured_output_valid ?? null,
+          structured_output_warning: result.runFinishFields?.structured_output_warning ?? null,
+          structured_output_bytes: result.runFinishFields?.structured_output_bytes ?? null,
+          structured_output_sha256: result.runFinishFields?.structured_output_sha256 ?? null,
+          structured_output_path: result.runFinishFields?.structured_output_path ?? null,
+          verification_result: result.runFinishFields?.verification_result ?? null,
         };
         const evidence = generateEvidence({
           ...job,
@@ -1108,7 +1338,7 @@ export async function prepareDispatch(job, opts, deps) {
     : 0;
 
   let run;
-  const createExecutionRun = () => {
+  const createExecutionRun = (approvalUsed = null) => {
     const created = createRun(job.id, {
       run_timeout_ms: job.run_timeout_ms,
       idempotency_key: idemKey,
@@ -1116,6 +1346,7 @@ export async function prepareDispatch(job, opts, deps) {
       dispatch_queue_id: dispatchRecord?.id || null,
       triggered_by_run: dispatchRecord?.source_run_id || null,
       retry_of: dispatchRecord?.retry_of_run_id || null,
+      approval_used: approvalUseSnapshot(approvalUsed),
     });
     const interruptedOutcomes = interruptedEvidenceOutcomes(job);
     if (Object.keys(interruptedOutcomes).length > 0) {
@@ -1131,14 +1362,20 @@ export async function prepareDispatch(job, opts, deps) {
           throw new Error('Approved dispatch claim changed before execution run creation');
         }
         const begin = beginApprovalDispatch(dispatchRecord.id, { db: getDb() });
+        if (begin.approval?.status === 'cancelled') {
+          return null;
+        }
         if (!begin.changed) {
           throw new Error(`Approval dispatch could not begin: ${begin.reason}`);
+        }
+        if (begin.approval?.status !== 'dispatching') {
+          throw new Error(`Approval dispatch entered unexpected status: ${begin.approval?.status || 'missing'}`);
         }
         const currentJob = getDb().prepare('SELECT enabled FROM jobs WHERE id = ?').get(job.id);
         if (!currentJob || currentJob.enabled !== 1) {
           throw new Error('Approved job became unavailable before execution run creation');
         }
-        const created = createExecutionRun();
+        const created = createExecutionRun(begin.approval);
         const marked = markApprovalDispatched(dispatchRecord.id, {
           db: getDb(),
           notes: `Execution run ${created.id} created`,
@@ -1163,9 +1400,27 @@ export async function prepareDispatch(job, opts, deps) {
   } else if (dispatchRecord) {
     run = getDb().transaction(() => {
       if (!hasCurrentDispatchClaim()) return null;
+      const currentJob = getDb().prepare('SELECT enabled FROM jobs WHERE id = ?').get(job.id);
+      if (!currentJob || currentJob.enabled !== 1) {
+        getDb().prepare(`
+          UPDATE job_dispatch_queue
+          SET status = 'cancelled', processed_at = datetime('now'),
+              claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL,
+              last_error = 'Job disabled before execution run creation'
+          WHERE id = ? AND status = 'claimed'
+        `).run(dispatchRecord.id);
+        return null;
+      }
       return createExecutionRun();
     }).immediate();
   } else {
+    const currentJob = getDb().prepare('SELECT enabled FROM jobs WHERE id = ?').get(job.id);
+    if (!currentJob || currentJob.enabled !== 1) {
+      log('info', `Skipping ${job.name} -- job is disabled before execution run creation`, {
+        jobId: job.id,
+      });
+      return null;
+    }
     run = createExecutionRun();
   }
 

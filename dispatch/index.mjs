@@ -1637,21 +1637,23 @@ async function cmdEnqueue(flags) {
     });
 
     // -- Post-spawn verification (Fix 3) --------------------------------
-    // Canary: poll sessions.json up to 3 times at 10s intervals to confirm the
-    // session appeared in the store. A session store entry with sessionId or
-    // startedAt/sessionStartedAt is enough: long first turns may not flush JSONL,
-    // token counts, or chat.history until the model call completes. The delivery
-    // watcher owns later completion/failure handling.
+    // Canary: inspect sessions.json immediately, then wait up to 3 intervals to
+    // confirm the session appeared in the store. A session store entry with
+    // sessionId or startedAt/sessionStartedAt is enough: long first turns may not
+    // flush JSONL, token counts, or chat.history until the model call completes.
+    // The delivery watcher owns later completion/failure handling.
     const SPAWN_POLL_MAX = 3;
     const SPAWN_POLL_DELAY_MS = 10_000;
     let spawnConfirmed = false;
-    for (let spawnPoll = 0; spawnPoll < SPAWN_POLL_MAX; spawnPoll++) {
-      await sleep(SPAWN_POLL_DELAY_MS);
+    for (let spawnPoll = 0; spawnPoll <= SPAWN_POLL_MAX; spawnPoll++) {
       const spawnStore = readSessionsStore(agent);
       const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
       if (signal.hasStartedSignal || signal.hasActivitySignal) {
         spawnConfirmed = true;
         break;
+      }
+      if (spawnPoll < SPAWN_POLL_MAX) {
+        await sleep(SPAWN_POLL_DELAY_MS);
       }
     }
     if (!spawnConfirmed) {

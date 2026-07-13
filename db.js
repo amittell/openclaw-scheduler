@@ -81,6 +81,7 @@ export async function initDb() {
       if (applied) {
         process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
       }
+      return applied;
     } catch (err) {
       throw dbInitError('consolidation migration', err);
     }
@@ -89,18 +90,18 @@ export async function initDb() {
   if (hasUserTables) {
     // Existing installs: normalize via migration first so schema re-apply doesn't
     // trip over legacy partial tables/indexes.
-    await runConsolidate();
-    applySchema('schema apply');
+    const migrated = await runConsolidate();
+    if (migrated) applySchema('schema apply');
     return db;
   }
 
   // Net-new installs: create the baseline schema, then run consolidation in case
   // a package upgrade adds idempotent backfills the base schema doesn't need.
   applySchema('initial schema apply');
-  await runConsolidate();
+  const migrated = await runConsolidate();
 
   // Re-apply schema so indexes/table defs are fully aligned after consolidation.
-  applySchema('schema re-apply');
+  if (migrated) applySchema('schema re-apply');
 
   return db;
 }

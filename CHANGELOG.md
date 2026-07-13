@@ -2,17 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.0] -- 2026-07-12
+## [0.4.0] -- 2026-07-13
 
 ### Added
 
 - schema v28 handoff fields for approval risk/scope, structured output,
   delegation results, immutable evidence, and run-scoped completion delivery
-- approval gates for every durable dispatch kind, including root, manual,
-  scheduled, one-shot, and chain work, with SHA-256 execution bindings and
+- approval gates for every durable dispatch kind, including scheduled,
+  one-shot, manual, chain, and retry work, with SHA-256 execution bindings and
   OS-authenticated bare/exact, local-user, UID, or local-principal scopes
 - `json`, `ndjson`, and `text` output contracts with persisted validation state
-  and fail-closed child triggering
+  plus byte counts, SHA-256 digests, and artifact references for large values
+- post-success shell verification with bounded execution, fenced cancellation,
+  `error` or `warn` policies, digest-only audit metadata, and terminal evidence
 - provider-backed `authorization_ref` resolution, provider-independent
   delegation-chain validation, and immutable `json-sort-v1` SHA-256 evidence
   records that exclude raw credentials
@@ -41,19 +43,39 @@ All notable changes to this project will be documented in this file.
   capability flags `completion_delivery_scope: "run"` and
   `multipart_delivery_checkpoints: true`
 - handoff v3 capability declarations for `root_approval_gate`,
-  `approval_scope_enforcement`, `structured_output_format`,
+  `structured_output_format`,
   `delegation_validation`, and `authorization_ref_resolution`; the runtime
+  advertises `approval_scope_enforcement: false` so agentcli scoped manifests
+  fail negotiation instead of partially accepting unsupported domain scopes,
   honestly advertises `evidence_generation: false` for agentcli evidence plus
   `checksum_evidence_generation: true` and
-  `evidence_integrity: "checksum-sha256-v2"` for its native evidence records
+  `evidence_integrity: "checksum-sha256-v3"` for its native evidence records
 - required hosted compatibility jobs against exact public agentcli commits for
-  handoff v3 (`38980ad8f1b8a31bb6757579fc5e0e60c280a718`) and backward-compatible
+  handoff v3 (`f1fed6d7d451196bda316b82d6567b174012a4ba`) and backward-compatible
   handoff v2 (`317cc0eea8b4c65bc3213f5f329124a45c958bd3`)
-- targeted exclusion of the v3 pin's stale upstream assertion that hard-codes
-  handoff field version 2; all other upstream integration cases still run
+- a release-gating black-box test against the signed and attested published
+  `@amittell/agentcli@0.4.1` package, including task working-directory and
+  sanitized runtime-environment parity for post-success verification
+- full upstream handoff v3 integration coverage without excluded assertions,
+  plus producer-to-terminal approval tests for schedule, one-shot, manual,
+  chain, and retry dispatches
 
 ### Changed
 
+- malformed JSON or NDJSON now records a nonfatal structured-output warning
+  and null parsed value while preserving successful execution and child flow
+- approval bindings include immutable dispatch and lineage identity, approved
+  work rechecks OS-authenticated scope at consumption, and execution runs retain
+  the approval-use snapshot; pending approvals from earlier binding versions
+  must be retriggered after upgrade
+- approval creation, consumption, and crash recovery now correlate job, run,
+  dispatch, and exact approval identity before mutating or resuming work
+- manual execution now rejects disabled jobs before queueing, matching every
+  other dispatch kind and preventing a disabled job from bypassing governance
+- `doctor` bounds ordinary evidence verification to the newest 500 records and
+  reports incomplete coverage; `doctor --deep` verifies the complete set
+- native evidence payloads use checksum contract v3 and bind structured-output
+  and verification metadata while retaining v2 verification compatibility
 - `identity.presentation` and `credential_handoff` may materialize credentials
   for shell jobs locally and for isolated agent jobs through a capable Gateway;
   main-session agent jobs continue to reject credential materialization
@@ -72,6 +94,9 @@ All notable changes to this project will be documented in this file.
 - GitHub Actions are pinned to immutable action commits, and npm publication is
   performed only by the tag-triggered provenance workflow after confirming the
   tagged commit is contained in `origin/main`
+- dispatch spawn confirmation now inspects an already-present session before
+  waiting for retry intervals while preserving the complete 30-second failure
+  window, reducing enqueue latency and repeated local/CI test time
 - the npm tarball includes the complete lint, typecheck, test, documentation,
   coverage, and verification harness referenced by its published scripts
 - package verification now installs the packed tarball into an isolated

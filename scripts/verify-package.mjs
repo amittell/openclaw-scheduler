@@ -46,6 +46,7 @@ try {
     'index.d.ts',
     'bin/openclaw-scheduler.js',
     'scripts/validate-doc-examples.mjs',
+    'scripts/verify-published-agentcli.mjs',
     'skills/durable-scheduler/SKILL.md',
     'tests/v04-evidence-lifecycle.test.mjs',
   ];
@@ -103,6 +104,7 @@ void snapshot;
     '--no-audit',
     '--no-fund',
     '--no-package-lock',
+    '--ignore-scripts=false',
     tarball,
   ], { cwd: installRoot });
   const installedPackage = join(installRoot, 'node_modules', 'openclaw-scheduler');
@@ -114,6 +116,20 @@ void snapshot;
   const expectedVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
   if (version.version !== expectedVersion) {
     throw new Error(`installed package version ${version.version} does not match ${expectedVersion}`);
+  }
+  const doctor = JSON.parse(run(process.execPath, [
+    join(installedPackage, 'bin', 'openclaw-scheduler.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: installRoot,
+    env: {
+      ...process.env,
+      SCHEDULER_DB: join(fixture, 'installed-smoke.db'),
+    },
+  }));
+  if (doctor.ok !== true || doctor.database?.schema_version !== 28) {
+    throw new Error(`installed package doctor failed: ${JSON.stringify(doctor)}`);
   }
 
   const unexpectedArchives = readdirSync(packageRoot).filter(name => name.endsWith('.tgz'));

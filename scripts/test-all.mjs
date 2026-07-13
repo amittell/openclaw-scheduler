@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -81,19 +81,6 @@ const agentcliIntegration = join(agentcliRoot, 'test', 'integration-scheduler.te
 const missingAgentcliFiles = [agentcliPackage, agentcliBin, agentcliIntegration]
   .filter(file => !existsSync(file));
 
-function hasStaleV2FieldVersionAssertion() {
-  if (process.env.AGENTCLI_STALE_V2_FIELD_ASSERTION === '1') return true;
-  if (missingAgentcliFiles.length > 0) return false;
-  try {
-    const packageVersion = JSON.parse(readFileSync(agentcliPackage, 'utf8')).version;
-    const integrationSource = readFileSync(agentcliIntegration, 'utf8');
-    return packageVersion === '0.4.0'
-      && integrationSource.includes("assert.equal(result.handoff.field_version, '2', 'field_version should be 2')");
-  } catch {
-    return false;
-  }
-}
-
 if (!skipAgentcli && missingAgentcliFiles.length === 0) {
   const isolatedHome = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-agentcli-'));
   try {
@@ -111,18 +98,7 @@ if (!skipAgentcli && missingAgentcliFiles.length === 0) {
     if (skipAgentcliOwned) {
       process.stdout.write('\n==> agentcli-owned integration explicitly skipped by --skip-agentcli-owned or SKIP_AGENTCLI_OWNED_INTEGRATION=1\n');
     } else {
-      const staleV2Assertion = hasStaleV2FieldVersionAssertion();
-      if (staleV2Assertion) {
-        process.stdout.write('\n==> agentcli-owned integration: excluding its stale field_version=2-only assertion against handoff v3\n');
-      }
-      const ownedArgs = staleV2Assertion
-        ? [
-            '--test',
-            '--test-skip-pattern=apply sends v0\\.2 fields when scheduler supports handoff v2',
-            agentcliIntegration,
-          ]
-        : ['--test', agentcliIntegration];
-      runStep('agentcli scheduler integration', process.execPath, ownedArgs, {
+      runStep('agentcli scheduler integration', process.execPath, ['--test', agentcliIntegration], {
         cwd: agentcliRoot,
         env: integrationEnv,
       });

@@ -51,17 +51,36 @@ function deriveErrorMessage(result, timeoutMs) {
   return result.rawError?.message || 'Shell command failed';
 }
 
+function assertArtifactPathSegment(value, label) {
+  const segment = String(value || '');
+  if (segment.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment)) {
+    throw new Error(`${label} must be a safe path segment`);
+  }
+  return segment;
+}
+
 function writeOutputArtifact(kind, runId, text, artifactsDir) {
-  if (!artifactsDir || !runId || !text.trim()) return null;
+  if (!artifactsDir || !runId || text.length === 0) return null;
   try {
-    const baseDir = ensureArtifactsDir(join(artifactsDir, 'runs', runId));
-    const filePath = join(baseDir, `${kind}.txt`);
+    const safeKind = assertArtifactPathSegment(kind, 'artifact kind');
+    const safeRunId = assertArtifactPathSegment(runId, 'run id');
+    const baseDir = ensureArtifactsDir(join(artifactsDir, 'runs', safeRunId));
+    const filePath = join(baseDir, `${safeKind}.txt`);
     writeFileSync(filePath, text, 'utf8');
     return filePath;
   } catch (err) {
     process.stderr.write(`[shell-result] writeOutputArtifact failed for ${kind} (run ${runId}): ${err.message}\n`);
     return null;
   }
+}
+
+/** Persist a bounded-runtime output artifact beneath the scheduler artifact root. */
+export function storeRunArtifact(kind, runId, text, artifactsDir = resolveArtifactsDir({ dbPath: getResolvedDbPath() })) {
+  if (!/^[a-z0-9-]+$/.test(String(kind || ''))) {
+    throw new Error('artifact kind must contain only lowercase letters, digits, and hyphens');
+  }
+  const safeRunId = assertArtifactPathSegment(runId, 'run id');
+  return writeOutputArtifact(kind, safeRunId, toText(text), artifactsDir);
 }
 
 function formatOutputBlock(label, excerpt, artifactPath, bytes) {

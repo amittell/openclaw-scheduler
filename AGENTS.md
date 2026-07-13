@@ -231,8 +231,8 @@ openclaw-scheduler alias add ops_team telegram -100200000000
 }
 ```
 
-Approval gates apply to every durable dispatch kind, including root, manual,
-scheduled, one-shot, and chain work. Resolve a gate by approval ID. The
+Approval gates apply to every durable dispatch kind, including scheduled,
+one-shot, manual, chain, and retry work. Resolve a gate by approval ID. The
 scheduler derives the approver from the invoking local OS account:
 
 ```bash
@@ -245,9 +245,10 @@ identities. Domain scopes and caller-selected approver flags are not supported.
 `jobs approve/reject JOB_ID` remains a legacy lookup for the job's current gate.
 
 Set `output_format` to `json`, `ndjson`, or `text` when a run must satisfy a
-declared output shape. Invalid structured output fails the run and blocks
-children. Retrieve and verify generated evidence with
-`openclaw-scheduler runs evidence RUN_ID --json`.
+declared output shape. Invalid JSON or NDJSON is nonfatal: the run records an
+invalidity warning, null parsed value, byte count, and SHA-256 digest while
+preserving primary execution success. Retrieve and verify generated evidence
+with `openclaw-scheduler runs evidence RUN_ID --json`.
 
 The built-in evidence backend is SHA-256 checksum-only. It is not agentcli's
 complete evidence payload or signed envelope contract, so the runtime reports

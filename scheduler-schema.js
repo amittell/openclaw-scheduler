@@ -53,6 +53,9 @@ export const SCHEDULER_SCHEMAS = {
       output_summary_limit_bytes: { type: 'integer', min: 64, default: 65536 },
       output_offload_threshold_bytes: { type: 'integer', min: 128, default: 65536 },
       output_format: { type: 'string', enum: ['json', 'ndjson', 'text'], nullable: true, description: 'Expected and validated execution output format' },
+      verify_shell: { type: 'string', nullable: true, description: 'Post-success verification command' },
+      verify_timeout_s: { type: 'integer', min: 1, nullable: true, description: 'Verification timeout in seconds' },
+      verify_on_failure: { type: 'string', enum: ['warn', 'error'], nullable: true, description: 'Whether verification failure warns or fails the run' },
       preferred_session_key: { type: 'string', nullable: true },
       auth_profile: { type: 'string', nullable: true, description: 'Auth profile override: null=default, "inherit"=main session profile, or "provider:label"' },
       auth_profile_fallback: { type: 'string', nullable: true, description: 'Optional fallback auth profile for a same-run retry after primary selection failure' },
@@ -97,7 +100,7 @@ export const SCHEDULER_SCHEMAS = {
   },
   runs: {
     statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed', 'recovery_blocked'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_required', 'evidence_execution_snapshot', 'evidence_declaration_snapshot', 'evidence_ref_snapshot', 'evidence_record', 'credential_handoff_summary', 'delegation_validation', 'output_format', 'structured_output', 'structured_output_valid'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_required', 'evidence_execution_snapshot', 'evidence_declaration_snapshot', 'evidence_ref_snapshot', 'evidence_record', 'credential_handoff_summary', 'delegation_validation', 'approval_used', 'output_format', 'structured_output', 'structured_output_valid', 'structured_output_warning', 'structured_output_bytes', 'structured_output_sha256', 'structured_output_path', 'verification_result'],
   },
   approvals: {
     statuses: ['pending', 'approved', 'dispatching', 'dispatched', 'rejected', 'timed_out', 'cancelled'],
@@ -106,7 +109,7 @@ export const SCHEDULER_SCHEMAS = {
   dispatches: {
     kinds: ['schedule', 'at', 'manual', 'chain', 'retry'],
     statuses: ['pending', 'claimed', 'awaiting_approval', 'done', 'cancelled', 'failed'],
-    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'source_run_id', 'retry_of_run_id', 'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count', 'last_error', 'replay_of_run_id'],
+    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'binding_scheduled_for', 'source_run_id', 'retry_of_run_id', 'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count', 'last_error', 'replay_of_run_id'],
   },
   messages: {
     kinds: ['text', 'task', 'result', 'status', 'system', 'spawn', 'decision', 'constraint', 'fact', 'preference'],

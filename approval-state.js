@@ -1,6 +1,10 @@
 import { getDb } from './db.js';
 import { Cron } from 'croner';
-import { approvalBindingHashForDb, approverMatchesScope } from './approval-binding.js';
+import {
+  approvalBindingHashForDb,
+  approverMatchesScope,
+  getAuthenticatedApprovalActor,
+} from './approval-binding.js';
 import { persistTerminalEvidence } from './runs.js';
 
 export const APPROVAL_STATUSES = Object.freeze({
@@ -33,6 +37,56 @@ function immediate(db, fn) {
 
 function approvalRow(db, id) {
   return db.prepare('SELECT * FROM approvals WHERE id = ?').get(id) || null;
+}
+
+function approvalAssociationMismatch(db, approval, dispatch) {
+  if (!dispatch) return 'Approval dispatch no longer exists';
+  if (dispatch.job_id !== approval.job_id) {
+    return 'Approval dispatch belongs to a different job';
+  }
+  if (!approval.run_id) return null;
+  const run = db.prepare(
+    'SELECT job_id, dispatch_queue_id FROM runs WHERE id = ?',
+  ).get(approval.run_id);
+  if (!run) return 'Approval gate run no longer exists';
+  if (run.job_id !== approval.job_id) {
+    return 'Approval gate run belongs to a different job';
+  }
+  if (run.dispatch_queue_id !== approval.dispatch_queue_id) {
+    return 'Approval gate run belongs to a different dispatch';
+  }
+  return null;
+}
+
+function cancelCorruptApprovalAssociation(db, approval, dispatch, reason) {
+  const normalizedReason = normalizeText(reason, 'Approval association is invalid');
+  const info = db.prepare(`
+    UPDATE approvals
+    SET status = 'cancelled',
+        resolved_at = COALESCE(resolved_at, datetime('now')),
+        resolved_by = COALESCE(resolved_by, 'scheduler'),
+        cancelled_reason = ?,
+        notes = COALESCE(notes, ?),
+        decision_version = decision_version + 1
+    WHERE id = ? AND status IN ('approved', 'dispatching')
+  `).run(normalizedReason, normalizedReason, approval.id);
+  if (info.changes === 1 && dispatch) {
+    db.prepare(`
+      UPDATE job_dispatch_queue
+      SET status = 'cancelled',
+          processed_at = datetime('now'),
+          claim_owner = NULL,
+          claim_token = NULL,
+          claim_expires_at = NULL,
+          last_error = ?
+      WHERE id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+    `).run(normalizedReason, dispatch.id);
+  }
+  return {
+    changed: info.changes === 1,
+    approval: approvalRow(db, approval.id),
+    reason: info.changes === 1 ? null : 'concurrent_transition',
+  };
 }
 
 function normalizeText(value, fallback = null, maxLength = 4000) {
@@ -215,7 +269,7 @@ function transitionPendingInTransaction(db, id, status, opts = {}) {
     if (!job || job.enabled !== 1) {
       effectiveStatus = APPROVAL_STATUSES.CANCELLED;
       forcedReason = !job ? 'Job deleted before approval' : 'Job disabled before approval';
-    } else if (!before.binding_hash || approvalBindingHashForDb(db, job) !== before.binding_hash) {
+    } else if (!before.binding_hash || approvalBindingHashForDb(db, job, { dispatch }) !== before.binding_hash) {
       effectiveStatus = APPROVAL_STATUSES.CANCELLED;
       forcedReason = before.binding_hash
         ? 'Job execution contract changed after approval was requested'
@@ -238,10 +292,11 @@ function transitionPendingInTransaction(db, id, status, opts = {}) {
         ? 'Approval cancelled'
         : 'Approval granted';
   const reason = normalizeText(forcedReason ?? opts.reason ?? notes, defaultReason);
+  const persistedNotes = reason;
   const info = db.prepare(pendingTransitionSql(effectiveStatus)).run(
     effectiveStatus,
     resolvedBy,
-    notes,
+    persistedNotes,
     effectiveStatus,
     effectiveStatus,
     effectiveStatus,
@@ -306,6 +361,20 @@ export function beginApprovalDispatch(dispatchQueueId, opts = {}) {
       return { changed: false, approval, reason: 'not_approved' };
     }
 
+    const dispatch = db.prepare(
+      'SELECT * FROM job_dispatch_queue WHERE id = ?'
+    ).get(dispatchQueueId);
+    const associationMismatch = approvalAssociationMismatch(db, approval, dispatch);
+    if (associationMismatch) {
+      const cancelled = cancelCorruptApprovalAssociation(
+        db,
+        approval,
+        dispatch,
+        associationMismatch,
+      );
+      return { ...cancelled, reason: 'association_mismatch' };
+    }
+
     const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(approval.job_id);
     if (!job || job.enabled !== 1) {
       const cancelled = cancelApprovalInTransaction(
@@ -316,7 +385,7 @@ export function beginApprovalDispatch(dispatchQueueId, opts = {}) {
       );
       return { ...cancelled, reason: 'job_unavailable' };
     }
-    if (!approval.binding_hash || approvalBindingHashForDb(db, job) !== approval.binding_hash) {
+    if (!approval.binding_hash || approvalBindingHashForDb(db, job, { dispatch }) !== approval.binding_hash) {
       const cancelled = cancelApprovalInTransaction(
         db,
         approval,
@@ -327,11 +396,24 @@ export function beginApprovalDispatch(dispatchQueueId, opts = {}) {
       );
       return { ...cancelled, reason: 'binding_mismatch' };
     }
-    const dispatch = db.prepare(
-      'SELECT status FROM job_dispatch_queue WHERE id = ?'
-    ).get(dispatchQueueId);
     if (!dispatch || dispatch.status !== 'claimed') {
       return { changed: false, approval, reason: 'dispatch_not_claimed' };
+    }
+
+    if (approval.approver_scope) {
+      const authenticatedActor = opts.authenticatedActor || getAuthenticatedApprovalActor();
+      if (
+        approval.resolved_by !== authenticatedActor.canonical
+        || !approverMatchesScope(authenticatedActor, approval.approver_scope)
+      ) {
+        const cancelled = cancelApprovalInTransaction(
+          db,
+          approval,
+          'Authenticated approval actor no longer satisfies the required scope',
+          'scheduler',
+        );
+        return { ...cancelled, reason: 'scope_mismatch' };
+      }
     }
 
     const info = db.prepare(`
@@ -554,6 +636,12 @@ export function recoverInterruptedApprovalDispatches(opts = {}) {
                SELECT 1 FROM runs r
                WHERE r.dispatch_queue_id = a.dispatch_queue_id
                  AND r.id != COALESCE(a.run_id, '')
+                 AND r.job_id = a.job_id
+                 AND CASE
+                   WHEN json_valid(r.approval_used)
+                   THEN json_extract(r.approval_used, '$.approval_id')
+                   ELSE NULL
+                 END = a.id
              ) AS has_execution_run
       FROM approvals a
       LEFT JOIN job_dispatch_queue q ON q.id = a.dispatch_queue_id

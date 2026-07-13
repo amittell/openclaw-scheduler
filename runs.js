@@ -26,9 +26,7 @@ export function createRun(jobId, opts = {}) {
   const evidenceRequired = opts.evidence_required == null
     ? declaredEvidenceRequired
     : Number(Boolean(opts.evidence_required));
-  const evidenceExecutionSnapshot = evidenceRequired === 1
-    ? JSON.stringify(buildEvidenceExecutionSnapshot(job))
-    : null;
+  const evidenceExecutionSnapshot = JSON.stringify(buildEvidenceExecutionSnapshot(job));
 
   db.prepare(`
     INSERT INTO runs (
@@ -37,9 +35,9 @@ export function createRun(jobId, opts = {}) {
       retry_of, triggered_by_run, dispatch_queue_id,
       dispatcher_owner, dispatcher_token, dispatch_started_at,
       evidence_required, evidence_execution_snapshot,
-      evidence_declaration_snapshot, evidence_ref_snapshot
+      evidence_declaration_snapshot, evidence_ref_snapshot, approval_used
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -61,6 +59,11 @@ export function createRun(jobId, opts = {}) {
     evidenceExecutionSnapshot,
     evidenceRequired === 1 ? job.evidence : null,
     evidenceRequired === 1 ? job.evidence_ref : null,
+    opts.approval_used == null
+      ? null
+      : typeof opts.approval_used === 'string'
+        ? opts.approval_used
+        : JSON.stringify(opts.approval_used),
   );
 
   return getRun(id);
@@ -424,12 +427,54 @@ export function persistTerminalEvidence(job, runId, status, fields = {}, outcome
     error.code = 'RUN_NOT_FOUND';
     throw error;
   }
-  if (run.evidence_required !== 1) return null;
   if (run.status !== status) {
     const error = new Error(`Cannot generate ${status} evidence for run in status ${run.status}`);
     error.code = 'EVIDENCE_RUN_STATUS_MISMATCH';
     throw error;
   }
+  const isApprovalGateRun = Boolean(
+    db.prepare('SELECT 1 FROM approvals WHERE run_id = ? LIMIT 1').get(run.id),
+  );
+  if (isApprovalGateRun && run.evidence_required !== 1) return null;
+  let executionSnapshot;
+  try {
+    executionSnapshot = run.evidence_execution_snapshot
+      ? JSON.parse(run.evidence_execution_snapshot)
+      : null;
+  } catch (cause) {
+    const error = new Error('Stored evidence execution snapshot is invalid JSON');
+    error.code = 'EVIDENCE_EXECUTION_SNAPSHOT_INVALID';
+    error.cause = cause;
+    throw error;
+  }
+  let verificationResult = fields.verification_result ?? run.verification_result ?? null;
+  const verificationSnapshot = executionSnapshot?.job_snapshot || {};
+  if (
+    verificationSnapshot.verification_declared === true
+    && verificationResult == null
+    && !isApprovalGateRun
+  ) {
+    verificationResult = {
+      passed: false,
+      status: 'interrupted',
+      on_failure: verificationSnapshot.verify_on_failure || 'error',
+      exit_code: null,
+      signal: null,
+      timed_out: status === 'timeout',
+      duration_ms: null,
+      stdout_bytes: 0,
+      stderr_bytes: 0,
+      stdout_sha256: null,
+      stderr_sha256: null,
+      error: `Verification did not complete before terminal status ${status}`,
+    };
+    db.prepare(`
+      UPDATE runs
+      SET verification_result = ?
+      WHERE id = ? AND verification_result IS NULL
+    `).run(JSON.stringify(verificationResult), run.id);
+  }
+  if (run.evidence_required !== 1) return null;
   const parseOutcome = field => {
     if (run[field] == null || Object.hasOwn(outcomes, field)) return undefined;
     try {
@@ -510,15 +555,13 @@ export function persistTerminalEvidence(job, runId, status, fields = {}, outcome
     timed_out: Boolean(fields.shell_timed_out ?? run.shell_timed_out ?? status === 'timeout'),
     structured_output: fields.structured_output ?? run.structured_output ?? null,
     structured_output_valid: fields.structured_output_valid ?? run.structured_output_valid ?? null,
+    structured_output_warning: fields.structured_output_warning ?? run.structured_output_warning ?? null,
+    structured_output_bytes: fields.structured_output_bytes ?? run.structured_output_bytes ?? null,
+    structured_output_sha256: fields.structured_output_sha256 ?? run.structured_output_sha256 ?? null,
+    structured_output_path: fields.structured_output_path ?? run.structured_output_path ?? null,
+    verification_result: verificationResult,
   };
-  try {
-    runMetadata.execution_snapshot = JSON.parse(run.evidence_execution_snapshot);
-  } catch (cause) {
-    const error = new Error('Stored evidence execution snapshot is invalid JSON');
-    error.code = 'EVIDENCE_EXECUTION_SNAPSHOT_INVALID';
-    error.cause = cause;
-    throw error;
-  }
+  runMetadata.execution_snapshot = executionSnapshot;
   const evidenceJob = {
     ...job,
     evidence: run.evidence_declaration_snapshot,
@@ -671,8 +714,8 @@ export function getEvidenceRecord(runId, opts = {}) {
   let payload;
   try {
     payload = JSON.parse(row.payload);
-  } catch (error) {
-    return { ...row, payload: null, integrity: { valid: false, error: `stored payload is invalid JSON: ${error.message}` } };
+  } catch {
+    return { ...row, payload: null, integrity: { valid: false, error: 'stored payload is invalid JSON' } };
   }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return {

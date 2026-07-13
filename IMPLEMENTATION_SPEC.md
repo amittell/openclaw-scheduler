@@ -88,8 +88,8 @@ claim approved work for dispatch. Rejection, timeout, cancellation, disabled
 job state, or a cancelled linked run prevents later dispatch. The approval and
 linked queue/run state are updated together where required.
 
-Every `approval_required` attempt, including root, manual, scheduled, one-shot,
-and chain dispatch, requires a durable queue row. Approval creation snapshots
+Every `approval_required` attempt, including scheduled, one-shot, manual,
+chain, and retry dispatch, requires a durable queue row. Approval creation snapshots
 `approval_risk_level`, `approval_approver_scope`, and a canonical SHA-256
 binding of the persisted execution contract. Scope matching supports exact,
 local username, numeric UID, and normalized local-principal identities. The CLI
@@ -108,10 +108,22 @@ obtain the complete approval UUID.
 
 `output_format` accepts `json`, `ndjson`, or `text`. JSON parses as one value;
 every nonblank NDJSON line parses independently; text uses the normalized text
-result. The run records `output_format`, `structured_output`, and
-`structured_output_valid`. Invalid declared output converts an otherwise
-successful result to `error`, releases the idempotency claim, and blocks child
-dispatch.
+result. The run records the declared format, validity, warning, raw byte count,
+SHA-256 digest, and either the parsed value or an offloaded artifact reference.
+Malformed JSON or NDJSON is nonfatal and does not change an otherwise
+successful execution or block success children.
+
+## Post-success Verification
+
+Synchronous jobs may declare a local shell check through `verify_shell`,
+`verify_timeout_s`, and `verify_on_failure`. Verification executes after primary execution and
+structured-output parsing but before credentials are cleaned up, terminal
+evidence is persisted, delivery is enqueued, or children are dispatched. The
+runtime applies the same timeout, cancellation, process-group, fencing, and
+environment controls as ordinary shell execution. Audit state contains only
+status, timing, exit metadata, byte counts, and output hashes. `error` converts
+verification failure to terminal error; `warn` preserves success. Interrupted
+verification receives a terminal evidence outcome during recovery.
 
 ## Delivery and Attachments
 
@@ -203,8 +215,9 @@ advertise no capabilities and fail closed for this surface.
 `capabilities --json` advertises handoff version 3. Relevant exact feature
 values are `evidence_generation: false`,
 `checksum_evidence_generation: true`,
-`evidence_integrity: "checksum-sha256-v2"`,
-`evidence_contract: "openclaw-scheduler-checksum-v2"`,
+`evidence_integrity: "checksum-sha256-v3"`,
+`evidence_contract: "openclaw-scheduler-checksum-v3"`,
+`approval_scope_enforcement: false`,
 `gateway_capability_discovery: true`,
 `gateway_env_injection_negotiation: true`,
 `multipart_delivery_checkpoints: true`, and

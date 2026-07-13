@@ -161,7 +161,7 @@ openclaw-scheduler approvals approve APPROVAL_ID --reason "Change window open"
 openclaw-scheduler approvals reject APPROVAL_ID --reason "not ready yet"
 ```
 
-Approval gates apply to root, manual, scheduled, one-shot, and chain-triggered
+Approval gates apply to scheduled, one-shot, manual, chain-triggered, and retry
 dispatches. Approving a scoped gate requires the invoking local OS identity to
 match, and scoped gates cannot use timeout auto-approval. Any
 execution-contract change cancels the pending approval. Legacy
@@ -186,8 +186,13 @@ gate and cannot choose a different identity.
 - `approval_risk_level`: `low`, `medium`, or `high`.
 - `approval_approver_scope`: unprefixed exact identity, `exact:`,
   `user:`, `uid:`, or `principal:` local identity. Domain scopes are rejected.
-- `output_format`: `json`, `ndjson`, or `text`. Invalid declared output fails
-  the run and blocks children.
+- `output_format`: `json`, `ndjson`, or `text`. Malformed JSON or NDJSON records
+  failed shape validation without changing an otherwise successful execution. The run
+  records a warning, validity flag, byte count, SHA-256 digest, and value or
+  artifact reference.
+- `verify_shell`: post-success shell verification executed before evidence,
+  delivery, and child dispatch. `verify_timeout_s` bounds it and
+  `verify_on_failure` selects `error` or `warn`.
 - `authorization_ref`: `provider:policy-ref` or
   `provider://provider/policy-ref`. The provider must implement
   `resolvePolicy()` or `resolveAuthorization()`; resolution errors deny.
@@ -271,6 +276,9 @@ openclaw-scheduler runs evidence RUN_ID --json
 | `approval_risk_level` | string | no | `low`, `medium`, or `high` |
 | `approval_approver_scope` | string | no | OS-authenticated bare/exact, local-user, UID, or local-principal scope |
 | `output_format` | string | no | `json`, `ndjson`, or `text` run-output contract |
+| `verify_shell` | string | no | Post-success shell verification command; unavailable for fire-and-forget jobs |
+| `verify_timeout_s` | integer | no | Verification timeout in seconds (default: 30) |
+| `verify_on_failure` | string | no | `error` to fail the run or `warn` to preserve primary success |
 | `identity_delegation_mode` | string | no | Declared delegation mode validated before execution |
 | `authorization_ref` | string | no | Provider-qualified external policy reference |
 | `evidence_ref` | string | no | Stable label for immutable run evidence |

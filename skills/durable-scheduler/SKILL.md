@@ -28,7 +28,7 @@ Use native OpenClaw cron when one scheduled command or agent turn is enough. Do 
 ## Install and diagnose
 
 ```bash
-npm install -g openclaw-scheduler
+npm install -g --ignore-scripts=false openclaw-scheduler
 openclaw-scheduler setup
 openclaw-scheduler doctor
 openclaw-scheduler status --json

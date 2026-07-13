@@ -304,7 +304,10 @@ test('cancelJob records live cancellation metadata and closes pending approval s
   assert.ok(claimDispatch(claimedDispatch.id, { ownerId: 'cancel-race-owner', leaseMs: 2_000 }));
   const approvalDispatch = enqueueDispatch(job.id, { kind: 'manual' });
   setDispatchStatus(approvalDispatch.id, 'awaiting_approval');
-  const approvalRun = createRun(job.id, { status: 'awaiting_approval' });
+  const approvalRun = createRun(job.id, {
+    status: 'awaiting_approval',
+    dispatch_queue_id: approvalDispatch.id,
+  });
   const approval = createApproval(job.id, approvalRun.id, approvalDispatch.id);
 
   assert.deepEqual(cancelJob(job.id, {
@@ -543,6 +546,54 @@ test('cancellation after dispatch claim atomically prevents execution run creati
   assert.equal(getDb().prepare('SELECT COUNT(*) AS count FROM runs WHERE job_id = ?').get(job.id).count, 0);
 });
 
+test('disabling a job after claim atomically prevents execution run creation', async () => {
+  const job = createShellJob('runtime-disable-after-claim');
+  const dispatch = enqueueDispatch(job.id, { kind: 'manual' });
+  const context = await prepareDispatch(getJob(job.id), { dispatchRecord: dispatch }, {
+    claimDispatch(id) {
+      const claimed = claimDispatch(id, { ownerId: 'disable-after-claim-owner', leaseMs: 2_000 });
+      updateJob(job.id, { enabled: 0 });
+      return claimed;
+    },
+    releaseDispatch,
+    setDispatchStatus,
+    countPendingApprovalsForJob: () => 0,
+    getPendingApproval: () => null,
+    createApproval,
+    getApprovalForDispatch: () => null,
+    beginApprovalDispatch: () => ({ changed: false }),
+    markApprovalDispatched: () => ({ changed: false }),
+    cancelApprovalForDispatch: () => ({ changed: false }),
+    createRun,
+    getRun,
+    hasRunningRunForPool: () => false,
+    hasRunningRun: () => false,
+    enqueueJob: () => ({ queued: false }),
+    getDispatchBacklogCount,
+    generateIdempotencyKey: () => null,
+    generateChainIdempotencyKey: () => null,
+    generateRunNowIdempotencyKey: () => null,
+    claimIdempotencyKey: () => true,
+    finishRun: () => null,
+    getDb,
+    sqliteNow: () => new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ''),
+    adaptiveDeferralMs: () => 1_000,
+    handleDelivery: () => null,
+    advanceNextRun: () => {},
+    updateJobAfterRun: () => {},
+    TICK_INTERVAL_MS: 1_000,
+    log: () => {},
+    evaluateGovernance: () => ({ allowed: true, violations: [], warnings: [] }),
+    buildShellEnvironment: () => ({}),
+    summarizeGovernance: () => null,
+  });
+
+  assert.equal(context, null);
+  assert.equal(getDispatch(dispatch.id).status, 'cancelled');
+  assert.match(getDispatch(dispatch.id).last_error, /disabled before execution/);
+  assert.equal(getDb().prepare('SELECT COUNT(*) AS count FROM runs WHERE job_id = ?').get(job.id).count, 0);
+});
+
 test('cancellation during slow preparation terminalizes the run before execution', async () => {
   const job = createShellJob('runtime-cancel-slow-prepare', {
     identity: JSON.stringify({ provider: 'slow-test-provider' }),
@@ -738,14 +789,15 @@ test('dispatch claims expire, recover, and use idempotent deterministic IDs', as
   assert.equal(getDispatch(legacy.id).status, 'pending');
 });
 
-test('disabled jobs cancel scheduled dispatches while preserving manual dispatches', () => {
+test('disabled jobs cancel every dispatch kind including manual dispatches', () => {
   const job = createShellJob('runtime-disabled-queue', { enabled: 0 });
   const scheduled = enqueueDispatch(job.id, { id: 'disabled-schedule', kind: 'schedule' });
   const manual = enqueueDispatch(job.id, { id: 'disabled-manual', kind: 'manual' });
   const due = getDueDispatches();
 
   assert.equal(getDispatch(scheduled.id).status, 'cancelled');
-  assert.ok(due.some(dispatch => dispatch.id === manual.id));
+  assert.equal(getDispatch(manual.id).status, 'cancelled');
+  assert.ok(!due.some(dispatch => dispatch.id === manual.id));
   assert.ok(!due.some(dispatch => dispatch.id === scheduled.id));
 });
 

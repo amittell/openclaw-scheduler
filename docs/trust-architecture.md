@@ -177,7 +177,7 @@ in the credential-scoping or access-control sense.
 ## Approval Boundary
 
 Every dispatch for a job with `approval_required` enters the durable approval
-gate, including root, manual, scheduled, one-shot, and chain-triggered work.
+gate, including scheduled, one-shot, manual, chain-triggered, and retry work.
 The approval record snapshots the optional `low`, `medium`, or `high` risk
 level, approver scope, and a canonical SHA-256 binding of the persisted job
 execution contract.

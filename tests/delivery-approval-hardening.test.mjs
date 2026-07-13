@@ -65,6 +65,7 @@ import {
 } from '../scripts/inbox-consumer.mjs';
 import { checkApprovals } from '../dispatcher-approvals.js';
 import { checkRunHealth, pruneDeliveryHistory } from '../dispatcher-maintenance.js';
+import { getAuthenticatedApprovalActor } from '../approval-binding.js';
 
 const tempRoot = mkdtempSync(join(tmpdir(), 'scheduler-hardening-'));
 const dbPath = join(tempRoot, 'scheduler.db');
@@ -666,10 +667,15 @@ test('consumer delivers outbox text and persisted media, then supports legacy ro
 });
 
 test('approval rejection atomically cancels its gate run and dispatch', () => {
-  const fixture = createApprovalFixture('approval-reject');
+  const fixture = createApprovalFixture('approval-reject', {
+    verify_shell: 'true',
+    verify_timeout_s: 5,
+    verify_on_failure: 'error',
+  });
   const resolved = resolveApproval(fixture.approval.id, 'rejected', 'operator', 'unsafe request');
   assert.equal(resolved.status, 'rejected');
   assert.equal(getRun(fixture.run.id).status, 'cancelled');
+  assert.equal(getRun(fixture.run.id).verification_result, null);
   assert.equal(getDispatch(fixture.dispatch.id).status, 'cancelled');
   assert.match(getDispatch(fixture.dispatch.id).last_error, /unsafe request/);
 });
@@ -734,6 +740,166 @@ test('only one concurrent approval decision wins', async () => {
   assert.equal(getDispatch(fixture.dispatch.id).status, final.status === 'approved' ? 'pending' : 'cancelled');
 });
 
+test('approval bindings cover immutable identity for every dispatch kind', () => {
+  for (const kind of ['schedule', 'at', 'manual', 'chain', 'retry']) {
+    const job = createJob(jobSpec(`approval-binding-${kind}`, { approval_required: 1 }));
+    const dispatch = enqueueDispatch(job.id, { kind });
+    const run = createRun(job.id, { status: 'awaiting_approval', dispatch_queue_id: dispatch.id });
+    const approval = createApproval(job.id, run.id, dispatch.id);
+    getDb().prepare(`
+      UPDATE job_dispatch_queue
+      SET binding_scheduled_for = datetime(binding_scheduled_for, '+1 second')
+      WHERE id = ?
+    `).run(dispatch.id);
+    const resolved = resolveApproval(approval.id, 'approved', 'operator');
+    assert.equal(resolved.status, 'cancelled', `${kind} dispatch binding must reject mutation`);
+    assert.match(resolved.cancelled_reason, /execution contract changed/);
+  }
+});
+
+test('approval creation rejects cross-job and cross-dispatch associations before mutation', () => {
+  const firstJob = createJob(jobSpec('approval-association-first', { approval_required: 1 }));
+  const secondJob = createJob(jobSpec('approval-association-second', { approval_required: 1 }));
+  const firstDispatch = enqueueDispatch(firstJob.id, { kind: 'manual' });
+  const alternateDispatch = enqueueDispatch(firstJob.id, { kind: 'retry' });
+  const secondDispatch = enqueueDispatch(secondJob.id, { kind: 'manual' });
+  const firstRun = createRun(firstJob.id, {
+    status: 'pending',
+    dispatch_queue_id: alternateDispatch.id,
+  });
+  const secondRun = createRun(secondJob.id, {
+    status: 'pending',
+    dispatch_queue_id: secondDispatch.id,
+  });
+
+  assert.throws(
+    () => createApproval(firstJob.id, null, secondDispatch.id),
+    error => error.code === 'APPROVAL_ASSOCIATION_MISMATCH'
+      && /different job/.test(error.message),
+  );
+  assert.throws(
+    () => createApproval(firstJob.id, secondRun.id, null),
+    error => error.code === 'APPROVAL_ASSOCIATION_MISMATCH'
+      && /different job/.test(error.message),
+  );
+  assert.throws(
+    () => createApproval(firstJob.id, firstRun.id, firstDispatch.id),
+    error => error.code === 'APPROVAL_ASSOCIATION_MISMATCH'
+      && /different dispatch/.test(error.message),
+  );
+
+  assert.equal(getDb().prepare('SELECT COUNT(*) AS count FROM approvals').get().count, 0);
+  assert.equal(getRun(firstRun.id).status, 'pending');
+  assert.equal(getRun(secondRun.id).status, 'pending');
+  for (const dispatch of [firstDispatch, alternateDispatch, secondDispatch]) {
+    assert.equal(getDispatch(dispatch.id).status, 'pending');
+  }
+});
+
+test('approval deduplication rejects a corrupted active association before mutation', () => {
+  const firstJob = createJob(jobSpec('approval-dedupe-corrupt-first', { approval_required: 1 }));
+  const secondJob = createJob(jobSpec('approval-dedupe-corrupt-second', { approval_required: 1 }));
+  const firstDispatch = enqueueDispatch(firstJob.id, { kind: 'manual' });
+  const secondDispatch = enqueueDispatch(secondJob.id, { kind: 'manual' });
+  const firstRun = createRun(firstJob.id, {
+    status: 'awaiting_approval',
+    dispatch_queue_id: firstDispatch.id,
+  });
+  const secondRun = createRun(secondJob.id, {
+    status: 'pending',
+    dispatch_queue_id: secondDispatch.id,
+  });
+  const existing = createApproval(firstJob.id, firstRun.id, firstDispatch.id);
+  getDb().prepare('UPDATE approvals SET dispatch_queue_id = ? WHERE id = ?')
+    .run(secondDispatch.id, existing.id);
+
+  assert.throws(
+    () => createApproval(secondJob.id, secondRun.id, secondDispatch.id),
+    error => error.code === 'APPROVAL_ASSOCIATION_MISMATCH'
+      && /Existing approval/.test(error.message),
+  );
+  assert.equal(getDb().prepare('SELECT COUNT(*) AS count FROM approvals').get().count, 1);
+  assert.equal(getRun(secondRun.id).status, 'pending');
+  assert.equal(getDispatch(secondDispatch.id).status, 'pending');
+  assert.equal(getApproval(existing.id).job_id, firstJob.id);
+  assert.equal(getApproval(existing.id).run_id, firstRun.id);
+});
+
+test('approval consumption cancels a corrupted cross-job dispatch association without touching its gate run', () => {
+  const fixture = createApprovalFixture('approval-consume-cross-job-dispatch');
+  assert.equal(resolveApproval(fixture.approval.id, 'approved', 'operator').status, 'approved');
+  const otherJob = createJob(jobSpec('approval-consume-cross-job-target'));
+  const otherDispatch = enqueueDispatch(otherJob.id, { kind: 'manual' });
+  assert.ok(claimDispatch(otherDispatch.id));
+  getDb().prepare('UPDATE approvals SET dispatch_queue_id = ? WHERE id = ?')
+    .run(otherDispatch.id, fixture.approval.id);
+
+  const rejected = beginApprovalDispatch(otherDispatch.id);
+  assert.equal(rejected.changed, true);
+  assert.equal(rejected.reason, 'association_mismatch');
+  assert.equal(getApproval(fixture.approval.id).status, 'cancelled');
+  assert.equal(getRun(fixture.run.id).status, 'approved');
+  assert.equal(getDispatch(fixture.dispatch.id).status, 'pending');
+  assert.equal(getDispatch(otherDispatch.id).status, 'cancelled');
+});
+
+test('approval consumption cancels corrupted gate-run job and dispatch associations', () => {
+  const crossJob = createApprovalFixture('approval-consume-cross-job-run');
+  assert.equal(resolveApproval(crossJob.approval.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(crossJob.dispatch.id));
+  const otherJob = createJob(jobSpec('approval-consume-cross-run-owner'));
+  const otherRun = createRun(otherJob.id, { status: 'pending' });
+  getDb().prepare('UPDATE approvals SET run_id = ? WHERE id = ?')
+    .run(otherRun.id, crossJob.approval.id);
+  const crossJobRejected = beginApprovalDispatch(crossJob.dispatch.id);
+  assert.equal(crossJobRejected.reason, 'association_mismatch');
+  assert.equal(getApproval(crossJob.approval.id).status, 'cancelled');
+  assert.equal(getRun(otherRun.id).status, 'pending');
+
+  const crossDispatch = createApprovalFixture('approval-consume-cross-dispatch-run');
+  assert.equal(resolveApproval(crossDispatch.approval.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(crossDispatch.dispatch.id));
+  const alternateDispatch = enqueueDispatch(crossDispatch.job.id, { kind: 'retry' });
+  const alternateRun = createRun(crossDispatch.job.id, {
+    status: 'pending',
+    dispatch_queue_id: alternateDispatch.id,
+  });
+  getDb().prepare('UPDATE approvals SET run_id = ? WHERE id = ?')
+    .run(alternateRun.id, crossDispatch.approval.id);
+  const crossDispatchRejected = beginApprovalDispatch(crossDispatch.dispatch.id);
+  assert.equal(crossDispatchRejected.reason, 'association_mismatch');
+  assert.equal(getApproval(crossDispatch.approval.id).status, 'cancelled');
+  assert.equal(getRun(alternateRun.id).status, 'pending');
+  assert.equal(getDispatch(alternateDispatch.id).status, 'pending');
+});
+
+test('approval consumption is single-winner and rechecks authenticated scope', async () => {
+  const fixture = createApprovalFixture('approval-consume-scope', {
+    approval_approver_scope: `user:${getAuthenticatedApprovalActor().username}`,
+  });
+  assert.equal(resolveApproval(fixture.approval.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(fixture.dispatch.id));
+  const mismatchedActor = {
+    authenticated: true,
+    canonical: 'local-user:mismatch',
+    aliases: ['local-user:mismatch', 'user:mismatch'],
+  };
+  const rejected = beginApprovalDispatch(fixture.dispatch.id, { authenticatedActor: mismatchedActor });
+  assert.equal(rejected.changed, true);
+  assert.equal(rejected.reason, 'scope_mismatch');
+  assert.equal(getApproval(fixture.approval.id).status, 'cancelled');
+
+  const race = createApprovalFixture('approval-consume-race');
+  assert.equal(resolveApproval(race.approval.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(race.dispatch.id));
+  const [first, second] = await Promise.all([
+    Promise.resolve().then(() => beginApprovalDispatch(race.dispatch.id)),
+    Promise.resolve().then(() => beginApprovalDispatch(race.dispatch.id)),
+  ]);
+  assert.equal(Number(first.changed) + Number(second.changed), 1);
+  assert.ok([first.reason, second.reason].includes('already_dispatching'));
+});
+
 test('approval dispatch recovery distinguishes started work from an expired claim', () => {
   const started = createApprovalFixture('approval-recovery-started');
   resolveApproval(started.approval.id, 'approved', 'operator');
@@ -742,6 +908,7 @@ test('approval dispatch recovery distinguishes started work from an expired clai
   createRun(started.job.id, {
     status: 'running',
     dispatch_queue_id: started.dispatch.id,
+    approval_used: { approval_id: started.approval.id },
   });
 
   const expired = createApprovalFixture('approval-recovery-expired');
@@ -760,6 +927,61 @@ test('approval dispatch recovery distinguishes started work from an expired clai
   assert.equal(getRun(started.run.id).status, 'skipped');
   assert.equal(getApproval(expired.approval.id).status, 'approved');
   assert.equal(getDispatch(expired.dispatch.id).status, 'pending');
+});
+
+test('approval recovery requires an execution run bound to the exact active gate', () => {
+  const root = createApprovalFixture('approval-recovery-multiple-gates');
+  assert.equal(resolveApproval(root.approval.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(root.dispatch.id));
+  assert.equal(beginApprovalDispatch(root.dispatch.id).changed, true);
+  assert.equal(markApprovalDispatched(root.dispatch.id).changed, true);
+
+  createRun(root.job.id, {
+    status: 'running',
+    dispatch_queue_id: root.dispatch.id,
+    approval_used: { approval_id: root.approval.id },
+  });
+  createRun(root.job.id, {
+    status: 'running',
+    dispatch_queue_id: root.dispatch.id,
+    approval_used: 'not-json',
+  });
+
+  const authorizationRun = createRun(root.job.id, {
+    status: 'awaiting_approval',
+    dispatch_queue_id: root.dispatch.id,
+  });
+  const authorization = createApproval(
+    root.job.id,
+    authorizationRun.id,
+    root.dispatch.id,
+    { gateKind: 'authorization' },
+  );
+  assert.equal(resolveApproval(authorization.id, 'approved', 'operator').status, 'approved');
+  assert.ok(claimDispatch(root.dispatch.id));
+  assert.equal(beginApprovalDispatch(root.dispatch.id).changed, true);
+  getDb().prepare(`
+    UPDATE job_dispatch_queue
+    SET claim_expires_at = datetime('now', '-1 second')
+    WHERE id = ?
+  `).run(root.dispatch.id);
+
+  const deferred = recoverInterruptedApprovalDispatches();
+  assert.equal(deferred.recovered, 1);
+  assert.equal(getApproval(authorization.id).status, 'approved');
+  assert.equal(getDispatch(root.dispatch.id).status, 'pending');
+
+  assert.ok(claimDispatch(root.dispatch.id));
+  assert.equal(beginApprovalDispatch(root.dispatch.id).changed, true);
+  createRun(root.job.id, {
+    status: 'running',
+    dispatch_queue_id: root.dispatch.id,
+    approval_used: { approval_id: authorization.id },
+  });
+  const completed = recoverInterruptedApprovalDispatches();
+  assert.equal(completed.recovered, 1);
+  assert.equal(getApproval(authorization.id).status, 'dispatched');
+  assert.equal(getRun(authorizationRun.id).status, 'skipped');
 });
 
 test('approval recovery terminalizes historical dispatched gate runs', () => {

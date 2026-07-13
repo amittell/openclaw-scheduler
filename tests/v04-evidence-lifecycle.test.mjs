@@ -17,6 +17,7 @@ import {
   finishRun,
   getEvidenceRecord,
   getRun,
+  persistTerminalEvidence,
   persistV02Outcomes,
   pruneEvidenceRecords,
   transitionRunTerminalWithEvidence,
@@ -236,12 +237,17 @@ test('corrupt evidence is retained, reported without crashing, and makes doctor 
   }));
   const run = createRun(job.id);
   transitionRunTerminalWithEvidence(job, run.id, 'ok', { summary: 'corruption fixture' });
-  getDb().prepare("UPDATE evidence_records SET payload = 'null' WHERE run_id = ?").run(run.id);
+  const secretMalformedPayload = 'TOP-SECRET-EVIDENCE-123';
+  getDb().prepare('UPDATE evidence_records SET payload = ? WHERE run_id = ?')
+    .run(secretMalformedPayload, run.id);
   assert.equal(pruneEvidenceRecords({ now: Date.now() + 61_000 }).changes, 0);
-  assert.equal(getEvidenceRecord(run.id).integrity.valid, false);
+  const corruptRecord = getEvidenceRecord(run.id);
+  assert.equal(corruptRecord.integrity.valid, false);
+  assert.equal(corruptRecord.integrity.error, 'stored payload is invalid JSON');
   const diagnostics = doctor();
   assert.equal(diagnostics.ok, false);
   assert.equal(diagnostics.diagnostics.evidence_records.invalid > 0, true);
+  assert.doesNotMatch(JSON.stringify(diagnostics), new RegExp(secretMalformedPayload));
   getDb().prepare('DELETE FROM evidence_records WHERE run_id = ?').run(run.id);
   getDb().prepare("UPDATE runs SET evidence_record = '{\"pruned\":true,\"reason\":\"retention_expired\"}' WHERE id = ?").run(run.id);
 });
@@ -260,6 +266,76 @@ test('retained evidence remains accessible after the run and job are deleted', (
   const response = JSON.parse(output);
   assert.equal(response.ok, true);
   assert.equal(response.evidence.run_id, run.id);
+});
+
+test('recovery records interrupted verification in the run and evidence postcondition', () => {
+  const job = createJob(jobSpec('verification-recovery', {
+    verify_shell: 'test -f /tmp/verification-result',
+    verify_timeout_s: 5,
+    verify_on_failure: 'error',
+  }));
+  const run = createRun(job.id);
+  const editedJob = updateJob(job.id, {
+    verify_shell: null,
+    verify_timeout_s: null,
+    verify_on_failure: null,
+  });
+  finishRun(run.id, 'crashed', { summary: 'dispatcher restarted during verification' });
+  const evidence = persistTerminalEvidence(
+    editedJob,
+    run.id,
+    'crashed',
+    { summary: 'dispatcher restarted during verification' },
+  );
+  const recoveredRun = getRun(run.id);
+  const verification = JSON.parse(recoveredRun.verification_result);
+  assert.equal(verification.status, 'interrupted');
+  assert.equal(verification.passed, false);
+  assert.equal(evidence.payload.version, 3);
+  assert.equal(evidence.payload.postcondition.verification_status, 'interrupted');
+  assert.equal(evidence.payload.postcondition.verification_passed, false);
+  assert.equal(verifyEvidenceRecord(evidence).valid, true);
+
+  const originallyUnverified = createJob(jobSpec('verification-recovery-no-fabrication', {
+    verify_shell: null,
+  }));
+  const unverifiedRun = createRun(originallyUnverified.id);
+  const laterVerified = updateJob(originallyUnverified.id, {
+    verify_shell: 'test -f /tmp/later-verification',
+    verify_timeout_s: 5,
+    verify_on_failure: 'error',
+  });
+  finishRun(unverifiedRun.id, 'crashed', { summary: 'crashed before any verification contract existed' });
+  const unverifiedEvidence = persistTerminalEvidence(
+    laterVerified,
+    unverifiedRun.id,
+    'crashed',
+    { summary: 'crashed before any verification contract existed' },
+  );
+  assert.equal(getRun(unverifiedRun.id).verification_result, null);
+  assert.equal(unverifiedEvidence.payload.postcondition.verification_status, null);
+
+  const noEvidenceJob = createJob(jobSpec('verification-recovery-without-evidence', {
+    evidence: null,
+    evidence_ref: null,
+    verify_shell: 'test -f /tmp/no-evidence-verification',
+    verify_timeout_s: 9,
+    verify_on_failure: 'warn',
+  }));
+  const noEvidenceRun = createRun(noEvidenceJob.id);
+  finishRun(noEvidenceRun.id, 'crashed', { summary: 'verification interrupted without evidence' });
+  assert.equal(
+    persistTerminalEvidence(
+      noEvidenceJob,
+      noEvidenceRun.id,
+      'crashed',
+      { summary: 'verification interrupted without evidence' },
+    ),
+    null,
+  );
+  const noEvidenceVerification = JSON.parse(getRun(noEvidenceRun.id).verification_result);
+  assert.equal(noEvidenceVerification.status, 'interrupted');
+  assert.equal(noEvidenceVerification.on_failure, 'warn');
 });
 
 test('cancellation-winning finalization persists evidence before suppressing side effects', async () => {
@@ -317,6 +393,121 @@ test('cancellation-winning finalization persists evidence before suppressing sid
   assert.equal(getEvidenceRecord(run.id).payload.run.status, 'cancelled');
   assert.equal(deliveries, 0);
   assert.equal(children, 0);
+});
+
+test('lifecycle-aborted verification preserves recovery ownership through cleanup failure', async () => {
+  const job = createJob(jobSpec('verification-lifecycle-preserve', {
+    verify_shell: 'test -f /tmp/verification-never-runs',
+    verify_timeout_s: 30,
+    verify_on_failure: 'error',
+  }));
+  const run = createRun(job.id);
+  const ctx = {
+    run,
+    idemKey: null,
+    dispatchRecord: null,
+    v02Outcomes: {},
+    abortKind: 'lease_lost',
+    abortSignal: new AbortController().signal,
+    dispatcherFence: { ownerId: 'lost-owner', fencingToken: 1 },
+    credentialCleanupTracked: true,
+    materializationCleanup: {
+      provider: {
+        cleanup: async () => { throw new Error('cleanup unavailable after ownership loss'); },
+      },
+      cleanupState: {},
+    },
+  };
+  const effects = { delivery: 0, children: 0, job: 0, dispatch: 0, cleanupState: 0 };
+  await finalizeDispatch(job, ctx, {
+    status: 'ok',
+    summary: 'primary succeeded',
+    content: 'primary succeeded',
+    errorMessage: null,
+    runFinishFields: {},
+    skipChildren: false,
+    skipDelivery: false,
+    idemAction: 'keep',
+    earlyReturn: false,
+  }, {
+    runShellCommand: async () => ({
+      stdout: '', stderr: '', exitCode: 1, signal: 'SIGTERM',
+      error: new Error('lease lost'), timedOut: false, aborted: true,
+    }),
+    isRunCancellationRequested: () => false,
+    materializationCleanupRetryDelaysMs: [0],
+    clearMaterializedEnvironment,
+    recordRunCredentialCleanupState: () => { effects.cleanupState += 1; return false; },
+    handleDelivery: () => { effects.delivery += 1; },
+    handleTriggeredChildren: () => { effects.children += 1; },
+    updateJobAfterRun: () => { effects.job += 1; },
+    setDispatchStatus: () => { effects.dispatch += 1; },
+    log: () => {},
+  });
+  assert.equal(ctx.preserveForRecovery, true);
+  assert.equal(ctx.materializationCleanupResult.cleaned, false);
+  assert.equal(getRun(run.id).status, 'running');
+  assert.deepEqual(effects, { delivery: 0, children: 0, job: 0, dispatch: 0, cleanupState: 1 });
+});
+
+test('successful verification terminalization preserves credential cleanup audit state', async () => {
+  const job = createJob(jobSpec('verification-cleanup-merge', {
+    evidence: null,
+    evidence_ref: null,
+    verify_shell: 'true',
+    verify_timeout_s: 5,
+    verify_on_failure: 'error',
+  }));
+  const run = createRun(job.id);
+  getDb().prepare('UPDATE runs SET context_summary = ? WHERE id = ?').run(
+    JSON.stringify({ credential_cleanup: { status: 'cleaned', attempts: 1 } }),
+    run.id,
+  );
+  await finalizeDispatch(job, {
+    run,
+    idemKey: null,
+    dispatchRecord: null,
+    v02Outcomes: null,
+  }, {
+    status: 'ok',
+    summary: 'primary succeeded',
+    content: 'primary succeeded',
+    errorMessage: null,
+    runFinishFields: { context_summary: { shell_result: { status: 'ok' } } },
+    skipChildren: false,
+    skipDelivery: true,
+    skipDequeue: true,
+    skipAgentCleanup: true,
+    idemAction: 'noop',
+    earlyReturn: false,
+  }, {
+    runShellCommand: async () => ({
+      stdout: '', stderr: '', exitCode: 0, signal: null,
+      error: null, timedOut: false, aborted: false,
+    }),
+    isRunCancellationRequested: () => false,
+    finishRun,
+    updateIdempotencyResultHash: () => {},
+    releaseIdempotencyKey: () => {},
+    setAgentStatus: () => {},
+    handleDelivery: () => {},
+    shouldRetry: () => false,
+    scheduleRetry: () => null,
+    getDb,
+    updateJobAfterRun: () => {},
+    setDispatchStatus: () => {},
+    handleTriggeredChildren: () => {},
+    dequeueJob: () => false,
+    log: () => {},
+    clearMaterializedEnvironment,
+  });
+  const completed = getRun(run.id);
+  assert.equal(completed.status, 'ok');
+  const context = JSON.parse(completed.context_summary);
+  assert.equal(context.credential_cleanup.status, 'cleaned');
+  assert.equal(context.credential_cleanup.attempts, 1);
+  assert.equal(context.shell_result.status, 'ok');
+  assert.equal(JSON.parse(completed.verification_result).status, 'passed');
 });
 
 test('maintenance timeout persists evidence atomically with the terminal transition', async () => {

@@ -18,6 +18,7 @@ const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
 const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
 const VALID_APPROVAL_RISK_LEVELS = new Set(['low', 'medium', 'high']);
 const VALID_OUTPUT_FORMATS = new Set(['json', 'ndjson', 'text']);
+const VALID_VERIFY_ON_FAILURE = new Set(['warn', 'error']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
 const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan', 'fire-and-forget']);
@@ -69,6 +70,7 @@ const PATCHABLE_COLUMNS = new Set([
   'contract_max_cost_usd', 'contract_audit',
   'child_credential_policy',
   'approval_risk_level', 'approval_approver_scope', 'output_format',
+  'verify_shell', 'verify_timeout_s', 'verify_on_failure',
 ]);
 
 function applyJobPatch(jobId, patch) {
@@ -321,6 +323,8 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'approval_risk_level',
     'approval_approver_scope',
     'output_format',
+    'verify_shell',
+    'verify_on_failure',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -480,6 +484,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (merged.output_format != null) {
     assertEnum('output_format', merged.output_format, VALID_OUTPUT_FORMATS);
   }
+  if (merged.verify_shell != null) {
+    assertSafeString('verify_shell', merged.verify_shell, { maxLength: 100000 });
+  }
+  if (merged.verify_on_failure != null) {
+    assertEnum('verify_on_failure', merged.verify_on_failure, VALID_VERIFY_ON_FAILURE);
+  }
   assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
   assertEnum('job_type', merged.job_type || 'standard', VALID_JOB_TYPES);
   assertEnum('execution_intent', merged.execution_intent || 'execute', VALID_EXECUTION_INTENTS);
@@ -489,7 +499,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     const localName = '[A-Za-z0-9@._/-]+';
     const localPrincipal = `(?:${localName}|local-user:[0-9]+)`;
     const allowedScope = new RegExp(
-      `^(?:${localName}|user:${localName}|uid:[0-9]+|exact:${localPrincipal}|principal:${localPrincipal})$`,
+      `^(?:${localPrincipal}|user:${localName}|uid:[0-9]+|exact:${localPrincipal}|principal:${localPrincipal})$`,
     );
     if (!allowedScope.test(merged.approval_approver_scope)) {
       throw new Error(
@@ -509,6 +519,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   if (merged.execution_intent === 'fire-and-forget' && merged.output_format != null) {
     throw new Error('output_format is not supported for execution_intent "fire-and-forget" because no synchronous task output exists');
   }
+  if (merged.execution_intent === 'fire-and-forget' && merged.verify_shell != null) {
+    throw new Error('verify_shell is not supported for execution_intent "fire-and-forget" because no synchronous task completion exists');
+  }
   if (
     merged.execution_intent === 'fire-and-forget'
     && (merged.evidence != null || merged.evidence_ref != null)
@@ -520,6 +533,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     && (merged.evidence != null || merged.evidence_ref != null)
   ) {
     throw new Error('evidence is not supported for watchdog jobs because watchdog_check_cmd is a separate execution contract');
+  }
+  if ((merged.job_type || 'standard') === 'watchdog' && merged.output_format != null) {
+    throw new Error('output_format is not supported for watchdog jobs because watchdog delivery occurs inside its health-check contract');
+  }
+  if ((merged.job_type || 'standard') === 'watchdog' && merged.verify_shell != null) {
+    throw new Error('verify_shell is not supported for watchdog jobs because watchdog delivery occurs inside its health-check contract');
   }
 
   if (merged.trigger_on != null) {
@@ -909,6 +928,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     ['trigger_delay_s', 0],
     ['max_retries', 0],
     ['approval_timeout_s', 1],
+    ['verify_timeout_s', 1],
     ['context_retrieval_limit', 1],
     ['consecutive_errors', 0],
     ['max_queued_dispatches', 1],
@@ -1063,6 +1083,7 @@ export function createJob(opts) {
       approval_required, approval_timeout_s, approval_auto, approval_risk_level, approval_approver_scope,
       context_retrieval, context_retrieval_limit,
       output_store_limit_bytes, output_excerpt_limit_bytes, output_summary_limit_bytes, output_offload_threshold_bytes, output_format,
+      verify_shell, verify_timeout_s, verify_on_failure,
       preferred_session_key,
       job_type, watchdog_target_label, watchdog_check_cmd,
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
@@ -1087,6 +1108,7 @@ export function createJob(opts) {
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?, ?, ?,
+      ?, ?, ?,
       ?, ?, ?,
       ?, ?,
       ?, ?, ?,
@@ -1165,6 +1187,9 @@ export function createJob(opts) {
     normalized.output_summary_limit_bytes || 65536,
     normalized.output_offload_threshold_bytes || 65536,
     normalized.output_format || null,
+    normalized.verify_shell || null,
+    normalized.verify_timeout_s ?? null,
+    normalized.verify_on_failure || null,
     normalized.preferred_session_key || null,
     normalized.job_type || 'standard',
     normalized.watchdog_target_label || null,
@@ -1247,6 +1272,7 @@ export function updateJob(id, patch) {
     'approval_required', 'approval_timeout_s', 'approval_auto', 'approval_risk_level', 'approval_approver_scope',
     'context_retrieval', 'context_retrieval_limit',
     'output_store_limit_bytes', 'output_excerpt_limit_bytes', 'output_summary_limit_bytes', 'output_offload_threshold_bytes', 'output_format',
+    'verify_shell', 'verify_timeout_s', 'verify_on_failure',
     'preferred_session_key',
     'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
@@ -1359,13 +1385,16 @@ export function deleteJob(id) {
 }
 
 /**
- * Schedule an existing job for immediate execution via a durable manual dispatch.
- * Manual dispatches can run even when the job is disabled, without mutating the
- * stored cron schedule.
+ * Schedule an enabled job for immediate execution via a durable manual dispatch.
  */
 export function runJobNow(id) {
   const job = getJob(id);
   if (!job) return null;
+  if (job.enabled !== 1) {
+    const error = new Error(`Cannot run disabled job ${job.name}`);
+    error.code = 'JOB_DISABLED';
+    throw error;
+  }
   if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
     throw new Error(`Dispatch backlog limit reached for ${job.name}`);
   }

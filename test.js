@@ -56,7 +56,7 @@ import {
 import { checkRunHealth } from './dispatcher-maintenance.js';
 import { chooseRepairWebhookUrl, evaluateWebhookHealth } from './scripts/telegram-webhook-check.mjs';
 import { parseLaunchctlPrint, evaluateInboxWatcherHealth } from './scripts/inbox-watcher-guardrail.mjs';
-import { normalizeShellResult, extractShellResultFromRun } from './shell-result.js';
+import { normalizeShellResult, extractShellResultFromRun, storeRunArtifact } from './shell-result.js';
 import {
   buildCompletionChecklistExample,
   buildCompletionSignalInstructions,
@@ -316,6 +316,17 @@ const shellOffloaded = normalizeShellResult(
 assert(typeof shellOffloaded.stdoutPath === 'string', 'shell result offloads stdout when threshold exceeded');
 assert(shellOffloaded.stdoutBytes === 5000, 'shell result stores stdout byte count');
 assert(readFileSync(shellOffloaded.stdoutPath, 'utf8').length === 5000, 'shell result writes offloaded stdout artifact');
+let artifactTraversalError = null;
+try {
+  storeRunArtifact('structured-output', '../outside', 'blocked', shellArtifactsDir);
+} catch (error) {
+  artifactTraversalError = error;
+}
+assert(
+  artifactTraversalError?.message === 'run id must be a safe path segment',
+  'artifact storage rejects run-id path traversal',
+);
+assert(!existsSync(join(shellArtifactsDir, 'outside', 'structured-output.txt')), 'artifact traversal writes no file');
 rmSync(shellArtifactsDir, { recursive: true, force: true });
 
 const shellRunJob = createJob({ name: 'Shell Run', schedule_cron: '*/5 * * * *', payload_message: '/bin/false', session_target: 'shell', payload_kind: 'shellCommand', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
@@ -1382,9 +1393,14 @@ const manualDispatch = getDispatch(triggered.dispatch_id);
 assert(manualDispatch.dispatch_kind === 'manual', 'runJobNow creates manual dispatch');
 assert(getDueDispatches().some(d => d.id === manualDispatch.id), 'runJobNow dispatch appears in dispatch queue');
 const disabledManualJob = createJob({ name: 'DisabledManualJob', enabled: 0, schedule_cron: '0 5 * * *', payload_message: 'manual while disabled', delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
-const disabledManualDispatch = runJobNow(disabledManualJob.id);
-assert(disabledManualDispatch.dispatch_id, 'runJobNow creates manual dispatch for disabled job');
-assert(getDueDispatches().some(d => d.id === disabledManualDispatch.dispatch_id), 'disabled job manual dispatch is queued');
+let disabledManualError = null;
+try {
+  runJobNow(disabledManualJob.id);
+} catch (error) {
+  disabledManualError = error;
+}
+assert(disabledManualError?.code === 'JOB_DISABLED', 'runJobNow rejects disabled jobs');
+assert(listDispatchesForJob(disabledManualJob.id).length === 0, 'disabled job manual dispatch is not queued');
 
 // 6. runJobNow does NOT change the schedule_cron (normal schedule is preserved)
 assert(triggered.schedule_cron === '0 4 * * *', 'runJobNow: schedule_cron unchanged');
@@ -4948,32 +4964,18 @@ console.log('\n-- Dispatcher Integration --');
         origin: 'system',
       });
       context.jobId = disabledManual.id;
-      triggerJob(disabledManual.id);
+      try {
+        triggerJob(disabledManual.id);
+      } catch (error) {
+        context.rejectionCode = error.code;
+      }
     },
     exercise: async ({ probeDb, context }) => {
-      const completion = await waitFor(
-        () => {
-          const run = probeDb.prepare(`
-            SELECT status, summary, finished_at
-            FROM runs
-            WHERE job_id = ? AND finished_at IS NOT NULL
-            ORDER BY started_at DESC, rowid DESC
-            LIMIT 1
-          `).get(context.jobId);
-          const dispatch = probeDb.prepare(`
-            SELECT status, dispatch_kind
-            FROM job_dispatch_queue
-            WHERE job_id = ?
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT 1
-          `).get(context.jobId);
-          if (run?.finished_at && dispatch?.status === 'done') return { run, dispatch };
-          return null;
-        },
-        { timeoutMs: 10000, intervalMs: 100, label: 'disabled manual dispatch run' }
-      );
-      assert(completion.run.status === 'ok', 'dispatcher integration: disabled manual job still executes');
-      assert(completion.dispatch.dispatch_kind === 'manual' && completion.dispatch.status === 'done', 'dispatcher integration: disabled manual dispatch completes instead of being cancelled');
+      assert(context.rejectionCode === 'JOB_DISABLED', 'dispatcher integration: disabled manual job is rejected before enqueue');
+      const runCount = probeDb.prepare('SELECT COUNT(*) AS count FROM runs WHERE job_id = ?').get(context.jobId).count;
+      const dispatchCount = probeDb.prepare('SELECT COUNT(*) AS count FROM job_dispatch_queue WHERE job_id = ?').get(context.jobId).count;
+      assert(runCount === 0, 'dispatcher integration: disabled manual job creates no run');
+      assert(dispatchCount === 0, 'dispatcher integration: disabled manual job creates no dispatch');
     },
   });
 
@@ -5363,6 +5365,13 @@ console.log('\n-- Dispatch Spawn Failure Detection --');
   assert(indexSrc.includes('SPAWN_POLL_MAX'), 'Fix 3: post-spawn poll loop present');
   assert(indexSrc.includes('hasStartedSignal'), 'Fix 3: post-spawn poll accepts session start signal');
   assert(indexSrc.includes('signal.hasStartedSignal || signal.hasActivitySignal'), 'Fix 3: post-spawn poll does not require transcript/history during startup');
+  const spawnPollStart = indexSrc.indexOf('for (let spawnPoll');
+  const immediateSpawnRead = indexSrc.indexOf('const spawnStore = readSessionsStore', spawnPollStart);
+  const delayedSpawnRetry = indexSrc.indexOf('await sleep(SPAWN_POLL_DELAY_MS)', spawnPollStart);
+  assert(
+    spawnPollStart >= 0 && immediateSpawnRead > spawnPollStart && delayedSpawnRetry > immediateSpawnRead,
+    'Fix 3: post-spawn confirmation checks current state before waiting for a retry interval',
+  );
 
   // 2. Status/sync bootstrap reconciliation: a Codex session can enter
   // sessions.json before chat.history, JSONL, or token counters are written.
@@ -9942,10 +9951,18 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
     const binDir = join(tmpBase, 'bin');
     const callsPath = join(tmpBase, 'openclaw-calls.jsonl');
     const openclawPath = join(binDir, 'openclaw');
+    const sessionKey = 'agent:main:subagent:origin-contract';
 
     mkdirSync(sessionsDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      ...sessions,
+      [sessionKey]: {
+        sessionId: 'origin-contract-session',
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }) + '\n');
     writeFileSync(labelsPath, JSON.stringify({}) + '\n');
 
     const stubSource = [
@@ -9977,6 +9994,7 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
         '--timeout', '300',
         '--delivery-mode', 'none',
         '--no-monitor',
+        '--session-key', sessionKey,
         ...extraArgs,
       ],
       {
@@ -10295,9 +10313,17 @@ console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
     const labelsPath  = join(tmpBase, 'labels.json');
     const binDir = join(tmpBase, 'bin');
     const openclawPath = join(binDir, 'openclaw');
+    const sessionKey = 'agent:main:subagent:origin-tiebreak';
     mkdirSync(sessionsDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify(sessions) + '\n');
+    writeFileSync(join(sessionsDir, 'sessions.json'), JSON.stringify({
+      ...sessions,
+      [sessionKey]: {
+        sessionId: 'origin-tiebreak-session',
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    }) + '\n');
     writeFileSync(labelsPath, JSON.stringify({}) + '\n');
     writeFileSync(openclawPath, [
       '#!/usr/bin/env node',
@@ -10320,6 +10346,7 @@ console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
         '--delivery-mode', 'none',
         '--timeout', '300',
         '--no-monitor',
+        '--session-key', sessionKey,
       ],
       {
         encoding: 'utf8',
@@ -11429,10 +11456,10 @@ console.log('\n-- v0.2 Capabilities CLI --');
   assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
   assert(capsOut.features.delegation_validation === true, 'capabilities: delegation_validation enabled');
   assert(capsOut.features.authorization_ref_resolution === true, 'capabilities: authorization_ref_resolution enabled');
-  assert(capsOut.features.evidence_integrity === 'checksum-sha256-v2', 'capabilities: checksum sha256 v2 evidence integrity enabled');
-  assert(capsOut.features.evidence_contract === 'openclaw-scheduler-checksum-v2', 'capabilities: scheduler checksum evidence contract is explicit');
+  assert(capsOut.features.evidence_integrity === 'checksum-sha256-v3', 'capabilities: checksum sha256 v3 evidence integrity enabled');
+  assert(capsOut.features.evidence_contract === 'openclaw-scheduler-checksum-v3', 'capabilities: scheduler checksum evidence contract is explicit');
   assert(capsOut.features.root_approval_gate === true, 'capabilities: root approval gate enabled');
-  assert(capsOut.features.approval_scope_enforcement === true, 'capabilities: approval scope enforcement enabled');
+  assert(capsOut.features.approval_scope_enforcement === false, 'capabilities: scoped manifests fail negotiation until domain identities are authenticatable');
   assert(capsOut.features.structured_output_format === true, 'capabilities: structured output validation enabled');
   assert(capsOut.features.gateway_capability_discovery === true, 'capabilities: Gateway discovery enabled');
   assert(capsOut.features.gateway_env_injection_negotiation === true, 'capabilities: Gateway env injection negotiation enabled');

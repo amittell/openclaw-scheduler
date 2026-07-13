@@ -169,7 +169,7 @@ Aliases:
 
 Status:
   status                             Overall scheduler status
-  doctor                             Validate DB/schema/runtime health and diagnostics
+  doctor [--deep]                    Validate DB/schema/runtime health; --deep verifies every evidence record
 
 Schema:
   schema [jobs|runs|messages|approvals|dispatches|dispatcher_leases|delivery_outbox|delivery_attachments|evidence_records|all]
@@ -299,7 +299,7 @@ function countByStatus(db, table) {
   ).all().map(row => [row.status, row.count]));
 }
 
-function getOperationalDiagnostics(db) {
+function getOperationalDiagnostics(db, opts = {}) {
   const lease = tableExists(db, 'dispatcher_leases')
     ? db.prepare(`
         SELECT *, CASE WHEN julianday(expires_at) > julianday('now') THEN 1 ELSE 0 END AS active
@@ -358,18 +358,33 @@ function getOperationalDiagnostics(db) {
       `).get().count
     : null;
   const evidence = tableExists(db, 'evidence_records')
-    ? (() => {
-      const rows = db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at ASC').all();
-      const invalid = [];
-      for (const row of rows) {
-        const record = getEvidenceRecord(row.run_id);
+    ? db.transaction(() => {
+      const total = db.prepare('SELECT COUNT(*) AS count FROM evidence_records').get().count;
+      const deep = opts.deepEvidence === true;
+      const evidenceLimit = Number.isInteger(opts.evidenceLimit) && opts.evidenceLimit > 0
+        ? opts.evidenceLimit
+        : 500;
+      const rowStatement = deep
+        ? db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC')
+        : db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
+      const rowIterator = deep ? rowStatement.iterate() : rowStatement.iterate(evidenceLimit);
+      let checked = 0;
+      let invalidCount = 0;
+      const invalidSamples = [];
+      for (const row of rowIterator) {
+        checked += 1;
+        const record = getEvidenceRecord(row.run_id, { db });
         if (record?.integrity?.valid !== true) {
-          invalid.push({ run_id: row.run_id, error: record?.integrity?.error || 'record unavailable' });
+          invalidCount += 1;
+          if (invalidSamples.length < 20) {
+            invalidSamples.push({
+              run_id: row.run_id,
+              error: record?.integrity?.error || 'record unavailable',
+            });
+          }
         }
       }
-      const missing = tableExists(db, 'runs') && tableExists(db, 'jobs')
-        ? db.prepare(`
-          SELECT r.id AS run_id, r.job_id
+      const missingWhere = `
           FROM runs r
           WHERE r.status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
             AND r.evidence_required = 1
@@ -379,18 +394,34 @@ function getOperationalDiagnostics(db) {
               AND json_extract(r.evidence_record, '$.pruned') = 1
               AND json_extract(r.evidence_record, '$.reason') = 'retention_expired'
             )
-          ORDER BY r.started_at ASC
-        `).all()
+      `;
+      const missingCount = tableExists(db, 'runs') && tableExists(db, 'jobs')
+        ? db.prepare(`SELECT COUNT(*) AS count ${missingWhere}`).get().count
+        : 0;
+      const missingSamples = missingCount > 0
+        ? db.prepare(`SELECT r.id AS run_id, r.job_id ${missingWhere} ORDER BY r.started_at ASC LIMIT 20`).all()
         : [];
       return {
-        total: rows.length,
-        invalid: invalid.length,
-        invalid_samples: invalid.slice(0, 20),
-        missing: missing.length,
-        missing_samples: missing.slice(0, 20),
+        total,
+        checked,
+        unchecked: Math.max(0, total - checked),
+        verification_complete: checked === total,
+        invalid: invalidCount,
+        invalid_samples: invalidSamples,
+        missing: missingCount,
+        missing_samples: missingSamples,
       };
     })()
-    : { total: null, invalid: null, invalid_samples: [], missing: null, missing_samples: [] };
+    : {
+        total: null,
+        checked: null,
+        unchecked: null,
+        verification_complete: null,
+        invalid: null,
+        invalid_samples: [],
+        missing: null,
+        missing_samples: [],
+      };
   return {
     dispatcher_lease: lease,
     dispatch_queue: queue,
@@ -1449,7 +1480,10 @@ switch (command) {
         dbParentWritable = false;
       }
     }
-    const diagnostics = getOperationalDiagnostics(db);
+    const doctorArgs = [sub, ...args].filter(Boolean);
+    const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep');
+    if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
+    const diagnostics = getOperationalDiagnostics(db, { deepEvidence: doctorArgs.includes('--deep') });
     const integrityRows = db.pragma('quick_check');
     const integrityMessages = integrityRows.map(row => String(Object.values(row)[0]));
     const integrityOk = integrityMessages.length === 1 && integrityMessages[0].toLowerCase() === 'ok';
@@ -1464,6 +1498,9 @@ switch (command) {
     if ((diagnostics.credential_cleanup_failures || 0) > 0) warnings.push('Credential cleanup failures require operator remediation; affected jobs were disabled.');
     if ((diagnostics.evidence_records.invalid || 0) > 0) warnings.push('One or more evidence records failed checksum or execution-binding verification.');
     if ((diagnostics.evidence_records.missing || 0) > 0) warnings.push('One or more terminal runs are missing declared evidence records.');
+    if (diagnostics.evidence_records.verification_complete === false) {
+      warnings.push('Evidence verification was sampled; run doctor --deep to verify every evidence record.');
+    }
     if (!integrityOk) warnings.push('SQLite quick_check reported database integrity errors.');
     if (foreignKeyViolations.length > 0) warnings.push('SQLite foreign-key violations require repair before safe operation.');
     const healthy = missingTables.length === 0
@@ -1560,12 +1597,16 @@ switch (command) {
         authorization_hook: true,
         evidence_generation: false,
         checksum_evidence_generation: true,
-        evidence_integrity: 'checksum-sha256-v2',
-        evidence_contract: 'openclaw-scheduler-checksum-v2',
+        evidence_integrity: 'checksum-sha256-v3',
+        evidence_contract: 'openclaw-scheduler-checksum-v3',
         authorization_ref_resolution: true,
         delegation_validation: true,
         root_approval_gate: true,
-        approval_scope_enforcement: true,
+        // AgentCLI handoff v3 negotiates scopes through one coarse boolean and can
+        // emit domain: scopes. This local runtime cannot authenticate domains,
+        // so advertise false and reject every scoped manifest during capability
+        // negotiation rather than accepting it and failing late.
+        approval_scope_enforcement: false,
         structured_output_format: true,
         credential_handoff: true,
         gateway_capability_discovery: true,

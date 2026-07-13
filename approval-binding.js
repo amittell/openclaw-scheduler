@@ -36,12 +36,29 @@ function stableJob(job) {
   return canonicalize(persisted);
 }
 
+function stableDispatch(dispatch) {
+  if (dispatch == null) return null;
+  if (typeof dispatch !== 'object' || Array.isArray(dispatch)) {
+    throw new Error('approval binding dispatch must be a record or null');
+  }
+  return canonicalize({
+    id: dispatch.id || null,
+    job_id: dispatch.job_id || null,
+    dispatch_kind: dispatch.dispatch_kind || null,
+    scheduled_for: dispatch.binding_scheduled_for || dispatch.scheduled_for || null,
+    source_run_id: dispatch.source_run_id || null,
+    retry_of_run_id: dispatch.retry_of_run_id || null,
+    replay_of_run_id: dispatch.replay_of_run_id || null,
+  });
+}
+
 export function approvalBindingPayload(job, opts = {}) {
   const lineage = Array.isArray(opts.lineage) ? opts.lineage : [];
   return canonicalize({
-    version: 2,
+    version: 3,
     job: stableJob(job),
     parent_lineage: lineage.map(stableJob),
+    dispatch: stableDispatch(opts.dispatch),
   });
 }
 
@@ -67,8 +84,15 @@ export function loadApprovalBindingLineage(db, job) {
   return lineage;
 }
 
-export function approvalBindingHashForDb(db, job) {
-  return approvalBindingHash(job, { lineage: loadApprovalBindingLineage(db, job) });
+export function approvalBindingHashForDb(db, job, opts = {}) {
+  let dispatch = opts.dispatch || null;
+  if (!dispatch && opts.dispatchQueueId) {
+    dispatch = db.prepare('SELECT * FROM job_dispatch_queue WHERE id = ?').get(opts.dispatchQueueId) || null;
+  }
+  return approvalBindingHash(job, {
+    lineage: loadApprovalBindingLineage(db, job),
+    dispatch,
+  });
 }
 
 export function getAuthenticatedApprovalActor() {

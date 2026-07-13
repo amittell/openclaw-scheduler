@@ -64,7 +64,7 @@ import {
   cancelAgentSession,
   isAgentCancellationConfirmed,
 } from './gateway.js';
-import { normalizeShellResult } from './shell-result.js';
+import { normalizeShellResult, storeRunArtifact } from './shell-result.js';
 import {
   getDispatch, getDueDispatches, claimDispatch, releaseDispatch, setDispatchStatus,
   enqueueDispatch,
@@ -643,6 +643,7 @@ function buildDispatchDeps(dispatcherFence = null) {
     applySessionOverridesToSessionStore,
     syncAuthStoreToSession,
     // Finalize
+    storeRunArtifact,
     updateIdempotencyResultHash,
     shouldRetry, scheduleRetry,
     updateJobAfterRun, handleTriggeredChildren,
@@ -685,6 +686,7 @@ function abortActiveRun(runId, reason = 'Run cancellation requested', abortKind 
   const active = activeRunControllers.get(runId);
   if (!active) return false;
   if (!active.abortKind) active.abortKind = abortKind;
+  if (active.ctx) active.ctx.abortKind = active.abortKind;
   if (!active.controller.signal.aborted) active.controller.abort(new Error(reason));
   const current = getRun(runId);
   if (!active.gatewayAbortSent && current?.session_key && active.job.session_target !== 'shell') {
@@ -708,6 +710,20 @@ function abortActiveRun(runId, reason = 'Run cancellation requested', abortKind 
 
 async function dispatchJob(job, opts = {}) {
   const deps = buildDispatchDeps(opts.dispatcherFence || null);
+  deps.onVerificationStart = (runId, timeoutMs) => {
+    const active = activeRunControllers.get(runId);
+    if (!active) return;
+    active.phase = 'verification';
+    active.verificationStartedAt = Date.now();
+    active.verificationTimeoutMs = timeoutMs;
+  };
+  deps.onVerificationEnd = (runId) => {
+    const active = activeRunControllers.get(runId);
+    if (!active) return;
+    active.phase = 'finalizing';
+    active.verificationStartedAt = null;
+    active.verificationTimeoutMs = null;
+  };
   const controller = new AbortController();
   let preparedRunId = null;
   deps.onRunPrepared = (run) => {
@@ -719,6 +735,7 @@ async function dispatchJob(job, opts = {}) {
       dispatcherFence: opts.dispatcherFence || null,
       gatewayAbortSent: false,
       abortKind: null,
+      phase: 'preparing',
     });
   };
   let ctx;
@@ -740,6 +757,7 @@ async function dispatchJob(job, opts = {}) {
     dispatcherFence: opts.dispatcherFence || null,
     gatewayAbortSent: false,
     abortKind: activeRunControllers.get(ctx.run.id)?.abortKind || null,
+    phase: 'execution',
   });
   const observeCancellation = () => {
     if (!isRunCancellationRequested(ctx.run.id)) return;
@@ -814,7 +832,13 @@ async function dispatchJob(job, opts = {}) {
     const cleaned = await cleanupDispatchMaterialization(job, ctx, deps);
     if (!cleaned) {
       const currentRun = getRun(ctx.run.id);
-      if (currentRun?.status === 'running' && dispatcherRuntime?.assertLeadership()) {
+      if (ctx.preserveForRecovery && currentRun?.status === 'running') {
+        log('error', `Credential cleanup failed while preserving run for recovery: ${job.name}`, {
+          jobId: job.id,
+          runId: ctx.run.id,
+          operatorActionRequired: true,
+        });
+      } else if (currentRun?.status === 'running' && dispatcherRuntime?.assertLeadership()) {
         await finalizeDispatch(job, ctx, {
           status: 'error',
           summary: 'Credential cleanup failed',
@@ -1087,7 +1111,7 @@ function submitDueDispatches() {
         setDispatchStatus(currentDispatch.id, 'cancelled', { lastError: 'Job no longer exists' });
         return;
       }
-      if (!job.enabled && currentDispatch.dispatch_kind !== 'manual') {
+      if (!job.enabled) {
         setDispatchStatus(currentDispatch.id, 'cancelled', { lastError: 'Job disabled before dispatch' });
         return;
       }
@@ -1150,6 +1174,7 @@ async function tick() {
         ...getTimedOutRuns(),
       ];
       for (const run of healthCandidates) {
+        if (activeRunControllers.get(run.id)?.phase === 'verification') continue;
         abortActiveRun(run.id, `Dispatcher health timeout for run ${run.id}`, 'health_timeout');
       }
       await checkRunHealth({
