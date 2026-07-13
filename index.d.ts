@@ -959,6 +959,7 @@ export const gateway: {
   MAX_GATEWAY_ENV_KEY_BYTES: number;
   MAX_GATEWAY_ENV_VALUE_BYTES: number;
   MAX_GATEWAY_ENV_INJECT_HEADER_BYTES: number;
+  resolveGatewayTokenPath(configuredPath?: string): string | null;
   GatewayCompatibilityError: new (
     code: string,
     message: string,

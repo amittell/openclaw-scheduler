@@ -36,7 +36,10 @@ const dbPath = join(testRoot, 'scheduler.db');
 
 function initializeDatabase(path) {
   const db = new Database(path);
-  db.exec(readFileSync(schemaPath, 'utf8'));
+  const bundledSchema = readFileSync(schemaPath, 'utf8');
+  // The SQL is the repository-owned test schema, not runtime input.
+  // codeql[js/sql-injection]
+  db.exec(bundledSchema);
   db.close();
 }
 

@@ -21,7 +21,9 @@ The scheduler resolves a bearer token using the following fallback chain:
 2. **Token file**: Path from `OPENCLAW_GATEWAY_TOKEN_PATH`, or the default
    `~/.openclaw/credentials/.gateway-token`. The file is read for every request,
    so an atomic token-file replacement takes effect without restarting the
-   scheduler.
+   scheduler. The canonical file must remain under `~/.openclaw/credentials`,
+   `/run/secrets`, or `/var/run/secrets`; symlinks that escape those roots are
+   rejected.
 
 When a token is available, every HTTP request includes:
 

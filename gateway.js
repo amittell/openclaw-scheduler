@@ -1,8 +1,10 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFile, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
+import {
+  readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync, realpathSync,
+} from 'fs';
+import { homedir, tmpdir } from 'os';
+import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
 
@@ -40,11 +42,53 @@ export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 // contract intact.
 export const ISOLATED_DISPATCH_PRIMITIVE = 'http-chat-completions';
 
+function isWithinPath(root, candidate) {
+  const relativePath = relative(root, candidate);
+  return relativePath === '' || (
+    relativePath !== '..'
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
+  );
+}
+
+/**
+ * Resolve the Gateway token file through an explicit credential-root allowlist.
+ * The canonical path check also prevents a symlink inside an allowed directory
+ * from escaping to an arbitrary file.
+ */
+export function resolveGatewayTokenPath(configuredPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH) {
+  const credentialRoot = resolve(homedir(), '.openclaw', 'credentials');
+  const allowedRoots = [
+    credentialRoot,
+    resolve('/run/secrets'),
+    resolve('/var/run/secrets'),
+    ...(process.env.NODE_ENV === 'test' ? [resolve(tmpdir())] : []),
+  ].map(root => {
+    try {
+      return realpathSync(root);
+    } catch {
+      return root;
+    }
+  });
+  const requestedPath = configuredPath || join(credentialRoot, '.gateway-token');
+  let canonicalPath;
+  try {
+    canonicalPath = realpathSync(resolve(requestedPath));
+  } catch {
+    return null;
+  }
+  return allowedRoots.some(root => isWithinPath(root, canonicalPath))
+    ? canonicalPath
+    : null;
+}
+
 function getGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
-    const tokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH
-      || join(HOME_DIR, '.openclaw/credentials/.gateway-token');
+    const tokenPath = resolveGatewayTokenPath();
+    if (!tokenPath) return null;
+    // The canonical token path is constrained to credential roots above.
+    // codeql[js/path-injection]
     return readFileSync(tokenPath, 'utf-8').trim() || null;
   } catch {
     return null;

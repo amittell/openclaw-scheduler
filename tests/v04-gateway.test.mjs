@@ -1,7 +1,7 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +15,7 @@ let executeAgent;
 let originalGatewayUrl;
 let originalGatewayToken;
 let originalGatewayTokenPath;
+let originalNodeEnv;
 let calls = [];
 
 function sendJson(response, status, payload, headers = {}) {
@@ -78,6 +79,8 @@ before(async () => {
   originalGatewayUrl = process.env.OPENCLAW_GATEWAY_URL;
   originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
   originalGatewayTokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+  originalNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'test';
 
   server = createServer(async (request, response) => {
     const body = await readRequestBody(request);
@@ -133,6 +136,8 @@ after(async () => {
   else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
   if (originalGatewayTokenPath === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
   else process.env.OPENCLAW_GATEWAY_TOKEN_PATH = originalGatewayTokenPath;
+  if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = originalNodeEnv;
 });
 
 test('Gateway token-file rotation is observed without restarting the dispatcher', async () => {
@@ -156,6 +161,21 @@ test('Gateway token-file rotation is observed without restarting the dispatcher'
     else process.env.OPENCLAW_GATEWAY_TOKEN = previousToken;
     if (previousTokenPath === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
     else process.env.OPENCLAW_GATEWAY_TOKEN_PATH = previousTokenPath;
+    rmSync(tokenDir, { recursive: true, force: true });
+  }
+});
+
+test('Gateway token paths reject files and symlink targets outside credential roots', () => {
+  const tokenDir = mkdtempSync(join(tmpdir(), 'scheduler-gateway-token-path-'));
+  const allowedPath = join(tokenDir, 'gateway-token');
+  const escapedPath = join(tokenDir, 'escaped-token');
+  try {
+    writeFileSync(allowedPath, 'allowed-token\n');
+    symlinkSync('/etc/passwd', escapedPath);
+    assert.equal(gateway.resolveGatewayTokenPath(allowedPath), realpathSync(allowedPath));
+    assert.equal(gateway.resolveGatewayTokenPath('/etc/passwd'), null);
+    assert.equal(gateway.resolveGatewayTokenPath(escapedPath), null);
+  } finally {
     rmSync(tokenDir, { recursive: true, force: true });
   }
 });

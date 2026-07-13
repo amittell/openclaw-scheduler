@@ -107,7 +107,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function initializeSchedulerFixtureDb(directory, filename = 'scheduler.db') {
   const fixturePath = join(directory, filename);
   const fixtureDb = new Database(fixturePath);
-  fixtureDb.exec(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'), 'utf8'));
+  const bundledSchema = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'),
+    'utf8',
+  );
+  // The SQL is the repository-owned test schema, not runtime input.
+  // codeql[js/sql-injection]
+  fixtureDb.exec(bundledSchema);
   fixtureDb.close();
   return fixturePath;
 }

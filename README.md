@@ -1473,7 +1473,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 |----------|---------|-------------|
 | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
-| `OPENCLAW_GATEWAY_TOKEN_PATH` | `~/.openclaw/credentials/.gateway-token` | Path to gateway token file (used when `OPENCLAW_GATEWAY_TOKEN` is not set) |
+| `OPENCLAW_GATEWAY_TOKEN_PATH` | `~/.openclaw/credentials/.gateway-token` | Path to a gateway token file under `~/.openclaw/credentials`, `/run/secrets`, or `/var/run/secrets` (used when `OPENCLAW_GATEWAY_TOKEN` is not set) |
 | `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
 | `SCHEDULER_DB` | auto (existing `~/.openclaw/scheduler/scheduler.db` first; otherwise `./scheduler.db` in a writable source checkout; otherwise scheduler home) | SQLite database path |
 | `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
