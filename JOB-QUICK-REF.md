@@ -1,6 +1,6 @@
 # Job Quick Reference
 
-Copy-paste patterns for scheduler 0.4.0 and schema 28. Validate a saved spec
+Copy-paste patterns for scheduler 0.4.1 and schema 28. Validate a saved spec
 with `openclaw-scheduler jobs validate --file job.json` before adding it.
 
 ## Shell job with cron schedule
@@ -243,6 +243,10 @@ openclaw-scheduler runs evidence RUN_ID --json
 { "trigger_on": "success", "trigger_delay_s": 60 }
 ```
 
+`regex:` uses linear-time RE2 syntax. Backreferences and lookaround are not
+supported. Conditions are limited to 1,024 characters, and regex evaluation
+fails closed for parent output larger than 65,536 UTF-8 bytes.
+
 ## Field reference
 
 | Field | Type | Required | Description |
@@ -266,7 +270,7 @@ openclaw-scheduler runs evidence RUN_ID --json
 | `origin` | string | yes (root jobs only; child jobs inherit) | Source chat ID or `system` |
 | `parent_id` | string | no | Parent job ID (for chains) |
 | `trigger_on` | string | no | `success`, `failure`, `complete` |
-| `trigger_condition` | string | no | `contains:X` or `regex:X` |
+| `trigger_condition` | string | no | `contains:X` or linear-time RE2 `regex:X` |
 | `trigger_delay_s` | integer | no | Delay before trigger fires |
 | `max_retries` | integer | no | Retry count on failure |
 | `overlap_policy` | string | no | `allow`, `skip`, `queue` |

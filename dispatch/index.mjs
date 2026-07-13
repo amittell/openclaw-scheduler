@@ -58,10 +58,27 @@ import {
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
+import {
+  agentIdFromSessionKey as validatedAgentIdFromSessionKey,
+  assertValidAgentId,
+  assertValidSessionId,
+  assertValidSessionKey,
+  assertValidSessionStore,
+  assertSessionKeyForAgent,
+  buildGatewayEndpointUrl,
+  buildGatewaySessionUrl,
+  parseGatewayBaseUrl,
+  resolveAgentSessionsStorePath,
+  resolveSessionTranscriptPath,
+} from '../identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
-const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
+const GATEWAY_BASE_URL = parseGatewayBaseUrl(
+  process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789',
+);
+const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL, endpoint);
+const GATEWAY_TOOLS_INVOKE_URL = gatewayEndpointUrl('tools/invoke');
 let labelsCache = null;
 let labelsCacheSignature = null;
 
@@ -269,12 +286,18 @@ function loadLabels() {
   }
   try {
     const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
+      throw new Error('labels ledger must contain a JSON object');
+    }
     labelsCache = labels;
     labelsCacheSignature = signature;
     return labels;
-  } catch {
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      process.stderr.write(`[${BRAND}] Refusing invalid labels ledger: ${error.message}\n`);
+    }
     labelsCache = {};
-    labelsCacheSignature = 'missing';
+    labelsCacheSignature = signature;
     return labelsCache;
   }
 }
@@ -296,26 +319,87 @@ function mutateLabels(mutator) {
   return labels;
 }
 
+function assertValidLabelSessionMetadata(name, entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`label ${JSON.stringify(name)} must contain an object`);
+  }
+
+  const explicitAgent = entry.agent === null || entry.agent === undefined
+    ? null
+    : assertValidAgentId(entry.agent, `agent for label ${JSON.stringify(name)}`);
+  const sessionKey = entry.sessionKey === null || entry.sessionKey === undefined
+    ? null
+    : assertValidSessionKey(entry.sessionKey, `sessionKey for label ${JSON.stringify(name)}`);
+  if (entry.sessionId !== null && entry.sessionId !== undefined) {
+    assertValidSessionId(entry.sessionId, `sessionId for label ${JSON.stringify(name)}`);
+  }
+  if (sessionKey?.startsWith('agent:') && explicitAgent) {
+    assertSessionKeyForAgent(sessionKey, explicitAgent, `sessionKey for label ${JSON.stringify(name)}`);
+  }
+  return entry;
+}
+
+function quarantineLabelSessionMetadata(name, error) {
+  const reason = `Rejected unsafe legacy session metadata for label ${JSON.stringify(name)}: ${error.message}`;
+  const labels = mutateLabels((current) => {
+    const entry = current[name];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      current[name] = {};
+    }
+    delete current[name].agent;
+    delete current[name].sessionKey;
+    delete current[name].sessionId;
+    current[name].status = 'error';
+    current[name].error = reason;
+    current[name].summary = reason;
+    current[name].metadataRejectedAt = new Date().toISOString();
+  });
+  process.stderr.write(`[${BRAND}] ${reason}\n`);
+  return labels[name];
+}
+
 function getLabel(name) {
-  return loadLabels()[name] || null;
+  const entry = loadLabels()[name] || null;
+  if (!entry) return null;
+  try {
+    return assertValidLabelSessionMetadata(name, entry);
+  } catch (error) {
+    return quarantineLabelSessionMetadata(name, error);
+  }
+}
+
+function loadValidatedLabels() {
+  const labels = loadLabels();
+  for (const [name, entry] of Object.entries(labels)) {
+    try {
+      assertValidLabelSessionMetadata(name, entry);
+    } catch (error) {
+      quarantineLabelSessionMetadata(name, error);
+    }
+  }
+  return loadLabels();
 }
 
 function setLabel(name, data) {
   const labels = mutateLabels((current) => {
-    current[name] = { ...current[name], ...data, updatedAt: new Date().toISOString() };
+    const updated = { ...current[name], ...data, updatedAt: new Date().toISOString() };
+    assertValidLabelSessionMetadata(name, updated);
+    current[name] = updated;
   });
   return labels[name];
 }
 
 function setLabelDone(name, data) {
   const labels = mutateLabels((current) => {
-    current[name] = {
+    const updated = {
       ...current[name],
       ...data,
       status: 'done',
       error: null,
       updatedAt: new Date().toISOString(),
     };
+    assertValidLabelSessionMetadata(name, updated);
+    current[name] = updated;
   });
   return labels[name];
 }
@@ -475,17 +559,33 @@ function check529InGatewayLog(sessionKey) {
  * @returns {Object|null} - The sessions store object, or null on error
  */
 function readSessionsStore(agent = 'main') {
+  let sessionsPath;
   try {
-    const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json');
-    return JSON.parse(readFileSync(sessionsPath, 'utf-8'));
-  } catch {
+    sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, agent);
+  } catch (error) {
+    process.stderr.write(`[${BRAND}] Refusing unsafe sessions store path: ${error.message}\n`);
+    return null;
+  }
+  try {
+    return assertValidSessionStore(
+      JSON.parse(readFileSync(sessionsPath, 'utf-8')),
+      `sessions store for agent ${JSON.stringify(agent)}`,
+    );
+  } catch (error) {
+    if (error instanceof SyntaxError || error?.code) return null;
+    process.stderr.write(`[${BRAND}] Refusing unsafe sessions store metadata: ${error.message}\n`);
     return null;
   }
 }
 
 function getSessionJsonlPath(agent = 'main', sessionId) {
   if (!sessionId) return null;
-  return join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', `${sessionId}.jsonl`);
+  try {
+    return resolveSessionTranscriptPath(HOME_DIR, agent, sessionId);
+  } catch (error) {
+    process.stderr.write(`[${BRAND}] Refusing unsafe session transcript path: ${error.message}\n`);
+    return null;
+  }
 }
 
 function inspectSessionActivitySignal(sessionKey, sessionsStore) {
@@ -562,7 +662,8 @@ function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, 
 function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
   if (!sessionId) return null;
   try {
-    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', `${sessionId}.jsonl`);
+    const jsonlPath = getSessionJsonlPath(agent, sessionId);
+    if (!jsonlPath) return null;
     return readFileSync(jsonlPath, 'utf-8')
       .split('\n')
       .filter(line => line.trim())
@@ -671,13 +772,11 @@ function getActiveOriginFromSessions() {
 /**
  * Parse the agent ID from a session key.
  * Session key format: agent:{agentId}:...
- * Falls back to 'main' for malformed keys.
+ * Bare validated keys use the main agent; malformed keys are rejected.
  */
 function agentFromSessionKey(sessionKey) {
-  if (!sessionKey) return 'main';
-  const parts = sessionKey.split(':');
-  if (parts.length >= 2 && parts[0] === 'agent') return parts[1];
-  return 'main';
+  if (!sessionKey) return assertValidAgentId('main');
+  return validatedAgentIdFromSessionKey(sessionKey, 'main');
 }
 
 function getSessionJsonlMtimeMs(agent, sessionId) {
@@ -1204,7 +1303,12 @@ async function cmdEnqueue(flags) {
     die('--message, --message-file, --message-env, --message-stdin, or piped stdin is required', 2);
   }
 
-  const agent       = flags.agent            || 'main';
+  let agent;
+  try {
+    agent = assertValidAgentId(flags.agent === undefined ? 'main' : flags.agent, '--agent');
+  } catch (error) {
+    die(error.message, 2);
+  }
   const thinking    = flags.thinking         || null;
   const timeoutS    = parseInt(flags.timeout || '300', 10);
   if (!Number.isFinite(timeoutS) || timeoutS <= 0) die('--timeout must be a positive integer', 2);
@@ -1309,7 +1413,14 @@ async function cmdEnqueue(flags) {
   const model       = flags.model            || DEFAULT_DISPATCH_MODEL;
 
   // -- Session key resolution ----------------------------------
-  let sessionKey = flags['session-key'] || null;
+  let sessionKey = Object.hasOwn(flags, 'session-key') ? flags['session-key'] : null;
+  if (sessionKey !== null) {
+    try {
+      sessionKey = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
+    } catch (error) {
+      die(error.message, 2);
+    }
+  }
 
   if (!sessionKey && mode === 'reuse') {
     const existing = getLabel(label);
@@ -1324,6 +1435,11 @@ async function cmdEnqueue(flags) {
   const isFresh = !sessionKey;
   if (isFresh) {
     sessionKey = makeSessionKey(agent);
+  }
+  try {
+    sessionKey = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
+  } catch (error) {
+    die(error.message, 2);
   }
 
   const idem = randomUUID();
@@ -1378,7 +1494,7 @@ async function cmdEnqueue(flags) {
     const safeChannel = safeJson(deliverChannel || 'telegram');
     const safeTarget = safeJson(deliverTo);
     const safeLabel = safeJson(label);
-    parts.push(`curl -s -X POST ${GATEWAY_URL}/tools/invoke -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main"}'`);
+    parts.push(`curl -s -X POST '${GATEWAY_TOOLS_INVOKE_URL}' -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);
     parts.push(``);
@@ -1492,8 +1608,9 @@ async function cmdEnqueue(flags) {
     // -- Send "Starting" notification via gateway HTTP API -----
     if (deliverTo && GATEWAY_TOKEN) {
       try {
-        await fetch(`${GATEWAY_URL}/tools/invoke`, {
+        await fetch(GATEWAY_TOOLS_INVOKE_URL, {
           method: 'POST',
+          redirect: 'error',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${GATEWAY_TOKEN}`,
@@ -1895,7 +2012,7 @@ async function cmdStuck(flags) {
   const thresholdMin = parseFloat(flags['threshold-min'] || '15');
   const thresholdMs  = thresholdMin * 60 * 1000;
 
-  const labels = loadLabels();
+  const labels = loadValidatedLabels();
   const stuckSessions  = [];
   const autoResolved   = [];
   const watcherSkipped = [];
@@ -2022,7 +2139,7 @@ async function cmdStuck(flags) {
 function cmdSync(flags) {
   const dryRun = flags['dry-run'] === true;
 
-  const labels  = loadLabels();
+  const labels  = loadValidatedLabels();
   const changes = [];
 
   // Preload sessions stores per agent
@@ -2466,9 +2583,10 @@ async function cmdDone(flags) {
   if (existing && existing.sessionKey && !flags['skip-activity-check'] && !forceDone) {
     try {
       const sessionInfoRes = await fetch(
-        `${GATEWAY_URL}/sessions/${existing.sessionKey}`,
+        buildGatewaySessionUrl(GATEWAY_BASE_URL, existing.sessionKey),
         {
           headers: { Authorization: `Bearer ${GATEWAY_TOKEN}` },
+          redirect: 'error',
           signal: AbortSignal.timeout(5000),
         }
       );
@@ -2623,6 +2741,11 @@ async function cmdSend(flags) {
     if (!entry?.sessionKey) die(`No session found for label "${label}"`);
     sessionKey = entry.sessionKey;
   }
+  try {
+    sessionKey = assertValidSessionKey(sessionKey, '--session-key');
+  } catch (error) {
+    die(error.message, 2);
+  }
 
   const idem = randomUUID();
 
@@ -2667,6 +2790,11 @@ function cmdHeartbeat(flags) {
     if (!entry?.sessionKey) die(`No session found for label "${label}"`);
     sessionKey = entry.sessionKey;
   }
+  try {
+    sessionKey = assertValidSessionKey(sessionKey, '--session-key');
+  } catch (error) {
+    die(error.message, 2);
+  }
 
   const hbAgent = label ? (getLabel(label)?.agent || agentFromSessionKey(sessionKey)) : agentFromSessionKey(sessionKey);
   const hbStore = readSessionsStore(hbAgent || 'main');
@@ -2709,7 +2837,7 @@ function cmdList(flags) {
   const filterStatus = flags.status || null;
   const limit        = parseInt(flags.limit || '20', 10);
 
-  const labels = loadLabels();
+  const labels = loadValidatedLabels();
   let entries = Object.entries(labels).map(([name, data]) => ({
     label: name,
     ...data,

@@ -1084,6 +1084,11 @@ openclaw-scheduler jobs add '{
 }'
 ```
 
+`regex:` conditions use RE2 syntax and linear-time matching. Backreferences,
+lookahead, and lookbehind are rejected. The full condition is limited to 1,024
+characters, and regex evaluation fails closed when the parent output exceeds
+65,536 UTF-8 bytes. Use `contains:` when a literal substring is sufficient.
+
 ### Pattern 3: Multi-Agent Workflows
 
 Chain jobs targeting different agents:
@@ -1512,18 +1517,22 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
 | `SCHEDULER_DB` | auto (existing `~/.openclaw/scheduler/scheduler.db` first; otherwise `./scheduler.db` in a writable source checkout; otherwise scheduler home) | SQLite database path |
 | `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
-| `SCHEDULER_TICK_MS` | `10000` | Tick interval (10s) |
-| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold |
-| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval |
-| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
-| `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
-| `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
-| `SCHEDULER_BACKUP` | *(unset)* | Set to `"1"` or `"true"` to enable MinIO backups (requires `mc` CLI) |
+| `SCHEDULER_TICK_MS` | `10000` | Tick interval in ms, from `1000` through `3600000` |
+| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold in seconds, from `10` through `604800` |
+| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval in ms, from `5000` through `3600000` |
+| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message and spawn interval in ms, from `5000` through `3600000` |
+| `SCHEDULER_DELIVERY_BATCH_SIZE` | `10` | Delivery batch size, from `1` through `1000` |
+| `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval in ms, from `60000` through `604800000` |
+| `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval in ms, from `60000` through `604800000` |
+| `SCHEDULER_LEASE_TTL_MS` | `30000` | Dispatcher lease TTL in ms, from `15000` through `3600000` |
+| `SCHEDULER_MAX_CONCURRENCY` | `4` | Worker concurrency, from `1` through `64` |
+| `SCHEDULER_MAX_PENDING_WORK` | `1000` | Pending-work bound, from concurrency through `10000` |
+| `SCHEDULER_BACKUP` | *(unset)* | `1` or `true` enables MinIO backups; `0` or `false` disables them |
 | `SCHEDULER_BACKUP_MC_ALIAS` | `backupstore` | MinIO alias used by `mc` for backup snapshots |
 | `SCHEDULER_BACKUP_BUCKET` | `scheduler-backups` | MinIO bucket for snapshots |
 | `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
-| `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
+| `SCHEDULER_DEBUG` | *(unset)* | `1` or `true` enables debug logging; `0` or `false` disables it |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |

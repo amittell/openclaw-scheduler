@@ -4839,7 +4839,7 @@ console.log('\n-- Dispatcher Integration --');
     const env = {
       ...process.env,
       SCHEDULER_DB: tempDbPath,
-      SCHEDULER_TICK_MS: '100',
+      SCHEDULER_TICK_MS: '1000',
       SCHEDULER_MESSAGE_DELIVERY_MS: '600000',
       SCHEDULER_PRUNE_MS: '600000',
       SCHEDULER_BACKUP_MS: '600000',

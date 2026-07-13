@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+import {
+  assertBoundedInteger,
+  assertIntegerAtLeast,
+  DISPATCHER_RUNTIME_OPTION_LIMITS,
+} from './runtime-config.js';
 
 export function createDispatcherOwnerId() {
   return `${hostname()}:${process.pid}:${randomUUID()}`;
@@ -33,9 +33,22 @@ export function createDispatcherRuntime({
   if (typeof releaseLease !== 'function') throw new Error('releaseLease is required');
   if (typeof assertLease !== 'function') throw new Error('assertLease is required');
 
-  const ttlMs = positiveInteger(leaseTtlMs, 30_000);
-  const concurrency = positiveInteger(maxConcurrency, 4);
-  const pendingLimit = positiveInteger(maxPending, 1000);
+  const ttlMs = assertBoundedInteger(
+    'leaseTtlMs',
+    leaseTtlMs,
+    DISPATCHER_RUNTIME_OPTION_LIMITS.leaseTtlMs,
+  );
+  const concurrency = assertBoundedInteger(
+    'maxConcurrency',
+    maxConcurrency,
+    DISPATCHER_RUNTIME_OPTION_LIMITS.maxConcurrency,
+  );
+  const pendingLimit = assertBoundedInteger(
+    'maxPending',
+    maxPending,
+    DISPATCHER_RUNTIME_OPTION_LIMITS.maxPending,
+  );
+  assertIntegerAtLeast('maxPending', pendingLimit, 'maxConcurrency', concurrency);
   const pending = [];
   const active = new Map();
   const keys = new Set();

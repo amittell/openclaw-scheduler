@@ -16,24 +16,32 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 
 import { fileURLToPath } from 'url';
 import { ensureSchedulerDbParent, resolveSchedulerDbPath, resolveServiceWorkingDirectory } from './paths.js';
+import { parseGatewayBaseUrl } from './identifiers.js';
 import { createJob } from './jobs.js';
 import { initDb } from './db.js';
+import {
+  MACOS_CHMOD_PATH,
+  MACOS_LAUNCHCTL_PATH,
+  MACOS_SUDO_PATH,
+  buildLaunchctlBootstrapArgs,
+  buildNpmConfigGetArgs,
+  buildPm2StartArgs,
+  buildSudoChmodPrivateArgs,
+  buildSudoInstallArgs,
+  buildSudoLaunchctlBootstrapArgs,
+  createSetupCommandRunner,
+  encodeLaunchdPlistValue,
+  formatPosixCommand,
+  renderSystemdUserService,
+} from './setup-service-utils.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VALID_MAC_SERVICE_MODES = new Set(['agent', 'daemon', 'skip']);
-
-function xmlEscape(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
-}
+const runSetupCommand = createSetupCommandRunner(execFileSync);
 
 function printSetupUsage() {
   process.stdout.write(`OpenClaw Scheduler setup
@@ -134,6 +142,17 @@ const ask = (q, def) => new Promise(resolve => {
   const hint = def ? ` (${def})` : '';
   rl.question(`${q}${hint}: `, ans => resolve(ans.trim() || def || ''));
 });
+
+async function askGatewayUrl(defaultValue) {
+  while (true) {
+    const candidate = await ask('Gateway URL', defaultValue);
+    try {
+      return parseGatewayBaseUrl(candidate, 'Gateway URL').href.replace(/\/$/u, '');
+    } catch (error) {
+      warn(error.message);
+    }
+  }
+}
 const confirm = async (q) => {
   const ans = await ask(`${q} [y/N]`);
   return /^y(es)?$/i.test(ans);
@@ -153,7 +172,7 @@ function appendIfMissing(filePath, anchor, content) {
 
 function getNpmConfigValue(key) {
   try {
-    return execSync(`npm config get ${key}`, { encoding: 'utf8' }).trim();
+    return runSetupCommand('npm', buildNpmConfigGetArgs(key), { encoding: 'utf8' }).trim();
   } catch {
     return '';
   }
@@ -192,7 +211,7 @@ const serviceWorkingDirectory = resolveServiceWorkingDirectory({ env: process.en
 const defaultWorkspace = path.join(os.homedir(), '.openclaw', 'workspace');
 const workspacePath = await ask('Workspace path', defaultWorkspace);
 const defaultGateway = 'http://127.0.0.1:18789';
-const gatewayUrl = await ask('Gateway URL', defaultGateway);
+const gatewayUrl = await askGatewayUrl(defaultGateway);
 const deliverTo = await ask('Telegram delivery ID for alerts (user or group ID, or blank to skip)');
 const schedulerDbPath = resolveSchedulerDbPath({ env: process.env });
 if (schedulerDbPath !== ':memory:') ensureSchedulerDbParent(schedulerDbPath);
@@ -213,7 +232,9 @@ if (ignoreScripts === 'true') {
   warn('Detected npm config: ignore-scripts=true');
   warn('better-sqlite3 requires install scripts to build/load native bindings.');
   warn('Recommended fix:');
-  warn(`  npm rebuild --prefix ${JSON.stringify(schedulerInstallRoot)} better-sqlite3 --ignore-scripts=false`);
+  warn(`  ${formatPosixCommand('npm', [
+    'rebuild', '--prefix', schedulerInstallRoot, 'better-sqlite3', '--ignore-scripts=false',
+  ])}`);
   const continueAnyway = await confirm('Continue setup anyway?');
   if (!continueAnyway) {
     print('Setup aborted. Run the scoped rebuild command, then rerun setup.');
@@ -326,7 +347,7 @@ if (!deliverTo) {
         name: icName,
         schedule_cron: '*/5 * * * *',
         session_target: 'shell',
-        payload_message: `node ${icScript} --to '${deliverTo.replace(/'/g, "'\\''")}'`,
+        payload_message: formatPosixCommand(process.execPath, [icScript, '--to', deliverTo]),
         payload_timeout_seconds: 60,
         delivery_mode: 'announce',
         delivery_channel: 'telegram',
@@ -341,7 +362,7 @@ if (!deliverTo) {
     // Stuck Run Detector
     const srdName = 'Stuck Run Detector';
     const srdScript = path.join(schedulerInstallRoot, 'scripts', 'stuck-run-detector.mjs');
-    const srdCmd = `node ${srdScript} --threshold-min 45`;  // coding tasks regularly take 30m+
+    const srdCmd = formatPosixCommand(process.execPath, [srdScript, '--threshold-min', '45']);
     if (existingNames.includes(srdName)) {
       skip(`"${srdName}" job already exists`);
     } else if (!fs.existsSync(srdScript)) {
@@ -410,6 +431,26 @@ if (platform === 'darwin') {
     },
   };
   const existingModes = Object.values(serviceModes).filter(cfg => fs.existsSync(cfg.plistPath));
+  const hardenExistingServiceFile = (service) => {
+    try {
+      if (service.mode === 'daemon') {
+        runSetupCommand(
+          MACOS_SUDO_PATH,
+          buildSudoChmodPrivateArgs(service.plistPath),
+          { stdio: 'inherit' },
+        );
+      } else {
+        fs.chmodSync(service.plistPath, 0o600);
+      }
+      ok(`${service.title} plist permissions set to 0600`);
+    } catch (error) {
+      const chmodCommand = service.mode === 'daemon'
+        ? formatPosixCommand(MACOS_SUDO_PATH, buildSudoChmodPrivateArgs(service.plistPath))
+        : formatPosixCommand(MACOS_CHMOD_PATH, ['0600', service.plistPath]);
+      warn(`Could not set ${service.title} plist permissions: ${error.message}`);
+      warn(`Run manually: ${chmodCommand}`);
+    }
+  };
   let selectedServiceMode = setupOptions.serviceMode;
   if (!selectedServiceMode) {
     print('  Choose how the scheduler should start on macOS:');
@@ -451,48 +492,53 @@ if (platform === 'darwin') {
 
     if (macServiceSummary && macServiceSummary !== service) {
       // User declined new service and kept existing one -- skip install block
+      hardenExistingServiceFile(macServiceSummary);
     } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
+      hardenExistingServiceFile(service);
       skip(`${service.title} already installed`);
       print(`  Path: ${service.plistPath}`);
       if (service.domain) {
-        const restartPrefix = service.mode === 'daemon' ? 'sudo ' : '';
-        print(`  To restart: ${restartPrefix}launchctl kickstart -k ${service.domain}/${service.label}`);
+        const restartArgs = ['kickstart', '-k', `${service.domain}/${service.label}`];
+        const restartCommand = service.mode === 'daemon'
+          ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...restartArgs])
+          : formatPosixCommand(MACOS_LAUNCHCTL_PATH, restartArgs);
+        print(`  To restart: ${restartCommand}`);
       }
     } else if (macServiceSummary) {
       const install = await confirm(service.installPrompt);
       if (install) {
         const tokenXml = gatewayToken
-          ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${xmlEscape(gatewayToken)}</string>\n`
+          ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${encodeLaunchdPlistValue(gatewayToken, 'gateway token')}</string>\n`
           : '';
         const userXml = service.mode === 'daemon'
-          ? `  <key>UserName</key>\n  <string>${xmlEscape(serviceUser)}</string>\n`
+          ? `  <key>UserName</key>\n  <string>${encodeLaunchdPlistValue(serviceUser, 'service user')}</string>\n`
           : '';
         const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Comment</key>
-  <string>${xmlEscape(service.comment)}</string>
+  <string>${encodeLaunchdPlistValue(service.comment, 'service comment')}</string>
   <key>Label</key>
   <string>${service.label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xmlEscape(nodePath)}</string>
+    <string>${encodeLaunchdPlistValue(nodePath, 'Node executable path')}</string>
     <string>--no-warnings</string>
-    <string>${xmlEscape(indexPath)}</string>
+    <string>${encodeLaunchdPlistValue(indexPath, 'dispatcher path')}</string>
   </array>
 ${userXml}  <key>WorkingDirectory</key>
-  <string>${xmlEscape(serviceWorkingDirectory)}</string>
+  <string>${encodeLaunchdPlistValue(serviceWorkingDirectory, 'service working directory')}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>${xmlEscape(os.homedir())}</string>
+    <string>${encodeLaunchdPlistValue(os.homedir(), 'home directory')}</string>
     <key>PATH</key>
-    <string>${xmlEscape(envPath)}</string>
+    <string>${encodeLaunchdPlistValue(envPath, 'service PATH')}</string>
     <key>OPENCLAW_GATEWAY_URL</key>
-    <string>${xmlEscape(gatewayUrl)}</string>
+    <string>${encodeLaunchdPlistValue(gatewayUrl, 'gateway URL')}</string>
     <key>SCHEDULER_DB</key>
-    <string>${xmlEscape(schedulerDbPath)}</string>
+    <string>${encodeLaunchdPlistValue(schedulerDbPath, 'scheduler database path')}</string>
 ${tokenXml}  </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -501,36 +547,39 @@ ${tokenXml}  </dict>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>${xmlEscape(logPath)}</string>
+  <string>${encodeLaunchdPlistValue(logPath, 'stdout log path')}</string>
   <key>StandardErrorPath</key>
-  <string>${xmlEscape(logPath)}</string>
+  <string>${encodeLaunchdPlistValue(logPath, 'stderr log path')}</string>
 </dict>
 </plist>`;
         if (service.mode === 'daemon') {
           const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-'));
           const tmpPlistPath = path.join(tmpDir, 'ai.openclaw.scheduler.plist');
           fs.writeFileSync(tmpPlistPath, plist, { mode: 0o600 });
+          const installArgs = buildSudoInstallArgs(tmpPlistPath, service.plistPath);
+          const bootstrapArgs = buildSudoLaunchctlBootstrapArgs(service.domain, service.plistPath);
           try {
-            execSync(`sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`, { stdio: 'inherit' });
-            execSync(`sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
+            runSetupCommand(MACOS_SUDO_PATH, installArgs, { stdio: 'inherit' });
+            runSetupCommand(MACOS_SUDO_PATH, bootstrapArgs, { stdio: 'inherit' });
             try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
             ok(`${service.title} installed and bootstrapped`);
           } catch (err) {
             ok(`${service.title} plist written -> ${tmpPlistPath}`);
             warn(`Auto-bootstrap failed: ${err.message.trim()}`);
-            warn(`Run manually: sudo install -o root -g wheel -m 644 "${tmpPlistPath}" "${service.plistPath}"`);
-            warn(`Then: sudo launchctl bootstrap ${service.domain} "${service.plistPath}"`);
+            warn(`Run manually: ${formatPosixCommand(MACOS_SUDO_PATH, installArgs)}`);
+            warn(`Then: ${formatPosixCommand(MACOS_SUDO_PATH, bootstrapArgs)}`);
           }
         } else {
           fs.mkdirSync(path.dirname(service.plistPath), { recursive: true });
-          fs.writeFileSync(service.plistPath, plist);
+          fs.writeFileSync(service.plistPath, plist, { mode: 0o600 });
+          const bootstrapArgs = buildLaunchctlBootstrapArgs(service.domain, service.plistPath);
           try {
-            execSync(`launchctl bootstrap ${service.domain} "${service.plistPath}"`, { stdio: 'inherit' });
+            runSetupCommand(MACOS_LAUNCHCTL_PATH, bootstrapArgs, { stdio: 'inherit' });
             ok(`${service.title} installed and bootstrapped`);
           } catch (err) {
             ok(`${service.title} plist written -> ${service.plistPath}`);
             warn(`Auto-bootstrap failed: ${err.message.trim()}`);
-            warn(`Run manually: launchctl bootstrap ${service.domain} "${service.plistPath}"`);
+            warn(`Run manually: ${formatPosixCommand(MACOS_LAUNCHCTL_PATH, bootstrapArgs)}`);
           }
         }
         print(`  Logs: ${logPath}`);
@@ -565,15 +614,24 @@ ${tokenXml}  </dict>
   if (isWSL && wslVersion === 1) {
     hasSystemd = false; // WSL1 never has systemd
   } else {
-    try { execSync('systemctl --user status', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+    try {
+      runSetupCommand('systemctl', ['--user', 'status'], { stdio: 'ignore' });
+      hasSystemd = true;
+    } catch {}
     if (!hasSystemd) {
-      try { execSync('systemctl --user list-units', { stdio: 'ignore' }); hasSystemd = true; } catch {}
+      try {
+        runSetupCommand('systemctl', ['--user', 'list-units'], { stdio: 'ignore' });
+        hasSystemd = true;
+      } catch {}
     }
   }
 
   // Check for PM2
   let hasPm2 = false;
-  try { execSync('pm2 --version', { stdio: 'ignore' }); hasPm2 = true; } catch {}
+  try {
+    runSetupCommand('pm2', ['--version'], { stdio: 'ignore' });
+    hasPm2 = true;
+  } catch {}
 
   if (hasSystemd) {
     const unitDir  = path.join(os.homedir(), '.config', 'systemd', 'user');
@@ -586,29 +644,24 @@ ${tokenXml}  </dict>
     } else {
       const install = await confirm('Install systemd user service (auto-start on login)?');
       if (install) {
-        const unit = `[Unit]
-Description=OpenClaw Scheduler
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${serviceWorkingDirectory}
-ExecStart=${nodePath} --no-warnings ${indexPath}
-Environment=OPENCLAW_GATEWAY_URL=${gatewayUrl}${gatewayToken ? `\nEnvironment="OPENCLAW_GATEWAY_TOKEN=${gatewayToken.replace(/"/g, '\\"')}"` : ''}
-Environment=SCHEDULER_DB=${schedulerDbPath}
-Restart=always
-RestartSec=5
-StandardOutput=append:${logPath}
-StandardError=append:${logPath}
-
-[Install]
-WantedBy=default.target
-`;
+        const unit = renderSystemdUserService({
+          workingDirectory: serviceWorkingDirectory,
+          nodePath,
+          indexPath,
+          gatewayUrl,
+          gatewayToken,
+          schedulerDbPath,
+          logPath,
+        });
         fs.mkdirSync(unitDir, { recursive: true, mode: 0o700 });
         fs.writeFileSync(unitPath, unit, { mode: 0o600 });
         try {
-          execSync('systemctl --user daemon-reload');
-          execSync('systemctl --user enable --now openclaw-scheduler');
+          runSetupCommand('systemctl', ['--user', 'daemon-reload'], { stdio: 'inherit' });
+          runSetupCommand(
+            'systemctl',
+            ['--user', 'enable', '--now', 'openclaw-scheduler.service'],
+            { stdio: 'inherit' },
+          );
           ok('systemd user service installed and started');
         } catch (err) {
           ok(`Unit file written -> ${unitPath}`);
@@ -627,7 +680,7 @@ WantedBy=default.target
     const pm2Name = 'openclaw-scheduler';
     let pm2Running = false;
     try {
-      const out = execSync('pm2 list --no-color', { encoding: 'utf8' });
+      const out = runSetupCommand('pm2', ['list', '--no-color'], { encoding: 'utf8' });
       pm2Running = out.includes(pm2Name);
     } catch {}
 
@@ -638,9 +691,14 @@ WantedBy=default.target
       const install = await confirm('Register with PM2 (auto-start on login)?');
       if (install) {
         try {
-          execSync(
-            `pm2 start "${indexPath}" --name "${pm2Name}" --cwd "${serviceWorkingDirectory}" ` +
-            `--log "${logPath}"`,
+          runSetupCommand(
+            'pm2',
+            buildPm2StartArgs({
+              indexPath,
+              processName: pm2Name,
+              workingDirectory: serviceWorkingDirectory,
+              logPath,
+            }),
             {
               stdio: 'inherit',
               env: {
@@ -650,7 +708,7 @@ WantedBy=default.target
               },
             }
           );
-          execSync('pm2 save');
+          runSetupCommand('pm2', ['save'], { stdio: 'inherit' });
           ok('PM2 process started and saved');
           print('  Run `pm2 startup` and follow the instructions to survive reboots.');
         } catch (err) {
@@ -707,10 +765,14 @@ print('Next steps:');
 
 if (platform === 'darwin') {
   if (macServiceSummary?.domain) {
-    const prefix = macServiceSummary.mode === 'daemon' ? 'sudo ' : '';
+    const checkArgs = ['print', `${macServiceSummary.domain}/${macServiceSummary.label}`];
+    const restartArgs = ['kickstart', '-k', `${macServiceSummary.domain}/${macServiceSummary.label}`];
+    const formatLaunchctl = args => macServiceSummary.mode === 'daemon'
+      ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...args])
+      : formatPosixCommand(MACOS_LAUNCHCTL_PATH, args);
     print(`  * Service mode:   ${macServiceSummary.title}`);
-    print(`  * Check service:  ${prefix}launchctl print ${macServiceSummary.domain}/${macServiceSummary.label}`);
-    print(`  * Restart:        ${prefix}launchctl kickstart -k ${macServiceSummary.domain}/${macServiceSummary.label}`);
+    print(`  * Check service:  ${formatLaunchctl(checkArgs)}`);
+    print(`  * Restart:        ${formatLaunchctl(restartArgs)}`);
   } else {
     print('  * Install later:  node setup.mjs --service-mode agent');
     print('                    node setup.mjs --service-mode daemon');

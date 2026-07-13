@@ -65,6 +65,30 @@ identity. A pending approval created by an earlier version cannot authorize the
 new binding contract and is cancelled when resolved. After the upgrade,
 retrigger that work to create a fresh approval rather than reusing the old ID.
 
+### Trigger condition note for 0.4.1
+
+Version 0.4.1 evaluates `regex:` trigger conditions with a linear-time RE2
+engine. Backreferences, lookahead, and lookbehind that native JavaScript
+regular expressions previously accepted are no longer supported. Review
+persisted child jobs before upgrade and replace unsupported expressions with
+RE2 syntax or `contains:`. Unsupported legacy patterns fail closed and do not
+trigger a child until updated. RE2 and native JavaScript regexes can also differ
+in Unicode and character-class corner cases, so validate every retained pattern.
+Regex conditions fail closed when parent output exceeds 65,536 UTF-8 bytes. Use
+`contains:` for literal checks or reduce the parent output below that bound.
+
+### launchd service file permissions for 0.4.1
+
+Version 0.4.1 creates launchd service files with owner-only permissions because
+they may contain the Gateway bearer token. Re-running setup tightens an existing
+selected service automatically. To remediate manually, run the command matching
+the installed service mode:
+
+```bash
+chmod 600 ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
+sudo chmod 600 /Library/LaunchDaemons/ai.openclaw.scheduler.plist
+```
+
 ---
 
 ## Step 1: Pull or Install the Update
@@ -251,7 +275,7 @@ cd ~/.openclaw/scheduler && node cli.js status
 A healthy startup log looks like:
 
 ```
-[scheduler] [info] Starting OpenClaw Scheduler v0.4.0 {"tickMs":10000,...}
+[scheduler] [info] Starting OpenClaw Scheduler v0.4.1 {"tickMs":10000,...}
 [scheduler] [info] Database initialized
 [scheduler] [info] Pruned old runs + messages
 ```

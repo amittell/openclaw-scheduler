@@ -7,6 +7,15 @@ import { homedir, tmpdir } from 'os';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
+import {
+  assertValidAgentId,
+  assertValidSessionKey,
+  assertValidSessionStore,
+  assertSessionKeyForAgent,
+  buildGatewayEndpointUrl,
+  parseGatewayBaseUrl,
+  resolveAgentSessionsStorePath,
+} from './identifiers.js';
 
 export {
   GATEWAY_ENV_INJECT_CAPABILITY,
@@ -22,7 +31,11 @@ export {
   negotiateGatewayEnvironmentInjection,
 } from './gateway-capabilities.js';
 
-const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
+const GATEWAY_BASE_URL = parseGatewayBaseUrl(
+  process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789',
+);
+const GATEWAY_URL = GATEWAY_BASE_URL.href;
+const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL, endpoint);
 const HOME_DIR = process.env.HOME || homedir();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
@@ -130,6 +143,12 @@ function parseGatewayCliJson(stdout) {
   return JSON.parse(text.slice(Math.min(...starts)));
 }
 
+function resolveGatewayResponseSessionKey(response, requestedSessionKey, agentId) {
+  const responseSessionKey = response.headers?.get?.('x-openclaw-session-key');
+  if (responseSessionKey === null || responseSessionKey === undefined) return requestedSessionKey;
+  return assertSessionKeyForAgent(responseSessionKey, agentId, 'Gateway response session key');
+}
+
 /**
  * Return true only when chat.abort supplied positive evidence that the target
  * agent run stopped. A generic successful RPC response is not enough to make
@@ -151,13 +170,23 @@ export function isAgentCancellationConfirmed(outcome) {
 
 /** Best-effort active-session cancellation through the Gateway RPC API. */
 export function cancelAgentSession(sessionKey, opts = {}) {
-  if (typeof sessionKey !== 'string' || sessionKey.trim().length === 0) {
-    return Promise.resolve({ ok: false, aborted: false, error: 'sessionKey is required' });
+  let validatedSessionKey;
+  let validatedAgentId;
+  try {
+    validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
+    validatedAgentId = opts.agentId === undefined
+      ? undefined
+      : assertValidAgentId(opts.agentId, 'agentId');
+    if (validatedAgentId) {
+      assertSessionKeyForAgent(validatedSessionKey, validatedAgentId, 'sessionKey');
+    }
+  } catch (error) {
+    return Promise.resolve({ ok: false, aborted: false, error: error.message });
   }
   const timeoutMs = Number.isInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 5_000;
   const params = {
-    sessionKey,
-    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    sessionKey: validatedSessionKey,
+    ...(validatedAgentId ? { agentId: validatedAgentId } : {}),
     ...(opts.runId ? { runId: opts.runId } : {}),
   };
 
@@ -224,6 +253,10 @@ export async function runAgentTurn(opts) {
     signal,
     cancelOnAbort = true,
   } = opts;
+  const validatedAgentId = assertValidAgentId(agentId, 'agentId');
+  const validatedSessionKey = sessionKey === undefined || sessionKey === null
+    ? sessionKey
+    : assertSessionKeyForAgent(sessionKey, validatedAgentId, 'sessionKey');
 
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
@@ -239,18 +272,19 @@ export async function runAgentTurn(opts) {
   }, timeoutMs);
 
   try {
-    const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+    const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders('operator.write'),
-        ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
-        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+        'x-openclaw-agent-id': validatedAgentId,
+        ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
-        model: model || `openclaw:${agentId}`,
+        model: model || `openclaw:${validatedAgentId}`,
         messages: [{ role: 'user', content: message }],
         stream: false,
       }),
@@ -267,13 +301,16 @@ export async function runAgentTurn(opts) {
       ok: true,
       content: data.choices?.[0]?.message?.content || '',
       usage: data.usage,
-      sessionKey: resp.headers.get('x-openclaw-session-key') || sessionKey,
+      sessionKey: resolveGatewayResponseSessionKey(resp, validatedSessionKey, validatedAgentId),
       raw: data,
     };
   } catch (err) {
     if (controller.signal.aborted) {
-      if (cancelOnAbort && sessionKey) {
-        await cancelAgentSession(sessionKey, { agentId, timeoutMs: Math.min(timeoutMs, 5_000) });
+      if (cancelOnAbort && validatedSessionKey) {
+        await cancelAgentSession(validatedSessionKey, {
+          agentId: validatedAgentId,
+          timeoutMs: Math.min(timeoutMs, 5_000),
+        });
       }
       if (abortReason === 'external') {
         const aborted = new Error('Agent turn aborted by caller', { cause: err });
@@ -327,6 +364,10 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     signal,
     cancelOnAbort = true,
   } = opts;
+  const validatedAgentId = assertValidAgentId(agentId, 'agentId');
+  const validatedSessionKey = sessionKey === undefined || sessionKey === null
+    ? sessionKey
+    : assertSessionKeyForAgent(sessionKey, validatedAgentId, 'sessionKey');
 
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
@@ -336,8 +377,8 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const controller = new AbortController();
   let abortReason = null;
   const unlinkExternalAbort = linkExternalAbort(controller, signal, () => { abortReason = 'external'; });
-  const normalizedAgentId = (agentId || 'main').toLowerCase();
-  const normalizedSessionKey = String(sessionKey || '').toLowerCase();
+  const normalizedAgentId = validatedAgentId.toLowerCase();
+  const normalizedSessionKey = String(validatedSessionKey || '').toLowerCase();
 
   const inferSessionKinds = () => {
     if (Array.isArray(sessionKinds) && sessionKinds.length > 0) {
@@ -394,7 +435,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       if (!Array.isArray(sessions)) return;
 
       const matched = sessions.find(
-        s => (s.key || s.sessionKey) === sessionKey
+        s => (s.key || s.sessionKey) === validatedSessionKey
       );
 
       if (matched && matched.updatedAt) {
@@ -423,18 +464,19 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const pollTimer = setInterval(checkActivity, pollIntervalMs);
 
   try {
-    const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+    const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders('operator.write'),
-        ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
-        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
+        'x-openclaw-agent-id': validatedAgentId,
+        ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
-        model: model || `openclaw:${agentId}`,
+        model: model || `openclaw:${validatedAgentId}`,
         messages: [{ role: 'user', content: message }],
         stream: false,
       }),
@@ -451,15 +493,15 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       ok: true,
       content: data.choices?.[0]?.message?.content || '',
       usage: data.usage,
-      sessionKey: resp.headers.get('x-openclaw-session-key') || sessionKey,
+      sessionKey: resolveGatewayResponseSessionKey(resp, validatedSessionKey, validatedAgentId),
       raw: data,
     };
   } catch (err) {
     // Translate AbortError into descriptive messages
     if (controller.signal.aborted) {
-      if (cancelOnAbort && sessionKey) {
-        await cancelAgentSession(sessionKey, {
-          agentId,
+      if (cancelOnAbort && validatedSessionKey) {
+        await cancelAgentSession(validatedSessionKey, {
+          agentId: validatedAgentId,
           timeoutMs: Math.min(absoluteTimeoutMs, 5_000),
         });
       }
@@ -544,13 +586,15 @@ export async function sendSystemEvent(text, mode = 'now') {
  * Invoke a tool via the Gateway's /tools/invoke endpoint.
  */
 export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
-  const resp = await fetch(`${GATEWAY_URL}/tools/invoke`, {
+  const validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
+  const resp = await fetch(gatewayEndpointUrl('tools/invoke'), {
     method: 'POST',
+    redirect: 'error',
     headers: {
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ tool, args, sessionKey }),
+    body: JSON.stringify({ tool, args, sessionKey: validatedSessionKey }),
     signal: AbortSignal.timeout(30_000),
   });
 
@@ -784,8 +828,9 @@ function stringifyGatewayError(value) {
  */
 export async function checkGatewayHealth() {
   try {
-    const resp = await fetch(`${GATEWAY_URL}/health`, {
+    const resp = await fetch(gatewayEndpointUrl('health'), {
       headers: authHeaders(),
+      redirect: 'error',
       signal: AbortSignal.timeout(5000),
     });
     return resp.ok;
@@ -807,8 +852,9 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const resp = await fetch(`${GATEWAY_URL}/health`, {
+      const resp = await fetch(gatewayEndpointUrl('health'), {
         headers: authHeaders(),
+        redirect: 'error',
         signal: AbortSignal.timeout(Math.min(intervalMs, 5000)),
       });
       try { await resp.body?.cancel(); } catch {}
@@ -840,11 +886,14 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
  * @returns {{ ok: boolean, error?: string }}
  */
 function resolveSessionKeyAliases(sessionKey, agentId = 'main') {
-  const canonicalMatch = sessionKey.match(/^agent:[^:]+:(.+)$/);
-  const canonicalKey = sessionKey.startsWith('agent:')
-    ? sessionKey
-    : `agent:${agentId}:${sessionKey}`;
-  const flatSessionKey = canonicalMatch?.[1] || sessionKey;
+  const validatedAgentId = assertValidAgentId(agentId, 'agentId');
+  const validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
+  const canonicalMatch = validatedSessionKey.match(/^agent:[^:]+:(.+)$/);
+  if (canonicalMatch) assertSessionKeyForAgent(validatedSessionKey, validatedAgentId, 'sessionKey');
+  const canonicalKey = validatedSessionKey.startsWith('agent:')
+    ? validatedSessionKey
+    : `agent:${validatedAgentId}:${validatedSessionKey}`;
+  const flatSessionKey = canonicalMatch?.[1] || validatedSessionKey;
   return Array.from(new Set([canonicalKey, flatSessionKey]));
 }
 
@@ -878,25 +927,21 @@ function parseSessionModelRef(modelRef) {
  * @returns {{ ok: boolean, error?: string }}
  */
 export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, agentId = 'main') {
-  if (!sessionKey) {
-    return { ok: false, error: 'sessionKey is required' };
-  }
-
-  const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
-  const shouldSetAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
-  const { providerOverride, modelOverride } = parseSessionModelRef(overrides.modelRef);
-  const shouldSetModelOverride = Boolean(modelOverride);
-
-  const keyAliases = resolveSessionKeyAliases(sessionKey, agentId);
-  const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'sessions', 'sessions.json');
-
   try {
+    const validatedAgentId = assertValidAgentId(agentId, 'agentId');
+    const keyAliases = resolveSessionKeyAliases(sessionKey, validatedAgentId);
+    const sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, validatedAgentId);
+    const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
+    const shouldSetAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
+    const { providerOverride, modelOverride } = parseSessionModelRef(overrides.modelRef);
+    const shouldSetModelOverride = Boolean(modelOverride);
+
     if (!existsSync(sessionsPath)) {
       return { ok: false, error: `sessions.json not found at ${sessionsPath}` };
     }
 
     const raw = readFileSync(sessionsPath, 'utf-8');
-    const store = JSON.parse(raw);
+    const store = assertValidSessionStore(JSON.parse(raw), 'gateway sessions store');
 
     const now = Date.now();
     let changed = false;
@@ -992,6 +1037,11 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
 export function syncAuthStoreToSession(agentId = 'main') {
   if (typeof agentId !== 'string' || agentId.trim() === '') {
     return { ok: false, error: 'agentId must be a non-empty string' };
+  }
+  try {
+    assertValidAgentId(agentId, 'agentId');
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
   return { ok: true, skipped: true, reason: 'gateway-managed-auth' };
 }

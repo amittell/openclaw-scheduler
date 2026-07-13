@@ -4,6 +4,11 @@
 
 import { fileURLToPath } from 'url';
 import { createHash } from 'node:crypto';
+import {
+  assertValidAgentId,
+  assertValidSessionKey,
+  assertSessionKeyForAgent,
+} from './identifiers.js';
 
 /**
  * DispatchResult shape (returned by every strategy):
@@ -2187,10 +2192,12 @@ export async function executeMain(job, ctx, deps) {
     // Sync path: reuse executeAgent with the main session key.
     // The job's preferred_session_key defaults to 'main' for main-session jobs.
     const originalSessionKey = job.preferred_session_key;
-    job.preferred_session_key = job.preferred_session_key || 'main';
-    const agentResult = await executeAgent(job, ctx, deps);
-    job.preferred_session_key = originalSessionKey;
-    return agentResult;
+    job.preferred_session_key = job.preferred_session_key ?? 'main';
+    try {
+      return await executeAgent(job, ctx, deps);
+    } finally {
+      job.preferred_session_key = originalSessionKey;
+    }
   }
 
   // Fire-and-forget path: inject system event, return immediately.
@@ -2445,31 +2452,36 @@ async function runAgentTurnForSelection(
 ) {
   const { log } = deps;
   const { applySessionOverridesToSessionStore: applySessionOverrides } = deps;
+  const agentId = assertValidAgentId(job.agent_id ?? 'main', 'job agent_id');
+  const validatedSessionKey = assertSessionKeyForAgent(sessionKey, agentId, 'job session_key');
 
   if (typeof applySessionOverrides === 'function') {
     const applyResult = applySessionOverrides(
-      sessionKey,
+      validatedSessionKey,
       {
         authProfile: selection.authProfile,
         modelRef: selection.model || null,
       },
-      job.agent_id || 'main',
+      agentId,
     );
     if (applyResult.ok) {
-      log('debug', `Applied session overrides for ${sessionKey}`, {
+      log('debug', `Applied session overrides for ${validatedSessionKey}`, {
         jobId: job.id,
         authProfile: selection.authProfile || null,
         modelRef: selection.model || null,
       });
     } else {
-      log('warn', `Failed to apply session overrides: ${applyResult.error}`, { jobId: job.id, sessionKey });
+      log('warn', `Failed to apply session overrides: ${applyResult.error}`, {
+        jobId: job.id,
+        sessionKey: validatedSessionKey,
+      });
     }
   }
 
   return dispatchAgentTurn({
     message: prompt,
-    agentId: job.agent_id || 'main',
-    sessionKey,
+    agentId,
+    sessionKey: validatedSessionKey,
     authProfile: selection.authProfile,
     materializedEnv: materializedEnv || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
@@ -2501,6 +2513,16 @@ export async function executeAgent(job, ctx, deps) {
     throw new Error('Run cancelled before agent dispatch');
   }
 
+  const agentId = assertValidAgentId(job.agent_id ?? 'main', 'job agent_id');
+  const requestedSessionKey = assertValidSessionKey(
+    job.preferred_session_key ?? `scheduler:${job.id}`,
+    'job preferred_session_key',
+  );
+  const sessionKey = requestedSessionKey.startsWith('agent:')
+    ? requestedSessionKey
+    : `agent:${agentId}:${requestedSessionKey}`;
+  assertSessionKeyForAgent(sessionKey, agentId, 'job session_key');
+
   // Gateway health check
   const gatewayReady = await waitForGateway(30000, 2000);
   if (!gatewayReady) {
@@ -2520,14 +2542,10 @@ export async function executeAgent(job, ctx, deps) {
   // the warm session. This avoids full agent bootstrap on every dispatch --
   // memory search, plugin init, and context loading only happen on the first
   // run. Later runs get a pre-warmed session with context already loaded.
-  const requestedSessionKey = job.preferred_session_key || `scheduler:${job.id}`;
-  const sessionKey = requestedSessionKey.startsWith('agent:')
-    ? requestedSessionKey
-    : `agent:${job.agent_id || 'main'}:${requestedSessionKey}`;
   updateRunSession(ctx.run.id, sessionKey, null);
 
   // Mark agent as busy
-  if (job.agent_id) setAgentStatus(job.agent_id, 'busy', sessionKey);
+  if (job.agent_id) setAgentStatus(agentId, 'busy', sessionKey);
 
   // Build prompt and collect context metadata
   const { prompt, contextMeta, injectedMessageIds = [] } = buildJobPrompt(job, ctx.run);

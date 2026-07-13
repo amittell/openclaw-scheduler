@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { spawnSync } from 'child_process';
@@ -17,6 +17,7 @@ const cliPath = join(root, 'cli.js');
 const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
 const consolidatePath = join(root, 'migrate-consolidate.js');
+const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -66,11 +67,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const version = runNode(cliPath, ['version', '--json'], { env });
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(parseStdout(version).version, '0.4.0');
+  assert.equal(parseStdout(version).version, packageVersion);
 
   const launcherVersion = runNode(binPath, ['--json', 'version'], { env });
   assert.equal(launcherVersion.status, 0, launcherVersion.stderr);
-  assert.equal(parseStdout(launcherVersion).version, '0.4.0');
+  assert.equal(parseStdout(launcherVersion).version, packageVersion);
 
   const schema = runNode(cliPath, ['schema', 'jobs', '--json'], { env });
   assert.equal(schema.status, 0, schema.stderr);
