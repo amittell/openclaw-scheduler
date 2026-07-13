@@ -59,17 +59,20 @@ function isWithinPath(root, candidate) {
 export function resolveGatewayTokenPath(configuredPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH) {
   const credentialRoot = resolve(homedir(), '.openclaw', 'credentials');
   const allowedRoots = [
-    credentialRoot,
-    resolve('/run/secrets'),
-    resolve('/var/run/secrets'),
-    ...(process.env.NODE_ENV === 'test' ? [resolve(tmpdir())] : []),
-  ].map(root => {
+    { path: credentialRoot, rejectSymlink: true },
+    { path: resolve('/run/secrets'), rejectSymlink: false },
+    { path: resolve('/var/run/secrets'), rejectSymlink: false },
+    ...(process.env.NODE_ENV === 'test'
+      ? [{ path: resolve(tmpdir()), rejectSymlink: false }]
+      : []),
+  ].map(({ path, rejectSymlink }) => {
     try {
-      return realpathSync(root);
+      const canonicalRoot = realpathSync(path);
+      return rejectSymlink && canonicalRoot !== path ? null : canonicalRoot;
     } catch {
-      return root;
+      return null;
     }
-  });
+  }).filter(Boolean);
   const requestedPath = configuredPath || join(credentialRoot, '.gateway-token');
   let canonicalPath;
   try {
@@ -88,7 +91,6 @@ function getGatewayToken() {
     const tokenPath = resolveGatewayTokenPath();
     if (!tokenPath) return null;
     // The canonical token path is constrained to credential roots above.
-    // codeql[js/path-injection]
     return readFileSync(tokenPath, 'utf-8').trim() || null;
   } catch {
     return null;

@@ -1,7 +1,9 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -177,6 +179,29 @@ test('Gateway token paths reject files and symlink targets outside credential ro
     assert.equal(gateway.resolveGatewayTokenPath(escapedPath), null);
   } finally {
     rmSync(tokenDir, { recursive: true, force: true });
+  }
+});
+
+test('Gateway token paths reject a symlinked user credential root', () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), 'scheduler-gateway-home-'));
+  const outsideRoot = mkdtempSync(join(tmpdir(), 'scheduler-gateway-outside-'));
+  const tokenPath = join(outsideRoot, 'gateway-token');
+  const previousHome = process.env.HOME;
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    mkdirSync(join(fakeHome, '.openclaw'));
+    symlinkSync(outsideRoot, join(fakeHome, '.openclaw', 'credentials'));
+    writeFileSync(tokenPath, 'outside-token\n');
+    process.env.HOME = fakeHome;
+    process.env.NODE_ENV = 'production';
+    assert.equal(gateway.resolveGatewayTokenPath(tokenPath), null);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
   }
 });
 

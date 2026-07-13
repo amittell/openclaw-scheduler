@@ -111,8 +111,6 @@ function initializeSchedulerFixtureDb(directory, filename = 'scheduler.db') {
     join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'),
     'utf8',
   );
-  // The SQL is the repository-owned test schema, not runtime input.
-  // codeql[js/sql-injection]
   fixtureDb.exec(bundledSchema);
   fixtureDb.close();
   return fixturePath;

@@ -64,6 +64,9 @@ All notable changes to this project will be documented in this file.
 - legacy or current Gateways that do not advertise environment injection now
   fail closed with `GATEWAY_ENV_INJECT_UNSUPPORTED` before a credential-bearing
   agent request is sent; auth-profile-only isolated turns remain compatible
+- Gateway token-file paths are canonicalized before every read and accepted
+  only beneath `~/.openclaw/credentials`, `/run/secrets`, or
+  `/var/run/secrets`; paths outside those roots and symlink escapes are rejected
 - Windows support is consistently WSL2-only across setup, install, upgrade, and
   uninstall guidance
 - GitHub Actions are pinned to immutable action commits, and npm publication is

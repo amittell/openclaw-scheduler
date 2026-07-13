@@ -18,8 +18,6 @@ const schemaSql = readFileSync(join(__dirname, '..', 'schema.sql'), 'utf8');
 function initializeSchedulerDb(tempDir) {
   const dbPath = join(tempDir, 'scheduler.db');
   const db = new Database(dbPath);
-  // The SQL is the repository-owned test schema, not runtime input.
-  // codeql[js/sql-injection]
   db.exec(schemaSql);
   db.close();
   return dbPath;

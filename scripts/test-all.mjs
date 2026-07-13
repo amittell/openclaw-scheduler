@@ -79,20 +79,13 @@ const agentcliPackage = join(agentcliRoot, 'package.json');
 const agentcliBin = join(agentcliRoot, 'bin', 'agentcli.js');
 const agentcliIntegration = join(agentcliRoot, 'test', 'integration-scheduler.test.js');
 const missingAgentcliFiles = [agentcliPackage, agentcliBin, agentcliIntegration]
-  // These are fixed filenames beneath the explicitly selected local test checkout.
-  // codeql[js/path-injection]
   .filter(file => !existsSync(file));
 
 function hasStaleV2FieldVersionAssertion() {
   if (process.env.AGENTCLI_STALE_V2_FIELD_ASSERTION === '1') return true;
   if (missingAgentcliFiles.length > 0) return false;
   try {
-    const packageVersion = JSON.parse(
-      // codeql[js/path-injection]
-      readFileSync(agentcliPackage, 'utf8'),
-    ).version;
-    // The integration source is a fixed file beneath the selected local checkout.
-    // codeql[js/path-injection]
+    const packageVersion = JSON.parse(readFileSync(agentcliPackage, 'utf8')).version;
     const integrationSource = readFileSync(agentcliIntegration, 'utf8');
     return packageVersion === '0.4.0'
       && integrationSource.includes("assert.equal(result.handoff.field_version, '2', 'field_version should be 2')");
