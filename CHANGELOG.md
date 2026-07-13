@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - replaced native regular-expression evaluation for user-authored
   `trigger_condition` values with the exact-pinned, linear-time RE2JS engine;
-  unsupported legacy patterns now fail closed and evaluated output is bounded
+  unsupported legacy patterns now fail closed and regex input is bounded
 - rejected unsafe agent identifiers and session keys at job, dispatch, Gateway,
   registry, and filesystem boundaries, with lexical and canonical containment
   checks protecting OpenClaw session stores from traversal and symlink escapes

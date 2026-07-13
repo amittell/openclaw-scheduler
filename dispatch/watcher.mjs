@@ -55,6 +55,7 @@ import {
   assertSessionKeyForAgent,
   resolveAgentSessionsStorePath,
   resolveSessionTranscriptPath,
+  toNullPrototypeRecord,
 } from '../identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -371,10 +372,10 @@ function loadLabels() {
     return labelsCache;
   }
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
-    if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
-      throw new Error('labels ledger must contain a JSON object');
-    }
+    const labels = toNullPrototypeRecord(
+      JSON.parse(readFileSync(LABELS_PATH, 'utf-8')),
+      'labels ledger',
+    );
     if (rejectUnsafeWatcherMetadata(labels)) {
       saveLabels(labels);
       return labels;
@@ -383,7 +384,7 @@ function loadLabels() {
     labelsCacheSignature = signature;
     return labels;
   } catch {
-    labelsCache = {};
+    labelsCache = Object.create(null);
     labelsCacheSignature = 'missing';
     return labelsCache;
   }

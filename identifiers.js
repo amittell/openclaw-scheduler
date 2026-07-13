@@ -89,11 +89,18 @@ export function assertValidSessionId(value, name = 'session_id') {
   return value;
 }
 
-export function assertValidSessionStore(store, name = 'sessions store') {
-  if (!store || typeof store !== 'object' || Array.isArray(store)) {
+export function toNullPrototypeRecord(value, name = 'record') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${name} must contain a JSON object`);
   }
-  for (const [sessionKey, entry] of Object.entries(store)) {
+  const record = Object.create(null);
+  for (const [key, entry] of Object.entries(value)) record[key] = entry;
+  return record;
+}
+
+export function assertValidSessionStore(store, name = 'sessions store') {
+  const safeStore = toNullPrototypeRecord(store, name);
+  for (const [sessionKey, entry] of Object.entries(safeStore)) {
     assertValidSessionKey(sessionKey, `${name} session key`);
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
       throw new Error(`${name} entry for ${JSON.stringify(sessionKey)} must be an object`);
@@ -102,7 +109,7 @@ export function assertValidSessionStore(store, name = 'sessions store') {
       assertValidSessionId(entry.sessionId, `${name} sessionId for ${JSON.stringify(sessionKey)}`);
     }
   }
-  return store;
+  return safeStore;
 }
 
 export function agentIdFromSessionKey(sessionKey, fallbackAgentId = 'main', name = 'session_key') {

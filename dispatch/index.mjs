@@ -70,6 +70,7 @@ import {
   parseGatewayBaseUrl,
   resolveAgentSessionsStorePath,
   resolveSessionTranscriptPath,
+  toNullPrototypeRecord,
 } from '../identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -285,10 +286,10 @@ function loadLabels() {
     return labelsCache;
   }
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
-    if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
-      throw new Error('labels ledger must contain a JSON object');
-    }
+    const labels = toNullPrototypeRecord(
+      JSON.parse(readFileSync(LABELS_PATH, 'utf-8')),
+      'labels ledger',
+    );
     labelsCache = labels;
     labelsCacheSignature = signature;
     return labels;
@@ -296,7 +297,7 @@ function loadLabels() {
     if (error?.code !== 'ENOENT') {
       process.stderr.write(`[${BRAND}] Refusing invalid labels ledger: ${error.message}\n`);
     }
-    labelsCache = {};
+    labelsCache = Object.create(null);
     labelsCacheSignature = signature;
     return labelsCache;
   }

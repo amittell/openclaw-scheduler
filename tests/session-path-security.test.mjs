@@ -12,12 +12,14 @@ import {
   assertValidAgentId,
   assertValidSessionId,
   assertValidSessionKey,
+  assertValidSessionStore,
   assertSessionKeyForAgent,
   buildGatewayEndpointUrl,
   buildGatewaySessionUrl,
   parseGatewayBaseUrl,
   resolveAgentSessionsStorePath,
   resolveSessionTranscriptPath,
+  toNullPrototypeRecord,
 } from '../identifiers.js';
 import {
   clearGatewayCapabilityCache,
@@ -115,6 +117,22 @@ test('session IDs are one safe filename segment', () => {
   for (const value of ['.', '..', '../sentinel', 'folder/file', 'folder\\file', 'id?query', 'id#fragment']) {
     assert.throws(() => assertValidSessionId(value), /session_id/);
   }
+});
+
+test('prototype-like keys remain ordinary own properties in trusted records', () => {
+  const record = toNullPrototypeRecord(JSON.parse(
+    '{"__proto__":{"status":"running"},"constructor":{"status":"done"}}',
+  ));
+  assert.equal(Object.getPrototypeOf(record), null);
+  assert.equal(Object.hasOwn(record, '__proto__'), true);
+  assert.equal(Object.hasOwn(record, 'constructor'), true);
+  assert.equal(record.__proto__.status, 'running');
+  assert.equal(record.constructor.status, 'done');
+
+  const emptyStore = assertValidSessionStore({});
+  assert.equal(Object.getPrototypeOf(emptyStore), null);
+  assert.equal(emptyStore.__proto__, undefined);
+  assert.equal(emptyStore.constructor, undefined);
 });
 
 test('session paths remain lexically and canonically under the agent sessions root', () => {
@@ -419,6 +437,40 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, count: 0, labels: [] });
     assert.deepEqual(JSON.parse(readFileSync(labelsPath, 'utf8')), poisonedLedger);
     assert.equal(readFileSync(sentinel, 'utf8'), 'sentinel-safe\n');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test('dispatch does not resolve inherited object properties as label entries', () => {
+  const home = makeTempDir('scheduler-dispatch-prototype-home-');
+  const state = makeTempDir('scheduler-dispatch-prototype-state-');
+  const labelsPath = join(state, 'labels.json');
+  try {
+    writeFileSync(labelsPath, '{}');
+    for (const label of ['__proto__', 'constructor', 'toString']) {
+      const result = spawnSync(process.execPath, ['dispatch/index.mjs', 'status', '--label', label], {
+        cwd: join(import.meta.dirname, '..'),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: home,
+          DISPATCH_LABELS_PATH: labelsPath,
+          OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
+        },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        ok: true,
+        label,
+        found: false,
+        message: 'No session found for this label',
+      });
+    }
+
+    const watcherSource = readFileSync(new URL('../dispatch/watcher.mjs', import.meta.url), 'utf8');
+    assert.match(watcherSource, /toNullPrototypeRecord\(/u);
   } finally {
     rmSync(home, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
