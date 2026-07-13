@@ -60,7 +60,6 @@ import {
   sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
   applySessionOverridesToSessionStore,
-  syncAuthStoreToSession,
   cancelAgentSession,
   isAgentCancellationConfirmed,
 } from './gateway.js';
@@ -641,7 +640,6 @@ function buildDispatchDeps(dispatcherFence = null) {
     matchesSentinel, detectTransientError,
     listSessions,
     applySessionOverridesToSessionStore,
-    syncAuthStoreToSession,
     // Finalize
     storeRunArtifact,
     updateIdempotencyResultHash,

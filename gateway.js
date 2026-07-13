@@ -1,7 +1,7 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFile, execFileSync } from 'child_process';
 import {
-  readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync, realpathSync,
+  readFileSync, writeFileSync, existsSync, realpathSync,
 } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
@@ -976,38 +976,22 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
 }
 
 /**
- * Sync the live auth-profiles.json from the main agent store to the target
- * agent store at ~/.openclaw/agents/<agentId>/agent/auth-profiles.json.
+ * Backward-compatible auth synchronization hook.
  *
- * This ensures scheduler sessions always use fresh credentials (tokens, order,
- * default profile) even when no explicit auth_profile is set on the job.
- * Without this, sessions created from a stable session key inherit a stale
- * copy of the auth store that was snapshotted when the session was first created.
+ * Gateway-backed dispatch resolves credentials inside the running OpenClaw
+ * Gateway. The scheduler must not copy auth profile files between agents:
+ * current Gateways may use a non-file auth store, secondary agents support
+ * read-through inheritance, and OAuth refresh credentials are not safely
+ * cloneable. The exported hook remains for consumers that feature-detect it,
+ * but reports that synchronization is intentionally owned by the Gateway.
  *
- * This is a fast file-copy operation (~1ms) and is safe to call before every
- * agent turn.
- *
- * @param {string} [agentId='main'] - Agent ID for store path resolution
- * @returns {{ ok: boolean, error?: string }}
+ * @deprecated Gateway-backed dispatch does not require credential-file sync.
+ * @param {string} [agentId='main'] - Agent ID retained for API compatibility
+ * @returns {{ ok: boolean, skipped?: boolean, reason?: string, error?: string }}
  */
 export function syncAuthStoreToSession(agentId = 'main') {
-  const livePath = join(HOME_DIR, '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
-  const agentStorePath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent', 'auth-profiles.json');
-
-  try {
-    if (!existsSync(livePath)) {
-      return { ok: false, error: `Live auth store not found at ${livePath}` };
-    }
-
-    // Ensure the agent directory exists
-    const agentDir = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent');
-    if (!existsSync(agentDir)) {
-      mkdirSync(agentDir, { recursive: true });
-    }
-
-    copyFileSync(livePath, agentStorePath);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: `Failed to sync auth store: ${err.message}` };
+  if (typeof agentId !== 'string' || agentId.trim() === '') {
+    return { ok: false, error: 'agentId must be a non-empty string' };
   }
+  return { ok: true, skipped: true, reason: 'gateway-managed-auth' };
 }

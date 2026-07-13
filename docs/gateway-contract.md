@@ -579,14 +579,19 @@ Each agent has its own configuration directory at
 - `models.json` -- provider endpoints and model definitions for this
   agent. Different agents can use different model providers (e.g. main
   uses Anthropic, beta uses OpenAI Codex via a different base URL).
-- `auth-profiles.json` -- credential profiles scoped to this agent.
-  Each agent can have independent API keys, OAuth tokens, and provider
-  configurations.
-- `sessions/` -- per-agent session store (sessions.json + JSONL files).
+- `openclaw-agent.sqlite` -- current Gateway-managed agent state, including
+  the auth-profile store. Legacy Gateway versions may instead use
+  `auth-profiles.json` in this directory.
 
-The gateway reads from the correct agent directory based on the resolved
-agent ID. This means agents on the same gateway can have completely
-independent credential surfaces.
+The per-agent session store is a sibling at
+`~/.openclaw/agents/<agentId>/sessions/` and contains `sessions.json` plus
+JSONL transcripts.
+
+The Gateway resolves effective model and auth state for the selected agent.
+Depending on Gateway version and configuration, that effective state may use
+read-through inheritance from the main agent. Agent IDs provide routing and
+session isolation, but the scheduler does not claim strict credential
+separation when Gateway inheritance is enabled.
 
 ### Scheduler dispatch to non-default agents
 
@@ -616,16 +621,19 @@ Jobs without an explicit `agent_id` default to `"main"`.
 
 ### Multi-agent trust considerations
 
-When multiple agents share a gateway, each agent is a separate execution
-principal with its own credential surface:
+When multiple agents share a gateway, each agent is a separate routing and
+session principal with a Gateway-resolved effective credential scope:
 
-- Auth profiles are per-agent (`~/.openclaw/agents/<id>/agent/auth-profiles.json`).
-  A job dispatched to beta uses beta's profiles, not main's.
+- Auth state is owned and resolved by the running Gateway. The scheduler sends
+  the target agent and profile selection but never copies credential files
+  between agents. A job dispatched to beta therefore uses the Gateway's beta
+  scope, including any Gateway-supported read-through inheritance, without
+  cloning main-agent OAuth refresh material.
 - The scheduler's `child_credential_policy` applies within a single
   agent's dispatch chain. Cross-agent credential scoping (e.g. a main
   job triggering a beta child with downscoped credentials) is not
-  currently supported -- each agent resolves credentials from its own
-  profile store.
+  currently supported. The scheduler cannot prove that effective credential
+  scopes remain distinct when Gateway inheritance applies.
 - The `x-openclaw-env-inject` header is agent-agnostic: materialized
   env vars are forwarded to whichever agent the job targets.
 - Session isolation between agents is enforced by the session key

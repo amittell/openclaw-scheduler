@@ -2444,18 +2444,7 @@ async function runAgentTurnForSelection(
   signal = null,
 ) {
   const { log } = deps;
-  const { syncAuthStoreToSession: syncAuth, applySessionOverridesToSessionStore: applySessionOverrides } = deps;
-
-  // Always sync the live auth store before each attempt so refreshed credentials
-  // are visible to any embedded/isolated runner startup.
-  if (typeof syncAuth === 'function') {
-    const syncResult = syncAuth(job.agent_id || 'main');
-    if (syncResult.ok) {
-      log('debug', `Synced live auth store to agent '${job.agent_id || 'main'}'`, { jobId: job.id });
-    } else {
-      log('warn', `Failed to sync auth store: ${syncResult.error}`, { jobId: job.id });
-    }
-  }
+  const { applySessionOverridesToSessionStore: applySessionOverrides } = deps;
 
   if (typeof applySessionOverrides === 'function') {
     const applyResult = applySessionOverrides(

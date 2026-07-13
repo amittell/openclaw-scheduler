@@ -3723,81 +3723,28 @@ console.log('\n-- Auth Profile Session Store Propagation --');
   console.log('  auth profile session store propagation: pass');
 }
 
-console.log('\n-- Sync Auth Store to Session --');
+console.log('\n-- Gateway-managed Auth Store Compatibility --');
 {
   const { syncAuthStoreToSession } = await import('./gateway.js');
-
-  // Create a temp HOME structure with live credentials and an agent dir
-  const tmpHome = mkdtempSync(join(tmpdir(), 'scheduler-sync-auth-'));
-  const liveCredsDir = join(tmpHome, '.openclaw', 'credentials');
-  const agentStoreDir = join(tmpHome, '.openclaw', 'agents', 'main', 'agent');
-  mkdirSync(liveCredsDir, { recursive: true });
-  mkdirSync(agentStoreDir, { recursive: true });
-
-  // Write a live auth-profiles.json with fresh tokens
-  const liveStore = {
-    version: 1,
-    profiles: {
-      'anthropic:me.com': { type: 'api-key', provider: 'anthropic', access: 'fresh-key-123' },
-      'anthropic:gmail': { type: 'api-key', provider: 'anthropic', access: 'fresh-key-456' },
-    },
-    order: { anthropic: ['anthropic:me.com', 'anthropic:gmail'] },
-    defaultProfileId: 'anthropic:me.com',
-  };
-  writeFileSync(join(liveCredsDir, 'auth-profiles.json'), JSON.stringify(liveStore), 'utf-8');
-
-  // Write a stale agent auth-profiles.json
-  const staleStore = {
-    version: 1,
-    profiles: {
-      'anthropic:me.com': { type: 'api-key', provider: 'anthropic', access: 'stale-key-OLD' },
-    },
-    order: { anthropic: ['anthropic:me.com'] },
-    defaultProfileId: 'anthropic:me.com',
-  };
-  writeFileSync(join(agentStoreDir, 'auth-profiles.json'), JSON.stringify(staleStore), 'utf-8');
-
-  // Monkey-patch HOME_DIR by temporarily overriding HOME env
-  const origHome = process.env.HOME;
-  process.env.HOME = tmpHome;
-
-  // Re-import to pick up new HOME (dynamic import caches, so test the logic directly)
-  // Instead, we test the function's core logic: read live, copy to agent
-  const livePath = join(tmpHome, '.openclaw', 'credentials', 'auth-profiles.json');
-  const agentPath = join(tmpHome, '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
-
-  // Verify the stale store before sync
-  const beforeSync = JSON.parse(readFileSync(agentPath, 'utf-8'));
-  assert(beforeSync.profiles['anthropic:me.com'].access === 'stale-key-OLD', 'agent store has stale key before sync');
-  assert(!beforeSync.profiles['anthropic:gmail'], 'agent store missing gmail profile before sync');
-
-  // Simulate the sync logic (same as syncAuthStoreToSession)
-  const { copyFileSync: cpFile } = await import('fs');
-  cpFile(livePath, agentPath);
-
-  // Verify the sync
-  const afterSync = JSON.parse(readFileSync(agentPath, 'utf-8'));
-  assert(afterSync.profiles['anthropic:me.com'].access === 'fresh-key-123', 'agent store has fresh key after sync');
-  assert(afterSync.profiles['anthropic:gmail'].access === 'fresh-key-456', 'agent store has gmail profile after sync');
-  assert(afterSync.defaultProfileId === 'anthropic:me.com', 'agent store has correct default profile');
-  assert(JSON.stringify(afterSync.order) === JSON.stringify(liveStore.order), 'agent store has correct order');
-
-  // Test the actual exported function exists
   assert(typeof syncAuthStoreToSession === 'function', 'syncAuthStoreToSession is exported');
-
-  // Restore HOME
-  process.env.HOME = origHome;
-
-  // Cleanup
-  rmSync(tmpHome, { recursive: true, force: true });
-  console.log('  sync auth store to session: pass');
+  assert(JSON.stringify(syncAuthStoreToSession('main')) === JSON.stringify({
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  }), 'main agent auth remains Gateway-managed');
+  assert(JSON.stringify(syncAuthStoreToSession('secondary')) === JSON.stringify({
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  }), 'secondary agent auth remains Gateway-managed without credential cloning');
+  assert(syncAuthStoreToSession('').ok === false, 'empty agent IDs are rejected');
+  console.log('  gateway-managed auth compatibility: pass');
 }
 
 console.log('\n-- executeAgent fallback selection --');
 {
   const turnAttempts = [];
   const appliedSelections = [];
-  const syncCalls = [];
   const logs = [];
 
   const result = await executeAgent({
@@ -3823,7 +3770,6 @@ console.log('\n-- executeAgent fallback selection --');
     detectTransientError: () => false,
     sqliteNow,
     log: (...args) => logs.push(args),
-    syncAuthStoreToSession: () => { syncCalls.push('sync'); return { ok: true }; },
     applySessionOverridesToSessionStore: (_sessionKey, overrides) => { appliedSelections.push(overrides); return { ok: true }; },
     runIsolatedAgentTurn: async ({ model, authProfile }) => {
       turnAttempts.push({ model: model || null, authProfile: authProfile || null });
@@ -3836,7 +3782,6 @@ console.log('\n-- executeAgent fallback selection --');
   assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
   assert(turnAttempts[0].model === null && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary dispatch uses primary auth profile and keeps model in session overrides');
   assert(turnAttempts[1].model === null && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry dispatch uses fallback auth profile and keeps model in session overrides');
-  assert(syncCalls.length === 2, 'executeAgent fallback: syncAuthStoreToSession runs before both attempts');
   assert(JSON.stringify(appliedSelections) === JSON.stringify([
     { authProfile: 'anthropic:primary', modelRef: 'gpt-5-mini' },
     { authProfile: 'openai:backup', modelRef: 'gpt-4.1-mini' },

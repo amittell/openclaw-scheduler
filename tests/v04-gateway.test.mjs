@@ -226,11 +226,30 @@ function makeAgentStrategyDeps(runIsolatedAgentTurn) {
     detectTransientError: () => false,
     sqliteNow: () => 'next-dispatch',
     log: () => {},
-    syncAuthStoreToSession: () => ({ ok: true }),
+    syncAuthStoreToSession: () => {
+      throw new Error('agent strategy must not copy Gateway credential stores');
+    },
     applySessionOverridesToSessionStore: () => ({ ok: true }),
     runIsolatedAgentTurn,
   };
 }
+
+test('Gateway owns auth synchronization without scheduler credential-file copies', () => {
+  assert.deepEqual(gateway.syncAuthStoreToSession('main'), {
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  });
+  assert.deepEqual(gateway.syncAuthStoreToSession('secondary'), {
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  });
+  assert.deepEqual(gateway.syncAuthStoreToSession(''), {
+    ok: false,
+    error: 'agentId must be a non-empty string',
+  });
+});
 
 async function assertRejectsWithCode(promise, code) {
   let rejected;

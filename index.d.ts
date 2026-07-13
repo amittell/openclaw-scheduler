@@ -1004,7 +1004,8 @@ export const gateway: {
   waitForGateway(timeoutMs?: number, intervalMs?: number): Promise<boolean>;
   applySessionOverridesToSessionStore(sessionKey: string, overrides?: { authProfile?: string | null; modelRef?: string | null }, agentId?: string): { ok: boolean; error?: string };
   applyAuthProfileToSessionStore(sessionKey: string, authProfile: string, agentId?: string): { ok: boolean; error?: string };
-  syncAuthStoreToSession(agentId?: string): { ok: boolean; error?: string };
+  /** @deprecated Gateway-backed dispatch owns authentication and does not copy credential files. */
+  syncAuthStoreToSession(agentId?: string): { ok: boolean; skipped?: boolean; reason?: string; error?: string };
 };
 
 export const paths: {

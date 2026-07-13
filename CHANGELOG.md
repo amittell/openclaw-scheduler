@@ -86,6 +86,9 @@ All notable changes to this project will be documented in this file.
 - legacy or current Gateways that do not advertise environment injection now
   fail closed with `GATEWAY_ENV_INJECT_UNSUPPORTED` before a credential-bearing
   agent request is sent; auth-profile-only isolated turns remain compatible
+- isolated dispatch leaves auth-store ownership with the running Gateway and
+  no longer copies credential files between agent scopes, avoiding obsolete
+  file-store warnings and unsafe OAuth refresh-token duplication
 - Gateway token-file paths are canonicalized before every read and accepted
   only beneath `~/.openclaw/credentials`, `/run/secrets`, or
   `/var/run/secrets`; paths outside those roots and symlink escapes are rejected
