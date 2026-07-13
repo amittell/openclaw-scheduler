@@ -12,6 +12,28 @@ export interface SqliteRunResult {
   lastInsertRowid: number | bigint;
 }
 
+export interface SchedulerStatement {
+  run(...params: unknown[]): SqliteRunResult;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
+
+export interface SchedulerTransaction<T> {
+  (): T;
+  deferred(): T;
+  immediate(): T;
+  exclusive(): T;
+}
+
+export interface SchedulerDatabase {
+  readonly inTransaction: boolean;
+  prepare(source: string): SchedulerStatement;
+  transaction<T>(callback: () => T): SchedulerTransaction<T>;
+  exec(source: string): this;
+  pragma(source: string, options?: { simple?: boolean }): unknown;
+  close(): void;
+}
+
 // -- Record interfaces matching schema.sql --
 
 export interface JobSpec {
@@ -73,6 +95,8 @@ export interface JobSpec {
   approval_required?: number | boolean;
   approval_timeout_s?: number;
   approval_auto?: 'approve' | 'reject';
+  approval_risk_level?: 'low' | 'medium' | 'high' | null;
+  approval_approver_scope?: string | null;
 
   // Context retrieval
   context_retrieval?: 'none' | 'recent' | 'hybrid';
@@ -83,6 +107,7 @@ export interface JobSpec {
   output_excerpt_limit_bytes?: number;
   output_summary_limit_bytes?: number;
   output_offload_threshold_bytes?: number;
+  output_format?: 'json' | 'ndjson' | 'text' | null;
 
   // Session continuity
   preferred_session_key?: string | null;
@@ -210,6 +235,10 @@ export interface RunRecord {
   retry_of?: string | null;
   triggered_by_run?: string | null;
   dispatch_queue_id?: string | null;
+  evidence_required?: number | boolean;
+  evidence_execution_snapshot?: string | null;
+  evidence_declaration_snapshot?: string | null;
+  evidence_ref_snapshot?: string | null;
 
   // Context & replay
   context_summary?: string | null;
@@ -225,6 +254,12 @@ export interface RunRecord {
   authorization_proof_verification?: string | null;
   evidence_record?: string | null;
   credential_handoff_summary?: string | null;
+  delegation_validation?: string | null;
+
+  // Structured output contract result
+  output_format?: 'json' | 'ndjson' | 'text' | null;
+  structured_output?: string | null;
+  structured_output_valid?: number | boolean | null;
 
   // Dispatcher ownership, cancellation, and process tracking
   dispatcher_owner?: string | null;
@@ -309,7 +344,34 @@ export interface ApprovalRecord {
   approved_at?: string | null;
   rejected_at?: string | null;
   dispatched_at?: string | null;
+  risk_level?: 'low' | 'medium' | 'high' | null;
+  approver_scope?: string | null;
+  binding_hash?: string | null;
+  gate_kind: 'job' | 'authorization';
+  decision_context?: string | null;
+  deduped?: boolean;
   [key: string]: unknown;
+}
+
+export interface EvidenceRecord {
+  id: string;
+  run_id: string;
+  job_id: string;
+  evidence_ref?: string | null;
+  algorithm: 'sha256';
+  hash: string;
+  payload: JsonValue | null;
+  retention_policy?: string | null;
+  retention_until?: string | null;
+  created_at: string;
+  integrity: {
+    valid: boolean;
+    algorithm?: 'sha256';
+    expected_hash?: string;
+    actual_hash?: string;
+    error?: string;
+    errors?: string[];
+  };
 }
 
 export interface AgentRecord {
@@ -416,6 +478,7 @@ export interface CreateRunOpts {
   retry_of?: string | null;
   triggered_by_run?: string | null;
   dispatch_queue_id?: string | null;
+  evidence_required?: number | boolean;
   ownerId?: string | null;
   fencingToken?: number | null;
 }
@@ -441,6 +504,10 @@ export interface FinishRunOpts {
   authorization_proof_verification?: string | object | null;
   evidence_record?: string | object | null;
   credential_handoff_summary?: string | object | null;
+  delegation_validation?: string | object | null;
+  output_format?: 'json' | 'ndjson' | 'text' | null;
+  structured_output?: string | null;
+  structured_output_valid?: number | boolean | null;
   ownerId?: string;
   fencingToken?: number;
 }
@@ -489,6 +556,7 @@ export interface AgentTurnOpts {
   sessionKey?: string;
   model?: string;
   authProfile?: string | null;
+  materializedEnv?: Record<string, string> | null;
   timeoutMs?: number;
   signal?: AbortSignal;
   cancelOnAbort?: boolean;
@@ -500,6 +568,7 @@ export interface AgentTurnWithTimeoutOpts {
   sessionKey?: string;
   model?: string;
   authProfile?: string | null;
+  materializedEnv?: Record<string, string> | null;
   sessionKinds?: string[];
   idleTimeoutMs?: number;
   pollIntervalMs?: number;
@@ -511,9 +580,42 @@ export interface AgentTurnWithTimeoutOpts {
 export interface AgentTurnResult {
   ok: true;
   content: string;
-  usage: Record<string, unknown>;
-  sessionKey: string;
+  usage?: Record<string, unknown>;
+  sessionKey?: string;
   raw: Record<string, unknown>;
+}
+
+export interface GatewayCapabilities {
+  readonly version: string | null;
+  readonly protocol: number | null;
+  readonly capabilities: readonly string[];
+  readonly source: string;
+  readonly legacy: boolean;
+}
+
+export interface GatewayCapabilityDiscoveryOpts {
+  gatewayUrl?: string;
+  fetchImpl?: typeof globalThis.fetch;
+  requestHeaders?: Record<string, string>;
+  timeoutMs?: number;
+  cacheTtlMs?: number;
+  forceRefresh?: boolean;
+}
+
+export interface GatewayEnvironmentNegotiation {
+  readonly headers: Readonly<Record<string, string>>;
+  readonly gateway: GatewayCapabilities | null;
+}
+
+export interface GatewayCompatibilityError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly gatewayVersion?: string | null;
+  readonly gatewayProtocol?: number | null;
+  readonly gatewayCapabilities?: string[];
+  readonly discoverySource?: string;
+  readonly legacyGateway?: boolean;
+  readonly requiredCapability?: string;
 }
 
 export interface DeliveryResult {
@@ -542,8 +644,8 @@ export interface DeliveryAttachmentRecord {
   ordinal: number;
   name: string;
   mime_type?: string | null;
-  source_path: string;
-  content_blob?: Buffer | null;
+  source_path: string | null;
+  content_blob?: Uint8Array | null;
   size_bytes: number;
   sha256: string;
   created_at?: string;
@@ -559,6 +661,11 @@ export interface DeliveryOutboxRecord {
   body: string;
   status: 'pending' | 'claimed' | 'delivered' | 'failed' | 'cancelled';
   idempotency_key?: string | null;
+  delivery_group_id?: string | null;
+  part_index?: number | null;
+  part_count?: number | null;
+  completion_label?: string | null;
+  completion_scope?: string | null;
   attempt_count: number;
   max_attempts: number;
   next_attempt_at: string;
@@ -572,6 +679,20 @@ export interface DeliveryOutboxRecord {
   deduped?: boolean;
 }
 
+export interface MultipartDeliveryResult extends DeliveryOutboxRecord {
+  partCount: number;
+  deliveries: DeliveryOutboxRecord[];
+  checkpointKey: string | null;
+}
+
+export interface DeliveryCheckpoint {
+  idempotencyKey: string;
+  partCount: number;
+  complete: boolean;
+  statusCounts: Record<string, number>;
+  deliveries: DeliveryOutboxRecord[];
+}
+
 export interface GovernanceDecision {
   allowed: boolean;
   violations: string[];
@@ -579,6 +700,50 @@ export interface GovernanceDecision {
   policy: Record<string, unknown>;
   enforcement: Record<string, boolean>;
   evaluated_at: string;
+}
+
+export interface AuthenticatedApprovalActor {
+  authenticated: true;
+  source: 'os-user';
+  canonical: string;
+  username: string;
+  uid: number | null;
+  aliases: readonly string[];
+}
+
+export interface ApprovalTransitionResult {
+  changed: boolean;
+  approval: ApprovalRecord | null;
+  reason: string | null;
+}
+
+export interface ApprovalStateOpts {
+  db?: SchedulerDatabase;
+  resolvedBy?: string;
+  authenticatedActor?: AuthenticatedApprovalActor;
+  automatic?: boolean;
+  notes?: string | null;
+  reason?: string | null;
+}
+
+export interface DeliveryAttachmentInput {
+  path?: string;
+  sourcePath?: string;
+  source_path?: string;
+  name?: string | null;
+  mimeType?: string | null;
+  mime_type?: string | null;
+}
+
+export interface DeliveryAttachmentOpts {
+  db?: SchedulerDatabase;
+  dbPath?: string;
+  artifactsDir?: string;
+  maxBytes?: number;
+  maxCount?: number;
+  maxTotalBytes?: number;
+  persistFiles?: boolean;
+  includeContent?: boolean;
 }
 
 export interface RunTransitionResult {
@@ -591,7 +756,7 @@ export interface RunTransitionResult {
 
 export const db: {
   setDbPath(path: string): void;
-  getDb(): import('better-sqlite3').Database;
+  getDb(): SchedulerDatabase;
   getResolvedDbPath(): string;
   initDb(): Promise<unknown>;
   checkpointWal(): { busy: number; checkpointed: number; log: number } | null;
@@ -667,16 +832,48 @@ export const runs: {
   getRunningRunsByPool(poolName: string): Array<RunRecord & { job_name: string }>;
   pruneRuns(keepPerJob?: number): void;
   updateContextSummary(runId: string, summaryObj: unknown): RunRecord | undefined;
+  persistV02Outcomes(runId: string, outcomes: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): void;
+  persistTerminalEvidence(
+    job: JobRecord,
+    runId: string,
+    status: string,
+    fields?: FinishRunOpts & Record<string, unknown>,
+    outcomes?: Record<string, unknown>,
+    opts?: Record<string, unknown> & { db?: SchedulerDatabase },
+  ): EvidenceRecord | null;
+  quarantineRunRecovery(
+    runId: string,
+    reason: string,
+    opts?: {
+      db?: SchedulerDatabase;
+      dispatcherFence?: {
+        ownerId: string;
+        fencingToken: number;
+        leaseName?: string;
+      } | null;
+      allowStaleRunOwner?: boolean;
+    },
+  ): { changed: boolean; run: RunRecord | null };
+  transitionRunTerminalWithEvidence(
+    job: JobRecord,
+    runId: string,
+    status: string,
+    fields?: FinishRunOpts & Record<string, unknown>,
+    outcomes?: Record<string, unknown>,
+    opts?: Record<string, unknown> & { db?: SchedulerDatabase },
+  ): RunTransitionResult;
+  getEvidenceRecord(runId: string, opts?: { db?: SchedulerDatabase }): EvidenceRecord | null;
+  pruneEvidenceRecords(opts?: { db?: SchedulerDatabase; limit?: number; now?: string | number | Date }): SqliteRunResult;
 };
 
 export const messages: {
   sendMessage(opts: SendMessageOpts): MessageRecord;
   getMessage(id: string): MessageRecord | undefined;
   getInbox(agentId: string, opts?: InboxOpts): MessageRecord[];
-  claimInboxForRun(agentId: string, runId: string, opts?: { limit?: number; db?: import('better-sqlite3').Database }): MessageRecord[];
-  ackClaimedInboxForRun(runId: string, messageIds: string[], opts?: { db?: import('better-sqlite3').Database }): { acked: number; messages: MessageRecord[] };
-  releaseClaimedInboxForRun(runId: string, messageIds: string[], opts?: { db?: import('better-sqlite3').Database; reason?: string }): { released: number; messages: MessageRecord[] };
-  recoverStaleInboxClaims(opts?: { olderThanSeconds?: number; db?: import('better-sqlite3').Database }): { recovered: number; messages: MessageRecord[] };
+  claimInboxForRun(agentId: string, runId: string, opts?: { limit?: number; db?: SchedulerDatabase }): MessageRecord[];
+  ackClaimedInboxForRun(runId: string, messageIds: string[], opts?: { db?: SchedulerDatabase }): { acked: number; messages: MessageRecord[] };
+  releaseClaimedInboxForRun(runId: string, messageIds: string[], opts?: { db?: SchedulerDatabase; reason?: string }): { released: number; messages: MessageRecord[] };
+  recoverStaleInboxClaims(opts?: { olderThanSeconds?: number; db?: SchedulerDatabase }): { recovered: number; messages: MessageRecord[] };
   getOutbox(agentId: string, limit?: number): MessageRecord[];
   getThread(messageId: string): MessageRecord[];
   getTeamMessages(teamId: string, opts?: TeamMessagesOpts): MessageRecord[];
@@ -692,11 +889,21 @@ export const messages: {
 };
 
 export const approvals: {
-  createApproval(jobId: string, runId: string, dispatchQueueId?: string | null): ApprovalRecord;
+  APPROVAL_STATUSES: Readonly<Record<'PENDING' | 'APPROVED' | 'REJECTED' | 'TIMED_OUT' | 'CANCELLED' | 'DISPATCHING' | 'DISPATCHED', string>>;
+  createApproval(jobId: string, runId: string | null, dispatchQueueId?: string | null, opts?: {
+    db?: SchedulerDatabase;
+    gateKind?: 'job' | 'authorization';
+    timeoutSeconds?: number;
+    expiresAt?: string | number | Date;
+    riskLevel?: 'low' | 'medium' | 'high';
+    approverScope?: string | null;
+    decisionContext?: string | Record<string, unknown> | null;
+    releaseIdempotencyKey?: string | null;
+  }): ApprovalRecord & { deduped: boolean };
   getApproval(id: string): ApprovalRecord | undefined;
-  getPendingApproval(jobId: string): ApprovalRecord | undefined;
+  getPendingApproval(jobId: string, opts?: { db?: SchedulerDatabase }): ApprovalRecord | undefined;
   listPendingApprovals(): Array<ApprovalRecord & { job_name: string }>;
-  resolveApproval(id: string, status: string, resolvedBy: string, notes?: string): ApprovalRecord;
+  resolveApproval(id: string, status: string, resolvedBy?: string | null, notes?: string | null, opts?: { automatic?: boolean }): ApprovalRecord | null;
   countPendingApprovalsForJob(jobId: string): number;
   getTimedOutApprovals(): Array<ApprovalRecord & { job_name: string; approval_timeout_s: number; approval_auto: string }>;
   pruneApprovals(retentionDays?: number): SqliteRunResult;
@@ -706,6 +913,10 @@ export const approvals: {
   markApprovalDispatched(dispatchQueueId: string, opts?: Record<string, unknown>): { changed: boolean; approval: ApprovalRecord | null; reason: string | null };
   cancelApprovalForDispatch(dispatchQueueId: string, reason?: string, opts?: Record<string, unknown>): { changed: boolean; approval: ApprovalRecord | null; reason: string | null };
   cancelApprovalsForJob(jobId: string, reason?: string, opts?: Record<string, unknown>): { changed: number; approvals: ApprovalRecord[] };
+  cancelApproval(id: string, reason?: string, opts?: Record<string, unknown>): ApprovalTransitionResult;
+  cancelUnavailableJobApprovals(opts?: { db?: SchedulerDatabase }): { changed: number; approvals: ApprovalRecord[] };
+  recoverInterruptedApprovalDispatches(opts?: { db?: SchedulerDatabase }): { recovered: number };
+  approverMatchesScope(approver: string | { aliases: readonly string[] }, scope: string | null): boolean;
 };
 
 export const agents: {
@@ -741,9 +952,28 @@ export const dispatchQueue: {
 
 export const gateway: {
   TELEGRAM_MAX_MESSAGE_LENGTH: number;
+  ISOLATED_DISPATCH_PRIMITIVE: string;
+  GATEWAY_ENV_INJECT_HEADER: string;
+  GATEWAY_ENV_INJECT_CAPABILITY: string;
+  MAX_GATEWAY_ENV_ENTRIES: number;
+  MAX_GATEWAY_ENV_KEY_BYTES: number;
+  MAX_GATEWAY_ENV_VALUE_BYTES: number;
+  MAX_GATEWAY_ENV_INJECT_HEADER_BYTES: number;
+  GatewayCompatibilityError: new (
+    code: string,
+    message: string,
+    details?: Record<string, unknown>,
+    options?: ErrorOptions & { retryable?: boolean },
+  ) => GatewayCompatibilityError;
+  buildGatewayEnvInjectHeader(materializedEnv?: Record<string, string> | null): Record<string, string>;
+  discoverGatewayCapabilities(opts?: GatewayCapabilityDiscoveryOpts): Promise<GatewayCapabilities>;
+  clearGatewayCapabilityCache(gatewayUrl?: string): void;
+  negotiateGatewayEnvironmentInjection(materializedEnv?: Record<string, string> | null, opts?: GatewayCapabilityDiscoveryOpts): Promise<GatewayEnvironmentNegotiation>;
   cancelAgentSession(sessionKey: string, opts?: { agentId?: string; runId?: string; timeoutMs?: number }): Promise<{ ok: boolean; aborted: boolean; error?: string }>;
+  isAgentCancellationConfirmed(outcome: unknown): boolean;
   runAgentTurn(opts: AgentTurnOpts): Promise<AgentTurnResult>;
   runAgentTurnWithActivityTimeout(opts: AgentTurnWithTimeoutOpts): Promise<AgentTurnResult>;
+  runIsolatedAgentTurn(opts: AgentTurnWithTimeoutOpts): Promise<AgentTurnResult>;
   sendSystemEvent(text: string, mode?: string): Promise<Record<string, unknown>>;
   invokeGatewayTool(tool: string, args: Record<string, unknown>, sessionKey?: string): Promise<Record<string, unknown>>;
   listSessions(opts?: { activeMinutes?: number; limit?: number; kinds?: string[] }): Promise<Record<string, unknown>>;
@@ -754,6 +984,9 @@ export const gateway: {
   deliverMessage(channel: string, target: string, message: string): Promise<DeliveryResult>;
   checkGatewayHealth(): Promise<boolean>;
   waitForGateway(timeoutMs?: number, intervalMs?: number): Promise<boolean>;
+  applySessionOverridesToSessionStore(sessionKey: string, overrides?: { authProfile?: string | null; modelRef?: string | null }, agentId?: string): { ok: boolean; error?: string };
+  applyAuthProfileToSessionStore(sessionKey: string, authProfile: string, agentId?: string): { ok: boolean; error?: string };
+  syncAuthStoreToSession(agentId?: string): { ok: boolean; error?: string };
 };
 
 export const paths: {
@@ -761,6 +994,7 @@ export const paths: {
   resolveSchedulerDbPath(params?: DbPathParams): string;
   ensureSchedulerDbParent(dbPath: string): string;
   resolveBackupStagingDir(env?: Record<string, string | undefined>): string;
+  resolveServiceWorkingDirectory(params?: DbPathParams): string;
   resolveArtifactsDir(params?: ArtifactsDirParams): string;
   ensureArtifactsDir(dirPath: string): string;
 };
@@ -812,7 +1046,7 @@ export const shellRuntime: {
   DEFAULT_SHELL: string;
   buildShellEnvironment(env?: Record<string, string> | null, policy?: 'minimal' | 'inherit'): Record<string, string>;
   inspectProcessIdentity(pid: number): { alive: boolean; identity: string | null };
-  terminateProcessTree(child: { pid: number; kill(signal?: NodeJS.Signals): boolean }, opts?: { pgid?: number; graceMs?: number }): Promise<boolean>;
+  terminateProcessTree(child: { pid: number; kill(signal?: string | number): boolean }, opts?: { pgid?: number; graceMs?: number }): Promise<boolean>;
   runShellCommand(command: string, timeoutMs?: number, env?: Record<string, string> | null, opts?: {
     signal?: AbortSignal;
     envPolicy?: 'minimal' | 'inherit';
@@ -857,6 +1091,16 @@ export const runState: {
   ACTIVE_RUN_STATUSES: readonly string[];
   TERMINAL_RUN_STATUSES: readonly string[];
   claimRunForDispatch(runId: string, opts: { ownerId: string; fencingToken: number }): RunRecord | null;
+  recordRunCredentialCleanupState(runId: string, state: {
+    status: 'pending' | 'not_required' | 'cleaned' | 'failed';
+    attempts?: number;
+    error?: string;
+  }, opts: {
+    ownerId: string;
+    fencingToken: number;
+    leaseName?: string;
+    allowAfterLeaseLoss?: boolean;
+  }): RunRecord | null;
   requestRunCancellation(runId: string, opts?: { requestedBy?: string; reason?: string }): RunTransitionResult;
   cancelRunBeforeExecution(runId: string, opts?: { requestedBy?: string; reason?: string }): RunTransitionResult;
   getRunCancellation(runId: string): Record<string, unknown> | null;
@@ -872,12 +1116,15 @@ export const runCompletion: {
   TERMINAL_RUN_STATUSES: Set<string>;
   isTerminalRunStatus(status: string): boolean;
   isCancellationRequested(run: RunRecord | null): boolean;
+  classifyPreExecutionAbort(run: RunRecord | null, abortKind?: string | null): 'cancel' | 'complete_error' | 'recover';
   completeRunFenced(opts: Record<string, unknown>): RunTransitionResult & { status: string; cancelled: boolean };
-  commitCompletionBookkeeping<T>(db: import('better-sqlite3').Database, callback: () => T): T;
+  commitCompletionBookkeeping<T>(db: SchedulerDatabase, callback: () => T): T;
   shouldRunPostCompletionEffects(completion: RunTransitionResult & { cancelled?: boolean }): boolean;
 };
 
 export const governance: {
+  isReservedCredentialEnvironmentKey(key: unknown): boolean;
+  assertCredentialEnvironmentKeyAllowed(key: string): void;
   evaluateGovernance(job: JobSpec | JobRecord, opts?: Record<string, unknown>): GovernanceDecision;
   assertGovernance(job: JobSpec | JobRecord, opts?: Record<string, unknown>): GovernanceDecision;
   buildShellEnvironment(job: JobSpec | JobRecord, materializedEnv?: Record<string, string> | null, baseEnv?: Record<string, string | undefined>): Record<string, string>;
@@ -889,8 +1136,12 @@ export const deliveryOutbox: {
   DELIVERY_STATUSES: Readonly<Record<string, string>>;
   DEFAULT_DELIVERY_RETENTION_DAYS: number;
   DEFAULT_DELIVERY_PRUNE_LIMIT: number;
+  DEFAULT_TELEGRAM_DELIVERY_PART_BYTES: number;
+  splitDeliveryBody(body: string, opts?: { channel?: string; maxPartBytes?: number }): string[];
   enqueueDelivery(opts: Record<string, unknown>): DeliveryOutboxRecord;
+  enqueueMultipartDelivery(opts: Record<string, unknown>): MultipartDeliveryResult;
   getDelivery(id: string, opts?: Record<string, unknown>): DeliveryOutboxRecord | null;
+  getDeliveryCheckpoint(idempotencyKey: string, opts?: Record<string, unknown>): DeliveryCheckpoint;
   getDeliveryByIdempotencyKey(key: string, opts?: Record<string, unknown>): DeliveryOutboxRecord | null;
   listDeliveries(opts?: Record<string, unknown>): DeliveryOutboxRecord[];
   claimDueDeliveries(opts?: Record<string, unknown>): DeliveryOutboxRecord[];
@@ -909,17 +1160,40 @@ export const deliveryOutbox: {
 
 export const deliveryAttachments: {
   DEFAULT_MAX_ATTACHMENT_BYTES: number;
+  DEFAULT_MAX_ATTACHMENT_COUNT: number;
+  DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: number;
+  stageDeliveryAttachments(outboxId: string, attachmentInputs?: Array<string | DeliveryAttachmentInput>, opts?: DeliveryAttachmentOpts): DeliveryAttachmentRecord[];
+  persistStagedAttachments(staged?: DeliveryAttachmentRecord[], opts?: DeliveryAttachmentOpts): DeliveryAttachmentRecord[];
+  insertStagedAttachments(db: SchedulerDatabase, outboxId: string, messageId: string | null, staged?: DeliveryAttachmentRecord[]): void;
+  cleanupStagedAttachments(staged?: DeliveryAttachmentRecord[], opts?: DeliveryAttachmentOpts): void;
+  cleanupDeliveryAttachmentMaterial(outboxIds?: string[], attachments?: DeliveryAttachmentRecord[], opts?: DeliveryAttachmentOpts): {
+    filesRemoved: number;
+    directoriesRemoved: number;
+    skippedUnsafePaths: number;
+  };
   listDeliveryAttachments(outboxId: string, opts?: Record<string, unknown>): DeliveryAttachmentRecord[];
   verifyDeliveryAttachment(attachment: DeliveryAttachmentRecord): boolean;
   materializeDeliveryAttachment(attachment: DeliveryAttachmentRecord, opts?: Record<string, unknown>): string;
 };
 
-export const approvalState: Record<string, unknown>;
+export const approvalState: {
+  APPROVAL_STATUSES: Readonly<Record<'PENDING' | 'APPROVED' | 'REJECTED' | 'TIMED_OUT' | 'CANCELLED' | 'DISPATCHING' | 'DISPATCHED', string>>;
+  transitionPendingApproval(id: string, status: string, opts?: ApprovalStateOpts): ApprovalTransitionResult;
+  getApprovalForDispatch(dispatchQueueId: string, opts?: { db?: SchedulerDatabase; activeOnly?: boolean }): ApprovalRecord | null;
+  beginApprovalDispatch(dispatchQueueId: string, opts?: { db?: SchedulerDatabase }): ApprovalTransitionResult;
+  markApprovalDispatched(dispatchQueueId: string, opts?: { db?: SchedulerDatabase; notes?: string | null }): ApprovalTransitionResult;
+  deferApprovalDispatch(dispatchQueueId: string, reason?: string | null, opts?: { db?: SchedulerDatabase; scheduledFor?: string | null }): ApprovalTransitionResult;
+  cancelApproval(id: string, reason?: string, opts?: { db?: SchedulerDatabase; resolvedBy?: string }): ApprovalTransitionResult;
+  cancelApprovalForDispatch(dispatchQueueId: string, reason?: string, opts?: { db?: SchedulerDatabase; resolvedBy?: string }): ApprovalTransitionResult;
+  cancelApprovalsForJob(jobId: string, reason?: string, opts?: { db?: SchedulerDatabase; resolvedBy?: string }): { changed: number; approvals: ApprovalRecord[] };
+  cancelUnavailableJobApprovals(opts?: { db?: SchedulerDatabase }): { changed: number; approvals: ApprovalRecord[] };
+  recoverInterruptedApprovalDispatches(opts?: { db?: SchedulerDatabase }): { recovered: number };
+};
 
 export const idempotency: {
-  generateIdempotencyKey(jobId: string, scheduledTime?: string): string;
+  generateIdempotencyKey(jobId: string, scheduledTime: string): string;
   generateChainIdempotencyKey(parentRunId: string, childJobId: string): string;
-  generateRunNowIdempotencyKey(jobId: string): string;
+  generateRunNowIdempotencyKey(jobId: string, dispatchId?: string | null): string;
   checkIdempotencyKey(key: string): Record<string, unknown> | null;
   getIdempotencyEntry(key: string): Record<string, unknown> | null;
   claimIdempotencyKey(key: string, jobId: string, runId: string, expiresAt: string): boolean;
@@ -1039,6 +1313,7 @@ export const SCHEDULER_SCHEMAS: {
   dispatcher_leases: { key_fields: string[] };
   delivery_outbox: { statuses: string[]; key_fields: string[] };
   delivery_attachments: { key_fields: string[] };
+  evidence_records: { key_fields: string[] };
 };
 
 // -- v0.2 Runtime result interfaces --
@@ -1047,11 +1322,11 @@ export interface ResolvedIdentity {
   provider?: string;
   session?: Record<string, unknown> | null;
   source?: 'provider' | 'provider-error';
-  subject_kind: string;
-  principal: string | null;
-  trust_level: string | null;
-  delegation_mode: string | null;
-  raw: Record<string, unknown> | null;
+  subject_kind?: string;
+  principal?: string | null;
+  trust_level?: string | null;
+  delegation_mode?: string | null;
+  raw?: Record<string, unknown> | null;
   transient?: boolean;
   error?: string;
 }
@@ -1067,7 +1342,7 @@ export interface AuthorizationProofResult {
   verified: boolean;
   method: string | null;
   ref: string | null;
-  source?: 'provider' | 'provider-error';
+  source?: 'provider' | 'provider-error' | 'explicit-opt-out' | 'verifier-required';
   provider?: string;
   error?: string;
 }
@@ -1076,31 +1351,63 @@ export interface AuthorizationResult {
   decision: 'permit' | 'deny' | 'escalate';
   reason: string;
   ref: string | null;
-  source?: 'provider' | 'provider-error';
+  source?: 'provider' | 'provider-error' | 'reference' | 'reference-error' | 'structural' | 'structural-error';
   provider?: string;
+  policy_digest?: string;
+  provider_context_hash?: string | null;
+  decision_context_hash?: string | null;
 }
 
 export interface EvidenceResult {
   evidence_ref: string | null;
   created_at: string;
-  hash: string | null;
-  integrity: 'none';
+  algorithm: 'sha256';
+  hash: string;
+  integrity: 'sha256';
+  canonicalization: 'json-sort-v1';
+  retention_policy: string | null;
+  retention_until: string | null;
+  payload: Record<string, unknown>;
   payload_summary: Record<string, unknown>;
+}
+
+export interface EvidenceExecutionSnapshot {
+  command: Record<string, JsonValue>;
+  contract: Record<string, JsonValue>;
+  job_snapshot: Record<string, JsonValue>;
+  hash: string;
+}
+
+export interface DelegationValidationResult {
+  valid: boolean;
+  mode: string | null;
+  depth: number;
+  max_depth: number;
+  acyclic: boolean | null;
+  no_duplicate_hops: boolean;
+  cycle_check: 'explicit-edges' | 'not-representable';
+  all_grants_present: boolean;
+  provider_validated: boolean;
+  errors: string[];
 }
 
 export interface CredentialHandoffSummary {
   mode: string | null;
   bindings_count: number;
   cleanup_required: boolean;
+  error?: string;
 }
 
 export const v02Runtime: {
   TRUST_LEVELS: readonly string[];
   compareTrustLevels(a: string | null | undefined, b: string | null | undefined): -1 | 0 | 1;
   resolveIdentity(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<ResolvedIdentity | null>;
+  validateDelegation(job: Record<string, unknown>, resolvedIdentity: ResolvedIdentity | null): DelegationValidationResult | null;
   evaluateTrust(job: Record<string, unknown>, resolvedIdentity: ResolvedIdentity | null): TrustEvaluation;
   verifyAuthorizationProof(job: Record<string, unknown>, ctx?: Record<string, unknown>): Promise<AuthorizationProofResult | null>;
   evaluateAuthorization(job: Record<string, unknown>, identityResult: ResolvedIdentity | null, trustResult: TrustEvaluation | null, ctx?: Record<string, unknown>): Promise<AuthorizationResult | null>;
+  buildEvidenceExecutionSnapshot(job: Record<string, unknown>): EvidenceExecutionSnapshot;
   generateEvidence(job: Record<string, unknown>, runResult: Record<string, unknown> | null, outcomes: Record<string, unknown> | null): EvidenceResult | null;
+  verifyEvidenceRecord(record: EvidenceResult | string): { valid: boolean; algorithm?: 'sha256'; expected_hash?: string; actual_hash?: string; error?: string; errors?: string[] };
   summarizeCredentialHandoff(job: Record<string, unknown>): CredentialHandoffSummary | null;
 };

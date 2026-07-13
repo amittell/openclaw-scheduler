@@ -39,6 +39,9 @@ const FINISH_FIELD_COLUMNS = new Map([
   ['shell_stdout_bytes', 'shell_stdout_bytes'],
   ['shell_stderr_bytes', 'shell_stderr_bytes'],
   ['process_terminated_at', 'process_terminated_at'],
+  ['output_format', 'output_format'],
+  ['structured_output', 'structured_output'],
+  ['structured_output_valid', 'structured_output_valid'],
 ]);
 
 function assertRunId(runId) {

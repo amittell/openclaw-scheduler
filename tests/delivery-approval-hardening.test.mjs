@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path';
 import test, { after, before, beforeEach } from 'node:test';
 
 import { initDb, closeDb, getDb, setDbPath } from '../db.js';
-import { createJob } from '../jobs.js';
+import { createJob, deleteJob, getJob } from '../jobs.js';
 import { createRun, getRun } from '../runs.js';
 import { claimDispatch, enqueueDispatch, getDispatch } from '../dispatch-queue.js';
 import {
@@ -695,7 +695,26 @@ test('approved dispatch survives deferral without requesting approval twice', ()
   assert.equal(beginApprovalDispatch(fixture.dispatch.id).changed, true);
   assert.equal(markApprovalDispatched(fixture.dispatch.id).changed, true);
   assert.equal(getApproval(fixture.approval.id).status, 'dispatched');
+  assert.equal(getRun(fixture.run.id).status, 'skipped');
   assert.equal(markApprovalDispatched(fixture.dispatch.id).changed, false);
+  assert.equal(deleteJob(fixture.job.id), true, 'terminal approval gate must not block self-destruct cleanup');
+  assert.equal(getJob(fixture.job.id), undefined);
+});
+
+test('public cancellation closes approved and dispatching approval gates', () => {
+  const approved = createApprovalFixture('approval-cancel-approved');
+  assert.equal(resolveApproval(approved.approval.id, 'approved', null).status, 'approved');
+  assert.equal(resolveApproval(approved.approval.id, 'cancelled', null, 'operator cancelled').status, 'cancelled');
+  assert.equal(getRun(approved.run.id).status, 'cancelled');
+  assert.equal(getDispatch(approved.dispatch.id).status, 'cancelled');
+
+  const dispatching = createApprovalFixture('approval-cancel-dispatching');
+  assert.equal(resolveApproval(dispatching.approval.id, 'approved', null).status, 'approved');
+  assert.ok(claimDispatch(dispatching.dispatch.id));
+  assert.equal(beginApprovalDispatch(dispatching.dispatch.id).changed, true);
+  assert.equal(resolveApproval(dispatching.approval.id, 'cancelled', null, 'operator cancelled').status, 'cancelled');
+  assert.equal(getRun(dispatching.run.id).status, 'cancelled');
+  assert.equal(getDispatch(dispatching.dispatch.id).status, 'cancelled');
 });
 
 test('only one concurrent approval decision wins', async () => {
@@ -738,8 +757,31 @@ test('approval dispatch recovery distinguishes started work from an expired clai
   const recovered = recoverInterruptedApprovalDispatches();
   assert.equal(recovered.recovered, 2);
   assert.equal(getApproval(started.approval.id).status, 'dispatched');
+  assert.equal(getRun(started.run.id).status, 'skipped');
   assert.equal(getApproval(expired.approval.id).status, 'approved');
   assert.equal(getDispatch(expired.dispatch.id).status, 'pending');
+});
+
+test('approval recovery terminalizes historical dispatched gate runs', () => {
+  const legacy = createApprovalFixture('approval-recovery-legacy-dispatched');
+  resolveApproval(legacy.approval.id, 'approved', 'operator');
+  getDb().prepare(`
+    UPDATE approvals
+    SET status = 'dispatched', dispatched_at = datetime('now')
+    WHERE id = ?
+  `).run(legacy.approval.id);
+  getDb().prepare(`
+    UPDATE runs
+    SET evidence_required = 1
+    WHERE id = ?
+  `).run(legacy.run.id);
+
+  const recovered = recoverInterruptedApprovalDispatches();
+  assert.equal(recovered.recovered, 1);
+  assert.equal(getApproval(legacy.approval.id).status, 'dispatched');
+  assert.equal(getRun(legacy.run.id).status, 'skipped');
+  assert.equal(getRun(legacy.run.id).evidence_required, 0);
+  assert.equal(deleteJob(legacy.job.id), true);
 });
 
 test('disabled jobs and explicit pre-delete cancellation close active approvals', () => {

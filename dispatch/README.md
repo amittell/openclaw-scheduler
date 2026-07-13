@@ -308,24 +308,27 @@ No manual token configuration needed on a standard OpenClaw install.
 ### How it works
 
 When `--deliver-to` is set, dispatch registers a **scheduler watcher job**
-after dispatching the session. The watcher polls the session result every
-minute until the agent sends the structured local `done` completion signal, then
-delivers via the scheduler's `handleDelivery` pipeline. If the structured signal
-is missed but the transcript has strict clean terminal completion evidence, the
-watcher may deliver that terminal assistant report; arbitrary mid-task replies
-remain diagnostics.
+after dispatching the session. The watcher polls until the agent sends the
+structured local `done` completion signal. Both the `done` path and the routed
+watcher acquire the same label/session/run-scoped completion claim and enqueue
+the final message in `delivery_outbox`. They never place externally addressed
+completion output in the agent inbox. If the structured signal is missed but
+the transcript has strict clean terminal completion evidence, the watcher may
+enqueue that terminal assistant report; arbitrary mid-task replies remain
+diagnostics.
 
 ```
 dispatch enqueue --deliver-to <telegram-user-id>
   -> gateway agent call (deliver: false, fire-and-forget)
   -> scheduler job: <brand>-deliver:<label> (run_now: true, shell, one-shot)
   -> watcher.mjs: long-running blocking process polls session status
-  -> on success (exit 0): scheduler delivers output to telegram/<telegram-user-id>
+  -> on success: watcher enqueues to delivery_outbox and emits no delivery stdout
+  -> outbox consumer delivers to telegram/<telegram-user-id>
   -> job auto-prunes via ttl_hours (default 48h)
 ```
 
 **Why scheduler instead of gateway `deliver:true`?**
-- Retry / at-least-once delivery guarantee
+- Retryable durable delivery with idempotency checkpoints
 - Delivery aliases (scheduler resolves `@team_room` → channel/target)
 - Audit trail (runs table records every attempt)
 - Chain triggers (completion can fire child jobs)
@@ -333,9 +336,20 @@ dispatch enqueue --deliver-to <telegram-user-id>
 
 ### Watcher script
 
-`deliver-watcher.sh` checks the session result. Exit 0 with output = deliver.
-Exit 1 with no output = retry on next cron tick (no spam — `announce-always`
-only delivers when `output.trim()` is truthy).
+`deliver-watcher.sh` checks the session result. For a configured route, a
+successful watcher enqueues the completion durably, exits 0 with empty stdout,
+and emits `WATCHER_ALREADY_DELIVERED` on stderr so the scheduler wrapper does
+not enqueue a duplicate. The legacy marker is not a channel delivery receipt;
+completion debt remains open until all outbox parts are actually delivered.
+Without a route, the watcher retains its historical stdout delivery result
+after acquiring the durable completion claim. Exit 1 with no output means retry
+on the next cron tick.
+
+Completion claims are scoped to the label, session, and run, so reusing a label
+does not suppress a later run. If the claim store is unavailable, the operation
+fails closed as `COMPLETION_CLAIM_UNAVAILABLE`. Multipart messages use separate
+outbox rows with deterministic `:part:i/N` idempotency keys, allowing retries
+to resume from the durable per-part checkpoint.
 
 Quiet sessions are treated conservatively. The watcher does not mark a running
 job failed just because `sessions.json` or the JSONL transcript has been quiet
@@ -355,9 +369,10 @@ error is cleared from the label.
 
 ### Progress check-ins from subagent sessions
 
-Subagent sessions run without PATH access to the `openclaw` CLI, so
-`openclaw system event` silently fails. For mid-task progress updates,
-use the gateway HTTP API via curl:
+The dispatch prompt includes a literal `openclaw-scheduler messages send`
+checkpoint command that the worker can copy at logical milestones. It does not
+promise a `CHECKPOINT_NOTIFY_CMD` environment variable. If the scheduler CLI is
+not available in the worker environment, use the gateway HTTP API directly:
 
 ```bash
 GW_TOKEN=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))['gateway']['auth']['token'])")

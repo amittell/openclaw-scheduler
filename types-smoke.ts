@@ -177,7 +177,7 @@ const gotApproval: ApprovalRecord | undefined = approvals.getApproval('id');
 const pending: ApprovalRecord | undefined = approvals.getPendingApproval('job-1');
 const allPending = approvals.listPendingApprovals();
 if (allPending.length) { void allPending[0].job_name; }
-const resolved: ApprovalRecord = approvals.resolveApproval('id', 'approved', 'operator', 'lgtm');
+const resolved: ApprovalRecord | null = approvals.resolveApproval('id', 'approved', 'operator', 'lgtm');
 const pendingCount: number = approvals.countPendingApprovalsForJob('job-1');
 const timedOutApprovals = approvals.getTimedOutApprovals();
 if (timedOutApprovals.length) {

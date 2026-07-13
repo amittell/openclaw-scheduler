@@ -20,7 +20,7 @@ const steps = smokeOnly
       { name: 'typecheck', cmd: [npmExec, ['run', 'typecheck']] },
       { name: 'test', cmd: [npmExec, ['test']] },
       { name: 'coverage', cmd: [npmExec, ['run', 'coverage']] },
-      { name: 'pack', cmd: [npmExec, ['pack', '--dry-run']] },
+      { name: 'package', cmd: [npmExec, ['run', 'verify:package']] },
     ];
 
 for (const step of steps) {

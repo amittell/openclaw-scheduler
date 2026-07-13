@@ -1,6 +1,6 @@
 # Job Quick Reference
 
-Copy-paste patterns for scheduler 0.3.0 and schema 27. Validate a saved spec
+Copy-paste patterns for scheduler 0.4.0 and schema 28. Validate a saved spec
 with `openclaw-scheduler jobs validate --file job.json` before adding it.
 
 ## Shell job with cron schedule
@@ -143,6 +143,9 @@ Create parent first, then child with `parent_id` set to the parent's ID.
   "run_timeout_ms": 600000,
   "approval_required": true,
   "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "approval_risk_level": "high",
+  "approval_approver_scope": "user:alex",
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
@@ -153,8 +156,57 @@ Create parent first, then child with `parent_id` set to the parent's ID.
 Approve or reject:
 
 ```bash
-openclaw-scheduler jobs approve <id>
-openclaw-scheduler jobs reject <id> "not ready yet"
+openclaw-scheduler approvals list --json
+openclaw-scheduler approvals approve APPROVAL_ID --reason "Change window open"
+openclaw-scheduler approvals reject APPROVAL_ID --reason "not ready yet"
+```
+
+Approval gates apply to root, manual, scheduled, one-shot, and chain-triggered
+dispatches. Approving a scoped gate requires the invoking local OS identity to
+match, and scoped gates cannot use timeout auto-approval. Any
+execution-contract change cancels the pending approval. Legacy
+`jobs approve/reject JOB_ID` commands resolve only the job's current pending
+gate and cannot choose a different identity.
+
+## Handoff v3 governed fields
+
+```json
+{
+  "approval_required": true,
+  "approval_risk_level": "high",
+  "approval_approver_scope": "user:alex",
+  "approval_auto": "reject",
+  "output_format": "json",
+  "authorization_ref": "opa:deployments/production",
+  "evidence_ref": "audit:production-deploy",
+  "evidence": "{\"provider\":\"sha256\",\"methods\":[\"sha256\"],\"verify\":{\"required\":false},\"collect\":[\"result\"],\"format\":\"json\"}"
+}
+```
+
+- `approval_risk_level`: `low`, `medium`, or `high`.
+- `approval_approver_scope`: unprefixed exact identity, `exact:`,
+  `user:`, `uid:`, or `principal:` local identity. Domain scopes are rejected.
+- `output_format`: `json`, `ndjson`, or `text`. Invalid declared output fails
+  the run and blocks children.
+- `authorization_ref`: `provider:policy-ref` or
+  `provider://provider/policy-ref`. The provider must implement
+  `resolvePolicy()` or `resolveAuthorization()`; resolution errors deny.
+- Delegation declarations are validated for mode, chain depth, allowed
+  delegators, per-hop grants, cycles, and provider denial before execution.
+- Supported checksum evidence is canonicalized with `json-sort-v1`, hashed with
+  SHA-256, and stored as one immutable record per run without raw credentials.
+  External providers such as `ssh` or `none`, non-SHA-256 methods, and required
+  signature verification fail validation.
+- `identity.presentation` and `credential_handoff` work locally for shell jobs
+  and through `chat-completions-env-inject-v1` for isolated jobs. They are
+  rejected for main-session jobs. Auth-profile-only isolated jobs remain
+  compatible with Gateways that do not advertise env injection.
+
+Inspect the runtime contract and evidence:
+
+```bash
+openclaw-scheduler capabilities --json
+openclaw-scheduler runs evidence RUN_ID --json
 ```
 
 ## Multi-agent job (target a specific agent)
@@ -215,6 +267,14 @@ openclaw-scheduler jobs reject <id> "not ready yet"
 | `overlap_policy` | string | no | `allow`, `skip`, `queue` |
 | `approval_required` | boolean | no | Require HITL approval |
 | `approval_timeout_s` | integer | no | Approval window in seconds |
+| `approval_auto` | string | no | `approve` or `reject`; scoped gates require `reject` |
+| `approval_risk_level` | string | no | `low`, `medium`, or `high` |
+| `approval_approver_scope` | string | no | OS-authenticated bare/exact, local-user, UID, or local-principal scope |
+| `output_format` | string | no | `json`, `ndjson`, or `text` run-output contract |
+| `identity_delegation_mode` | string | no | Declared delegation mode validated before execution |
+| `authorization_ref` | string | no | Provider-qualified external policy reference |
+| `evidence_ref` | string | no | Stable label for immutable run evidence |
+| `evidence` | JSON/string | no | Built-in SHA-256 checksum declaration; external signer/verifier providers are rejected |
 | `enabled` | integer | no | 1 (enabled) or 0 (disabled) |
 
 For the full field list, run `openclaw-scheduler schema jobs`.

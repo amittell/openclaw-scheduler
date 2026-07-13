@@ -29,7 +29,7 @@ import {
   getStaleRuns, getTimedOutRuns,
   updateHeartbeat, pruneRuns,
   getRunningRunsByPool, updateRunSession, updateContextSummary,
-  persistV02Outcomes,
+  persistV02Outcomes, persistTerminalEvidence,
 } from './runs.js';
 import {
   sendMessage, getMessage, getInbox, getOutbox, getThread,
@@ -73,11 +73,22 @@ import {
 import { resolveLabelsPath } from './dispatch/paths.mjs';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
-  evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
+  evaluateAuthorization, generateEvidence, verifyEvidenceRecord, summarizeCredentialHandoff,
   TRUST_LEVELS, compareTrustLevels,
 } from './v02-runtime.js';
 import { runShellCommand } from './dispatcher-shell.js';
-import { prepareDispatch, finalizeDispatch, redactOutcomesForPersistence, executeAgent } from './dispatcher-strategies.js';
+import {
+  cleanupDispatchMaterialization,
+  prepareDispatch,
+  finalizeDispatch,
+  redactOutcomesForPersistence,
+  executeAgent,
+} from './dispatcher-strategies.js';
+import {
+  buildShellEnvironment,
+  evaluateGovernance,
+  summarizeGovernance,
+} from './governance.js';
 import { loadProviders, getIdentityProvider, _resetForTesting as resetProviderRegistry } from './provider-registry.js';
 import * as publicApi from './index.js';
 
@@ -92,6 +103,14 @@ function assert(cond, msg) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function initializeSchedulerFixtureDb(directory, filename = 'scheduler.db') {
+  const fixturePath = join(directory, filename);
+  const fixtureDb = new Database(fixturePath);
+  fixtureDb.exec(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'), 'utf8'));
+  fixtureDb.close();
+  return fixturePath;
+}
 
 async function waitFor(fn, { timeoutMs = 5000, intervalMs = 50, label = 'condition' } = {}) {
   const started = Date.now();
@@ -829,7 +848,16 @@ assert(teamInbox.some(m => m.id === teamMsg.id), 'getTeamMessages finds team mes
 // -- Cascade delete ------------------------------------------
 console.log('\nCascade:');
 const delJob = createJob({ name: 'Deletable', schedule_cron: '0 * * * *', payload_message: 'bye', delivery_mode: 'none', delivery_opt_out_reason: 'test' , run_timeout_ms: 300_000, origin: 'system' });
-createRun(delJob.id);
+const delRun = createRun(delJob.id);
+let activeDeleteRejected = false;
+try {
+  deleteJob(delJob.id);
+} catch (error) {
+  activeDeleteRejected = error.code === 'JOB_ACTIVE_RUNS';
+}
+assert(activeDeleteRejected, 'active runs prevent destructive job deletion');
+assert(getRun(delRun.id)?.status === 'running', 'failed deletion preserves the active run');
+finishRun(delRun.id, 'cancelled', { summary: 'cascade test cleanup' });
 deleteJob(delJob.id);
 assert(!getJob(delJob.id), 'job deleted');
 assert(getRunsForJob(delJob.id).length === 0, 'runs cascade deleted');
@@ -838,7 +866,10 @@ assert(getRunsForJob(delJob.id).length === 0, 'runs cascade deleted');
 console.log('\nPrune:');
 for (let i = 0; i < 5; i++) { const r = createRun(job.id); finishRun(r.id, 'ok'); }
 pruneRuns(3);
-assert(getRunsForJob(job.id).length <= 3, 'pruneRuns');
+assert(
+  getRunsForJob(job.id).filter(run => ['ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked'].includes(run.status)).length <= 3,
+  'pruneRuns bounds terminal history without deleting active lifecycle state',
+);
 pruneMessages(0);
 
 // ===========================================================
@@ -1846,7 +1877,7 @@ console.log('\n-- v5: Approval Gates --');
   // Approve it
   const resolved = resolveApproval(approval.id, 'approved', 'operator', 'looks good');
   assert(resolved.status === 'approved', 'approval resolved as approved');
-  assert(resolved.resolved_by === 'operator', 'resolved_by set');
+  assert(resolved.resolved_by?.startsWith('local-user:'), 'resolved_by uses the authenticated OS identity');
   assert(resolved.notes === 'looks good', 'notes stored');
   assert(resolved.resolved_at !== null, 'resolved_at timestamp set');
 
@@ -2192,6 +2223,18 @@ console.log('\n-- Idempotency Keys --');
   await new Promise(r => setTimeout(r, 2));
   const rnKey2 = generateRunNowIdempotencyKey('job-abc');
   assert(rnKey1 !== rnKey2, 'run-now keys are unique per call');
+  const durableRunNow1 = generateRunNowIdempotencyKey('job-abc', 'manual-dispatch-1');
+  const durableRunNowReplay = generateRunNowIdempotencyKey('job-abc', 'manual-dispatch-1');
+  const durableRunNow2 = generateRunNowIdempotencyKey('job-abc', 'manual-dispatch-2');
+  assert(durableRunNow1 === durableRunNowReplay, 'run-now keys are stable for one durable dispatch');
+  assert(durableRunNow1 !== durableRunNow2, 'distinct durable manual dispatches receive distinct keys');
+  let rejectedObjectJobId = false;
+  try {
+    generateIdempotencyKey({ id: 'not-a-string' }, '2026-02-23 09:00:00');
+  } catch (error) {
+    rejectedObjectJobId = /jobId must be a non-empty string/.test(error.message);
+  }
+  assert(rejectedObjectJobId, 'scheduled key generation rejects object coercion that could collide across jobs');
 
   // 5. Ledger claim blocks duplicate dispatch
   const testJob = createJob({ name: 'idem-test-1', schedule_cron: '0 * * * *', payload_message: 'test' , delivery_mode: 'none', delivery_opt_out_reason: 'test', run_timeout_ms: 300_000, origin: 'system' });
@@ -2362,6 +2405,7 @@ console.log('\n-- Idempotency Keys --');
 
   // Clean up test runs
   finishRun(testRun.id, 'ok'); finishRun(testRun2.id, 'ok'); finishRun(testRun3.id, 'ok');
+  finishRun(runWithKey.id, 'ok');
   finishRun(nullKeyRun.id, 'ok');
   deleteJob(testJob.id);
 }
@@ -5417,6 +5461,7 @@ process.exit(1);
   //    We use a mock dispatch that always returns status=done with liveness error,
   //    simulating auto-resolve after STARTUP_GRACE_MS with session never found.
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-sftest-'));
+  const watcherDbPath = initializeSchedulerFixtureDb(tempDir);
   const mockSpawnFailPath = join(tempDir, 'mock-spawn-fail.mjs');
   const mockLabelsSpawnFail = join(tempDir, 'labels-sf.json');
   const watcherPath = join(dispatchDir, 'watcher.mjs');
@@ -5458,6 +5503,7 @@ if (sub === 'status') {
     execFileSync(process.execPath, [watcherPath, '--label', 'test-sf', '--timeout', '5', '--poll-interval', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockSpawnFailPath,
         DISPATCH_LABELS_PATH: mockLabelsSpawnFail,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -5539,6 +5585,7 @@ if (sub === 'status') {
     ncStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-nc', '--timeout', '30', '--poll-interval', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockNormalPath,
         DISPATCH_LABELS_PATH: mockLabelsNormal,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -5617,6 +5664,7 @@ if (sub === 'status') {
       summaryStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-summary', '--timeout', '5', '--poll-interval', '1'], {
         env: {
           ...process.env,
+          SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockSummaryPath,
           DISPATCH_LABELS_PATH: mockLabelsSummary,
           OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -5732,6 +5780,7 @@ if (sub === 'status') {
     const handoffChild = spawn(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '30', '--poll-interval', '5', '--idle-threshold', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockHandoffPath,
         DISPATCH_LABELS_PATH: mockLabelsHandoff,
         OPENCLAW_GATEWAY_TOKEN: 'test-token',
@@ -5799,31 +5848,33 @@ if (sub === 'status') {
       resultReads: handoffState.resultReads,
     }, null, 2));
 
-    let resumedStdout;
-    let resumedExitCode = 0;
-    try {
-      resumedStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '5', '--poll-interval', '1', '--idle-threshold', '1'], {
+    const resumed = spawnSync(process.execPath, [watcherPath, '--label', 'test-handoff', '--timeout', '5', '--poll-interval', '1', '--idle-threshold', '1'], {
         env: {
           ...process.env,
+          SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockHandoffPath,
           DISPATCH_LABELS_PATH: mockLabelsHandoff,
-            OPENCLAW_GATEWAY_TOKEN: 'test-token',
+          OPENCLAW_GATEWAY_TOKEN: 'test-token',
           OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         },
         encoding: 'utf8',
         timeout: 12000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
-    } catch (err) {
-      resumedExitCode = err.status ?? 1;
-      resumedStdout = err.stdout ?? '';
-    }
 
     const finalLabels = JSON.parse(readFileSync(mockLabelsHandoff, 'utf8'));
-    assert(resumedExitCode === 0, 'sigterm handoff: successor watcher exits 0 on real completion');
-    assert(resumedStdout.includes('Handoff preserved the real completion delivery.'), 'sigterm handoff: successor watcher delivers the actual completion text');
-    assert(!resumedStdout.includes('interrupted by watcher timeout'), 'sigterm handoff: successor watcher output stays free of fake timeout text');
+    const handoffDeliveryDb = new Database(watcherDbPath, { readonly: true });
+    const handoffOutbox = handoffDeliveryDb.prepare(`
+      SELECT body, status FROM delivery_outbox WHERE target = ? ORDER BY created_at DESC LIMIT 1
+    `).get('telegram:test');
+    handoffDeliveryDb.close();
+    assert(resumed.status === 0, 'sigterm handoff: successor watcher exits 0 on real completion');
+    assert((resumed.stdout || '').trim() === '', 'sigterm handoff: routed successor does not duplicate completion on stdout');
+    assert((resumed.stderr || '').includes('WATCHER_ALREADY_DELIVERED'), 'sigterm handoff: routed successor reports durable delivery marker');
+    assert(handoffOutbox?.body.includes('Handoff preserved the real completion delivery.'), 'sigterm handoff: successor enqueues the actual completion text');
+    assert(handoffOutbox?.status === 'pending', 'sigterm handoff: successor leaves completion pending in durable outbox');
     assert(finalLabels['test-handoff'].status === 'done', 'sigterm handoff: successor watcher marks the label done after real completion');
+    assert(Array.isArray(finalLabels['test-handoff'].completionOutboxIds), 'sigterm handoff: successor records durable outbox IDs');
 
     rmSync(handoffTempDir, { recursive: true, force: true });
   }
@@ -5884,6 +5935,7 @@ if (sub === 'status') {
     const trivialRun = spawnSync(process.execPath, [watcherPath, '--label', 'test-trivial', '--timeout', '5', '--poll-interval', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockTrivialPath,
         DISPATCH_LABELS_PATH: mockLabelsTrivial,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -5944,6 +5996,7 @@ if (sub === 'status') {
       intrStdout = execFileSync(process.execPath, [watcherPath, '--label', 'test-intr', '--timeout', '30', '--poll-interval', '1'], {
         env: {
           ...process.env,
+          SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockIntrPath,
           DISPATCH_LABELS_PATH: mockLabelsIntr,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -6033,6 +6086,7 @@ if (sub === 'status') {
     const missedRun = spawnSync(process.execPath, [watcherPath, '--label', missedLabel, '--timeout', '5', '--poll-interval', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         HOME: missedTempDir,
         DISPATCH_INDEX_PATH: mockMissedPath,
         DISPATCH_LABELS_PATH: mockLabelsMissed,
@@ -6098,6 +6152,7 @@ if (sub === 'status') {
     const verifiedRun = spawnSync(process.execPath, [watcherPath, '--label', verifiedLabel, '--timeout', '5', '--poll-interval', '1'], {
       env: {
         ...process.env,
+        SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockVerifiedPath,
         DISPATCH_LABELS_PATH: mockLabelsVerified,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -6358,6 +6413,7 @@ console.log('\n-- Watcher stop_reason early delivery --');
 
   // isSessionCleanlyFinished behavioral tests using real JSONL files
   const tmpDir = mkdtempSync(join(tmpdir(), 'watcher-stopreason-'));
+  const stopReasonDbPath = initializeSchedulerFixtureDb(tmpDir);
   const sessionsDir = join(tmpDir, '.openclaw', 'agents', 'main', 'sessions');
   mkdirSync(sessionsDir, { recursive: true });
 
@@ -6436,6 +6492,7 @@ if (sub === 'status') {
       encoding: 'utf8',
       env: {
         ...process.env,
+        SCHEDULER_DB: stopReasonDbPath,
         HOME: tmpDir,
         DISPATCH_INDEX_PATH: mockDispatchEt,
         DISPATCH_LABELS_PATH: mockLabels,
@@ -6518,6 +6575,7 @@ if (sub === 'status') {
         encoding: 'utf8',
         env: {
           ...process.env,
+          SCHEDULER_DB: stopReasonDbPath,
           HOME: tmpDir,
           DISPATCH_INDEX_PATH: mockDispatchTu,
           DISPATCH_LABELS_PATH: mockLabels2,
@@ -9251,7 +9309,7 @@ console.log('\n-- Watchdog Heartbeat Guard --');
 // Post-Office Routing
 // ===========================================================
 
-console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table --');
+console.log('\n-- Post-Office Routing: gatewayNotify enqueues to durable delivery outbox --');
 {
   const { onFinished } = await import('./dispatch/hooks.mjs');
   const liveDb = getDb();
@@ -9267,9 +9325,10 @@ console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table 
     expectedBodyText,
     unexpectedBodyText,
   }) {
-    const before = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=?").get(label).cnt;
+    const before = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get().cnt;
+    const messagesBefore = liveDb.prepare('SELECT COUNT(*) as cnt FROM messages').get().cnt;
 
-    await onFinished({
+    const outcomes = await onFinished({
       label,
       job_id: `jid-${label}`,
       run_id: `rid-${label}`,
@@ -9281,22 +9340,26 @@ console.log('\n-- Post-Office Routing: gatewayNotify enqueues to messages table 
       completion,
     });
 
-    const after = liveDb.prepare("SELECT COUNT(*) as cnt FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=?").get(label).cnt;
-    assert(after === before + 1, `gatewayNotify ${label}: enqueues one message to messages table`);
+    const deliveryResult = outcomes
+      .filter(outcome => outcome.status === 'fulfilled')
+      .map(outcome => outcome.value)
+      .find(value => value?.enqueued === true);
+    const after = liveDb.prepare('SELECT COUNT(*) as cnt FROM delivery_outbox').get().cnt;
+    const messagesAfter = liveDb.prepare('SELECT COUNT(*) as cnt FROM messages').get().cnt;
+    assert(after === before + 1, `gatewayNotify ${label}: enqueues one durable outbox row`);
+    assert(messagesAfter === messagesBefore, `gatewayNotify ${label}: does not enqueue through the agent messages table`);
+    assert(deliveryResult?.partCount === 1, `gatewayNotify ${label}: returns the durable single-part checkpoint`);
 
-    const msg = liveDb.prepare("SELECT * FROM messages WHERE from_agent='dispatch' AND to_agent='main' AND kind='result' AND subject=? ORDER BY created_at DESC, id DESC LIMIT 1").get(label);
-    assert(msg !== undefined,                              `gatewayNotify ${label}: message exists`);
-    assert(msg.from_agent === 'dispatch',                  `gatewayNotify ${label}: from_agent=dispatch`);
-    assert(msg.to_agent === 'main',                        `gatewayNotify ${label}: to_agent=main`);
-    assert(msg.kind === 'result',                          `gatewayNotify ${label}: kind=result`);
-    assert(msg.subject === label,                          `gatewayNotify ${label}: subject=label`);
+    const msg = liveDb.prepare('SELECT * FROM delivery_outbox WHERE id = ?').get(deliveryResult?.outboxId);
+    assert(msg !== undefined,                              `gatewayNotify ${label}: outbox row exists`);
     assert(msg.body.includes(label),                       `gatewayNotify ${label}: body includes label`);
     assert(msg.body.includes(expectedBodyText),            `gatewayNotify ${label}: body includes structured delivery text`);
     if (unexpectedBodyText) {
       assert(!msg.body.includes(unexpectedBodyText),       `gatewayNotify ${label}: body suppresses fallback/raw text`);
     }
-    assert(msg.channel === 'telegram',                     `gatewayNotify ${label}: channel stored for reference`);
-    assert(msg.status === 'pending',                       `gatewayNotify ${label}: message status=pending (not yet delivered)`);
+    assert(msg.channel === 'telegram',                     `gatewayNotify ${label}: channel stored`);
+    assert(msg.target === '1234567890',                    `gatewayNotify ${label}: target stored`);
+    assert(msg.status === 'pending',                       `gatewayNotify ${label}: outbox status=pending`);
   }
 
   await runGatewayNotifyCase({
@@ -9391,6 +9454,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     expectEnqueued,
   }) {
     const tempDir = mkdtempSync(join(tmpdir(), `dispatch-post-office-${slug}-`));
+    const schedulerDbPath = initializeSchedulerFixtureDb(tempDir);
     const labelsPath = join(tempDir, 'labels.json');
     const label = `post-office-${slug}`;
     const jobName = `DispatchCompletion-${slug}`;
@@ -9425,7 +9489,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
 
     execFileSync(process.execPath, doneArgs, {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999', HOME: tempDir },
+      env: { ...process.env, SCHEDULER_DB: schedulerDbPath, DISPATCH_LABELS_PATH: labelsPath, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999', HOME: tempDir },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -9434,6 +9498,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       encoding: 'utf8',
       env: {
         ...process.env,
+        SCHEDULER_DB: schedulerDbPath,
         DISPATCH_LABELS_PATH: labelsPath,
         OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999',
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -9576,9 +9641,11 @@ console.log('\n-- Post-Office Routing: direct done-path delivery debt tracking -
     FROM completion_debts
     WHERE task_label = ?
   `).get(deliveredLabel);
-  assert(deliveredDebt?.status === 'closed', 'done-path debt: visible completion closes debt row');
-  assert(deliveredDebt?.close_reason === 'confirmed-completion-delivered', 'done-path debt: close_reason records confirmed delivery');
-  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(deliveredLabel);
+  assert(deliveredDebt?.status === 'delivering', 'done-path debt: durable enqueue keeps the debt open until delivery is confirmed');
+  assert(deliveredDebt?.close_reason === null, 'done-path debt: durable enqueue is not treated as a delivery receipt');
+  for (const outboxId of delivered.outboxIds || []) {
+    liveDb.prepare('DELETE FROM delivery_outbox WHERE id = ?').run(outboxId);
+  }
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(deliveredLabel);
 
   const debtLabel = `delivery-debt-open-${Date.now()}`;
@@ -9636,7 +9703,7 @@ console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) 
   );
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(claimLabel);
 
-  // End-to-end: two enqueues of the same completion produce exactly one message.
+  // End-to-end: two enqueues of the same completion produce exactly one outbox row.
   const dupLabel = `delivery-claim-enqueue-${Date.now()}`;
   const enqueueArgs = {
     label: dupLabel,
@@ -9647,19 +9714,20 @@ console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) 
   };
   const first = await enqueueCompletionNotification(enqueueArgs);
   const second = await enqueueCompletionNotification(enqueueArgs);
-  assert(first.ok === true && first.delivered === true, 'delivery claim: first enqueue delivers');
+  assert(first.ok === true && first.enqueued === true && first.delivered === false, 'delivery claim: first attempt enqueues durable delivery');
   assert(second.ok === false && second.deduped === true && second.reason === 'already-claimed', 'delivery claim: second enqueue is deduped, not re-delivered');
-  const dupMessages = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE subject = ?`).get(dupLabel);
-  assert(dupMessages.cnt === 1, 'delivery claim: exactly one completion message is enqueued across both attempts');
-  liveDb.prepare(`DELETE FROM messages WHERE subject = ?`).run(dupLabel);
+  const dupOutbox = liveDb.prepare('SELECT COUNT(*) AS cnt FROM delivery_outbox WHERE id = ?').get(first.outboxId);
+  assert(dupOutbox.cnt === 1, 'delivery claim: exactly one completion outbox row is enqueued across both attempts');
+  for (const outboxId of first.outboxIds || []) {
+    liveDb.prepare('DELETE FROM delivery_outbox WHERE id = ?').run(outboxId);
+  }
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(dupLabel);
 
-  // Message-level idempotency backstops the claim: even if the claim is no longer
+  // Outbox idempotency backstops the claim: even if the claim is no longer
   // blocking (crash-recovery stale reclaim), re-enqueuing the same run's
   // completion does not produce a second message row.
   const idemLabel = `enqueue-idem-${Date.now()}`;
   const idemSession = 'agent:main:subagent:enqueue-idem';
-  const idemKey = `dispatch-completion:${idemLabel}:${idemSession}`;
   const idemArgs = {
     label: idemLabel,
     summary: 'Landed the completion-message idempotency backstop.',
@@ -9670,11 +9738,14 @@ console.log('\n-- Post-Office Routing: atomic completion delivery claim (dedup) 
   const e1 = await enqueueCompletionNotification(idemArgs);
   resetCompletionDeliveryClaim({ label: idemLabel }); // simulate the claim no longer blocking
   const e2 = await enqueueCompletionNotification(idemArgs);
-  assert(e1.ok === true && e1.delivered === true && e1.deduped === false, 'enqueue idempotency: first enqueue delivers a fresh message');
-  assert(e2.ok === true && e2.deduped === true, 'enqueue idempotency: a re-enqueue past the claim is deduped by the message key');
-  const idemMsgRows = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE idempotency_key = ?`).get(idemKey);
-  assert(idemMsgRows.cnt === 1, 'enqueue idempotency: exactly one completion message row exists for the run');
-  liveDb.prepare(`DELETE FROM messages WHERE idempotency_key = ?`).run(idemKey);
+  assert(e1.ok === true && e1.enqueued === true && e1.delivered === false && e1.deduped === false, 'enqueue idempotency: first enqueue creates a fresh outbox checkpoint');
+  assert(e2.ok === true && e2.deduped === true, 'enqueue idempotency: a re-enqueue past the claim is deduped by the outbox key');
+  assert(e2.checkpointKey === e1.checkpointKey, 'enqueue idempotency: duplicate returns the same checkpoint key');
+  const idemOutboxRows = liveDb.prepare(`SELECT COUNT(*) AS cnt FROM delivery_outbox WHERE id = ?`).get(e1.outboxId);
+  assert(idemOutboxRows.cnt === 1, 'enqueue idempotency: exactly one completion outbox row exists for the run');
+  for (const outboxId of e1.outboxIds || []) {
+    liveDb.prepare('DELETE FROM delivery_outbox WHERE id = ?').run(outboxId);
+  }
   liveDb.prepare(`DELETE FROM completion_debts WHERE task_label = ?`).run(idemLabel);
 }
 
@@ -10404,7 +10475,7 @@ console.log('\n-- v0.2 Validation: valid fields accepted --');
     identity_delegation_mode: 'none',
     identity: JSON.stringify({ subject_kind: 'agent', principal: 'agent:scheduler-v2', trust_level: 'supervised' }),
     authorization_proof_ref: 'urn:openclaw:proof:abc123',
-    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'abc123' }),
+    authorization_proof: JSON.stringify({ method: 'none', ref: 'abc123', verify: { required: false } }),
     authorization_ref: 'urn:openclaw:authz:policy-1',
     authorization: JSON.stringify({ decision: 'permit', reason: 'pre-approved' }),
     evidence_ref: 'urn:openclaw:evidence:run-log-1',
@@ -10520,25 +10591,22 @@ console.log('\n-- v0.2 Validation: invalid enum rejected --');
 
 console.log('\n-- v0.2 Validation: credential handoff target guard --');
 {
-  let threwNonShellPresentation = false;
-  try {
-    createJob({
-      name: 'v02-handoff-isolated',
-      schedule_cron: '0 5 * * *',
-      payload_message: 'bad target',
-      delivery_mode: 'none',
-      delivery_opt_out_reason: 'test',
-      run_timeout_ms: 300_000,
-      origin: 'system',
-      identity: JSON.stringify({
-        provider: 'mock-provider',
-        presentation: { mode: 'inject-env' },
-      }),
-    });
-  } catch (e) {
-    threwNonShellPresentation = e.message.includes('session_target "shell"');
-  }
-  assert(threwNonShellPresentation, 'createJob rejects credential handoff on non-shell jobs');
+  const isolatedHandoffJob = createJob({
+    name: 'v02-handoff-isolated',
+    schedule_cron: '0 5 * * *',
+    session_target: 'isolated',
+    payload_kind: 'agentTurn',
+    payload_message: 'capability-negotiated isolated handoff',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'mock-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  assert(isolatedHandoffJob.session_target === 'isolated', 'createJob allows capability-negotiated isolated credential handoff');
 
   const shellHandoffJob = createJob({
     name: 'v02-handoff-shell',
@@ -10556,6 +10624,7 @@ console.log('\n-- v0.2 Validation: credential handoff target guard --');
     }),
   });
   assert(shellHandoffJob.session_target === 'shell', 'createJob allows credential handoff on shell jobs');
+  deleteJob(isolatedHandoffJob.id);
   deleteJob(shellHandoffJob.id);
 }
 
@@ -10762,7 +10831,7 @@ console.log('\n-- v0.2 Storage Round-Trip --');
       cleanup_required: false,
     },
   });
-  const authProofBlob = JSON.stringify({ method: 'hmac', ref: 'proof-ref-456', payload: 'base64data' });
+  const authProofBlob = JSON.stringify({ method: 'none', ref: 'proof-ref-456', verify: { required: false } });
   const authBlob = JSON.stringify({ decision: 'permit', reason: 'approved by policy engine', depends_on_trust: true });
   const evidenceBlob = JSON.stringify({ collect: ['stdout', 'exit_code'], retention: '90d', format: 'json' });
   const allowedPathsBlob = JSON.stringify(['/opt/data', '/var/log']);
@@ -10994,22 +11063,22 @@ console.log('\n-- v0.2 evaluateTrust enforcement normalization --');
 
 console.log('\n-- v0.2 verifyAuthorizationProof --');
 {
-  // Valid proof structure -> verified:true
+  // Explicit method none is the only structural opt-out.
   const validProof = await verifyAuthorizationProof({
-    authorization_proof: JSON.stringify({ method: 'signed-jwt', ref: 'jwt-ref-1' }),
+    authorization_proof: JSON.stringify({ method: 'none', ref: 'proof-ref-1', verify: { required: false } }),
     authorization_proof_ref: 'urn:proof:1',
   });
   assert(validProof !== null, 'verifyAuthorizationProof: valid proof returns non-null');
   assert(validProof.verified === true, 'verifyAuthorizationProof: valid proof verified is true');
-  assert(validProof.method === 'signed-jwt', 'verifyAuthorizationProof: method extracted');
-  assert(validProof.ref === 'jwt-ref-1', 'verifyAuthorizationProof: ref from blob');
+  assert(validProof.method === 'none', 'verifyAuthorizationProof: method none is explicit');
+  assert(validProof.ref === 'proof-ref-1', 'verifyAuthorizationProof: ref from blob');
 
-  // All known methods accepted
-  for (const method of ['signed-jwt', 'hmac', 'api-key', 'bearer', 'mtls', 'oidc', 'saml', 'custom']) {
+  // Cryptographic methods require a loaded verifier.
+  for (const method of ['jwt', 'detached-signature', 'certificate']) {
     const r = await verifyAuthorizationProof({
       authorization_proof: JSON.stringify({ method }),
     });
-    assert(r.verified === true, `verifyAuthorizationProof: method ${method} accepted`);
+    assert(r.verified === false && r.source === 'verifier-required', `verifyAuthorizationProof: method ${method} requires a verifier`);
   }
 
   // No proof -> null
@@ -11048,7 +11117,7 @@ console.log('\n-- v0.2 verifyAuthorizationProof --');
 
   // Explicit verifier with no loaded plugin -> fail closed
   const missingVerifier = await verifyAuthorizationProof({
-    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'jwt' }),
   }, {});
   assert(missingVerifier.verified === false, 'verifyAuthorizationProof: missing explicit verifier fails closed');
   assert(missingVerifier.source === 'provider-error', 'verifyAuthorizationProof: missing explicit verifier reports provider-error');
@@ -11061,13 +11130,13 @@ console.log('\n-- v0.2 evaluateAuthorization --');
   assert(await evaluateAuthorization({}, null, null) === null, 'evaluateAuthorization: no authorization -> null');
   assert(await evaluateAuthorization(null, null, null) === null, 'evaluateAuthorization: null job -> null');
 
-  // Ref only -> deny (external policy resolution not implemented, fail closed)
+  // Ref only -> deny when no policy resolver is configured (fail closed)
   const refOnlyAuth = await evaluateAuthorization(
     { authorization_ref: 'urn:authz:1' }, null, null
   );
   assert(refOnlyAuth.decision === 'deny', 'evaluateAuthorization: ref-only -> deny (fail closed)');
   assert(refOnlyAuth.ref === 'urn:authz:1', 'evaluateAuthorization: ref-only ref');
-  assert(refOnlyAuth.reason.includes('not yet implemented'), 'evaluateAuthorization: ref-only reason explains why');
+  assert(refOnlyAuth.reason.includes('configured authorization policy resolver'), 'evaluateAuthorization: ref-only reason explains the missing resolver');
 
   // Explicit deny in policy
   const explicitDeny = await evaluateAuthorization(
@@ -11156,6 +11225,8 @@ console.log('\n-- v0.2 generateEvidence --');
   // With evidence declaration
   const evidenceResult = generateEvidence(
     {
+      id: 'evidence-job-1',
+      payload_kind: 'shellCommand',
       evidence: JSON.stringify({ collect: ['stdout'], retention: '30d', format: 'json' }),
       evidence_ref: 'urn:evidence:1',
     },
@@ -11171,7 +11242,7 @@ console.log('\n-- v0.2 generateEvidence --');
   assert(evidenceResult.payload_summary.run_id === 'run-1', 'generateEvidence: run_id in summary');
   assert(evidenceResult.payload_summary.run_status === 'ok', 'generateEvidence: run_status in summary');
   assert(Array.isArray(evidenceResult.payload_summary.outcome_fields_present), 'generateEvidence: outcome fields listed');
-  assert(evidenceResult.payload_summary.outcome_fields_present.includes('identity_resolved'), 'generateEvidence: identity_resolved in outcome fields');
+  assert(!evidenceResult.payload_summary.outcome_fields_present.includes('identity'), 'generateEvidence: collect excludes unrequested identity outcome');
 
   // No evidence -> null
   assert(generateEvidence({}, null, null) === null, 'generateEvidence: no evidence -> null');
@@ -11179,17 +11250,25 @@ console.log('\n-- v0.2 generateEvidence --');
 
   // Ref only (no inline evidence blob)
   const refOnlyEvidence = generateEvidence(
-    { evidence_ref: 'urn:evidence:2' }, null, null
+    { id: 'evidence-job-2', payload_kind: 'shellCommand', evidence_ref: 'urn:evidence:2' },
+    { id: 'run-2', status: 'ok' },
+    null
   );
   assert(refOnlyEvidence !== null, 'generateEvidence: ref-only returns non-null');
   assert(refOnlyEvidence.evidence_ref === 'urn:evidence:2', 'generateEvidence: ref-only evidence_ref');
 
-  // Invalid evidence JSON -> returns with error in payload_summary
-  const badEvidence = generateEvidence(
-    { evidence: 'broken{json', evidence_ref: 'urn:evidence:3' }, null, null
-  );
-  assert(badEvidence !== null, 'generateEvidence: bad JSON returns non-null');
-  assert(badEvidence.payload_summary.error && badEvidence.payload_summary.error.includes('parse failed'), 'generateEvidence: bad JSON error in payload_summary');
+  // Invalid evidence JSON fails before a terminal record can be committed.
+  let badEvidenceRejected = false;
+  try {
+    generateEvidence(
+      { id: 'evidence-job-3', payload_kind: 'shellCommand', evidence: 'broken{json', evidence_ref: 'urn:evidence:3' },
+      { id: 'run-3', status: 'error' },
+      null
+    );
+  } catch (error) {
+    badEvidenceRejected = error.code === 'EVIDENCE_DECLARATION_INVALID';
+  }
+  assert(badEvidenceRejected, 'generateEvidence: malformed declaration fails closed');
 }
 
 console.log('\n-- v0.2 summarizeCredentialHandoff --');
@@ -11262,7 +11341,6 @@ console.log('\n-- v0.2 persistV02Outcomes --');
     trust_evaluation: trustEvaluation,
     authorization_decision: authDecision,
     authorization_proof_verification: proofVerification,
-    evidence_record: evidenceRecord,
     credential_handoff_summary: handoffSummary,
   });
 
@@ -11271,7 +11349,7 @@ console.log('\n-- v0.2 persistV02Outcomes --');
   assert(fetchedRun.trust_evaluation !== null, 'persistV02Outcomes: trust_evaluation stored');
   assert(fetchedRun.authorization_decision !== null, 'persistV02Outcomes: authorization_decision stored');
   assert(fetchedRun.authorization_proof_verification !== null, 'persistV02Outcomes: authorization_proof_verification stored');
-  assert(fetchedRun.evidence_record !== null, 'persistV02Outcomes: evidence_record stored');
+  assert(fetchedRun.evidence_record === null, 'persistV02Outcomes: evidence remains absent without a valid terminal record');
   assert(fetchedRun.credential_handoff_summary !== null, 'persistV02Outcomes: credential_handoff_summary stored');
 
   // Verify JSON serialization round-trip
@@ -11290,8 +11368,13 @@ console.log('\n-- v0.2 persistV02Outcomes --');
   assert(parsedProof.verified === true, 'persistV02Outcomes: authorization_proof_verification JSON roundtrip verified');
   assert(parsedProof.method === 'signed-jwt', 'persistV02Outcomes: authorization_proof_verification JSON roundtrip method');
 
-  const parsedEvidence = JSON.parse(fetchedRun.evidence_record);
-  assert(parsedEvidence.evidence_ref === 'urn:evidence:1', 'persistV02Outcomes: evidence_record JSON roundtrip ref');
+  let malformedEvidenceRejected = false;
+  try {
+    persistV02Outcomes(outcomeRun.id, { evidence_record: evidenceRecord });
+  } catch (error) {
+    malformedEvidenceRejected = error.code === 'EVIDENCE_INTEGRITY_INVALID';
+  }
+  assert(malformedEvidenceRejected, 'persistV02Outcomes: malformed evidence is rejected');
 
   const parsedHandoff = JSON.parse(fetchedRun.credential_handoff_summary);
   assert(parsedHandoff.mode === 'inject-env', 'persistV02Outcomes: credential_handoff_summary JSON roundtrip mode');
@@ -11328,18 +11411,29 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 27, 'capabilities: schema_version is 27');
-  assert(capsOut.handoff_version === '2', 'capabilities: handoff_version is 2');
+  assert(capsOut.schema_version === 28, 'capabilities: schema_version is 28');
+  assert(capsOut.handoff_version === '3', 'capabilities: handoff_version is 3');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');
   assert(capsOut.features.runtime_identity_resolution === true, 'capabilities: runtime_identity_resolution enabled');
   assert(capsOut.features.trust_evaluation === true, 'capabilities: trust_evaluation enabled');
   assert(capsOut.features.authorization_proof_verification === true, 'capabilities: authorization_proof_verification enabled');
   assert(capsOut.features.authorization_hook === true, 'capabilities: authorization_hook enabled');
-  assert(capsOut.features.evidence_generation === true, 'capabilities: evidence_generation enabled');
+  assert(capsOut.features.evidence_generation === false, 'capabilities: agentcli evidence generation is not advertised');
+  assert(capsOut.features.checksum_evidence_generation === true, 'capabilities: scheduler checksum evidence generation enabled');
   assert(capsOut.features.credential_handoff === true, 'capabilities: credential_handoff enabled');
   assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
-  assert(capsOut.features.delegation_validation === false, 'capabilities: delegation_validation not yet enabled');
+  assert(capsOut.features.delegation_validation === true, 'capabilities: delegation_validation enabled');
+  assert(capsOut.features.authorization_ref_resolution === true, 'capabilities: authorization_ref_resolution enabled');
+  assert(capsOut.features.evidence_integrity === 'checksum-sha256-v2', 'capabilities: checksum sha256 v2 evidence integrity enabled');
+  assert(capsOut.features.evidence_contract === 'openclaw-scheduler-checksum-v2', 'capabilities: scheduler checksum evidence contract is explicit');
+  assert(capsOut.features.root_approval_gate === true, 'capabilities: root approval gate enabled');
+  assert(capsOut.features.approval_scope_enforcement === true, 'capabilities: approval scope enforcement enabled');
+  assert(capsOut.features.structured_output_format === true, 'capabilities: structured output validation enabled');
+  assert(capsOut.features.gateway_capability_discovery === true, 'capabilities: Gateway discovery enabled');
+  assert(capsOut.features.gateway_env_injection_negotiation === true, 'capabilities: Gateway env injection negotiation enabled');
+  assert(capsOut.features.multipart_delivery_checkpoints === true, 'capabilities: multipart delivery checkpoints enabled');
+  assert(capsOut.features.completion_delivery_scope === 'run', 'capabilities: completion delivery is scoped per run');
   assert(capsOut.features.runtime_execution === true, 'capabilities: runtime_execution enabled');
 }
 
@@ -11509,12 +11603,17 @@ function buildPrepareDispatchDeps(overrides = {}) {
       persistV02Outcomes,
       releaseIdempotencyKey() {},
       updateJobAfterRun() {},
+      updateJob,
       handleTriggeredChildren() {},
       dequeueJob: () => false,
       compareTrustLevels,
       getIdentityProvider: () => null,
       getAuthorizationProvider: () => null,
       getProofVerifier: () => null,
+      evaluateGovernance,
+      buildShellEnvironment,
+      summarizeGovernance,
+      generateEvidence,
       ...overrides,
     };
 }
@@ -11546,6 +11645,90 @@ console.log('\n-- prepareDispatch v0.2 gating --');
   if (scalarCtx) finishRun(scalarCtx.run.id, 'cancelled', { summary: 'test cleanup' });
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(scalarIdentityJob.id);
   deleteJob(scalarIdentityJob.id);
+
+  const recoveryEvidenceJob = createJob({
+    name: 'prepare-dispatch-recovery-evidence',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo recovery evidence',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity_subject_kind: 'service',
+    identity_principal: 'service:recovery-evidence',
+    identity_trust_level: 'supervised',
+    evidence_ref: 'audit:prepared-recovery-evidence',
+    evidence: JSON.stringify({
+      provider: 'sha256',
+      methods: ['sha256'],
+      collect: ['identity', 'result'],
+      payload: { bind: ['identity'] },
+    }),
+  });
+  let scheduledKeyJobId = null;
+  const recoveryEvidenceCtx = await prepareDispatch(
+    getJob(recoveryEvidenceJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      generateIdempotencyKey: jobId => {
+        scheduledKeyJobId = jobId;
+        return 'prepared-recovery-evidence-key';
+      },
+    }),
+  );
+  assert(recoveryEvidenceCtx !== null, 'prepareDispatch: evidence recovery fixture prepares');
+  assert(scheduledKeyJobId === recoveryEvidenceJob.id, 'prepareDispatch: scheduled idempotency receives the string job ID');
+  const preparedRecoveryRun = getRun(recoveryEvidenceCtx.run.id);
+  assert(JSON.parse(preparedRecoveryRun.identity_resolved).principal === 'service:recovery-evidence', 'prepareDispatch: outcomes are durable before execution starts');
+  finishRun(preparedRecoveryRun.id, 'crashed', { summary: 'simulated dispatcher crash' });
+  const crashEvidence = persistTerminalEvidence(
+    recoveryEvidenceJob,
+    preparedRecoveryRun.id,
+    'crashed',
+    { summary: 'simulated dispatcher crash' },
+  );
+  assert(crashEvidence.payload.outcomes.identity.principal === 'service:recovery-evidence', 'recovery evidence uses the durable prepared identity outcome');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(recoveryEvidenceJob.id);
+  deleteJob(recoveryEvidenceJob.id);
+
+  const manualIdentityJob = createJob({
+    name: 'prepare-dispatch-manual-idempotency',
+    schedule_cron: '0 7 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo manual idempotency',
+    delivery_mode: 'none',
+    delivery_opt_out_reason: 'test',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const manualDispatch = enqueueDispatch(manualIdentityJob.id, {
+    id: 'prepare-manual-idempotency-dispatch',
+    kind: 'manual',
+  });
+  const claimedManualDispatch = claimDispatch(manualDispatch.id);
+  let manualKeyArgs = null;
+  const manualCtx = await prepareDispatch(
+    getJob(manualIdentityJob.id),
+    { dispatchRecord: claimedManualDispatch },
+    buildPrepareDispatchDeps({
+      generateRunNowIdempotencyKey: (...args) => {
+        manualKeyArgs = args;
+        return 'prepared-manual-idempotency-key';
+      },
+    }),
+  );
+  assert(manualCtx !== null, 'prepareDispatch: durable manual fixture prepares');
+  assert(
+    manualKeyArgs?.[0] === manualIdentityJob.id && manualKeyArgs?.[1] === manualDispatch.id,
+    'prepareDispatch: manual idempotency binds the durable dispatch ID',
+  );
+  finishRun(manualCtx.run.id, 'cancelled', { summary: 'manual idempotency cleanup' });
+  setDispatchStatus(manualDispatch.id, 'cancelled');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(manualIdentityJob.id);
+  deleteJob(manualIdentityJob.id);
 
   const providerErrorJob = createJob({
     name: 'prepare-dispatch-provider-error',
@@ -11599,7 +11782,7 @@ console.log('\n-- prepareDispatch v0.2 gating --');
     delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000,
     origin: 'system',
-    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'signed-jwt' }),
+    authorization_proof: JSON.stringify({ verifier: 'missing-verifier', method: 'jwt' }),
   });
   const missingVerifierCtx = await prepareDispatch(
     getJob(missingVerifierJob.id),
@@ -11857,6 +12040,112 @@ console.log('\n-- prepareDispatch v0.2 gating --');
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(asyncProviderJob.id);
   deleteJob(asyncProviderJob.id);
 
+  let aliasPresentation = null;
+  const aliasProvider = {
+    ...asyncProvider,
+    name: 'alias-provider',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'alias-provider',
+          subject: { kind: 'service', principal: 'svc:alias' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    async materialize(_session, presentation) {
+      aliasPresentation = presentation;
+      return { materialized: true, env_vars: { ALIAS_TOKEN: 'scoped' }, cleanup_required: false };
+    },
+  };
+  const aliasJob = createJob({
+    name: 'prepare-dispatch-credential-handoff-alias',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo alias handoff',
+    delivery_mode: 'none',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'alias-provider',
+      credential_handoff: { mode: 'inject-env' },
+    }),
+  });
+  const aliasCtx = await prepareDispatch(
+    getJob(aliasJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: name => name === 'alias-provider' ? aliasProvider : null,
+    }),
+  );
+  assert(aliasCtx?.executionEnv?.ALIAS_TOKEN === 'scoped', 'prepareDispatch: credential_handoff alias materializes into the shell environment');
+  assert(aliasPresentation?.mode === 'inject-env', 'prepareDispatch: credential_handoff alias reaches the provider');
+  finishRun(aliasCtx.run.id, 'cancelled', { summary: 'alias test cleanup' });
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(aliasJob.id);
+  deleteJob(aliasJob.id);
+
+  let invalidEnvironmentCleanupCalls = 0;
+  const invalidEnvironmentProvider = {
+    name: 'invalid-environment-provider',
+    type: 'identity',
+    resolveSession() {
+      return {
+        ok: true,
+        session: {
+          provider: 'invalid-environment-provider',
+          subject: { kind: 'service', principal: 'svc:invalid-env' },
+          trust: { effective_level: 'supervised' },
+          credentials: {},
+        },
+      };
+    },
+    async materialize() {
+      return {
+        materialized: true,
+        env_vars: { OPENCLAW_GATEWAY_TOKEN: 'must-never-enter-child-env' },
+        cleanup_required: true,
+        cleanup_token: 'invalid-environment-cleanup',
+      };
+    },
+    async cleanup() {
+      invalidEnvironmentCleanupCalls += 1;
+      return { cleaned: true };
+    },
+  };
+  const invalidEnvironmentJob = createJob({
+    name: 'prepare-dispatch-invalid-credential-environment',
+    schedule_cron: '0 10 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo invalid credential environment',
+    delivery_mode: 'none',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+    identity: JSON.stringify({
+      provider: 'invalid-environment-provider',
+      presentation: { mode: 'inject-env' },
+    }),
+  });
+  const invalidEnvironmentCtx = await prepareDispatch(
+    getJob(invalidEnvironmentJob.id),
+    {},
+    buildPrepareDispatchDeps({
+      getIdentityProvider: name => name === 'invalid-environment-provider'
+        ? invalidEnvironmentProvider
+        : null,
+    }),
+  );
+  assert(invalidEnvironmentCtx === null, 'prepareDispatch: invalid credential environment fails closed');
+  assert(invalidEnvironmentCleanupCalls === 1, 'prepareDispatch: invalid credential environment invokes provider cleanup');
+  const invalidEnvironmentRun = getRunsForJob(invalidEnvironmentJob.id, 1)[0];
+  assert(invalidEnvironmentRun.status === 'error', 'prepareDispatch: invalid credential environment terminalizes the run');
+  assert(getJob(invalidEnvironmentJob.id).enabled === 0, 'prepareDispatch: invalid credential environment disables the job');
+  getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(invalidEnvironmentJob.id);
+  deleteJob(invalidEnvironmentJob.id);
+
   const legacyNonShellHandoffJob = createJob({
     name: 'prepare-dispatch-legacy-nonshell-handoff',
     schedule_cron: '0 11 * * *',
@@ -11874,19 +12163,22 @@ console.log('\n-- prepareDispatch v0.2 gating --');
   });
   getDb().prepare('UPDATE jobs SET session_target = ?, payload_kind = ? WHERE id = ?')
     .run('isolated', 'agentTurn', legacyNonShellHandoffJob.id);
+  const legacyNonShellDeps = buildPrepareDispatchDeps({
+    getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
+  });
   const legacyNonShellHandoffCtx = await prepareDispatch(
     getJob(legacyNonShellHandoffJob.id),
     {},
-    buildPrepareDispatchDeps({
-      getIdentityProvider: (name) => name === 'async-provider' ? asyncProvider : null,
-    }),
+    legacyNonShellDeps,
   );
-  assert(legacyNonShellHandoffCtx === null, 'prepareDispatch: non-shell credential handoff fails closed');
-  const legacyNonShellHandoffRun = getRunsForJob(legacyNonShellHandoffJob.id, 1)[0];
-  const legacyNonShellStored = getRun(legacyNonShellHandoffRun.id);
-  assert(legacyNonShellStored.status === 'error', 'prepareDispatch: non-shell credential handoff finishes run as error');
-  assert(legacyNonShellStored.error_message.includes('shell jobs'), 'prepareDispatch: non-shell credential handoff stores clear error');
-  assert(legacyNonShellStored.credential_handoff_summary !== null, 'prepareDispatch: non-shell credential handoff still persists summary');
+  assert(legacyNonShellHandoffCtx !== null, 'prepareDispatch: isolated credential handoff materializes for capability negotiation');
+  assert(legacyNonShellHandoffCtx?.materializedEnv?.ASYNC_PROVIDER_TOKEN === 'token-123', 'prepareDispatch: isolated credential handoff carries scoped environment');
+  await cleanupDispatchMaterialization(
+    getJob(legacyNonShellHandoffJob.id),
+    legacyNonShellHandoffCtx,
+    legacyNonShellDeps,
+  );
+  finishRun(legacyNonShellHandoffCtx.run.id, 'cancelled', { summary: 'isolated handoff test cleanup' });
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(legacyNonShellHandoffJob.id);
   deleteJob(legacyNonShellHandoffJob.id);
 }
@@ -12155,7 +12447,7 @@ console.log('\n-- Downscope happy path --');
   }));
   const persistedRun = getRun(dsRun.id);
   const persistedIdentity = JSON.parse(persistedRun.identity_resolved);
-  assert(persistedIdentity.session.credentials.token.value === '[REDACTED]', 'prepareDispatch: downscope persisted credentials are redacted');
+  assert(!Object.hasOwn(persistedIdentity.session, 'credentials'), 'prepareDispatch: downscope persisted credentials are removed');
 
   getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(dsParent.id, dsChild.id);
   deleteJob(dsChild.id);
@@ -12327,7 +12619,7 @@ console.log('\n-- Credential redaction --');
 
   const persistedRedactRun = getRun(redactCtx.run.id);
   const persistedRedactIdentity = JSON.parse(persistedRedactRun.identity_resolved);
-  assert(persistedRedactIdentity.session.credentials.api_key.value === '[REDACTED]', 'credential redaction: live token replaced with [REDACTED]');
+  assert(!Object.hasOwn(persistedRedactIdentity.session, 'credentials'), 'credential redaction: provider descriptions cannot retain credential fields');
   assert(!JSON.stringify(persistedRedactIdentity).includes('sk_live_SHOULD_NOT_PERSIST'), 'credential redaction: raw token not present in persisted data');
 
   // Also test redaction without describeSession (falls back to credential stripping)
@@ -12396,7 +12688,7 @@ console.log('\n-- authorization_ref-only denial --');
     {},
   );
   assert(refOnlyResult.decision === 'deny', 'authorization_ref-only: decision is deny');
-  assert(refOnlyResult.reason.includes('not yet implemented'), 'authorization_ref-only: reason mentions not implemented');
+  assert(refOnlyResult.reason.includes('configured authorization policy resolver'), 'authorization_ref-only: reason mentions missing resolver');
 }
 
 // -- independent child trust cap --
@@ -12673,13 +12965,19 @@ console.log('\n-- security abort skips triggered children --');
 console.log('\n-- evidence integrity field --');
 {
   const evidence = generateEvidence(
-    { evidence: JSON.stringify({ collect: 'all' }) },
+    {
+      id: 'evidence-integrity-job',
+      payload_kind: 'shellCommand',
+      evidence: JSON.stringify({ collect: ['result', 'identity', 'stdout', 'stderr', 'exit_code'] }),
+    },
     { id: 'run-123', status: 'ok' },
     { identity_resolved: { principal: 'test' } },
   );
   assert(evidence !== null, 'evidence: generated from valid job');
-  assert(evidence.integrity === 'none', 'evidence: integrity field is "none"');
-  assert(evidence.hash === null, 'evidence: hash is null');
+  assert(evidence.integrity === 'sha256', 'evidence: integrity field is "sha256"');
+  assert(evidence.algorithm === 'sha256', 'evidence: algorithm is sha256');
+  assert(/^sha256:[a-f0-9]{64}$/.test(evidence.hash), 'evidence: hash is a prefixed sha256 digest');
+  assert(verifyEvidenceRecord(evidence).valid === true, 'evidence: generated record verifies');
 }
 
 // -- persistV02Outcomes guards --

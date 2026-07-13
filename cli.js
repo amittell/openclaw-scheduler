@@ -5,7 +5,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
-import { getRun, getRunsForJob, getRunningRuns, getStaleRuns } from './runs.js';
+import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, getEvidenceRecord } from './runs.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, getMessage, listMessageReceipts, getTeamMessages,
@@ -96,13 +96,15 @@ Jobs:
                                      Update job fields
                                      --profile: auth profile override (null, 'inherit', or 'provider:label')
   jobs run <id>                      Trigger immediate run (sets next_run_at to now)
-  jobs approve <id>                  Approve a pending job
+  jobs approve <id> [--reason <text>]
+                                     Approve the latest pending gate as the authenticated local OS user
   jobs reject <id> [reason]          Reject with optional reason
 
 Runs:
   runs list <job-id> [limit]         List runs for a job
   runs get <run-id>                  Get a run by id
   runs output <run-id> [stdout|stderr]  Print offloaded or stored shell output
+  runs evidence <run-id>             Read and verify persisted content-addressed evidence
   runs running                       Currently running runs
   runs stale [threshold-s]           Stale runs
 
@@ -149,6 +151,10 @@ Tasks:
 Approvals:
   approvals list                     List pending approvals
   approvals pending                  Alias for list
+  approvals approve <approval-id> [--reason <text>]
+                                     Approve one exact gate as the authenticated local OS user
+  approvals reject <approval-id> [--reason <text>]
+                                     Reject one exact gate as the authenticated local OS user
 
 Idempotency:
   idem status <job-id>               Show recent idempotency keys for a job
@@ -166,7 +172,7 @@ Status:
   doctor                             Validate DB/schema/runtime health and diagnostics
 
 Schema:
-  schema [jobs|runs|messages|approvals|dispatches|dispatcher_leases|delivery_outbox|delivery_attachments|all]
+  schema [jobs|runs|messages|approvals|dispatches|dispatcher_leases|delivery_outbox|delivery_attachments|evidence_records|all]
 
 Capabilities:
   capabilities                       Report runtime feature support without opening the DB
@@ -351,6 +357,40 @@ function getOperationalDiagnostics(db) {
           AND json_extract(context_summary, '$.credential_cleanup.status') = 'failed'
       `).get().count
     : null;
+  const evidence = tableExists(db, 'evidence_records')
+    ? (() => {
+      const rows = db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at ASC').all();
+      const invalid = [];
+      for (const row of rows) {
+        const record = getEvidenceRecord(row.run_id);
+        if (record?.integrity?.valid !== true) {
+          invalid.push({ run_id: row.run_id, error: record?.integrity?.error || 'record unavailable' });
+        }
+      }
+      const missing = tableExists(db, 'runs') && tableExists(db, 'jobs')
+        ? db.prepare(`
+          SELECT r.id AS run_id, r.job_id
+          FROM runs r
+          WHERE r.status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+            AND r.evidence_required = 1
+            AND NOT EXISTS (SELECT 1 FROM evidence_records e WHERE e.run_id = r.id)
+            AND NOT (
+              COALESCE(json_valid(r.evidence_record), 0) = 1
+              AND json_extract(r.evidence_record, '$.pruned') = 1
+              AND json_extract(r.evidence_record, '$.reason') = 'retention_expired'
+            )
+          ORDER BY r.started_at ASC
+        `).all()
+        : [];
+      return {
+        total: rows.length,
+        invalid: invalid.length,
+        invalid_samples: invalid.slice(0, 20),
+        missing: missing.length,
+        missing_samples: missing.slice(0, 20),
+      };
+    })()
+    : { total: null, invalid: null, invalid_samples: [], missing: null, missing_samples: [] };
   return {
     dispatcher_lease: lease,
     dispatch_queue: queue,
@@ -359,6 +399,7 @@ function getOperationalDiagnostics(db) {
     cancellation_pending_runs: cancellation,
     recovery_blocked_runs: recoveryBlocked,
     credential_cleanup_failures: cleanupFailures,
+    evidence_records: evidence,
   };
 }
 
@@ -599,15 +640,29 @@ switch (command) {
         break;
       }
       case 'approve': {
-        if (!args[0]) fail('Usage: jobs approve <job-id>');
+        const approvePositionals = commandPositionals(args, {
+          valueFlags: ['--reason'],
+        });
+        const jobId = approvePositionals[0];
+        if (!jobId) fail('Usage: jobs approve <job-id> [--reason <text>]');
+        const reasonIdx = args.indexOf('--reason');
+        const reason = reasonIdx >= 0 ? args[reasonIdx + 1] : (approvePositionals.slice(1).join(' ') || null);
         const { getPendingApproval, resolveApproval } = await import('./approval.js');
-        const approval = getPendingApproval(args[0]);
-        if (!approval) fail(`No pending approval for job: ${args[0]}`, 1, 'NOT_FOUND');
-        const resolved = resolveApproval(approval.id, 'approved', 'operator');
+        const approval = getPendingApproval(jobId);
+        if (!approval) fail(`No pending approval for job: ${jobId}`, 1, 'NOT_FOUND');
+        const resolved = resolveApproval(approval.id, 'approved', null, reason);
         if (!resolved || resolved.status !== 'approved') {
           fail(`Approval could not be granted; current status is ${resolved?.status || 'unknown'}`, 1, 'APPROVAL_CONFLICT');
         }
-        emit({ ok: true, approval_id: approval.id, job_id: approval.job_id, status: 'approved' }, `Approved: ${approval.job_id}`);
+        emit({
+          ok: true,
+          approval_id: approval.id,
+          job_id: approval.job_id,
+          status: 'approved',
+          approver: resolved.resolved_by,
+          risk_level: approval.risk_level || null,
+          approver_scope: approval.approver_scope || null,
+        }, `Approved: ${approval.job_id}`);
         break;
       }
       case 'reject': {
@@ -616,7 +671,7 @@ switch (command) {
         const approval = getPendingApproval(args[0]);
         if (!approval) fail(`No pending approval for job: ${args[0]}`, 1, 'NOT_FOUND');
         const reason = args.slice(1).join(' ') || null;
-        const resolved = resolveApproval(approval.id, 'rejected', 'operator', reason);
+        const resolved = resolveApproval(approval.id, 'rejected', null, reason);
         if (!resolved || resolved.status !== 'rejected') {
           fail(`Approval could not be rejected; current status is ${resolved?.status || 'unknown'}`, 1, 'APPROVAL_CONFLICT');
         }
@@ -674,6 +729,14 @@ switch (command) {
           process.stdout.write(payload);
           if (!payload.endsWith('\n')) process.stdout.write('\n');
         }
+        break;
+      }
+      case 'evidence': {
+        if (!args[0]) fail('Usage: runs evidence <run-id>');
+        const evidence = getEvidenceRecord(args[0]);
+        if (!evidence) fail(`Evidence not found for run: ${args[0]}`, 1, 'NOT_FOUND');
+        emit({ ok: evidence.integrity?.valid === true, evidence });
+        if (evidence.integrity?.valid !== true) process.exitCode = 1;
         break;
       }
       case 'running': {
@@ -1061,14 +1124,45 @@ switch (command) {
         const approvals = listPendingApprovals();
         if (approvals.length === 0) { emit([], 'No pending approvals'); break; }
         const rows = approvals.map(a => ({
-          id: a.id.slice(0, 8),
-          job: a.job_id.slice(0, 8),
+          id: a.id,
+          job: a.job_id,
           job_name: a.job_name || '-',
-          run: a.run_id?.slice(0, 8) || '-',
+          run: a.run_id || '-',
+          gate: a.gate_kind || 'job',
           status: a.status,
           requested: a.requested_at,
         }));
         emit(jsonMode ? approvals : rows, () => console.table(rows));
+        break;
+      }
+      case 'approve':
+      case 'reject': {
+        const positionals = commandPositionals(args, { valueFlags: ['--reason'] });
+        const approvalId = positionals[0];
+        if (!approvalId) fail(`Usage: approvals ${sub} <approval-id> [--reason <text>]`);
+        const reasonIdx = args.indexOf('--reason');
+        const reason = reasonIdx >= 0 ? args[reasonIdx + 1] : (positionals.slice(1).join(' ') || null);
+        const { getApproval, resolveApproval } = await import('./approval.js');
+        const approval = getApproval(approvalId);
+        if (!approval) fail(`Approval not found: ${approvalId}`, 1, 'NOT_FOUND');
+        if (approval.status !== 'pending') {
+          fail(`Approval is already ${approval.status}: ${approvalId}`, 1, 'APPROVAL_CONFLICT');
+        }
+        const requestedStatus = sub === 'approve' ? 'approved' : 'rejected';
+        const resolved = resolveApproval(approval.id, requestedStatus, null, reason);
+        if (!resolved || resolved.status !== requestedStatus) {
+          fail(`Approval could not be ${sub}d; current status is ${resolved?.status || 'unknown'}`, 1, 'APPROVAL_CONFLICT');
+        }
+        emit({
+          ok: true,
+          approval_id: resolved.id,
+          job_id: resolved.job_id,
+          run_id: resolved.run_id || null,
+          gate_kind: resolved.gate_kind || 'job',
+          status: resolved.status,
+          resolved_by: resolved.resolved_by,
+          reason,
+        }, `${sub === 'approve' ? 'Approved' : 'Rejected'} approval: ${resolved.id}`);
         break;
       }
       default: usage();
@@ -1341,7 +1435,7 @@ switch (command) {
     const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
     const requiredTables = [
       'jobs', 'runs', 'messages', 'approvals', 'job_dispatch_queue',
-      'dispatcher_leases', 'delivery_outbox', 'delivery_attachments', 'schema_migrations',
+      'dispatcher_leases', 'delivery_outbox', 'delivery_attachments', 'evidence_records', 'schema_migrations',
     ];
     const missingTables = requiredTables.filter(name => !tableExists(db, name));
     const schemaVersion = getSchemaVersion(db);
@@ -1368,6 +1462,8 @@ switch (command) {
     if ((diagnostics.cancellation_pending_runs || 0) > 0) warnings.push('Active runs have pending cancellation requests.');
     if ((diagnostics.recovery_blocked_runs || 0) > 0) warnings.push('One or more runs are recovery-blocked; affected jobs were disabled for operator review.');
     if ((diagnostics.credential_cleanup_failures || 0) > 0) warnings.push('Credential cleanup failures require operator remediation; affected jobs were disabled.');
+    if ((diagnostics.evidence_records.invalid || 0) > 0) warnings.push('One or more evidence records failed checksum or execution-binding verification.');
+    if ((diagnostics.evidence_records.missing || 0) > 0) warnings.push('One or more terminal runs are missing declared evidence records.');
     if (!integrityOk) warnings.push('SQLite quick_check reported database integrity errors.');
     if (foreignKeyViolations.length > 0) warnings.push('SQLite foreign-key violations require repair before safe operation.');
     const healthy = missingTables.length === 0
@@ -1376,7 +1472,9 @@ switch (command) {
       && integrityOk
       && foreignKeyViolations.length === 0
       && (diagnostics.recovery_blocked_runs || 0) === 0
-      && (diagnostics.credential_cleanup_failures || 0) === 0;
+      && (diagnostics.credential_cleanup_failures || 0) === 0
+      && (diagnostics.evidence_records.invalid || 0) === 0
+      && (diagnostics.evidence_records.missing || 0) === 0;
     const result = {
       ok: healthy,
       package: { name: pkg.name, version: pkg.version, node: process.version },
@@ -1446,7 +1544,7 @@ switch (command) {
       product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
       schema_version_source: 'package',
       schema_version_note: 'Run status or doctor to inspect the initialized database schema.',
-      handoff_version: '2',
+      handoff_version: '3',
       features: {
         approvals: 'runtime',
         model_policy: 'model+thinking',
@@ -1460,14 +1558,25 @@ switch (command) {
         trust_evaluation: true,
         authorization_proof_verification: true,
         authorization_hook: true,
-        evidence_generation: true,
-        delegation_validation: false,
+        evidence_generation: false,
+        checksum_evidence_generation: true,
+        evidence_integrity: 'checksum-sha256-v2',
+        evidence_contract: 'openclaw-scheduler-checksum-v2',
+        authorization_ref_resolution: true,
+        delegation_validation: true,
+        root_approval_gate: true,
+        approval_scope_enforcement: true,
+        structured_output_format: true,
         credential_handoff: true,
+        gateway_capability_discovery: true,
+        gateway_env_injection_negotiation: true,
         audit_export: true,
         dispatcher_fencing: true,
         process_tree_cancellation: true,
         leased_dispatch_recovery: true,
         transactional_delivery_outbox: true,
+        multipart_delivery_checkpoints: true,
+        completion_delivery_scope: 'run',
         durable_delivery_attachments: true,
         atomic_approval_state: true,
         governance_enforcement: true,

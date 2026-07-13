@@ -19,6 +19,7 @@ import { createRun, finishRun, getRun, getTimedOutRuns } from '../runs.js';
 import {
   cleanupDispatchMaterialization,
   finalizeDispatch,
+  redactOutcomesForPersistence,
 } from '../dispatcher-strategies.js';
 
 function shellJob(overrides = {}) {
@@ -77,7 +78,13 @@ test('agent cost contracts fail closed when the gateway cannot meter dollars', (
   });
   assert.equal(result.allowed, false);
   assert.match(result.violations.join('\n'), /cost metering/i);
-  assert.equal(evaluateGovernance(shellJob({ contract_max_cost_usd: 0 })).allowed, true);
+  const shellResult = evaluateGovernance(shellJob({ contract_max_cost_usd: 0 }));
+  assert.equal(shellResult.allowed, false);
+  assert.match(shellResult.violations.join('\n'), /cost metering/i);
+  assert.equal(evaluateGovernance(
+    shellJob({ contract_max_cost_usd: 0 }),
+    { costMetered: true },
+  ).allowed, true);
 });
 
 test('minimal shell environments exclude dispatcher secrets and add materialized credentials explicitly', () => {
@@ -181,6 +188,24 @@ test('fenced completion makes cancellation win and suppresses post-run effects',
   assert.equal(completion.cancelled, true);
   assert.equal(completion.status, 'cancelled');
   assert.equal(shouldRunPostCompletionEffects(completion), false);
+});
+
+test('provider session descriptions cannot reintroduce raw credentials', () => {
+  const outcomes = {
+    identity_resolved: {
+      provider: 'hostile-description-provider',
+      session: { credentials: { token: 'raw-secret' }, subject: { principal: 'svc:test' } },
+    },
+  };
+  const redacted = redactOutcomesForPersistence(outcomes, {
+    getIdentityProvider: () => ({
+      describeSession(session) {
+        return session;
+      },
+    }),
+  });
+  assert.equal(Object.hasOwn(redacted.identity_resolved.session, 'credentials'), false);
+  assert.deepEqual(outcomes.identity_resolved.session.credentials, { token: 'raw-secret' });
 });
 
 test('completion bookkeeping executes through the database transaction boundary', () => {

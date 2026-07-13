@@ -2,6 +2,11 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import {
+  approvalBindingHashForDb,
+  approverMatchesScope,
+  getAuthenticatedApprovalActor,
+} from './approval-binding.js';
+import {
   APPROVAL_STATUSES,
   beginApprovalDispatch,
   cancelApproval,
@@ -27,10 +32,12 @@ function sqliteTimestamp(value) {
 export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) {
   const db = opts.db || getDb();
   const id = randomUUID();
+  const gateKind = opts.gateKind || 'job';
+  if (!['job', 'authorization'].includes(gateKind)) {
+    throw new Error(`Invalid approval gate kind '${gateKind}'`);
+  }
   const create = () => {
-    const job = db.prepare(
-      'SELECT id, enabled, approval_timeout_s FROM jobs WHERE id = ?'
-    ).get(jobId);
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
     if (!job) throw new Error(`Cannot create approval for missing job '${jobId}'`);
     if (job.enabled !== 1) throw new Error(`Cannot create approval for disabled job '${jobId}'`);
 
@@ -38,9 +45,11 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
       const existing = db.prepare(`
         SELECT * FROM approvals
         WHERE dispatch_queue_id = ?
-        ORDER BY requested_at DESC, id DESC
+          AND gate_kind = ?
+          AND status IN ('pending', 'approved', 'dispatching')
+        ORDER BY requested_at DESC, rowid DESC
         LIMIT 1
-      `).get(dispatchQueueId);
+      `).get(dispatchQueueId, gateKind);
       if (existing) return { ...existing, deduped: true };
     }
 
@@ -52,16 +61,47 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
         : null;
     db.prepare(`
       INSERT INTO approvals (
-        id, job_id, run_id, dispatch_queue_id, status, requested_at, expires_at
-      ) VALUES (?, ?, ?, ?, 'pending', datetime('now'), ?)
-    `).run(id, jobId, runId || null, dispatchQueueId || null, expiresAt);
+        id, job_id, run_id, dispatch_queue_id, status, requested_at, expires_at,
+        risk_level, approver_scope, binding_hash, gate_kind, decision_context
+      ) VALUES (?, ?, ?, ?, 'pending', datetime('now'), ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      jobId,
+      runId || null,
+      dispatchQueueId || null,
+      expiresAt,
+      opts.riskLevel || job.approval_risk_level || null,
+      opts.approverScope ?? job.approval_approver_scope ?? null,
+      approvalBindingHashForDb(db, job),
+      gateKind,
+      opts.decisionContext == null
+        ? null
+        : typeof opts.decisionContext === 'string'
+          ? opts.decisionContext
+          : JSON.stringify(opts.decisionContext),
+    );
 
     if (runId) {
       db.prepare(`
         UPDATE runs
-        SET status = 'awaiting_approval'
-        WHERE id = ? AND status = 'pending'
+        SET status = 'awaiting_approval',
+            dispatcher_owner = NULL,
+            dispatcher_token = NULL
+        WHERE id = ? AND status IN ('pending', 'running')
       `).run(runId);
+    }
+    if (opts.releaseIdempotencyKey && runId) {
+      db.prepare(`
+        DELETE FROM idempotency_ledger
+        WHERE key = ? AND run_id = ? AND status = 'claimed'
+      `).run(opts.releaseIdempotencyKey, runId);
+      db.prepare(`
+        UPDATE runs
+        SET idempotency_key = NULL
+        WHERE id = ?
+          AND status = 'awaiting_approval'
+          AND idempotency_key = ?
+      `).run(runId, opts.releaseIdempotencyKey);
     }
     if (dispatchQueueId) {
       db.prepare(`
@@ -90,11 +130,11 @@ export function getApproval(id, opts = {}) {
 /**
  * Get the latest pending approval for a job (if any).
  */
-export function getPendingApproval(jobId) {
-  return getDb().prepare(`
+export function getPendingApproval(jobId, opts = {}) {
+  return (opts.db || getDb()).prepare(`
     SELECT * FROM approvals
     WHERE job_id = ? AND status = 'pending'
-    ORDER BY requested_at DESC
+    ORDER BY requested_at DESC, rowid DESC
     LIMIT 1
   `).get(jobId);
 }
@@ -126,17 +166,28 @@ export function countPendingApprovalsForJob(jobId) {
  */
 const VALID_APPROVAL_STATUSES = new Set(['approved', 'rejected', 'timed_out', 'cancelled']);
 
-export function resolveApproval(id, status, resolvedBy, notes) {
+export function resolveApproval(id, status, resolvedBy, notes, opts = {}) {
   if (!VALID_APPROVAL_STATUSES.has(status)) {
     throw new Error(`Invalid approval status '${status}': must be one of ${[...VALID_APPROVAL_STATUSES].join(', ')}`);
   }
-  const transition = status === APPROVAL_STATUSES.CANCELLED
-    ? cancelApproval(id, notes || 'Approval cancelled', { resolvedBy: resolvedBy || null })
-    : transitionPendingApproval(id, status, {
-      resolvedBy: resolvedBy || null,
-      notes: notes || null,
-      reason: notes || null,
-    });
+  const automaticActor = opts.automatic === true
+    ? (typeof resolvedBy === 'string' && resolvedBy.trim() ? resolvedBy.trim() : 'scheduler')
+    : null;
+  const authenticatedActor = automaticActor ? null : getAuthenticatedApprovalActor();
+  const canonicalActor = automaticActor || authenticatedActor.canonical;
+  if (status === APPROVAL_STATUSES.CANCELLED) {
+    return cancelApproval(id, notes || 'Approval cancelled', {
+      resolvedBy: canonicalActor,
+      db: opts.db,
+    }).approval;
+  }
+  const transition = transitionPendingApproval(id, status, {
+    resolvedBy: canonicalActor,
+    authenticatedActor,
+    automatic: Boolean(automaticActor),
+    notes: notes || null,
+    reason: notes || null,
+  });
   return transition.approval;
 }
 
@@ -182,4 +233,5 @@ export {
   getApprovalForDispatch,
   markApprovalDispatched,
   recoverInterruptedApprovalDispatches,
+  approverMatchesScope,
 };

@@ -1,7 +1,12 @@
 // Run lifecycle management
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
-import { transitionRunTerminal } from './run-state.js';
+import { TERMINAL_RUN_STATUSES, transitionRunTerminal } from './run-state.js';
+import {
+  buildEvidenceExecutionSnapshot,
+  generateEvidence,
+  verifyEvidenceRecord,
+} from './v02-runtime.js';
 
 /**
  * Create a new run for a job.
@@ -16,15 +21,25 @@ export function createRun(jobId, opts = {}) {
   if (hasDispatcherOwner !== hasDispatcherToken) {
     throw new Error('dispatcher owner and fencing token must be provided together');
   }
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  const declaredEvidenceRequired = job && (job.evidence != null || job.evidence_ref != null) ? 1 : 0;
+  const evidenceRequired = opts.evidence_required == null
+    ? declaredEvidenceRequired
+    : Number(Boolean(opts.evidence_required));
+  const evidenceExecutionSnapshot = evidenceRequired === 1
+    ? JSON.stringify(buildEvidenceExecutionSnapshot(job))
+    : null;
 
   db.prepare(`
     INSERT INTO runs (
       id, job_id, status, run_timeout_ms, session_key, session_id,
       dispatched_at, context_summary, replay_of, idempotency_key, retry_count,
       retry_of, triggered_by_run, dispatch_queue_id,
-      dispatcher_owner, dispatcher_token, dispatch_started_at
+      dispatcher_owner, dispatcher_token, dispatch_started_at,
+      evidence_required, evidence_execution_snapshot,
+      evidence_declaration_snapshot, evidence_ref_snapshot
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -41,7 +56,11 @@ export function createRun(jobId, opts = {}) {
     opts.dispatch_queue_id || null,
     hasDispatcherOwner ? dispatcherOwner : null,
     hasDispatcherToken ? dispatcherToken : null,
-    opts.dispatch_started_at || (hasDispatcherOwner ? new Date().toISOString() : null)
+    opts.dispatch_started_at || (hasDispatcherOwner ? new Date().toISOString() : null),
+    evidenceRequired,
+    evidenceExecutionSnapshot,
+    evidenceRequired === 1 ? job.evidence : null,
+    evidenceRequired === 1 ? job.evidence_ref : null,
   );
 
   return getRun(id);
@@ -183,8 +202,14 @@ export function pruneRuns(keepPerJob = 100) {
 
   for (const job of jobs) {
     db.prepare(`
-      DELETE FROM runs WHERE job_id = ? AND id NOT IN (
-        SELECT id FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?
+      DELETE FROM runs
+      WHERE job_id = ?
+        AND status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed')
+        AND id NOT IN (
+        SELECT id FROM runs
+        WHERE job_id = ?
+          AND status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed')
+        ORDER BY started_at DESC LIMIT ?
       )
     `).run(job.id, job.id, keepPerJob);
   }
@@ -250,12 +275,13 @@ const V02_OUTCOME_COLUMNS = new Set([
   'authorization_proof_verification',
   'evidence_record',
   'credential_handoff_summary',
+  'delegation_validation',
 ]);
 
-export function persistV02Outcomes(runId, outcomes) {
+export function persistV02Outcomes(runId, outcomes, opts = {}) {
   if (!outcomes || typeof outcomes !== 'object') return;
   if (!runId) return;
-  const db = getDb();
+  const db = opts.db || getDb();
   const fields = [];
   const values = [];
   for (const [key, value] of Object.entries(outcomes)) {
@@ -265,7 +291,470 @@ export function persistV02Outcomes(runId, outcomes) {
     fields.push(`${key} = ?`);
     values.push(value != null && typeof value === 'object' ? JSON.stringify(value) : value);
   }
-  if (fields.length === 0) return;
-  values.push(runId);
-  db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  const hasEvidenceRecord = Object.hasOwn(outcomes, 'evidence_record');
+  const evidenceRecord = outcomes.evidence_record
+    && typeof outcomes.evidence_record === 'object'
+    && outcomes.evidence_record.algorithm === 'sha256'
+    && outcomes.evidence_record.payload
+    ? outcomes.evidence_record
+    : null;
+  if (hasEvidenceRecord && !evidenceRecord) {
+    const error = new Error('Refusing to persist malformed evidence record');
+    error.code = 'EVIDENCE_INTEGRITY_INVALID';
+    throw error;
+  }
+  if (fields.length === 0 && !evidenceRecord) return;
+
+  const requireRunningFence = opts.requireRunningFence === true;
+  const dispatcherFence = opts.dispatcherFence || {};
+  const ownerId = dispatcherFence.ownerId ?? dispatcherFence.dispatcher_owner ?? null;
+  const fencingToken = dispatcherFence.fencingToken ?? dispatcherFence.dispatcher_token ?? null;
+  const leaseName = dispatcherFence.leaseName || 'scheduler-dispatcher';
+  if (requireRunningFence && (
+    typeof ownerId !== 'string'
+    || !ownerId
+    || !Number.isInteger(fencingToken)
+    || fencingToken <= 0
+  )) {
+    const error = new Error('A valid dispatcher fence is required for a running outcome checkpoint');
+    error.code = 'RUN_OUTCOME_CHECKPOINT_FENCED';
+    throw error;
+  }
+
+  const persist = () => {
+    if (fields.length > 0) {
+      const update = requireRunningFence
+        ? db.prepare(`
+            UPDATE runs
+            SET ${fields.join(', ')}
+            WHERE id = ?
+              AND status = 'running'
+              AND dispatcher_owner = ?
+              AND dispatcher_token = ?
+              AND EXISTS (
+                SELECT 1
+                FROM dispatcher_leases
+                WHERE name = ?
+                  AND owner_id = ?
+                  AND fencing_token = ?
+                  AND julianday(expires_at) > julianday('now')
+              )
+          `).run(...values, runId, ownerId, fencingToken, leaseName, ownerId, fencingToken)
+        : db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values, runId);
+      if (requireRunningFence && update.changes !== 1) {
+        const error = new Error(`Run ${runId} is no longer owned by the live dispatcher fence`);
+        error.code = 'RUN_OUTCOME_CHECKPOINT_FENCED';
+        throw error;
+      }
+    }
+    if (!evidenceRecord) return;
+
+    const verification = verifyEvidenceRecord(evidenceRecord);
+    if (!verification.valid) {
+      const error = new Error(`Refusing to persist invalid evidence: ${verification.error || 'hash mismatch'}`);
+      error.code = 'EVIDENCE_INTEGRITY_INVALID';
+      throw error;
+    }
+    const run = db.prepare('SELECT job_id, status FROM runs WHERE id = ?').get(runId);
+    if (!run) {
+      const error = new Error(`Cannot persist evidence for missing run ${runId}`);
+      error.code = 'RUN_NOT_FOUND';
+      throw error;
+    }
+    if (evidenceRecord.payload.run?.id !== runId) {
+      const error = new Error(`Evidence run binding ${JSON.stringify(evidenceRecord.payload.run?.id)} does not match target run ${runId}`);
+      error.code = 'EVIDENCE_RUN_BINDING_MISMATCH';
+      throw error;
+    }
+    if (evidenceRecord.payload.job_id !== run.job_id) {
+      const error = new Error(`Evidence job binding ${JSON.stringify(evidenceRecord.payload.job_id)} does not match target job ${run.job_id}`);
+      error.code = 'EVIDENCE_JOB_BINDING_MISMATCH';
+      throw error;
+    }
+    if (evidenceRecord.payload.run?.status !== run.status
+      || evidenceRecord.payload.result?.status !== run.status
+      || evidenceRecord.payload.postcondition?.terminal_status !== run.status) {
+      const error = new Error(`Evidence status does not match terminal run status ${JSON.stringify(run.status)}`);
+      error.code = 'EVIDENCE_RUN_STATUS_MISMATCH';
+      throw error;
+    }
+    if (!TERMINAL_RUN_STATUSES.includes(run.status)) {
+      const error = new Error(`Evidence cannot be persisted for non-terminal run status ${JSON.stringify(run.status)}`);
+      error.code = 'EVIDENCE_RUN_STATUS_MISMATCH';
+      throw error;
+    }
+    const existing = db.prepare('SELECT * FROM evidence_records WHERE run_id = ?').get(runId);
+    if (existing && existing.hash !== evidenceRecord.hash) {
+      const error = new Error(`Evidence for run ${runId} is immutable`);
+      error.code = 'EVIDENCE_RECORD_IMMUTABLE';
+      throw error;
+    }
+    if (!existing) {
+      db.prepare(`
+        INSERT INTO evidence_records (
+          id, run_id, job_id, evidence_ref, algorithm, hash, payload,
+          retention_policy, retention_until, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        `${runId}:${evidenceRecord.hash}`,
+        runId,
+        run.job_id,
+        evidenceRecord.evidence_ref || null,
+        evidenceRecord.algorithm,
+        evidenceRecord.hash,
+        JSON.stringify(evidenceRecord.payload),
+        evidenceRecord.retention_policy || null,
+        evidenceRecord.retention_until || null,
+        evidenceRecord.created_at || new Date().toISOString(),
+      );
+    }
+  };
+  const transaction = db.transaction(persist);
+  if (db.inTransaction) transaction();
+  else transaction.immediate();
+}
+
+/** Persist scheduler-native checksum evidence after a terminal transition. */
+export function persistTerminalEvidence(job, runId, status, fields = {}, outcomes = {}, opts = {}) {
+  if (!job) return null;
+  const db = opts.db || getDb();
+  const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
+  if (!run) {
+    const error = new Error(`Cannot generate evidence for missing run ${runId}`);
+    error.code = 'RUN_NOT_FOUND';
+    throw error;
+  }
+  if (run.evidence_required !== 1) return null;
+  if (run.status !== status) {
+    const error = new Error(`Cannot generate ${status} evidence for run in status ${run.status}`);
+    error.code = 'EVIDENCE_RUN_STATUS_MISMATCH';
+    throw error;
+  }
+  const parseOutcome = field => {
+    if (run[field] == null || Object.hasOwn(outcomes, field)) return undefined;
+    try {
+      return JSON.parse(run[field]);
+    } catch (cause) {
+      const error = new Error(`Stored ${field} outcome is invalid JSON`);
+      error.code = 'EVIDENCE_OUTCOME_INVALID';
+      error.cause = cause;
+      throw error;
+    }
+  };
+  const effectiveOutcomes = { ...outcomes };
+  for (const field of [
+    'identity_resolved', 'trust_evaluation', 'authorization_decision',
+    'authorization_proof_verification', 'credential_handoff_summary',
+    'delegation_validation',
+  ]) {
+    const parsed = parseOutcome(field);
+    if (parsed !== undefined) effectiveOutcomes[field] = parsed;
+  }
+  if (status !== 'ok') {
+    let declaration;
+    try {
+      declaration = run.evidence_declaration_snapshot
+        ? JSON.parse(run.evidence_declaration_snapshot)
+        : null;
+    } catch (cause) {
+      const error = new Error('Stored evidence declaration snapshot is invalid JSON');
+      error.code = 'EVIDENCE_DECLARATION_SNAPSHOT_INVALID';
+      error.cause = cause;
+      throw error;
+    }
+    const requestedBindings = new Set(
+      Array.isArray(declaration?.payload?.bind) ? declaration.payload.bind : [],
+    );
+    const reason = `Runtime evaluation did not complete before terminal status ${status}`;
+    const interrupted = {
+      identity: ['identity_resolved', { source: 'runtime-interrupted', error: reason }],
+      trust: ['trust_evaluation', { decision: 'deny', enforcement: 'runtime-interrupted', reason }],
+      authorization: ['authorization_decision', { decision: 'deny', source: 'runtime-interrupted', reason }],
+      authorization_proof: ['authorization_proof_verification', { verified: false, source: 'runtime-interrupted', error: reason }],
+      delegation: ['delegation_validation', {
+        valid: false,
+        acyclic: null,
+        no_duplicate_hops: null,
+        errors: [reason],
+      }],
+      credential_handoff: ['credential_handoff_summary', {
+        mode: null,
+        bindings_count: 0,
+        cleanup_required: false,
+        error: reason,
+      }],
+    };
+    for (const binding of requestedBindings) {
+      const fallback = interrupted[binding];
+      if (fallback && effectiveOutcomes[fallback[0]] == null) {
+        effectiveOutcomes[fallback[0]] = fallback[1];
+      }
+    }
+  }
+  const output = opts.output ?? fields.output ?? run.shell_stdout ?? null;
+  const stderr = opts.stderr ?? fields.stderr ?? run.shell_stderr ?? null;
+  const runMetadata = {
+    id: run.id,
+    status: run.status,
+    summary: fields.summary ?? run.summary ?? null,
+    output,
+    stderr,
+    stdout_sha256: opts.stdout_sha256 ?? fields.stdout_sha256 ?? null,
+    stderr_sha256: opts.stderr_sha256 ?? fields.stderr_sha256 ?? (stderr == null ? null : undefined),
+    stdout_bytes: opts.stdout_bytes ?? fields.stdout_bytes ?? run.shell_stdout_bytes
+      ?? (output == null ? null : Buffer.byteLength(String(output), 'utf8')),
+    stderr_bytes: opts.stderr_bytes ?? fields.stderr_bytes ?? run.shell_stderr_bytes
+      ?? (stderr == null ? null : Buffer.byteLength(String(stderr), 'utf8')),
+    exit_code: fields.shell_exit_code ?? run.shell_exit_code ?? null,
+    signal: fields.shell_signal ?? run.shell_signal ?? null,
+    timed_out: Boolean(fields.shell_timed_out ?? run.shell_timed_out ?? status === 'timeout'),
+    structured_output: fields.structured_output ?? run.structured_output ?? null,
+    structured_output_valid: fields.structured_output_valid ?? run.structured_output_valid ?? null,
+  };
+  try {
+    runMetadata.execution_snapshot = JSON.parse(run.evidence_execution_snapshot);
+  } catch (cause) {
+    const error = new Error('Stored evidence execution snapshot is invalid JSON');
+    error.code = 'EVIDENCE_EXECUTION_SNAPSHOT_INVALID';
+    error.cause = cause;
+    throw error;
+  }
+  const evidenceJob = {
+    ...job,
+    evidence: run.evidence_declaration_snapshot,
+    evidence_ref: run.evidence_ref_snapshot,
+  };
+  const evidence = generateEvidence(evidenceJob, runMetadata, effectiveOutcomes);
+  persistV02Outcomes(runId, { ...effectiveOutcomes, evidence_record: evidence }, { db });
+  return evidence;
+}
+
+/**
+ * Fail closed when recovery cannot safely construct the terminal evidence that
+ * a run declared. This transition intentionally does not create evidence: the
+ * recovery_blocked status and disabled job are the durable operator signal
+ * that the evidence contract could not be satisfied.
+ */
+export function quarantineRunRecovery(runId, reason, opts = {}) {
+  if (typeof runId !== 'string' || runId.trim().length === 0) {
+    throw new Error('runId must be a non-empty string');
+  }
+  if (typeof reason !== 'string' || reason.trim().length === 0) {
+    throw new Error('reason must be a non-empty string');
+  }
+  const db = opts.db || getDb();
+  const dispatcherFence = opts.dispatcherFence || null;
+  const ownerId = dispatcherFence?.ownerId ?? dispatcherFence?.dispatcher_owner ?? null;
+  const fencingToken = dispatcherFence?.fencingToken ?? dispatcherFence?.dispatcher_token ?? null;
+  const leaseName = dispatcherFence?.leaseName || 'scheduler-dispatcher';
+  const hasFence = dispatcherFence != null;
+  const allowStaleRunOwner = opts.allowStaleRunOwner === true;
+  if (allowStaleRunOwner && !hasFence) {
+    throw new Error('allowStaleRunOwner requires a live dispatcher fence');
+  }
+  if (hasFence && (
+    typeof ownerId !== 'string'
+    || ownerId.trim().length === 0
+    || !Number.isInteger(fencingToken)
+    || fencingToken <= 0
+  )) {
+    throw new Error('A valid dispatcher fence is required for recovery quarantine');
+  }
+
+  const quarantine = () => {
+    const updated = hasFence
+      ? db.prepare(`
+          UPDATE runs
+          SET status = 'recovery_blocked',
+              finished_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              terminal_transition_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              duration_ms = MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)),
+              error_message = ?,
+              summary = ?
+          WHERE id = ?
+            AND status = 'running'
+            ${allowStaleRunOwner ? '' : 'AND dispatcher_owner = ? AND dispatcher_token = ?'}
+            AND EXISTS (
+              SELECT 1
+              FROM dispatcher_leases
+              WHERE name = ?
+                AND owner_id = ?
+                AND fencing_token = ?
+                AND julianday(expires_at) > julianday('now')
+            )
+          RETURNING *
+        `).get(
+          reason,
+          reason,
+          runId,
+          ...(allowStaleRunOwner ? [] : [ownerId, fencingToken]),
+          leaseName,
+          ownerId,
+          fencingToken,
+        )
+      : db.prepare(`
+          UPDATE runs
+          SET status = 'recovery_blocked',
+              finished_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              terminal_transition_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              duration_ms = MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)),
+              error_message = ?,
+              summary = ?
+          WHERE id = ?
+            AND status = 'running'
+            AND dispatcher_owner IS NULL
+            AND dispatcher_token IS NULL
+          RETURNING *
+        `).get(reason, reason, runId);
+    if (!updated) {
+      return { changed: false, run: db.prepare('SELECT * FROM runs WHERE id = ?').get(runId) || null };
+    }
+    db.prepare(`
+      UPDATE jobs
+      SET enabled = 0,
+          last_run_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+          last_status = 'recovery_blocked'
+      WHERE id = ?
+    `).run(updated.job_id);
+    if (updated.dispatch_queue_id) {
+      db.prepare(`
+        UPDATE job_dispatch_queue
+        SET status = 'failed',
+            processed_at = COALESCE(processed_at, strftime('%Y-%m-%d %H:%M:%f', 'now')),
+            claim_expires_at = NULL,
+            last_error = ?
+        WHERE id = ?
+          AND status IN ('pending', 'claimed', 'awaiting_approval')
+      `).run(reason, updated.dispatch_queue_id);
+    }
+    return { changed: true, run: updated };
+  };
+  const transaction = db.transaction(quarantine);
+  return db.inTransaction ? transaction() : transaction.immediate();
+}
+
+/** Atomically transition a run and persist declared checksum evidence. */
+export function transitionRunTerminalWithEvidence(
+  job,
+  runId,
+  status,
+  fields = {},
+  outcomes = {},
+  opts = {},
+) {
+  const db = opts.db || getDb();
+  const commit = () => {
+    const transition = transitionRunTerminal(runId, status, fields, {
+      ownerId: opts.ownerId ?? opts.dispatcher_owner,
+      fencingToken: opts.fencingToken ?? opts.dispatcher_token,
+      leaseName: opts.leaseName,
+    });
+    if (transition.changed) {
+      persistTerminalEvidence(
+        job,
+        runId,
+        transition.run.status,
+        fields,
+        outcomes,
+        { ...opts, db },
+      );
+    }
+    return transition;
+  };
+  const transaction = db.transaction(commit);
+  return db.inTransaction ? transaction() : transaction.immediate();
+}
+
+export function getEvidenceRecord(runId, opts = {}) {
+  const row = (opts.db || getDb()).prepare('SELECT * FROM evidence_records WHERE run_id = ?').get(runId);
+  if (!row) return null;
+  let payload;
+  try {
+    payload = JSON.parse(row.payload);
+  } catch (error) {
+    return { ...row, payload: null, integrity: { valid: false, error: `stored payload is invalid JSON: ${error.message}` } };
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      ...row,
+      payload,
+      integrity: { valid: false, error: 'stored payload is not an evidence object' },
+    };
+  }
+  const record = {
+    evidence_ref: row.evidence_ref,
+    created_at: row.created_at,
+    algorithm: row.algorithm,
+    hash: row.hash,
+    integrity: 'sha256',
+    canonicalization: 'json-sort-v1',
+    retention_policy: row.retention_policy || null,
+    retention_until: row.retention_until || null,
+    payload,
+  };
+  const integrity = verifyEvidenceRecord(record);
+  const bindingErrors = [];
+  if (payload.run?.id !== row.run_id) bindingErrors.push('stored run_id does not match payload.run.id');
+  if (payload.job_id !== row.job_id) bindingErrors.push('stored job_id does not match payload.job_id');
+  if (payload.evidence_ref !== row.evidence_ref) bindingErrors.push('stored evidence_ref does not match payload.evidence_ref');
+  if (payload.created_at !== row.created_at) bindingErrors.push('stored created_at does not match payload.created_at');
+  if ((payload.retention_policy ?? null) !== (row.retention_policy ?? null)) {
+    bindingErrors.push('stored retention_policy does not match payload.retention_policy');
+  }
+  if ((payload.retention_until ?? null) !== (row.retention_until ?? null)) {
+    bindingErrors.push('stored retention_until does not match payload.retention_until');
+  }
+  return {
+    ...row,
+    payload,
+    integrity: bindingErrors.length === 0
+      ? integrity
+      : {
+        ...integrity,
+        valid: false,
+        error: [...(integrity.errors || []), ...bindingErrors].join('; '),
+        errors: [...(integrity.errors || []), ...bindingErrors],
+      },
+  };
+}
+
+/** Delete only evidence records whose explicit retention deadline has elapsed. */
+export function pruneEvidenceRecords(opts = {}) {
+  const db = opts.db || getDb();
+  const limit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : 1000;
+  const cutoff = opts.now == null ? new Date() : new Date(opts.now);
+  if (Number.isNaN(cutoff.getTime())) throw new Error('invalid evidence retention cutoff');
+  const candidates = db.prepare(`
+    SELECT id, run_id
+    FROM evidence_records
+    WHERE retention_until IS NOT NULL
+      AND julianday(retention_until) <= julianday(?)
+    ORDER BY retention_until ASC
+    LIMIT ?
+  `).all(cutoff.toISOString(), limit);
+  const remove = db.prepare('DELETE FROM evidence_records WHERE id = ?');
+  const markPruned = db.prepare(`
+    UPDATE runs
+    SET evidence_record = ?
+    WHERE id = ?
+  `);
+  const prune = () => {
+    let changes = 0;
+    for (const candidate of candidates) {
+      const evidence = getEvidenceRecord(candidate.run_id, { db });
+      if (evidence?.integrity?.valid !== true) continue;
+      markPruned.run(JSON.stringify({
+        pruned: true,
+        reason: 'retention_expired',
+        hash: evidence.hash,
+        evidence_ref: evidence.evidence_ref,
+        retention_until: evidence.retention_until,
+        pruned_at: new Date().toISOString(),
+      }), candidate.run_id);
+      changes += remove.run(candidate.id).changes;
+    }
+    return { changes };
+  };
+  const transaction = db.transaction(prune);
+  return db.inTransaction ? transaction() : transaction.immediate();
 }

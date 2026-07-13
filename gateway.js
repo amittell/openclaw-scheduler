@@ -4,6 +4,21 @@ import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from
 import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db.js';
+import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
+
+export {
+  GATEWAY_ENV_INJECT_CAPABILITY,
+  GATEWAY_ENV_INJECT_HEADER,
+  GatewayCompatibilityError,
+  MAX_GATEWAY_ENV_ENTRIES,
+  MAX_GATEWAY_ENV_INJECT_HEADER_BYTES,
+  MAX_GATEWAY_ENV_KEY_BYTES,
+  MAX_GATEWAY_ENV_VALUE_BYTES,
+  buildGatewayEnvInjectHeader,
+  clearGatewayCapabilityCache,
+  discoverGatewayCapabilities,
+  negotiateGatewayEnvironmentInjection,
+} from './gateway-capabilities.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const HOME_DIR = process.env.HOME || homedir();
@@ -25,23 +40,15 @@ export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 // contract intact.
 export const ISOLATED_DISPATCH_PRIMITIVE = 'http-chat-completions';
 
-let _cachedToken;
-let _tokenLoaded = false;
-
 function getGatewayToken() {
-  if (!_tokenLoaded) {
-    _tokenLoaded = true;
-    if (process.env.OPENCLAW_GATEWAY_TOKEN) {
-      _cachedToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-    } else {
-      try {
-        const tokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH
-          || join(HOME_DIR, '.openclaw/credentials/.gateway-token');
-        _cachedToken = readFileSync(tokenPath, 'utf-8').trim();
-      } catch { _cachedToken = null; }
-    }
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    const tokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH
+      || join(HOME_DIR, '.openclaw/credentials/.gateway-token');
+    return readFileSync(tokenPath, 'utf-8').trim() || null;
+  } catch {
+    return null;
   }
-  return _cachedToken;
 }
 
 function authHeaders(scopes = null) {
@@ -156,6 +163,7 @@ export function cancelAgentSession(sessionKey, opts = {}) {
  * @param {string} [opts.sessionKey] - Session key for continuity.
  * @param {string} [opts.model] - Model override.
  * @param {string|null} [opts.authProfile] - Auth profile header value.
+ * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject.
  * @param {number} [opts.timeoutMs=300000] - Request timeout in milliseconds.
  */
 export async function runAgentTurn(opts) {
@@ -165,10 +173,16 @@ export async function runAgentTurn(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     timeoutMs = 300000,
     signal,
     cancelOnAbort = true,
   } = opts;
+
+  const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
+    gatewayUrl: GATEWAY_URL,
+    requestHeaders: authHeaders(),
+  });
 
   const controller = new AbortController();
   let abortReason = null;
@@ -187,6 +201,7 @@ export async function runAgentTurn(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjection.headers,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
@@ -248,6 +263,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
+ * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject
  * @param {string[]} [opts.sessionKinds]  - Optional session kinds to track for activity polling
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
@@ -257,6 +273,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
@@ -264,6 +281,11 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     signal,
     cancelOnAbort = true,
   } = opts;
+
+  const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
+    gatewayUrl: GATEWAY_URL,
+    requestHeaders: authHeaders(),
+  });
 
   const controller = new AbortController();
   let abortReason = null;
@@ -363,6 +385,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjection.headers,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,

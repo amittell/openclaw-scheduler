@@ -1,14 +1,22 @@
 // Idempotency key generation and ledger operations
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { getDb } from './db.js';
+
+function requiredId(value, name) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new TypeError(`${name} must be a non-empty string`);
+  }
+  return value.trim();
+}
 
 /**
  * Generate an idempotency key for a scheduled job execution.
  * Deterministic: same job + same scheduled time = same key.
  */
 export function generateIdempotencyKey(jobId, scheduledTime) {
+  const normalizedJobId = requiredId(jobId, 'jobId');
   if (!scheduledTime) throw new Error('scheduledTime is required for deterministic idempotency key');
-  const raw = `${jobId}:${scheduledTime}`;
+  const raw = `${normalizedJobId}:${scheduledTime}`;
   return createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 
@@ -17,16 +25,21 @@ export function generateIdempotencyKey(jobId, scheduledTime) {
  * Based on the parent run ID + child job ID.
  */
 export function generateChainIdempotencyKey(parentRunId, childJobId) {
-  const raw = `chain:${parentRunId}:${childJobId}`;
+  const raw = `chain:${requiredId(parentRunId, 'parentRunId')}:${requiredId(childJobId, 'childJobId')}`;
   return createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 
 /**
  * Generate an idempotency key for a manual run-now trigger.
- * Unique per call (timestamp-based).
+ * A durable dispatch ID makes the key stable across replay. Direct callers
+ * that omit it receive a collision-resistant unique key.
  */
-export function generateRunNowIdempotencyKey(jobId) {
-  const raw = `run_now:${jobId}:${Date.now()}`;
+export function generateRunNowIdempotencyKey(jobId, dispatchId = null) {
+  const normalizedJobId = requiredId(jobId, 'jobId');
+  const seed = dispatchId == null
+    ? `nonce:${randomUUID()}`
+    : `dispatch:${requiredId(dispatchId, 'dispatchId')}`;
+  const raw = `run_now:${normalizedJobId}:${seed}`;
   return createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 

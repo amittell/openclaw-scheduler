@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
 import { executeMain, executeShell, executeWatchdog } from '../dispatcher-strategies.js';
@@ -12,6 +13,15 @@ import { buildCompletionSignalInstructions } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'cli.js');
+const schemaSql = readFileSync(join(__dirname, '..', 'schema.sql'), 'utf8');
+
+function initializeSchedulerDb(tempDir) {
+  const dbPath = join(tempDir, 'scheduler.db');
+  const db = new Database(dbPath);
+  db.exec(schemaSql);
+  db.close();
+  return dbPath;
+}
 
 function noop() {}
 
@@ -71,8 +81,9 @@ test('watchdog disarms only after a structured terminal payload proves completio
   assert.equal(deliveries.length, 1);
   assert.match(deliveries[0][1], /completed -- watchdog disarmed/i);
   assert.match(deliveries[0][1], /Implemented the scheduler delivery fix\./);
-  assert.deepEqual(updated, [['watchdog-job', { enabled: 0 }]]);
-  assert.deepEqual(deleted, [['watchdog-job']]);
+  assert.deepEqual(updated, []);
+  assert.deepEqual(deleted, []);
+  assert.equal(result.selfDestructJob, true);
   assert.match(result.summary, /completed -- watchdog disarmed/i);
 });
 
@@ -214,6 +225,7 @@ test('completion watcher shell jobs deliver stdout only and keep stderr diagnost
 
 test('completion watcher preserves long normal completion payloads for downstream Telegram chunking', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-long-completion-'));
+  const schedulerDbPath = initializeSchedulerDb(tempDir);
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
   const label = 'long-completion';
@@ -274,6 +286,7 @@ if (sub === 'status' || sub === 'result') {
         HOME: tempDir,
         DISPATCH_INDEX_PATH: mockDispatch,
         DISPATCH_LABELS_PATH: labelsPath,
+        SCHEDULER_DB: schedulerDbPath,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -295,6 +308,7 @@ if (sub === 'status' || sub === 'result') {
 
 test('completion watcher spills oversized completion payloads with a full-report pointer', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-spill-completion-'));
+  const schedulerDbPath = initializeSchedulerDb(tempDir);
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
   const artifactsDir = join(tempDir, 'artifacts');
@@ -348,6 +362,7 @@ if (sub === 'status' || sub === 'result') {
         HOME: tempDir,
         DISPATCH_INDEX_PATH: mockDispatch,
         DISPATCH_LABELS_PATH: labelsPath,
+        SCHEDULER_DB: schedulerDbPath,
         SCHEDULER_ARTIFACTS_DIR: artifactsDir,
         DISPATCH_COMPLETION_INLINE_LIMIT_BYTES: '1200',
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
@@ -603,6 +618,7 @@ if (sub === 'status') {
 
 test('watcher --once delivers clean terminal assistant reply without done marker', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-once-terminal-reply-'));
+  const schedulerDbPath = initializeSchedulerDb(tempDir);
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
   const label = 'terminal-jsonl-no-done';
@@ -637,9 +653,6 @@ test('watcher --once delivers clean terminal assistant reply without done marker
         timeoutSeconds: 1200,
         thinking: 'high',
         lastPing: new Date().toISOString(),
-        deliverTo: '123',
-        deliverChannel: 'telegram',
-        deliveryMode: 'announce',
       },
     }) + '\n');
     writeFileSync(mockDispatch, `
@@ -672,6 +685,7 @@ if (sub === 'status') {
         HOME: tempDir,
         DISPATCH_INDEX_PATH: mockDispatch,
         DISPATCH_LABELS_PATH: labelsPath,
+        SCHEDULER_DB: schedulerDbPath,
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',

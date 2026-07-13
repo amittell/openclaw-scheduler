@@ -1,9 +1,10 @@
-import { enqueueDelivery } from './delivery-outbox.js';
+import { enqueueDelivery, enqueueMultipartDelivery } from './delivery-outbox.js';
 
 export function createDeliveryHelpers({
   log,
   resolveDeliveryAlias,
   enqueueDeliveryFn = enqueueDelivery,
+  enqueueMultipartDeliveryFn = null,
 }) {
   function resolveAlias(target) {
     if (!target) return null;
@@ -54,7 +55,12 @@ export function createDeliveryHelpers({
       const idempotencyKey = opts.idempotencyKey
         || (opts.runId ? `run:${opts.runId}:delivery:${channel}:${target}` : null)
         || (opts.eventId ? `event:${opts.eventId}:delivery:${channel}:${target}` : null);
-      const delivery = enqueueDeliveryFn({
+      const attachments = opts.imageAttachments || opts.attachments || [];
+      const multipartEnqueue = enqueueMultipartDeliveryFn
+        || (enqueueDeliveryFn === enqueueDelivery ? enqueueMultipartDelivery : null);
+      const delivery = (attachments.length === 0 && multipartEnqueue
+        ? multipartEnqueue
+        : enqueueDeliveryFn)({
         db: opts.db,
         messageId: opts.messageId || null,
         jobId: job.id || null,
@@ -62,7 +68,7 @@ export function createDeliveryHelpers({
         channel,
         target,
         body: String(content ?? ''),
-        attachments: opts.imageAttachments || opts.attachments || [],
+        attachments,
         idempotencyKey,
         maxAttempts: opts.maxAttempts,
       });
@@ -72,6 +78,7 @@ export function createDeliveryHelpers({
         channel,
         to: target,
         attachments: delivery.attachments?.length || 0,
+        parts: delivery.partCount || 1,
       });
       return delivery;
     } catch (err) {

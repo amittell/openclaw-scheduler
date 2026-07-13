@@ -34,12 +34,13 @@ const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
 import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
-  updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes
+  updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes,
+  persistTerminalEvidence, pruneEvidenceRecords, quarantineRunRecovery,
 } from './runs.js';
 import {
   resolveIdentity, evaluateTrust, verifyAuthorizationProof,
   evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
-  compareTrustLevels,
+  compareTrustLevels, validateDelegation,
 } from './v02-runtime.js';
 import {
   markDelivered, claimInboxForRun, ackClaimedInboxForRun,
@@ -50,7 +51,7 @@ import {
   createApproval, getPendingApproval,
   resolveApproval, getTimedOutApprovals, pruneApprovals, countPendingApprovalsForJob,
   getApprovalForDispatch, beginApprovalDispatch,
-  markApprovalDispatched, cancelApprovalForDispatch,
+  markApprovalDispatched, cancelApprovalForDispatch, recoverInterruptedApprovalDispatches,
 } from './approval.js';
 import { buildRetrievalContext } from './retrieval.js';
 import { upsertAgent, setAgentStatus } from './agents.js';
@@ -105,6 +106,7 @@ import {
 } from './dispatcher-strategies.js';
 import {
   loadProviders, getIdentityProvider, getAuthorizationProvider, getProofVerifier,
+  resolveAuthorizationRef,
 } from './provider-registry.js';
 import {
   evaluateGovernance,
@@ -137,11 +139,7 @@ import {
 import { drainDeliveryOutbox } from './scripts/inbox-consumer.mjs';
 
 // -- Idempotency Key Wrappers --------------------------------
-// The shared module (idempotency.js) uses jobId strings; dispatcher wraps with job objects.
-function generateIdempotencyKey(job, scheduledTime) {
-  if (job.parent_id && !scheduledTime) return null;
-  return _genIdemKey(job.id, scheduledTime);
-}
+const generateIdempotencyKey = _genIdemKey;
 const generateChainIdempotencyKey = _genChainKey;
 const generateRunNowIdempotencyKey = _genRunNowKey;
 const claimIdempotencyKey = _claimIdemKey;
@@ -199,6 +197,15 @@ function requireDispatcherLeadership(context) {
 // -- Replay orphaned runs on startup -------------------------
 async function replayOrphanedRuns() {
   const db = getDb();
+  const persistRecoveryEvidence = (...args) => {
+    try {
+      return persistTerminalEvidence(...args);
+    } catch (cause) {
+      const error = new Error(`Recovery evidence persistence failed: ${cause.message}`, { cause });
+      error.code = 'RECOVERY_EVIDENCE_PERSIST_FAILED';
+      throw error;
+    }
+  };
   const orphaned = db.prepare(`
     SELECT r.id, r.job_id, r.dispatch_queue_id, r.idempotency_key,
            r.process_pid, r.process_pgid, r.process_identity,
@@ -214,38 +221,82 @@ async function replayOrphanedRuns() {
   if (orphaned.length === 0) return;
   log('info', `Found ${orphaned.length} orphaned run(s) to process`);
 
-  const blockRecovery = (run, reason) => db.transaction(() => {
-    const blockedAt = sqliteNow();
-    const blocked = db.prepare(`
-      UPDATE runs
-      SET status = 'recovery_blocked',
-          finished_at = ?,
-          terminal_transition_at = ?,
-          error_message = ?,
-          summary = ?
-      WHERE id = ? AND status = 'running'
-      RETURNING id
-    `).get(blockedAt, blockedAt, reason, reason, run.id);
-    if (!blocked) return false;
-    db.prepare(`
-      UPDATE jobs
-      SET enabled = 0,
-          last_run_at = ?,
-          last_status = 'recovery_blocked'
-      WHERE id = ?
-    `).run(blockedAt, run.job_id);
-    if (run.dispatch_queue_id) {
-      db.prepare(`
-        UPDATE job_dispatch_queue
-        SET status = 'failed',
-            processed_at = COALESCE(processed_at, ?),
-            claim_expires_at = NULL,
-            last_error = ?
-        WHERE id = ? AND status IN ('claimed', 'awaiting_approval')
-      `).run(blockedAt, reason, run.dispatch_queue_id);
+  const recoveryFence = () => ({
+    ownerId: dispatcherRuntime.ownerId,
+    fencingToken: dispatcherRuntime.fencingToken,
+  });
+  const blockRecovery = (run, reason) => {
+    try {
+      return db.transaction(() => {
+        const blockedAt = sqliteNow();
+        const fence = recoveryFence();
+        const blocked = db.prepare(`
+          UPDATE runs
+          SET status = 'recovery_blocked',
+              finished_at = ?,
+              terminal_transition_at = ?,
+              duration_ms = MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)),
+              error_message = ?,
+              summary = ?
+          WHERE id = ?
+            AND status = 'running'
+            AND EXISTS (
+              SELECT 1
+              FROM dispatcher_leases
+              WHERE name = 'scheduler-dispatcher'
+                AND owner_id = ?
+                AND fencing_token = ?
+                AND julianday(expires_at) > julianday('now')
+            )
+          RETURNING id
+        `).get(blockedAt, blockedAt, reason, reason, run.id, fence.ownerId, fence.fencingToken);
+        if (!blocked) return false;
+        const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(run.job_id);
+        persistRecoveryEvidence(
+          job,
+          run.id,
+          'recovery_blocked',
+          { summary: reason, error_message: reason },
+          {},
+          { db },
+        );
+        db.prepare(`
+          UPDATE jobs
+          SET enabled = 0,
+              last_run_at = ?,
+              last_status = 'recovery_blocked'
+          WHERE id = ?
+        `).run(blockedAt, run.job_id);
+        if (run.dispatch_queue_id) {
+          db.prepare(`
+            UPDATE job_dispatch_queue
+            SET status = 'failed',
+                processed_at = COALESCE(processed_at, ?),
+                claim_expires_at = NULL,
+                last_error = ?
+            WHERE id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+          `).run(blockedAt, reason, run.dispatch_queue_id);
+        }
+        return true;
+      }).immediate();
+    } catch (error) {
+      if (error?.code !== 'RECOVERY_EVIDENCE_PERSIST_FAILED') throw error;
+      const quarantineReason = `${reason}; required recovery evidence was unavailable: ${error.message}`;
+      const quarantine = quarantineRunRecovery(run.id, quarantineReason, {
+        db,
+        dispatcherFence: recoveryFence(),
+        allowStaleRunOwner: true,
+      });
+      if (quarantine.changed) {
+        log('error', `Quarantined recovery without evidence and disabled job: ${run.job_name}`, {
+          runId: run.id,
+          jobId: run.job_id,
+          evidenceError: error.message,
+        });
+      }
+      return quarantine.changed;
     }
-    return true;
-  }).immediate();
+  };
 
   const confirmOriginalStopped = async (run) => {
     if (run.process_pid && !run.process_terminated_at) {
@@ -333,6 +384,7 @@ async function replayOrphanedRuns() {
     // cannot leave the run marked crashed without the corresponding retry enqueued.
     const processOrphan = db.transaction(() => {
       const crashedAt = sqliteNow();
+      const crashReason = 'Recovered after dispatcher lease expiry';
 
       // Mark old run as crashed
       const transitioned = db.prepare(`
@@ -340,14 +392,25 @@ async function replayOrphanedRuns() {
         SET status = 'crashed',
             finished_at = ?,
             terminal_transition_at = ?,
+            summary = COALESCE(summary, ?),
+            error_message = COALESCE(error_message, ?),
             process_terminated_at = CASE
               WHEN process_pid IS NOT NULL THEN COALESCE(process_terminated_at, ?)
               ELSE process_terminated_at
             END
         WHERE id = ? AND status = 'running'
         RETURNING id
-      `).get(crashedAt, crashedAt, crashedAt, run.id);
+      `).get(crashedAt, crashedAt, crashReason, crashReason, crashedAt, run.id);
       if (!transitioned) return { changed: false, replayDispatch: null };
+      const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(run.job_id);
+      persistRecoveryEvidence(
+        job,
+        run.id,
+        'crashed',
+        { summary: crashReason, error_message: crashReason },
+        {},
+        { db },
+      );
       if (run.dispatch_queue_id) {
         db.prepare(`
           UPDATE job_dispatch_queue
@@ -398,7 +461,20 @@ async function replayOrphanedRuns() {
         return { changed: true, replayDispatch: null };
       }
     });
-    const recovery = processOrphan();
+    let recovery;
+    try {
+      recovery = processOrphan();
+    } catch (error) {
+      if (error?.code !== 'RECOVERY_EVIDENCE_PERSIST_FAILED') throw error;
+      const reason = `Orphan recovery could not persist its terminal record: ${error.message}`;
+      blockRecovery(run, reason);
+      log('error', `Blocked orphan replay after terminal persistence failure: ${run.job_name}`, {
+        runId: run.id,
+        jobId: run.job_id,
+        error: error.message,
+      });
+      continue;
+    }
     if (!recovery.changed) continue;
     if (recovery.replayDispatch) {
       log('info', `Replaying run for ${run.job_name} (at-least-once)`, {
@@ -576,12 +652,13 @@ function buildDispatchDeps(dispatcherFence = null) {
     // v0.2 runtime
     resolveIdentity, evaluateTrust, verifyAuthorizationProof,
     evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,
-    compareTrustLevels,
+    compareTrustLevels, validateDelegation,
     persistV02Outcomes,
     // Provider registry
     getIdentityProvider,
     getAuthorizationProvider,
     getProofVerifier,
+    resolveAuthorizationRef,
     // Enforceable governance
     evaluateGovernance,
     buildShellEnvironment,
@@ -903,6 +980,9 @@ function updateJobAfterRun(job, status) {
   if (!freshJob) return; // Job was already deleted (e.g. delete_after_run race)
   const currentErrors = freshJob?.consecutive_errors || 0;
   const patch = { last_run_at: sqliteNow(), last_status: status };
+  const hasChildren = Boolean(getDb().prepare(
+    'SELECT 1 FROM jobs WHERE parent_id = ? LIMIT 1',
+  ).get(freshJob.id));
 
   if (status === 'error' || status === 'timeout') {
     patch.consecutive_errors = currentErrors + 1;
@@ -912,7 +992,7 @@ function updateJobAfterRun(job, status) {
 
   // At-jobs (one-shot): don't advance cron schedule -- delete or disable
   if (freshJob.schedule_kind === 'at') {
-    if (freshJob.delete_after_run) {
+    if (freshJob.delete_after_run && !hasChildren) {
       getDb().transaction(() => {
         updateJob(job.id, patch);
         deleteJob(job.id);
@@ -921,7 +1001,9 @@ function updateJobAfterRun(job, status) {
     } else {
       patch.enabled = 0; // Disable so it won't fire again via getDueAtJobs
       updateJob(job.id, patch);
-      log('info', `Disabling completed at-job: ${job.name}`, { jobId: job.id });
+      log('info', hasChildren
+        ? `Disabling completed at-job until its workflow children are retired: ${job.name}`
+        : `Disabling completed at-job: ${job.name}`, { jobId: job.id });
     }
     return;
   }
@@ -938,13 +1020,14 @@ function updateJobAfterRun(job, status) {
     if (backoffDate > nextDate) patch.next_run_at = backoffDate.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
   }
 
-  if (status === 'ok' && freshJob.delete_after_run) {
+  if (status === 'ok' && freshJob.delete_after_run && !hasChildren) {
     getDb().transaction(() => {
       updateJob(job.id, patch);
       deleteJob(freshJob.id);
     })();
     log('info', `Deleting one-shot: ${freshJob.name}`);
   } else {
+    if (status === 'ok' && freshJob.delete_after_run && hasChildren) patch.enabled = 0;
     updateJob(job.id, patch);
   }
 }
@@ -1242,12 +1325,14 @@ async function tick() {
     lastPrune = now;
     try {
       pruneRuns(100);
+      const prunedEvidence = pruneEvidenceRecords();
       pruneMessages(30);
       pruneApprovals(30);
       pruneIdempotencyLedger();
       pruneDeliveryHistory({ log, getDb });
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
+      if (prunedEvidence.changes > 0) log('info', `Pruned ${prunedEvidence.changes} expired evidence record(s)`);
       // Ensure inbox consumer jobs exist for agents with delivery config
       ensureAgentInboxJobs({ log, getDb, createJob });
       // Checkpoint WAL to disk -- reduces data loss window on crash/SIGKILL
@@ -1395,6 +1480,12 @@ async function main() {
   upsertAgent('main', { name: 'Main Agent', status: 'idle', capabilities: ['*'] });
 
   log('info', 'Database initialized');
+
+  const recoveredApprovals = recoverInterruptedApprovalDispatches();
+  if (recoveredApprovals.recovered > 0) {
+    log('warn', `Recovered ${recoveredApprovals.recovered} approval dispatch state(s) before scheduling`);
+  }
+  requireDispatcherLeadership('startup approval recovery');
 
   // Replay orphaned runs from previous crash (delivery guarantee support)
   await replayOrphanedRuns();

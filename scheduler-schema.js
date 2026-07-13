@@ -1,5 +1,5 @@
-export const SCHEDULER_SCHEMA_VERSION = 27;
-export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.3.0';
+export const SCHEDULER_SCHEMA_VERSION = 28;
+export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.4.0';
 
 export const SCHEDULER_SCHEMAS = {
   jobs: {
@@ -44,12 +44,15 @@ export const SCHEDULER_SCHEMAS = {
       approval_required: { type: 'boolean', default: false },
       approval_timeout_s: { type: 'integer', min: 1, default: 3600 },
       approval_auto: { type: 'string', enum: ['approve', 'reject'], default: 'reject' },
+      approval_risk_level: { type: 'string', enum: ['low', 'medium', 'high'], nullable: true },
+      approval_approver_scope: { type: 'string', nullable: true, description: 'Authenticated local OS approver: exact, principal:, user:, or uid: scope' },
       context_retrieval: { type: 'string', enum: ['none', 'recent', 'hybrid'], default: 'none' },
       context_retrieval_limit: { type: 'integer', min: 1, default: 5 },
       output_store_limit_bytes: { type: 'integer', min: 128, default: 65536 },
       output_excerpt_limit_bytes: { type: 'integer', min: 64, default: 65536 },
       output_summary_limit_bytes: { type: 'integer', min: 64, default: 65536 },
       output_offload_threshold_bytes: { type: 'integer', min: 128, default: 65536 },
+      output_format: { type: 'string', enum: ['json', 'ndjson', 'text'], nullable: true, description: 'Expected and validated execution output format' },
       preferred_session_key: { type: 'string', nullable: true },
       auth_profile: { type: 'string', nullable: true, description: 'Auth profile override: null=default, "inherit"=main session profile, or "provider:label"' },
       auth_profile_fallback: { type: 'string', nullable: true, description: 'Optional fallback auth profile for a same-run retry after primary selection failure' },
@@ -94,11 +97,11 @@ export const SCHEDULER_SCHEMAS = {
   },
   runs: {
     statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed', 'recovery_blocked'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_record', 'credential_handoff_summary'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_required', 'evidence_execution_snapshot', 'evidence_declaration_snapshot', 'evidence_ref_snapshot', 'evidence_record', 'credential_handoff_summary', 'delegation_validation', 'output_format', 'structured_output', 'structured_output_valid'],
   },
   approvals: {
     statuses: ['pending', 'approved', 'dispatching', 'dispatched', 'rejected', 'timed_out', 'cancelled'],
-    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes', 'decision_version', 'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at', 'dispatched_at'],
+    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes', 'decision_version', 'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at', 'dispatched_at', 'risk_level', 'approver_scope', 'binding_hash', 'gate_kind', 'decision_context'],
   },
   dispatches: {
     kinds: ['schedule', 'at', 'manual', 'chain', 'retry'],
@@ -114,9 +117,12 @@ export const SCHEDULER_SCHEMAS = {
   },
   delivery_outbox: {
     statuses: ['pending', 'claimed', 'delivered', 'failed', 'cancelled'],
-    key_fields: ['message_id', 'job_id', 'run_id', 'channel', 'target', 'status', 'idempotency_key', 'attempt_count', 'max_attempts', 'next_attempt_at', 'claim_owner', 'claim_token', 'claim_expires_at', 'last_error', 'delivered_at'],
+    key_fields: ['message_id', 'job_id', 'run_id', 'channel', 'target', 'status', 'idempotency_key', 'delivery_group_id', 'part_index', 'part_count', 'completion_label', 'completion_scope', 'attempt_count', 'max_attempts', 'next_attempt_at', 'claim_owner', 'claim_token', 'claim_expires_at', 'last_error', 'delivered_at'],
   },
   delivery_attachments: {
     key_fields: ['outbox_id', 'message_id', 'ordinal', 'name', 'mime_type', 'source_path', 'content_blob', 'size_bytes', 'sha256'],
+  },
+  evidence_records: {
+    key_fields: ['run_id', 'job_id', 'evidence_ref', 'algorithm', 'hash', 'payload', 'retention_policy', 'retention_until', 'created_at'],
   },
 };

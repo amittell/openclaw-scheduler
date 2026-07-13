@@ -4,7 +4,7 @@
  * Fires structured dispatch events to:
  *   1. Loki (always -- structured log stream for Grafana observability)
  *   2. DISPATCH_WEBHOOK_URL (optional -- external systems, dashboards, etc.)
- *   3. Gateway post office (optional -- when opts.deliverTo is set)
+ *   3. Durable delivery outbox (optional -- when opts.deliverTo is set)
  *
  * All calls are best-effort and non-blocking. A hook failure never
  * prevents dispatch from completing.
@@ -16,10 +16,11 @@
  *   dispatch.cancelled -- run manually cancelled
  */
 
+import { createHash, randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { resolveCompletionDelivery } from './completion.mjs';
 import { getDb } from '../db.js';
-import { sendMessage } from '../messages.js';
+import { enqueueMultipartDelivery } from '../delivery-outbox.js';
 
 const LOKI_URL     = process.env.LOKI_PUSH_URL     || '';
 const WEBHOOK_URL  = process.env.DISPATCH_WEBHOOK_URL || '';
@@ -41,9 +42,68 @@ function safeJson(value) {
   }
 }
 
+const COMPLETION_SCOPE_METADATA_KEY = '_completion_delivery';
+const COMPLETION_SCOPE_JSON_PATH = '$._completion_delivery.scope_key';
+
+function hasCompositeCompletionDebtSchema(db) {
+  const columns = new Set(db.prepare('PRAGMA table_info(completion_debts)').all().map(column => column.name));
+  return columns.has('id') && columns.has('delivery_scope');
+}
+
+export function buildCompletionDeliveryScope({
+  label,
+  sessionKey = null,
+  runId = null,
+  deliveryScope = null,
+} = {}) {
+  if (deliveryScope != null) {
+    if (typeof deliveryScope !== 'string' || !deliveryScope.trim()) {
+      throw new Error('deliveryScope must be a non-empty string when provided');
+    }
+    return deliveryScope.trim();
+  }
+  if (typeof label !== 'string' || !label.trim()) throw new Error('label is required');
+  const identity = JSON.stringify({
+    label: label.trim(),
+    session_key: sessionKey || null,
+    run_id: runId || null,
+  });
+  return `v1:${createHash('sha256').update(identity).digest('hex')}`;
+}
+
+function metadataWithCompletionScope(metadata, { scope, runId }) {
+  return {
+    ...(metadata && typeof metadata === 'object' ? metadata : {}),
+    [COMPLETION_SCOPE_METADATA_KEY]: {
+      scope_key: scope,
+      run_id: runId || null,
+    },
+  };
+}
+
+function completionDebtContext({ label, sessionKey = null, runId = null, deliveryScope = null, metadata = null }) {
+  const normalizedLabel = typeof label === 'string' ? label.trim() : '';
+  if (!normalizedLabel) throw new Error('label is required');
+  const scope = buildCompletionDeliveryScope({
+    label: normalizedLabel,
+    sessionKey,
+    runId,
+    deliveryScope,
+  });
+  return {
+    label: normalizedLabel,
+    sessionKey: sessionKey || null,
+    runId: runId || null,
+    scope,
+    metadata: metadataWithCompletionScope(metadata, { scope, runId }),
+  };
+}
+
 function upsertCompletionDebt({
   label,
   sessionKey = null,
+  runId = null,
+  deliveryScope = null,
   status,
   openReason = null,
   closeReason = null,
@@ -56,24 +116,63 @@ function upsertCompletionDebt({
   try {
     const db = getDb();
     const now = schedulerNow();
-    const metadataJson = safeJson(metadata);
+    const context = completionDebtContext({ label, sessionKey, runId, deliveryScope, metadata });
+    const metadataJson = safeJson(context.metadata);
+    const values = [
+      context.label,
+      context.sessionKey,
+      status,
+      openReason,
+      closeReason,
+      status === 'open' ? now : null,
+      status === 'closed' ? now : null,
+      lastVisibleUpdateAt,
+      finalReportedAt,
+      Number(Boolean(noReply)),
+      metadataJson,
+      now,
+      now,
+    ];
 
-    db.prepare(`
+    if (hasCompositeCompletionDebtSchema(db)) {
+      db.prepare(`
+        INSERT INTO completion_debts (
+          id, task_label, delivery_scope, session_key, source, status,
+          open_reason, close_reason, opened_at, closed_at,
+          last_visible_update_at, final_reported_at, no_reply, metadata,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'dispatch', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_label, delivery_scope) DO UPDATE SET
+          session_key = COALESCE(excluded.session_key, completion_debts.session_key),
+          source = 'dispatch',
+          status = excluded.status,
+          open_reason = COALESCE(excluded.open_reason, completion_debts.open_reason),
+          close_reason = COALESCE(excluded.close_reason, completion_debts.close_reason),
+          opened_at = CASE
+            WHEN excluded.status = 'open' THEN COALESCE(completion_debts.opened_at, excluded.opened_at)
+            ELSE completion_debts.opened_at
+          END,
+          closed_at = CASE
+            WHEN excluded.status = 'closed' THEN excluded.closed_at
+            ELSE completion_debts.closed_at
+          END,
+          last_visible_update_at = COALESCE(excluded.last_visible_update_at, completion_debts.last_visible_update_at),
+          final_reported_at = COALESCE(excluded.final_reported_at, completion_debts.final_reported_at),
+          no_reply = excluded.no_reply,
+          metadata = COALESCE(excluded.metadata, completion_debts.metadata),
+          updated_at = excluded.updated_at
+      `).run(randomUUID(), context.label, context.scope, ...values.slice(1));
+      return db.prepare(
+        'SELECT * FROM completion_debts WHERE task_label = ? AND delivery_scope = ?'
+      ).get(context.label, context.scope) || null;
+    }
+
+    const result = db.prepare(`
       INSERT INTO completion_debts (
-        task_label,
-        session_key,
-        source,
-        status,
-        open_reason,
-        close_reason,
-        opened_at,
-        closed_at,
-        last_visible_update_at,
-        final_reported_at,
-        no_reply,
-        metadata,
-        created_at,
-        updated_at
+        task_label, session_key, source, status, open_reason, close_reason,
+        opened_at, closed_at, last_visible_update_at, final_reported_at,
+        no_reply, metadata, created_at, updated_at
       )
       VALUES (?, ?, 'dispatch', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_label) DO UPDATE SET
@@ -95,25 +194,14 @@ function upsertCompletionDebt({
         no_reply = excluded.no_reply,
         metadata = COALESCE(excluded.metadata, completion_debts.metadata),
         updated_at = excluded.updated_at
-    `).run(
-      label,
-      sessionKey,
-      status,
-      openReason,
-      closeReason,
-      status === 'open' ? now : null,
-      status === 'closed' ? now : null,
-      lastVisibleUpdateAt,
-      finalReportedAt,
-      Number(Boolean(noReply)),
-      metadataJson,
-      now,
-      now,
-    );
-
-    return db.prepare('SELECT * FROM completion_debts WHERE task_label = ?').get(label);
+      WHERE json_extract(completion_debts.metadata, '${COMPLETION_SCOPE_JSON_PATH}') = ?
+         OR (json_extract(completion_debts.metadata, '${COMPLETION_SCOPE_JSON_PATH}') IS NULL
+             AND completion_debts.session_key IS excluded.session_key)
+    `).run(...values, context.scope);
+    if (result.changes === 0) return null;
+    return db.prepare('SELECT * FROM completion_debts WHERE task_label = ?').get(context.label) || null;
   } catch (err) {
-    process.stderr.write(`[dispatch-hooks] completion debt tracking skipped for ${label}: ${err.message}\n`);
+    process.stderr.write(`[dispatch-hooks] completion debt tracking failed for ${label}: ${err.message}\n`);
     return null;
   }
 }
@@ -121,6 +209,8 @@ function upsertCompletionDebt({
 export function recordCompletionDeliveryDebt({
   label,
   sessionKey = null,
+  runId = null,
+  deliveryScope = null,
   openReason = 'no-clean-user-facing-completion',
   noReply = false,
   metadata = null,
@@ -128,6 +218,8 @@ export function recordCompletionDeliveryDebt({
   return upsertCompletionDebt({
     label,
     sessionKey,
+    runId,
+    deliveryScope,
     status: 'open',
     openReason,
     noReply,
@@ -138,6 +230,8 @@ export function recordCompletionDeliveryDebt({
 export function recordCompletionDelivered({
   label,
   sessionKey = null,
+  runId = null,
+  deliveryScope = null,
   closeReason = 'confirmed-completion-delivered',
   metadata = null,
 } = {}) {
@@ -145,6 +239,8 @@ export function recordCompletionDelivered({
   return upsertCompletionDebt({
     label,
     sessionKey,
+    runId,
+    deliveryScope,
     status: 'closed',
     closeReason,
     metadata,
@@ -153,17 +249,94 @@ export function recordCompletionDelivered({
   });
 }
 
-// Clear any prior-run completion debt so a re-dispatched label starts with a
-// clean delivery claim. The debt row is keyed by task_label and durable across
-// runs; without this reset a stale 'closed' row from an earlier run would make
-// the next run's delivery claim fail and silently suppress its announce.
-export function resetCompletionDeliveryClaim({ label } = {}) {
+export function recordCompletionEnqueued({
+  label,
+  sessionKey = null,
+  runId = null,
+  deliveryScope = null,
+  metadata = null,
+} = {}) {
+  return upsertCompletionDebt({
+    label,
+    sessionKey,
+    runId,
+    deliveryScope,
+    status: 'delivering',
+    metadata,
+  });
+}
+
+// Reserve the new run's scope before its watcher can race a stale watcher from
+// an older use of the same label. Legacy schemas can retain only one scope per
+// label; the reservation still makes stale-run claims fail closed atomically.
+export function resetCompletionDeliveryClaim({
+  label,
+  sessionKey = null,
+  runId = null,
+  deliveryScope = null,
+} = {}) {
   if (!label) return;
   try {
-    getDb().prepare('DELETE FROM completion_debts WHERE task_label = ?').run(label);
+    const db = getDb();
+    const hasIdentity = Boolean(sessionKey || runId || deliveryScope);
+    if (!hasIdentity) {
+      db.prepare('DELETE FROM completion_debts WHERE task_label = ?').run(label);
+      return;
+    }
+
+    const context = completionDebtContext({ label, sessionKey, runId, deliveryScope });
+    const now = schedulerNow();
+    const metadataJson = safeJson(context.metadata);
+    if (hasCompositeCompletionDebtSchema(db)) {
+      db.prepare(`
+        DELETE FROM completion_debts
+        WHERE task_label = ?
+          AND json_extract(metadata, '$._completion_delivery.migrated_legacy_unscoped') = 1
+      `).run(context.label);
+      db.prepare(`
+        INSERT INTO completion_debts (
+          id, task_label, delivery_scope, session_key, source, status,
+          opened_at, closed_at, final_reported_at, no_reply, metadata,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'dispatch', 'tracking', NULL, NULL, NULL, 0, ?, ?, ?)
+        ON CONFLICT(task_label, delivery_scope) DO UPDATE SET
+          session_key = excluded.session_key,
+          source = 'dispatch',
+          status = 'tracking',
+          open_reason = NULL,
+          close_reason = NULL,
+          opened_at = NULL,
+          closed_at = NULL,
+          final_reported_at = NULL,
+          no_reply = 0,
+          metadata = excluded.metadata,
+          updated_at = excluded.updated_at
+      `).run(randomUUID(), context.label, context.scope, context.sessionKey, metadataJson, now, now);
+      return;
+    }
+
+    db.prepare(`
+      INSERT INTO completion_debts (
+        task_label, session_key, source, status, opened_at, closed_at,
+        final_reported_at, no_reply, metadata, created_at, updated_at
+      )
+      VALUES (?, ?, 'dispatch', 'tracking', NULL, NULL, NULL, 0, ?, ?, ?)
+      ON CONFLICT(task_label) DO UPDATE SET
+        session_key = excluded.session_key,
+        source = 'dispatch',
+        status = 'tracking',
+        open_reason = NULL,
+        close_reason = NULL,
+        opened_at = NULL,
+        closed_at = NULL,
+        final_reported_at = NULL,
+        no_reply = 0,
+        metadata = excluded.metadata,
+        updated_at = excluded.updated_at
+    `).run(context.label, context.sessionKey, metadataJson, now, now);
   } catch (err) {
-    if (/no such table:\s*completion_debts/i.test(err.message || '')) return;
-    process.stderr.write(`[dispatch-hooks] completion debt reset skipped for ${label}: ${err.message}\n`);
+    process.stderr.write(`[dispatch-hooks] completion debt reservation failed for ${label}: ${err.message}\n`);
   }
 }
 
@@ -176,29 +349,78 @@ const CLAIM_STALE_WINDOW = "-2 minutes";
 // or freshly 'delivering' (send in flight) blocks the claim. A 'delivering' row
 // older than the stale window is reclaimable so a crashed sender cannot wedge
 // delivery forever. Returns true when this caller owns delivery.
-export function claimCompletionDelivery({ label, sessionKey = null } = {}) {
-  if (!label) return true;
+export function claimCompletionDelivery({
+  label,
+  sessionKey = null,
+  runId = null,
+  deliveryScope = null,
+} = {}) {
+  if (!label) throw new Error('label is required');
   try {
     const db = getDb();
     const now = schedulerNow();
-    const res = db.prepare(`
-      INSERT INTO completion_debts (task_label, session_key, source, status, opened_at, created_at, updated_at)
-      VALUES (?, ?, 'dispatch', 'delivering', ?, ?, ?)
-      ON CONFLICT(task_label) DO UPDATE SET
-        status = 'delivering',
-        session_key = COALESCE(excluded.session_key, completion_debts.session_key),
-        opened_at = COALESCE(completion_debts.opened_at, excluded.opened_at),
-        updated_at = excluded.updated_at
-      WHERE completion_debts.status != 'closed'
-        AND (completion_debts.status != 'delivering'
-             OR completion_debts.updated_at <= datetime('now', '${CLAIM_STALE_WINDOW}'))
-    `).run(label, sessionKey, now, now, now);
+    const context = completionDebtContext({ label, sessionKey, runId, deliveryScope });
+    const metadataJson = safeJson(context.metadata);
+    if (hasCompositeCompletionDebtSchema(db)) {
+      const migratedTerminal = db.prepare(`
+        SELECT 1
+        FROM completion_debts
+        WHERE task_label = ?
+          AND status IN ('delivering', 'closed')
+          AND json_extract(metadata, '$._completion_delivery.migrated_legacy_unscoped') = 1
+          AND (session_key IS NULL OR session_key IS ?)
+        LIMIT 1
+      `).get(context.label, context.sessionKey);
+      if (migratedTerminal) return false;
+    }
+    const res = hasCompositeCompletionDebtSchema(db)
+      ? db.prepare(`
+          INSERT INTO completion_debts (
+            id, task_label, delivery_scope, session_key, source, status,
+            opened_at, metadata, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, 'dispatch', 'delivering', ?, ?, ?, ?)
+          ON CONFLICT(task_label, delivery_scope) DO UPDATE SET
+            status = 'delivering',
+            session_key = COALESCE(excluded.session_key, completion_debts.session_key),
+            opened_at = COALESCE(completion_debts.opened_at, excluded.opened_at),
+            metadata = COALESCE(excluded.metadata, completion_debts.metadata),
+            updated_at = excluded.updated_at
+          WHERE completion_debts.status != 'closed'
+            AND (completion_debts.status != 'delivering'
+                 OR completion_debts.updated_at <= datetime('now', '${CLAIM_STALE_WINDOW}'))
+        `).run(
+          randomUUID(), context.label, context.scope, context.sessionKey,
+          now, metadataJson, now, now,
+        )
+      : db.prepare(`
+          INSERT INTO completion_debts (
+            task_label, session_key, source, status, opened_at, metadata,
+            created_at, updated_at
+          )
+          VALUES (?, ?, 'dispatch', 'delivering', ?, ?, ?, ?)
+          ON CONFLICT(task_label) DO UPDATE SET
+            status = 'delivering',
+            session_key = COALESCE(excluded.session_key, completion_debts.session_key),
+            opened_at = COALESCE(completion_debts.opened_at, excluded.opened_at),
+            metadata = COALESCE(excluded.metadata, completion_debts.metadata),
+            updated_at = excluded.updated_at
+          WHERE (json_extract(completion_debts.metadata, '${COMPLETION_SCOPE_JSON_PATH}') = ?
+                 OR (json_extract(completion_debts.metadata, '${COMPLETION_SCOPE_JSON_PATH}') IS NULL
+                     AND completion_debts.session_key IS excluded.session_key))
+            AND completion_debts.status != 'closed'
+            AND (completion_debts.status != 'delivering'
+                 OR completion_debts.updated_at <= datetime('now', '${CLAIM_STALE_WINDOW}'))
+        `).run(context.label, context.sessionKey, now, metadataJson, now, now, context.scope);
     return res.changes > 0;
   } catch (err) {
-    // Missing table / DB error: preserve prior best-effort delivery rather than
-    // silently dropping the user's completion announce.
-    process.stderr.write(`[dispatch-hooks] completion delivery claim skipped for ${label}: ${err.message}\n`);
-    return true;
+    const claimError = new Error(
+      `completion delivery claim unavailable for ${label}: ${err.message}`,
+      { cause: err },
+    );
+    claimError.code = 'COMPLETION_CLAIM_UNAVAILABLE';
+    process.stderr.write(`[dispatch-hooks] ${claimError.message}\n`);
+    throw claimError;
   }
 }
 
@@ -241,8 +463,8 @@ async function webhookPush(event, payload) {
 // -- Post-office notification ---------------------------------
 
 /**
- * Enqueue a completion notification into the messages queue (post office).
- * The Inbox Consumer drains pending messages and delivers to Telegram.
+ * Enqueue a completion notification into the durable delivery outbox.
+ * The Inbox Consumer drains pending outbox rows and delivers externally.
  * Used for unregistered-label done signals where no watcher is waiting.
  *
  * @param {string} label           - Dispatch label
@@ -251,43 +473,59 @@ async function webhookPush(event, payload) {
  * @param {string} [deliveryChannel='telegram'] - Channel to deliver via (stored for reference)
  * @param {object} [completion=null] - Structured completion payload
  */
-async function gatewayNotify(label, summary, deliverTo, deliveryChannel = 'telegram', completion = null) {
+async function gatewayNotify(
+  label,
+  summary,
+  deliverTo,
+  deliveryChannel = 'telegram',
+  completion = null,
+  deliveryContext = {},
+) {
   return enqueueCompletionNotification({
     label,
     summary,
     deliverTo,
     deliveryChannel,
     completion,
+    ...deliveryContext,
   });
 }
 
-export async function enqueueCompletionNotification({
+export function enqueueCompletionNotification({
   label,
   summary = null,
   deliverTo,
   deliveryChannel = 'telegram',
   completion = null,
   sessionKey = null,
+  runId = null,
+  deliveryScope = null,
+  resolvedDelivery = null,
   origin = null,
   metadata = null,
+  maxPartBytes = null,
 } = {}) {
-  const delivery = resolveCompletionDelivery({
-    completion,
-    fallbackSummary: summary,
-  });
+  const delivery = resolvedDelivery && typeof resolvedDelivery === 'object'
+    ? resolvedDelivery
+    : resolveCompletionDelivery({ completion, fallbackSummary: summary });
   const bodyText = delivery.deliveryText || null;
+  const scope = buildCompletionDeliveryScope({ label, sessionKey, runId, deliveryScope });
   const baseMetadata = {
     ...(metadata && typeof metadata === 'object' ? metadata : {}),
     delivery_channel: deliveryChannel,
     delivery_to: deliverTo,
     origin: origin || null,
     delivery_source: delivery.source || null,
+    delivery_scope: scope,
+    run_id: runId || null,
   };
 
   if (!bodyText) {
     recordCompletionDeliveryDebt({
       label,
       sessionKey,
+      runId,
+      deliveryScope: scope,
       openReason: 'no-clean-user-facing-completion',
       noReply: true,
       metadata: baseMetadata,
@@ -296,7 +534,36 @@ export async function enqueueCompletionNotification({
     return { ok: false, delivered: false, suppressed: true, reason: 'no-clean-user-facing-completion' };
   }
 
-  if (!claimCompletionDelivery({ label, sessionKey })) {
+  let ownsClaim;
+  try {
+    ownsClaim = claimCompletionDelivery({
+      label,
+      sessionKey,
+      runId,
+      deliveryScope: scope,
+    });
+  } catch (claimError) {
+    recordCompletionDeliveryDebt({
+      label,
+      sessionKey,
+      runId,
+      deliveryScope: scope,
+      openReason: 'completion-claim-unavailable',
+      noReply: false,
+      metadata: {
+        ...baseMetadata,
+        error: claimError.message,
+      },
+    });
+    return {
+      ok: false,
+      delivered: false,
+      reason: 'completion-claim-unavailable',
+      error: claimError.message,
+    };
+  }
+
+  if (!ownsClaim) {
     // The watcher (or a prior done-path enqueue) already owns this completion's
     // delivery. Skip sending so the user gets exactly one announce.
     process.stderr.write(`[dispatch-hooks] completion delivery deduped for ${label}: already claimed by another path\n`);
@@ -305,34 +572,48 @@ export async function enqueueCompletionNotification({
 
   try {
     const body = `✅ [${label}] done\n\n${bodyText}`;
-    // Run-scoped dedup key: a crash-retry (or a second delivery path) for the
-    // same run's completion collapses to the original message row. Keyed with
-    // sessionKey so a re-dispatched label (new session) is never suppressed by a
-    // prior run's row; omitted when no sessionKey is available.
-    const idempotencyKey = sessionKey ? `dispatch-completion:${label}:${sessionKey}` : null;
-    const message = await sendMessage({
-      from_agent:  'dispatch',
-      to_agent:    'main',
-      kind:        'result',
-      subject:     label,
+    const routeHash = createHash('sha256')
+      .update(JSON.stringify({ channel: deliveryChannel, target: deliverTo }))
+      .digest('hex')
+      .slice(0, 16);
+    const idempotencyKey = `dispatch-completion:${scope}:${routeHash}`;
+    const outbox = enqueueMultipartDelivery({
       body,
       channel:     deliveryChannel,
-      delivery_to: deliverTo,
-      idempotency_key: idempotencyKey,
+      target:      deliverTo,
+      idempotencyKey,
+      completionLabel: label,
+      completionScope: scope,
+      ...(maxPartBytes == null ? {} : { maxPartBytes }),
     });
-    recordCompletionDelivered({
+    recordCompletionEnqueued({
       label,
       sessionKey,
+      runId,
+      deliveryScope: scope,
       metadata: {
         ...baseMetadata,
-        message_id: message?.id || null,
+        outbox_ids: outbox.deliveries.map(item => item.id),
+        part_count: outbox.partCount,
       },
     });
-    return { ok: true, delivered: true, deduped: message?.deduped === true, bodyText, messageId: message?.id || null };
+    return {
+      ok: true,
+      delivered: false,
+      enqueued: true,
+      deduped: outbox.deduped === true,
+      bodyText,
+      outboxId: outbox.id,
+      outboxIds: outbox.deliveries.map(item => item.id),
+      partCount: outbox.partCount,
+      checkpointKey: outbox.checkpointKey,
+    };
   } catch (e) {
     recordCompletionDeliveryDebt({
       label,
       sessionKey,
+      runId,
+      deliveryScope: scope,
       openReason: 'completion-enqueue-failed',
       noReply: false,
       metadata: {
@@ -340,7 +621,7 @@ export async function enqueueCompletionNotification({
         error: e.message,
       },
     });
-    process.stderr.write(`[dispatch-hooks] post-office enqueue failed for ${label}: ${e.message}\n`);
+    process.stderr.write(`[dispatch-hooks] durable outbox enqueue failed for ${label}: ${e.message}\n`);
     return { ok: false, delivered: false, reason: 'completion-enqueue-failed', error: e.message };
   }
 }
@@ -405,7 +686,18 @@ export async function onFinished(opts) {
   if (opts.deliverTo) {
     const summary = opts.summary || opts.status || 'completed';
     tasks.push(
-      gatewayNotify(opts.label, summary, opts.deliverTo, opts.deliveryChannel || 'telegram', opts.completion || null)
+      gatewayNotify(
+        opts.label,
+        summary,
+        opts.deliverTo,
+        opts.deliveryChannel || 'telegram',
+        opts.completion || null,
+        {
+          sessionKey: opts.session_key || null,
+          runId: opts.run_id || null,
+          origin: opts.origin || null,
+        },
+      )
     );
   }
 

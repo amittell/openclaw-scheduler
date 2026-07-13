@@ -27,21 +27,13 @@ sudo launchctl bootout system/ai.openclaw.scheduler
 sudo rm /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
-### Linux
+### Linux or Windows WSL2
 
 ```bash
 systemctl --user stop openclaw-scheduler
 systemctl --user disable openclaw-scheduler
 rm ~/.config/systemd/user/openclaw-scheduler.service
 systemctl --user daemon-reload
-```
-
-### Windows (PM2)
-
-```powershell
-pm2 stop openclaw-scheduler
-pm2 delete openclaw-scheduler
-pm2 save   # persist the removal
 ```
 
 ---
@@ -86,25 +78,15 @@ sqlite3 ~/.openclaw/scheduler/scheduler.db ".backup '$HOME/scheduler.db.uninstal
 **Remove the scheduler directory:**
 
 ```bash
-# macOS / Linux
+# macOS / Linux / Windows WSL2
 rm -rf ~/.openclaw/scheduler/
-
-# Windows (PowerShell)
-Remove-Item -Recurse -Force "$env:USERPROFILE\.openclaw\scheduler"
 ```
 
 **Remove log files:**
 
 ```bash
-# macOS / Linux
+# macOS / Linux / Windows WSL2
 rm -f /tmp/openclaw-scheduler.log
-```
-
-On Windows, PM2 stores logs in `~/.pm2/logs/`. Remove if desired:
-
-```powershell
-Remove-Item -Force "$env:USERPROFILE\.pm2\logs\openclaw-scheduler-out.log"
-Remove-Item -Force "$env:USERPROFILE\.pm2\logs\openclaw-scheduler-error.log"
 ```
 
 ---
@@ -122,7 +104,7 @@ openclaw gateway restart
 
 ---
 
-## Linger (Linux only)
+## Linger (Linux or Windows WSL2 only)
 
 If you enabled linger to keep the service running without a login session, you can disable it:
 

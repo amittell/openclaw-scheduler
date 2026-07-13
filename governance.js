@@ -15,6 +15,43 @@ const MINIMAL_ENV_KEYS = new Set([
 const HOST_SANDBOX_VALUES = new Set(['', 'none', 'off', 'host', 'inherit']);
 const OPEN_NETWORK_VALUES = new Set(['', 'allow', 'full', 'host', 'inherit', 'unrestricted']);
 const AUDIT_VALUES = new Set(['', 'none', 'off', 'basic', 'minimal', 'full', 'always']);
+const RESERVED_CREDENTIAL_ENV_KEYS = new Set([
+  'PATH', 'HOME', 'SHELL', 'USER', 'LOGNAME', 'PWD', 'OLDPWD', 'TMPDIR', 'IFS',
+  'ENV', 'BASH_ENV', 'ZDOTDIR', 'SHELLOPTS', 'CDPATH',
+  'NODE_OPTIONS', 'NODE_PATH', 'PYTHONPATH', 'PYTHONHOME', 'RUBYOPT', 'PERL5OPT',
+  'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'GIT_SSH_COMMAND', 'GIT_CONFIG_GLOBAL', 'SSH_AUTH_SOCK',
+]);
+const RESERVED_CREDENTIAL_ENV_PREFIXES = [
+  'DYLD_', 'OPENCLAW_', 'SCHEDULER_', 'DISPATCH_', 'COORD_',
+  'NPM_CONFIG_', 'GIT_CONFIG_',
+];
+const INHERITED_SECRET_KEYS = new Set([
+  'GH_TOKEN', 'GITHUB_TOKEN', 'NODE_AUTH_TOKEN', 'NPM_TOKEN', 'VAULT_TOKEN',
+  'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'GOOGLE_APPLICATION_CREDENTIALS',
+]);
+
+export function isReservedCredentialEnvironmentKey(key) {
+  if (typeof key !== 'string') return true;
+  const normalized = key.toUpperCase();
+  return RESERVED_CREDENTIAL_ENV_KEYS.has(normalized)
+    || RESERVED_CREDENTIAL_ENV_PREFIXES.some(prefix => normalized.startsWith(prefix));
+}
+
+export function assertCredentialEnvironmentKeyAllowed(key) {
+  if (isReservedCredentialEnvironmentKey(key)) {
+    const error = new Error(`Credential presentation cannot override reserved runtime environment key ${JSON.stringify(key)}`);
+    error.code = 'CREDENTIAL_ENV_KEY_RESERVED';
+    throw error;
+  }
+}
+
+function shouldStripInheritedEnvironmentKey(key) {
+  const normalized = key.toUpperCase();
+  return INHERITED_SECRET_KEYS.has(normalized)
+    || ['OPENCLAW_', 'SCHEDULER_', 'DISPATCH_', 'COORD_'].some(prefix => normalized.startsWith(prefix));
+}
 
 function parseJsonField(name, value, fallback = null) {
   if (value == null || value === '') return fallback;
@@ -136,9 +173,8 @@ export function evaluateGovernance(job, {
   }
 
   const maxCost = job.contract_max_cost_usd;
-  const isShell = job.session_target === 'shell' || job.job_type === 'watchdog';
-  if (maxCost != null && !isShell && !costMetered) {
-    violations.push('contract_max_cost_usd is set, but the selected agent runtime does not expose enforceable cost metering');
+  if (maxCost != null && !costMetered) {
+    violations.push('contract_max_cost_usd is set, but the selected runtime does not expose enforceable cost metering');
   }
 
   const shellEnvPolicy = job.shell_env_policy || 'minimal';
@@ -166,7 +202,7 @@ export function evaluateGovernance(job, {
       sandbox: sandboxEnforced,
       network: networkEnforced,
       paths: pathEnforced,
-      cost: isShell || costMetered,
+      cost: costMetered,
     },
     evaluated_at: evaluatedAt,
   };
@@ -199,11 +235,17 @@ export function buildShellEnvironment(job, materializedEnv = null, baseEnv = pro
   } else {
     throw new Error(`Unsupported shell_env_policy "${policy}"`);
   }
+  for (const key of Object.keys(env)) {
+    if (shouldStripInheritedEnvironmentKey(key)) delete env[key];
+  }
   if (materializedEnv && typeof materializedEnv === 'object') {
     for (const [key, value] of Object.entries(materializedEnv)) {
-      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && value != null) {
-        env[key] = String(value);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        throw new Error(`Invalid materialized environment key ${JSON.stringify(key)}`);
       }
+      assertCredentialEnvironmentKeyAllowed(key);
+      if (value == null) throw new Error(`Materialized environment value for ${JSON.stringify(key)} is required`);
+      env[key] = String(value);
     }
   }
   return env;

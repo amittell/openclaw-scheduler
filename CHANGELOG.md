@@ -2,6 +2,113 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] -- 2026-07-12
+
+### Added
+
+- schema v28 handoff fields for approval risk/scope, structured output,
+  delegation results, immutable evidence, and run-scoped completion delivery
+- approval gates for every durable dispatch kind, including root, manual,
+  scheduled, one-shot, and chain work, with SHA-256 execution bindings and
+  OS-authenticated bare/exact, local-user, UID, or local-principal scopes
+- `json`, `ndjson`, and `text` output contracts with persisted validation state
+  and fail-closed child triggering
+- provider-backed `authorization_ref` resolution, provider-independent
+  delegation-chain validation, and immutable `json-sort-v1` SHA-256 evidence
+  records that exclude raw credentials
+- immutable per-run execution, evidence-declaration, and reference snapshots so
+  evidence remains bound to the configuration that actually started even when
+  a job is later edited or deleted
+- terminal evidence coverage for normal completion, cancellation, timeout,
+  authorization rejection, crash recovery, and recovery quarantine, with
+  retention tombstones and corruption-aware pruning
+- fail-closed evidence validation for unsupported external providers such as
+  `ssh` or `none`, non-SHA-256 methods, and required signature verification;
+  the built-in backend is checksum-only
+- Gateway capability discovery through explicit JSON capability metadata from
+  `GET /v1/info` or `GET /health`, with bounded parsing and a per-Gateway cache
+- forced Gateway capability refresh before every credential-bearing isolated
+  request, so a restart or downgrade cannot reuse stale positive capability
+  metadata; current OpenClaw Gateway 2026.6.11 advertises no capabilities and
+  therefore fails closed for task-scoped environment injection
+- per-request Gateway token-file reads so bearer-token rotation no longer
+  requires restarting the scheduler process
+- capability-negotiated task credential injection for isolated agent jobs using
+  `chat-completions-env-inject-v1` and `x-openclaw-env-inject`
+- scheduler capability flags `gateway_capability_discovery` and
+  `gateway_env_injection_negotiation` for handoff v3 consumers
+- run-scoped completion ownership, durable per-part delivery checkpoints, and
+  capability flags `completion_delivery_scope: "run"` and
+  `multipart_delivery_checkpoints: true`
+- handoff v3 capability declarations for `root_approval_gate`,
+  `approval_scope_enforcement`, `structured_output_format`,
+  `delegation_validation`, and `authorization_ref_resolution`; the runtime
+  honestly advertises `evidence_generation: false` for agentcli evidence plus
+  `checksum_evidence_generation: true` and
+  `evidence_integrity: "checksum-sha256-v2"` for its native evidence records
+- required hosted compatibility jobs against exact public agentcli commits for
+  handoff v3 (`38980ad8f1b8a31bb6757579fc5e0e60c280a718`) and backward-compatible
+  handoff v2 (`317cc0eea8b4c65bc3213f5f329124a45c958bd3`)
+- targeted exclusion of the v3 pin's stale upstream assertion that hard-codes
+  handoff field version 2; all other upstream integration cases still run
+
+### Changed
+
+- `identity.presentation` and `credential_handoff` may materialize credentials
+  for shell jobs locally and for isolated agent jobs through a capable Gateway;
+  main-session agent jobs continue to reject credential materialization
+- approval decisions now use the invoking OS account through
+  `approvals approve/reject APPROVAL_ID`; caller-supplied approver identity and
+  domain scopes are rejected, while legacy job-ID commands resolve only the
+  current pending gate
+- legacy or current Gateways that do not advertise environment injection now
+  fail closed with `GATEWAY_ENV_INJECT_UNSUPPORTED` before a credential-bearing
+  agent request is sent; auth-profile-only isolated turns remain compatible
+- Windows support is consistently WSL2-only across setup, install, upgrade, and
+  uninstall guidance
+- GitHub Actions are pinned to immutable action commits, and npm publication is
+  performed only by the tag-triggered provenance workflow after confirming the
+  tagged commit is contained in `origin/main`
+- the npm tarball includes the complete lint, typecheck, test, documentation,
+  coverage, and verification harness referenced by its published scripts
+- package verification now installs the packed tarball into an isolated
+  production consumer, type-checks its public declarations with library checks
+  enabled, and verifies the installed CLI version
+- public TypeScript declarations no longer require consumers to install
+  `better-sqlite3` or ambient Node types merely to type-check scheduler APIs
+- dispatch completion from both `done` and routed watchers now enters only the
+  delivery outbox; routed watchers emit `WATCHER_ALREADY_DELIVERED` with no
+  delivery body on stdout, while route-less watchers retain stdout
+  compatibility. The marker prevents wrapper duplication but is not a channel
+  delivery receipt
+- a completion debt remains open after durable enqueue and closes only after
+  every outbox part is actually delivered
+- completion claim-store failures fail closed as
+  `COMPLETION_CLAIM_UNAVAILABLE`, and legacy completion schemas reserve the
+  active run so a stale run cannot take its delivery claim
+- multipart output uses independently retryable outbox rows with deterministic
+  `:part:i/N` idempotency keys and queryable delivery checkpoints
+- ordinary scheduler announcements use the same durable multipart rows and
+  enforce predecessor ordering even through direct outbox claim APIs
+- successful watcher completion resets both overload and Gateway-restart retry
+  counters, including completion observed exactly at the deadline
+- dispatch prompts include a literal checkpoint command without claiming that
+  a `CHECKPOINT_NOTIFY_CMD` environment variable exists
+- updated `better-sqlite3` to 12.11.1, ESLint to 10.7.0, and `globals` to 17.7.0
+  while retaining TypeScript 5
+- Dependabot now proposes weekly npm and GitHub Actions updates
+
+### Migration Notes
+
+- migration 28 transactionally rebuilds legacy `completion_debts` rows with a
+  derived delivery scope, creates `evidence_records`, adds multipart
+  `delivery_group_id`/`part_index`/`part_count` coordinates and indexes to the
+  outbox, preserves existing data, and records schema version 28
+- rerunning migration 28 repairs any missing required correctness index instead
+  of treating a version marker alone as proof that the schema is complete
+- run `openclaw-scheduler doctor --json` after upgrade and use
+  `openclaw-scheduler runs evidence RUN_ID --json` to verify generated evidence
+
 ## [0.3.0] -- 2026-07-11
 
 ### Added

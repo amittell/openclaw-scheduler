@@ -1,6 +1,6 @@
 # Installing OpenClaw Scheduler on an Additional Host
 
-This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own service (launchd on macOS, systemd on Linux, PM2 on Windows) -- they don't share state. This is not a replication setup; each host schedules and dispatches jobs independently.
+This guide is for setting up the scheduler on a **second or additional OpenClaw instance**. Each host runs its own independent SQLite database and its own service (launchd on macOS or systemd/PM2 on Linux). Windows hosts must run the Linux service inside WSL2; native Windows and WSL1 are not supported. The hosts do not share state. This is not a replication setup; each host schedules and dispatches jobs independently.
 
 > **Starting fresh:** Unlike migrating from OC cron, on an additional host you'll typically create jobs from scratch. Use the job examples in README.md.
 > **Need copy-paste examples?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
@@ -11,7 +11,7 @@ This guide is for setting up the scheduler on a **second or additional OpenClaw 
 
 | Requirement | Notes |
 |-------------|-------|
-| macOS or Linux | Tested on macOS arm64 |
+| macOS, Linux, or Windows WSL2 | Tested on macOS arm64; Windows runs inside WSL2 only |
 | Node.js 22 LTS, 24 LTS, or 26 Current | `node --version` (use full path if needed: `/opt/homebrew/bin/node --version`) |
 | OpenClaw gateway running | With auth token |
 | Git or SCP access | To clone/copy the repo |

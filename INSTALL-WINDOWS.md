@@ -1,307 +1,130 @@
 # Installing OpenClaw Scheduler on Windows
 
-> **TL;DR:** Use WSL2. It's faster to set up, fully supported, and eliminates every Windows-specific limitation listed in this guide.
->
-> **Need examples or migration help?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
+OpenClaw Scheduler supports Windows through WSL2 only. Native Windows and
+WSL1 are not supported runtime environments. Do not run the dispatcher with
+native Windows PM2, `cmd.exe`, or PowerShell shell jobs.
 
----
+Inside WSL2 the scheduler uses the same Linux runtime, shell behavior, SQLite
+binding, and service configuration documented in [INSTALL-LINUX.md](INSTALL-LINUX.md).
 
-## Option A: WSL2 (Strongly Recommended)
+## 1. Install or update WSL2
 
-If you're running OpenClaw in WSL2, follow the Linux guide: **[INSTALL-LINUX.md](INSTALL-LINUX.md)**
+Run the following in an elevated PowerShell terminal:
 
-WSL2 gives you a full Linux environment with:
-- **systemd support** — Ubuntu 22.04+ in WSL2 ships with systemd enabled by default
-- Full bash/zsh shell job compatibility
-- No path separator issues, no `.bat` script constraints
-- Identical behavior to a native Linux install
+```powershell
+wsl --install -d Ubuntu
+wsl --set-default-version 2
+wsl --update
+wsl --list --verbose
+```
 
-To enable systemd in WSL2 (Ubuntu 22.04+), add to `/etc/wsl.conf`:
-```ini
+The Ubuntu row must report version `2`. If an existing Ubuntu distribution is
+still version `1`, convert it before installing the scheduler:
+
+```powershell
+wsl --set-version Ubuntu 2
+wsl --list --verbose
+```
+
+Open the Ubuntu terminal after installation completes.
+
+## 2. Enable systemd in WSL2
+
+Run these commands inside Ubuntu:
+
+```bash
+sudo tee /etc/wsl.conf >/dev/null <<'EOF'
 [boot]
 systemd=true
+EOF
 ```
 
-Then restart WSL: `wsl --shutdown` from PowerShell, reopen your terminal.
+Exit Ubuntu, then restart WSL from PowerShell:
 
----
-
-## Option B: PM2 (Native Windows)
-
-Use this path only if you can't use WSL2 — for example, if OpenClaw itself is running natively on Windows (not in WSL2).
-
-> ⚠️ **Shell job limitations apply.** See [Shell Jobs on Windows](#shell-jobs-on-windows) below.
-
----
-
-### Prerequisites
-
-| Requirement | Install |
-|-------------|---------|
-| Node.js 22 LTS, 24 LTS, or 26 Current | [nodejs.org](https://nodejs.org) -- use an installer for one of the supported versions |
-| pm2 | `npm install -g pm2` |
-| OpenClaw gateway | Must be running with a valid auth token |
-| Git for Windows | [git-scm.com](https://git-scm.com) or use GitHub Desktop |
-
-**Build tools for `better-sqlite3`** (required -- it compiles a native addon):
-
-Option 1 -- Visual Studio Build Tools (recommended):
-1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) -- select the **"Desktop development with C++"** workload
-2. Install [Python 3.x](https://python.org) -- check "Add to PATH" during install
-
-Option 2 -- `windows-build-tools` (deprecated, may not work on newer Windows):
 ```powershell
-npm install -g windows-build-tools
+wsl --shutdown
+wsl -d Ubuntu
 ```
 
-Verify:
-```powershell
-node -e "require('better-sqlite3')" && echo "OK"
+Back inside Ubuntu, verify the user service manager is available:
+
+```bash
+systemctl --user status
 ```
 
----
+If that command fails, confirm `/etc/wsl.conf` contains the `[boot]` section,
+run `wsl --shutdown` again from PowerShell, and reopen Ubuntu.
 
-### Step 1: Install Scheduler Files
+## 3. Install the Linux prerequisites
 
-```powershell
-cd $env:USERPROFILE\.openclaw
-git clone https://github.com/amittell/openclaw-scheduler.git scheduler
-cd scheduler
+Continue inside Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential git python3 sqlite3
 ```
 
-Or npm-first install (no git clone):
-```powershell
-mkdir $env:USERPROFILE\.openclaw\scheduler -Force
-npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@latest
-npm exec --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler -- help
+Install a supported Node.js release as described in
+[INSTALL-LINUX.md](INSTALL-LINUX.md#prerequisites), then verify it:
+
+```bash
+node --version
+npm --version
 ```
 
-Runtime state for npm installs defaults to `$env:USERPROFILE\.openclaw\scheduler`, not the package directory under `node_modules`.
+## 4. Install and configure the scheduler
 
----
+Follow the complete [Linux installation guide](INSTALL-LINUX.md) from
+"Step 1: Install Scheduler Files" onward. Run every scheduler, OpenClaw, npm,
+and systemctl command inside the WSL2 distribution, not from Windows
+PowerShell.
 
-### Step 2: Install Dependencies
+The npm-first path is:
 
-If you used the npm-first install path in Step 1, dependencies are already installed; skip to Step 3.
+```bash
+mkdir -p ~/.openclaw/scheduler
+npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup
+```
 
-```powershell
+For a source checkout, use:
+
+```bash
+git clone https://github.com/amittell/openclaw-scheduler.git ~/.openclaw/scheduler
+cd ~/.openclaw/scheduler
 npm install
-```
-
-If `better-sqlite3` fails with a build error, make sure Visual Studio Build Tools and Python are installed (see Prerequisites above), then:
-```powershell
-npm install --build-from-source
-```
-
-If Node changes later on this machine, rebuild the native binding before restarting the scheduler:
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm rebuild better-sqlite3
-```
-
----
-
-### Step 3: Run Tests
-
-```powershell
 npm run verify:local
+node setup.mjs
 ```
 
-All tests must pass before continuing.
+## 5. Verify the service and runtime
 
----
+Run inside WSL2:
 
-### Step 4: Enable Chat Completions on Gateway
-
-```powershell
-openclaw config set gateway.http.endpoints.chatCompletions.enabled true
-openclaw gateway restart
-```
-
-Verify (PowerShell):
-```powershell
-$headers = @{ Authorization = "Bearer YOUR_GATEWAY_TOKEN"; "Content-Type" = "application/json" }
-$body = '{"model":"openclaw:main","messages":[{"role":"user","content":"reply OK"}]}'
-(Invoke-WebRequest -Uri http://127.0.0.1:18789/v1/chat/completions -Method POST -Headers $headers -Body $body).StatusCode
-# Expected: 200
-```
-
----
-
-### Step 5: Migrate Jobs from OC Cron
-
-```powershell
-openclaw-scheduler migrate --dry-run --json | Out-File migration-report.json
-openclaw-scheduler migrate --json
-```
-
-The default source is `openclaw cron list/get --json`. Use
-`--legacy-json ~/.openclaw/cron/jobs.json` only for an old export. Intervals
-that cannot be represented exactly require the explicit
-`--allow-inexact-every` option.
-
-Verify:
-```powershell
-openclaw-scheduler jobs list --json
+```bash
+systemctl --user --no-pager --full status openclaw-scheduler
+journalctl --user -u openclaw-scheduler -n 20 --no-pager
 openclaw-scheduler doctor --json
+openclaw-scheduler status --json
 ```
 
----
+Shell jobs execute under `/bin/bash` by default. Override that only with a
+Linux shell path, for example `SCHEDULER_SHELL=/usr/bin/bash`.
 
-### Step 6: Disable Migrated Native Jobs
+## WSL lifecycle notes
 
-```powershell
-openclaw cron list
-# For each enabled job:
-openclaw cron edit <job-id> --disable
-```
+- A Windows reboot or `wsl --shutdown` stops the WSL virtual machine and all
+  scheduler processes inside it.
+- The enabled systemd user unit starts when the WSL2 distribution starts and
+  the user service manager becomes available.
+- Keep the OpenClaw Gateway and scheduler in the same WSL2 environment when
+  using the default `http://127.0.0.1:18789` Gateway URL.
+- Store scheduler state in the Linux filesystem under
+  `~/.openclaw/scheduler`, not under `/mnt/c`, to retain Linux permissions and
+  SQLite filesystem semantics.
 
-Disable only imported jobs after successful scheduler test runs. Leave unrelated
-native jobs and heartbeat settings unchanged. Rollback by stopping the
-scheduler, disabling its imported copies, and re-enabling the native jobs.
+## Upgrading and removal
 
----
-
-### Step 7: Start with PM2
-
-```powershell
-$env:OPENCLAW_GATEWAY_URL = "http://127.0.0.1:18789"
-$env:OPENCLAW_GATEWAY_TOKEN = "YOUR_GATEWAY_TOKEN"
-$env:SCHEDULER_TICK_MS = "10000"
-$env:SCHEDULER_STALE_THRESHOLD_S = "90"
-pm2 start dispatcher.js --name openclaw-scheduler
-
-# Optional verbose logging:
-$env:SCHEDULER_DEBUG = "1"
-pm2 restart openclaw-scheduler --update-env
-
-# Save PM2 process list (persists across restarts)
-pm2 save
-
-# Generate and apply startup hook (run the printed command as Administrator)
-pm2 startup
-```
-
-Verify:
-```powershell
-pm2 status
-pm2 logs openclaw-scheduler --lines 20
-```
-
----
-
-### Step 8: Smoke Test
-
-> **Note:** These smoke test commands use direct file imports and are for the git-clone install path. For npm installs, use `openclaw-scheduler` CLI commands instead.
-
-```powershell
-node --input-type=module -e "
-import { initDb, getDb } from './db.js';
-import { createJob } from './jobs.js';
-initDb();
-const job = createJob({
-  name: 'Smoke Test',
-  schedule_cron: '0 0 31 2 *',
-  payload_message: 'Reply with exactly: SCHEDULER_OK',
-  delivery_mode: 'none',
-  delete_after_run: true,
-  origin: 'system',
-  run_timeout_ms: 300000,
-});
-getDb().prepare(\"UPDATE jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?\").run(job.id);
-console.log('Created smoke test:', job.id);
-"
-Start-Sleep 20; pm2 logs openclaw-scheduler --lines 20
-```
-
-Look for: `Dispatching: Smoke Test` → `Completed: Smoke Test`
-
----
-
-## PM2 Management
-
-```powershell
-# Status
-pm2 status
-
-# Logs (live)
-pm2 logs openclaw-scheduler
-
-# Restart
-pm2 restart openclaw-scheduler
-
-# Stop
-pm2 stop openclaw-scheduler
-
-# Remove from PM2
-pm2 delete openclaw-scheduler
-```
-
----
-
-## Shell Jobs on Windows
-
-Shell jobs (`session_target: 'shell'`) use **`cmd.exe`** by default on Windows. Override with:
-
-```
-SCHEDULER_SHELL=powershell.exe
-```
-
-Set this in your PM2 launch command:
-```powershell
-pm2 start dispatcher.js --name openclaw-scheduler `
-  --env SCHEDULER_SHELL=powershell.exe `
-  ...
-```
-
-### Known Limitations (native Windows)
-
-| Limitation | Impact | Fix |
-|------------|--------|-----|
-| Shell is `cmd.exe` by default | Bash scripts won't work | Use `.bat`/`.cmd` or set `SCHEDULER_SHELL=powershell.exe` |
-| No `/bin/bash` or `/bin/zsh` | Can't use Unix shell syntax | Rewrite scripts as PowerShell |
-| Path separators | `\` vs `/` in commands | Use `\\` in `payload_message` strings |
-| Line endings | `.sh` scripts may fail | Save scripts with LF line endings |
-
-**WSL2 eliminates all of these.** If you hit these issues in practice, switching to WSL2 will be faster than working around them.
-
----
-
-## Rollback
-
-```powershell
-# Stop and remove PM2 process
-pm2 stop openclaw-scheduler
-pm2 delete openclaw-scheduler
-
-# Re-enable OC cron
-openclaw cron edit <job-id> --enable  # for each job
-openclaw config set cron.enabled true
-# remove OPENCLAW_SKIP_CRON=1 from gateway process env
-
-# Re-enable heartbeat
-openclaw config set agents.defaults.heartbeat.every "5m"
-openclaw gateway restart
-```
-
-For a complete removal (deleting all data), see [UNINSTALL.md](UNINSTALL.md).
-
----
-
-## Upgrading
-
-Already have the scheduler installed and need to update to a newer version? See [UPGRADING.md](UPGRADING.md).
-
----
-
-## Validation Checklist
-
-- [ ] `npm run verify:local` -- all checks passing
-- [ ] `node cli.js status` → shows jobs, 0 stale
-- [ ] `pm2 status` → openclaw-scheduler is `online`
-- [ ] PM2 log has startup lines, no errors
-- [ ] OC cron → all disabled
-- [ ] OC heartbeat → `0m`
-- [ ] Chat completions → 200
-- [ ] Smoke test → dispatched + completed in log
-- [ ] First real job → fires on schedule
+Use the Linux/WSL2 commands in [UPGRADING.md](UPGRADING.md). For removal and
+rollback to native OpenClaw jobs, follow [UNINSTALL.md](UNINSTALL.md) from
+inside WSL2.

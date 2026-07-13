@@ -13,45 +13,145 @@ jobs:
   verify:
     name: Verify (Linux / Node 24)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: scheduler
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          path: scheduler
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tagged commit is contained in main
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          TAG_COMMIT="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+            echo "Tag $GITHUB_REF_NAME points to $TAG_COMMIT, which is not contained in origin/main"
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: '24'
           cache: npm
+          cache-dependency-path: scheduler/package-lock.json
 
-      - name: Install dependencies
+      - name: Install scheduler dependencies
         run: npm ci
 
       - name: Smoke verification
+        env:
+          SKIP_AGENTCLI_INTEGRATION: '1'
         run: npm run verify:smoke
+
+  agentcli-integration:
+    name: Public agentcli ${{ matrix.contract }} compatibility (Ubuntu / Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - contract: handoff-v3
+            ref: 38980ad8f1b8a31bb6757579fc5e0e60c280a718
+            stale_v2_assertion: '1'
+          - contract: handoff-v2
+            ref: 317cc0eea8b4c65bc3213f5f329124a45c958bd3
+            stale_v2_assertion: '0'
+    defaults:
+      run:
+        working-directory: scheduler
+
+    steps:
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          path: scheduler
+          persist-credentials: false
+
+      - name: Checkout pinned public agentcli
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: amittell/agentcli
+          ref: ${{ matrix.ref }}
+          path: agentcli
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: scheduler/package-lock.json
+
+      - name: Install scheduler dependencies
+        run: npm ci
+
+      - name: Run required scheduler-agentcli contract checks
+        env:
+          AGENTCLI_PATH: ${{ github.workspace }}/agentcli
+          AGENTCLI_CONTRACT: ${{ matrix.contract }}
+          AGENTCLI_STALE_V2_FIELD_ASSERTION: ${{ matrix.stale_v2_assertion }}
+        run: npm run test:agentcli
 
   publish:
     name: Publish
-    needs: verify
+    needs:
+      - verify
+      - agentcli-integration
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
+    defaults:
+      run:
+        working-directory: scheduler
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          path: scheduler
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tagged commit is contained in main
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          TAG_COMMIT="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+            echo "Tag $GITHUB_REF_NAME points to $TAG_COMMIT, which is not contained in origin/main"
+            exit 1
+          fi
+
+      - name: Checkout pinned public agentcli
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: amittell/agentcli
+          ref: 38980ad8f1b8a31bb6757579fc5e0e60c280a718
+          path: agentcli
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: '24'
           cache: npm
           registry-url: 'https://registry.npmjs.org'
+          cache-dependency-path: scheduler/package-lock.json
 
-      - name: Install dependencies
+      - name: Install scheduler dependencies
         run: npm ci
 
       - name: Verify tag matches package.json version
@@ -64,4 +164,8 @@ jobs:
           fi
 
       - name: Publish
+        env:
+          AGENTCLI_PATH: ${{ github.workspace }}/agentcli
+          AGENTCLI_CONTRACT: handoff-v3
+          AGENTCLI_STALE_V2_FIELD_ASSERTION: '1'
         run: npm publish --access public --provenance

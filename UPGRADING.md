@@ -32,19 +32,6 @@ sleep 3 && systemctl --user --no-pager --full status openclaw-scheduler
 node cli.js status
 ```
 
-### Windows native (PM2, git-clone install)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git pull
-npm install
-npm run verify:local
-pm2 restart openclaw-scheduler
-Start-Sleep 3
-pm2 logs openclaw-scheduler --lines 5 --nostream
-node cli.js status
-```
-
 That is the whole process for a routine update. The rest of this document explains each step, covers edge cases, and documents both git-clone and npm install paths.
 
 ---
@@ -84,13 +71,6 @@ cd ~/.openclaw/scheduler
 git pull
 ```
 
-#### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git pull
-```
-
 If you have local modifications, stash them first:
 ```bash
 git stash
@@ -104,12 +84,6 @@ git stash pop
 
 ```bash
 npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
-```
-
-#### Windows native (PowerShell)
-
-```powershell
-npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@latest
 ```
 
 ### Local source tarball upgrade (`npm pack`)
@@ -141,13 +115,6 @@ cd ~/.openclaw/scheduler
 npm install
 ```
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm install
-```
-
 If you upgraded Node.js since the last install, also rebuild the native module:
 
 ```bash
@@ -170,13 +137,6 @@ cd ~/.openclaw/scheduler
 npm run verify:local
 ```
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm run verify:local
-```
-
 All tests must pass before restarting the service. If tests fail, do not restart -- investigate the failure first and check the CHANGELOG for any required manual steps.
 
 ---
@@ -187,6 +147,11 @@ The dispatcher runs pending schema migrations automatically on startup. No
 manual schema command is needed. Schema application and consolidation fail
 closed: a migration error stops startup instead of continuing on a partial
 schema.
+
+Schema 28 transactionally rebuilds legacy `completion_debts` with a derived
+delivery scope, creates immutable `evidence_records` storage and indexes,
+preserves existing rows, and records migration version 28. A failure rolls the
+migration back and stops startup.
 
 `migrate.js` imports OpenClaw cron definitions through `openclaw cron list/get
 --json`; it is not the schema migrator. `--legacy-json` is only for an old
@@ -228,13 +193,6 @@ Only run that repair when the reported violations are those two orphan forms.
 Investigate any other parent table or integrity error instead of deleting data
 generically.
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-openclaw-scheduler doctor --json
-```
-
 ---
 
 ## Step 5: Restart the Service
@@ -263,12 +221,6 @@ sudo systemctl restart openclaw-scheduler
 systemctl --user restart openclaw-scheduler
 ```
 
-### Windows native (PM2)
-
-```powershell
-pm2 restart openclaw-scheduler
-```
-
 ---
 
 ## Step 6: Verify
@@ -289,24 +241,18 @@ journalctl --user -u openclaw-scheduler -n 20 --no-pager
 cd ~/.openclaw/scheduler && node cli.js status
 ```
 
-### Windows native (PM2)
-
-```powershell
-pm2 status
-pm2 logs openclaw-scheduler --lines 20 --nostream
-cd $env:USERPROFILE\.openclaw\scheduler
-node cli.js status
-```
-
 A healthy startup log looks like:
 
 ```
-[scheduler] [info] Starting OpenClaw Scheduler v0.3.0 {"tickMs":10000,...}
+[scheduler] [info] Starting OpenClaw Scheduler v0.4.0 {"tickMs":10000,...}
 [scheduler] [info] Database initialized
 [scheduler] [info] Pruned old runs + messages
 ```
 
-If you see `Gateway unreachable`, isolated agent jobs will be deferred until the gateway is back. Shell jobs and main-session jobs continue unaffected.
+If you see `Gateway unreachable`, isolated agent jobs are deferred until the
+Gateway is back. Shell jobs continue independently. Main-session jobs still
+depend on the Gateway-backed `openclaw system event` path, so they can fail and
+enter their configured retry behavior while the Gateway is unavailable.
 
 ---
 
@@ -359,24 +305,6 @@ sleep 3
 ssh $HOST "systemctl --user --no-pager --full status openclaw-scheduler && cd ~/.openclaw/scheduler && node cli.js status"
 ```
 
-#### Windows native host via PowerShell Remoting
-
-```powershell
-$HOST = "your-windows-host"
-
-Invoke-Command -ComputerName $HOST -ScriptBlock {
-  cd $env:USERPROFILE\.openclaw\scheduler
-  git pull
-  npm install
-  $env:SCHEDULER_DB=":memory:"
-  npm run verify:smoke
-  pm2 restart openclaw-scheduler
-  Start-Sleep 3
-  pm2 logs openclaw-scheduler --lines 5 --nostream
-  node cli.js status
-}
-```
-
 ---
 
 ## Rollback
@@ -405,16 +333,6 @@ npm install
 systemctl --user restart openclaw-scheduler
 ```
 
-#### Windows native (PM2)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git log --oneline -5
-git checkout <commit-hash>
-npm install
-pm2 restart openclaw-scheduler
-```
-
 ### npm installs
 
 #### macOS (launchd)
@@ -431,14 +349,7 @@ npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
 systemctl --user restart openclaw-scheduler
 ```
 
-#### Windows native (PM2)
-
-```powershell
-npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@<previous-version>
-pm2 restart openclaw-scheduler
-```
-
-**Schema rollback:** Do not assume an older package can safely use a schema 27
+**Schema rollback:** Do not assume an older package can safely use a schema 28
 database. Stop the service before changing database files. If the previous
 version fails its startup checks, preserve the failed database, restore
 `scheduler.db.pre-upgrade` to `scheduler.db`, remove stale `scheduler.db-wal`
@@ -481,7 +392,10 @@ for detailed examples.
 
 ### Gateway unreachable after update
 
-The scheduler update does not affect the OpenClaw gateway. If the gateway is down, that is a separate issue. The scheduler logs `Gateway unreachable` on startup but continues running shell and main-session jobs.
+The scheduler update does not affect the OpenClaw Gateway. If the Gateway is
+down, that is a separate issue. The scheduler continues running shell jobs,
+defers isolated agent jobs, and cannot successfully deliver main-session system
+events until the Gateway is available.
 
 ### Node version changed
 
@@ -501,12 +415,4 @@ launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 cd ~/.openclaw/scheduler
 npm rebuild better-sqlite3
 systemctl --user restart openclaw-scheduler
-```
-
-### Windows native (PM2)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm rebuild better-sqlite3
-pm2 restart openclaw-scheduler
 ```

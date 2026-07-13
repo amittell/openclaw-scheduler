@@ -1,4 +1,5 @@
 import { transitionRunTerminal } from './run-state.js';
+import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { pruneTerminalDeliveries } from './delivery-outbox.js';
 
 export function pruneDeliveryHistory({
@@ -56,6 +57,48 @@ export async function checkRunHealth({
   const fencing = dispatcherOwnerId && dispatcherFencingToken
     ? { ownerId: dispatcherOwnerId, fencingToken: dispatcherFencingToken }
     : {};
+  const transitionWithEvidence = (run, status, fields) => {
+    const db = getDb();
+    const persistRecoveryEvidence = (...args) => {
+      try {
+        return persistTerminalEvidence(...args);
+      } catch (cause) {
+        const error = new Error(`Recovery evidence persistence failed: ${cause.message}`, { cause });
+        error.code = 'RECOVERY_EVIDENCE_PERSIST_FAILED';
+        throw error;
+      }
+    };
+    const commit = () => {
+      const transition = transitionRunTerminalFn(run.id, status, fields, fencing);
+      if (transition?.changed) {
+        const job = getJob(run.job_id);
+        persistRecoveryEvidence(job, run.id, transition.run.status, fields, {}, { db });
+      }
+      return transition;
+    };
+    const transaction = db.transaction(commit);
+    try {
+      return db.inTransaction ? transaction() : transaction.immediate();
+    } catch (error) {
+      if (error?.code !== 'RECOVERY_EVIDENCE_PERSIST_FAILED') throw error;
+      const reason = `Recovery could not persist required terminal evidence: ${error.message}`;
+      const quarantine = quarantineRunRecovery(run.id, reason, {
+        db,
+        dispatcherFence: Object.keys(fencing).length > 0 ? {
+          ownerId: dispatcherOwnerId,
+          fencingToken: dispatcherFencingToken,
+        } : null,
+      });
+      if (quarantine.changed) {
+        log('error', `Recovery blocked and job disabled: ${run.job_name}`, {
+          runId: run.id,
+          jobId: run.job_id,
+          evidenceError: error.message,
+        });
+      }
+      return quarantine;
+    }
+  };
   const runningRuns = getRunningRuns();
   if (runningRuns.length === 0) return;
 
@@ -70,9 +113,9 @@ export async function checkRunHealth({
       continue;
     }
     log('warn', `Stale run: ${run.job_name}`, { runId: run.id });
-    const transition = transitionRunTerminalFn(run.id, 'timeout', {
+    const transition = transitionWithEvidence(run, 'timeout', {
       error_message: `No activity for ${staleThresholdSeconds}s`,
-    }, fencing);
+    });
     if (!transition?.changed || transition.run?.status !== 'timeout') {
       log('debug', `Skipped stale timeout side effects after losing terminal transition: ${run.job_name}`, {
         runId: run.id,
@@ -124,9 +167,9 @@ export async function checkRunHealth({
       continue;
     }
     log('warn', `Timed out: ${run.job_name}`, { runId: run.id, timeoutMs: run.run_timeout_ms });
-    const transition = transitionRunTerminalFn(run.id, 'timeout', {
+    const transition = transitionWithEvidence(run, 'timeout', {
       error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,
-    }, fencing);
+    });
     if (!transition?.changed || transition.run?.status !== 'timeout') {
       log('debug', `Skipped timeout side effects after losing terminal transition: ${run.job_name}`, {
         runId: run.id,

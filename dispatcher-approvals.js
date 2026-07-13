@@ -45,7 +45,8 @@ export async function checkApprovals({
           approval.id,
           'cancelled',
           'scheduler',
-          !job ? 'Job deleted before approval timeout' : 'Job disabled before approval timeout'
+          !job ? 'Job deleted before approval timeout' : 'Job disabled before approval timeout',
+          { automatic: true },
         );
         if (result?.status === 'cancelled') {
           log('info', `Approval cancelled for unavailable job: ${approval.job_name || approval.job_id}`, {
@@ -55,12 +56,27 @@ export async function checkApprovals({
         continue;
       }
 
-      if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
+      if ((approval.approver_scope || job.approval_approver_scope) && job.approval_auto === 'approve') {
+        const result = resolveApproval(
+          approval.id,
+          'timed_out',
+          'timeout',
+          'Scoped approval timed out; automatic approval cannot satisfy an approver scope',
+          { automatic: true },
+        );
+        if (result?.status === 'timed_out') {
+          log('info', `Scoped approval timed out and was rejected: ${approval.job_name || job.name}`, {
+            approvalId: approval.id,
+            dispatchId: approval.dispatch_queue_id || null,
+          });
+        }
+      } else if (approval.approval_auto === 'approve' || job.approval_auto === 'approve') {
         const result = resolveApproval(
           approval.id,
           'approved',
           'timeout',
-          'Approval granted by timeout auto-approve policy'
+          'Approval granted by timeout auto-approve policy',
+          { automatic: true },
         );
         if (result?.status === 'approved') {
           log('info', `Approval auto-approved after timeout: ${approval.job_name || job.name}`, {
@@ -73,7 +89,8 @@ export async function checkApprovals({
           approval.id,
           'timed_out',
           'timeout',
-          'Approval timed out and was rejected by policy'
+          'Approval timed out and was rejected by policy',
+          { automatic: true },
         );
         if (result?.status === 'timed_out') {
           log('info', `Approval timed out and was rejected: ${approval.job_name || job.name}`, {

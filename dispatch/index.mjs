@@ -1367,12 +1367,6 @@ async function cmdEnqueue(flags) {
   // that will be delivered to the inbox consumer (and ultimately Telegram).
   const schedulerCliPath = resolveSchedulerCliPath();
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
-  // TODO: Inject CHECKPOINT_NOTIFY_CMD as an env var into the agent session so
-  // agents can discover the checkpoint command programmatically (not just from
-  // the prompt text at line ~714). Depends on the gateway implementing the
-  // x-openclaw-env-inject receiver (PR #5 sends the header, gateway ignores it
-  // until receiver support lands). Once available, pass it alongside materialized
-  // credentials via the env-inject header in the gatewayCall('agent', ...) below.
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
@@ -1399,7 +1393,6 @@ async function cmdEnqueue(flags) {
   parts.push(`  ${checkpointNotifyCmd} "<message>"`);
   parts.push(`Call this at logical checkpoints: start of a major step, on conflict/error, before completing.`);
   parts.push(`Example: ${checkpointNotifyCmd} "Starting step 2: running tests"`);
-  parts.push(`(Environment variable CHECKPOINT_NOTIFY_CMD is set to: ${checkpointNotifyCmd})`);
   parts.push(`---`);
   parts.push(``);
 
@@ -1480,9 +1473,15 @@ async function cmdEnqueue(flags) {
       taskPrompt:     message.slice(0, 2000),
     });
 
-    // New run of this label -- clear any prior-run delivery debt so the fresh
-    // run's done-path/watcher claim is not blocked by a stale closed row.
-    resetCompletionDeliveryClaim({ label });
+    // Reserve this run's delivery scope before a stale watcher from an earlier
+    // use of the same label can claim the fresh completion.
+    if (!deliveryDisabled) {
+      resetCompletionDeliveryClaim({
+        label,
+        sessionKey,
+        runId: response?.runId || idem,
+      });
+    }
 
     // Fire dispatch.started hook (best-effort)
     await onStarted({
@@ -1519,9 +1518,8 @@ async function cmdEnqueue(flags) {
     // -- Register scheduler watcher for delivery ---------------
     // Creates a quick-poll shell job that runs watcher.mjs once per tick. Empty
     // stdout means "still running" and advances the next tick without delivery.
-    // Terminal stdout goes through the scheduler's handleDelivery with retry,
-    // alias resolution, and audit trail in scheduler.db.
-    // The watcher is the only final-delivery path for dispatched jobs.
+    // The watcher enqueues terminal output directly into the durable outbox;
+    // stdout remains only as a route-less compatibility fallback.
     const sq = s => String(s).replace(/'/g, "'\\''");
     let schedulerWatcherOk = false;
     if (deliverTo && deliverMode !== 'none') {
@@ -2543,6 +2541,7 @@ async function cmdDone(flags) {
       deliverTo: existing.deliverTo,
       deliveryChannel: existing.deliverChannel || 'telegram',
       sessionKey: existing.sessionKey || null,
+      runId: existing.runId || null,
       origin: existing.origin || null,
       metadata: {
         last_label_status: 'done',

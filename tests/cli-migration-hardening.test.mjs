@@ -16,6 +16,7 @@ const root = resolve(import.meta.dirname, '..');
 const cliPath = join(root, 'cli.js');
 const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
+const consolidatePath = join(root, 'migrate-consolidate.js');
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -65,11 +66,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const version = runNode(cliPath, ['version', '--json'], { env });
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(parseStdout(version).version, '0.3.0');
+  assert.equal(parseStdout(version).version, '0.4.0');
 
   const launcherVersion = runNode(binPath, ['--json', 'version'], { env });
   assert.equal(launcherVersion.status, 0, launcherVersion.stderr);
-  assert.equal(parseStdout(launcherVersion).version, '0.3.0');
+  assert.equal(parseStdout(launcherVersion).version, '0.4.0');
 
   const schema = runNode(cliPath, ['schema', 'jobs', '--json'], { env });
   assert.equal(schema.status, 0, schema.stderr);
@@ -77,11 +78,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const capabilities = runNode(cliPath, ['capabilities', '--json'], { env });
   assert.equal(capabilities.status, 0, capabilities.stderr);
-  assert.equal(parseStdout(capabilities).schema_version, 27);
+  assert.equal(parseStdout(capabilities).schema_version, 28);
 
   const launcherCapabilities = runNode(binPath, ['--json', 'capabilities'], { env });
   assert.equal(launcherCapabilities.status, 0, launcherCapabilities.stderr);
-  assert.equal(parseStdout(launcherCapabilities).schema_version, 27);
+  assert.equal(parseStdout(launcherCapabilities).schema_version, 28);
 
   const specPath = join(dir, 'job.json');
   writeFileSync(specPath, JSON.stringify(validShellJob()));
@@ -147,7 +148,7 @@ test('jobs add and update accept file and stdin JSON payloads', t => {
   assert.equal(parseStdout(updated).job.name, 'Updated through stdin');
 });
 
-test('doctor reports schema v27 and lease, queue, outbox, and approval diagnostics', t => {
+test('doctor reports schema v28 and lease, queue, outbox, and approval diagnostics', t => {
   const dir = tempRoot(t, 'scheduler-doctor-');
   const result = runNode(cliPath, ['doctor', '--json'], {
     env: { SCHEDULER_DB: join(dir, 'scheduler.db') },
@@ -155,14 +156,88 @@ test('doctor reports schema v27 and lease, queue, outbox, and approval diagnosti
   assert.equal(result.status, 0, result.stderr);
   const payload = parseStdout(result);
   assert.equal(payload.ok, true);
-  assert.equal(payload.database.schema_version, 27);
-  assert.equal(payload.database.latest_schema_version, 27);
+  assert.equal(payload.database.schema_version, 28);
+  assert.equal(payload.database.latest_schema_version, 28);
   assert.ok('dispatcher_lease' in payload.diagnostics);
   assert.ok('dispatch_queue' in payload.diagnostics);
   assert.ok('delivery_outbox' in payload.diagnostics);
   assert.ok('approvals' in payload.diagnostics);
   assert.deepEqual(payload.database.integrity_check, ['ok']);
   assert.equal(payload.database.foreign_key_violations, 0);
+});
+
+test('schema v28 consolidation repairs missing required indexes before taking the no-op path', t => {
+  const dir = tempRoot(t, 'scheduler-index-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const initialized = runNode(cliPath, ['doctor', '--json'], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 28);
+    db.exec('DROP INDEX idx_delivery_outbox_group_part');
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
+      0,
+    );
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
+
+  const noOp = runNode(consolidatePath, [], { env });
+  assert.equal(noOp.status, 0, noOp.stderr);
+  assert.match(noOp.stdout, /DB already at v28/);
+});
+
+test('schema v28 consolidation recreates a completely missing approvals table', t => {
+  const dir = tempRoot(t, 'scheduler-approvals-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const initialized = runNode(cliPath, ['doctor', '--json'], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.exec('DROP TABLE approvals');
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    const columns = new Set(repairedDb.prepare('PRAGMA table_info(approvals)').all().map(column => column.name));
+    for (const column of [
+      'dispatch_queue_id', 'decision_version', 'risk_level', 'approver_scope',
+      'binding_hash', 'gate_kind', 'decision_context',
+    ]) {
+      assert(columns.has(column), `recreated approvals table missing ${column}`);
+    }
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_approvals_dispatch_queue'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
 });
 
 test('doctor fails closed on foreign-key corruption', t => {

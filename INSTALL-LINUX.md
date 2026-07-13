@@ -3,7 +3,7 @@
 Step-by-step guide to deploy the scheduler on a Linux host running OpenClaw.
 
 > **macOS?** See [INSTALL.md](INSTALL.md).
-> **Windows?** See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
+> **Windows?** Install WSL2 first using [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md), then follow this guide inside WSL2. Native Windows and WSL1 are not supported.
 > **Need examples or migration help?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
 
 ---
