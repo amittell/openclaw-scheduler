@@ -605,7 +605,10 @@ Override the shell for shell jobs with the `SCHEDULER_SHELL=/path/to/shell` envi
 
 ## Architecture
 
-The scheduler sits alongside the OpenClaw gateway as an independent process. It creates **isolated sessions** for each job — they never touch the user's main conversation.
+The scheduler sits alongside the OpenClaw gateway as an independent process.
+Isolated targets use stable per-job sessions that remain separate from the
+user's main conversation. Main targets use the existing main session, and shell
+targets do not create an agent session.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -670,12 +673,14 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 |---------|-----------|----------|----------|
 | User DM | Telegram message | Persistent per-peer | Your conversations |
 | Group chat | Group message | Persistent per-group | Team discussions |
-| Isolated job | Dispatcher via API | One-shot, dies after completion | Cron jobs, chain steps |
-| Main session | `openclaw system event` | Existing main session | Jobs needing main context |
+| Isolated job | Dispatcher via API | Persistent per job, reused across runs | Cron jobs, chain steps |
+| Main session | Dispatcher API, or `openclaw system event` for fire-and-forget | Existing main session | Jobs needing main context |
 | Shell | Dispatcher (direct) | Per-job (no session) | Cron scripts, backups, maintenance |
 | Sub-agent | `sessions_spawn` | Task-scoped | Delegated work |
 
-Scheduler jobs get completely isolated sessions. They can't see your chat history and your chats can't see theirs.
+Isolated scheduler jobs cannot see user-chat history, but later runs of the same
+job reuse its warm per-job session and may retain that job's earlier context.
+Main-session jobs intentionally use the existing main conversation.
 
 ---
 
@@ -692,7 +697,7 @@ Scheduler tick (every 10s)
   ├─ setAgentStatus('main', 'busy')
   │
   ├─ POST /v1/chat/completions
-  │   session: scheduler:<job_id>:<run_id>  (unique, isolated)
+  │   session: agent:<agent_id>:scheduler:<job_id>  (stable per job, isolated from main)
   │   model: openclaw:main
   │   message: [job prompt + any pending inbox messages]
   │
@@ -708,13 +713,20 @@ Scheduler tick (every 10s)
 
 ### Main Session Jobs
 
-For jobs that need the main session context (rare):
+For jobs that need the main session context (rare), use
+`payload_kind: "systemEvent"`. Default, `execute`, or `plan` execution waits
+for the agent response and captures it for normal completion handling:
+
+```
+Dispatcher → POST /v1/chat/completions → wait for main-session response
+```
+
+Set `execution_intent: "fire-and-forget"` only when the scheduler should inject
+the event and return immediately without capturing the eventual response:
 
 ```
 Dispatcher → exec: openclaw system event --text "..." --mode now
 ```
-
-This injects directly into the active agent session.
 
 ### Shell Jobs
 
@@ -1651,9 +1663,11 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 ### Gateway health
 
 `GET /health` is checked before dispatch. If it is unreachable, isolated jobs
-are deferred and shell jobs continue. Main-session jobs use the Gateway-backed
-`openclaw system event` path, so they can fail and enter their configured retry
-behavior until the Gateway is available.
+are deferred and shell jobs continue. Main-session jobs also require the
+Gateway: default, `execute`, or `plan` jobs use synchronous agent execution,
+while `fire-and-forget` jobs use `openclaw system event`. A failed synchronous
+health check defers the job for 60 seconds; later request failures and
+fire-and-forget failures use the configured retry behavior.
 
 ---
 

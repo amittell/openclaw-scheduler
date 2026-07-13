@@ -281,9 +281,10 @@ A healthy startup log looks like:
 ```
 
 If you see `Gateway unreachable`, isolated agent jobs are deferred until the
-Gateway is back. Shell jobs continue independently. Main-session jobs still
-depend on the Gateway-backed `openclaw system event` path, so they can fail and
-enter their configured retry behavior while the Gateway is unavailable.
+Gateway is back. Shell jobs continue independently. Main-session jobs also
+depend on the Gateway: default, `execute`, or `plan` jobs use synchronous agent
+execution, while `fire-and-forget` jobs use `openclaw system event`. They can
+defer or enter configured retry behavior while the Gateway is unavailable.
 
 ---
 
@@ -425,8 +426,9 @@ for detailed examples.
 
 The scheduler update does not affect the OpenClaw Gateway. If the Gateway is
 down, that is a separate issue. The scheduler continues running shell jobs,
-defers isolated agent jobs, and cannot successfully deliver main-session system
-events until the Gateway is available.
+defers isolated agent jobs, and cannot execute main-session jobs until the
+Gateway is available. Default, `execute`, or `plan` main jobs use synchronous
+agent execution; `fire-and-forget` main jobs use system-event injection.
 
 ### Node version changed
 

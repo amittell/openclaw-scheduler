@@ -435,6 +435,26 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stderr, /Refusing invalid labels ledger/);
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, count: 0, labels: [] });
+    const originalBytes = readFileSync(labelsPath);
+    const mutation = spawnSync(process.execPath, [
+      'dispatch/index.mjs',
+      'done',
+      '--label', 'ledger-recovery-probe',
+      '--summary', 'Ledger recovery probe completed.',
+      '--checklist', '{"work_complete":true}',
+    ], {
+      cwd: join(import.meta.dirname, '..'),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: home,
+        DISPATCH_LABELS_PATH: labelsPath,
+        OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
+      },
+    });
+    assert.notEqual(mutation.status, 0, mutation.stdout);
+    assert.match(mutation.stderr, /Refusing to mutate invalid labels ledger/);
+    assert.deepEqual(readFileSync(labelsPath), originalBytes);
     assert.deepEqual(JSON.parse(readFileSync(labelsPath, 'utf8')), poisonedLedger);
     assert.equal(readFileSync(sentinel, 'utf8'), 'sentinel-safe\n');
   } finally {

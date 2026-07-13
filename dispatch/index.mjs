@@ -82,6 +82,7 @@ const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL,
 const GATEWAY_TOOLS_INVOKE_URL = gatewayEndpointUrl('tools/invoke');
 let labelsCache = null;
 let labelsCacheSignature = null;
+let labelsCacheError = null;
 
 // -- Invocation Directory -------------------------------------
 // When invoked via symlink (e.g. my-brand/index.mjs -> dispatch/index.mjs),
@@ -292,10 +293,14 @@ function loadLabels() {
     );
     labelsCache = labels;
     labelsCacheSignature = signature;
+    labelsCacheError = null;
     return labels;
   } catch (error) {
     if (error?.code !== 'ENOENT') {
       process.stderr.write(`[${BRAND}] Refusing invalid labels ledger: ${error.message}\n`);
+      labelsCacheError = error;
+    } else {
+      labelsCacheError = null;
     }
     labelsCache = Object.create(null);
     labelsCacheSignature = signature;
@@ -309,10 +314,17 @@ function saveLabels(labels) {
   renameSync(tmp, LABELS_PATH);
   labelsCache = labels;
   labelsCacheSignature = getLabelsSignature();
+  labelsCacheError = null;
 }
 
 function mutateLabels(mutator) {
   const labels = loadLabels();
+  if (labelsCacheError) {
+    throw new Error(
+      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+      { cause: labelsCacheError },
+    );
+  }
   const changed = mutator(labels);
   if (changed !== false) {
     saveLabels(labels);

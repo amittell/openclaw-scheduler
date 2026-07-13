@@ -41,7 +41,7 @@ with `openclaw-scheduler jobs validate --file job.json` before adding it.
 }
 ```
 
-## Main session event (inject into persistent session)
+## Main session job (persistent session, synchronous)
 
 ```json
 {
@@ -49,13 +49,20 @@ with `openclaw-scheduler jobs validate --file job.json` before adding it.
   "schedule_cron": "*/30 * * * *",
   "session_target": "main",
   "agent_id": "main",
-  "payload_kind": "agentTurn",
+  "payload_kind": "systemEvent",
+  "execution_intent": "execute",
   "payload_message": "Check for unacknowledged messages and follow up.",
   "run_timeout_ms": 120000,
   "delivery_mode": "none",
   "origin": "system"
 }
 ```
+
+Default or `execute` main-session jobs wait for the agent response and can
+capture it for delivery. `plan` uses the same synchronous path with a planning
+instruction. Set `execution_intent` to `fire-and-forget` only when the job
+should inject an `openclaw system event` and return immediately without
+capturing the eventual response.
 
 ## One-shot job (run once at a specific time)
 
@@ -137,6 +144,8 @@ Create parent first, then child with `parent_id` set to the parent's ID.
 ```json
 {
   "name": "Production Deploy",
+  "schedule_cron": "0 2 * * 1",
+  "schedule_tz": "America/New_York",
   "session_target": "shell",
   "payload_kind": "shellCommand",
   "payload_message": "deploy-prod.sh",

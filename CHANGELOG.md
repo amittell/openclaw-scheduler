@@ -26,6 +26,8 @@ All notable changes to this project will be documented in this file.
 
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
+- malformed existing dispatch label ledgers remain byte-for-byte intact and
+  reject every mutating command until an operator repairs the ledger
 - malformed or unsupported persisted trigger regexes no longer crash or block
   the dispatcher and cannot trigger child jobs
 

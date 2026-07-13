@@ -39,8 +39,8 @@ workflow requires direct conditional job graphs and governed execution.
 |----------|--------|-----|
 | Backups, scripts, log rotation, file cleanup | `shell` | No LLM cost, no gateway dependency, runs even if gateway is down |
 | Morning briefings, reports, analysis, summaries | `isolated` | Gets full LLM + tools, isolated from your conversations |
-| Urgent alerts that must appear in active chat | `main` | Injects directly into your live session |
-| Build → deploy → notify pipelines | Chain of `isolated` jobs | Each step gets fresh context, failures stop the chain |
+| Work that needs persistent main-session context | `main` | Uses the main session synchronously, or injects when explicitly fire-and-forget |
+| Build → deploy → notify pipelines | Chain of `isolated` jobs | Each step has its own per-job context, failures stop the chain |
 
 ---
 
@@ -174,11 +174,14 @@ Keep it under 200 words.
 
 ### When to use `main`
 
-Use `main` sparingly. It injects directly into your active agent session — the same conversation you're having with your agent right now.
+Use `main` sparingly. Default, `execute`, and `plan` jobs run synchronously in
+the active agent session and capture the response. Only
+`execution_intent: "fire-and-forget"` injects a system event and returns without
+capturing the eventual response.
 
 **Good uses:**
 - Long-running task check-ins: "You've been running for 30 minutes — report status"
-- Alerts that should appear in your live chat, not delivered separately to a channel
+- Alerts that should appear in your live chat, using fire-and-forget when immediate injection is required
 - Jobs that genuinely need your ongoing conversation context (rare)
 
 **Bad uses:**
@@ -264,7 +267,10 @@ operating-system isolation exists.
 
 ## Integrating with Your OpenClaw Agent
 
-Your agent runs in a fresh context each isolated session. This section covers how to make it scheduler-aware.
+An isolated job uses a stable session that is separate from the user's main
+conversation and reused across that job's runs. The first run starts fresh;
+later runs can retain job-local context. This section covers how to make the
+agent scheduler-aware.
 
 ### What the Agent Needs to Know
 
@@ -512,7 +518,8 @@ and fires jobs independently of your chat sessions.
 - Logs: `tail -f /tmp/openclaw-scheduler.log`
 
 ### When you receive a scheduled prompt
-You're in an isolated session. No conversation history. No context from prior chats.
+You're in an isolated per-job session. You have no user-chat history, but you
+may have context from earlier runs of this same job.
 Read the `[scheduler:...]` header to identify the job, then do exactly what `payload_message` says.
 - Reply `HEARTBEAT_OK` for watchdog/health-check jobs when nothing needs attention (suppresses delivery)
 - For analysis/report jobs, write a concise summary — it's stored as the run record
@@ -522,8 +529,8 @@ Read the `[scheduler:...]` header to identify the job, then do exactly what `pay
 | Type | Use for |
 |------|---------|
 | `shell` | Scripts, backups, pings — fast, no LLM, runs even when gateway is down |
-| `isolated` | AI tasks needing tools, memory, reasoning — each run gets fresh context |
-| `main` | Urgent alerts that must appear in your active chat (use sparingly) |
+| `isolated` | AI tasks needing tools, memory, and per-job context isolated from the main chat |
+| `main` | Tasks needing persistent main context; only fire-and-forget injects a system event |
 
 ### Creating jobs
 When asked to set up a scheduled task, use:

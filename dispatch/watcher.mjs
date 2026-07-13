@@ -64,6 +64,7 @@ const LABELS_PATH = resolveLabelsPath({ legacyCandidates: [join(__dirname, 'labe
 const HOME_DIR = process.env.HOME || homedir();
 let labelsCache = null;
 let labelsCacheSignature = null;
+let labelsCacheError = null;
 
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
@@ -382,10 +383,17 @@ function loadLabels() {
     }
     labelsCache = labels;
     labelsCacheSignature = signature;
+    labelsCacheError = null;
     return labels;
-  } catch {
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      process.stderr.write(`[watcher] Refusing invalid labels ledger: ${error.message}\n`);
+      labelsCacheError = error;
+    } else {
+      labelsCacheError = null;
+    }
     labelsCache = Object.create(null);
-    labelsCacheSignature = 'missing';
+    labelsCacheSignature = signature;
     return labelsCache;
   }
 }
@@ -399,10 +407,17 @@ function saveLabels(labels) {
   renameSync(tmp, LABELS_PATH);
   labelsCache = labels;
   labelsCacheSignature = getLabelsSignature();
+  labelsCacheError = null;
 }
 
 function mutateLabels(mutator) {
   const labels = loadLabels();
+  if (labelsCacheError) {
+    throw new Error(
+      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+      { cause: labelsCacheError },
+    );
+  }
   const changed = mutator(labels);
   if (changed !== false) {
     saveLabels(labels);

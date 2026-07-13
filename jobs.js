@@ -36,7 +36,7 @@ const MAX_TRIGGER_REGEX_INPUT_BYTES = 65536;
 
 /**
  * Valid payload_kind values for each session_target.
- *   - main:     systemEvent only  (inject into the main session)
+ *   - main:     systemEvent only  (synchronous or fire-and-forget main session)
  *   - shell:    shellCommand only (run a shell command)
  *   - isolated: systemEvent or agentTurn (standalone agent session)
  */
@@ -417,7 +417,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // Exempt from this requirement:
   //   - job_type='watchdog' (internal health monitor jobs)
   //   - name starts with 'watchdog:' (watchdog jobs by naming convention)
-  //   - session_target='main' (injects into the main session, no chat routing needed)
+  //   - session_target='main' (the main session is the default delivery surface)
   //   - delivery_mode='none' (explicitly opted out of delivery)
   if (mode === 'create') {
     const _target = merged.session_target || 'isolated';
@@ -441,7 +441,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // 'announce' or 'announce-always'. Validates on create (when delivery_mode is
   // explicitly provided) and on update (when delivery_mode is being changed or
   // the merged record would end up in announce mode without a delivery_to).
-  // Exempt: watchdog jobs, session_target='main' (no external chat routing needed).
+  // Exempt: watchdog jobs, session_target='main' (the main session is the default delivery surface).
   {
     const modeExplicitlySet = 'delivery_mode' in normalized;
     const deliveryToExplicitlySet = 'delivery_to' in normalized;

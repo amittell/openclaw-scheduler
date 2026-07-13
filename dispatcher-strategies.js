@@ -2173,9 +2173,9 @@ export async function executeWatchdog(job, ctx, deps) {
 
 export async function executeMain(job, ctx, deps) {
   // Main session dispatch mode:
-  // - execution_intent 'background' or missing: use executeAgent (sync, waits
-  //   for response, captures content for delivery). Best for quick tasks where
-  //   a few seconds of session latency is acceptable.
+  // - execution_intent 'execute', 'plan', or missing: use executeAgent (sync,
+  //   waits for response, captures content for delivery). Best for quick tasks
+  //   where a few seconds of session latency is acceptable.
   // - execution_intent 'fire-and-forget': inject a system event and return
   //   immediately. The agent processes asynchronously and the session stays
   //   unblocked for interactive DMs. No response capture -- if delivery is

@@ -2,7 +2,7 @@
 
 Date: 2026-03-28
 
-Updated: 2026-07-12 for scheduler 0.4.0 and schema 28
+Updated: 2026-07-13 for scheduler 0.4.1 and schema 28
 
 ## Purpose
 
@@ -287,8 +287,10 @@ subagent session:
 **Scheduler behavior when unhealthy**:
 - Isolated jobs are deferred (next_run_at pushed forward by 60s).
 - Shell jobs continue independently.
-- Main-session jobs may still be attempted, but their `openclaw system event`
-  operation requires the Gateway and can fail into configured retry behavior.
+- Main-session jobs may still be attempted, but they require the Gateway.
+  Default, `execute`, or `plan` jobs use synchronous agent execution and defer
+  for 60 seconds when the health check fails. `fire-and-forget` jobs use
+  `openclaw system event`; request failures use configured retry behavior.
 - Health is re-checked every 60 seconds (`dispatcher.js` `tick()`).
 
 ---
@@ -324,9 +326,11 @@ non-fatal -- the activity check is skipped with a stderr warning.
 
 ### CLI: openclaw system event
 
-**Purpose**: Inject a system event into the main session. Used for jobs with
-`session_target: 'main'` that communicate via the primary conversation thread
-rather than isolated sessions.
+**Purpose**: Inject a system event into the main session. Used only for jobs
+with `session_target: 'main'` and
+`execution_intent: 'fire-and-forget'`. Default, `execute`, or `plan`
+main-session jobs use synchronous agent execution through
+`POST /v1/chat/completions`.
 
 **Caller**: `gateway.js` `sendSystemEvent()`
 
@@ -349,8 +353,8 @@ openclaw doctor output) is stripped by finding the first `{` character.
 
 **Error semantics**: Throws `system event failed: <message>`.
 
-**Used by**: `dispatcher-strategies.js` for main-session dispatch strategy, and
-`dispatcher.js` via `buildDispatchDeps()`.
+**Used by**: `dispatcher-strategies.js` for the fire-and-forget branch of the
+main-session dispatch strategy, and `dispatcher.js` via `buildDispatchDeps()`.
 
 ---
 
@@ -459,14 +463,17 @@ written to sessions.json.
 
 ### Creation
 
-Sessions are created implicitly. The scheduler generates a session key in the
-format `agent:<agentId>:subagent:<uuid>` (dispatch/index.mjs `makeSessionKey()`).
-No explicit "create session" API exists -- the gateway creates the
-session when it first receives a request with that key.
+Sessions are created implicitly. Scheduled isolated jobs use the stable key
+`agent:<agentId>:scheduler:<jobId>` so later runs reuse the same warm per-job
+session. The dispatch CLI uses `agent:<agentId>:subagent:<uuid>`
+(`dispatch/index.mjs` `makeSessionKey()`) for each newly enqueued sub-agent.
+Main-session jobs use `agent:<agentId>:main`. No explicit "create session" API
+exists; the Gateway creates a session when it first receives a request with
+that key.
 
 ### Configuration (Pre-dispatch)
 
-Before dispatching work, `cmdEnqueue` patches the session via
+Before dispatching a new CLI sub-agent, `cmdEnqueue` patches the session via
 `openclaw gateway call sessions.patch` to set:
 - `spawnDepth: 1` (always, for fresh sessions)
 - `model` (if `--model` flag was provided)
@@ -478,8 +485,8 @@ The scheduler dispatches work via two paths:
 
 1. **Isolated agent turns** (`dispatcher.js` -> `dispatcher-strategies.js`):
    Uses `runAgentTurnWithActivityTimeout()` which calls
-   `POST /v1/chat/completions`. The response session key is stored in the run
-   record via `updateRunSession()`.
+   `POST /v1/chat/completions` with a stable per-job session key. The response
+   session key is stored in the run record via `updateRunSession()`.
 
 2. **Sub-agent dispatch** (`dispatch/index.mjs`): Uses
    `openclaw gateway call agent` which is the CLI-based equivalent. Session key
@@ -779,8 +786,8 @@ isolated turns do not require environment injection and remain compatible.
 Credential materialization is supported for shell and isolated agent jobs.
 Shell jobs receive the scoped environment locally. Isolated agent jobs use the
 negotiated header path above. Main-session jobs reject
-`identity.presentation` and `credential_handoff` because a main-session event
-cannot enforce a task-scoped environment boundary.
+`identity.presentation` and `credential_handoff` because a main-session
+dispatch cannot enforce a task-scoped environment boundary.
 
 Reference: `gateway.js` (`runAgentTurn()`,
 `runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
@@ -983,13 +990,13 @@ request headers.
 
 | Surface | Method | Source File | Purpose |
 |---|---|---|---|
-| `POST /v1/chat/completions` | HTTP | `gateway.js` | Agent turn dispatch |
+| `POST /v1/chat/completions` | HTTP | `gateway.js` | Isolated and synchronous main-session agent dispatch |
 | `GET /v1/info` | HTTP | `gateway-capabilities.js` | Preferred Gateway version and capability discovery |
 | `POST /tools/invoke` (sessions_list) | HTTP | `gateway.js` | Session activity polling, auth profile resolution |
 | `POST /tools/invoke` (message) | HTTP | `gateway.js`, `dispatch/index.mjs` | Message delivery, notifications |
 | `GET /health` | HTTP | `gateway.js` | Gateway reachability check |
 | `GET /sessions/:key` | HTTP | `dispatch/index.mjs` | Session activity validation (done guard) |
-| `openclaw system event` | CLI | `gateway.js` | Main-session event injection |
+| `openclaw system event` | CLI | `gateway.js` | Fire-and-forget main-session event injection |
 | `openclaw gateway call sessions.patch` | CLI | `dispatch/index.mjs` | Session configuration (model, thinking, spawnDepth) |
 | `openclaw gateway call agent` | CLI | `dispatch/index.mjs` | Subagent session dispatch |
 | `openclaw gateway call chat.history` | CLI | `dispatch/index.mjs` | Session transcript retrieval |
