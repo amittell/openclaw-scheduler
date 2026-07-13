@@ -654,8 +654,12 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
     );
     assert(scopedFailure?.ok === false, 'scoped handoff fails capability negotiation');
     assert(
-      JSON.stringify(scopedFailure).includes('approval_scope_enforcement'),
-      'scoped handoff rejection names approval_scope_enforcement',
+      scopedFailure?.code === 'unsupported_capability',
+      'scoped handoff rejection uses the public unsupported_capability code',
+    );
+    assert(
+      /approver scope.*runtime cannot enforce/i.test(scopedFailure?.error || ''),
+      'scoped handoff rejection explains the unsupported approver-scope enforcement',
     );
   } else if (expectedAgentcliContract === 'handoff-v2') {
     const applyOutput = applyManifest(resolve(agentcliExamples, 'flyctl-ops.json')).result;
