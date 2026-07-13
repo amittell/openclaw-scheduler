@@ -774,6 +774,7 @@ export const db: {
   setDbPath(path: string): void;
   getDb(): SchedulerDatabase;
   getResolvedDbPath(): string;
+  applyBundledSchema(label?: string): SchedulerDatabase;
   initDb(): Promise<unknown>;
   checkpointWal(): { busy: number; checkpointed: number; log: number } | null;
   closeDb(): void;

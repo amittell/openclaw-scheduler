@@ -15,6 +15,7 @@ import {
   type DbPathParams, type ArtifactsDirParams,
   type AgentTurnOpts, type AgentTurnWithTimeoutOpts,
   type AgentTurnResult, type DeliveryResult, type SqliteRunResult,
+  type SchedulerDatabase,
   type TaskGroupOpts, type TaskGroupResult, type TaskGroupStatus,
   type TeamTaskGateOpts,
   type ResolvedIdentity, type TrustEvaluation, type AuthorizationProofResult,
@@ -23,6 +24,8 @@ import {
 
 // ---- db ----
 void db.getResolvedDbPath();
+const schemaDb: SchedulerDatabase = db.applyBundledSchema('type smoke schema apply');
+void schemaDb;
 void db.setDbPath(':memory:');
 void db.closeDb();
 const checkpoint = db.checkpointWal();

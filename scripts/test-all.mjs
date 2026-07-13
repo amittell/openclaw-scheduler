@@ -74,7 +74,10 @@ if (!skipDocs && !agentcliOnly) {
   runStep('documentation examples', process.execPath, [join('scripts', 'validate-doc-examples.mjs')]);
 }
 
-const agentcliRoot = resolve(process.env.AGENTCLI_PATH || join(root, '..', 'agentcli'));
+const agentcliRoot = resolve(root, '..', 'agentcli');
+if (process.env.AGENTCLI_PATH && resolve(process.env.AGENTCLI_PATH) !== agentcliRoot) {
+  throw new Error(`AGENTCLI_PATH must resolve to the sibling checkout ${agentcliRoot}`);
+}
 const agentcliPackage = join(agentcliRoot, 'package.json');
 const agentcliBin = join(agentcliRoot, 'bin', 'agentcli.js');
 const agentcliIntegration = join(agentcliRoot, 'test', 'integration-scheduler.test.js');

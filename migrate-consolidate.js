@@ -14,8 +14,7 @@
  */
 
 import { Cron } from 'croner';
-import { readFileSync } from 'node:fs';
-import { getDb } from './db.js';
+import { applyBundledSchema, getDb } from './db.js';
 
 function nextRunFromCron(cronExpr, tz) {
   const cron = new Cron(cronExpr, { timezone: tz || 'UTC' });
@@ -1403,8 +1402,7 @@ export default function migrateConsolidate() {
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
   if (applied) {
-    const schema = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
-    getDb().transaction(() => getDb().exec(schema))();
+    applyBundledSchema('standalone schema apply');
     if (migrateConsolidate()) {
       throw new Error('Consolidation migration did not reach a complete schema no-op state');
     }
