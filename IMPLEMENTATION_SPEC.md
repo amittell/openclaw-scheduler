@@ -1,11 +1,11 @@
-# Implementation Specification: Scheduler 0.3.0
+# Implementation Specification: Scheduler 0.4.0
 
 This document records the current runtime contract. The executable schema is
 `schema.sql`; the idempotent upgrade path is `migrate-consolidate.js`.
 
 ## Database Contract
 
-Schema version: 27
+Schema version: 28
 
 Initialization is fail closed:
 
@@ -16,7 +16,7 @@ Initialization is fail closed:
 4. Throw `DB_INIT_FAILED` on open, schema, or consolidation failure. Do not run
    the dispatcher against a partial schema.
 
-The v27 ownership and delivery tables are:
+The v28 ownership, governance, evidence, and delivery tables are:
 
 - `dispatcher_leases`: named owner, monotonically increasing fencing token,
   acquisition, renewal, and expiry times.
@@ -25,11 +25,15 @@ The v27 ownership and delivery tables are:
 - `runs`: dispatcher fence, cancellation fields, process identity and lifecycle,
   agent-abort audit, and one terminal transition timestamp.
 - `approvals`: versioned decisions and explicit approved, rejected, cancelled,
-  expired, dispatching, and dispatched timestamps/state.
-- `delivery_outbox`: externally addressed output, retry budget, due time, and
-  leased claim state.
+  timed-out, dispatching, and dispatched timestamps/state, plus risk, approver
+  scope, and the bound execution-contract hash.
+- `delivery_outbox`: externally addressed output, retry budget, due time,
+  leased claim state, and multipart group/index/count coordinates.
 - `delivery_attachments`: ordered durable content/path, size, MIME type, and
   SHA-256 integrity metadata.
+- `completion_debts`: run-scoped completion delivery ownership and recovery
+  state.
+- `evidence_records`: one immutable canonical SHA-256 evidence row per run.
 
 Agent prompt messages remain in `messages`. `prompt_claimed` means a dispatcher
 owns prompt injection. An external delivery never enters that route.
@@ -84,15 +88,72 @@ claim approved work for dispatch. Rejection, timeout, cancellation, disabled
 job state, or a cancelled linked run prevents later dispatch. The approval and
 linked queue/run state are updated together where required.
 
+Every `approval_required` attempt, including scheduled, one-shot, manual,
+chain, and retry dispatch, requires a durable queue row. Approval creation snapshots
+`approval_risk_level`, `approval_approver_scope`, and a canonical SHA-256
+binding of the persisted execution contract. Scope matching supports exact,
+local username, numeric UID, and normalized local-principal identities. The CLI
+derives these values from the invoking operating-system account; flags and
+environment variables cannot substitute another identity. Domain scopes are
+rejected. An approve decision for a scoped gate must match, and scoped gates
+cannot timeout-auto-approve. Mutation, disable, or delete cancels the bound
+approval.
+
+`approvals approve/reject APPROVAL_ID` is the primary decision surface. Legacy
+`jobs approve/reject JOB_ID` first resolves that job's current pending approval
+and never selects approver identity. Operators use `approvals list --json` to
+obtain the complete approval UUID.
+
+## Structured Output
+
+`output_format` accepts `json`, `ndjson`, or `text`. JSON parses as one value;
+every nonblank NDJSON line parses independently; text uses the normalized text
+result. The run records the declared format, validity, warning, raw byte count,
+SHA-256 digest, and either the parsed value or an offloaded artifact reference.
+Malformed JSON or NDJSON is nonfatal and does not change an otherwise
+successful execution or block success children.
+
+## Post-success Verification
+
+Synchronous jobs may declare a local shell check through `verify_shell`,
+`verify_timeout_s`, and `verify_on_failure`. Verification executes after primary execution and
+structured-output parsing but before credentials are cleaned up, terminal
+evidence is persisted, delivery is enqueued, or children are dispatched. The
+runtime applies the same timeout, cancellation, process-group, fencing, and
+environment controls as ordinary shell execution. Audit state contains only
+status, timing, exit metadata, byte counts, and output hashes. `error` converts
+verification failure to terminal error; `warn` preserves success. Interrupted
+verification receives a terminal evidence outcome during recovery.
+
 ## Delivery and Attachments
 
 `delivery-outbox.js` is the only durable route for external channel output.
 Completion enqueues an idempotent outbox row. The consumer claims due rows with
 an expiry, retries within `max_attempts`, and records delivered or failed state.
+Long output is split into independent rows with deterministic
+`:part:i/N` idempotency keys. `getDeliveryCheckpoint()` reports aggregate and
+per-part status so a retry resumes without resending completed parts.
 
 `attachment-store.js` stages attachments, validates size, computes SHA-256, and
 stores either durable content or a controlled artifact path. Failed enqueue
 cleans staged artifacts. Agent prompt consumption cannot claim outbox rows.
+
+Completion delivery ownership is scoped to the tuple of task label, session,
+and run, not only the task label or session. Both `dispatch done` and routed
+watchers must acquire that claim and enqueue through `delivery_outbox`; they do
+not send completion output through the agent inbox. A routed watcher writes no
+delivery body to stdout and emits `WATCHER_ALREADY_DELIVERED` after durable
+enqueue. That legacy-named marker is an enqueue ownership signal for the
+scheduler wrapper, not a channel delivery receipt. The completion debt remains
+open until reconciliation confirms every outbox part is delivered. A route-less
+watcher retains stdout compatibility after acquiring its claim. Claim-store
+errors fail closed as `COMPLETION_CLAIM_UNAVAILABLE`.
+
+Legacy completion schemas reserve one active scope and reject stale-run claims.
+Schema migration 28 rebuilds legacy completion debts transactionally and
+derives their delivery scope without discarding existing rows. A successful
+watcher result resets both 529 overload and Gateway-restart retry counters,
+including when completion is observed exactly at the deadline.
 
 ## Governance
 
@@ -100,15 +161,67 @@ cleans staged artifacts. Agent prompt consumption cannot claim outbox rows.
 
 - Fresh shell jobs default to `shell_env_policy: "minimal"`.
 - Migrated shell jobs explicitly retain `shell_env_policy: "inherit"` and emit
-  a warning.
+  a warning. Inherit exposes the scheduler's complete process environment,
+  including any bearer or master credentials stored there.
 - A requested sandbox, restricted network, allowed-path boundary, or agent cost
   cap is denied unless the executor reports real enforcement.
 - Identity, trust, proof, authorization, and credential handoff failures remain
   fail closed.
 - Materialized credential values are cleared during cleanup paths.
+- Delegation validation enforces declared mode, maximum depth, allowed
+  delegators, per-hop grants, cycles, and provider denial before execution.
+- `authorization_ref` resolves only through a loaded provider implementing
+  `resolvePolicy()` or `resolveAuthorization()`; all resolution failures deny.
+- Shell credential handoff materializes locally. Isolated-agent handoff requires
+  Gateway capability `chat-completions-env-inject-v1` before the scoped
+  `x-openclaw-env-inject` header is sent. Main-session materialization is
+  rejected. Auth-profile-only isolated jobs remain backward compatible.
 
 The default host executor does not claim container, namespace, firewall,
 filesystem, or agent-cost isolation.
+
+## Evidence Contract
+
+The built-in evidence backend is checksum-only. It accepts a legacy checksum
+declaration or `provider: "sha256"`/`"checksum"`, omitted methods or exactly
+`methods: ["sha256"]`, `verify.required: false`, and canonical JSON payload
+format. Unsupported providers such as `ssh` or `none`, non-SHA-256 methods, and
+required external verification fail job validation. The scheduler does not
+silently downgrade those declarations.
+
+Supported evidence uses `json-sort-v1` canonical JSON with SHA-256. The payload
+contains job/run identity, status, a hash of output, and redacted governance
+outcomes. It never contains raw materialized credentials. Persistence and the
+run outcome update share a transaction. A different replacement row for the
+same run fails with `EVIDENCE_RECORD_IMMUTABLE`.
+
+`runs evidence RUN_ID --json` reparses the payload, recomputes its hash, and
+exits nonzero on an integrity mismatch. This is checksum verification, not a
+signature or third-party attestation.
+
+## Gateway Compatibility
+
+`gateway-capabilities.js` discovers metadata only from explicit JSON capability
+declarations returned by `GET /v1/info` or `GET /health`, then caches the
+bounded result per Gateway for ordinary discovery. Before every isolated
+request with a non-empty materialized environment, it force-refreshes that
+metadata so a Gateway restart or downgrade cannot reuse a stale positive
+result. The request requires `chat-completions-env-inject-v1`; missing support
+fails before the credential-bearing chat request with
+`GATEWAY_ENV_INJECT_UNSUPPORTED`. Plain-text health, JSON without an explicit
+capability declaration, and current OpenClaw Gateway 2026.6.11 therefore
+advertise no capabilities and fail closed for this surface.
+
+`capabilities --json` advertises handoff version 3. Relevant exact feature
+values are `evidence_generation: false`,
+`checksum_evidence_generation: true`,
+`evidence_integrity: "checksum-sha256-v3"`,
+`evidence_contract: "openclaw-scheduler-checksum-v3"`,
+`approval_scope_enforcement: false`,
+`gateway_capability_discovery: true`,
+`gateway_env_injection_negotiation: true`,
+`multipart_delivery_checkpoints: true`, and
+`completion_delivery_scope: "run"`.
 
 ## CLI Contract
 
@@ -149,7 +262,10 @@ per-job structured report and exits nonzero when any job fails.
 2. every `tests/*.test.mjs` file in its own process and isolated database,
    sequentially;
 3. documentation example validation;
-4. the sibling agentcli scheduler integration when that checkout is present.
+4. both scheduler-agentcli integration suites when a checkout is present.
 
 `npm run verify:local` adds lint, type checking, coverage, and a package dry run.
-CI uses the same smoke gate without the extra coverage pass.
+An absent local agentcli checkout is reported explicitly. `npm run
+test:agentcli` requires it. CI uses the smoke gate without the extra coverage
+pass and has a separate required compatibility job pinned to public agentcli
+commit `317cc0eea8b4c65bc3213f5f329124a45c958bd3`.

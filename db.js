@@ -43,6 +43,29 @@ function dbInitError(phase, err) {
   return wrapped;
 }
 
+function readBundledSchema() {
+  try {
+    return readFileSync(join(__dirname, 'schema.sql'), 'utf8');
+  } catch (err) {
+    throw dbInitError('schema read', err);
+  }
+}
+
+function applySchemaText(db, schema, label) {
+  try {
+    db.transaction(() => db.exec(schema))();
+  } catch (err) {
+    throw dbInitError(label, err);
+  }
+}
+
+/** Apply the package-owned schema file through the fixed module-relative path. */
+export function applyBundledSchema(label = 'schema apply') {
+  const db = getDb();
+  applySchemaText(db, readBundledSchema(), label);
+  return db;
+}
+
 export async function initDb() {
   let db;
   try {
@@ -50,12 +73,7 @@ export async function initDb() {
   } catch (err) {
     throw dbInitError('database open', err);
   }
-  let schema;
-  try {
-    schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-  } catch (err) {
-    throw dbInitError('schema read', err);
-  }
+  const schema = readBundledSchema();
   let hasUserTables;
   try {
     hasUserTables = (db.prepare(`
@@ -68,11 +86,7 @@ export async function initDb() {
     throw dbInitError('database inspect', err);
   }
   const applySchema = (label) => {
-    try {
-      db.transaction(() => db.exec(schema))();
-    } catch (err) {
-      throw dbInitError(label, err);
-    }
+    applySchemaText(db, schema, label);
   };
   const runConsolidate = async () => {
     try {
@@ -81,6 +95,7 @@ export async function initDb() {
       if (applied) {
         process.stderr.write(`${new Date().toISOString()} [db] Consolidation migration applied\n`);
       }
+      return applied;
     } catch (err) {
       throw dbInitError('consolidation migration', err);
     }
@@ -89,18 +104,18 @@ export async function initDb() {
   if (hasUserTables) {
     // Existing installs: normalize via migration first so schema re-apply doesn't
     // trip over legacy partial tables/indexes.
-    await runConsolidate();
-    applySchema('schema apply');
+    const migrated = await runConsolidate();
+    if (migrated) applySchema('schema apply');
     return db;
   }
 
   // Net-new installs: create the baseline schema, then run consolidation in case
   // a package upgrade adds idempotent backfills the base schema doesn't need.
   applySchema('initial schema apply');
-  await runConsolidate();
+  const migrated = await runConsolidate();
 
   // Re-apply schema so indexes/table defs are fully aligned after consolidation.
-  applySchema('schema re-apply');
+  if (migrated) applySchema('schema re-apply');
 
   return db;
 }

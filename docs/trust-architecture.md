@@ -3,7 +3,7 @@
 Date: 2026-03-30
 Status: Accepted
 
-Updated: 2026-07-11 for scheduler 0.3.0 and schema 27
+Updated: 2026-07-12 for scheduler 0.4.0 and schema 28
 
 ## Purpose
 
@@ -11,7 +11,7 @@ This document describes the trust architecture of the scheduler/sub-agent
 execution model: what the boundary guarantees, what it does not, and how
 operators reason about the security properties of scheduled workflows.
 
-## Version 0.3.0 Enforcement Status
+## Version 0.4.0 Enforcement Status
 
 Governance fields are no longer treated as prompt-only metadata. Every dispatch
 evaluates the stored policy before execution. The runtime currently enforces a
@@ -23,14 +23,27 @@ enforced. The default host executor does not claim those controls.
 This is deliberate fail-closed behavior, not an assertion that the host process
 has container, namespace, firewall, filesystem, or cost-metering isolation.
 `contract_audit` is parsed and recorded, while identity, trust, authorization
-proof, credential handoff, and evidence checks retain their provider-specific
-runtime enforcement.
+proof, and credential handoff retain their provider-specific runtime
+enforcement. Evidence declared for a run is reduced to a redacted canonical
+payload, hashed, and stored immutably by the scheduler.
 
 Fresh shell jobs use `shell_env_policy: "minimal"`, which passes only a small
 operating-system allowlist plus explicitly materialized task credentials.
-Migrated jobs use `inherit` to preserve legacy behavior and emit a warning.
-Materialized credential objects are cleared during cleanup, including error and
-cancellation paths.
+Migrated jobs use `inherit` to preserve legacy behavior and emit a warning. An
+`inherit` shell receives the scheduler service's complete process environment,
+which can include Gateway bearer tokens or provider/master keys. It is not a
+credential-isolation boundary. Materialized credential objects are cleared
+during cleanup, including error and cancellation paths, but cleanup does not
+remove variables inherited from the scheduler service environment.
+
+Handoff v3 also enforces approval state and OS-derived scope matching,
+structured output, delegation, external authorization references, and evidence
+integrity. Approval-gated work cannot execute without a durable dispatch row.
+The scheduler derives approver identity from the invoking local operating-system
+account; caller-provided flags or environment variables cannot substitute
+another identity. JSON and NDJSON output contracts fail the run when parsing
+fails. Delegation and authorization reference failures deny before execution.
+Evidence is content-addressed with SHA-256 and verified when retrieved.
 
 ## The Core Design: Scheduler as Broker, Child as Bounded Actor
 
@@ -40,12 +53,15 @@ lifecycle. It authenticates to the gateway with a single operator-provisioned
 bearer token and holds whatever master/scoped keys the operator has loaded
 into its environment or provider plugins.
 
-Child tasks are bounded execution principals. They receive only what the
-scheduler gives them and cannot escalate their own authority. A child's
-credentials are resolved by an identity provider, narrowed via
-`prepareHandoff` when the policy requires it, and materialized as scoped
-environment variables (shell tasks) or auth-profile headers (agent tasks).
-The child never sees the scheduler's own bearer token or master keys.
+Child tasks can be bounded execution principals when the selected target and
+environment policy create a narrower boundary. A child's credentials are
+resolved by an identity provider, narrowed via `prepareHandoff` when the policy
+requires it, and materialized as scoped environment variables for minimal shell
+tasks or capability-negotiated isolated agent turns. Auth-profile-only isolated
+turns may instead use the existing profile header. Main-session jobs cannot
+receive a task-scoped materialized environment. An `inherit` shell is the
+important exception: it receives the full scheduler environment and can see
+any bearer token or master key present there.
 
 This is the broker/orchestrator + bounded actor pattern. The scheduler
 decides what to run, with what credentials, under what trust constraints.
@@ -129,8 +145,10 @@ in the credential-scoping or access-control sense.
   run rather than proceeding with degraded security.
 - Session isolation: child sessions have independent memory, history, and
   tool scope from the parent.
-- Audit attribution: every run is attributed to a resolved identity with
-  full trust/authorization/evidence chain.
+- Audit attribution: declared runs persist the resolved identity and redacted
+  trust, authorization, delegation, and credential-handoff summaries. Evidence
+  records bind those summaries and an output hash to one run with canonical
+  SHA-256 integrity.
 - Security aborts do not fire triggered children: a parent that fails a
   security gate (identity, trust, authorization, proof) does not dispatch
   downstream work.
@@ -146,9 +164,38 @@ in the credential-scoping or access-control sense.
   passes through verbatim.
 - That a child cannot observe side effects of the parent's execution
   through shared filesystem state.
-- That the gateway itself enforces credential boundaries. Credential
-  enforcement happens at dispatch time in the scheduler; the gateway
-  trusts the auth-profile header it receives.
+- That a Gateway capability advertisement proves the Gateway implementation is
+  trustworthy. The scheduler requires `chat-completions-env-inject-v1` before
+  sending a materialized env map, but the operator still controls and trusts
+  the connected Gateway. Auth-profile routing remains a separate Gateway trust
+  surface.
+- That a SHA-256 evidence record is a digital signature or third-party
+  attestation. It detects payload changes after generation; authenticity still
+  depends on the scheduler and any configured proof provider. Raw credentials
+  are never stored as evidence.
+
+## Approval Boundary
+
+Every dispatch for a job with `approval_required` enters the durable approval
+gate, including scheduled, one-shot, manual, chain-triggered, and retry work.
+The approval record snapshots the optional `low`, `medium`, or `high` risk
+level, approver scope, and a canonical SHA-256 binding of the persisted job
+execution contract.
+
+An approver scope may be an unprefixed exact identity or use `exact:`, `user:`,
+`uid:`, or `principal:` for a normalized local identity. Domain scopes are not
+supported. The decision command derives username, UID, and local principal from
+the invoking operating-system account. Approving a scoped gate requires that
+derived identity to match, and scoped gates cannot use timeout auto-approval.
+If the job changes, is disabled, or is deleted before execution, the approval
+is cancelled rather than transferred to different work.
+
+Operators should decide by immutable approval ID with `approvals approve` or
+`approvals reject`. Legacy job-ID commands locate only the current pending gate
+for that job and do not accept an identity override. This boundary authenticates
+the local OS caller; remote approval services still need their own authenticated
+mapping to a restricted local account. Use `approvals list --json` when copying
+the complete approval UUID.
 
 ## Credential Flow
 
@@ -180,12 +227,19 @@ For each dispatched job, the scheduler runs the v0.2 evaluation chain:
    `inherit` forwards the parent's auth profile, `downscope` calls
    `prepareHandoff()` to create a narrower session, `independent` uses
    the child's own credentials (trust-capped at parent's level).
-3. `evaluateTrust()` -- compares effective trust level against the
+3. `validateDelegation()` -- enforces the declared mode, maximum chain depth
+   (16 by default), allowed delegators, per-hop grants, cycle detection, and
+   any provider denial.
+4. `evaluateTrust()` -- compares effective trust level against the
    contract floor. Blocks on `deny`, warns on `warn`.
-4. `verifyAuthorizationProof()` -- validates proof if declared. Blocks
+5. `verifyAuthorizationProof()` -- validates proof if declared. Blocks
    if verification fails or verifier is missing.
-5. `evaluateAuthorization()` -- evaluates inline policy or invokes
-   authorization provider. Blocks on `deny`, aborts on `escalate`.
+6. `evaluateAuthorization()` -- evaluates inline policy, or resolves
+   `authorization_ref` through the named provider's `resolvePolicy()` or
+   `resolveAuthorization()` method. Missing, unresolved, or failing resolvers
+   deny. Resolved policies are structural unless they explicitly name a provider
+   that implements `authorize()`. Provider decisions block on `deny` and abort
+   on `escalate`.
 
 ### 4. Provider narrows credentials
 
@@ -204,18 +258,52 @@ would exceed the parent's, dispatch is aborted.
 ### 5. Child receives scoped credentials
 
 For shell tasks, credentials are injected as environment variables via
-`provider.materialize()`. For agent tasks, the scheduler either forwards a
-resolved auth profile or, when materialization yields env vars, sends an
-`x-openclaw-env-inject` header that the gateway can apply to the child
-session. Gateway receiver support is still required for env injection, so
-profile forwarding remains the compatibility path until that support is
-present. The child never sees the master key.
+`provider.materialize()`. A shell using `shell_env_policy: "inherit"` also
+receives the scheduler's full service environment, including any bearer or
+master credentials stored there; use `minimal` for task-scoped isolation. For
+isolated agent tasks, a non-empty materialized env map triggers Gateway
+capability discovery. The scheduler sends
+`x-openclaw-env-inject` only when the Gateway advertises
+`chat-completions-env-inject-v1`; otherwise dispatch fails closed with
+`GATEWAY_ENV_INJECT_UNSUPPORTED` before credentials leave the scheduler.
+Auth-profile-only isolated turns remain compatible without that capability.
+Main-session tasks reject materialized credential handoff because their event
+path cannot enforce a task-scoped environment. Minimal shell and isolated
+handoff paths do not intentionally forward the provider's master key, but an
+inherited shell can observe it when it exists in the service environment.
 
 ### 6. Cleanup
 
 On task completion (success or failure), `provider.cleanup()` revokes
 dynamically minted keys and removes temporary materialization artifacts.
 Cleanup runs even on error paths.
+
+## Evidence Integrity
+
+The built-in evidence backend is checksum-only. A declaration may omit a
+provider for legacy checksum behavior or select `sha256`/`checksum` with only
+the `sha256` method and without required external verification. Unsupported
+providers such as `ssh` or `none`, non-SHA-256 methods, and
+`verify.required: true` fail validation because the scheduler has no matching
+signer or verifier. They are never silently downgraded.
+
+This checksum record is not agentcli's complete evidence payload or signed
+envelope contract. The scheduler therefore advertises
+`evidence_generation: false` for agentcli capability negotiation and the
+separate `checksum_evidence_generation: true` capability for its native record.
+Agentcli evidence declarations fail capability negotiation instead of being
+accepted as equivalent checksum evidence.
+
+For a supported declaration, the scheduler creates a `json-sort-v1` canonical
+payload containing job and run identity, status, an output SHA-256 hash, and
+redacted outcome summaries. It computes a SHA-256 content hash over that
+payload and transactionally inserts one immutable `evidence_records` row for
+the run. A second, different record for the same run is rejected.
+
+`openclaw-scheduler runs evidence RUN_ID --json` recomputes the checksum and
+exits nonzero if it does not match. It does not verify a signature or external
+principal. The evidence payload never includes raw materialized credentials,
+bearer tokens, or provider secrets.
 
 ## Trust Boundary Definition
 

@@ -15,6 +15,7 @@ import {
   type DbPathParams, type ArtifactsDirParams,
   type AgentTurnOpts, type AgentTurnWithTimeoutOpts,
   type AgentTurnResult, type DeliveryResult, type SqliteRunResult,
+  type SchedulerDatabase,
   type TaskGroupOpts, type TaskGroupResult, type TaskGroupStatus,
   type TeamTaskGateOpts,
   type ResolvedIdentity, type TrustEvaluation, type AuthorizationProofResult,
@@ -23,6 +24,8 @@ import {
 
 // ---- db ----
 void db.getResolvedDbPath();
+const schemaDb: SchedulerDatabase = db.applyBundledSchema('type smoke schema apply');
+void schemaDb;
 void db.setDbPath(':memory:');
 void db.closeDb();
 const checkpoint = db.checkpointWal();
@@ -177,7 +180,7 @@ const gotApproval: ApprovalRecord | undefined = approvals.getApproval('id');
 const pending: ApprovalRecord | undefined = approvals.getPendingApproval('job-1');
 const allPending = approvals.listPendingApprovals();
 if (allPending.length) { void allPending[0].job_name; }
-const resolved: ApprovalRecord = approvals.resolveApproval('id', 'approved', 'operator', 'lgtm');
+const resolved: ApprovalRecord | null = approvals.resolveApproval('id', 'approved', 'operator', 'lgtm');
 const pendingCount: number = approvals.countPendingApprovalsForJob('job-1');
 const timedOutApprovals = approvals.getTimedOutApprovals();
 if (timedOutApprovals.length) {
@@ -274,6 +277,8 @@ void shellResults.DEFAULT_STORE_LIMIT;
 void shellResults.DEFAULT_EXCERPT_LIMIT;
 void shellResults.DEFAULT_SUMMARY_LIMIT;
 void shellResults.DEFAULT_OFFLOAD_THRESHOLD;
+const storedArtifact: string | null = shellResults.storeRunArtifact('verification', 'run-id', 'output');
+void storedArtifact;
 const normalized: ShellResult = shellResults.normalizeShellResult(
   { stdout: 'ok', stderr: '', error: null },
   { runId: 'r-1', storeLimit: 1024 },

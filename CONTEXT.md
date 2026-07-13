@@ -20,9 +20,9 @@ local governance and delivery contract.
   `@amittell/agentcli` manifests.
 - It is not a replacement for ordinary native OpenClaw cron jobs.
 
-## Version 0.3.0 Design Bias
+## Version 0.4.0 Design Bias
 
-- schema version 27 in local SQLite with WAL and foreign keys enabled
+- schema version 28 in local SQLite with WAL and foreign keys enabled
 - fail-closed schema initialization and migration
 - one dispatcher lease with monotonically fenced ownership
 - bounded concurrent workers rather than a globally serial tick
@@ -30,6 +30,11 @@ local governance and delivery contract.
   Gateway abort for agent sessions
 - atomic completion, job update, and child enqueue
 - external delivery separate from agent prompt messages
+- run-scoped completion claims and independently retryable multipart delivery
+- approval bindings and approver scopes on every durable dispatch kind
+- handoff v3 structured output, delegation, provider-resolved authorization,
+  and immutable SHA-256 evidence
+- fail-closed Gateway capability negotiation before isolated credential injection
 - minimal shell environment for fresh jobs; explicit `inherit` for migrated jobs
 - governance requests denied when the selected executor cannot enforce them
 - explicit positive `run_timeout_ms` on every authored job

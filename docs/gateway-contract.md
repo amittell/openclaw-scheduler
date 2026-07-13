@@ -2,7 +2,7 @@
 
 Date: 2026-03-28
 
-Updated: 2026-07-11 for scheduler 0.3.0 and schema 27
+Updated: 2026-07-12 for scheduler 0.4.0 and schema 28
 
 ## Purpose
 
@@ -19,8 +19,11 @@ The scheduler resolves a bearer token using the following fallback chain:
 
 1. **Environment variable**: `OPENCLAW_GATEWAY_TOKEN` (checked first).
 2. **Token file**: Path from `OPENCLAW_GATEWAY_TOKEN_PATH`, or the default
-   `~/.openclaw/credentials/.gateway-token`. The file contents are read once
-   and cached for the process lifetime.
+   `~/.openclaw/credentials/.gateway-token`. The file is read for every request,
+   so an atomic token-file replacement takes effect without restarting the
+   scheduler. The canonical file must remain under `~/.openclaw/credentials`,
+   `/run/secrets`, or `/var/run/secrets`; symlinks that escape those roots are
+   rejected.
 
 When a token is available, every HTTP request includes:
 
@@ -225,6 +228,23 @@ recovered before retry. Only the outbox consumer invokes the gateway `message`
 tool for that row. This separation prevents externally addressed output from
 being injected into a later agent prompt.
 
+Dispatch completion has the same boundary. Both `dispatch done` and routed
+watchers acquire a label/session/run-scoped completion claim and enqueue only
+through `delivery_outbox`. A routed watcher emits
+`WATCHER_ALREADY_DELIVERED` on stderr and leaves stdout empty after durable
+enqueue. The marker tells the scheduler wrapper not to enqueue a duplicate; it
+does not assert that the Gateway or destination accepted the message. The
+completion debt remains open until every outbox part is delivered. A watcher
+without a delivery route preserves stdout compatibility only after acquiring
+its claim. Completion claim storage failures are explicit and fail closed as
+`COMPLETION_CLAIM_UNAVAILABLE`.
+
+Multipart messages are split before enqueue. Each part is an independently
+retryable outbox row with a deterministic `:part:i/N` idempotency suffix, so
+the delivery checkpoint records partial progress without resending completed
+parts. `delivery_group_id`, `part_index`, and `part_count` persist the group
+coordinates, with uniqueness enforced per group and part index.
+
 **Also used directly in dispatch/index.mjs** `cmdEnqueue()` via raw `fetch` to
 `POST /tools/invoke` for the "Starting..." notification when spawning a
 subagent session:
@@ -266,7 +286,9 @@ subagent session:
 
 **Scheduler behavior when unhealthy**:
 - Isolated jobs are deferred (next_run_at pushed forward by 60s).
-- Shell and main-session jobs continue regardless.
+- Shell jobs continue independently.
+- Main-session jobs may still be attempted, but their `openclaw system event`
+  operation requires the Gateway and can fail into configured retry behavior.
 - Health is re-checked every 60 seconds (`dispatcher.js` `tick()`).
 
 ---
@@ -557,14 +579,19 @@ Each agent has its own configuration directory at
 - `models.json` -- provider endpoints and model definitions for this
   agent. Different agents can use different model providers (e.g. main
   uses Anthropic, beta uses OpenAI Codex via a different base URL).
-- `auth-profiles.json` -- credential profiles scoped to this agent.
-  Each agent can have independent API keys, OAuth tokens, and provider
-  configurations.
-- `sessions/` -- per-agent session store (sessions.json + JSONL files).
+- `openclaw-agent.sqlite` -- current Gateway-managed agent state, including
+  the auth-profile store. Legacy Gateway versions may instead use
+  `auth-profiles.json` in this directory.
 
-The gateway reads from the correct agent directory based on the resolved
-agent ID. This means agents on the same gateway can have completely
-independent credential surfaces.
+The per-agent session store is a sibling at
+`~/.openclaw/agents/<agentId>/sessions/` and contains `sessions.json` plus
+JSONL transcripts.
+
+The Gateway resolves effective model and auth state for the selected agent.
+Depending on Gateway version and configuration, that effective state may use
+read-through inheritance from the main agent. Agent IDs provide routing and
+session isolation, but the scheduler does not claim strict credential
+separation when Gateway inheritance is enabled.
 
 ### Scheduler dispatch to non-default agents
 
@@ -594,16 +621,19 @@ Jobs without an explicit `agent_id` default to `"main"`.
 
 ### Multi-agent trust considerations
 
-When multiple agents share a gateway, each agent is a separate execution
-principal with its own credential surface:
+When multiple agents share a gateway, each agent is a separate routing and
+session principal with a Gateway-resolved effective credential scope:
 
-- Auth profiles are per-agent (`~/.openclaw/agents/<id>/agent/auth-profiles.json`).
-  A job dispatched to beta uses beta's profiles, not main's.
+- Auth state is owned and resolved by the running Gateway. The scheduler sends
+  the target agent and profile selection but never copies credential files
+  between agents. A job dispatched to beta therefore uses the Gateway's beta
+  scope, including any Gateway-supported read-through inheritance, without
+  cloning main-agent OAuth refresh material.
 - The scheduler's `child_credential_policy` applies within a single
   agent's dispatch chain. Cross-agent credential scoping (e.g. a main
   job triggering a beta child with downscoped credentials) is not
-  currently supported -- each agent resolves credentials from its own
-  profile store.
+  currently supported. The scheduler cannot prove that effective credential
+  scopes remain distinct when Gateway inheritance applies.
 - The `x-openclaw-env-inject` header is agent-agnostic: materialized
   env vars are forwarded to whichever agent the job targets.
 - Session isolation between agents is enforced by the session key
@@ -719,12 +749,11 @@ Neither header overrides the other.
 
 ### Header size limits
 
-Materialized env maps should be kept small (a handful of API keys and
-scope tokens). The scheduler does not enforce a size limit, but HTTP
-proxies and gateways typically cap individual header values at 8 KB.
-Gateway implementations should reject `x-openclaw-env-inject` values
-that exceed a reasonable threshold (suggested: 8192 bytes) and return
-`431 Request Header Fields Too Large`.
+Materialized env maps are bounded before capability discovery or dispatch. The
+scheduler accepts at most 64 entries, 128 UTF-8 bytes per key, 4,096 UTF-8 bytes
+per value, and 7,168 UTF-8 bytes for the serialized header. Unsafe environment
+names, accessors, symbol keys, non-string values, NUL bytes, arrays, and
+prototype-pollution keys fail closed with `GATEWAY_ENV_INJECT_INVALID`.
 
 ### Receiver-side implementation notes
 
@@ -738,9 +767,20 @@ merge strategy. Specifically:
 - Do not use recursive merge or spread into `Object.prototype` --
   naive merge enables prototype pollution.
 
-This path requires matching receiver-side support in the gateway. Until that
-support is available, `auth_profile` forwarding remains the compatibility path
-for agent-side credential selection.
+This path requires matching receiver-side support in the Gateway. Before an
+isolated agent request containing materialized credentials is sent, the
+scheduler discovers Gateway metadata and requires the explicit
+`chat-completions-env-inject-v1` capability. A legacy or current Gateway that
+does not advertise that capability fails closed with
+`GATEWAY_ENV_INJECT_UNSUPPORTED`; the scheduler never silently drops the
+credentials or sends them to an unconfirmed receiver. Auth-profile-only
+isolated turns do not require environment injection and remain compatible.
+
+Credential materialization is supported for shell and isolated agent jobs.
+Shell jobs receive the scoped environment locally. Isolated agent jobs use the
+negotiated header path above. Main-session jobs reject
+`identity.presentation` and `credential_handoff` because a main-session event
+cannot enforce a task-scoped environment boundary.
 
 Reference: `gateway.js` (`runAgentTurn()`,
 `runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
@@ -763,11 +803,12 @@ The gateway contract intersects with the trust architecture at these points:
 - **Auth-profile forwarding:** the scheduler can direct the gateway to use a
   specific credential profile for agent tasks (see "Auth-Profile Forwarding"
   above).
-- **Credential materialization:** for shell tasks, credentials are injected as
-  environment variables by the identity provider. For agent tasks, the
-  scheduler can now forward a materialized env map via
-  `x-openclaw-env-inject`; `auth_profile` forwarding remains the profile-based
-  compatibility path when the gateway does not yet apply env injection.
+- **Credential materialization:** shell tasks receive provider-materialized
+  environment variables locally. Isolated agent tasks require the Gateway to
+  advertise `chat-completions-env-inject-v1` before the scheduler sends the
+  scoped `x-openclaw-env-inject` header. Main-session materialization is
+  rejected. Auth-profile-only isolated turns remain the compatibility path for
+  Gateways without environment injection.
 
 ---
 
@@ -781,11 +822,18 @@ the authorization blob names a provider (`authorization.provider` or
 return one of `permit`, `deny`, or `escalate`; unsupported or missing decisions
 fail closed as `deny`.
 
-`authorization_ref` by itself is **not** an external-policy lookup mechanism
-today. If `authorization_ref` is set and `authorization` is empty, dispatch-time
-evaluation fails closed with `deny` because external policy resolution is not
-implemented yet. Jobs that need a dispatch-time authorization gate must provide
-an inline authorization blob (optionally provider-backed), or remove the ref.
+When `authorization_ref` is set without an inline `authorization` blob, handoff
+v3 resolves it through a named authorization provider. References use either
+`provider:policy-ref` or `provider://provider/policy-ref`. The provider must be
+loaded and implement `resolvePolicy()` or `resolveAuthorization()`. A missing
+provider, unsupported resolver, missing policy, thrown error, or non-object
+policy fails closed as `deny`; the scheduler never treats the reference string
+itself as a permit.
+
+Resolver output is evaluated structurally unless the returned policy explicitly
+names an authorization provider. A resolver that also requires a second
+`authorize()` call must set that provider field and implement `authorize()`;
+the scheduler never adds it implicitly.
 
 The scheduler can load local identity, authorization, and proof-verifier
 plugins from `SCHEDULER_PROVIDER_PATH` at startup. Every `*.js` file in that
@@ -797,11 +845,13 @@ This is a high-trust boundary:
 - The directory should not be writable by untrusted users or automation.
 - If a job explicitly references a provider or verifier and that plugin is not
   loaded, the v0.2 runtime fails closed instead of falling back to structural
-  checks.
-- Credential handoff materialization is currently shell-only. Jobs that declare
-  `identity.presentation` or `credential_handoff` must use
-  `session_target: "shell"`; non-shell jobs fail closed at validation/dispatch
-  time.
+  checks. This includes provider-qualified `authorization_ref` policy
+  resolution.
+- Credential handoff materialization supports `session_target: "shell"` and
+  `session_target: "isolated"`. Isolated jobs negotiate
+  `chat-completions-env-inject-v1` before dispatch. Main-session jobs fail
+  closed because their event-injection path cannot enforce task-scoped env
+  materialization.
 
 For the broader trust architecture that frames this provider trust boundary
 within the scheduler/child execution model, see `docs/trust-architecture.md`.
@@ -809,6 +859,7 @@ within the scheduler/child execution model, see `docs/trust-architecture.md`.
 Reference:
 - `dispatcher.js` `main()` (provider loading at startup)
 - `provider-registry.js` `loadProviders()`
+- `provider-registry.js` `resolveAuthorizationRef()`
 - `v02-runtime.js` (`resolveIdentity()`, `verifyAuthorizationProof()`, `evaluateAuthorization()`)
 
 ---
@@ -844,35 +895,46 @@ external side effect already performed by the agent.
 
 ### Current State
 
-The scheduler performs no version or capability checking against the gateway.
-The `/health` endpoint is used only as a binary reachability check (2xx = up,
-anything else = down). There is no mechanism to detect whether the gateway
-supports specific tools, API versions, or features.
+Version 0.4 discovers explicit Gateway version, protocol, and capability
+metadata before using a capability-gated credential surface. Discovery tries,
+in order:
 
-This creates a fragile coupling: if the gateway removes or changes a tool (e.g.
-`sessions_list` response shape), the scheduler will fail at runtime with
-opaque errors rather than a clear incompatibility signal.
+1. `GET /v1/info` with a bounded JSON response.
+2. Structured capability metadata in `GET /health`.
 
-### Proposed: Version and Capability Endpoint
+Only an explicit JSON capability declaration from one of those HTTP responses
+is authoritative. The first authoritative response is normalized and cached
+per Gateway base URL for 60 seconds during ordinary discovery. Before every
+credential-bearing isolated request, the scheduler bypasses that cache and
+force-refreshes capability metadata so a Gateway restart or downgrade cannot
+reuse stale positive support. Metadata with invalid types, excessive size, too
+many capabilities, or oversized values is rejected. Plain-text health and JSON
+health without an explicit capability declaration remain valid liveness
+evidence but advertise no capabilities. Current OpenClaw Gateway 2026.6.11
+advertises no capabilities, so task-scoped environment injection fails closed.
 
-The `/health` response should include version and capability metadata:
+`openclaw-scheduler capabilities --json` advertises this scheduler support as
+`features.gateway_capability_discovery: true` and
+`features.gateway_env_injection_negotiation: true`.
+
+An HTTP discovery response may use this shape:
 
 ```json
 {
   "ok": true,
-  "version": "2026.3.15",
+  "version": "2026.7.11",
+  "protocol": 4,
   "capabilities": [
-    "sessions_list",
-    "sessions.patch",
-    "chat.history",
-    "agent",
-    "message"
+    "chat-completions-env-inject-v1"
   ]
 }
 ```
 
-Alternatively, a dedicated `GET /v1/info` endpoint could serve this purpose,
-keeping `/health` lightweight for load balancer probes.
+Capability discovery is lazy. Ordinary health checks and auth-profile-only
+agent turns retain their existing behavior and ordinary discovery uses the
+bounded cache. A non-empty materialized env map force-refreshes discovery and
+requires `chat-completions-env-inject-v1`; absence produces
+`GATEWAY_ENV_INJECT_UNSUPPORTED` before `POST /v1/chat/completions`.
 
 ---
 
@@ -922,6 +984,7 @@ request headers.
 | Surface | Method | Source File | Purpose |
 |---|---|---|---|
 | `POST /v1/chat/completions` | HTTP | `gateway.js` | Agent turn dispatch |
+| `GET /v1/info` | HTTP | `gateway-capabilities.js` | Preferred Gateway version and capability discovery |
 | `POST /tools/invoke` (sessions_list) | HTTP | `gateway.js` | Session activity polling, auth profile resolution |
 | `POST /tools/invoke` (message) | HTTP | `gateway.js`, `dispatch/index.mjs` | Message delivery, notifications |
 | `GET /health` | HTTP | `gateway.js` | Gateway reachability check |
@@ -936,4 +999,5 @@ request headers.
 | `x-openclaw-session-key` | Header (req) | `gateway.js` | Session continuity |
 | `x-openclaw-session-key` | Header (resp) | `gateway.js` | Session key propagation |
 | `x-openclaw-auth-profile` | Header | `gateway.js` | Auth profile override |
+| `x-openclaw-env-inject` | Header | `gateway.js`, `gateway-capabilities.js` | Capability-gated task-scoped env materialization for isolated turns |
 | `~/.openclaw/agents/<agent>/sessions/sessions.json` | File | `dispatch/index.mjs` | Local session state (ground truth) |

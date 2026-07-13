@@ -16,6 +16,7 @@ const root = resolve(import.meta.dirname, '..');
 const cliPath = join(root, 'cli.js');
 const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
+const consolidatePath = join(root, 'migrate-consolidate.js');
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -65,11 +66,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const version = runNode(cliPath, ['version', '--json'], { env });
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(parseStdout(version).version, '0.3.0');
+  assert.equal(parseStdout(version).version, '0.4.0');
 
   const launcherVersion = runNode(binPath, ['--json', 'version'], { env });
   assert.equal(launcherVersion.status, 0, launcherVersion.stderr);
-  assert.equal(parseStdout(launcherVersion).version, '0.3.0');
+  assert.equal(parseStdout(launcherVersion).version, '0.4.0');
 
   const schema = runNode(cliPath, ['schema', 'jobs', '--json'], { env });
   assert.equal(schema.status, 0, schema.stderr);
@@ -77,11 +78,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const capabilities = runNode(cliPath, ['capabilities', '--json'], { env });
   assert.equal(capabilities.status, 0, capabilities.stderr);
-  assert.equal(parseStdout(capabilities).schema_version, 27);
+  assert.equal(parseStdout(capabilities).schema_version, 28);
 
   const launcherCapabilities = runNode(binPath, ['--json', 'capabilities'], { env });
   assert.equal(launcherCapabilities.status, 0, launcherCapabilities.stderr);
-  assert.equal(parseStdout(launcherCapabilities).schema_version, 27);
+  assert.equal(parseStdout(launcherCapabilities).schema_version, 28);
 
   const specPath = join(dir, 'job.json');
   writeFileSync(specPath, JSON.stringify(validShellJob()));
@@ -147,7 +148,7 @@ test('jobs add and update accept file and stdin JSON payloads', t => {
   assert.equal(parseStdout(updated).job.name, 'Updated through stdin');
 });
 
-test('doctor reports schema v27 and lease, queue, outbox, and approval diagnostics', t => {
+test('doctor reports schema v28 and lease, queue, outbox, and approval diagnostics', t => {
   const dir = tempRoot(t, 'scheduler-doctor-');
   const result = runNode(cliPath, ['doctor', '--json'], {
     env: { SCHEDULER_DB: join(dir, 'scheduler.db') },
@@ -155,14 +156,540 @@ test('doctor reports schema v27 and lease, queue, outbox, and approval diagnosti
   assert.equal(result.status, 0, result.stderr);
   const payload = parseStdout(result);
   assert.equal(payload.ok, true);
-  assert.equal(payload.database.schema_version, 27);
-  assert.equal(payload.database.latest_schema_version, 27);
+  assert.equal(payload.database.schema_version, 28);
+  assert.equal(payload.database.latest_schema_version, 28);
   assert.ok('dispatcher_lease' in payload.diagnostics);
   assert.ok('dispatch_queue' in payload.diagnostics);
   assert.ok('delivery_outbox' in payload.diagnostics);
   assert.ok('approvals' in payload.diagnostics);
+  assert.equal(payload.diagnostics.evidence_records.checked, 0);
+  assert.equal(payload.diagnostics.evidence_records.verification_complete, true);
   assert.deepEqual(payload.database.integrity_check, ['ok']);
   assert.equal(payload.database.foreign_key_violations, 0);
+});
+
+test('doctor bounds evidence verification by default and supports an explicit deep pass', t => {
+  const dir = tempRoot(t, 'scheduler-doctor-evidence-sampling-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    const samplePlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT run_id FROM evidence_records
+      ORDER BY created_at DESC, run_id DESC LIMIT 500
+    `).all();
+    assert(
+      samplePlan.some(row => /idx_evidence_records_created_run/.test(row.detail)),
+      `doctor evidence sample is not index-backed: ${JSON.stringify(samplePlan)}`,
+    );
+    const insert = db.prepare(`
+      INSERT INTO evidence_records (id, run_id, job_id, algorithm, hash, payload)
+      VALUES (?, ?, 'sampling-job', 'sha256', 'sha256:invalid', 'null')
+    `);
+    db.transaction(() => {
+      for (let index = 0; index < 501; index++) {
+        insert.run(`sampling-evidence-${index}`, `sampling-run-${index}`);
+      }
+    })();
+  } finally {
+    db.close();
+  }
+
+  const sampled = runNode(cliPath, ['doctor', '--json'], { env });
+  assert.notEqual(sampled.status, 0);
+  const sampledPayload = parseStdout(sampled);
+  assert.equal(sampledPayload.diagnostics.evidence_records.total, 501);
+  assert.equal(sampledPayload.diagnostics.evidence_records.checked, 500);
+  assert.equal(sampledPayload.diagnostics.evidence_records.unchecked, 1);
+  assert.equal(sampledPayload.diagnostics.evidence_records.verification_complete, false);
+  assert(sampledPayload.warnings.some(warning => /doctor --deep/.test(warning)));
+
+  const deep = runNode(cliPath, ['doctor', '--deep', '--json'], { env });
+  assert.notEqual(deep.status, 0);
+  const deepPayload = parseStdout(deep);
+  assert.equal(deepPayload.diagnostics.evidence_records.checked, 501);
+  assert.equal(deepPayload.diagnostics.evidence_records.unchecked, 0);
+  assert.equal(deepPayload.diagnostics.evidence_records.verification_complete, true);
+});
+
+test('current databases remain readable while another process holds the write lock', t => {
+  const dir = tempRoot(t, 'scheduler-current-read-lock-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+
+  const writer = new Database(dbPath);
+  try {
+    writer.pragma('journal_mode = WAL');
+    writer.exec('BEGIN IMMEDIATE');
+    const status = runNode(cliPath, ['status', '--json'], { env });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(parseStdout(status).db_init_ok, true);
+  } finally {
+    if (writer.inTransaction) writer.exec('ROLLBACK');
+    writer.close();
+  }
+});
+
+test('schema v28 consolidation repairs missing required indexes before taking the no-op path', t => {
+  const dir = tempRoot(t, 'scheduler-index-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const initialized = runNode(cliPath, ['doctor', '--json'], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 28);
+    db.exec('DROP INDEX idx_delivery_outbox_group_part');
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
+      0,
+    );
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
+
+  const noOp = runNode(consolidatePath, [], { env });
+  assert.equal(noOp.status, 0, noOp.stderr);
+  assert.match(noOp.stdout, /DB already at v28/);
+});
+
+test('schema v28 consolidation repairs malformed correctness-critical unique indexes', t => {
+  const dir = tempRoot(t, 'scheduler-index-definition-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      DROP INDEX idx_delivery_outbox_group_part;
+      CREATE INDEX idx_delivery_outbox_group_part
+      ON delivery_outbox(delivery_group_id);
+    `);
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+  const repairedDb = new Database(dbPath);
+  try {
+    const listed = repairedDb.prepare('PRAGMA index_list(delivery_outbox)').all()
+      .find(index => index.name === 'idx_delivery_outbox_group_part');
+    assert.equal(listed.unique, 1);
+    assert.deepEqual(
+      repairedDb.prepare('PRAGMA index_info(idx_delivery_outbox_group_part)').all()
+        .sort((left, right) => left.seqno - right.seqno)
+        .map(column => column.name),
+      ['delivery_group_id', 'part_index'],
+    );
+    repairedDb.prepare(`
+      INSERT INTO delivery_outbox (
+        id, channel, target, body, delivery_group_id, part_index
+      ) VALUES (?, 'test', 'target', 'body', 'group-one', 1)
+    `).run('unique-part-one');
+    assert.throws(
+      () => repairedDb.prepare(`
+        INSERT INTO delivery_outbox (
+          id, channel, target, body, delivery_group_id, part_index
+        ) VALUES (?, 'test', 'target', 'body', 'group-one', 1)
+      `).run('unique-part-two'),
+      /UNIQUE constraint failed/,
+    );
+  } finally {
+    repairedDb.close();
+  }
+});
+
+test('older runtime refuses a database with a newer schema version', t => {
+  const dir = tempRoot(t, 'scheduler-newer-schema-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.prepare('INSERT INTO schema_migrations (version) VALUES (29)').run();
+  } finally {
+    db.close();
+  }
+
+  const rejected = runNode(cliPath, ['status', '--json'], { env });
+  assert.notEqual(rejected.status, 0);
+  const payload = parseStdout(rejected);
+  assert.equal(payload.code, 'DB_INIT_FAILED');
+  assert.equal(payload.details.phase, 'consolidation migration');
+  assert.match(payload.error, /newer than supported version 28/);
+  const untouched = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(untouched.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 29);
+  } finally {
+    untouched.close();
+  }
+});
+
+test('schema consolidation repairs complete baseline objects before its no-op path', t => {
+  const dir = tempRoot(t, 'scheduler-schema-apply-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.exec('DROP TABLE delivery_aliases');
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'delivery_aliases'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
+  const noOp = runNode(consolidatePath, [], { env });
+  assert.equal(noOp.status, 0, noOp.stderr);
+  assert.match(noOp.stdout, /DB already at v28/);
+});
+
+test('schema v28 consolidation strengthens queue binding nullability without losing references', t => {
+  const dir = tempRoot(t, 'scheduler-queue-binding-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.prepare(`
+      INSERT INTO jobs (
+        id, name, schedule_cron, session_target, payload_kind,
+        payload_message, run_timeout_ms, delivery_mode, origin
+      ) VALUES ('queue-repair-job', 'Queue repair', '0 * * * *', 'shell',
+        'shellCommand', 'true', 5000, 'none', 'system')
+    `).run();
+    db.prepare(`
+      INSERT INTO job_dispatch_queue (
+        id, job_id, dispatch_kind, status, scheduled_for, binding_scheduled_for
+      ) VALUES ('queue-repair-dispatch', 'queue-repair-job', 'manual', 'awaiting_approval',
+        '2026-07-13 04:00:00', '2026-07-13 04:00:00')
+    `).run();
+    db.prepare(`
+      INSERT INTO runs (id, job_id, status, dispatch_queue_id)
+      VALUES ('queue-repair-run', 'queue-repair-job', 'awaiting_approval', 'queue-repair-dispatch')
+    `).run();
+    db.prepare(`
+      INSERT INTO approvals (
+        id, job_id, run_id, dispatch_queue_id, status, binding_hash
+      ) VALUES ('queue-repair-approval', 'queue-repair-job', 'queue-repair-run',
+        'queue-repair-dispatch', 'pending', 'sha256:test')
+    `).run();
+
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE job_dispatch_queue_nullable (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        dispatch_kind TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        scheduled_for TEXT NOT NULL,
+        binding_scheduled_for TEXT,
+        source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        claimed_at TEXT,
+        processed_at TEXT,
+        claim_owner TEXT,
+        claim_token TEXT,
+        claim_expires_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+      );
+      INSERT INTO job_dispatch_queue_nullable SELECT * FROM job_dispatch_queue;
+      UPDATE job_dispatch_queue_nullable SET binding_scheduled_for = NULL;
+      DROP TABLE job_dispatch_queue;
+      ALTER TABLE job_dispatch_queue_nullable RENAME TO job_dispatch_queue;
+    `);
+    db.pragma('foreign_keys = ON');
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    const bindingColumn = repairedDb.prepare('PRAGMA table_info(job_dispatch_queue)').all()
+      .find(column => column.name === 'binding_scheduled_for');
+    assert.equal(bindingColumn.notnull, 1);
+    assert.equal(
+      repairedDb.prepare("SELECT binding_scheduled_for FROM job_dispatch_queue WHERE id = 'queue-repair-dispatch'").get().binding_scheduled_for,
+      '2026-07-13 04:00:00',
+    );
+    assert.equal(
+      repairedDb.prepare("SELECT dispatch_queue_id FROM runs WHERE id = 'queue-repair-run'").get().dispatch_queue_id,
+      'queue-repair-dispatch',
+    );
+    assert.equal(
+      repairedDb.prepare("SELECT dispatch_queue_id FROM approvals WHERE id = 'queue-repair-approval'").get().dispatch_queue_id,
+      'queue-repair-dispatch',
+    );
+    assert.deepEqual(repairedDb.pragma('foreign_key_check'), []);
+  } finally {
+    repairedDb.close();
+  }
+});
+
+test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
+  const dir = tempRoot(t, 'scheduler-schema-v27-upgrade-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      DROP INDEX idx_delivery_outbox_group_part;
+      DROP INDEX idx_delivery_outbox_group_status;
+      DROP INDEX idx_delivery_outbox_completion;
+      DROP INDEX idx_evidence_records_created_run;
+      DROP INDEX idx_evidence_records_job;
+      DROP INDEX idx_evidence_records_hash;
+      DROP TABLE evidence_records;
+      DROP INDEX idx_completion_debts_task;
+      DROP INDEX idx_completion_debts_scope;
+      DROP TABLE completion_debts;
+      CREATE TABLE completion_debts (
+        task_label TEXT PRIMARY KEY,
+        session_key TEXT,
+        source TEXT NOT NULL DEFAULT 'dispatch',
+        status TEXT NOT NULL DEFAULT 'tracking',
+        open_reason TEXT,
+        close_reason TEXT,
+        opened_at TEXT,
+        closed_at TEXT,
+        last_checkin_at TEXT,
+        last_progress_at TEXT,
+        last_visible_update_at TEXT,
+        final_reported_at TEXT,
+        last_reminder_at TEXT,
+        reminder_count INTEGER NOT NULL DEFAULT 0,
+        awaiting_user INTEGER NOT NULL DEFAULT 0,
+        no_reply INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX idx_completion_debts_status ON completion_debts(status, updated_at);
+      CREATE INDEX idx_completion_debts_session ON completion_debts(session_key) WHERE session_key IS NOT NULL;
+      ALTER TABLE jobs DROP COLUMN approval_risk_level;
+      ALTER TABLE jobs DROP COLUMN approval_approver_scope;
+      ALTER TABLE jobs DROP COLUMN output_format;
+      ALTER TABLE jobs DROP COLUMN verify_shell;
+      ALTER TABLE jobs DROP COLUMN verify_timeout_s;
+      ALTER TABLE jobs DROP COLUMN verify_on_failure;
+      ALTER TABLE runs DROP COLUMN evidence_required;
+      ALTER TABLE runs DROP COLUMN evidence_execution_snapshot;
+      ALTER TABLE runs DROP COLUMN evidence_declaration_snapshot;
+      ALTER TABLE runs DROP COLUMN evidence_ref_snapshot;
+      ALTER TABLE runs DROP COLUMN delegation_validation;
+      ALTER TABLE runs DROP COLUMN approval_used;
+      ALTER TABLE runs DROP COLUMN output_format;
+      ALTER TABLE runs DROP COLUMN structured_output;
+      ALTER TABLE runs DROP COLUMN structured_output_valid;
+      ALTER TABLE runs DROP COLUMN structured_output_warning;
+      ALTER TABLE runs DROP COLUMN structured_output_bytes;
+      ALTER TABLE runs DROP COLUMN structured_output_sha256;
+      ALTER TABLE runs DROP COLUMN structured_output_path;
+      ALTER TABLE runs DROP COLUMN verification_result;
+      ALTER TABLE approvals DROP COLUMN risk_level;
+      ALTER TABLE approvals DROP COLUMN approver_scope;
+      ALTER TABLE approvals DROP COLUMN binding_hash;
+      ALTER TABLE approvals DROP COLUMN gate_kind;
+      ALTER TABLE approvals DROP COLUMN decision_context;
+      ALTER TABLE job_dispatch_queue DROP COLUMN binding_scheduled_for;
+      ALTER TABLE delivery_outbox DROP COLUMN delivery_group_id;
+      ALTER TABLE delivery_outbox DROP COLUMN part_index;
+      ALTER TABLE delivery_outbox DROP COLUMN part_count;
+      ALTER TABLE delivery_outbox DROP COLUMN completion_label;
+      ALTER TABLE delivery_outbox DROP COLUMN completion_scope;
+      DELETE FROM schema_migrations WHERE version = 28;
+    `);
+  } finally {
+    db.close();
+  }
+
+  const upgraded = runNode(cliPath, ['doctor', '--deep', '--json'], { env });
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.equal(parseStdout(upgraded).database.schema_version, 28);
+  const upgradedDb = new Database(dbPath, { readonly: true });
+  try {
+    const expectedColumns = {
+      jobs: [
+        'approval_risk_level', 'approval_approver_scope', 'output_format',
+        'verify_shell', 'verify_timeout_s', 'verify_on_failure',
+      ],
+      runs: [
+        'evidence_required', 'evidence_execution_snapshot',
+        'evidence_declaration_snapshot', 'evidence_ref_snapshot',
+        'delegation_validation', 'approval_used', 'output_format',
+        'structured_output', 'structured_output_valid',
+        'structured_output_warning', 'structured_output_bytes',
+        'structured_output_sha256', 'structured_output_path',
+        'verification_result',
+      ],
+      approvals: [
+        'risk_level', 'approver_scope', 'binding_hash', 'gate_kind',
+        'decision_context',
+      ],
+      job_dispatch_queue: ['binding_scheduled_for'],
+      delivery_outbox: [
+        'delivery_group_id', 'part_index', 'part_count',
+        'completion_label', 'completion_scope',
+      ],
+    };
+    for (const [table, columns] of Object.entries(expectedColumns)) {
+      const actual = new Map(
+        upgradedDb.prepare(`PRAGMA table_info(${table})`).all()
+          .map(column => [column.name, column]),
+      );
+      for (const column of columns) assert(actual.has(column), `${table}.${column} was not upgraded`);
+    }
+    const queueBinding = upgradedDb.prepare('PRAGMA table_info(job_dispatch_queue)').all()
+      .find(column => column.name === 'binding_scheduled_for');
+    assert.equal(queueBinding.notnull, 1);
+    for (const objectName of [
+      'evidence_records', 'idx_evidence_records_created_run',
+      'idx_delivery_outbox_group_part', 'idx_delivery_outbox_group_status',
+      'idx_delivery_outbox_completion', 'idx_completion_debts_task',
+      'idx_completion_debts_scope',
+    ]) {
+      assert.equal(
+        upgradedDb.prepare('SELECT COUNT(*) AS count FROM sqlite_master WHERE name = ?').get(objectName).count,
+        1,
+        `${objectName} was not upgraded`,
+      );
+    }
+  } finally {
+    upgradedDb.close();
+  }
+});
+
+test('schema v28 consolidation removes redundant completion-debt uniqueness', t => {
+  const dir = tempRoot(t, 'scheduler-completion-unique-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      DROP INDEX idx_completion_debts_scope;
+      ALTER TABLE completion_debts RENAME TO completion_debts_source;
+      CREATE TABLE completion_debts (
+        id TEXT PRIMARY KEY,
+        task_label TEXT NOT NULL,
+        delivery_scope TEXT NOT NULL,
+        session_key TEXT,
+        source TEXT NOT NULL DEFAULT 'dispatch',
+        status TEXT NOT NULL DEFAULT 'tracking',
+        open_reason TEXT,
+        close_reason TEXT,
+        opened_at TEXT,
+        closed_at TEXT,
+        last_checkin_at TEXT,
+        last_progress_at TEXT,
+        last_visible_update_at TEXT,
+        final_reported_at TEXT,
+        last_reminder_at TEXT,
+        reminder_count INTEGER NOT NULL DEFAULT 0,
+        awaiting_user INTEGER NOT NULL DEFAULT 0,
+        no_reply INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(task_label, delivery_scope)
+      );
+      INSERT INTO completion_debts SELECT * FROM completion_debts_source;
+      DROP TABLE completion_debts_source;
+      CREATE UNIQUE INDEX idx_completion_debts_scope
+      ON completion_debts(task_label, delivery_scope);
+    `);
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    const tableSql = repairedDb.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'completion_debts'",
+    ).get().sql;
+    assert.doesNotMatch(tableSql, /UNIQUE\s*\(\s*task_label\s*,\s*delivery_scope\s*\)/i);
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_completion_debts_scope'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
+});
+
+test('schema v28 consolidation recreates a completely missing approvals table', t => {
+  const dir = tempRoot(t, 'scheduler-approvals-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const initialized = runNode(cliPath, ['doctor', '--json'], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.exec('DROP TABLE approvals');
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+
+  const repairedDb = new Database(dbPath, { readonly: true });
+  try {
+    const columns = new Set(repairedDb.prepare('PRAGMA table_info(approvals)').all().map(column => column.name));
+    for (const column of [
+      'dispatch_queue_id', 'decision_version', 'risk_level', 'approver_scope',
+      'binding_hash', 'gate_kind', 'decision_context',
+    ]) {
+      assert(columns.has(column), `recreated approvals table missing ${column}`);
+    }
+    assert.equal(
+      repairedDb.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_approvals_dispatch_queue'").get().count,
+      1,
+    );
+  } finally {
+    repairedDb.close();
+  }
 });
 
 test('doctor fails closed on foreign-key corruption', t => {

@@ -1,0 +1,514 @@
+import { after, before, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import {
+  mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const ENV_INJECT_CAPABILITY = 'chat-completions-env-inject-v1';
+
+let mode = 'capable';
+let server;
+let gatewayUrl;
+let gateway;
+let executeAgent;
+let originalGatewayUrl;
+let originalGatewayToken;
+let originalGatewayTokenPath;
+let originalNodeEnv;
+let calls = [];
+
+function sendJson(response, status, payload, headers = {}) {
+  response.writeHead(status, {
+    'Content-Type': 'application/json',
+    ...headers,
+  });
+  response.end(JSON.stringify(payload));
+}
+
+async function readRequestBody(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function handleInfo(_request, response) {
+  if (mode === 'legacy') {
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end('<!doctype html><title>OpenClaw</title>');
+    return;
+  }
+  if (mode === 'health-capable') {
+    response.writeHead(404, { 'Content-Type': 'text/plain' });
+    response.end('not found');
+    return;
+  }
+  if (mode === 'malformed') {
+    sendJson(response, 200, { version: 42, capabilities: 'not-an-array' });
+    return;
+  }
+  if (mode === 'unsupported') {
+    sendJson(response, 200, {
+      version: '2026.7.10',
+      protocol: 4,
+      capabilities: ['chat-send-routing-contract'],
+    });
+    return;
+  }
+  sendJson(response, 200, {
+    version: '2026.7.11',
+    protocol: 4,
+    capabilities: [ENV_INJECT_CAPABILITY, 'chat-send-routing-contract'],
+  });
+}
+
+function handleHealth(_request, response) {
+  if (mode === 'health-capable') {
+    sendJson(response, 200, {
+      server: { version: '2026.7.11-health' },
+      protocol: 4,
+      features: { capabilities: [ENV_INJECT_CAPABILITY] },
+    });
+    return;
+  }
+  response.writeHead(200, { 'Content-Type': 'text/plain' });
+  response.end('OK');
+}
+
+before(async () => {
+  originalGatewayUrl = process.env.OPENCLAW_GATEWAY_URL;
+  originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  originalGatewayTokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+  originalNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'test';
+
+  server = createServer(async (request, response) => {
+    const body = await readRequestBody(request);
+    calls.push({
+      method: request.method,
+      path: request.url,
+      headers: request.headers,
+      body,
+    });
+
+    if (request.method === 'GET' && request.url === '/v1/info') {
+      handleInfo(request, response);
+      return;
+    }
+    if (request.method === 'GET' && request.url === '/health') {
+      handleHealth(request, response);
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/v1/chat/completions') {
+      sendJson(
+        response,
+        200,
+        {
+          choices: [{ message: { content: 'stub gateway response' } }],
+          usage: { total_tokens: 2 },
+        },
+        { 'x-openclaw-session-key': 'agent:main:stub-session' },
+      );
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  gatewayUrl = `http://127.0.0.1:${address.port}`;
+  process.env.OPENCLAW_GATEWAY_URL = gatewayUrl;
+  process.env.OPENCLAW_GATEWAY_TOKEN = 'stub-gateway-token';
+  gateway = await import(`../gateway.js?v04-gateway=${Date.now()}`);
+  ({ executeAgent } = await import('../dispatcher-strategies.js'));
+});
+
+after(async () => {
+  gateway?.clearGatewayCapabilityCache();
+  await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  if (originalGatewayUrl === undefined) delete process.env.OPENCLAW_GATEWAY_URL;
+  else process.env.OPENCLAW_GATEWAY_URL = originalGatewayUrl;
+  if (originalGatewayToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+  else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
+  if (originalGatewayTokenPath === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+  else process.env.OPENCLAW_GATEWAY_TOKEN_PATH = originalGatewayTokenPath;
+  if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = originalNodeEnv;
+});
+
+test('Gateway token-file rotation is observed without restarting the dispatcher', async () => {
+  const tokenDir = mkdtempSync(join(tmpdir(), 'scheduler-gateway-token-'));
+  const tokenPath = join(tokenDir, 'gateway-token');
+  const previousToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  const previousTokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+  try {
+    delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    process.env.OPENCLAW_GATEWAY_TOKEN_PATH = tokenPath;
+    writeFileSync(tokenPath, 'rotating-token-one\n');
+    calls = [];
+    await gateway.checkGatewayHealth();
+    writeFileSync(tokenPath, 'rotating-token-two\n');
+    await gateway.checkGatewayHealth();
+    const healthCalls = calls.filter(call => call.path === '/health');
+    assert.equal(healthCalls[0].headers.authorization, 'Bearer rotating-token-one');
+    assert.equal(healthCalls[1].headers.authorization, 'Bearer rotating-token-two');
+  } finally {
+    if (previousToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = previousToken;
+    if (previousTokenPath === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+    else process.env.OPENCLAW_GATEWAY_TOKEN_PATH = previousTokenPath;
+    rmSync(tokenDir, { recursive: true, force: true });
+  }
+});
+
+test('Gateway token paths reject files and symlink targets outside credential roots', () => {
+  const tokenDir = mkdtempSync(join(tmpdir(), 'scheduler-gateway-token-path-'));
+  const allowedPath = join(tokenDir, 'gateway-token');
+  const escapedPath = join(tokenDir, 'escaped-token');
+  try {
+    writeFileSync(allowedPath, 'allowed-token\n');
+    symlinkSync('/etc/passwd', escapedPath);
+    assert.equal(gateway.resolveGatewayTokenPath(allowedPath), realpathSync(allowedPath));
+    assert.equal(gateway.resolveGatewayTokenPath('/etc/passwd'), null);
+    assert.equal(gateway.resolveGatewayTokenPath(escapedPath), null);
+  } finally {
+    rmSync(tokenDir, { recursive: true, force: true });
+  }
+});
+
+test('Gateway token paths reject a symlinked user credential root', () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), 'scheduler-gateway-home-'));
+  const outsideRoot = mkdtempSync(join(tmpdir(), 'scheduler-gateway-outside-'));
+  const tokenPath = join(outsideRoot, 'gateway-token');
+  const previousHome = process.env.HOME;
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    mkdirSync(join(fakeHome, '.openclaw'));
+    symlinkSync(outsideRoot, join(fakeHome, '.openclaw', 'credentials'));
+    writeFileSync(tokenPath, 'outside-token\n');
+    process.env.HOME = fakeHome;
+    process.env.NODE_ENV = 'production';
+    assert.equal(gateway.resolveGatewayTokenPath(tokenPath), null);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+function reset(nextMode) {
+  mode = nextMode;
+  calls = [];
+  gateway.clearGatewayCapabilityCache(gatewayUrl);
+}
+
+function callsFor(path) {
+  return calls.filter(call => call.path === path);
+}
+
+function makeAgentStrategyDeps(runIsolatedAgentTurn) {
+  return {
+    waitForGateway: async () => true,
+    updateRunSession: () => {},
+    setAgentStatus: () => {},
+    buildJobPrompt: () => ({ prompt: 'perform governed work', contextMeta: {} }),
+    updateContextSummary: () => {},
+    matchesSentinel: () => false,
+    detectTransientError: () => false,
+    sqliteNow: () => 'next-dispatch',
+    log: () => {},
+    syncAuthStoreToSession: () => {
+      throw new Error('agent strategy must not copy Gateway credential stores');
+    },
+    applySessionOverridesToSessionStore: () => ({ ok: true }),
+    runIsolatedAgentTurn,
+  };
+}
+
+test('Gateway owns auth synchronization without scheduler credential-file copies', () => {
+  assert.deepEqual(gateway.syncAuthStoreToSession('main'), {
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  });
+  assert.deepEqual(gateway.syncAuthStoreToSession('secondary'), {
+    ok: true,
+    skipped: true,
+    reason: 'gateway-managed-auth',
+  });
+  assert.deepEqual(gateway.syncAuthStoreToSession(''), {
+    ok: false,
+    error: 'agentId must be a non-empty string',
+  });
+});
+
+async function assertRejectsWithCode(promise, code) {
+  let rejected;
+  await assert.rejects(promise, err => {
+    rejected = err;
+    return err instanceof gateway.GatewayCompatibilityError && err.code === code;
+  });
+  return rejected;
+}
+
+test('capable Gateway receives validated credentials and revalidates before each credential-bearing request', async () => {
+  reset('capable');
+  assert.equal(gateway.GATEWAY_ENV_INJECT_CAPABILITY, ENV_INJECT_CAPABILITY);
+
+  const first = await gateway.runAgentTurn({
+    message: 'use the scoped credential',
+    agentId: 'main',
+    sessionKey: 'agent:main:stub-one',
+    authProfile: 'provider:production',
+    materializedEnv: { STRIPE_API_KEY: 'secret-one' },
+    timeoutMs: 2_000,
+  });
+  assert.equal(first.content, 'stub gateway response');
+  const discovered = await gateway.discoverGatewayCapabilities({ gatewayUrl });
+  assert.deepEqual(discovered, {
+    version: '2026.7.11',
+    protocol: 4,
+    capabilities: [ENV_INJECT_CAPABILITY, 'chat-send-routing-contract'],
+    source: '/v1/info',
+    legacy: false,
+  });
+
+  await gateway.runAgentTurnWithActivityTimeout({
+    message: 'reuse discovery cache',
+    agentId: 'main',
+    sessionKey: 'agent:main:stub-two',
+    authProfile: 'provider:production',
+    materializedEnv: { STRIPE_API_KEY: 'secret-two' },
+    pollIntervalMs: 60_000,
+    idleTimeoutMs: 60_000,
+    absoluteTimeoutMs: 2_000,
+  });
+
+  assert.equal(callsFor('/v1/info').length, 2);
+  assert.equal(callsFor('/health').length, 0);
+  assert.equal(callsFor('/v1/chat/completions').length, 2);
+  const chatCalls = callsFor('/v1/chat/completions');
+  for (const [index, call] of chatCalls.entries()) {
+    assert.equal(call.headers.authorization, 'Bearer stub-gateway-token');
+    assert.equal(call.headers['x-openclaw-auth-profile'], 'provider:production');
+    assert.deepEqual(JSON.parse(call.headers['x-openclaw-env-inject']), {
+      STRIPE_API_KEY: index === 0 ? 'secret-one' : 'secret-two',
+    });
+  }
+});
+
+test('structured health metadata is accepted as an authoritative compatibility fallback', async () => {
+  reset('health-capable');
+  await gateway.runAgentTurn({
+    message: 'health capability fallback',
+    materializedEnv: { SCOPED_TOKEN: 'health-secret' },
+    timeoutMs: 2_000,
+  });
+  assert.equal(callsFor('/v1/info').length, 1);
+  assert.equal(callsFor('/health').length, 1);
+  assert.equal(callsFor('/v1/chat/completions').length, 1);
+});
+
+test('legacy Gateway does not treat unauthenticated WebSocket metadata as a capability contract', async () => {
+  reset('legacy');
+  const discovered = await gateway.discoverGatewayCapabilities({
+    gatewayUrl,
+    forceRefresh: true,
+    requestHeaders: { Authorization: 'Bearer stub-gateway-token' },
+    webSocketFactory: class FabricatedCapabilitySocket {
+      constructor() {
+        throw new Error('must not be used');
+      }
+    },
+  });
+
+  assert.deepEqual(discovered, {
+    version: null,
+    protocol: null,
+    capabilities: [],
+    source: '/health',
+    legacy: true,
+  });
+});
+
+test('a Gateway restart or downgrade invalidates a previously positive capability result', async () => {
+  reset('capable');
+  await gateway.runAgentTurn({
+    message: 'first credential-bearing request',
+    materializedEnv: { PRIVATE_TOKEN: 'first' },
+    timeoutMs: 2_000,
+  });
+  assert.equal(callsFor('/v1/chat/completions').length, 1);
+
+  mode = 'unsupported';
+  const error = await assertRejectsWithCode(
+    gateway.runAgentTurn({
+      message: 'must revalidate after receiver downgrade',
+      materializedEnv: { PRIVATE_TOKEN: 'second' },
+      timeoutMs: 2_000,
+    }),
+    'GATEWAY_ENV_INJECT_UNSUPPORTED',
+  );
+  assert.equal(error.gatewayVersion, '2026.7.10');
+  assert.equal(callsFor('/v1/info').length, 2);
+  assert.equal(callsFor('/v1/chat/completions').length, 1);
+});
+
+test('legacy Gateway keeps auth_profile compatibility when no env injection is requested', async () => {
+  reset('legacy');
+  await gateway.runAgentTurn({
+    message: 'profile-only dispatch',
+    authProfile: 'provider:legacy-compatible',
+    timeoutMs: 2_000,
+  });
+
+  assert.equal(callsFor('/v1/info').length, 0);
+  assert.equal(callsFor('/health').length, 0);
+  const [chatCall] = callsFor('/v1/chat/completions');
+  assert.ok(chatCall);
+  assert.equal(chatCall.headers['x-openclaw-auth-profile'], 'provider:legacy-compatible');
+  assert.equal(chatCall.headers['x-openclaw-env-inject'], undefined);
+});
+
+test('legacy Gateway fails closed when materialized credentials require injection', async () => {
+  reset('legacy');
+  const error = await assertRejectsWithCode(
+    gateway.runAgentTurn({
+      message: 'must not run without credentials',
+      materializedEnv: { PRIVATE_TOKEN: 'must-not-leak' },
+      timeoutMs: 2_000,
+    }),
+    'GATEWAY_ENV_INJECT_UNSUPPORTED',
+  );
+
+  assert.equal(error.legacyGateway, true);
+  assert.equal(error.requiredCapability, ENV_INJECT_CAPABILITY);
+  assert.doesNotMatch(error.message, /must-not-leak/);
+  assert.equal(callsFor('/v1/info').length, 1);
+  assert.equal(callsFor('/health').length, 1);
+  assert.equal(callsFor('/v1/chat/completions').length, 0);
+});
+
+test('explicitly unsupported Gateway fails closed with version diagnostics', async () => {
+  reset('unsupported');
+  const error = await assertRejectsWithCode(
+    gateway.runIsolatedAgentTurn({
+      message: 'requires receiver support',
+      materializedEnv: { PRIVATE_TOKEN: 'scoped' },
+      pollIntervalMs: 60_000,
+      idleTimeoutMs: 60_000,
+      absoluteTimeoutMs: 2_000,
+    }),
+    'GATEWAY_ENV_INJECT_UNSUPPORTED',
+  );
+
+  assert.equal(error.gatewayVersion, '2026.7.10');
+  assert.deepEqual(error.gatewayCapabilities, ['chat-send-routing-contract']);
+  assert.equal(callsFor('/health').length, 0);
+  assert.equal(callsFor('/v1/chat/completions').length, 0);
+});
+
+test('malformed capability metadata is rejected before credential-bearing dispatch', async () => {
+  reset('malformed');
+  const error = await assertRejectsWithCode(
+    gateway.runAgentTurn({
+      message: 'reject malformed metadata',
+      materializedEnv: { PRIVATE_TOKEN: 'scoped' },
+      timeoutMs: 2_000,
+    }),
+    'GATEWAY_CAPABILITY_DISCOVERY_INVALID',
+  );
+
+  assert.equal(error.source, '/v1/info');
+  assert.equal(callsFor('/v1/chat/completions').length, 0);
+});
+
+test('invalid env maps throw instead of silently dropping requested credentials', async () => {
+  reset('capable');
+  const invalidInputs = [
+    ['array', ['secret']],
+    ['non-string value', { TOKEN: 123 }],
+    ['unsafe key', { 'TOKEN-NAME': 'secret' }],
+    ['NUL value', { TOKEN: 'before\0after' }],
+    ['Node preload', { NODE_OPTIONS: '--require=/tmp/inject.js' }],
+    ['Gateway control secret', { OPENCLAW_GATEWAY_TOKEN: 'replace-master-token' }],
+    ['runtime path override', { PATH: '/tmp/attacker-bin' }],
+  ];
+
+  for (const [label, materializedEnv] of invalidInputs) {
+    const error = await assertRejectsWithCode(
+      gateway.runAgentTurn({ message: label, materializedEnv, timeoutMs: 2_000 }),
+      'GATEWAY_ENV_INJECT_INVALID',
+    );
+    assert.match(error.message, /Invalid materialized environment/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('oversized env headers are rejected locally before discovery or dispatch', async () => {
+  reset('capable');
+  const error = await assertRejectsWithCode(
+    gateway.runAgentTurn({
+      message: 'reject oversized env',
+      materializedEnv: {
+        TOKEN_ONE: 'a'.repeat(4_000),
+        TOKEN_TWO: 'b'.repeat(4_000),
+      },
+      timeoutMs: 2_000,
+    }),
+    'GATEWAY_ENV_INJECT_TOO_LARGE',
+  );
+
+  assert.ok(error.headerBytes > gateway.MAX_GATEWAY_ENV_INJECT_HEADER_BYTES);
+  assert.equal(calls.length, 0);
+});
+
+test('agent strategy forwards materialized env and does not selection-retry compatibility failures', async () => {
+  const materializedEnv = { SCOPED_TOKEN: 'strategy-secret' };
+  const forwarded = [];
+  const job = {
+    id: 'gateway-v04-strategy',
+    name: 'Gateway v0.4 Strategy',
+    agent_id: 'main',
+    auth_profile: 'provider:primary',
+    auth_profile_fallback: 'provider:fallback',
+    payload_timeout_seconds: 120,
+    run_timeout_ms: 2_000,
+    delivery_mode: 'none',
+  };
+  const ctx = {
+    run: { id: 'gateway-v04-run' },
+    materializedEnv,
+    v02Outcomes: {},
+  };
+
+  const result = await executeAgent(job, { ...ctx }, makeAgentStrategyDeps(async opts => {
+    forwarded.push(opts);
+    return { content: 'credential-aware result', usage: { total_tokens: 1 } };
+  }));
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(forwarded[0].materializedEnv, materializedEnv);
+
+  let attempts = 0;
+  const compatibilityError = new gateway.GatewayCompatibilityError(
+    'GATEWAY_ENV_INJECT_UNSUPPORTED',
+    'stub Gateway cannot enforce credential injection',
+  );
+  await assert.rejects(
+    executeAgent(job, { ...ctx }, makeAgentStrategyDeps(async () => {
+      attempts++;
+      throw compatibilityError;
+    })),
+    error => error === compatibilityError,
+  );
+  assert.equal(attempts, 1);
+});

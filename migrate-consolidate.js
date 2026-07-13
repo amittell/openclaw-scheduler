@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v27).
+ * Brings any DB from any prior version up to the current schema (v28).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -14,7 +14,7 @@
  */
 
 import { Cron } from 'croner';
-import { getDb } from './db.js';
+import { applyBundledSchema, getDb } from './db.js';
 
 function nextRunFromCron(cronExpr, tz) {
   const cron = new Cron(cronExpr, { timezone: tz || 'UTC' });
@@ -46,8 +46,14 @@ export default function migrateConsolidate() {
   const current = hasTable('schema_migrations')
     ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
     : 0;
+  if (current > 28) {
+    const error = new Error(`Database schema version ${current} is newer than supported version 28`);
+    error.code = 'SCHEMA_VERSION_UNSUPPORTED';
+    throw error;
+  }
   // SQLite PRAGMA does not support bound parameters; table names here are all hardcoded literals.
-  const columnsFor = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  const columnInfoFor = (table) => db.prepare(`PRAGMA table_info(${table})`).all();
+  const columnsFor = (table) => new Set(columnInfoFor(table).map((c) => c.name));
   const hasColumns = (actual, required) => required.every((name) => actual.has(name));
   const jobColumns = columnsFor('jobs');
   const runColumns = columnsFor('runs');
@@ -55,8 +61,19 @@ export default function migrateConsolidate() {
   const msgColumns = columnsFor('messages');
   const approvalColumns = columnsFor('approvals');
   const queueColumns = columnsFor('job_dispatch_queue');
+  const queueBindingIsNotNull = columnInfoFor('job_dispatch_queue')
+    .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
   const trackerColumns = columnsFor('task_tracker');
   const trackerAgentColumns = columnsFor('task_tracker_agents');
+  const completionDebtColumns = columnsFor('completion_debts');
+  const completionDebtSql = hasTable('completion_debts')
+    ? db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'completion_debts'").get()?.sql || ''
+    : '';
+  const completionDebtHasTableUnique = /UNIQUE\s*\(\s*task_label\s*,\s*delivery_scope\s*\)/i.test(completionDebtSql);
+  const outboxColumns = columnsFor('delivery_outbox');
+  const evidenceColumns = columnsFor('evidence_records');
+  const evidenceHasForeignKeys = hasTable('evidence_records')
+    && db.prepare('PRAGMA foreign_key_list(evidence_records)').all().length > 0;
   const hasLatestColumns =
     hasColumns(jobColumns, [
       'job_type', 'execution_intent', 'execution_read_only', 'shell_env_policy',
@@ -80,6 +97,8 @@ export default function migrateConsolidate() {
       'contract_sandbox', 'contract_allowed_paths', 'contract_network',
       'contract_max_cost_usd', 'contract_audit',
       'child_credential_policy',
+      'approval_risk_level', 'approval_approver_scope', 'output_format',
+      'verify_shell', 'verify_timeout_s', 'verify_on_failure',
     ])
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
@@ -88,8 +107,14 @@ export default function migrateConsolidate() {
       'summary', 'error_message', 'session_key', 'session_id',
       'dispatched_at', 'last_heartbeat',
       'identity_resolved', 'trust_evaluation', 'authorization_decision',
-      'authorization_proof_verification', 'evidence_record',
+      'authorization_proof_verification', 'evidence_required',
+      'evidence_execution_snapshot', 'evidence_declaration_snapshot',
+      'evidence_ref_snapshot', 'evidence_record',
       'credential_handoff_summary',
+      'delegation_validation', 'output_format', 'structured_output',
+      'structured_output_valid', 'structured_output_warning',
+      'structured_output_bytes', 'structured_output_sha256',
+      'structured_output_path', 'verification_result', 'approval_used',
       'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at',
       'cancel_requested_at', 'cancel_requested_by', 'cancel_reason',
       'process_pid', 'process_pgid', 'process_identity', 'process_started_at',
@@ -109,11 +134,16 @@ export default function migrateConsolidate() {
       'job_id', 'run_id', 'dispatch_queue_id', 'status', 'requested_at',
       'resolved_at', 'resolved_by', 'notes', 'decision_version',
       'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at',
-      'dispatched_at',
+      'dispatched_at', 'risk_level', 'approver_scope', 'binding_hash',
+      'gate_kind', 'decision_context',
     ])
     && hasColumns(queueColumns, [
       'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count',
-      'last_error', 'replay_of_run_id',
+      'last_error', 'replay_of_run_id', 'binding_scheduled_for',
+    ])
+    && hasColumns(outboxColumns, [
+      'delivery_group_id', 'part_index', 'part_count',
+      'completion_label', 'completion_scope',
     ])
     && hasColumns(trackerColumns, [
       'name', 'created_at', 'created_by', 'expected_agents', 'timeout_s',
@@ -155,17 +185,127 @@ export default function migrateConsolidate() {
           AND (delivery_opt_out_reason IS NULL OR trim(delivery_opt_out_reason) = '')
       `).get()?.cnt ?? 0)
     : 0;
+  const schemaNoOpTables = [
+    'agents', 'approvals', 'completion_debts', 'delivery_aliases',
+    'delivery_attachments', 'delivery_outbox', 'dispatcher_leases',
+    'evidence_records', 'idempotency_ledger', 'job_dispatch_queue', 'jobs',
+    'message_receipts', 'messages', 'runs', 'schema_migrations',
+    'task_tracker', 'task_tracker_agents', 'team_mailbox_events', 'team_tasks',
+  ];
+  const schemaNoOpIndexes = [
+    'idx_approvals_dispatch_queue', 'idx_approvals_job', 'idx_approvals_status',
+    'idx_completion_debts_scope', 'idx_completion_debts_session',
+    'idx_completion_debts_status', 'idx_completion_debts_task',
+    'idx_delivery_attachments_message', 'idx_delivery_outbox_claim_expiry',
+    'idx_delivery_outbox_completion', 'idx_delivery_outbox_due',
+    'idx_delivery_outbox_group_part', 'idx_delivery_outbox_group_status',
+    'idx_delivery_outbox_idempotency', 'idx_dispatch_queue_claim_expiry',
+    'idx_dispatch_queue_due', 'idx_dispatch_queue_job',
+    'idx_dispatch_queue_source_run', 'idx_dispatcher_leases_expiry',
+    'idx_evidence_records_created_run', 'idx_evidence_records_hash',
+    'idx_evidence_records_job', 'idx_idem_expires', 'idx_idem_job',
+    'idx_jobs_next_run', 'idx_jobs_parent', 'idx_messages_ack_pending',
+    'idx_messages_created', 'idx_messages_from', 'idx_messages_idempotency',
+    'idx_messages_pending', 'idx_messages_task', 'idx_messages_team',
+    'idx_messages_to', 'idx_receipts_message', 'idx_runs_cancel_requested',
+    'idx_runs_dispatch_queue', 'idx_runs_dispatcher_owner',
+    'idx_runs_idempotency', 'idx_runs_job_id', 'idx_runs_status',
+    'idx_task_tracker_status', 'idx_team_events_task', 'idx_team_events_team',
+    'idx_team_tasks_gate', 'idx_team_tasks_status', 'idx_tta_session_key',
+    'idx_tta_status', 'idx_tta_tracker',
+  ];
+  const migrationRequiredTables = [
+    'approvals', 'completion_debts', 'delivery_aliases',
+    'delivery_attachments', 'delivery_outbox', 'dispatcher_leases',
+    'evidence_records', 'job_dispatch_queue',
+  ];
+  const migrationRequiredIndexes = [
+    'idx_approvals_dispatch_queue', 'idx_completion_debts_scope',
+    'idx_completion_debts_task', 'idx_delivery_attachments_message',
+    'idx_delivery_outbox_claim_expiry', 'idx_delivery_outbox_completion',
+    'idx_delivery_outbox_due', 'idx_delivery_outbox_group_part',
+    'idx_delivery_outbox_group_status', 'idx_delivery_outbox_idempotency',
+    'idx_dispatch_queue_claim_expiry', 'idx_dispatch_queue_due',
+    'idx_dispatch_queue_job', 'idx_dispatch_queue_source_run',
+    'idx_dispatcher_leases_expiry', 'idx_evidence_records_created_run',
+    'idx_evidence_records_hash', 'idx_evidence_records_job',
+  ];
+  const criticalUniqueIndexes = [
+    {
+      name: 'idx_completion_debts_scope',
+      table: 'completion_debts',
+      columns: ['task_label', 'delivery_scope'],
+      where: null,
+    },
+    {
+      name: 'idx_messages_idempotency',
+      table: 'messages',
+      columns: ['idempotency_key'],
+      where: 'idempotency_key is not null',
+    },
+    {
+      name: 'idx_runs_idempotency',
+      table: 'runs',
+      columns: ['idempotency_key'],
+      where: 'idempotency_key is not null',
+    },
+    {
+      name: 'idx_delivery_outbox_idempotency',
+      table: 'delivery_outbox',
+      columns: ['idempotency_key'],
+      where: 'idempotency_key is not null',
+    },
+    {
+      name: 'idx_delivery_outbox_group_part',
+      table: 'delivery_outbox',
+      columns: ['delivery_group_id', 'part_index'],
+      where: 'delivery_group_id is not null',
+    },
+  ];
+  const normalizeSql = value => String(value || '')
+    .toLowerCase()
+    .replaceAll(/["'`[\]]/g, '')
+    .replaceAll(/\s+/g, ' ')
+    .trim();
+  const criticalIndexMatches = (spec) => {
+    if (!hasIndex(spec.name)) return false;
+    const listed = db.prepare(`PRAGMA index_list(${spec.table})`).all()
+      .find(index => index.name === spec.name);
+    if (!listed || listed.unique !== 1) return false;
+    const columns = db.prepare(`PRAGMA index_info(${spec.name})`).all()
+      .sort((left, right) => left.seqno - right.seqno)
+      .map(column => column.name);
+    if (JSON.stringify(columns) !== JSON.stringify(spec.columns)) return false;
+    const sql = normalizeSql(
+      db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(spec.name)?.sql,
+    );
+    const where = sql.includes(' where ') ? sql.slice(sql.indexOf(' where ') + 7) : null;
+    return where === spec.where;
+  };
+  const recordedVersionCount = hasTable('schema_migrations')
+    ? db.prepare(`
+        SELECT COUNT(DISTINCT version) AS count
+        FROM schema_migrations
+        WHERE version BETWEEN 1 AND 28
+      `).get().count
+    : 0;
   if (
-    current >= 27
+    current >= 28
+    && recordedVersionCount === 28
     && hasLatestColumns
+    && queueBindingIsNotNull
     && hasTable('completion_debts')
     && hasTable('dispatcher_leases')
     && hasTable('delivery_outbox')
     && hasTable('delivery_attachments')
-    // Verify the unique index exists, not just the column/version: sendMessage's
-    // ON CONFLICT(idempotency_key) target requires it, so a swallowed index
-    // creation must re-run rather than being masked by the version bump.
-    && hasIndex('idx_messages_idempotency')
+    && hasTable('evidence_records')
+    && hasColumns(evidenceColumns, ['retention_policy', 'retention_until'])
+    && !evidenceHasForeignKeys
+    && hasColumns(completionDebtColumns, ['id', 'task_label', 'delivery_scope'])
+    && !completionDebtHasTableUnique
+    && schemaNoOpTables.every(hasTable)
+    && schemaNoOpIndexes.every(hasIndex)
+    && criticalUniqueIndexes.every(criticalIndexMatches)
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
@@ -391,6 +531,39 @@ export default function migrateConsolidate() {
     // v24: explicit fallback model/auth selection
     `ALTER TABLE jobs ADD COLUMN payload_model_fallback TEXT`,
     `ALTER TABLE jobs ADD COLUMN auth_profile_fallback TEXT DEFAULT NULL`,
+    // v28: agentcli handoff v3 governance and structured-output contract
+    `ALTER TABLE jobs ADD COLUMN approval_risk_level TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN approval_approver_scope TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN output_format TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN verify_shell TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN verify_timeout_s INTEGER DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN verify_on_failure TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN delegation_validation TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN output_format TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output_valid INTEGER DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output_warning TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output_bytes INTEGER DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output_sha256 TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN structured_output_path TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN verification_result TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN approval_used TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN evidence_required INTEGER NOT NULL DEFAULT 0 CHECK (evidence_required IN (0,1))`,
+    `ALTER TABLE runs ADD COLUMN evidence_execution_snapshot TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN evidence_declaration_snapshot TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN evidence_ref_snapshot TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN risk_level TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN approver_scope TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN binding_hash TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN gate_kind TEXT NOT NULL DEFAULT 'job'`,
+    `ALTER TABLE approvals ADD COLUMN decision_context TEXT DEFAULT NULL`,
+    `ALTER TABLE delivery_outbox ADD COLUMN delivery_group_id TEXT DEFAULT NULL`,
+    `ALTER TABLE delivery_outbox ADD COLUMN part_index INTEGER DEFAULT NULL`,
+    `ALTER TABLE delivery_outbox ADD COLUMN part_count INTEGER DEFAULT NULL`,
+    `ALTER TABLE delivery_outbox ADD COLUMN completion_label TEXT DEFAULT NULL`,
+    `ALTER TABLE delivery_outbox ADD COLUMN completion_scope TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN retention_policy TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN retention_until TEXT DEFAULT NULL`,
     // v27: leased queue claims and replay diagnostics
     `ALTER TABLE job_dispatch_queue ADD COLUMN claim_owner TEXT`,
     `ALTER TABLE job_dispatch_queue ADD COLUMN claim_token TEXT`,
@@ -398,6 +571,7 @@ export default function migrateConsolidate() {
     `ALTER TABLE job_dispatch_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE job_dispatch_queue ADD COLUMN last_error TEXT`,
     `ALTER TABLE job_dispatch_queue ADD COLUMN replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN binding_scheduled_for TEXT`,
     // v27: atomic approval decisions and audit timestamps
     `ALTER TABLE approvals ADD COLUMN decision_version INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE approvals ADD COLUMN cancelled_reason TEXT`,
@@ -417,10 +591,271 @@ export default function migrateConsolidate() {
     }
   }
 
+  // SQLite cannot strengthen a column to NOT NULL with ALTER TABLE. Rebuild
+  // the queue while foreign-key enforcement is temporarily disabled so child
+  // approval/run links are preserved rather than receiving ON DELETE effects.
+  const queueNeedsBindingConstraint = hasTable('job_dispatch_queue')
+    && !columnInfoFor('job_dispatch_queue')
+      .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
+  if (queueNeedsBindingConstraint) {
+    const foreignKeysWereEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+    db.pragma('foreign_keys = OFF');
+    try {
+      if (db.pragma('foreign_keys', { simple: true }) !== 0) {
+        throw new Error('Migration v28 queue rebuild could not disable foreign key enforcement');
+      }
+      db.transaction(() => {
+        db.exec(`
+          DROP TABLE IF EXISTS job_dispatch_queue_v28;
+          CREATE TABLE job_dispatch_queue_v28 (
+            id              TEXT PRIMARY KEY,
+            job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            dispatch_kind   TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            scheduled_for   TEXT NOT NULL,
+            binding_scheduled_for TEXT NOT NULL,
+            source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+            retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            claimed_at      TEXT,
+            processed_at    TEXT,
+            claim_owner     TEXT,
+            claim_token     TEXT,
+            claim_expires_at TEXT,
+            attempt_count   INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+          );
+          INSERT INTO job_dispatch_queue_v28 (
+            id, job_id, dispatch_kind, status, scheduled_for,
+            binding_scheduled_for, source_run_id, retry_of_run_id, created_at,
+            claimed_at, processed_at, claim_owner, claim_token,
+            claim_expires_at, attempt_count, last_error, replay_of_run_id
+          )
+          SELECT
+            id, job_id, dispatch_kind, status, scheduled_for,
+            COALESCE(binding_scheduled_for, scheduled_for), source_run_id,
+            retry_of_run_id, created_at, claimed_at, processed_at, claim_owner,
+            claim_token, claim_expires_at, attempt_count, last_error,
+            replay_of_run_id
+          FROM job_dispatch_queue;
+          DROP TABLE job_dispatch_queue;
+          ALTER TABLE job_dispatch_queue_v28 RENAME TO job_dispatch_queue;
+        `);
+        const violations = db.pragma('foreign_key_check');
+        if (violations.length > 0) {
+          throw new Error(`Migration v28 queue rebuild violated ${violations.length} foreign key constraint(s)`);
+        }
+      })();
+    } finally {
+      db.pragma(`foreign_keys = ${foreignKeysWereEnabled ? 'ON' : 'OFF'}`);
+    }
+  }
+
   // Wrap all backfill statements, table creation, index creation, and version
   // inserts in a single transaction so that partial backfill cannot occur.
   // ALTER TABLE stays outside because some SQLite builds reject DDL in transactions.
   db.transaction(() => {
+
+  if (hasTable('job_dispatch_queue')) {
+    db.prepare(`
+      UPDATE job_dispatch_queue
+      SET binding_scheduled_for = scheduled_for
+      WHERE binding_scheduled_for IS NULL
+    `).run();
+  }
+
+  // v28: completion claims are scoped to one concrete dispatch/run. The old
+  // task_label primary key could not represent overlapping or re-dispatched
+  // runs with the same human label, so rebuild the table with a surrogate key
+  // and a composite uniqueness constraint.
+  if (
+    hasTable('completion_debts')
+    && (!completionDebtColumns.has('id') || !completionDebtColumns.has('delivery_scope'))
+  ) {
+    db.exec(`
+      DROP TABLE IF EXISTS completion_debts_v28;
+      CREATE TABLE completion_debts_v28 (
+        id                      TEXT PRIMARY KEY,
+        task_label              TEXT NOT NULL,
+        delivery_scope          TEXT NOT NULL,
+        session_key             TEXT,
+        source                  TEXT NOT NULL DEFAULT 'dispatch',
+        status                  TEXT NOT NULL DEFAULT 'tracking',
+        open_reason             TEXT,
+        close_reason            TEXT,
+        opened_at               TEXT,
+        closed_at               TEXT,
+        last_checkin_at         TEXT,
+        last_progress_at        TEXT,
+        last_visible_update_at  TEXT,
+        final_reported_at       TEXT,
+        last_reminder_at        TEXT,
+        reminder_count          INTEGER NOT NULL DEFAULT 0,
+        awaiting_user           INTEGER NOT NULL DEFAULT 0,
+        no_reply                INTEGER NOT NULL DEFAULT 0,
+        metadata                TEXT,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO completion_debts_v28 (
+        id, task_label, delivery_scope, session_key, source, status,
+        open_reason, close_reason, opened_at, closed_at, last_checkin_at,
+        last_progress_at, last_visible_update_at, final_reported_at,
+        last_reminder_at, reminder_count, awaiting_user, no_reply, metadata,
+        created_at, updated_at
+      )
+      SELECT
+        lower(hex(randomblob(16))),
+        task_label,
+        COALESCE(
+          CASE
+            WHEN json_valid(metadata)
+            THEN NULLIF(json_extract(metadata, '$._completion_delivery.scope_key'), '')
+          END,
+          CASE
+            WHEN session_key IS NOT NULL AND trim(session_key) != ''
+            THEN 'session:' || session_key
+          END,
+          'legacy:' || task_label
+        ),
+        session_key, source, status, open_reason, close_reason, opened_at,
+        closed_at, last_checkin_at, last_progress_at, last_visible_update_at,
+        final_reported_at, last_reminder_at, reminder_count, awaiting_user,
+        no_reply,
+        CASE
+          WHEN json_valid(metadata)
+            AND NULLIF(json_extract(metadata, '$._completion_delivery.scope_key'), '') IS NOT NULL
+          THEN metadata
+          WHEN json_valid(metadata) AND json_type(metadata) = 'object'
+          THEN json_set(metadata, '$._completion_delivery.migrated_legacy_unscoped', 1)
+          ELSE json_object(
+            '_completion_delivery',
+            json_object('migrated_legacy_unscoped', 1)
+          )
+        END,
+        created_at, updated_at
+      FROM completion_debts;
+      DROP TABLE completion_debts;
+      ALTER TABLE completion_debts_v28 RENAME TO completion_debts;
+    `);
+  } else if (hasTable('completion_debts') && completionDebtHasTableUnique) {
+    // Early v28 candidates declared both a table-level UNIQUE constraint and
+    // the named unique index repaired below. Rebuild once so each write updates
+    // only the named index while preserving every debt row verbatim.
+    db.exec(`
+      DROP TABLE IF EXISTS completion_debts_v28;
+      CREATE TABLE completion_debts_v28 (
+        id                      TEXT PRIMARY KEY,
+        task_label              TEXT NOT NULL,
+        delivery_scope          TEXT NOT NULL,
+        session_key             TEXT,
+        source                  TEXT NOT NULL DEFAULT 'dispatch',
+        status                  TEXT NOT NULL DEFAULT 'tracking',
+        open_reason             TEXT,
+        close_reason            TEXT,
+        opened_at               TEXT,
+        closed_at               TEXT,
+        last_checkin_at         TEXT,
+        last_progress_at        TEXT,
+        last_visible_update_at  TEXT,
+        final_reported_at       TEXT,
+        last_reminder_at        TEXT,
+        reminder_count          INTEGER NOT NULL DEFAULT 0,
+        awaiting_user           INTEGER NOT NULL DEFAULT 0,
+        no_reply                INTEGER NOT NULL DEFAULT 0,
+        metadata                TEXT,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO completion_debts_v28 (
+        id, task_label, delivery_scope, session_key, source, status,
+        open_reason, close_reason, opened_at, closed_at, last_checkin_at,
+        last_progress_at, last_visible_update_at, final_reported_at,
+        last_reminder_at, reminder_count, awaiting_user, no_reply, metadata,
+        created_at, updated_at
+      )
+      SELECT
+        id, task_label, delivery_scope, session_key, source, status,
+        open_reason, close_reason, opened_at, closed_at, last_checkin_at,
+        last_progress_at, last_visible_update_at, final_reported_at,
+        last_reminder_at, reminder_count, awaiting_user, no_reply, metadata,
+        created_at, updated_at
+      FROM completion_debts;
+      DROP TABLE completion_debts;
+      ALTER TABLE completion_debts_v28 RENAME TO completion_debts;
+    `);
+  }
+
+  // Evidence is an audit artifact, not subordinate run/job history. Earlier
+  // v28 prerelease schemas cascaded it away when runs were pruned or jobs were
+  // deleted, so rebuild without foreign keys while preserving identifiers.
+  if (evidenceHasForeignKeys) {
+    db.exec(`
+      DROP TABLE IF EXISTS evidence_records_v28;
+      CREATE TABLE evidence_records_v28 (
+        id              TEXT PRIMARY KEY,
+        run_id          TEXT NOT NULL UNIQUE,
+        job_id          TEXT NOT NULL,
+        evidence_ref    TEXT,
+        algorithm       TEXT NOT NULL DEFAULT 'sha256',
+        hash            TEXT NOT NULL,
+        payload         TEXT NOT NULL,
+        retention_policy TEXT,
+        retention_until TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(algorithm, hash, run_id)
+      );
+      INSERT INTO evidence_records_v28 (
+        id, run_id, job_id, evidence_ref, algorithm, hash, payload,
+        retention_policy, retention_until, created_at
+      )
+      SELECT
+        id, run_id, job_id, evidence_ref, algorithm, hash, payload,
+        retention_policy, retention_until, created_at
+      FROM evidence_records;
+      DROP TABLE evidence_records;
+      ALTER TABLE evidence_records_v28 RENAME TO evidence_records;
+    `);
+  }
+
+  // Legacy active approvals have no immutable execution binding. Require a
+  // fresh decision under v0.4 rather than allowing an unbound approval to run.
+  const unboundApprovals = hasTable('approvals')
+    ? db.prepare(`
+        SELECT id, run_id, dispatch_queue_id
+        FROM approvals
+        WHERE status IN ('pending', 'approved', 'dispatching')
+          AND (binding_hash IS NULL OR trim(binding_hash) = '')
+      `).all()
+    : [];
+  const unboundReason = 'Approval cancelled during schema 28 upgrade because it predates immutable execution binding';
+  for (const approval of unboundApprovals) {
+    db.prepare(`
+      UPDATE approvals
+      SET status = 'cancelled', resolved_at = datetime('now'),
+          resolved_by = 'migration-v28', cancelled_reason = ?,
+          notes = COALESCE(notes, ?), decision_version = decision_version + 1
+      WHERE id = ? AND status IN ('pending', 'approved', 'dispatching')
+    `).run(unboundReason, unboundReason, approval.id);
+    if (approval.run_id) {
+      db.prepare(`
+        UPDATE runs
+        SET status = 'cancelled', finished_at = datetime('now'),
+            error_message = COALESCE(error_message, ?),
+            terminal_transition_at = COALESCE(terminal_transition_at, datetime('now'))
+        WHERE id = ? AND status IN ('pending', 'awaiting_approval', 'approved', 'running')
+      `).run(unboundReason, approval.run_id);
+    }
+    if (approval.dispatch_queue_id) {
+      db.prepare(`
+        UPDATE job_dispatch_queue
+        SET status = 'cancelled', processed_at = datetime('now'), last_error = ?,
+            claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL
+        WHERE id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+      `).run(unboundReason, approval.dispatch_queue_id);
+    }
+  }
 
   // Normalize legacy ISO schedule_at / next_run_at values for at-jobs so due checks
   // use a consistent SQLite UTC datetime format after upgrades.
@@ -514,6 +949,14 @@ export default function migrateConsolidate() {
   // -- Tables that may be absent on very old installs ---------------------
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS delivery_aliases (
+      alias       TEXT PRIMARY KEY,
+      channel     TEXT NOT NULL,
+      target      TEXT NOT NULL,
+      description TEXT,
+      created_at  TEXT DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS approvals (
       id              TEXT PRIMARY KEY,
       job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -529,7 +972,12 @@ export default function migrateConsolidate() {
       expires_at      TEXT,
       approved_at     TEXT,
       rejected_at     TEXT,
-      dispatched_at   TEXT
+      dispatched_at   TEXT,
+      risk_level      TEXT,
+      approver_scope  TEXT,
+      binding_hash    TEXT,
+      gate_kind       TEXT NOT NULL DEFAULT 'job',
+      decision_context TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
@@ -620,6 +1068,7 @@ export default function migrateConsolidate() {
       dispatch_kind   TEXT NOT NULL,
       status          TEXT NOT NULL DEFAULT 'pending',
       scheduled_for   TEXT NOT NULL,
+      binding_scheduled_for TEXT NOT NULL,
       source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
       retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -652,6 +1101,11 @@ export default function migrateConsolidate() {
       body            TEXT NOT NULL,
       status          TEXT NOT NULL DEFAULT 'pending',
       idempotency_key TEXT,
+      delivery_group_id TEXT,
+      part_index      INTEGER,
+      part_count      INTEGER,
+      completion_label TEXT,
+      completion_scope TEXT,
       attempt_count   INTEGER NOT NULL DEFAULT 0,
       max_attempts    INTEGER NOT NULL DEFAULT 5,
       next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -678,8 +1132,24 @@ export default function migrateConsolidate() {
       UNIQUE(outbox_id, ordinal)
     );
 
+    CREATE TABLE IF NOT EXISTS evidence_records (
+      id              TEXT PRIMARY KEY,
+      run_id          TEXT NOT NULL UNIQUE,
+      job_id          TEXT NOT NULL,
+      evidence_ref    TEXT,
+      algorithm       TEXT NOT NULL DEFAULT 'sha256',
+      hash            TEXT NOT NULL,
+      payload         TEXT NOT NULL,
+      retention_policy TEXT,
+      retention_until TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(algorithm, hash, run_id)
+    );
+
     CREATE TABLE IF NOT EXISTS completion_debts (
-      task_label              TEXT PRIMARY KEY,
+      id                      TEXT PRIMARY KEY,
+      task_label              TEXT NOT NULL,
+      delivery_scope          TEXT NOT NULL,
       session_key             TEXT,
       source                  TEXT NOT NULL DEFAULT 'dispatch',
       status                  TEXT NOT NULL DEFAULT 'tracking',
@@ -703,6 +1173,33 @@ export default function migrateConsolidate() {
 
   // -- Indexes that may be absent ----------------------------------------
 
+  for (const spec of criticalUniqueIndexes) {
+    if (hasIndex(spec.name) && !criticalIndexMatches(spec)) {
+      db.exec(`DROP INDEX ${spec.name}`);
+    }
+  }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_jobs_next_run
+      ON jobs(next_run_at) WHERE enabled = 1;
+      CREATE INDEX IF NOT EXISTS idx_jobs_parent
+      ON jobs(parent_id) WHERE parent_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_runs_job_id
+      ON runs(job_id);
+      CREATE INDEX IF NOT EXISTS idx_runs_status
+      ON runs(status) WHERE status = 'running';
+      CREATE INDEX IF NOT EXISTS idx_messages_to
+      ON messages(to_agent, status);
+      CREATE INDEX IF NOT EXISTS idx_messages_from
+      ON messages(from_agent);
+      CREATE INDEX IF NOT EXISTS idx_messages_created
+      ON messages(created_at);
+      CREATE INDEX IF NOT EXISTS idx_messages_pending
+      ON messages(to_agent, status, priority DESC) WHERE status = 'pending';
+    `);
+  } catch { /* base table may be irreparably incomplete; final checks fail closed */ }
+
   try {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_completion_debts_status
@@ -716,6 +1213,21 @@ export default function migrateConsolidate() {
       ON completion_debts(session_key) WHERE session_key IS NOT NULL
     `);
   } catch { /* index may already exist */ }
+
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_completion_debts_task
+      ON completion_debts(task_label, updated_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_completion_debts_scope
+      ON completion_debts(task_label, delivery_scope);
+      CREATE INDEX IF NOT EXISTS idx_evidence_records_job
+      ON evidence_records(job_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_evidence_records_hash
+      ON evidence_records(algorithm, hash);
+      CREATE INDEX IF NOT EXISTS idx_evidence_records_created_run
+      ON evidence_records(created_at DESC, run_id DESC)
+    `);
+  } catch { /* indexes may already exist */ }
 
   try {
     db.exec(`
@@ -848,50 +1360,36 @@ export default function migrateConsolidate() {
       ON delivery_outbox(status, next_attempt_at);
       CREATE INDEX IF NOT EXISTS idx_delivery_outbox_claim_expiry
       ON delivery_outbox(status, claim_expires_at) WHERE status = 'claimed';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_group_part
+      ON delivery_outbox(delivery_group_id, part_index) WHERE delivery_group_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_delivery_outbox_group_status
+      ON delivery_outbox(delivery_group_id, status, part_index) WHERE delivery_group_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_delivery_outbox_completion
+      ON delivery_outbox(completion_label, completion_scope, status) WHERE completion_label IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_delivery_attachments_message
       ON delivery_attachments(message_id) WHERE message_id IS NOT NULL;
     `);
   } catch { /* indexes may already exist */ }
 
-  // Fail closed if any required v27 object was not created. Earlier releases
+  // Fail closed if any required current-schema object was not created. Earlier releases
   // treated index creation as best effort; a missing uniqueness or due-work
   // index changes correctness, not just performance.
-  const requiredTables = [
-    'approvals',
-    'job_dispatch_queue',
-    'dispatcher_leases',
-    'delivery_outbox',
-    'delivery_attachments',
-    'completion_debts',
-  ];
-  for (const table of requiredTables) {
-    if (!hasTable(table)) throw new Error(`Migration v27 failed to create required table ${table}`);
+  for (const table of migrationRequiredTables) {
+    if (!hasTable(table)) throw new Error(`Migration v28 failed to create required table ${table}`);
   }
-  const requiredIndexes = [
-    'idx_messages_idempotency',
-    'idx_runs_idempotency',
-    'idx_runs_dispatch_queue',
-    'idx_approvals_dispatch_queue',
-    'idx_dispatch_queue_due',
-    'idx_dispatch_queue_job',
-    'idx_dispatch_queue_source_run',
-    'idx_dispatch_queue_claim_expiry',
-    'idx_runs_dispatcher_owner',
-    'idx_runs_cancel_requested',
-    'idx_dispatcher_leases_expiry',
-    'idx_delivery_outbox_idempotency',
-    'idx_delivery_outbox_due',
-    'idx_delivery_outbox_claim_expiry',
-    'idx_delivery_attachments_message',
-  ];
-  for (const index of requiredIndexes) {
-    if (!hasIndex(index)) throw new Error(`Migration v27 failed to create required index ${index}`);
+  for (const index of migrationRequiredIndexes) {
+    if (!hasIndex(index)) throw new Error(`Migration v28 failed to create required index ${index}`);
+  }
+  for (const spec of criticalUniqueIndexes) {
+    if (hasTable(spec.table) && !criticalIndexMatches(spec)) {
+      throw new Error(`Migration v28 failed to enforce required unique index ${spec.name}`);
+    }
   }
 
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]) {
     stmt.run(v);
   }
 
@@ -903,8 +1401,14 @@ export default function migrateConsolidate() {
 // Allow running as standalone script: node migrate-consolidate.js
 if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
   const applied = migrateConsolidate();
+  if (applied) {
+    applyBundledSchema('standalone schema apply');
+    if (migrateConsolidate()) {
+      throw new Error('Consolidation migration did not reach a complete schema no-op state');
+    }
+  }
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v27'
-    : 'DB already at v27 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v28'
+    : 'DB already at v28 -- nothing to do'
   );
 }

@@ -19,6 +19,7 @@ jobs:
   verify:
     name: Smoke + Tests (${{ matrix.os }} / Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -37,10 +38,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -49,4 +52,118 @@ jobs:
         run: npm ci
 
       - name: Repository verification gate
+        env:
+          SKIP_AGENTCLI_INTEGRATION: '1'
         run: npm run verify:smoke
+
+  agentcli-integration:
+    name: Public agentcli ${{ matrix.contract }} compatibility (Ubuntu / Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - contract: handoff-v3
+            ref: f1fed6d7d451196bda316b82d6567b174012a4ba
+          - contract: handoff-v2
+            ref: 317cc0eea8b4c65bc3213f5f329124a45c958bd3
+    defaults:
+      run:
+        working-directory: scheduler
+
+    steps:
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          path: scheduler
+          persist-credentials: false
+
+      - name: Checkout pinned public agentcli
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: amittell/agentcli
+          ref: ${{ matrix.ref }}
+          path: agentcli
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: scheduler/package-lock.json
+
+      - name: Install scheduler dependencies
+        run: npm ci
+
+      - name: Run required scheduler-agentcli contract checks
+        env:
+          AGENTCLI_PATH: ${{ github.workspace }}/agentcli
+          AGENTCLI_CONTRACT: ${{ matrix.contract }}
+        run: npm run test:agentcli
+
+  published-agentcli:
+    name: Published agentcli 0.4.1 black-box (Ubuntu / Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout scheduler
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install scheduler dependencies
+        run: npm ci
+
+      - name: Install exact published agentcli package
+        run: |
+          mkdir -p "$RUNNER_TEMP/agentcli-published"
+          cd "$RUNNER_TEMP/agentcli-published"
+          npm init -y
+          npm install --save-exact --no-audit --no-fund @amittell/agentcli@0.4.1
+
+      - name: Verify published package signatures and provenance
+        working-directory: ${{ runner.temp }}/agentcli-published
+        run: npm audit signatures --include-attestations
+
+      - name: Run published-package compile, apply, approve, restart, execute, and inspect conformance
+        env:
+          AGENTCLI_BIN: ${{ runner.temp }}/agentcli-published/node_modules/@amittell/agentcli/bin/agentcli.js
+        run: npm run verify:agentcli-published
+
+  package:
+    name: Published package contract (Ubuntu / Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify extracted npm package and strict consumer types
+        run: npm run verify:package

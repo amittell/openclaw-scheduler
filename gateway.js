@@ -1,9 +1,26 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFile, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
+import {
+  readFileSync, writeFileSync, existsSync, realpathSync,
+} from 'fs';
+import { homedir, tmpdir } from 'os';
+import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
+import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
+
+export {
+  GATEWAY_ENV_INJECT_CAPABILITY,
+  GATEWAY_ENV_INJECT_HEADER,
+  GatewayCompatibilityError,
+  MAX_GATEWAY_ENV_ENTRIES,
+  MAX_GATEWAY_ENV_INJECT_HEADER_BYTES,
+  MAX_GATEWAY_ENV_KEY_BYTES,
+  MAX_GATEWAY_ENV_VALUE_BYTES,
+  buildGatewayEnvInjectHeader,
+  clearGatewayCapabilityCache,
+  discoverGatewayCapabilities,
+  negotiateGatewayEnvironmentInjection,
+} from './gateway-capabilities.js';
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const HOME_DIR = process.env.HOME || homedir();
@@ -25,23 +42,59 @@ export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 // contract intact.
 export const ISOLATED_DISPATCH_PRIMITIVE = 'http-chat-completions';
 
-let _cachedToken;
-let _tokenLoaded = false;
+function isWithinPath(root, candidate) {
+  const relativePath = relative(root, candidate);
+  return relativePath === '' || (
+    relativePath !== '..'
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
+  );
+}
+
+/**
+ * Resolve the Gateway token file through an explicit credential-root allowlist.
+ * The canonical path check also prevents a symlink inside an allowed directory
+ * from escaping to an arbitrary file.
+ */
+export function resolveGatewayTokenPath(configuredPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH) {
+  const credentialRoot = resolve(homedir(), '.openclaw', 'credentials');
+  const allowedRoots = [
+    { path: credentialRoot, rejectSymlink: true },
+    { path: resolve('/run/secrets'), rejectSymlink: false },
+    { path: resolve('/var/run/secrets'), rejectSymlink: false },
+    ...(process.env.NODE_ENV === 'test'
+      ? [{ path: resolve(tmpdir()), rejectSymlink: false }]
+      : []),
+  ].map(({ path, rejectSymlink }) => {
+    try {
+      const canonicalRoot = realpathSync(path);
+      return rejectSymlink && canonicalRoot !== path ? null : canonicalRoot;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  const requestedPath = configuredPath || join(credentialRoot, '.gateway-token');
+  let canonicalPath;
+  try {
+    canonicalPath = realpathSync(resolve(requestedPath));
+  } catch {
+    return null;
+  }
+  return allowedRoots.some(root => isWithinPath(root, canonicalPath))
+    ? canonicalPath
+    : null;
+}
 
 function getGatewayToken() {
-  if (!_tokenLoaded) {
-    _tokenLoaded = true;
-    if (process.env.OPENCLAW_GATEWAY_TOKEN) {
-      _cachedToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-    } else {
-      try {
-        const tokenPath = process.env.OPENCLAW_GATEWAY_TOKEN_PATH
-          || join(HOME_DIR, '.openclaw/credentials/.gateway-token');
-        _cachedToken = readFileSync(tokenPath, 'utf-8').trim();
-      } catch { _cachedToken = null; }
-    }
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
+  try {
+    const tokenPath = resolveGatewayTokenPath();
+    if (!tokenPath) return null;
+    // The canonical token path is constrained to credential roots above.
+    return readFileSync(tokenPath, 'utf-8').trim() || null;
+  } catch {
+    return null;
   }
-  return _cachedToken;
 }
 
 function authHeaders(scopes = null) {
@@ -156,6 +209,7 @@ export function cancelAgentSession(sessionKey, opts = {}) {
  * @param {string} [opts.sessionKey] - Session key for continuity.
  * @param {string} [opts.model] - Model override.
  * @param {string|null} [opts.authProfile] - Auth profile header value.
+ * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject.
  * @param {number} [opts.timeoutMs=300000] - Request timeout in milliseconds.
  */
 export async function runAgentTurn(opts) {
@@ -165,10 +219,16 @@ export async function runAgentTurn(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     timeoutMs = 300000,
     signal,
     cancelOnAbort = true,
   } = opts;
+
+  const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
+    gatewayUrl: GATEWAY_URL,
+    requestHeaders: authHeaders(),
+  });
 
   const controller = new AbortController();
   let abortReason = null;
@@ -187,6 +247,7 @@ export async function runAgentTurn(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjection.headers,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
@@ -248,6 +309,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
+ * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject
  * @param {string[]} [opts.sessionKinds]  - Optional session kinds to track for activity polling
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
@@ -257,6 +319,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     sessionKey,
     model,
     authProfile,
+    materializedEnv,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
@@ -264,6 +327,11 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     signal,
     cancelOnAbort = true,
   } = opts;
+
+  const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
+    gatewayUrl: GATEWAY_URL,
+    requestHeaders: authHeaders(),
+  });
 
   const controller = new AbortController();
   let abortReason = null;
@@ -363,6 +431,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...(agentId ? { 'x-openclaw-agent-id': agentId } : {}),
         ...(sessionKey ? { 'x-openclaw-session-key': sessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...envInjection.headers,
       },
       body: JSON.stringify({
         model: model || `openclaw:${agentId}`,
@@ -907,38 +976,22 @@ export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId 
 }
 
 /**
- * Sync the live auth-profiles.json from the main agent store to the target
- * agent store at ~/.openclaw/agents/<agentId>/agent/auth-profiles.json.
+ * Backward-compatible auth synchronization hook.
  *
- * This ensures scheduler sessions always use fresh credentials (tokens, order,
- * default profile) even when no explicit auth_profile is set on the job.
- * Without this, sessions created from a stable session key inherit a stale
- * copy of the auth store that was snapshotted when the session was first created.
+ * Gateway-backed dispatch resolves credentials inside the running OpenClaw
+ * Gateway. The scheduler must not copy auth profile files between agents:
+ * current Gateways may use a non-file auth store, secondary agents support
+ * read-through inheritance, and OAuth refresh credentials are not safely
+ * cloneable. The exported hook remains for consumers that feature-detect it,
+ * but reports that synchronization is intentionally owned by the Gateway.
  *
- * This is a fast file-copy operation (~1ms) and is safe to call before every
- * agent turn.
- *
- * @param {string} [agentId='main'] - Agent ID for store path resolution
- * @returns {{ ok: boolean, error?: string }}
+ * @deprecated Gateway-backed dispatch does not require credential-file sync.
+ * @param {string} [agentId='main'] - Agent ID retained for API compatibility
+ * @returns {{ ok: boolean, skipped?: boolean, reason?: string, error?: string }}
  */
 export function syncAuthStoreToSession(agentId = 'main') {
-  const livePath = join(HOME_DIR, '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json');
-  const agentStorePath = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent', 'auth-profiles.json');
-
-  try {
-    if (!existsSync(livePath)) {
-      return { ok: false, error: `Live auth store not found at ${livePath}` };
-    }
-
-    // Ensure the agent directory exists
-    const agentDir = join(HOME_DIR, '.openclaw', 'agents', agentId, 'agent');
-    if (!existsSync(agentDir)) {
-      mkdirSync(agentDir, { recursive: true });
-    }
-
-    copyFileSync(livePath, agentStorePath);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: `Failed to sync auth store: ${err.message}` };
+  if (typeof agentId !== 'string' || agentId.trim() === '') {
+    return { ok: false, error: 'agentId must be a non-empty string' };
   }
+  return { ok: true, skipped: true, reason: 'gateway-managed-auth' };
 }

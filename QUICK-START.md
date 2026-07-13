@@ -8,10 +8,14 @@ For the complete reference, see [README.md](README.md).
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
 ocs setup
 ```
+
+The explicit `--ignore-scripts=false` lets the trusted `better-sqlite3`
+dependency install its native binding. If an earlier install disabled lifecycle
+scripts, rebuild it with `npm rebuild --ignore-scripts=false better-sqlite3`.
 
 The setup wizard creates or upgrades the database and installs the selected macOS launchd or Linux systemd service.
 
@@ -22,7 +26,7 @@ ocs doctor
 ocs status --json
 ```
 
-`doctor` verifies schema version 27, required tables, database writability, the singleton dispatcher lease, dispatch queue claims, delivery outbox claims, approval state, and pending cancellations. A missing active lease is a warning when the dispatcher is intentionally stopped.
+`doctor` verifies schema version 28, required tables, database writability, the singleton dispatcher lease, dispatch queue claims, delivery outbox claims, approval state, immutable evidence storage, and pending cancellations. A missing active lease is a warning when the dispatcher is intentionally stopped.
 
 ## 3. Create a shell job
 
@@ -91,7 +95,7 @@ Create the parent job first. Copy its returned `job.id` into a child spec as `pa
 - `trigger_on: "failure"`
 - `trigger_on: "complete"`
 
-Add `trigger_condition: "contains:ALERT"` or `trigger_condition: "regex:ERROR.*critical"` when output must also match. Add `approval_required: true` to a risky child. Approval decisions are atomic and audited; rejected, expired, disabled, or cancelled work cannot be dispatched later by a stale approval record.
+Add `trigger_condition: "contains:ALERT"` or `trigger_condition: "regex:ERROR.*critical"` when output must also match. Add `approval_required: true` to risky work. Approval gates apply to root, manual, scheduled, one-shot, and chain dispatches. For scoped production work, add `approval_risk_level: "high"` and `approval_approver_scope: "user:alex"`, then use `ocs approvals approve <approval-id> --reason "Reviewed"` from that local OS account. Approval decisions are atomic and execution-bound; rejected, expired, changed, disabled, or cancelled work cannot be dispatched later by a stale approval record. Domain scopes and caller-selected approver identity are not supported.
 
 For larger graphs, install the control-plane companion:
 
@@ -147,15 +151,16 @@ ocs jobs enable <job-id>
 ocs jobs cancel <job-id>
 ocs runs get <run-id> --json
 ocs runs output <run-id> stdout
+ocs runs evidence <run-id> --json
 ocs approvals list --json
 ocs doctor --json
 ```
 
 Cancellation is fenced against dispatcher ownership. Shell cancellation and timeout terminate the tracked process group before a terminal transition is committed. Agent cancellation records the Gateway cancellation request. Always confirm the authoritative run state with `runs get`, `runs running`, or `status`; asynchronous chat updates can be stale.
 
-External delivery is committed through a transactional outbox that is separate from agent prompt messages. Attachments are retained with size and SHA-256 metadata. Delivery is retried under a claim lease and cannot be consumed as another agent's prompt context.
+External delivery is committed through a transactional outbox that is separate from agent prompt messages. Attachments are retained with size and SHA-256 metadata. Delivery is retried under a claim lease and cannot be consumed as another agent's prompt context. Durable enqueue is not a delivery receipt; completion debt closes only after every outbox part is actually delivered.
 
-Governance fields are execution controls in version 0.3.0. If a requested sandbox, path, network, credential, trust, proof, or cost policy cannot be enforced, execution fails closed. These controls do not make a destructive command idempotent, so the command itself must still detect prior completion safely.
+Governance fields are execution controls in version 0.4.0. If a requested sandbox, path, network, credential, trust, proof, delegation, authorization, output, evidence, or cost policy cannot be enforced, execution fails closed. These controls do not make a destructive command idempotent, so the command itself must still detect prior completion safely.
 
 ## 8. Run the complete repository gate
 

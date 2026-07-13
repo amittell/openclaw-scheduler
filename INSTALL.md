@@ -33,9 +33,13 @@ scp -r user@source-host:~/.openclaw/scheduler ~/.openclaw/scheduler
 Or npm-first install (no git clone):
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- help
 ```
+
+Keep `--ignore-scripts=false`: the trusted `better-sqlite3` dependency must
+install its native binding. If lifecycle scripts were previously disabled, run
+`npm rebuild --ignore-scripts=false better-sqlite3` in the install prefix.
 
 Runtime state for npm installs defaults to `~/.openclaw/scheduler/`, not the package directory under `node_modules/`.
 
@@ -49,7 +53,7 @@ npm run verify:local
 npm pack
 
 mkdir -p ~/.openclaw/packages/openclaw-scheduler
-npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
 In that setup, run the service from `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js` and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
@@ -73,7 +77,7 @@ If Node changes later under this checkout, rebuild the native module before rest
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 Typical cases:

@@ -43,13 +43,13 @@ const knownTopLevel = new Set([
 
 const knownSubcommands = new Map([
   ['jobs', new Set(['list', 'tree', 'get', 'add', 'validate', 'enable', 'disable', 'delete', 'cancel', 'update', 'run', 'approve', 'reject'])],
-  ['runs', new Set(['list', 'get', 'output', 'running', 'stale'])],
+  ['runs', new Set(['list', 'get', 'output', 'evidence', 'running', 'stale'])],
   ['queue', new Set(['list', 'clear', 'prune'])],
   ['messages', new Set(['send'])],
   ['msg', new Set(['send', 'inbox', 'team-inbox', 'outbox', 'thread', 'ack', 'receipts', 'read', 'readall', 'unread'])],
   ['agents', new Set(['list', 'get', 'register'])],
   ['tasks', new Set(['list', 'status', 'create', 'history', 'heartbeat', 'register-session'])],
-  ['approvals', new Set(['list', 'pending'])],
+  ['approvals', new Set(['list', 'pending', 'approve', 'reject'])],
   ['idem', new Set(['status', 'check', 'release', 'prune'])],
   ['alias', new Set(['list', 'add', 'remove'])],
 ]);

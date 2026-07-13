@@ -28,13 +28,13 @@ Use native OpenClaw cron when one scheduled command or agent turn is enough. Do 
 ## Install and diagnose
 
 ```bash
-npm install -g openclaw-scheduler
+npm install -g --ignore-scripts=false openclaw-scheduler
 openclaw-scheduler setup
 openclaw-scheduler doctor
 openclaw-scheduler status --json
 ```
 
-`setup` creates or upgrades the runtime database and installs the selected service mode. `doctor` validates schema version 27 and reports dispatcher lease, dispatch queue, delivery outbox, approval, and cancellation state.
+`setup` creates or upgrades the runtime database and installs the selected service mode. `doctor` validates schema version 28 and reports dispatcher lease, dispatch queue, delivery outbox, approval, immutable evidence, and cancellation state.
 
 ## Define a job
 
@@ -88,7 +88,7 @@ Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old exported file. In
 - `openclaw-scheduler jobs list --json`: job definitions and next-run state
 - `openclaw-scheduler runs list <job-id> --json`: run history
 - `openclaw-scheduler runs output <run-id> stdout`: stored or offloaded output
-- `openclaw-scheduler jobs approve <job-id>` and `jobs reject <job-id>`: resolve a pending gate
+- `openclaw-scheduler approvals approve <approval-id>` and `approvals reject <approval-id>`: resolve a gate using the invoking local OS identity
 - `openclaw-scheduler jobs disable <job-id>` and `jobs enable <job-id>`: stop or resume scheduling
 - `openclaw-scheduler jobs cancel <job-id>`: request fenced cancellation for active work and descendants
 - `openclaw-scheduler doctor --json`: schema and runtime diagnostics
@@ -99,7 +99,9 @@ Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old exported file. In
 - Shell cancellation and timeout terminate the tracked process group before terminal state is committed.
 - Dispatch queue claims have leases and stale-claim recovery.
 - External delivery uses a transactional outbox separate from agent prompt messages, with durable attachment metadata.
-- Approval decisions are atomic and audited.
+- Approval decisions are atomic, execution-bound, scoped when requested, and audited for every durable dispatch kind.
+- Declared JSON/NDJSON output is validated before children run. Supported checksum evidence is stored as immutable SHA-256 content without raw credentials; external signer/verifier declarations fail validation.
+- Isolated credential injection requires the Gateway capability `chat-completions-env-inject-v1`; missing receiver support fails closed before dispatch.
 - Governance fields are enforced at execution time; a job is rejected when its requested policy cannot be enforced.
 
 These controls reduce duplicate side effects but do not make an arbitrary shell command idempotent. Design destructive commands with their own idempotency checks and verify cancellation through `runs get` or `status`, never from asynchronous chat messages.

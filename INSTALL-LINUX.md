@@ -3,7 +3,7 @@
 Step-by-step guide to deploy the scheduler on a Linux host running OpenClaw.
 
 > **macOS?** See [INSTALL.md](INSTALL.md).
-> **Windows?** See [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md).
+> **Windows?** Install WSL2 first using [INSTALL-WINDOWS.md](INSTALL-WINDOWS.md), then follow this guide inside WSL2. Native Windows and WSL1 are not supported.
 > **Need examples or migration help?** See [Starter Recipes in the README](README.md#starter-recipes) and [Common Migrations](README.md#common-migrations).
 
 ---
@@ -36,7 +36,7 @@ scp -r user@source-host:~/.openclaw/scheduler ~/.openclaw/scheduler
 Or npm-first install (no git clone):
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- help
 ```
 
@@ -76,7 +76,7 @@ node -e "require('better-sqlite3')" && echo "OK"
 If the host's Node runtime changes later, rebuild the native binding before restarting the scheduler:
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 ---

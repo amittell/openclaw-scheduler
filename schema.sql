@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v0.3.0, schema version: 27)
+-- OpenClaw Scheduler Schema (current: v0.4.0, schema version: 28)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   approval_required  INTEGER DEFAULT 0,
   approval_timeout_s INTEGER DEFAULT 3600,
   approval_auto      TEXT DEFAULT 'reject',         -- 'approve'|'reject'
+  approval_risk_level TEXT DEFAULT NULL,             -- NULL|'low'|'medium'|'high'
+  approval_approver_scope TEXT DEFAULT NULL,          -- local exact, principal:<id>, user:<name>, or uid:<number>
 
   -- Context retrieval (v5)
   context_retrieval       TEXT DEFAULT 'none',      -- 'none'|'recent'|'hybrid'
@@ -86,6 +88,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   output_excerpt_limit_bytes INTEGER NOT NULL DEFAULT 65536,
   output_summary_limit_bytes INTEGER NOT NULL DEFAULT 65536,
   output_offload_threshold_bytes INTEGER NOT NULL DEFAULT 65536,
+  output_format TEXT DEFAULT NULL,                    -- NULL|'json'|'ndjson'|'text'
+
+  -- Post-success verification contract (agentcli handoff v2)
+  verify_shell TEXT DEFAULT NULL,
+  verify_timeout_s INTEGER DEFAULT NULL,
+  verify_on_failure TEXT DEFAULT NULL,                 -- NULL|'warn'|'error'
 
   -- Session continuity (v9)
   preferred_session_key TEXT DEFAULT NULL,           -- pass to gateway for session reuse
@@ -230,8 +238,26 @@ CREATE TABLE IF NOT EXISTS runs (
   trust_evaluation                 TEXT DEFAULT NULL,
   authorization_decision           TEXT DEFAULT NULL,
   authorization_proof_verification TEXT DEFAULT NULL,
+  evidence_required                INTEGER NOT NULL DEFAULT 0 CHECK (evidence_required IN (0,1)),
+  evidence_execution_snapshot      TEXT DEFAULT NULL,
+  evidence_declaration_snapshot    TEXT DEFAULT NULL,
+  evidence_ref_snapshot            TEXT DEFAULT NULL,
   evidence_record                  TEXT DEFAULT NULL,
-  credential_handoff_summary       TEXT DEFAULT NULL
+  credential_handoff_summary       TEXT DEFAULT NULL,
+  delegation_validation            TEXT DEFAULT NULL,
+  approval_used                     TEXT DEFAULT NULL,
+
+  -- Structured output contract result (v28)
+  output_format                     TEXT DEFAULT NULL,
+  structured_output                TEXT DEFAULT NULL,
+  structured_output_valid          INTEGER DEFAULT NULL,
+  structured_output_warning        TEXT DEFAULT NULL,
+  structured_output_bytes          INTEGER DEFAULT NULL,
+  structured_output_sha256         TEXT DEFAULT NULL,
+  structured_output_path           TEXT DEFAULT NULL,
+
+  -- Post-success verification outcome (agentcli handoff v2)
+  verification_result              TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_id ON runs(job_id);
@@ -354,7 +380,12 @@ CREATE TABLE IF NOT EXISTS approvals (
   expires_at      TEXT,
   approved_at     TEXT,
   rejected_at     TEXT,
-  dispatched_at   TEXT
+  dispatched_at   TEXT,
+  risk_level      TEXT,
+  approver_scope  TEXT,
+  binding_hash    TEXT,
+  gate_kind       TEXT NOT NULL DEFAULT 'job',         -- job|authorization
+  decision_context TEXT                                -- audit-safe JSON context for escalation
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
@@ -370,6 +401,7 @@ CREATE TABLE IF NOT EXISTS job_dispatch_queue (
   dispatch_kind   TEXT NOT NULL,                   -- schedule|at|manual|chain|retry
   status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled|failed
   scheduled_for   TEXT NOT NULL,
+  binding_scheduled_for TEXT NOT NULL,              -- immutable occurrence timestamp used by approval bindings
   source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
   retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -414,6 +446,11 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
   body            TEXT NOT NULL,
   status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|delivered|failed|cancelled
   idempotency_key TEXT,
+  delivery_group_id TEXT,
+  part_index      INTEGER,
+  part_count      INTEGER,
+  completion_label TEXT,
+  completion_scope TEXT,
   attempt_count   INTEGER NOT NULL DEFAULT 0,
   max_attempts    INTEGER NOT NULL DEFAULT 5,
   next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -427,6 +464,9 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_idempotency ON delivery_outbox(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_delivery_outbox_due ON delivery_outbox(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_outbox_claim_expiry ON delivery_outbox(status, claim_expires_at) WHERE status = 'claimed';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_group_part ON delivery_outbox(delivery_group_id, part_index) WHERE delivery_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_group_status ON delivery_outbox(delivery_group_id, status, part_index) WHERE delivery_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_completion ON delivery_outbox(completion_label, completion_scope, status) WHERE completion_label IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS delivery_attachments (
   id              TEXT PRIMARY KEY,
@@ -443,6 +483,26 @@ CREATE TABLE IF NOT EXISTS delivery_attachments (
   UNIQUE(outbox_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS idx_delivery_attachments_message ON delivery_attachments(message_id) WHERE message_id IS NOT NULL;
+
+-- ============================================================
+-- EVIDENCE RECORDS: immutable, content-addressed execution evidence (v28)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS evidence_records (
+  id              TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL UNIQUE,
+  job_id          TEXT NOT NULL,
+  evidence_ref    TEXT,
+  algorithm       TEXT NOT NULL DEFAULT 'sha256',
+  hash            TEXT NOT NULL,
+  payload         TEXT NOT NULL,
+  retention_policy TEXT,
+  retention_until TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(algorithm, hash, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_records_job ON evidence_records(job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_evidence_records_hash ON evidence_records(algorithm, hash);
+CREATE INDEX IF NOT EXISTS idx_evidence_records_created_run ON evidence_records(created_at DESC, run_id DESC);
 
 -- ============================================================
 -- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
@@ -545,12 +605,14 @@ CREATE INDEX IF NOT EXISTS idx_team_events_task ON team_mailbox_events(team_id, 
 -- ============================================================
 -- COMPLETION DEBTS: durable record of dispatch completions that
 -- still owe the user a visible announce, plus an atomic delivery
--- claim so the done-path and the watcher never both deliver (v25).
--- Column set matches the historical live table so an already
--- populated store upgrades cleanly.
+-- claim so the done-path and the watcher never both deliver. The v28
+-- delivery_scope makes claims run-scoped, so concurrent or re-dispatched
+-- uses of the same label do not suppress one another.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS completion_debts (
-  task_label              TEXT PRIMARY KEY,
+  id                      TEXT PRIMARY KEY,
+  task_label              TEXT NOT NULL,
+  delivery_scope          TEXT NOT NULL,
   session_key             TEXT,
   source                  TEXT NOT NULL DEFAULT 'dispatch',
   status                  TEXT NOT NULL DEFAULT 'tracking',   -- tracking|open|delivering|closed
@@ -572,6 +634,8 @@ CREATE TABLE IF NOT EXISTS completion_debts (
 );
 CREATE INDEX IF NOT EXISTS idx_completion_debts_status ON completion_debts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_completion_debts_session ON completion_debts(session_key) WHERE session_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_completion_debts_task ON completion_debts(task_label, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_completion_debts_scope ON completion_debts(task_label, delivery_scope);
 
 -- ============================================================
 -- MIGRATION LOG
@@ -581,8 +645,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-27 (all columns already in schema above).
--- Existing installs are brought up to v27 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-28 (all columns already in schema above).
+-- Existing installs are brought up to v28 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -610,3 +674,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (24);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (25);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (26);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (27);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (28);

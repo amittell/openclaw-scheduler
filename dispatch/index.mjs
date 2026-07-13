@@ -1367,12 +1367,6 @@ async function cmdEnqueue(flags) {
   // that will be delivered to the inbox consumer (and ultimately Telegram).
   const schedulerCliPath = resolveSchedulerCliPath();
   const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
-  // TODO: Inject CHECKPOINT_NOTIFY_CMD as an env var into the agent session so
-  // agents can discover the checkpoint command programmatically (not just from
-  // the prompt text at line ~714). Depends on the gateway implementing the
-  // x-openclaw-env-inject receiver (PR #5 sends the header, gateway ignores it
-  // until receiver support lands). Once available, pass it alongside materialized
-  // credentials via the env-inject header in the gatewayCall('agent', ...) below.
 
   // Prepend CHECK_IN template when delivery target is set
   if (deliverTo) {
@@ -1399,7 +1393,6 @@ async function cmdEnqueue(flags) {
   parts.push(`  ${checkpointNotifyCmd} "<message>"`);
   parts.push(`Call this at logical checkpoints: start of a major step, on conflict/error, before completing.`);
   parts.push(`Example: ${checkpointNotifyCmd} "Starting step 2: running tests"`);
-  parts.push(`(Environment variable CHECKPOINT_NOTIFY_CMD is set to: ${checkpointNotifyCmd})`);
   parts.push(`---`);
   parts.push(``);
 
@@ -1480,9 +1473,15 @@ async function cmdEnqueue(flags) {
       taskPrompt:     message.slice(0, 2000),
     });
 
-    // New run of this label -- clear any prior-run delivery debt so the fresh
-    // run's done-path/watcher claim is not blocked by a stale closed row.
-    resetCompletionDeliveryClaim({ label });
+    // Reserve this run's delivery scope before a stale watcher from an earlier
+    // use of the same label can claim the fresh completion.
+    if (!deliveryDisabled) {
+      resetCompletionDeliveryClaim({
+        label,
+        sessionKey,
+        runId: response?.runId || idem,
+      });
+    }
 
     // Fire dispatch.started hook (best-effort)
     await onStarted({
@@ -1519,9 +1518,8 @@ async function cmdEnqueue(flags) {
     // -- Register scheduler watcher for delivery ---------------
     // Creates a quick-poll shell job that runs watcher.mjs once per tick. Empty
     // stdout means "still running" and advances the next tick without delivery.
-    // Terminal stdout goes through the scheduler's handleDelivery with retry,
-    // alias resolution, and audit trail in scheduler.db.
-    // The watcher is the only final-delivery path for dispatched jobs.
+    // The watcher enqueues terminal output directly into the durable outbox;
+    // stdout remains only as a route-less compatibility fallback.
     const sq = s => String(s).replace(/'/g, "'\\''");
     let schedulerWatcherOk = false;
     if (deliverTo && deliverMode !== 'none') {
@@ -1639,21 +1637,23 @@ async function cmdEnqueue(flags) {
     });
 
     // -- Post-spawn verification (Fix 3) --------------------------------
-    // Canary: poll sessions.json up to 3 times at 10s intervals to confirm the
-    // session appeared in the store. A session store entry with sessionId or
-    // startedAt/sessionStartedAt is enough: long first turns may not flush JSONL,
-    // token counts, or chat.history until the model call completes. The delivery
-    // watcher owns later completion/failure handling.
+    // Canary: inspect sessions.json immediately, then wait up to 3 intervals to
+    // confirm the session appeared in the store. A session store entry with
+    // sessionId or startedAt/sessionStartedAt is enough: long first turns may not
+    // flush JSONL, token counts, or chat.history until the model call completes.
+    // The delivery watcher owns later completion/failure handling.
     const SPAWN_POLL_MAX = 3;
     const SPAWN_POLL_DELAY_MS = 10_000;
     let spawnConfirmed = false;
-    for (let spawnPoll = 0; spawnPoll < SPAWN_POLL_MAX; spawnPoll++) {
-      await sleep(SPAWN_POLL_DELAY_MS);
+    for (let spawnPoll = 0; spawnPoll <= SPAWN_POLL_MAX; spawnPoll++) {
       const spawnStore = readSessionsStore(agent);
       const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
       if (signal.hasStartedSignal || signal.hasActivitySignal) {
         spawnConfirmed = true;
         break;
+      }
+      if (spawnPoll < SPAWN_POLL_MAX) {
+        await sleep(SPAWN_POLL_DELAY_MS);
       }
     }
     if (!spawnConfirmed) {
@@ -2543,6 +2543,7 @@ async function cmdDone(flags) {
       deliverTo: existing.deliverTo,
       deliveryChannel: existing.deliverChannel || 'telegram',
       sessionKey: existing.sessionKey || null,
+      runId: existing.runId || null,
       origin: existing.origin || null,
       metadata: {
         last_label_status: 'done',

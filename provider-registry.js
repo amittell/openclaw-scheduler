@@ -74,6 +74,80 @@ export function getProofVerifier(name) {
   return proofVerifiers.get(name) || null;
 }
 
+function parseAuthorizationReference(ref) {
+  if (typeof ref !== 'string' || !ref.trim()) {
+    const error = new Error('authorization_ref must be a non-empty string');
+    error.code = 'AUTHORIZATION_REF_INVALID';
+    throw error;
+  }
+  const normalized = ref.trim();
+  if (normalized.length > 2048) {
+    const error = new Error('authorization_ref exceeds 2048 characters');
+    error.code = 'AUTHORIZATION_REF_INVALID';
+    throw error;
+  }
+  if (normalized.startsWith('provider://')) {
+    const match = /^provider:\/\/([^/]+)\/(.+)$/.exec(normalized);
+    if (!match) {
+      const error = new Error('authorization_ref must use provider://<provider>/<policy-ref>');
+      error.code = 'AUTHORIZATION_REF_INVALID';
+      throw error;
+    }
+    return { providerName: decodeURIComponent(match[1]), policyRef: decodeURIComponent(match[2]) };
+  }
+  const separator = normalized.indexOf(':');
+  if (separator <= 0 || separator === normalized.length - 1) {
+    const error = new Error('authorization_ref must identify a provider as <provider>:<policy-ref> or provider://<provider>/<policy-ref>');
+    error.code = 'AUTHORIZATION_REF_INVALID';
+    throw error;
+  }
+  return {
+    providerName: normalized.slice(0, separator),
+    policyRef: normalized.slice(separator + 1),
+  };
+}
+
+export async function resolveAuthorizationRef(ref, ctx = {}) {
+  const { providerName, policyRef } = parseAuthorizationReference(ref);
+  const provider = getAuthorizationProvider(providerName);
+  if (!provider) {
+    const error = new Error(`authorization provider not loaded: ${providerName}`);
+    error.code = 'AUTHORIZATION_PROVIDER_NOT_LOADED';
+    throw error;
+  }
+  const resolver = typeof provider.resolvePolicy === 'function'
+    ? provider.resolvePolicy.bind(provider)
+    : typeof provider.resolveAuthorization === 'function'
+      ? provider.resolveAuthorization.bind(provider)
+      : null;
+  if (!resolver) {
+    const error = new Error(`authorization provider ${providerName} does not implement resolvePolicy()`);
+    error.code = 'AUTHORIZATION_REF_UNSUPPORTED';
+    throw error;
+  }
+  const resolved = await resolver(policyRef, {
+    ...ctx,
+    ref,
+    provider: providerName,
+    env: ctx.env || process.env,
+    cwd: ctx.cwd || process.cwd(),
+  });
+  const policy = resolved?.policy || resolved;
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    const error = new Error(`authorization provider ${providerName} returned no policy for ${policyRef}`);
+    error.code = 'AUTHORIZATION_REF_NOT_FOUND';
+    throw error;
+  }
+  return {
+    policy: {
+      ...policy,
+      ref: policy.ref || ref,
+    },
+    provider: providerName,
+    ref,
+  };
+}
+
 export function hasProvider(name) {
   return identityProviders.has(name) || authorizationProviders.has(name) || proofVerifiers.has(name);
 }
@@ -81,7 +155,13 @@ export function hasProvider(name) {
 export function listProviders() {
   const result = [];
   for (const [name, p] of identityProviders) result.push({ name, type: p.type });
-  for (const [name, p] of authorizationProviders) result.push({ name, type: p.type });
+  for (const [name, p] of authorizationProviders) {
+    result.push({
+      name,
+      type: p.type,
+      policy_resolution: typeof p.resolvePolicy === 'function' || typeof p.resolveAuthorization === 'function',
+    });
+  }
   for (const [name, p] of proofVerifiers) result.push({ name, type: p.type });
   return result;
 }

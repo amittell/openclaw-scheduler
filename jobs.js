@@ -6,6 +6,7 @@ import { enqueueDispatch } from './dispatch-queue.js';
 import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js';
 import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
+import { persistTerminalEvidence } from './runs.js';
 
 const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
@@ -15,11 +16,19 @@ const VALID_PAYLOAD_SCOPES = new Set(['own', 'global']);
 const VALID_DELIVERY_GUARANTEES = new Set(['at-most-once', 'at-least-once']);
 const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
 const VALID_APPROVAL_AUTO = new Set(['approve', 'reject']);
+const VALID_APPROVAL_RISK_LEVELS = new Set(['low', 'medium', 'high']);
+const VALID_OUTPUT_FORMATS = new Set(['json', 'ndjson', 'text']);
+const VALID_VERIFY_ON_FAILURE = new Set(['warn', 'error']);
 const VALID_CONTEXT_RETRIEVAL = new Set(['none', 'recent', 'hybrid']);
 const VALID_JOB_TYPES = new Set(['standard', 'watchdog']);
 const VALID_EXECUTION_INTENTS = new Set(['execute', 'plan', 'fire-and-forget']);
 const VALID_SHELL_ENV_POLICIES = new Set(['minimal', 'inherit']);
 const VALID_SCHEDULE_KINDS = new Set(['cron', 'at']);
+const VALID_CHECKSUM_EVIDENCE_BINDINGS = new Set([
+  'execution_id', 'command', 'contract', 'result', 'postcondition',
+  'identity', 'trust', 'authorization', 'authorization_proof',
+  'delegation', 'credential_handoff', 'context',
+]);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -60,6 +69,8 @@ const PATCHABLE_COLUMNS = new Set([
   'contract_sandbox', 'contract_allowed_paths', 'contract_network',
   'contract_max_cost_usd', 'contract_audit',
   'child_credential_policy',
+  'approval_risk_level', 'approval_approver_scope', 'output_format',
+  'verify_shell', 'verify_timeout_s', 'verify_on_failure',
 ]);
 
 function applyJobPatch(jobId, patch) {
@@ -149,6 +160,88 @@ function assertJsonBlob(name, value, maxBytes = 32768) {
   }
 }
 
+function assertKnownObjectKeys(name, value, allowed) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${name} must be a JSON object`);
+  }
+  const unknown = Object.keys(value).filter(key => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${name} contains unknown field(s): ${unknown.join(', ')}`);
+  }
+}
+
+function assertOptionalObject(name, value, allowed) {
+  if (value == null) return;
+  assertKnownObjectKeys(name, value, allowed);
+}
+
+function assertOptionalBoolean(name, value) {
+  if (value != null && typeof value !== 'boolean') {
+    throw new Error(`${name} must be a boolean`);
+  }
+}
+
+function assertOptionalStringArray(name, value) {
+  if (value == null) return;
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim())) {
+    throw new Error(`${name} must be an array of non-empty strings`);
+  }
+}
+
+const IDENTITY_SUBJECT_KEYS = new Set([
+  'kind', 'principal', 'display_name', 'run_as', 'issuer', 'delegation_mode',
+  'attributes', 'attributes_hash',
+]);
+const IDENTITY_AUTH_KEYS = new Set([
+  'mode', 'scopes', 'audience', 'resource', 'cache', 'refresh', 'required',
+  'delegation_policy', 'provider_config', 'inputs', 'provider',
+]);
+const IDENTITY_TRUST_KEYS = new Set(['level', 'effective_level', 'constraints']);
+const IDENTITY_TRUST_CONSTRAINT_KEYS = new Set([
+  'escalation', 'max_autonomy', 'escalation_timeout', 'require_justification',
+]);
+const PRESENTATION_KEYS = new Set([
+  'bindings', 'handoff', 'cleanup', 'default_redaction',
+  'mode', 'cleanup_required',
+]);
+const PRESENTATION_BINDING_KEYS = new Set([
+  'source', 'target', 'required', 'redact', 'format',
+  'env', 'path', 'cleanup',
+]);
+const PRESENTATION_TARGET_KEYS = new Set(['kind', 'name', 'prefix', 'expose_as']);
+const DELEGATION_HOP_KEYS = new Set([
+  'principal', 'grant', 'validated', 'delegator', 'delegatee',
+  'from_principal', 'to_principal', 'from', 'to',
+]);
+const VALUE_FROM_KEYS = new Set(['env', 'file', 'literal', 'command']);
+
+function validatePresentation(name, presentation) {
+  if (presentation == null) return;
+  assertKnownObjectKeys(name, presentation, PRESENTATION_KEYS);
+  assertOptionalBoolean(`${name}.default_redaction`, presentation.default_redaction);
+  assertOptionalBoolean(`${name}.cleanup_required`, presentation.cleanup_required);
+  if (presentation.bindings != null) {
+    if (!Array.isArray(presentation.bindings)) throw new Error(`${name}.bindings must be an array`);
+    for (const [index, binding] of presentation.bindings.entries()) {
+      const bindingName = `${name}.bindings[${index}]`;
+      assertKnownObjectKeys(bindingName, binding, PRESENTATION_BINDING_KEYS);
+      assertOptionalBoolean(`${bindingName}.required`, binding.required);
+      assertOptionalBoolean(`${bindingName}.redact`, binding.redact);
+      assertOptionalBoolean(`${bindingName}.cleanup`, binding.cleanup);
+      assertOptionalObject(`${bindingName}.target`, binding.target, PRESENTATION_TARGET_KEYS);
+    }
+  }
+}
+
+function validateDelegationChain(name, chain) {
+  if (chain == null) return;
+  if (!Array.isArray(chain)) throw new Error(`${name} must be an array`);
+  for (const [index, hop] of chain.entries()) {
+    assertKnownObjectKeys(`${name}[${index}]`, hop, DELEGATION_HOP_KEYS);
+    assertOptionalBoolean(`${name}[${index}].validated`, hop.validated);
+  }
+}
+
 function validateTriggerConditionSyntax(condition) {
   if (condition == null) return;
   assertSafeString('trigger_condition', condition, { maxLength: 1024 });
@@ -227,6 +320,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'contract_network',
     'contract_audit',
     'child_credential_policy',
+    'approval_risk_level',
+    'approval_approver_scope',
+    'output_format',
+    'verify_shell',
+    'verify_on_failure',
   ]) {
     if (key in normalized) normalized[key] = normalizeNullableString(normalized[key]);
   }
@@ -380,12 +478,67 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('delivery_guarantee', merged.delivery_guarantee || 'at-most-once', VALID_DELIVERY_GUARANTEES);
   assertEnum('job_class', merged.job_class || 'standard', VALID_JOB_CLASSES);
   assertEnum('approval_auto', merged.approval_auto || 'reject', VALID_APPROVAL_AUTO);
+  if (merged.approval_risk_level != null) {
+    assertEnum('approval_risk_level', merged.approval_risk_level, VALID_APPROVAL_RISK_LEVELS);
+  }
+  if (merged.output_format != null) {
+    assertEnum('output_format', merged.output_format, VALID_OUTPUT_FORMATS);
+  }
+  if (merged.verify_shell != null) {
+    assertSafeString('verify_shell', merged.verify_shell, { maxLength: 100000 });
+  }
+  if (merged.verify_on_failure != null) {
+    assertEnum('verify_on_failure', merged.verify_on_failure, VALID_VERIFY_ON_FAILURE);
+  }
   assertEnum('context_retrieval', merged.context_retrieval || 'none', VALID_CONTEXT_RETRIEVAL);
   assertEnum('job_type', merged.job_type || 'standard', VALID_JOB_TYPES);
   assertEnum('execution_intent', merged.execution_intent || 'execute', VALID_EXECUTION_INTENTS);
   assertEnum('shell_env_policy', merged.shell_env_policy || 'minimal', VALID_SHELL_ENV_POLICIES);
+  if (merged.approval_approver_scope != null) {
+    assertSafeString('approval_approver_scope', merged.approval_approver_scope, { maxLength: 256 });
+    const localName = '[A-Za-z0-9@._/-]+';
+    const localPrincipal = `(?:${localName}|local-user:[0-9]+)`;
+    const allowedScope = new RegExp(
+      `^(?:${localPrincipal}|user:${localName}|uid:[0-9]+|exact:${localPrincipal}|principal:${localPrincipal})$`,
+    );
+    if (!allowedScope.test(merged.approval_approver_scope)) {
+      throw new Error(
+        'approval_approver_scope must identify an authenticatable local OS account using exact, user:, uid:, or principal:',
+      );
+    }
+    if (!merged.approval_required) {
+      throw new Error('approval_approver_scope requires approval_required');
+    }
+    if ((merged.approval_auto || 'reject') === 'approve') {
+      throw new Error('approval_auto "approve" cannot be used with approval_approver_scope');
+    }
+  }
   if (merged.execution_intent === 'fire-and-forget' && (merged.session_target || 'isolated') !== 'main') {
     throw new Error('execution_intent "fire-and-forget" is only supported for session_target "main"');
+  }
+  if (merged.execution_intent === 'fire-and-forget' && merged.output_format != null) {
+    throw new Error('output_format is not supported for execution_intent "fire-and-forget" because no synchronous task output exists');
+  }
+  if (merged.execution_intent === 'fire-and-forget' && merged.verify_shell != null) {
+    throw new Error('verify_shell is not supported for execution_intent "fire-and-forget" because no synchronous task completion exists');
+  }
+  if (
+    merged.execution_intent === 'fire-and-forget'
+    && (merged.evidence != null || merged.evidence_ref != null)
+  ) {
+    throw new Error('evidence is not supported for execution_intent "fire-and-forget" because no synchronous execution result exists');
+  }
+  if (
+    (merged.job_type || 'standard') === 'watchdog'
+    && (merged.evidence != null || merged.evidence_ref != null)
+  ) {
+    throw new Error('evidence is not supported for watchdog jobs because watchdog_check_cmd is a separate execution contract');
+  }
+  if ((merged.job_type || 'standard') === 'watchdog' && merged.output_format != null) {
+    throw new Error('output_format is not supported for watchdog jobs because watchdog delivery occurs inside its health-check contract');
+  }
+  if ((merged.job_type || 'standard') === 'watchdog' && merged.verify_shell != null) {
+    throw new Error('verify_shell is not supported for watchdog jobs because watchdog delivery occurs inside its health-check contract');
   }
 
   if (merged.trigger_on != null) {
@@ -466,13 +619,70 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertJsonBlob('identity', merged.identity);
   if (merged.identity) {
     const identityBlob = JSON.parse(merged.identity);
+    assertKnownObjectKeys('identity', identityBlob, new Set([
+      'id', 'ref', 'provider', 'provider_config', 'scope', 'subject', 'auth', 'trust',
+      'presentation', 'credential_handoff', 'subject_kind', 'identity_subject_kind',
+      'principal', 'identity_principal', 'trust_level', 'identity_trust_level',
+      'delegation_mode', 'identity_delegation_mode', 'delegation_chain',
+      'delegation_policy',
+    ]));
+    assertOptionalObject('identity.subject', identityBlob.subject, IDENTITY_SUBJECT_KEYS);
+    assertOptionalObject('identity.auth', identityBlob.auth, IDENTITY_AUTH_KEYS);
+    if (identityBlob.auth) {
+      assertOptionalBoolean('identity.auth.required', identityBlob.auth.required);
+      assertOptionalStringArray('identity.auth.scopes', identityBlob.auth.scopes);
+      if (identityBlob.auth.inputs != null) {
+        assertKnownObjectKeys(
+          'identity.auth.inputs',
+          identityBlob.auth.inputs,
+          new Set(Object.keys(identityBlob.auth.inputs)),
+        );
+        for (const [inputName, valueFrom] of Object.entries(identityBlob.auth.inputs)) {
+          assertKnownObjectKeys(`identity.auth.inputs.${inputName}`, valueFrom, VALUE_FROM_KEYS);
+        }
+      }
+    }
+    assertOptionalObject('identity.trust', identityBlob.trust, IDENTITY_TRUST_KEYS);
+    if (identityBlob.trust) {
+      assertOptionalObject(
+        'identity.trust.constraints',
+        identityBlob.trust.constraints,
+        IDENTITY_TRUST_CONSTRAINT_KEYS,
+      );
+      assertOptionalBoolean(
+        'identity.trust.constraints.require_justification',
+        identityBlob.trust.constraints?.require_justification,
+      );
+    }
+    validatePresentation('identity.presentation', identityBlob.presentation);
+    validatePresentation('identity.credential_handoff', identityBlob.credential_handoff);
+    validateDelegationChain('identity.delegation_chain', identityBlob.delegation_chain);
+    const delegationPolicy = identityBlob.auth?.delegation_policy || identityBlob.delegation_policy;
+    if (delegationPolicy != null) {
+      assertKnownObjectKeys('identity delegation policy', delegationPolicy, new Set([
+        'max_depth', 'allowed_delegators', 'require_grant_per_hop',
+      ]));
+      if (delegationPolicy.max_depth != null) assertInt('identity delegation policy max_depth', delegationPolicy.max_depth, 1);
+      if (delegationPolicy.allowed_delegators != null && (
+        !Array.isArray(delegationPolicy.allowed_delegators)
+        || delegationPolicy.allowed_delegators.some(value => typeof value !== 'string' || !value)
+      )) {
+        throw new Error('identity delegation policy allowed_delegators must be an array of non-empty strings');
+      }
+      if (delegationPolicy.require_grant_per_hop != null && typeof delegationPolicy.require_grant_per_hop !== 'boolean') {
+        throw new Error('identity delegation policy require_grant_per_hop must be a boolean');
+      }
+    }
     const presentation = identityBlob && typeof identityBlob === 'object' && !Array.isArray(identityBlob)
       ? (identityBlob.presentation || identityBlob.credential_handoff || null)
       : null;
     if (presentation && typeof presentation === 'object' && !Array.isArray(presentation)) {
       const finalTarget = merged.session_target || 'isolated';
-      if (finalTarget !== 'shell') {
-        throw new Error('identity presentation / credential_handoff is only supported for session_target "shell"');
+      if (finalTarget === 'main') {
+        throw new Error('identity presentation / credential_handoff is not supported for session_target "main"');
+      }
+      if (finalTarget !== 'shell' && finalTarget !== 'isolated') {
+        throw new Error(`identity presentation / credential_handoff is not supported for session_target ${JSON.stringify(finalTarget)}`);
       }
     }
   }
@@ -480,14 +690,201 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // --- v0.2 Authorization Proof ---
   assertSafeString('authorization_proof_ref', merged.authorization_proof_ref, { maxLength: 256 });
   assertJsonBlob('authorization_proof', merged.authorization_proof);
+  if (merged.authorization_proof) {
+    const proofBlob = JSON.parse(merged.authorization_proof);
+    assertKnownObjectKeys('authorization_proof', proofBlob, new Set([
+      'id', 'ref', 'method', 'issuer', 'audience', 'jwks_uri', 'public_key',
+      'allowed_signers', 'principal', 'namespace', 'ca_certificate',
+      'ca_certificate_from', 'proof', 'claims', 'verify', 'verifier', 'provider',
+    ]));
+    if (proofBlob.method != null && !['none', 'jwt', 'detached-signature', 'certificate'].includes(proofBlob.method)) {
+      throw new Error('authorization_proof.method must be "none", "jwt", "detached-signature", or "certificate"');
+    }
+    assertOptionalObject('authorization_proof.verify', proofBlob.verify, new Set(['required']));
+    assertOptionalBoolean('authorization_proof.verify.required', proofBlob.verify?.required);
+    assertOptionalObject('authorization_proof.proof', proofBlob.proof, new Set(['value_from']));
+    assertOptionalObject('authorization_proof.proof.value_from', proofBlob.proof?.value_from, VALUE_FROM_KEYS);
+  }
 
   // --- v0.2 Authorization ---
   assertSafeString('authorization_ref', merged.authorization_ref, { maxLength: 256 });
   assertJsonBlob('authorization', merged.authorization);
+  if (merged.authorization) {
+    const authorizationBlob = JSON.parse(merged.authorization);
+    assertKnownObjectKeys('authorization', authorizationBlob, new Set([
+      'id', 'ref', 'provider', 'authorization_provider', 'provider_config',
+      'on_error', 'request', 'decision', 'reason', 'depends_on_trust',
+      'requires_identity',
+    ]));
+    assertOptionalObject('authorization.request', authorizationBlob.request, new Set(['include']));
+    assertOptionalStringArray('authorization.request.include', authorizationBlob.request?.include);
+    if (authorizationBlob.decision && typeof authorizationBlob.decision === 'object') {
+      if (!authorizationBlob.provider && !authorizationBlob.authorization_provider) {
+        throw new Error('authorization.decision mapping objects require an authorization provider');
+      }
+      assertKnownObjectKeys('authorization.decision', authorizationBlob.decision, new Set([
+        'allow_values', 'deny_values', 'escalate_values',
+      ]));
+      assertOptionalStringArray('authorization.decision.allow_values', authorizationBlob.decision.allow_values);
+      assertOptionalStringArray('authorization.decision.deny_values', authorizationBlob.decision.deny_values);
+      assertOptionalStringArray('authorization.decision.escalate_values', authorizationBlob.decision.escalate_values);
+    } else if (authorizationBlob.decision != null && typeof authorizationBlob.decision !== 'string') {
+      throw new Error('authorization.decision must be a string or decision mapping object');
+    }
+    assertOptionalBoolean('authorization.depends_on_trust', authorizationBlob.depends_on_trust);
+    assertOptionalBoolean('authorization.requires_identity', authorizationBlob.requires_identity);
+    if (
+      typeof authorizationBlob.decision === 'string'
+      && !['permit', 'deny', 'escalate'].includes(authorizationBlob.decision)
+    ) {
+      throw new Error('authorization.decision must be "permit", "deny", or "escalate"');
+    }
+  }
 
   // --- v0.2 Evidence ---
   assertSafeString('evidence_ref', merged.evidence_ref, { maxLength: 256 });
   assertJsonBlob('evidence', merged.evidence);
+  if (merged.evidence) {
+    const evidenceBlob = JSON.parse(merged.evidence);
+    assertKnownObjectKeys('evidence', evidenceBlob, new Set([
+      'id', 'ref', 'provider', 'methods', 'provider_config', 'payload', 'verify',
+      'collect', 'retention', 'format',
+    ]));
+    if (evidenceBlob.id != null) {
+      assertSafeString('evidence.id', evidenceBlob.id, { allowEmpty: false, maxLength: 256 });
+    }
+    if (evidenceBlob.ref != null) {
+      assertSafeString('evidence.ref', evidenceBlob.ref, { allowEmpty: false, maxLength: 256 });
+    }
+    if (evidenceBlob.ref && merged.evidence_ref && evidenceBlob.ref !== merged.evidence_ref) {
+      throw new Error('evidence.ref must match evidence_ref when both are provided');
+    }
+    const provider = evidenceBlob.provider || null;
+    const methods = evidenceBlob.methods == null
+      ? []
+      : Array.isArray(evidenceBlob.methods)
+        ? evidenceBlob.methods
+        : null;
+    if (methods === null || methods.some(method => typeof method !== 'string' || !method)) {
+      throw new Error('evidence.methods must be an array of non-empty strings');
+    }
+    if (evidenceBlob.methods != null && (methods.length !== 1 || methods[0] !== 'sha256')) {
+      throw new Error('evidence.methods must contain exactly one sha256 method');
+    }
+    if (evidenceBlob.verify?.required === true) {
+      throw new Error('evidence.verify.required is not supported by the scheduler checksum evidence backend');
+    }
+    assertOptionalObject('evidence.verify', evidenceBlob.verify, new Set(['required']));
+    assertOptionalBoolean('evidence.verify.required', evidenceBlob.verify?.required);
+    assertOptionalObject('evidence.payload', evidenceBlob.payload, new Set(['bind', 'context', 'format']));
+    assertOptionalStringArray('evidence.payload.bind', evidenceBlob.payload?.bind);
+    if (evidenceBlob.payload?.bind && new Set(evidenceBlob.payload.bind).size !== evidenceBlob.payload.bind.length) {
+      throw new Error('evidence.payload.bind must not contain duplicates');
+    }
+    if (evidenceBlob.payload?.context != null) {
+      if (
+        typeof evidenceBlob.payload.context !== 'object'
+        || Array.isArray(evidenceBlob.payload.context)
+        || evidenceBlob.payload.context === null
+      ) {
+        throw new Error('evidence.payload.context must be an object');
+      }
+      if (Buffer.byteLength(JSON.stringify(evidenceBlob.payload.context), 'utf8') > 16 * 1024) {
+        throw new Error('evidence.payload.context must not exceed 16384 bytes');
+      }
+    }
+    if (evidenceBlob.payload?.bind?.some(binding => !VALID_CHECKSUM_EVIDENCE_BINDINGS.has(binding))) {
+      throw new Error(
+        `evidence.payload.bind contains unsupported checksum binding; supported values are: ${[...VALID_CHECKSUM_EVIDENCE_BINDINGS].join(', ')}`,
+      );
+    }
+    const requestedBindings = new Set(evidenceBlob.payload?.bind || []);
+    const collectedEvidence = new Set(evidenceBlob.collect || [
+      'result', 'identity', 'authorization', 'governance', 'stdout', 'stderr', 'exit_code',
+    ]);
+    const hasIdentityDeclaration = Boolean(
+      merged.identity
+      || merged.identity_ref
+      || merged.identity_principal
+      || merged.identity_run_as
+      || merged.identity_attestation
+      || merged.identity_subject_kind
+      || merged.identity_subject_principal
+      || merged.identity_trust_level
+      || merged.identity_delegation_mode
+    );
+    const identityBlob = merged.identity ? JSON.parse(merged.identity) : null;
+    const hasCredentialHandoff = Boolean(
+      identityBlob?.presentation || identityBlob?.credential_handoff,
+    );
+    const bindingPrerequisites = [
+      ['identity', collectedEvidence.has('identity') && hasIdentityDeclaration],
+      ['trust', collectedEvidence.has('identity') && Boolean(hasIdentityDeclaration || merged.contract_required_trust_level)],
+      ['authorization', collectedEvidence.has('authorization') && Boolean(merged.authorization || merged.authorization_ref)],
+      ['authorization_proof', collectedEvidence.has('authorization') && Boolean(merged.authorization_proof || merged.authorization_proof_ref)],
+      ['delegation', collectedEvidence.has('identity') && hasIdentityDeclaration],
+      ['credential_handoff', collectedEvidence.has('identity') && hasCredentialHandoff],
+      ['context', Object.keys(evidenceBlob.payload?.context || {}).length > 0],
+    ];
+    for (const [binding, available] of bindingPrerequisites) {
+      if (requestedBindings.has(binding) && !available) {
+        throw new Error(`evidence.payload.bind ${binding} requires its declared runtime input and matching evidence.collect category`);
+      }
+    }
+    if (evidenceBlob.retention != null) {
+      if (
+        typeof evidenceBlob.retention !== 'string'
+        || !/^(?:forever|indefinite|[1-9]\d*(?:m|h|d|w|y))$/i.test(evidenceBlob.retention.trim())
+      ) {
+        throw new Error('evidence.retention must be forever or a positive duration such as 30d');
+      }
+      const retentionMatch = /^(\d+)([mhdwy])$/i.exec(evidenceBlob.retention.trim());
+      if (retentionMatch) {
+        const unitYears = { m: 1 / 525600, h: 1 / 8760, d: 1 / 365, w: 7 / 365, y: 1 };
+        if (Number(retentionMatch[1]) * unitYears[retentionMatch[2].toLowerCase()] > 100) {
+          throw new Error('evidence.retention must not exceed 100 years');
+        }
+      }
+    }
+    if (provider && !['sha256', 'checksum'].includes(provider)) {
+      throw new Error(`evidence provider ${JSON.stringify(provider)} is not supported; the scheduler currently supports only sha256 checksum evidence`);
+    }
+    if (methods.some(method => method !== 'sha256')) {
+      throw new Error('evidence.methods contains an unsupported method; the scheduler currently supports only sha256');
+    }
+    if (
+      evidenceBlob.provider_config != null
+      && (
+        typeof evidenceBlob.provider_config !== 'object'
+        || Array.isArray(evidenceBlob.provider_config)
+        || Object.keys(evidenceBlob.provider_config).length > 0
+      )
+    ) {
+      throw new Error('evidence.provider_config is not supported by the scheduler checksum evidence backend');
+    }
+    const evidenceFormat = evidenceBlob.payload?.format || evidenceBlob.format || null;
+    if (evidenceFormat && !['canonical-json', 'json'].includes(evidenceFormat)) {
+      throw new Error('evidence format must be "canonical-json" or "json" for checksum evidence');
+    }
+    if (evidenceBlob.collect != null) {
+      const supportedCollect = new Set([
+        'result', 'identity', 'authorization', 'governance', 'stdout', 'stderr', 'exit_code',
+      ]);
+      if (
+        !Array.isArray(evidenceBlob.collect)
+        || evidenceBlob.collect.length === 0
+        || evidenceBlob.collect.some(item => typeof item !== 'string' || !supportedCollect.has(item))
+      ) {
+        throw new Error(`evidence.collect must be a non-empty array containing: ${[...supportedCollect].join(', ')}`);
+      }
+      if (new Set(evidenceBlob.collect).size !== evidenceBlob.collect.length) {
+        throw new Error('evidence.collect must not contain duplicates');
+      }
+    }
+    if (evidenceBlob.payload?.format && !['canonical-json', 'json'].includes(evidenceBlob.payload.format)) {
+      throw new Error('evidence.payload.format must be "canonical-json" or "json" for checksum evidence');
+    }
+  }
 
   // --- v0.2 Contract ---
   assertEnum('contract_required_trust_level', merged.contract_required_trust_level,
@@ -531,6 +928,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     ['trigger_delay_s', 0],
     ['max_retries', 0],
     ['approval_timeout_s', 1],
+    ['verify_timeout_s', 1],
     ['context_retrieval_limit', 1],
     ['consecutive_errors', 0],
     ['max_queued_dispatches', 1],
@@ -682,9 +1080,10 @@ export function createJob(opts) {
       max_retries, payload_scope, resource_pool,
       trigger_condition,
       delivery_guarantee, job_class,
-      approval_required, approval_timeout_s, approval_auto,
+      approval_required, approval_timeout_s, approval_auto, approval_risk_level, approval_approver_scope,
       context_retrieval, context_retrieval_limit,
-      output_store_limit_bytes, output_excerpt_limit_bytes, output_summary_limit_bytes, output_offload_threshold_bytes,
+      output_store_limit_bytes, output_excerpt_limit_bytes, output_summary_limit_bytes, output_offload_threshold_bytes, output_format,
+      verify_shell, verify_timeout_s, verify_on_failure,
       preferred_session_key,
       job_type, watchdog_target_label, watchdog_check_cmd,
       watchdog_timeout_min, watchdog_alert_channel, watchdog_alert_target,
@@ -710,12 +1109,13 @@ export function createJob(opts) {
       ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?,
+      ?, ?, ?,
       ?, ?,
       ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?,
       ?,
       ?, ?, ?,
       ?, ?, ?,
@@ -778,12 +1178,18 @@ export function createJob(opts) {
     normalized.approval_required ? 1 : 0,
     normalized.approval_timeout_s || 3600,
     normalized.approval_auto || 'reject',
+    normalized.approval_risk_level || null,
+    normalized.approval_approver_scope || null,
     normalized.context_retrieval || 'none',
     normalized.context_retrieval_limit || 5,
     normalized.output_store_limit_bytes || 65536,
     normalized.output_excerpt_limit_bytes || 65536,
     normalized.output_summary_limit_bytes || 65536,
     normalized.output_offload_threshold_bytes || 65536,
+    normalized.output_format || null,
+    normalized.verify_shell || null,
+    normalized.verify_timeout_s ?? null,
+    normalized.verify_on_failure || null,
     normalized.preferred_session_key || null,
     normalized.job_type || 'standard',
     normalized.watchdog_target_label || null,
@@ -863,9 +1269,10 @@ export function updateJob(id, patch) {
     'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
     'max_retries', 'payload_scope', 'resource_pool', 'trigger_condition',
     'delivery_guarantee', 'job_class',
-    'approval_required', 'approval_timeout_s', 'approval_auto',
+    'approval_required', 'approval_timeout_s', 'approval_auto', 'approval_risk_level', 'approval_approver_scope',
     'context_retrieval', 'context_retrieval_limit',
-    'output_store_limit_bytes', 'output_excerpt_limit_bytes', 'output_summary_limit_bytes', 'output_offload_threshold_bytes',
+    'output_store_limit_bytes', 'output_excerpt_limit_bytes', 'output_summary_limit_bytes', 'output_offload_threshold_bytes', 'output_format',
+    'verify_shell', 'verify_timeout_s', 'verify_on_failure',
     'preferred_session_key',
     'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
     'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
@@ -946,6 +1353,28 @@ export function updateJob(id, patch) {
 export function deleteJob(id) {
   const db = getDb();
   const remove = () => {
+    const activeRuns = db.prepare(`
+      WITH RECURSIVE job_tree(id) AS (
+        SELECT id FROM jobs WHERE id = ?
+        UNION ALL
+        SELECT child.id
+        FROM jobs child
+        JOIN job_tree parent ON child.parent_id = parent.id
+      )
+      SELECT runs.id, runs.job_id, runs.status
+      FROM runs
+      JOIN job_tree ON job_tree.id = runs.job_id
+      WHERE runs.status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+      ORDER BY runs.started_at ASC
+    `).all(id);
+    if (activeRuns.length > 0) {
+      const error = new Error(
+        `Cannot delete job ${id} while ${activeRuns.length} active run(s) remain; cancel the job and poll run status before deleting`,
+      );
+      error.code = 'JOB_ACTIVE_RUNS';
+      error.activeRuns = activeRuns.map(run => ({ id: run.id, job_id: run.job_id, status: run.status }));
+      throw error;
+    }
     cancelApprovalsForJob(id, 'Job deleted before approval completed', {
       db,
       resolvedBy: 'scheduler',
@@ -956,13 +1385,16 @@ export function deleteJob(id) {
 }
 
 /**
- * Schedule an existing job for immediate execution via a durable manual dispatch.
- * Manual dispatches can run even when the job is disabled, without mutating the
- * stored cron schedule.
+ * Schedule an enabled job for immediate execution via a durable manual dispatch.
  */
 export function runJobNow(id) {
   const job = getJob(id);
   if (!job) return null;
+  if (job.enabled !== 1) {
+    const error = new Error(`Cannot run disabled job ${job.name}`);
+    error.code = 'JOB_DISABLED';
+    throw error;
+  }
   if (!canEnqueueDispatch(job.id, job.max_queued_dispatches || 25)) {
     throw new Error(`Dispatch backlog limit reached for ${job.name}`);
   }
@@ -1022,12 +1454,42 @@ export function pruneExpiredJobs() {
       AND delete_after_run = 1
       AND last_run_at IS NOT NULL
       AND last_run_at < datetime('now', '-24 hours')
+      AND COALESCE(last_status, '') != 'recovery_blocked'
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id
+          AND runs.status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+      )
+      AND NOT EXISTS (SELECT 1 FROM jobs child WHERE child.parent_id = jobs.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id AND runs.status = 'recovery_blocked'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM job_dispatch_queue queue
+        WHERE queue.job_id = jobs.id
+          AND queue.status IN ('pending', 'claimed', 'awaiting_approval')
+      )
   `).run();
   // Delete orphaned children whose parent no longer exists
   const orphans = db.prepare(`
     DELETE FROM jobs
     WHERE parent_id IS NOT NULL
       AND parent_id NOT IN (SELECT id FROM jobs)
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id AND runs.status = 'recovery_blocked'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id
+          AND runs.status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM job_dispatch_queue queue
+        WHERE queue.job_id = jobs.id
+          AND queue.status IN ('pending', 'claimed', 'awaiting_approval')
+      )
   `).run();
   // TTL pruning: delete disabled jobs that have completed and are past their ttl_hours window
   const ttlExpired = db.prepare(`
@@ -1037,6 +1499,22 @@ export function pruneExpiredJobs() {
       AND last_status IN ('ok', 'error', 'timeout')
       AND last_run_at IS NOT NULL
       AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
+      AND COALESCE(last_status, '') != 'recovery_blocked'
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id
+          AND runs.status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+      )
+      AND NOT EXISTS (SELECT 1 FROM jobs child WHERE child.parent_id = jobs.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM runs
+        WHERE runs.job_id = jobs.id AND runs.status = 'recovery_blocked'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM job_dispatch_queue queue
+        WHERE queue.job_id = jobs.id
+          AND queue.status IN ('pending', 'claimed', 'awaiting_approval')
+      )
   `).run();
   return aged.changes + orphans.changes + ttlExpired.changes;
 }
@@ -1269,6 +1747,7 @@ export function cancelJob(jobId, opts = {}) {
     }
 
     for (const cancelledJobId of cancelled) {
+      const cancelledJob = db.prepare('SELECT * FROM jobs WHERE id = ?').get(cancelledJobId);
       db.prepare('UPDATE jobs SET enabled = 0 WHERE id = ?').run(cancelledJobId);
 
       db.prepare(`
@@ -1296,7 +1775,17 @@ export function cancelJob(jobId, opts = {}) {
         if (run.status === 'running') {
           requestRunCancellation(run.id, { requestedBy, reason });
         } else {
-          cancelRunBeforeExecution(run.id, { requestedBy, reason });
+          const transition = cancelRunBeforeExecution(run.id, { requestedBy, reason });
+          if (transition.changed) {
+            persistTerminalEvidence(
+              cancelledJob,
+              run.id,
+              'cancelled',
+              { summary: reason, error_message: reason },
+              {},
+              { db },
+            );
+          }
         }
       }
     }

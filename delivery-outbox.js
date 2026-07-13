@@ -11,6 +11,10 @@ import {
 
 export const DEFAULT_DELIVERY_RETENTION_DAYS = 30;
 export const DEFAULT_DELIVERY_PRUNE_LIMIT = 500;
+// The inbox consumer prepends a bounded brand/subject/age header. Keeping the
+// durable body below this limit ensures one outbox part maps to one Telegram
+// send instead of being split again inside the Gateway client.
+export const DEFAULT_TELEGRAM_DELIVERY_PART_BYTES = 3600;
 
 export const DELIVERY_STATUSES = Object.freeze({
   PENDING: 'pending',
@@ -24,6 +28,78 @@ const TERMINAL_STATUSES = new Set([
   DELIVERY_STATUSES.DELIVERED,
   DELIVERY_STATUSES.CANCELLED,
 ]);
+
+function utf8Length(value) {
+  return Buffer.byteLength(String(value ?? ''), 'utf8');
+}
+
+function utf8PrefixIndex(value, maxBytes) {
+  let bytes = 0;
+  let index = 0;
+  for (const character of value) {
+    const characterBytes = utf8Length(character);
+    if (bytes + characterBytes > maxBytes) break;
+    bytes += characterBytes;
+    index += character.length;
+  }
+  return index;
+}
+
+function resolvePartBytes(channel, requestedBytes) {
+  if (requestedBytes != null) {
+    return positiveInteger(requestedBytes, null, 'maxPartBytes');
+  }
+  return String(channel || '').toLowerCase() === 'telegram'
+    ? DEFAULT_TELEGRAM_DELIVERY_PART_BYTES
+    : null;
+}
+
+/**
+ * Deterministically split a delivery body into independently retryable parts.
+ * The prefix budget is reserved before splitting so every returned part stays
+ * within maxPartBytes even for multi-byte text and large part counts.
+ */
+export function splitDeliveryBody(body, opts = {}) {
+  const text = String(body ?? '');
+  const maxPartBytes = resolvePartBytes(opts.channel, opts.maxPartBytes);
+  if (!maxPartBytes || utf8Length(text) <= maxPartBytes) return [text];
+  if (maxPartBytes < 256) throw new Error('maxPartBytes must be at least 256');
+
+  const prefixReserve = 32;
+  const contentLimit = maxPartBytes - prefixReserve;
+  const rawParts = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (utf8Length(remaining) <= contentLimit) {
+      rawParts.push(remaining);
+      break;
+    }
+
+    const hardIndex = utf8PrefixIndex(remaining, contentLimit);
+    if (hardIndex <= 0) throw new Error('maxPartBytes cannot hold the next UTF-8 character');
+    const minimumSoftBreak = Math.floor(hardIndex * 0.5);
+    let splitAt = remaining.lastIndexOf('\n', hardIndex);
+    if (splitAt < minimumSoftBreak) splitAt = remaining.lastIndexOf(' ', hardIndex);
+    if (splitAt < minimumSoftBreak) splitAt = hardIndex;
+
+    const part = remaining.slice(0, splitAt).trimEnd();
+    if (!part) {
+      rawParts.push(remaining.slice(0, hardIndex));
+      remaining = remaining.slice(hardIndex);
+    } else {
+      rawParts.push(part);
+      remaining = remaining.slice(splitAt).trimStart();
+    }
+  }
+
+  return rawParts.map((part, index) => {
+    const prefixed = `[${index + 1}/${rawParts.length}] ${part}`;
+    if (utf8Length(prefixed) > maxPartBytes) {
+      throw new Error(`delivery part ${index + 1} exceeds maxPartBytes after prefixing`);
+    }
+    return prefixed;
+  });
+}
 
 function sqliteTimestamp(value = Date.now()) {
   const date = value instanceof Date ? value : new Date(value);
@@ -85,9 +161,68 @@ function clearClaimSql() {
   return `claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL`;
 }
 
+function markCompletionDebt(db, delivery, status, reason) {
+  if (!delivery?.completion_label || !delivery?.completion_scope) return;
+  const terminal = status === 'closed';
+  db.prepare(`
+    UPDATE completion_debts
+    SET status = ?,
+        open_reason = CASE WHEN ? = 'open' THEN ? ELSE open_reason END,
+        close_reason = CASE WHEN ? = 'closed' THEN ? ELSE NULL END,
+        opened_at = CASE WHEN ? = 'open' THEN COALESCE(opened_at, datetime('now')) ELSE opened_at END,
+        closed_at = CASE WHEN ? = 'closed' THEN datetime('now') ELSE NULL END,
+        final_reported_at = CASE WHEN ? = 'closed' THEN datetime('now') ELSE final_reported_at END,
+        last_visible_update_at = CASE WHEN ? = 'closed' THEN datetime('now') ELSE last_visible_update_at END,
+        updated_at = datetime('now')
+    WHERE task_label = ? AND delivery_scope = ?
+  `).run(
+    status,
+    status, reason,
+    status, reason,
+    status,
+    status,
+    status,
+    status,
+    delivery.completion_label,
+    delivery.completion_scope,
+  );
+  if (terminal) return;
+}
+
+function reconcileCompletionDebt(db, delivery) {
+  if (!delivery?.completion_label || !delivery?.completion_scope) return;
+  const counts = db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered,
+      SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END) AS failed
+    FROM delivery_outbox
+    WHERE completion_label = ? AND completion_scope = ?
+  `).get(delivery.completion_label, delivery.completion_scope);
+  if (counts.total > 0 && counts.delivered === counts.total) {
+    markCompletionDebt(db, delivery, 'closed', 'confirmed-completion-delivered');
+  } else if (counts.failed > 0) {
+    markCompletionDebt(db, delivery, 'open', 'completion-delivery-failed');
+  } else {
+    markCompletionDebt(db, delivery, 'delivering', 'completion-enqueued-durably');
+  }
+}
+
+function cancelLaterGroupParts(db, delivery, reason) {
+  if (!delivery?.delivery_group_id || !Number.isInteger(delivery.part_index)) return 0;
+  return db.prepare(`
+    UPDATE delivery_outbox
+    SET status = 'cancelled', next_attempt_at = datetime('now'),
+        ${clearClaimSql()}, last_error = ?
+    WHERE delivery_group_id = ?
+      AND part_index > ?
+      AND status IN ('pending', 'failed')
+  `).run(reason, delivery.delivery_group_id, delivery.part_index).changes;
+}
+
 function recoverExpiredClaimsInTransaction(db, now) {
   const expired = db.prepare(`
-    SELECT id, attempt_count, max_attempts
+    SELECT *
     FROM delivery_outbox
     WHERE status = 'claimed'
       AND claim_expires_at IS NOT NULL
@@ -114,7 +249,13 @@ function recoverExpiredClaimsInTransaction(db, now) {
   let failed = 0;
   for (const row of expired) {
     if (row.attempt_count >= row.max_attempts) {
-      failed += fail.run(now, row.id, now).changes;
+      const changed = fail.run(now, row.id, now).changes;
+      failed += changed;
+      if (changed) {
+        const updated = getDeliveryRow(db, row.id);
+        cancelLaterGroupParts(db, updated, 'Multipart delivery stopped after an expired final claim');
+        reconcileCompletionDebt(db, updated);
+      }
     } else {
       pending += retry.run(now, row.id, now).changes;
     }
@@ -134,7 +275,20 @@ function attachmentIdentity(attachment) {
 
 function assertEquivalentIdempotentDelivery(existing, requested, existingAttachments, requestedAttachments) {
   const differingFields = [];
-  for (const field of ['channel', 'target', 'body', 'message_id', 'job_id', 'run_id']) {
+  const legacySinglePartUpgrade = existing.delivery_group_id == null
+    && existing.part_index == null
+    && existing.part_count == null
+    && requested.delivery_group_id === requested.idempotency_key
+    && requested.part_index === 1
+    && requested.part_count === 1;
+  for (const field of [
+    'channel', 'target', 'body', 'message_id', 'job_id', 'run_id',
+    'delivery_group_id', 'part_index', 'part_count',
+    'completion_label', 'completion_scope',
+  ]) {
+    if (legacySinglePartUpgrade && ['delivery_group_id', 'part_index', 'part_count'].includes(field)) {
+      continue;
+    }
     if ((existing[field] ?? null) !== (requested[field] ?? null)) differingFields.push(field);
   }
   const existingIdentity = existingAttachments.map(attachmentIdentity);
@@ -175,6 +329,32 @@ export function enqueueDelivery(opts = {}) {
   const messageId = opts.messageId ?? opts.message_id ?? null;
   const jobId = opts.jobId ?? opts.job_id ?? null;
   const runId = opts.runId ?? opts.run_id ?? null;
+  const deliveryGroupIdValue = opts.deliveryGroupId ?? opts.delivery_group_id ?? null;
+  const deliveryGroupId = deliveryGroupIdValue == null
+    ? null
+    : requiredString(deliveryGroupIdValue, 'deliveryGroupId');
+  const partIndexValue = opts.partIndex ?? opts.part_index ?? null;
+  const partCountValue = opts.partCount ?? opts.part_count ?? null;
+  if ((partIndexValue == null) !== (partCountValue == null)) {
+    throw new Error('partIndex and partCount must be provided together');
+  }
+  const partIndex = partIndexValue == null ? null : positiveInteger(partIndexValue, null, 'partIndex');
+  const partCount = partCountValue == null ? null : positiveInteger(partCountValue, null, 'partCount');
+  if (partIndex != null && partIndex > partCount) throw new Error('partIndex cannot exceed partCount');
+  if (deliveryGroupId == null && partIndex != null) {
+    throw new Error('deliveryGroupId is required for multipart metadata');
+  }
+  const completionLabelValue = opts.completionLabel ?? opts.completion_label ?? null;
+  const completionScopeValue = opts.completionScope ?? opts.completion_scope ?? null;
+  if ((completionLabelValue == null) !== (completionScopeValue == null)) {
+    throw new Error('completionLabel and completionScope must be provided together');
+  }
+  const completionLabel = completionLabelValue == null
+    ? null
+    : requiredString(completionLabelValue, 'completionLabel');
+  const completionScope = completionScopeValue == null
+    ? null
+    : requiredString(completionScopeValue, 'completionScope');
   const requested = {
     channel,
     target,
@@ -183,6 +363,11 @@ export function enqueueDelivery(opts = {}) {
     job_id: jobId,
     run_id: runId,
     idempotency_key: normalizedKey,
+    delivery_group_id: deliveryGroupId,
+    part_index: partIndex,
+    part_count: partCount,
+    completion_label: completionLabel,
+    completion_scope: completionScope,
   };
   const outerTransaction = db.inTransaction;
   const staged = stageDeliveryAttachments(id, attachments, {
@@ -200,8 +385,9 @@ export function enqueueDelivery(opts = {}) {
       const info = db.prepare(`
         INSERT INTO delivery_outbox (
           id, message_id, job_id, run_id, channel, target, body,
-          status, idempotency_key, max_attempts, next_attempt_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+          status, idempotency_key, delivery_group_id, part_index, part_count,
+          completion_label, completion_scope, max_attempts, next_attempt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
       `).run(
         id,
@@ -212,6 +398,11 @@ export function enqueueDelivery(opts = {}) {
         target,
         body,
         normalizedKey,
+        deliveryGroupId,
+        partIndex,
+        partCount,
+        completionLabel,
+        completionScope,
         maxAttempts,
         nextAttemptAt
       );
@@ -262,9 +453,111 @@ export function enqueueDelivery(opts = {}) {
   }
 }
 
+/**
+ * Enqueue a logical delivery as one or more independently claimed outbox rows.
+ * A deterministic per-part idempotency key is the durable checkpoint: retries
+ * claim only parts that have not already reached a terminal delivered state.
+ */
+export function enqueueMultipartDelivery(opts = {}) {
+  const db = opts.db || getDb();
+  const channel = requiredString(opts.channel, 'channel');
+  const body = requiredString(opts.body, 'body', { allowEmpty: true });
+  const parts = splitDeliveryBody(body, {
+    channel,
+    maxPartBytes: opts.maxPartBytes ?? opts.max_part_bytes,
+  });
+
+  const suppliedKey = opts.idempotencyKey ?? opts.idempotency_key ?? null;
+  if (suppliedKey != null && (typeof suppliedKey !== 'string' || !suppliedKey.trim())) {
+    throw new Error('idempotencyKey must be a non-empty string when provided');
+  }
+  const baseKey = suppliedKey?.trim() || null;
+  const groupId = opts.deliveryGroupId ?? opts.delivery_group_id ?? baseKey ?? randomUUID();
+
+  if (parts.length === 1) {
+    const delivery = enqueueDelivery({
+      ...opts,
+      db,
+      channel,
+      body: parts[0],
+      deliveryGroupId: groupId,
+      partIndex: 1,
+      partCount: 1,
+    });
+    return {
+      ...delivery,
+      partCount: 1,
+      deliveries: [delivery],
+      checkpointKey: delivery.idempotency_key || null,
+    };
+  }
+
+  const attachments = opts.attachments || [];
+  if (!Array.isArray(attachments)) throw new Error('attachments must be an array');
+  if (attachments.length > 0) {
+    throw new Error('multipart delivery attachments must be enqueued as a separate logical delivery');
+  }
+
+  const deliveries = immediate(db, () => parts.map((part, index) => enqueueDelivery({
+    ...opts,
+    db,
+    id: opts.id ? `${opts.id}:part:${index + 1}` : undefined,
+    channel,
+    body: part,
+    attachments: [],
+    deliveryGroupId: groupId,
+    partIndex: index + 1,
+    partCount: parts.length,
+    idempotencyKey: baseKey ? `${baseKey}:part:${index + 1}/${parts.length}` : null,
+  })));
+
+  return {
+    ...deliveries[0],
+    deduped: deliveries.every(delivery => delivery.deduped === true),
+    partCount: deliveries.length,
+    deliveries,
+    checkpointKey: baseKey,
+  };
+}
+
 export function getDelivery(id, opts = {}) {
   const db = opts.db || getDb();
   return decorateDelivery(db, getDeliveryRow(db, id), opts);
+}
+
+/**
+ * Return durable per-part progress for a logical idempotency key. This uses the
+ * existing outbox schema, where each part is a normal independently leased row.
+ */
+export function getDeliveryCheckpoint(idempotencyKey, opts = {}) {
+  const db = opts.db || getDb();
+  const baseKey = requiredString(idempotencyKey, 'idempotencyKey');
+  const partPrefix = `${baseKey}:part:`;
+  const rows = db.prepare(`
+    SELECT o.*, j.name AS job_name
+    FROM delivery_outbox o
+    LEFT JOIN jobs j ON j.id = o.job_id
+    WHERE o.idempotency_key = ?
+       OR instr(o.idempotency_key, ?) = 1
+    ORDER BY o.created_at ASC, o.id ASC
+  `).all(baseKey, partPrefix)
+    .sort((left, right) => {
+      const leftPart = Number.parseInt(left.idempotency_key?.slice(partPrefix.length).split('/')[0] || '0', 10);
+      const rightPart = Number.parseInt(right.idempotency_key?.slice(partPrefix.length).split('/')[0] || '0', 10);
+      return leftPart - rightPart;
+    })
+    .map(row => decorateDelivery(db, row, opts));
+  const statusCounts = Object.fromEntries(
+    Object.values(DELIVERY_STATUSES).map(status => [status, 0])
+  );
+  for (const row of rows) statusCounts[row.status] = (statusCounts[row.status] || 0) + 1;
+  return {
+    idempotencyKey: baseKey,
+    partCount: rows.length,
+    complete: rows.length > 0 && rows.every(row => row.status === DELIVERY_STATUSES.DELIVERED),
+    statusCounts,
+    deliveries: rows,
+  };
 }
 
 export function getDeliveryByIdempotencyKey(idempotencyKey, opts = {}) {
@@ -349,6 +642,10 @@ export function claimDueDeliveries(opts = {}) {
 
   return immediate(db, () => {
     recoverExpiredClaimsInTransaction(db, now);
+    const exhaustedPending = db.prepare(`
+      SELECT * FROM delivery_outbox
+      WHERE status = 'pending' AND attempt_count >= max_attempts
+    `).all();
     db.prepare(`
       UPDATE delivery_outbox
       SET status = 'failed',
@@ -356,8 +653,23 @@ export function claimDueDeliveries(opts = {}) {
           last_error = COALESCE(last_error, 'Delivery attempt limit exhausted')
       WHERE status = 'pending' AND attempt_count >= max_attempts
     `).run(now);
+    for (const exhausted of exhaustedPending) {
+      const updated = getDeliveryRow(db, exhausted.id);
+      cancelLaterGroupParts(db, updated, 'Multipart delivery stopped after its attempt limit was exhausted');
+      reconcileCompletionDebt(db, updated);
+    }
 
-    const where = ["o.status = 'pending'", 'o.next_attempt_at <= ?', 'o.attempt_count < o.max_attempts'];
+    const where = [
+      "o.status = 'pending'",
+      'o.next_attempt_at <= ?',
+      'o.attempt_count < o.max_attempts',
+      `(o.delivery_group_id IS NULL OR o.part_index IS NULL OR o.part_index <= 1 OR NOT EXISTS (
+        SELECT 1 FROM delivery_outbox predecessor
+        WHERE predecessor.delivery_group_id = o.delivery_group_id
+          AND predecessor.part_index < o.part_index
+          AND predecessor.status != 'delivered'
+      ))`,
+    ];
     const params = [now];
     if (opts.channel) {
       where.push('o.channel = ?');
@@ -371,7 +683,9 @@ export function claimDueDeliveries(opts = {}) {
       SELECT o.id
       FROM delivery_outbox o
       WHERE ${where.join(' AND ')}
-      ORDER BY o.next_attempt_at ASC, o.created_at ASC, o.id ASC
+      ORDER BY o.next_attempt_at ASC, o.created_at ASC,
+               COALESCE(o.delivery_group_id, o.id) ASC,
+               COALESCE(o.part_index, 1) ASC, o.id ASC
       LIMIT ?
     `).all(...params, limit);
     return claimCandidates(db, candidates.map(row => row.id), owner, now, leaseExpiresAt);
@@ -389,7 +703,25 @@ export function claimDelivery(id, opts = {}) {
   const leaseExpiresAt = sqliteTimestamp(nowMs + leaseMs);
   return immediate(db, () => {
     recoverExpiredClaimsInTransaction(db, now);
-    return claimCandidates(db, [id], owner, now, leaseExpiresAt)[0] || null;
+    const candidate = db.prepare(`
+      SELECT o.id
+      FROM delivery_outbox o
+      WHERE o.id = ?
+        AND (
+          o.delivery_group_id IS NULL
+          OR o.part_index IS NULL
+          OR o.part_index <= 1
+          OR NOT EXISTS (
+            SELECT 1 FROM delivery_outbox predecessor
+            WHERE predecessor.delivery_group_id = o.delivery_group_id
+              AND predecessor.part_index < o.part_index
+              AND predecessor.status != 'delivered'
+          )
+        )
+    `).get(id);
+    return candidate
+      ? claimCandidates(db, [candidate.id], owner, now, leaseExpiresAt)[0] || null
+      : null;
   });
 }
 
@@ -442,8 +774,10 @@ export function markDeliveryDelivered(id, claimToken, opts = {}) {
           last_error = NULL
       WHERE id = ? AND status = 'claimed' AND claim_token = ?
     `).run(id, claimToken);
+    const delivered = getDeliveryRow(db, id);
+    if (info.changes === 1) reconcileCompletionDebt(db, delivered);
     return {
-      ...decorateDelivery(db, getDeliveryRow(db, id)),
+      ...decorateDelivery(db, delivered),
       transitioned: info.changes === 1,
     };
   });
@@ -472,8 +806,13 @@ export function retryDelivery(id, claimToken, error, opts = {}) {
           last_error = ?
       WHERE id = ? AND status = 'claimed' AND claim_token = ?
     `).run(nextStatus, nextStatus, nextAttemptAt, terminalAt, errorText, id, claimToken);
+    const updated = getDeliveryRow(db, id);
+    if (info.changes === 1) {
+      if (exhausted) cancelLaterGroupParts(db, updated, `Multipart delivery stopped after part ${updated.part_index || '?'} failed: ${errorText}`);
+      reconcileCompletionDebt(db, updated);
+    }
     return {
-      ...decorateDelivery(db, getDeliveryRow(db, id)),
+      ...decorateDelivery(db, updated),
       transitioned: info.changes === 1,
       retryScheduled: info.changes === 1 && !exhausted,
     };
@@ -500,8 +839,13 @@ export function markDeliveryFailed(id, claimToken, error, opts = {}) {
           last_error = ?
       WHERE id = ? AND status = 'claimed' AND claim_token = ?
     `).run(errorText, id, claimToken);
+    const updated = getDeliveryRow(db, id);
+    if (info.changes === 1) {
+      cancelLaterGroupParts(db, updated, `Multipart delivery stopped after part ${updated.part_index || '?'} failed: ${errorText}`);
+      reconcileCompletionDebt(db, updated);
+    }
     return {
-      ...decorateDelivery(db, getDeliveryRow(db, id)),
+      ...decorateDelivery(db, updated),
       transitioned: info.changes === 1,
     };
   });
@@ -527,8 +871,13 @@ export function cancelDelivery(id, reason = 'Delivery cancelled', opts = {}) {
           last_error = ?
       WHERE id = ? AND status IN ('pending', 'claimed', 'failed')
     `).run(reasonText, id);
+    const updated = getDeliveryRow(db, id);
+    if (info.changes === 1) {
+      cancelLaterGroupParts(db, updated, `Multipart delivery stopped after cancellation: ${reasonText}`);
+      reconcileCompletionDebt(db, updated);
+    }
     return {
-      ...decorateDelivery(db, getDeliveryRow(db, id)),
+      ...decorateDelivery(db, updated),
       transitioned: info.changes === 1,
     };
   });
@@ -537,29 +886,45 @@ export function cancelDelivery(id, reason = 'Delivery cancelled', opts = {}) {
 export function cancelDeliveriesForRun(runId, reason = 'Run cancelled', opts = {}) {
   const db = opts.db || getDb();
   const reasonText = String(reason || 'Run cancelled').slice(0, 4000);
-  const info = db.prepare(`
-    UPDATE delivery_outbox
-    SET status = 'cancelled',
-        next_attempt_at = datetime('now'),
-        ${clearClaimSql()},
-        last_error = ?
-    WHERE run_id = ? AND status IN ('pending', 'claimed', 'failed')
-  `).run(reasonText, runId);
-  return info.changes;
+  return immediate(db, () => {
+    const linked = db.prepare(`
+      SELECT DISTINCT completion_label, completion_scope
+      FROM delivery_outbox
+      WHERE run_id = ? AND completion_label IS NOT NULL
+    `).all(runId);
+    const info = db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'cancelled',
+          next_attempt_at = datetime('now'),
+          ${clearClaimSql()},
+          last_error = ?
+      WHERE run_id = ? AND status IN ('pending', 'claimed', 'failed')
+    `).run(reasonText, runId);
+    for (const completion of linked) reconcileCompletionDebt(db, completion);
+    return info.changes;
+  });
 }
 
 export function cancelDeliveriesForJob(jobId, reason = 'Job cancelled', opts = {}) {
   const db = opts.db || getDb();
   const reasonText = String(reason || 'Job cancelled').slice(0, 4000);
-  const info = db.prepare(`
-    UPDATE delivery_outbox
-    SET status = 'cancelled',
-        next_attempt_at = datetime('now'),
-        ${clearClaimSql()},
-        last_error = ?
-    WHERE job_id = ? AND status IN ('pending', 'claimed', 'failed')
-  `).run(reasonText, jobId);
-  return info.changes;
+  return immediate(db, () => {
+    const linked = db.prepare(`
+      SELECT DISTINCT completion_label, completion_scope
+      FROM delivery_outbox
+      WHERE job_id = ? AND completion_label IS NOT NULL
+    `).all(jobId);
+    const info = db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'cancelled',
+          next_attempt_at = datetime('now'),
+          ${clearClaimSql()},
+          last_error = ?
+      WHERE job_id = ? AND status IN ('pending', 'claimed', 'failed')
+    `).run(reasonText, jobId);
+    for (const completion of linked) reconcileCompletionDebt(db, completion);
+    return info.changes;
+  });
 }
 
 export function retryFailedDelivery(id, opts = {}) {
@@ -568,6 +933,8 @@ export function retryFailedDelivery(id, opts = {}) {
   const resetAttempts = opts.resetAttempts !== false;
   const nextAttemptAt = sqliteTimestamp(opts.nextAttemptAt ?? Date.now());
   return immediate(db, () => {
+    const before = getDeliveryRow(db, id);
+    if (!before) return null;
     const info = db.prepare(`
       UPDATE delivery_outbox
       SET status = 'pending',
@@ -585,7 +952,18 @@ export function retryFailedDelivery(id, opts = {}) {
       nextAttemptAt,
       id
     );
+    if (info.changes === 1 && before.delivery_group_id && Number.isInteger(before.part_index)) {
+      db.prepare(`
+        UPDATE delivery_outbox
+        SET status = 'pending', attempt_count = 0, max_attempts = ?,
+            next_attempt_at = ?, ${clearClaimSql()}, last_error = NULL
+        WHERE delivery_group_id = ?
+          AND part_index > ?
+          AND status = 'cancelled'
+      `).run(maxAttempts, nextAttemptAt, before.delivery_group_id, before.part_index);
+    }
     const row = getDeliveryRow(db, id);
+    if (info.changes === 1) reconcileCompletionDebt(db, row);
     return row ? { ...decorateDelivery(db, row), transitioned: info.changes === 1 } : null;
   });
 }

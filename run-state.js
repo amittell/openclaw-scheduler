@@ -39,6 +39,14 @@ const FINISH_FIELD_COLUMNS = new Map([
   ['shell_stdout_bytes', 'shell_stdout_bytes'],
   ['shell_stderr_bytes', 'shell_stderr_bytes'],
   ['process_terminated_at', 'process_terminated_at'],
+  ['output_format', 'output_format'],
+  ['structured_output', 'structured_output'],
+  ['structured_output_valid', 'structured_output_valid'],
+  ['structured_output_warning', 'structured_output_warning'],
+  ['structured_output_bytes', 'structured_output_bytes'],
+  ['structured_output_sha256', 'structured_output_sha256'],
+  ['structured_output_path', 'structured_output_path'],
+  ['verification_result', 'verification_result'],
 ]);
 
 function assertRunId(runId) {
@@ -358,7 +366,9 @@ export function transitionRunTerminal(runId, status, fields = {}, opts = {}) {
   for (const [field, column] of FINISH_FIELD_COLUMNS) {
     if (!(field in fields) || fields[field] == null) continue;
     let value = fields[field];
-    if (field === 'context_summary' && typeof value !== 'string') value = JSON.stringify(value);
+    if ((field === 'context_summary' || field === 'verification_result') && typeof value !== 'string') {
+      value = JSON.stringify(value);
+    }
     if (field === 'shell_timed_out') value = Number(Boolean(value));
     sets.push(`${column} = ?`);
     values.push(value);

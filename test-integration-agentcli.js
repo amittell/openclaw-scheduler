@@ -2,10 +2,12 @@
 // Integration tests: validate that job specs compiled by agentcli can
 // round-trip through the scheduler's validation and storage layer.
 
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 
 import { setDbPath, initDb, getDb } from './db.js';
 import { validateJobSpec, createJob, getJob } from './jobs.js';
@@ -17,6 +19,8 @@ const AGENTCLI_PATH = process.env.AGENTCLI_PATH || resolve(__dirname, '../agentc
 const agentcliBin = resolve(AGENTCLI_PATH, 'bin/agentcli.js');
 const agentcliExamples = resolve(AGENTCLI_PATH, 'examples');
 const agentcliAvailable = existsSync(agentcliBin);
+const agentcliRequired = process.env.REQUIRE_AGENTCLI_INTEGRATION === '1';
+const expectedAgentcliContract = process.env.AGENTCLI_CONTRACT || null;
 
 // -- Test harness (matches test.js pattern) --------------------
 
@@ -33,18 +37,113 @@ function assert(cond, msg) {
 
 function compileManifest(manifestPath) {
   try {
-    const result = execFileSync('node', [agentcliBin, 'compile', manifestPath, '--target', 'openclaw-scheduler'], {
+    const result = execFileSync(process.execPath, [agentcliBin, 'compile', manifestPath, '--target', 'openclaw-scheduler'], {
       encoding: 'utf-8',
       timeout: 10000,
     });
     const parsed = JSON.parse(result);
     if (!parsed.ok || !parsed.output || !Array.isArray(parsed.output.jobs)) {
-      return null;
+      throw new Error('agentcli compile returned an invalid scheduler payload');
     }
     return parsed.output;
-  } catch {
+  } catch (error) {
+    if (agentcliRequired) {
+      throw new Error(`Required agentcli compile failed for ${manifestPath}: ${error.message}`, { cause: error });
+    }
     return null;
   }
+}
+
+function applyManifest(manifestPath) {
+  const fixture = mkdtempSync(join(tmpdir(), 'scheduler-agentcli-apply-'));
+  const dbPath = join(fixture, 'scheduler.db');
+  try {
+    const output = execFileSync(process.execPath, [
+      agentcliBin,
+      'apply',
+      manifestPath,
+      '--db', dbPath,
+      '--scheduler-prefix', __dirname,
+    ], {
+      encoding: 'utf-8',
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        SCHEDULER_DB: dbPath,
+      },
+    });
+    const db = new Database(dbPath, { readonly: true });
+    let jobs;
+    try {
+      jobs = db.prepare('SELECT * FROM jobs ORDER BY id').all();
+    } finally {
+      db.close();
+    }
+    return { result: JSON.parse(output), jobs };
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+function applyManifestExpectingFailure(manifestPath) {
+  const fixture = mkdtempSync(join(tmpdir(), 'scheduler-agentcli-apply-failure-'));
+  const dbPath = join(fixture, 'scheduler.db');
+  try {
+    try {
+      execFileSync(process.execPath, [
+        agentcliBin,
+        'apply',
+        manifestPath,
+        '--db', dbPath,
+        '--scheduler-prefix', __dirname,
+      ], {
+        encoding: 'utf-8',
+        timeout: 30_000,
+        env: { ...process.env, SCHEDULER_DB: dbPath },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return null;
+    } catch (error) {
+      const output = String(error.stdout || error.stderr || '').trim();
+      try {
+        return JSON.parse(output);
+      } catch {
+        return { ok: false, error: { message: output || error.message } };
+      }
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+function withManifestFile(manifest, callback) {
+  const fixture = mkdtempSync(join(tmpdir(), 'scheduler-agentcli-manifest-'));
+  const manifestPath = join(fixture, 'manifest.json');
+  try {
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    return callback(manifestPath);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+function unsupportedEvidenceReason(spec) {
+  if (spec.evidence == null) return null;
+  let evidence;
+  try {
+    evidence = typeof spec.evidence === 'string' ? JSON.parse(spec.evidence) : spec.evidence;
+  } catch {
+    return 'malformed evidence declaration';
+  }
+  if (evidence?.verify?.required === true) return 'required external evidence verification';
+  if (evidence?.provider && !['sha256', 'checksum'].includes(evidence.provider)) {
+    return `unsupported evidence provider ${evidence.provider}`;
+  }
+  if (Array.isArray(evidence?.methods)
+      && evidence.methods.some(method => method !== 'sha256')) {
+    return 'unsupported evidence method';
+  }
+  return null;
 }
 
 /**
@@ -301,11 +400,15 @@ const v02Spec = {
   identity_subject_principal: 'arn:aws:iam::123:role/test',
   identity: JSON.stringify({ ref: 'aws-role', subject: { kind: 'service', principal: 'arn:aws:iam::123:role/test' }, trust: { level: 'supervised' } }),
   authorization_proof_ref: 'jwt-proof',
-  authorization_proof: JSON.stringify({ method: 'signed-jwt', claims: { iss: 'test' } }),
+  authorization_proof: JSON.stringify({ method: 'none', claims: { iss: 'test' }, verify: { required: false } }),
   authorization_ref: 'opa-policy',
-  authorization: JSON.stringify({ provider: 'opa', request: { action: 'execute' } }),
-  evidence_ref: 'ssh-evidence',
-  evidence: JSON.stringify({ provider: 'ssh', methods: ['payload-signature'] }),
+  authorization: JSON.stringify({ provider: 'opa', request: { include: ['command'] } }),
+  evidence_ref: 'checksum-evidence',
+  evidence: JSON.stringify({
+    provider: 'sha256',
+    methods: ['sha256'],
+    verify: { required: false },
+  }),
   contract_required_trust_level: 'supervised',
   contract_trust_enforcement: 'block',
   contract_sandbox: 'strict',
@@ -346,7 +449,7 @@ if (!v02Threw) {
   // authorization proof
   assert(v02Fetched.authorization_proof_ref === 'jwt-proof', 'authorization_proof_ref round-trips');
   const authProofParsed = JSON.parse(v02Fetched.authorization_proof);
-  assert(authProofParsed.method === 'signed-jwt', 'authorization_proof blob round-trips');
+  assert(authProofParsed.method === 'none', 'authorization_proof blob round-trips');
 
   // authorization
   assert(v02Fetched.authorization_ref === 'opa-policy', 'authorization_ref round-trips');
@@ -354,9 +457,10 @@ if (!v02Threw) {
   assert(authParsed.provider === 'opa', 'authorization blob round-trips');
 
   // evidence
-  assert(v02Fetched.evidence_ref === 'ssh-evidence', 'evidence_ref round-trips');
+  assert(v02Fetched.evidence_ref === 'checksum-evidence', 'evidence_ref round-trips');
   const evidenceParsed = JSON.parse(v02Fetched.evidence);
-  assert(evidenceParsed.provider === 'ssh', 'evidence blob round-trips');
+  assert(evidenceParsed.provider === 'sha256', 'supported evidence provider round-trips');
+  assert(evidenceParsed.methods[0] === 'sha256', 'supported evidence method round-trips');
 
   // contract fields
   assert(v02Fetched.contract_required_trust_level === 'supervised', 'contract_required_trust_level round-trips');
@@ -370,10 +474,10 @@ if (!v02Threw) {
 }
 
 // ===============================================================
-// (d) All agentcli examples compile and validate (if available)
+// (d) All agentcli examples compile and satisfy the scheduler contract
 // ===============================================================
 
-console.log('\nAll agentcli examples compile and validate:');
+console.log('\nAll agentcli examples satisfy the scheduler validation contract:');
 
 if (agentcliAvailable && existsSync(agentcliExamples)) {
   const exampleFiles = readdirSync(agentcliExamples)
@@ -382,6 +486,7 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
 
   let examplesCompiled = 0;
   let examplesFailed = 0;
+  let expectedEvidenceRejections = 0;
 
   for (const file of exampleFiles) {
     const manifestPath = resolve(agentcliExamples, file);
@@ -397,20 +502,173 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
       const spec = toSchedulerSpec(compiledJob);
       // Use a unique id to avoid collisions from reused stable IDs across examples
       spec.id = `example-${file}-${spec.id}`;
-      let threw = false;
+      const expectedRejection = unsupportedEvidenceReason(spec);
+      let validationError = null;
       try {
         // Validate only (skip createJob to avoid parent_id conflicts across examples)
         validateJobSpec(spec, null, 'create');
       } catch (err) {
-        threw = true;
-        console.error(`    validateJobSpec threw for ${file} / ${compiledJob.name}: ${err.message}`);
+        validationError = err;
       }
-      assert(!threw, `${file}: "${compiledJob.name}" validates`);
+      if (expectedRejection) {
+        expectedEvidenceRejections++;
+        assert(
+          validationError != null,
+          `${file}: "${compiledJob.name}" fails closed for ${expectedRejection}`,
+        );
+        assert(
+          /evidence.*(?:not supported|unsupported|verification|sha256)/i.test(validationError?.message || ''),
+          `${file}: "${compiledJob.name}" reports a clear unsupported evidence error`,
+        );
+      } else {
+        if (validationError) {
+          console.error(`    validateJobSpec threw for ${file} / ${compiledJob.name}: ${validationError.message}`);
+        }
+        assert(!validationError, `${file}: "${compiledJob.name}" validates`);
+      }
     }
   }
 
   assert(examplesCompiled > 0, `compiled at least one example (${examplesCompiled}/${exampleFiles.length})`);
   assert(examplesFailed === 0, `no examples failed to compile (${examplesFailed} failures)`);
+  if (expectedAgentcliContract) {
+    assert(
+      expectedEvidenceRejections > 0,
+      `${expectedAgentcliContract} public examples exercise fail-closed evidence compatibility`,
+    );
+  }
+
+  if (expectedAgentcliContract === 'handoff-v3') {
+    const shellOutput = compileManifest(resolve(agentcliExamples, 'shell-workflow.json'));
+    const deployOutput = compileManifest(resolve(agentcliExamples, 'full-stack-deploy.json'));
+    const identityOutput = compileManifest(resolve(agentcliExamples, 'identity-v2.json'));
+    const v3Jobs = [
+      ...(shellOutput?.jobs || []),
+      ...(deployOutput?.jobs || []),
+      ...(identityOutput?.jobs || []),
+    ];
+
+    assert(v3Jobs.length > 0, 'handoff-v3 producer emits scheduler jobs');
+    assert(
+      v3Jobs.every(job => Object.hasOwn(job, 'approval_risk_level')),
+      'handoff-v3 producer emits approval_risk_level',
+    );
+    assert(
+      v3Jobs.every(job => Object.hasOwn(job, 'approval_approver_scope')),
+      'handoff-v3 producer emits approval_approver_scope',
+    );
+    assert(
+      v3Jobs.every(job => Object.hasOwn(job, 'output_format')),
+      'handoff-v3 producer emits output_format',
+    );
+    assert(
+      v3Jobs.some(job => job.approval_risk_level === 'high'),
+      'handoff-v3 producer projects declared approval risk',
+    );
+    assert(
+      v3Jobs.some(job => job.output_format === 'json'),
+      'handoff-v3 producer projects declared structured output',
+    );
+    assert(
+      v3Jobs.some(job => job.evidence_ref != null),
+      'handoff-v3 producer projects declared evidence',
+    );
+
+    const evidenceApplyFailure = applyManifestExpectingFailure(
+      resolve(agentcliExamples, 'identity-v2.json'),
+    );
+    assert(evidenceApplyFailure?.ok === false, 'agentcli evidence apply fails capability negotiation');
+    assert(
+      JSON.stringify(evidenceApplyFailure).includes('evidence_generation'),
+      'agentcli evidence capability failure names evidence_generation',
+    );
+
+    const supportedManifest = {
+      version: '0.2',
+      identity_profiles: [{
+        id: 'local-agent',
+        provider: 'none',
+        subject: {
+          kind: 'agent',
+          principal: 'agent://integration/release-manager',
+          delegation_mode: 'none',
+        },
+        trust: { level: 'supervised' },
+        presentation: { handoff: 'none', cleanup: 'always' },
+      }],
+      workflows: [{
+        id: 'handoff-v3-contract',
+        name: 'Handoff v3 contract',
+        tasks: [{
+          id: 'governed-output',
+          name: 'Governed structured output',
+          shell: { program: 'printf', args: ['{"ok":true}'] },
+          target: { session_target: 'shell' },
+          schedule: { cron: '0 1 * * *' },
+          identity: { ref: 'local-agent' },
+          approval: {
+            policy: 'manual',
+            risk_level: 'high',
+            timeout_s: 1800,
+          },
+          output: { format: 'json' },
+          verify: { shell: 'test -n "$PATH"', timeout_seconds: 7, on_failure: 'warn' },
+          delivery: { mode: 'none' },
+        }],
+      }],
+    };
+    const positive = withManifestFile(supportedManifest, manifestPath => ({
+      compiled: compileManifest(manifestPath),
+      applied: applyManifest(manifestPath),
+    }));
+    const compiledPositive = positive.compiled?.jobs?.[0];
+    const storedPositive = positive.applied.jobs[0];
+
+    assert(compiledPositive?.approval_risk_level === 'high', 'handoff-v3 compiles approval risk');
+    assert(compiledPositive?.approval_approver_scope == null, 'handoff-v3 preserves an unscoped approval');
+    assert(compiledPositive?.output_format === 'json', 'handoff-v3 compiles structured output');
+    assert(compiledPositive?.verify_shell === 'test -n "$PATH"', 'handoff-v3 compiles verification command');
+    assert(compiledPositive?.verify_timeout_s === 7, 'handoff-v3 compiles verification timeout');
+    assert(compiledPositive?.verify_on_failure === 'warn', 'handoff-v3 compiles verification failure policy');
+    assert(positive.applied.result.ok === true, 'handoff-v3 producer applies through scheduler CLI');
+    assert(
+      positive.applied.result.handoff?.field_version === '3',
+      'handoff-v3 producer negotiates field_version 3',
+    );
+    assert(
+      Number(positive.applied.result.handoff?.projected_fields) >= 70,
+      'handoff-v3 producer projects the expanded scheduler field set',
+    );
+    assert(storedPositive.approval_risk_level === 'high', 'scheduler stores v3 approval risk');
+    assert(storedPositive.approval_approver_scope == null, 'scheduler stores an unscoped v3 approval');
+    assert(storedPositive.output_format === 'json', 'scheduler stores v3 structured output');
+    assert(storedPositive.verify_shell === 'test -n "$PATH"', 'scheduler stores verification command');
+    assert(storedPositive.verify_timeout_s === 7, 'scheduler stores verification timeout');
+    assert(storedPositive.verify_on_failure === 'warn', 'scheduler stores verification failure policy');
+
+    const scopedManifest = structuredClone(supportedManifest);
+    scopedManifest.workflows[0].tasks[0].approval.approver_scope = 'domain:example.com';
+    const scopedFailure = withManifestFile(
+      scopedManifest,
+      manifestPath => applyManifestExpectingFailure(manifestPath),
+    );
+    assert(scopedFailure?.ok === false, 'scoped handoff fails capability negotiation');
+    assert(
+      scopedFailure?.code === 'unsupported_capability',
+      'scoped handoff rejection uses the public unsupported_capability code',
+    );
+    assert(
+      /approver scope.*runtime cannot enforce/i.test(scopedFailure?.error || ''),
+      'scoped handoff rejection explains the unsupported approver-scope enforcement',
+    );
+  } else if (expectedAgentcliContract === 'handoff-v2') {
+    const applyOutput = applyManifest(resolve(agentcliExamples, 'flyctl-ops.json')).result;
+    assert(applyOutput.ok === true, 'handoff-v2 producer remains applicable to scheduler v3');
+    assert(
+      applyOutput.handoff?.v02_fields_included === true,
+      'handoff-v2 producer retains v0.2 identity field projection',
+    );
+  }
 } else {
   console.log('  (skipped: agentcli not available)');
 }

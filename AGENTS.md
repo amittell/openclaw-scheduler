@@ -74,7 +74,7 @@ Successful operations return:
 When first interacting with `openclaw-scheduler`, use this sequence:
 
 1. `openclaw-scheduler` -- show usage (plain-text help output)
-2. `openclaw-scheduler doctor --json` -- verify schema 27 and live diagnostics
+2. `openclaw-scheduler doctor --json` -- verify schema 28 and live diagnostics
 3. `openclaw-scheduler status --json` -- inspect lease, queue, outbox, approvals, and runs
 4. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
 5. `openclaw-scheduler agents list --json` -- see registered agents
@@ -224,9 +224,37 @@ openclaw-scheduler alias add ops_team telegram -100200000000
 ```json
 {
   "approval_required": true,
-  "approval_timeout_s": 3600
+  "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "approval_risk_level": "high",
+  "approval_approver_scope": "user:alex"
 }
 ```
+
+Approval gates apply to every durable dispatch kind, including scheduled,
+one-shot, manual, chain, and retry work. Resolve a gate by approval ID. The
+scheduler derives the approver from the invoking local OS account:
+
+```bash
+openclaw-scheduler approvals list --json
+openclaw-scheduler approvals approve APPROVAL_ID --reason "Reviewed"
+```
+
+Scopes may be bare/exact, `exact:`, `user:`, `uid:`, or `principal:` local
+identities. Domain scopes and caller-selected approver flags are not supported.
+`jobs approve/reject JOB_ID` remains a legacy lookup for the job's current gate.
+
+Set `output_format` to `json`, `ndjson`, or `text` when a run must satisfy a
+declared output shape. Invalid JSON or NDJSON is nonfatal: the run records an
+invalidity warning, null parsed value, byte count, and SHA-256 digest while
+preserving primary execution success. Retrieve and verify generated evidence
+with `openclaw-scheduler runs evidence RUN_ID --json`.
+
+The built-in evidence backend is SHA-256 checksum-only. It is not agentcli's
+complete evidence payload or signed envelope contract, so the runtime reports
+`evidence_generation: false` and `checksum_evidence_generation: true`.
+External evidence providers, non-SHA-256 methods, and required signature
+verification fail validation rather than being silently downgraded.
 
 ## Multi-Agent
 
@@ -292,8 +320,10 @@ shell crons, agent prompts, and multi-step chains.
 
 agentcli is the control-plane companion. It provides declarative manifests,
 stable job IDs, workflow chain compilation, and v0.2 identity/authorization
-support. The scheduler works without it, but agentcli is preferred for
-complex workflows.
+profiles. Scheduler handoff v3 adds root approval gates, approver scopes,
+structured output, delegation validation, provider-resolved authorization
+references, and SHA-256 evidence integrity. The scheduler works without
+agentcli, but agentcli is preferred for complex workflows.
 
 ### Installing alongside the scheduler (same time)
 

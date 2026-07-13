@@ -32,19 +32,6 @@ sleep 3 && systemctl --user --no-pager --full status openclaw-scheduler
 node cli.js status
 ```
 
-### Windows native (PM2, git-clone install)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git pull
-npm install
-npm run verify:local
-pm2 restart openclaw-scheduler
-Start-Sleep 3
-pm2 logs openclaw-scheduler --lines 5 --nostream
-node cli.js status
-```
-
 That is the whole process for a routine update. The rest of this document explains each step, covers edge cases, and documents both git-clone and npm install paths.
 
 ---
@@ -71,6 +58,13 @@ That is the whole process for a routine update. The rest of this document explai
    sqlite3 scheduler.db ".backup 'scheduler.db.pre-upgrade'"
    ```
 
+### Approval note for 0.4.0
+
+Version 0.4.0 strengthens approval bindings with immutable dispatch and lineage
+identity. A pending approval created by an earlier version cannot authorize the
+new binding contract and is cancelled when resolved. After the upgrade,
+retrigger that work to create a fresh approval rather than reusing the old ID.
+
 ---
 
 ## Step 1: Pull or Install the Update
@@ -81,13 +75,6 @@ That is the whole process for a routine update. The rest of this document explai
 
 ```bash
 cd ~/.openclaw/scheduler
-git pull
-```
-
-#### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
 git pull
 ```
 
@@ -103,13 +90,7 @@ git stash pop
 #### macOS / Linux / Windows WSL2
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
-```
-
-#### Windows native (PowerShell)
-
-```powershell
-npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 ```
 
 ### Local source tarball upgrade (`npm pack`)
@@ -125,7 +106,7 @@ npm run verify:local
 npm pack
 
 mkdir -p ~/.openclaw/packages/openclaw-scheduler
-npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
 Keep `SCHEDULER_HOME=~/.openclaw/scheduler` and `SCHEDULER_DB=~/.openclaw/scheduler/scheduler.db`, and point the service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`.
@@ -141,17 +122,10 @@ cd ~/.openclaw/scheduler
 npm install
 ```
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm install
-```
-
 If you upgraded Node.js since the last install, also rebuild the native module:
 
 ```bash
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 Common triggers for needing a rebuild:
@@ -170,13 +144,6 @@ cd ~/.openclaw/scheduler
 npm run verify:local
 ```
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm run verify:local
-```
-
 All tests must pass before restarting the service. If tests fail, do not restart -- investigate the failure first and check the CHANGELOG for any required manual steps.
 
 ---
@@ -187,6 +154,11 @@ The dispatcher runs pending schema migrations automatically on startup. No
 manual schema command is needed. Schema application and consolidation fail
 closed: a migration error stops startup instead of continuing on a partial
 schema.
+
+Schema 28 transactionally rebuilds legacy `completion_debts` with a derived
+delivery scope, creates immutable `evidence_records` storage and indexes,
+preserves existing rows, and records migration version 28. A failure rolls the
+migration back and stops startup.
 
 `migrate.js` imports OpenClaw cron definitions through `openclaw cron list/get
 --json`; it is not the schema migrator. `--legacy-json` is only for an old
@@ -228,13 +200,6 @@ Only run that repair when the reported violations are those two orphan forms.
 Investigate any other parent table or integrity error instead of deleting data
 generically.
 
-### Windows native (PowerShell)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-openclaw-scheduler doctor --json
-```
-
 ---
 
 ## Step 5: Restart the Service
@@ -263,12 +228,6 @@ sudo systemctl restart openclaw-scheduler
 systemctl --user restart openclaw-scheduler
 ```
 
-### Windows native (PM2)
-
-```powershell
-pm2 restart openclaw-scheduler
-```
-
 ---
 
 ## Step 6: Verify
@@ -289,24 +248,18 @@ journalctl --user -u openclaw-scheduler -n 20 --no-pager
 cd ~/.openclaw/scheduler && node cli.js status
 ```
 
-### Windows native (PM2)
-
-```powershell
-pm2 status
-pm2 logs openclaw-scheduler --lines 20 --nostream
-cd $env:USERPROFILE\.openclaw\scheduler
-node cli.js status
-```
-
 A healthy startup log looks like:
 
 ```
-[scheduler] [info] Starting OpenClaw Scheduler v0.3.0 {"tickMs":10000,...}
+[scheduler] [info] Starting OpenClaw Scheduler v0.4.0 {"tickMs":10000,...}
 [scheduler] [info] Database initialized
 [scheduler] [info] Pruned old runs + messages
 ```
 
-If you see `Gateway unreachable`, isolated agent jobs will be deferred until the gateway is back. Shell jobs and main-session jobs continue unaffected.
+If you see `Gateway unreachable`, isolated agent jobs are deferred until the
+Gateway is back. Shell jobs continue independently. Main-session jobs still
+depend on the Gateway-backed `openclaw system event` path, so they can fail and
+enter their configured retry behavior while the Gateway is unavailable.
 
 ---
 
@@ -341,7 +294,7 @@ HOST=youruser@your-mac-host.lan
 TARBALL=./openclaw-scheduler-*.tgz
 
 scp $TARBALL $HOST:~/.openclaw/
-ssh $HOST "mkdir -p ~/.openclaw/packages/openclaw-scheduler && npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
+ssh $HOST "mkdir -p ~/.openclaw/packages/openclaw-scheduler && npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ~/.openclaw/$(basename $TARBALL)"
 ssh $HOST "launchctl kickstart -k gui/\$(id -u)/ai.openclaw.scheduler"
 sleep 3
 ssh $HOST "tail -5 /tmp/openclaw-scheduler.log && launchctl print gui/\$(id -u)/ai.openclaw.scheduler | sed -n '1,20p'"
@@ -357,24 +310,6 @@ ssh $HOST "cd ~/.openclaw/scheduler && npm run verify:smoke" 2>&1 | tail -20
 ssh $HOST "systemctl --user restart openclaw-scheduler"
 sleep 3
 ssh $HOST "systemctl --user --no-pager --full status openclaw-scheduler && cd ~/.openclaw/scheduler && node cli.js status"
-```
-
-#### Windows native host via PowerShell Remoting
-
-```powershell
-$HOST = "your-windows-host"
-
-Invoke-Command -ComputerName $HOST -ScriptBlock {
-  cd $env:USERPROFILE\.openclaw\scheduler
-  git pull
-  npm install
-  $env:SCHEDULER_DB=":memory:"
-  npm run verify:smoke
-  pm2 restart openclaw-scheduler
-  Start-Sleep 3
-  pm2 logs openclaw-scheduler --lines 5 --nostream
-  node cli.js status
-}
 ```
 
 ---
@@ -405,40 +340,23 @@ npm install
 systemctl --user restart openclaw-scheduler
 ```
 
-#### Windows native (PM2)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git log --oneline -5
-git checkout <commit-hash>
-npm install
-pm2 restart openclaw-scheduler
-```
-
 ### npm installs
 
 #### macOS (launchd)
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```
 
 #### Linux / Windows WSL2 (systemd)
 
 ```bash
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@<previous-version>
 systemctl --user restart openclaw-scheduler
 ```
 
-#### Windows native (PM2)
-
-```powershell
-npm install --prefix $env:USERPROFILE\.openclaw\scheduler openclaw-scheduler@<previous-version>
-pm2 restart openclaw-scheduler
-```
-
-**Schema rollback:** Do not assume an older package can safely use a schema 27
+**Schema rollback:** Do not assume an older package can safely use a schema 28
 database. Stop the service before changing database files. If the previous
 version fails its startup checks, preserve the failed database, restore
 `scheduler.db.pre-upgrade` to `scheduler.db`, remove stale `scheduler.db-wal`
@@ -471,7 +389,7 @@ for detailed examples.
 
 - Check the CHANGELOG for breaking changes or new prerequisites.
 - Make sure `npm install` completed without errors.
-- If `better-sqlite3` fails to load, run `npm rebuild better-sqlite3`.
+- If `better-sqlite3` fails to load, run `npm rebuild better-sqlite3 --ignore-scripts=false`.
 
 ### Service won't start after update
 
@@ -481,7 +399,10 @@ for detailed examples.
 
 ### Gateway unreachable after update
 
-The scheduler update does not affect the OpenClaw gateway. If the gateway is down, that is a separate issue. The scheduler logs `Gateway unreachable` on startup but continues running shell and main-session jobs.
+The scheduler update does not affect the OpenClaw Gateway. If the Gateway is
+down, that is a separate issue. The scheduler continues running shell jobs,
+defers isolated agent jobs, and cannot successfully deliver main-session system
+events until the Gateway is available.
 
 ### Node version changed
 
@@ -491,7 +412,7 @@ If Node was upgraded alongside the scheduler (e.g., `brew upgrade` updated both)
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 ```
 
@@ -499,14 +420,6 @@ launchctl kickstart -k gui/$(id -u)/ai.openclaw.scheduler
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 systemctl --user restart openclaw-scheduler
-```
-
-### Windows native (PM2)
-
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-npm rebuild better-sqlite3
-pm2 restart openclaw-scheduler
 ```

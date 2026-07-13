@@ -31,7 +31,7 @@ Duplicating all native OpenClaw scheduling features would add operational cost w
 
 ## Runtime Contract
 
-OpenClaw Scheduler version 0.3.0 and schema 27 provide these ownership rules:
+OpenClaw Scheduler version 0.4.0 and schema 28 provide these ownership rules:
 
 - One live dispatcher holds a named lease and monotonically fenced token.
 - Active runs and queue claims carry ownership. A stale owner cannot finalize work or create downstream dispatches.

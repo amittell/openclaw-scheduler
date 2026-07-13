@@ -123,8 +123,20 @@ export function formatMessageForDelivery(msg, { brand = 'Scheduler' } = {}) {
 
   // Header: brand + subject + age
   const age = timeAgo(msg.created_at);
-  const subject = msg.subject || 'Notification';
-  const header = `${brand} | ${subject} | ${age}`;
+  const truncateUtf8 = (value, maxBytes) => {
+    let result = '';
+    let bytes = 0;
+    for (const character of String(value || '')) {
+      const characterBytes = Buffer.byteLength(character, 'utf8');
+      if (bytes + characterBytes > maxBytes) break;
+      result += character;
+      bytes += characterBytes;
+    }
+    return result;
+  };
+  const boundedBrand = truncateUtf8(brand || 'Scheduler', 128) || 'Scheduler';
+  const subject = truncateUtf8(msg.subject || 'Notification', 256) || 'Notification';
+  const header = `${boundedBrand} | ${subject} | ${age}`;
 
   return `${header}\n\n${body}`;
 }

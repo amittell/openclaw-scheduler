@@ -1,10 +1,12 @@
 # OpenClaw Scheduler
 
 [![CI](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/openclaw-scheduler/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Node](https://img.shields.io/badge/node-22%20%7C%2024%20%7C%2025%20%7C%2026-green)](https://nodejs.org)
 
 A durable continuity and governed-workflow sidecar for [OpenClaw](https://openclaw.ai) agents and shell workflows. Current OpenClaw already provides [SQLite cron state, command jobs, retries, and run history](https://docs.openclaw.ai/cli/cron), plus [background tasks](https://docs.openclaw.ai/automation/tasks), [Task Flow](https://docs.openclaw.ai/automation/taskflow), and [Lobster approval checkpoints](https://docs.openclaw.ai/tools/lobster). Use this scheduler when shell jobs must survive Gateway downtime, the scheduler needs a separate failure domain, workflows need direct conditional job graphs, or `@amittell/agentcli` needs its durable runtime target.
+
+This is an independent community project and is not affiliated with the OpenClaw project.
 
 It can coexist with native OpenClaw cron. Do not run the same job in both systems.
 
@@ -12,8 +14,8 @@ It can coexist with native OpenClaw cron. Do not run the same job in both system
 **Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
 **Runtime:** Node.js 22, 24, 25, or 26 (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
-**Schema:** version 27
-**Tests:** run with `npm test` (legacy suite, isolated focused tests, docs, and sibling agentcli integration when available)
+**Schema:** version 28
+**Tests:** run with `npm test` (legacy suite, isolated focused tests, docs, and agentcli integration when a checkout is present; hosted CI requires a pinned public checkout)
 **Platform:** macOS · Linux · Windows (WSL2)
 
 In practice, this gives you:
@@ -124,14 +126,14 @@ Do not use it merely to obtain run history, command jobs, or basic retries. Nati
 
 ---
 
-## Version 0.3.0 Runtime Safety
+## Version 0.4.0 Runtime Safety
 
 - A singleton dispatcher lease and fencing token prevent a second dispatcher from taking ownership of live work.
 - Active runs carry dispatcher ownership. Only the owning fence can commit the terminal transition or trigger downstream work.
 - Cancellation is a durable request. Shell jobs terminate their tracked process group; agent jobs record and send the Gateway cancellation request. Check `runs get` or `status` for authoritative state.
 - Expired dispatch claims return to the pending queue only when no active run owns them.
 - Run completion, job state, and child dispatch creation commit atomically.
-- External delivery uses a transactional outbox that is separate from agent prompt messages. Attachments retain size and SHA-256 metadata.
+- External delivery uses a transactional outbox that is separate from agent prompt messages. Completion ownership is scoped by run, multipart deliveries have independently retryable per-part checkpoints, and completion debt closes only after every part is actually delivered. Attachments retain size and SHA-256 metadata.
 - Approval decisions use atomic versioned transitions and cannot dispatch disabled, rejected, expired, or cancelled work.
 - Governance declarations are enforced at execution time. Unsupported sandbox, path, network, credential, trust, proof, or cost requirements fail closed.
 - Database schema and consolidation failures stop startup. `openclaw-scheduler doctor --json` reports schema, lease, queue, outbox, approval, and cancellation diagnostics.
@@ -150,7 +152,7 @@ For the full reference, use the npm-first path below and then jump straight to [
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler -- setup
 ```
 
@@ -160,13 +162,18 @@ This installs the package without cloning the repo. The launcher command maps to
 - `openclaw-scheduler webhook-check` → `scripts/telegram-webhook-check.mjs`
 - `openclaw-scheduler <anything-else>` → `cli.js`
 
+The explicit `--ignore-scripts=false` is required because `better-sqlite3`
+builds or installs its trusted native binding during the npm lifecycle. If a
+prior install used `ignore-scripts=true`, rerun the install command above or
+run `npm rebuild --ignore-scripts=false better-sqlite3` before starting.
+
 For npm installs, scheduler state defaults to `~/.openclaw/scheduler/` rather than `node_modules/openclaw-scheduler/`, so upgrades do not trample the database path.
 
 If your Node runtime changes later, rebuild the native SQLite binding before restarting the scheduler:
 
 ```bash
 cd ~/.openclaw/scheduler
-npm rebuild better-sqlite3
+npm rebuild better-sqlite3 --ignore-scripts=false
 ```
 
 This is commonly needed after a Homebrew Node upgrade on macOS or any major Node ABI change.
@@ -218,7 +225,7 @@ npm run verify:local                 # full local maintainer gate
 npm run verify:smoke                 # lightweight smoke gate used by GitHub Actions
 ```
 
-GitHub Actions runs `npm run verify:smoke` on Linux and macOS across the supported Node.js lines. That gate includes lint, type checking, every repository test, documentation validation, and a package dry run. `npm run verify:local` adds coverage and is enforced again by `prepublishOnly`. Focused test files run sequentially with isolated databases; the sibling agentcli integration also runs when that checkout is available.
+GitHub Actions runs `npm run verify:smoke` on Linux and macOS across the supported Node.js lines. That gate includes lint, type checking, every repository test, documentation validation, and a package dry run. `npm run verify:local` adds coverage and is enforced again by `prepublishOnly`. Focused test files run sequentially with isolated databases. A dedicated required job separately checks the exact public handoff-v3 producer and the previous handoff-v2 producer.
 
 ### Option C: local npm pack (simulate the published package from source)
 
@@ -232,7 +239,7 @@ npm run verify:local
 npm pack
 
 mkdir -p ~/.openclaw/packages/openclaw-scheduler
-npm install --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
+npm install --ignore-scripts=false --prefix ~/.openclaw/packages/openclaw-scheduler --omit=dev --no-package-lock ./openclaw-scheduler-*.tgz
 ```
 
 Point your service at `~/.openclaw/packages/openclaw-scheduler/node_modules/openclaw-scheduler/dispatcher.js`, and keep mutable state in `~/.openclaw/scheduler` via `SCHEDULER_HOME` and `SCHEDULER_DB`.
@@ -282,7 +289,7 @@ This is the shortest path from "I installed it" to "I have a real job running."
 
 ```bash
 mkdir -p ~/.openclaw/scheduler
-npm install --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
+npm install --ignore-scripts=false --prefix ~/.openclaw/scheduler openclaw-scheduler@latest
 alias ocs='npm exec --prefix ~/.openclaw/scheduler openclaw-scheduler --'
 ocs setup
 ocs status
@@ -387,7 +394,7 @@ ocs jobs add '{
 
 Why this is useful:
 - the agent runs in its own isolated session
-- the result is delivered every time
+- delivery is retried durably and exhausted failures remain visible to operators
 - the run history stays separate from your personal chat threads
 
 ### 3. Approval-gated follow-up step
@@ -419,9 +426,9 @@ Why this is useful:
 Approve or reject later with:
 
 ```bash
-ocs approvals list
-ocs jobs approve <job-id>
-ocs jobs reject <job-id> "Not today"
+ocs approvals list --json
+ocs approvals approve <approval-id> --reason "Change window open"
+ocs approvals reject <approval-id> --reason "Not today"
 ```
 
 ---
@@ -583,10 +590,10 @@ When converting existing work:
 
 | Platform | Service Manager | Shell Jobs | Status |
 |----------|----------------|------------|--------|
-| macOS | launchd (`agent` or `daemon`) | `/bin/zsh` | ✅ Tested |
-| Linux | systemd user service | `/bin/bash` | ✅ Supported |
-| Windows (WSL2) | systemd (WSL2) / PM2 (WSL1) | `/bin/bash` | ✅ Supported |
-| Windows (native) | — | — | ❌ Not supported — use WSL2 |
+| macOS | launchd (`agent` or `daemon`) | `/bin/zsh` | Tested |
+| Linux | systemd user service or PM2 fallback | `/bin/bash` | Supported |
+| Windows (WSL2) | systemd user service or PM2 fallback inside WSL2 | `/bin/bash` | Supported |
+| Windows (native or WSL1) | Not applicable | Not applicable | Not supported; use WSL2 |
 
 - **macOS:** Full guide in [INSTALL.md](INSTALL.md)
 - **Linux:** Full guide in [INSTALL-LINUX.md](INSTALL-LINUX.md)
@@ -750,7 +757,7 @@ channel-specific target (chat ID, channel ID, phone number, handle, etc.).
 | `announce` | Agent jobs: delivers when run status is not `ok`. Shell jobs: non-zero exit only. Silently skipped for `main` session jobs (use `announce-always` instead) |
 | `announce-always` | Always delivers output (LLM or shell), including `main` session jobs |
 
-> **Note:** non-exempt jobs using `announce` or `announce-always` are rejected at validation time when `delivery_to` is absent. Runtime delivery is written to a transactional outbox, separate from agent prompt messages. Outbox claims expire and recover safely; attachment rows retain size and SHA-256 metadata.
+> **Note:** non-exempt jobs using `announce` or `announce-always` are rejected at validation time when `delivery_to` is absent. Runtime delivery is written to a transactional outbox, separate from agent prompt messages. Outbox claims expire and recover safely. Multipart output is stored as independently retryable rows with deterministic `:part:i/N` idempotency keys. Durable enqueue is not a delivery receipt; run-scoped completion debt closes only after every part is delivered. Attachment rows retain size and SHA-256 metadata.
 >
 > Examples in this document use Telegram for delivery_channel since it is the
 > most common configuration. Replace with your channel of choice.
@@ -833,41 +840,103 @@ openclaw-scheduler jobs add '{
 
 ## HITL Approval Gates
 
-Jobs with `approval_required: 1` pause before each chain-triggered execution and wait for a human to approve or reject.
+Jobs with `approval_required: 1` pause every dispatch before execution. The gate
+applies uniformly to root, manual, scheduled, one-shot, retry, and
+chain-triggered work. Every gated attempt is represented by a durable dispatch
+row and an `awaiting_approval` run.
 
 ```bash
-# Job that requires operator approval before each chain-triggered execution
+# Scheduled root job that requires a scoped operator approval
 openclaw-scheduler jobs add '{
   "name": "Deploy to Prod",
-  "parent_id": "<build-job-id>",
-  "trigger_on": "success",
+  "schedule_cron": "0 10 * * 1-5",
   "approval_required": 1,
+  "approval_risk_level": "high",
+  "approval_approver_scope": "user:alex",
   "approval_timeout_s": 3600,
   "approval_auto": "reject",
+  "session_target": "shell",
+  "payload_kind": "shellCommand",
   "payload_message": "Deploy the application to production",
+  "delivery_mode": "none",
+  "origin": "system",
   "run_timeout_ms": 300000
 }'
 ```
 
-When triggered, the job creator receives: `⚠️ Job 'Deploy to Prod' requires approval.`
+When triggered, the job creator receives the pending approval identifier, risk,
+scope, and CLI commands.
 
 ```bash
-openclaw-scheduler jobs approve <job-id>
-openclaw-scheduler jobs reject <job-id> "Postponing — too late in the day"
-openclaw-scheduler approvals list
+openclaw-scheduler approvals list --json
+openclaw-scheduler approvals approve APPROVAL_ID --reason "Change window open"
+openclaw-scheduler approvals reject APPROVAL_ID --reason "Postponing until the next change window"
 ```
 
 **Key notes:**
-- Approval gates only apply to **chain-triggered** jobs (`parent_id` set)
-- Cron-scheduled jobs always dispatch without waiting for approval
-- `approval_timeout_s` — auto-resolve timeout (seconds)
-- `approval_auto` — `"approve"` or `"reject"` — what happens on timeout
+- `approval_risk_level` is optional and accepts `low`, `medium`, or `high`.
+- `approval_approver_scope` accepts an unprefixed exact identity or
+  `exact:`, `user:`, `uid:`, or `principal:` matching for the local OS account.
+  Domain scopes are not supported.
+- AgentCLI handoff v3 exposes approval-scope enforcement as one coarse capability
+  while its manifests may contain domain scopes. The scheduler therefore
+  advertises `approval_scope_enforcement: false` so scoped agentcli manifests
+  fail capability negotiation instead of being partially enforced. Direct
+  scheduler jobs may still use the supported local scopes above.
+- The scheduler derives the approver from the invoking operating-system user
+  and UID. CLI flags and environment variables cannot select another identity.
+- Prefer `approvals approve/reject APPROVAL_ID`; `jobs approve/reject JOB_ID`
+  remains a legacy convenience for that job's current pending approval and
+  cannot override approver identity.
+- Use `approvals list --json` to copy the complete approval UUID before making
+  a decision.
+- `approval_auto: "approve"` is invalid with an approver scope. Scoped timeout
+  resolution fails closed.
+- The approval snapshots risk, scope, and a canonical SHA-256 binding of the
+  execution contract. Changing, disabling, or deleting the job cancels the
+  pending approval instead of applying it to different work.
+- `approval_timeout_s` controls the auto-resolution deadline and
+  `approval_auto` selects `"approve"` or `"reject"` for unscoped jobs.
+
+### Declared output formats
+
+Set `output_format` to `json`, `ndjson`, or `text` when downstream work requires
+a validated result shape. Successful JSON output must parse as one JSON value;
+each nonblank NDJSON line must parse independently; text is stored on the
+normalized text path. The scheduler persists validity, byte count, SHA-256
+digest, and either the parsed value or an artifact reference on the run.
+Malformed JSON or NDJSON remains a successful execution with
+`structured_output_valid: 0`, a `structured_output_warning`, and a null parsed
+value; success children may still run because transport success is distinct
+from output-shape validation.
+
+### Post-success verification
+
+Any synchronous job can declare a separate local shell verification command
+that runs after its primary execution and structured-output parsing, but before
+terminal evidence, delivery, and child dispatch:
+
+```json
+{
+  "verify_shell": "test -f /srv/app/healthy",
+  "verify_timeout_s": 30,
+  "verify_on_failure": "error"
+}
+```
+
+`verify_on_failure` accepts `error` or `warn`. An error policy converts a failed
+verification to a terminal error and blocks success children; a warning policy
+preserves primary success and records the warning. Verification stores only
+status, timing, exit metadata, byte counts, and SHA-256 digests, never raw
+verification output. Fire-and-forget jobs cannot declare verification.
 
 ---
 
 ## Idempotency
 
-Control what happens when the dispatcher crashes mid-run.
+Control what happens when the dispatcher crashes mid-run. Despite the legacy
+field name `delivery_guarantee`, this setting governs execution replay, not
+external message-delivery confirmation.
 
 ```bash
 # Enable at-least-once: crashed runs replay on next startup
@@ -1250,7 +1319,7 @@ openclaw-scheduler agents register <id> [name]
 
 ## Database Schema
 
-**Schema version:** 27 | **Mode:** WAL | **Foreign keys:** ON
+**Schema version:** 28 | **Mode:** WAL | **Foreign keys:** ON
 
 ### Tables
 
@@ -1267,8 +1336,10 @@ openclaw-scheduler agents register <id> [name]
 | `delivery_aliases` | Named delivery targets (channel + target pairs) |
 | `job_dispatch_queue` | Leased durable dispatch claims and replay state |
 | `dispatcher_leases` | Singleton dispatcher ownership and fencing tokens |
-| `delivery_outbox` | Transactional external delivery queue |
+| `delivery_outbox` | Transactional external delivery queue with multipart group/part coordinates |
 | `delivery_attachments` | Durable attachment content/path and integrity metadata |
+| `completion_debts` | Run-scoped completion delivery ownership and recovery state |
+| `evidence_records` | Immutable, content-addressed SHA-256 evidence, one row per run |
 | `message_receipts` | Delivery receipt tracking for messages |
 | `team_tasks` | Team-scoped task definitions and status |
 | `team_mailbox_events` | Projected events from team mailbox activity |
@@ -1288,6 +1359,8 @@ delivery_to, delivery_guarantee, delete_after_run, ttl_hours,
 parent_id, trigger_on, trigger_delay_s, trigger_condition,
 resource_pool, auth_profile, auth_profile_fallback,
 approval_required, approval_timeout_s, approval_auto,
+approval_risk_level, approval_approver_scope, output_format,
+verify_shell, verify_timeout_s, verify_on_failure,
 context_retrieval, context_retrieval_limit,
 preferred_session_key, job_type, watchdog_target_label,
 watchdog_check_cmd, watchdog_timeout_min, watchdog_alert_channel,
@@ -1304,10 +1377,13 @@ last_heartbeat, session_key, session_id, summary,
 error_message, shell_exit_code, shell_signal, shell_timed_out,
 shell_stdout, shell_stderr, shell_stdout_path, shell_stderr_path,
 shell_stdout_bytes, shell_stderr_bytes, dispatched_at, run_timeout_ms,
-triggered_by_run, retry_of, retry_count, replay_of
+triggered_by_run, retry_of, retry_count, replay_of,
+delegation_validation, output_format, structured_output, structured_output_valid,
+structured_output_warning, structured_output_bytes, structured_output_sha256,
+structured_output_path, verification_result, approval_used
 ```
 
-**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`, `awaiting_approval`, `approved`
+**Run statuses:** `pending`, `running`, `ok`, `error`, `timeout`, `skipped`, `cancelled`, `crashed`, `recovery_blocked`, `awaiting_approval`, `approved`
 
 ### Messages (key columns)
 
@@ -1345,6 +1421,7 @@ openclaw-scheduler jobs cancel <id>              # Cancel running chain
 openclaw-scheduler runs list <job-id> [limit]    # Run history
 openclaw-scheduler runs get <run-id>             # Full run details
 openclaw-scheduler runs output <run-id> stdout   # Stored/offloaded stdout or stderr
+openclaw-scheduler runs evidence <run-id>        # Verify and return immutable execution evidence
 openclaw-scheduler runs running                  # Active runs
 openclaw-scheduler runs stale [threshold-s]      # Stale runs (default 90s)
 
@@ -1366,9 +1443,11 @@ openclaw-scheduler agents get <id>
 openclaw-scheduler agents register <id> [name]
 
 # ── Approvals ─────────────────────────────────────
-openclaw-scheduler jobs approve <id>            # Approve pending gate
-openclaw-scheduler jobs reject <id> [reason]    # Reject pending gate
-openclaw-scheduler approvals list               # All pending approvals
+openclaw-scheduler approvals list --json                 # Full pending approval IDs
+openclaw-scheduler approvals approve <id> [--reason ...] # Approve by approval ID
+openclaw-scheduler approvals reject <id> [--reason ...]  # Reject by approval ID
+openclaw-scheduler jobs approve <job-id>                  # Legacy current-gate lookup
+openclaw-scheduler jobs reject <job-id> [reason]          # Legacy current-gate lookup
 
 # ── Task Tracker ──────────────────────────────────
 openclaw-scheduler tasks create '<json>'        # Create task group
@@ -1429,7 +1508,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 |----------|---------|-------------|
 | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway endpoint |
 | `OPENCLAW_GATEWAY_TOKEN` | *(required)* | Gateway auth token |
-| `OPENCLAW_GATEWAY_TOKEN_PATH` | `~/.openclaw/credentials/.gateway-token` | Path to gateway token file (used when `OPENCLAW_GATEWAY_TOKEN` is not set) |
+| `OPENCLAW_GATEWAY_TOKEN_PATH` | `~/.openclaw/credentials/.gateway-token` | Path to a gateway token file under `~/.openclaw/credentials`, `/run/secrets`, or `/var/run/secrets` (used when `OPENCLAW_GATEWAY_TOKEN` is not set) |
 | `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
 | `SCHEDULER_DB` | auto (existing `~/.openclaw/scheduler/scheduler.db` first; otherwise `./scheduler.db` in a writable source checkout; otherwise scheduler home) | SQLite database path |
 | `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
@@ -1445,7 +1524,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
-| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL), `cmd.exe` (Windows) | Shell used for shell jobs |
+| `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
 | `DISPATCH_LABELS_PATH` | *(auto)* | Override path to labels.json for dispatch session tracking |
@@ -1463,7 +1542,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 ---
 
 Provider-backed identity / authorization / proof behavior, including
-`authorization_ref` fail-closed semantics, is documented in the
+provider-resolved `authorization_ref` and its fail-closed error semantics, is documented in the
 [gateway contract](docs/gateway-contract.md#dispatch-time-authorization-evaluation).
 
 ---
@@ -1562,7 +1641,10 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 
 ### Gateway health
 
-`GET /health` checked before each tick. If unreachable, isolated jobs are deferred; shell and main-session jobs continue.
+`GET /health` is checked before dispatch. If it is unreachable, isolated jobs
+are deferred and shell jobs continue. Main-session jobs use the Gateway-backed
+`openclaw system event` path, so they can fail and enter their configured retry
+behavior until the Gateway is available.
 
 ---
 
@@ -1579,10 +1661,10 @@ Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old export.
 
 ### Schema baseline
 
-Version 0.3.0 uses schema version 27.
+Version 0.4.0 uses schema version 28.
 
 - Net-new installs apply `schema.sql` transactionally.
-- Existing databases run the idempotent consolidation migration, then reapply the current schema.
+- Existing databases run the idempotent consolidation migration, then reapply the current schema. Migration 28 preserves existing state while rebuilding legacy completion debt rows with a derived delivery scope, adding multipart outbox group/part coordinates, and adding immutable evidence storage.
 - Any schema or consolidation error aborts startup. It is never logged and ignored.
 
 ### Native-job ownership and release history
@@ -1613,15 +1695,6 @@ cd ~/.openclaw/scheduler
 git pull && npm install
 npm run verify:local
 systemctl --user restart openclaw-scheduler
-```
-
-### Windows native (PM2, git-clone install)
-```powershell
-cd $env:USERPROFILE\.openclaw\scheduler
-git pull
-npm install
-npm run verify:local
-pm2 restart openclaw-scheduler
 ```
 
 ---
@@ -1673,8 +1746,8 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── attachment-store.js       # Durable attachment staging and integrity metadata
 ├── governance.js             # Execution-time governance enforcement
 ├── db.js                  # SQLite connection, fail-closed schema init, WAL checkpoints
-├── schema.sql             # Complete schema (v27)
-├── migrate-consolidate.js # Single migration for existing DBs through v27
+├── schema.sql             # Complete schema (v28)
+├── migrate-consolidate.js # Single migration for existing DBs through v28
 ├── jobs.js                # Job CRUD, cron, chains, cycle detection, resource pools, queue
 ├── runs.js                # Run lifecycle, stale/timeout, cancellation, context summary
 ├── messages.js            # Inter-agent message queue (priority, TTL, typed messages)
@@ -1682,7 +1755,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── gateway.js             # OpenClaw API client (chat completions, events, delivery, aliases)
 ├── approval.js            # HITL approval queries
 ├── approval-state.js      # Atomic approval decisions and dispatch claims
-├── idempotency.js         # Idempotency ledger (at-least-once delivery dedup)
+├── idempotency.js         # Idempotency ledger (execution replay dedup)
 ├── retrieval.js           # Context retrieval (recent/hybrid run summaries)
 ├── task-tracker.js        # Dead-man's-switch for multi-agent sub-agent teams
 ├── team-adapter.js        # Team mailbox/task projection and task completion gates
@@ -1701,7 +1774,7 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ├── INSTALL.md             # Full installation guide — macOS (first host)
 ├── INSTALL-ADDITIONAL-HOST.md  # Installation guide for additional hosts
 ├── INSTALL-LINUX.md       # Installation guide for Linux (systemd user service)
-├── INSTALL-WINDOWS.md     # Installation guide for Windows (WSL2 or PM2)
+├── INSTALL-WINDOWS.md     # Installation guide for Windows (WSL2 only)
 ├── UPGRADING.md           # Upgrade guide (all platforms)
 ├── UNINSTALL.md           # Removal guide (all platforms)
 ├── BEST-PRACTICES.md      # Job type selection, prompt writing, agent integration
@@ -1716,12 +1789,23 @@ See [BEST-PRACTICES.md](BEST-PRACTICES.md) for:
 ## Testing
 
 ```bash
-# Run the legacy suite, isolated focused tests, docs, and sibling integration
+# Run the legacy suite, isolated focused tests, docs, and agentcli integration when present
 npm test
+
+# Require scheduler-owned and agentcli-owned integration suites
+npm run test:agentcli
 
 # Add lint, types, coverage, and package verification
 npm run verify:local
 ```
+
+The agentcli checkout defaults to `../agentcli`; set `AGENTCLI_PATH` when it is
+elsewhere. A missing checkout is reported as an explicit local skip.
+`SKIP_AGENTCLI_INTEGRATION=1 npm test` records an intentional scheduler-only
+iteration. Hosted CI runs the scheduler-owned contract and the compatible
+upstream-owned tests against exact public handoff-v3 and handoff-v2 commits. At
+the v3 pin, the upstream test that hard-codes `field_version: "2"` is reported
+as an explicit skip while all other upstream integration tests run.
 
 Focused `tests/*.test.mjs` files run sequentially in separate processes and
 databases so shared module state cannot contaminate another file.
@@ -1749,7 +1833,9 @@ databases so shared module state cannot contaminate another file.
 
 ## Sub-agent Dispatch
 
-The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key, recorded in the originating host's local `labels.json` ledger, and delivered back through a scheduler watcher when the agent calls `done` from that same local dispatch shell as its final action. Do not run the completion marker from inside `ssh`, Docker, tmux, or another nested shell, because that can update a different label store. The watcher normalizes completions into short human-readable summaries before posting them to chat, and it only falls back to terminal assistant output when the transcript contains strict clean completion evidence. The module also supports symlink-based branding: a wrapper directory (such as `my-brand`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
+The dispatch module (`dispatch/index.mjs`) spawns and steers isolated agent sessions via the OpenClaw Gateway API and tracks them by a human-readable label. Unlike the scheduler's job/run model, dispatch calls the gateway directly -- no scheduler tick delay, no DB write required to start a session. Each session is assigned a unique session key and recorded in the originating host's local `labels.json` ledger. When the agent calls `done` from that same local dispatch shell, final delivery is claimed by label, session, and run, then enqueued durably in `delivery_outbox`. The routed watcher uses the same claim and outbox path, so the two completion paths cannot both enqueue the same run. Do not run the completion marker from inside `ssh`, Docker, tmux, or another nested shell, because that can update a different label store. The watcher normalizes completions into short human-readable summaries, and it only falls back to terminal assistant output when the transcript contains strict clean completion evidence. The module also supports symlink-based branding: a wrapper directory (such as `my-brand`) contains a `config.json` with a custom name and a symlink to `dispatch/index.mjs`, giving the same CLI a different identity in notifications and logs.
+
+Routed watchers write no delivery body to stdout after a durable enqueue and emit `WATCHER_ALREADY_DELIVERED` on stderr for the scheduler wrapper. Despite its legacy name, that marker means the completion was already enqueued and the wrapper must not enqueue it again; it is not a channel delivery receipt. The run-scoped completion debt stays open until every outbox part is delivered. A watcher with no configured delivery route retains its historical stdout behavior, but only after it acquires the durable run-scoped completion claim. If completion claim storage is unavailable, delivery fails closed with `COMPLETION_CLAIM_UNAVAILABLE`. Multipart output is split into independent outbox rows and can resume from its recorded per-part checkpoint.
 
 ### Quick Example
 
@@ -1814,7 +1900,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 
 ### Multi-agent Orchestration
 
-The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are delivered back to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
+The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are enqueued for durable outbox delivery to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
 
 **Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. The dispatcher sets `spawnDepth: 1` on each fresh session automatically.
 
@@ -1839,7 +1925,7 @@ openclaw-scheduler enqueue \
   --message "Update the API docs to reflect the new /v2 endpoints" \
   --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
 
-# Each worker gets a watcher-delivered, channel-safe completion summary when done.
+# Each worker gets an outbox-delivered, channel-safe completion summary when done.
 # No polling needed. Watchdog jobs are auto-registered for each.
 ```
 
@@ -1915,7 +2001,8 @@ The scheduler works without agentcli -- most jobs are created by the OpenClaw
 agent itself when a user requests a scheduled task via Telegram or another
 messaging channel, and operators can also create jobs directly via the CLI.
 Adding agentcli on top gives you declarative workflow manifests, stable job IDs,
-v0.2 identity/authorization/evidence support, and repeatable applies for
+v0.2 identity and authorization support, evidence capability negotiation,
+handoff v3 capability negotiation, and repeatable applies for
 workflows that outgrow ad-hoc job creation.
 
 ### Installing agentcli
@@ -2045,8 +2132,9 @@ on Build success, Verify triggers on Deploy success.
 ### v0.2 identity and authorization
 
 agentcli v0.2 manifests add identity profiles, authorization proofs, evidence
-generation, and credential handoff. These compile to the scheduler's v0.2
-runtime fields and are enforced at dispatch time:
+declarations, and credential handoff. Identity, authorization, and supported
+handoff fields compile to the scheduler's v0.2 runtime fields and are enforced
+at dispatch time:
 
 ```json
 {
@@ -2077,9 +2165,50 @@ runtime fields and are enforced at dispatch time:
 }
 ```
 
+Credential materialization is target-specific. Shell jobs receive a scoped
+environment locally. Isolated agent jobs first require the connected Gateway
+to advertise `chat-completions-env-inject-v1`, then send the validated scoped
+map through `x-openclaw-env-inject`. If the capability is absent, dispatch fails
+closed with `GATEWAY_ENV_INJECT_UNSUPPORTED` before a credential-bearing request
+is sent. Main-session jobs reject `identity.presentation` and
+`credential_handoff`. Auth-profile-only isolated turns remain compatible with
+Gateways that do not provide env injection.
+
+Handoff v3 also validates delegated identity chains before execution and resolves
+`authorization_ref` only through a configured provider resolver. Independently,
+direct scheduler job specifications can request checksum evidence, stored as one
+immutable canonical SHA-256 record per run.
+Evidence contains redacted outcome summaries and an output hash, never raw
+credentials. The built-in evidence backend accepts legacy checksum declarations
+or `provider: "sha256"`/`"checksum"` with only the `sha256` method and
+`verify.required: false`. External envelope providers such as `ssh` or `none`,
+non-SHA-256 methods, and required signature verification fail validation because
+the scheduler has no signer/verifier for them. Use `openclaw-scheduler runs
+evidence RUN_ID --json` to retrieve and checksum-verify the stored record.
+
+The scheduler does not implement agentcli's complete evidence payload and
+envelope contract, which binds the manifest digest and effective task hash and
+may require provider signing. It therefore reports `evidence_generation: false`
+to agentcli and fails capability negotiation for agentcli evidence declarations.
+This is intentionally distinct from the scheduler-native checksum facility.
+
+`openclaw-scheduler capabilities --json` reports `handoff_version: "3"` and
+the enforcement features `root_approval_gate`,
+`approval_scope_enforcement: false`,
+`structured_output_format`, `delegation_validation`,
+`authorization_ref_resolution`, `evidence_generation: false`,
+`checksum_evidence_generation: true`,
+`evidence_integrity: "checksum-sha256-v3"`,
+`evidence_contract: "openclaw-scheduler-checksum-v3"`,
+`gateway_capability_discovery`, `gateway_env_injection_negotiation`,
+`multipart_delivery_checkpoints: true`, and
+`completion_delivery_scope: "run"`.
+
 See the [agentcli examples directory](https://github.com/amittell/agentcli/tree/main/examples)
 for fully annotated manifests covering Stripe, Fly.io, Terraform, GitHub CLI,
-and more.
+and more. Examples declaring an external evidence provider require a runtime
+that implements that provider; this scheduler rejects those declarations rather
+than silently treating them as built-in checksum evidence.
 
 ### Environment variables
 
@@ -2174,8 +2303,9 @@ Dispatcher logs to stderr (unbuffered). If logs look stale, the process may have
 ### Job shows 'awaiting_approval'
 
 ```bash
-openclaw-scheduler approvals list
-openclaw-scheduler jobs approve <id>   # or reject
+openclaw-scheduler approvals list --json
+openclaw-scheduler approvals approve <approval-id> --reason "Reviewed"
+# Or: openclaw-scheduler approvals reject <approval-id> --reason "Not ready"
 ```
 
 ### Backup failing

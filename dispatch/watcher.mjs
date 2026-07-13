@@ -38,6 +38,7 @@ import {
 } from './completion.mjs';
 import {
   claimCompletionDelivery,
+  enqueueCompletionNotification,
   recordCompletionDelivered,
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
@@ -1046,7 +1047,7 @@ function markLabelDone(label, summary) {
 
 /**
  * Update labels.json to mark the watched label as 'error' (best-effort, atomic write).
- * Used instead of markDoneSync/markLabelDone for sessions that did NOT complete
+ * Used instead of markLabelDone for sessions that did NOT complete
  * successfully: gateway-restart-kill, timeout with no result, spawn failure.
  * This ensures the scheduler run status reflects the true failure outcome.
  */
@@ -1132,6 +1133,14 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
+  // Every authoritative successful completion clears transient recovery debt.
+  // Keeping this at the delivery boundary covers normal polling, once mode,
+  // and the exact-deadline path uniformly.
+  const retryCount = getRetryCount(label);
+  if (retryCount > 0) setRetryCount(label, 0);
+  const gatewayRetryCount = getGwRestartRetryCount(label);
+  if (gatewayRetryCount > 0) setGwRestartRetryCount(label, 0);
+
   // Update labels.json before exiting -- prevents stuck detector false positives
   const completion = resolveCompletionDelivery({
     lastReply,
@@ -1141,11 +1150,53 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   markLabelDone(label, completion.summary);
 
   if (completion.deliveryText) {
+    const claimEntry = getLabelEntry(label);
+    if (claimEntry?.deliverTo && claimEntry?.deliveryMode !== 'none') {
+      const deliveryResult = enqueueCompletionNotification({
+        label,
+        summary: completion.summary,
+        completion: completionPayload,
+        resolvedDelivery: completion,
+        deliverTo: claimEntry.deliverTo,
+        deliveryChannel: claimEntry.deliverChannel || 'telegram',
+        sessionKey: claimEntry.sessionKey || null,
+        runId: claimEntry.runId || null,
+        origin: claimEntry.origin || null,
+        metadata: {
+          delivery_source: completion.source || 'watcher',
+          last_label_status: claimEntry.status || 'done',
+        },
+      });
+      if (deliveryResult.ok) {
+        updateExistingLabel(label, (entry) => {
+          entry.completionDeliveredAt = new Date().toISOString();
+          entry.completionDeliverySource = completion.source || 'watcher';
+          entry.completionOutboxIds = deliveryResult.outboxIds;
+        });
+      }
+      if (
+        deliveryResult.ok
+        || deliveryResult.deduped
+        || deliveryResult.reason === 'already-claimed'
+      ) {
+        markWatcherAlreadyDelivered(label);
+        process.exit(0);
+      }
+      process.stderr.write(
+        `[watcher] durable completion enqueue failed for ${label}: ` +
+        `${deliveryResult.error || deliveryResult.reason || 'unknown error'}\n`,
+      );
+      process.exit(1);
+    }
+
     // Atomic guard against the done-path (cmdDone) delivering the same
     // completion. The preflight completionDeliveredAt check narrows the window;
     // this claim closes it -- if the done-path already owns delivery, stand down.
-    const claimEntry = getLabelEntry(label);
-    if (!claimCompletionDelivery({ label, sessionKey: claimEntry?.sessionKey || null })) {
+    if (!claimCompletionDelivery({
+      label,
+      sessionKey: claimEntry?.sessionKey || null,
+      runId: claimEntry?.runId || null,
+    })) {
       markWatcherAlreadyDelivered(label);
     }
     updateExistingLabel(label, (entry) => {
@@ -1156,6 +1207,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     recordCompletionDelivered({
       label,
       sessionKey: deliveredEntry?.sessionKey || null,
+      runId: deliveredEntry?.runId || null,
       metadata: {
         delivery_source: completion.source || 'watcher',
         last_label_status: deliveredEntry?.status || 'done',
@@ -1172,6 +1224,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   recordCompletionDeliveryDebt({
     label,
     sessionKey: failedEntry?.sessionKey || null,
+    runId: failedEntry?.runId || null,
     openReason: 'no-clean-user-facing-completion',
     noReply: true,
     metadata: {
@@ -1927,17 +1980,6 @@ function getTokenCount(sessionKey) {
   } catch { return null; }
 }
 
-function markDoneSync(summary) {
-  try {
-    updateExistingLabel(label, (entry) => {
-      entry.status = 'done';
-      entry.summary = summary;
-    });
-  } catch (e) {
-    process.stderr.write(`[watcher] markDoneSync failed: ${e.message}\n`);
-  }
-}
-
 const statusAtDeadline = dispatch('status', ['--label', label]);
 let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null;
 let baselineTokens = getTokenCount(tokenSessionKey);
@@ -1960,15 +2002,23 @@ if (sessionInternalId) {
 // If the session already completed (gateway pruned it -> null tokens), exit cleanly.
 if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
   const r = dispatch('result', ['--label', label]);
-  if (hasStructuredCompletion(r)) {
-    // deliverResult calls process.exit(0) internally
-    deliverResult(label, r?.lastReply || null, statusAtDeadline?.summary || null, r?.completion || null);
-  }
-  // Status is explicitly done -- exit cleanly, no timeout noise
   if (statusAtDeadline?.status === 'done') {
-    markDoneSync(statusAtDeadline?.summary || 'completed');
-    process.stdout.write(`✅ dispatch [${label}] completed (status=done at deadline)\n`);
-    process.exit(0);
+    const retryCount = getRetryCount(label);
+    if (retryCount > 0) setRetryCount(label, 0);
+    const gatewayRetryCount = getGwRestartRetryCount(label);
+    if (gatewayRetryCount > 0) setGwRestartRetryCount(label, 0);
+    // Route the authoritative deadline completion through the same durable
+    // outbox path as every other watcher completion, even without a structured
+    // payload. deliverResult exits after enqueueing or explicit fallback.
+    deliverResult(
+      label,
+      r?.lastReply || null,
+      statusAtDeadline?.summary || 'completed',
+      r?.completion || statusAtDeadline?.completion || null,
+    );
+  }
+  if (hasStructuredCompletion(r)) {
+    deliverResult(label, r?.lastReply || null, statusAtDeadline?.summary || null, r?.completion || null);
   }
   // Truly no result and no tokens -- telemetry unavailable
   if (baselineTokens === null) {
@@ -2065,7 +2115,7 @@ while (Date.now() - flatSince < FLAT_WINDOW_MS) {
 }
 
 // -- Pre-steer JSONL sanity check ------------------------------------------
-// Before triggering steer/markDoneSync, verify the session is not currently
+// Before triggering recovery, verify the session is not currently
 // mid-turn. A mid-turn session has an in-flight tool call (JSONL last entry
 // is tool_use or tool_result) -- steering or declaring it done would interrupt
 // active work and produce a partial/zombie result.

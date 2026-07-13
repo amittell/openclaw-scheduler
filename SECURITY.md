@@ -33,7 +33,7 @@ Please report unsafe defaults, credential leaks, or privilege boundary issues.
 
 ## Runtime Boundary
 
-Version 0.3.0 fails closed when a job requests sandbox, filesystem, network, or
+Version 0.4.0 fails closed when a job requests sandbox, filesystem, network, or
 agent cost controls that the selected executor cannot enforce. The default host
 executor does not claim container, namespace, firewall, filesystem, or cost
 metering isolation. A restrictive contract is denied rather than simulated.
