@@ -493,6 +493,78 @@ test('route-less watcher retains stdout compatibility after a durable scoped cla
   }
 });
 
+test('routed watcher exits successfully after durable completion enqueue', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'scheduler-v04-routed-watcher-'));
+  const fixtureDbPath = join(fixture, 'scheduler.db');
+  const labelsPath = join(fixture, 'labels.json');
+  const mockDispatchPath = join(fixture, 'mock-dispatch.mjs');
+  const label = 'routed-completion';
+  initializeDatabase(fixtureDbPath);
+  writeFileSync(labelsPath, JSON.stringify({
+    [label]: {
+      status: 'running',
+      sessionKey: 'agent:main:subagent:routed',
+      runId: 'gateway-run-routed',
+      agent: 'main',
+      deliverTo: 'routed-target',
+      deliverChannel: 'telegram',
+      deliveryMode: 'announce-always',
+      spawnedAt: new Date().toISOString(),
+      timeoutSeconds: 60,
+    },
+  }));
+  writeFileSync(mockDispatchPath, `
+    const subcommand = process.argv[2];
+    const completion = { summary_human: 'Completed through the durable routed watcher path.' };
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      status: subcommand === 'sync' ? 'ok' : 'done',
+      sessionKey: 'agent:main:subagent:routed',
+      summary: completion.summary_human,
+      completion
+    }));
+  `);
+
+  try {
+    const result = spawnSync(process.execPath, [
+      watcherPath,
+      '--label', label,
+      '--timeout', '60',
+      '--poll-interval', '1',
+      '--once',
+    ], {
+      env: {
+        ...process.env,
+        HOME: fixture,
+        SCHEDULER_DB: fixtureDbPath,
+        DISPATCH_LABELS_PATH: labelsPath,
+        DISPATCH_INDEX_PATH: mockDispatchPath,
+        OPENCLAW_GATEWAY_TOKEN: '',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /WATCHER_ALREADY_DELIVERED/);
+    assert.doesNotMatch(result.stderr, /durable completion enqueue failed/);
+
+    const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    assert.equal(labels[label].status, 'done');
+    assert.ok(Array.isArray(labels[label].completionOutboxIds));
+    const db = new Database(fixtureDbPath, { readonly: true });
+    const rows = db.prepare('SELECT body, status FROM delivery_outbox').all();
+    const debt = db.prepare('SELECT status FROM completion_debts WHERE task_label = ?').get(label);
+    db.close();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, 'pending');
+    assert.match(rows[0].body, /Completed through the durable routed watcher path/);
+    assert.equal(debt.status, 'delivering');
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test('enqueue prompt provides a literal checkpoint command without claiming an environment variable exists', () => {
   const fixture = mkdtempSync(join(tmpdir(), 'scheduler-v04-prompt-'));
   const fixtureDbPath = join(fixture, 'scheduler.db');

@@ -1173,10 +1173,14 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
           entry.completionDeliverySource = completion.source || 'watcher';
           entry.completionOutboxIds = deliveryResult.outboxIds;
         });
-        markWatcherAlreadyDelivered(label);
       }
-      if (deliveryResult.deduped || deliveryResult.reason === 'already-claimed') {
+      if (
+        deliveryResult.ok
+        || deliveryResult.deduped
+        || deliveryResult.reason === 'already-claimed'
+      ) {
         markWatcherAlreadyDelivered(label);
+        process.exit(0);
       }
       process.stderr.write(
         `[watcher] durable completion enqueue failed for ${label}: ` +
