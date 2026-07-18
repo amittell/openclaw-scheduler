@@ -26,7 +26,8 @@ All notable changes to this project will be documented in this file.
 
 - kept GitHub as the release authority for tag-triggered npm OIDC publication
   while mirroring GitHub branches and tags to WritHub with a repository-scoped
-  credential and non-force, atomic ref updates
+  credential, repository-configured mirror target, and non-force atomic ref
+  updates
 - made maintenance timeout recovery commit terminal evidence and job or retry
   bookkeeping in one transaction, and reconcile already-terminal schedule rows
   whose job schedule update was interrupted

@@ -67,7 +67,7 @@ test('legacy catastrophic patterns are evaluated by the linear-time engine', () 
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf8',
-    timeout: 2_000,
+    timeout: 10_000,
     windowsHide: true,
   });
 

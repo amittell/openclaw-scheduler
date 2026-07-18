@@ -31,6 +31,8 @@ jobs:
       - name: Mirror branches and tags to WritHub
         env:
           WRITHUB_TOKEN: ${{ secrets.WRITHUB_TOKEN }}
+          WRITHUB_USERNAME: ${{ vars.WRITHUB_USERNAME }}
+          WRITHUB_REPOSITORY: ${{ vars.WRITHUB_REPOSITORY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -39,12 +41,20 @@ jobs:
             echo "WRITHUB_TOKEN is not configured"
             exit 1
           fi
+          if [[ ! "${WRITHUB_USERNAME:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "WRITHUB_USERNAME is missing or invalid"
+            exit 1
+          fi
+          if [[ ! "${WRITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "WRITHUB_REPOSITORY is missing or invalid"
+            exit 1
+          fi
 
           askpass="$RUNNER_TEMP/writhub-askpass.sh"
           printf '%s\n' \
             '#!/bin/sh' \
             'case "$1" in' \
-            '  *Username*) printf "%s\\n" "alexm" ;;' \
+            '  *Username*) printf "%s\\n" "$WRITHUB_USERNAME" ;;' \
             '  *Password*) printf "%s\\n" "$WRITHUB_TOKEN" ;;' \
             '  *) exit 1 ;;' \
             'esac' > "$askpass"
@@ -53,7 +63,7 @@ jobs:
           git fetch --prune --tags origin \
             '+refs/heads/*:refs/remotes/github/*'
           git remote add writhub \
-            'https://writhub.io/alexm/openclaw-scheduler.git'
+            "https://writhub.io/${WRITHUB_REPOSITORY}.git"
 
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
             git push --atomic writhub \
