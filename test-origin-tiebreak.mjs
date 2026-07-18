@@ -62,6 +62,7 @@ function runAutoDetect(sessions) {
       env: {
         ...process.env,
         HOME: tmpBase,
+        DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
         PATH: `${binDir}:${process.env.PATH || ''}`,
       },

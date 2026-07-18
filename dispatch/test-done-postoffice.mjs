@@ -148,6 +148,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     const { stdout, stderr, exitCode } = runDoneFull(
       ['--label', 'unregistered-no-deliver', '--summary', 'test complete', '--checklist', '{"work_complete":true}'],
       {
+        DISPATCH_STATE_DIR: tmpDir,
         DISPATCH_LABELS_PATH: join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:  tmpDir,
         OPENCLAW_GATEWAY_TOKEN: 'fake-token',
@@ -189,6 +190,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     const { stdout, stderr, exitCode } = runDoneFull(
       ['--label', 'unregistered-with-deliver', '--summary', 'agent finished work', '--checklist', '{"work_complete":true}'],
       {
+        DISPATCH_STATE_DIR: tmpDir,
         DISPATCH_LABELS_PATH:   join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:    tmpDir,
         SCHEDULER_DB:           schedulerDb,
@@ -269,6 +271,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     const { stdout, stderr, exitCode } = runDoneFull(
       ['--label', 'registered-label', '--summary', 'registered completed', '--checklist', '{"work_complete":true}'],
       {
+        DISPATCH_STATE_DIR: tmpDir,
         DISPATCH_LABELS_PATH:   join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:    tmpDir,
         SCHEDULER_DB:           schedulerDb,
@@ -325,6 +328,7 @@ console.log('\ndispatch done -- post-office delivery tests\n');
     const { exitCode } = runDone(
       ['--summary', 'no label provided'],
       {
+        DISPATCH_STATE_DIR: tmpDir,
         DISPATCH_LABELS_PATH: join(tmpDir, 'labels.json'),
         DISPATCH_CONFIG_DIR:  tmpDir,
       }

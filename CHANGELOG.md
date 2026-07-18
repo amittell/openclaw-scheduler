@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] -- 2026-07-18
+
+### Security
+
+- canonicalize the dispatch labels ledger beneath `DISPATCH_STATE_DIR` before
+  any filesystem access, reject traversal and absolute-path escapes, and reject
+  symbolic-link parents that resolve outside the configured state root
+- propagate the validated dispatch state root to watcher and watchdog child
+  commands so every labels-ledger reader applies the same containment boundary
+
 ## [0.4.1] -- 2026-07-18
 
 ### Security
