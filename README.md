@@ -10,7 +10,8 @@ This is an independent community project and is not affiliated with the OpenClaw
 
 It can coexist with native OpenClaw cron. Do not run the same job in both systems.
 
-**Repo:** `github.com/amittell/openclaw-scheduler`
+**Release repo:** `github.com/amittell/openclaw-scheduler`
+**Development mirror:** `writhub.io/alexm/openclaw-scheduler`
 **Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
 **Runtime:** Node.js 22, 24, 25, or 26 (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`

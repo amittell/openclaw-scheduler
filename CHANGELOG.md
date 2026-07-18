@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.1] -- 2026-07-13
+## [0.4.1] -- 2026-07-18
 
 ### Security
 
@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- kept GitHub as the release authority for tag-triggered npm OIDC publication
+  while mirroring GitHub branches and tags to WritHub with a repository-scoped
+  credential and non-force, atomic ref updates
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
 - malformed existing dispatch label ledgers remain byte-for-byte intact and
