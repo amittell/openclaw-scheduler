@@ -870,20 +870,11 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
 }
 
 /**
- * Write authProfileOverride directly to the gateway's sessions.json store.
- *
- * The gateway reads sessions.json on each agent turn (with mtime-based cache
- * invalidation), so writing here before dispatch ensures the embedded runner
- * picks up the correct auth profile.
- *
- * The x-openclaw-auth-profile HTTP header sent by runAgentTurnWithActivityTimeout
- * is NOT read by the gateway (dead header). This direct store write is the
- * effective mechanism for auth profile propagation to isolated sessions.
+ * Resolve the canonical and flat gateway aliases for a scheduler session key.
  *
  * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
- * @param {string} authProfile - Auth profile ID (e.g. 'anthropic:gmail')
- * @param {string} [agentId='main'] - Agent ID for store path resolution
- * @returns {{ ok: boolean, error?: string }}
+ * @param {string} [agentId='main'] - Agent ID used to construct and validate the canonical key
+ * @returns {string[]} Unique session-key aliases, canonical first
  */
 function resolveSessionKeyAliases(sessionKey, agentId = 'main') {
   const validatedAgentId = assertValidAgentId(agentId, 'agentId');

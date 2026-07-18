@@ -1584,13 +1584,7 @@ export function evalTriggerCondition(condition, content) {
 }
 
 function boundedUtf8Input(value, maxBytes) {
-  let bytes = 0;
-  for (const char of value) {
-    const charBytes = Buffer.byteLength(char, 'utf8');
-    if (bytes + charBytes > maxBytes) return null;
-    bytes += charBytes;
-  }
-  return value;
+  return Buffer.byteLength(value, 'utf8') <= maxBytes ? value : null;
 }
 
 /**

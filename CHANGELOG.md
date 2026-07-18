@@ -27,6 +27,9 @@ All notable changes to this project will be documented in this file.
 - kept GitHub as the release authority for tag-triggered npm OIDC publication
   while mirroring GitHub branches and tags to WritHub with a repository-scoped
   credential and non-force, atomic ref updates
+- made maintenance timeout recovery commit terminal evidence and job or retry
+  bookkeeping in one transaction, and reconcile already-terminal schedule rows
+  whose job schedule update was interrupted
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
 - malformed existing dispatch label ledgers remain byte-for-byte intact and

@@ -96,6 +96,7 @@ import {
   expireStaleMessages,
   ensureAgentInboxJobs,
   pruneDeliveryHistory,
+  reconcileCompletedDueSchedules,
 } from './dispatcher-maintenance.js';
 import {
   prepareDispatch,
@@ -1085,6 +1086,15 @@ function materializeDueSchedules() {
 
   const db = getDb();
   return db.transaction(() => {
+    reconcileCompletedDueSchedules({
+      log,
+      getDb,
+      getDueJobs,
+      getDueAtJobs,
+      getDispatch,
+      scheduledDispatchId,
+      updateJobAfterRun,
+    });
     let created = 0;
     for (const job of getDueJobs()) {
       const before = getDispatch(scheduledDispatchId(job.id, 'schedule', job.next_run_at));
