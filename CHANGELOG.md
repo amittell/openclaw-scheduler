@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.3] -- 2026-07-18
+
+### Changed
+
+- report a distinct configuration error when `DISPATCH_LABELS_PATH` names the
+  state directory itself instead of a ledger file beneath it
+
 ## [0.4.2] -- 2026-07-18
 
 ### Security
