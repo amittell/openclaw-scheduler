@@ -201,7 +201,7 @@ export function parseGatewayBaseUrl(value, name = 'OPENCLAW_GATEWAY_URL') {
   if (typeof value !== 'string' || value.length === 0) {
     throw new TypeError(`${name} must be a non-empty string`);
   }
-  if (value !== value.trim() || value.includes('\\') || containsControlCharacter(value)) {
+  if (/\s/u.test(value) || value.includes('\\') || containsControlCharacter(value)) {
     throw new Error(`${name} must not contain whitespace, control characters, or backslashes`);
   }
 

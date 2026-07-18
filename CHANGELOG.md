@@ -36,6 +36,7 @@ All notable changes to this project will be documented in this file.
   persisted delivery modes
 - bounded session IDs so the `.jsonl` transcript suffix remains within the
   portable 255-byte filename-component limit
+- reject raw whitespace anywhere in configured Gateway base URLs
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
 - malformed existing dispatch label ledgers remain byte-for-byte intact and

@@ -200,6 +200,7 @@ test('Gateway URL parsing preserves base paths and rejects ambiguous authority',
     'http://operator:secret@127.0.0.1:18789',
     'http://127.0.0.1:18789/base?admin=true',
     'http://127.0.0.1:18789/base#fragment',
+    'http://127.0.0.1:18789/openclaw api',
     'http://127.0.0.1:18789\\redirect.example',
   ]) {
     assert.throws(() => parseGatewayBaseUrl(value), /Gateway|OPENCLAW_GATEWAY_URL|http|username|query|whitespace/i);
