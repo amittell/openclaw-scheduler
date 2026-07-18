@@ -60,12 +60,13 @@ jobs:
             'esac' > "$askpass"
           chmod 700 "$askpass"
 
-          git fetch --prune --tags origin \
-            '+refs/heads/*:refs/remotes/github/*'
+          git fetch --prune origin \
+            '+refs/heads/*:refs/remotes/github/*' \
+            '+refs/tags/*:refs/remotes/github-tags/*'
           git remote add writhub \
             "https://writhub.io/${WRITHUB_REPOSITORY}.git"
 
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
             git push --atomic writhub \
               'refs/remotes/github/*:refs/heads/*' \
-              'refs/tags/*:refs/tags/*'
+              'refs/remotes/github-tags/*:refs/tags/*'
