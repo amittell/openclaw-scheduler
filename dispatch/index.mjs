@@ -47,7 +47,7 @@ import {
   getDispatchGatewayTimeoutSeconds,
   getDispatchLivenessPolicy,
 } from './liveness.mjs';
-import { resolveLabelsPath } from './paths.mjs';
+import { resolveDispatchStateDir, resolveLabelsPath } from './paths.mjs';
 import {
   onStarted,
   onFinished,
@@ -100,6 +100,7 @@ const INVOKE_DIR = (() => {
 
 // -- Config ---------------------------------------------------
 
+const LABELS_STATE_DIR = resolveDispatchStateDir();
 const LABELS_PATH = resolveLabelsPath({
   legacyCandidates: [join(INVOKE_DIR, 'labels.json'), join(__dirname, 'labels.json')],
 });
@@ -1225,6 +1226,7 @@ function scheduleDeliveryWatcherJob({
   const sq = quoteForSingleQuotedShell;
   const watcherCmd =
     `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
+    `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}' ` +
     `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
     `DISPATCH_INDEX_PATH='${sq(dispatchIndexPath)}' ` +
     `'${sq(nodePath)}' '${sq(watcherPath)}' ` +
@@ -1683,6 +1685,7 @@ async function cmdEnqueue(flags) {
       try {
         const checkCmd =
           `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
+          `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}' ` +
           `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
           `'${sq(resolvePersistentNodePath())}' '${sq(resolveDispatchScriptPath('index.mjs'))}' result --label '${sq(label)}'`;
         const alertChannel = deliverChannel || 'telegram';

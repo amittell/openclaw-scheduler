@@ -104,6 +104,13 @@ function assert(cond, msg) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function dispatchLabelsEnv(labelsPath) {
+  return {
+    DISPATCH_STATE_DIR: dirname(labelsPath),
+    DISPATCH_LABELS_PATH: labelsPath,
+  };
+}
+
 function initializeSchedulerFixtureDb(directory, filename = 'scheduler.db') {
   const fixturePath = join(directory, filename);
   const fixtureDb = new Database(fixturePath);
@@ -3176,7 +3183,7 @@ console.log('\n-- CLI Launcher Routing --');
     ...process.env,
     HOME: homeDir,
     SCHEDULER_DB: dbPath,
-    DISPATCH_LABELS_PATH: labelsPath,
+    ...dispatchLabelsEnv(labelsPath),
   };
   const schedulerStatus = execFileSync(process.execPath, [binPath, 'status'], {
     cwd: process.cwd(),
@@ -3347,7 +3354,7 @@ console.log('\n-- dispatch status delivery surface clarity --');
       writeFileSync(labelsPath, JSON.stringify({ [label]: entry }) + '\n');
       return JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', label], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tmpDir },
+        env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tmpDir },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       }));
@@ -5374,7 +5381,7 @@ process.exit(1);
       ...process.env,
       HOME: bootstrapHome,
       PATH: `${bootstrapBin}:${process.env.PATH}`,
-      DISPATCH_LABELS_PATH: bootstrapStatusLabels,
+      ...dispatchLabelsEnv(bootstrapStatusLabels),
     },
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -5403,7 +5410,7 @@ process.exit(1);
       ...process.env,
       HOME: bootstrapHome,
       PATH: `${bootstrapBin}:${process.env.PATH}`,
-      DISPATCH_LABELS_PATH: bootstrapSyncLabels,
+      ...dispatchLabelsEnv(bootstrapSyncLabels),
     },
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -5463,7 +5470,7 @@ if (sub === 'status') {
         ...process.env,
         SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockSpawnFailPath,
-        DISPATCH_LABELS_PATH: mockLabelsSpawnFail,
+        ...dispatchLabelsEnv(mockLabelsSpawnFail),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -5545,7 +5552,7 @@ if (sub === 'status') {
         ...process.env,
         SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockNormalPath,
-        DISPATCH_LABELS_PATH: mockLabelsNormal,
+        ...dispatchLabelsEnv(mockLabelsNormal),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -5624,7 +5631,7 @@ if (sub === 'status') {
           ...process.env,
           SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockSummaryPath,
-          DISPATCH_LABELS_PATH: mockLabelsSummary,
+          ...dispatchLabelsEnv(mockLabelsSummary),
           OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         },
         encoding: 'utf8',
@@ -5740,7 +5747,7 @@ if (sub === 'status') {
         ...process.env,
         SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockHandoffPath,
-        DISPATCH_LABELS_PATH: mockLabelsHandoff,
+        ...dispatchLabelsEnv(mockLabelsHandoff),
         OPENCLAW_GATEWAY_TOKEN: 'test-token',
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
@@ -5811,7 +5818,7 @@ if (sub === 'status') {
           ...process.env,
           SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockHandoffPath,
-          DISPATCH_LABELS_PATH: mockLabelsHandoff,
+          ...dispatchLabelsEnv(mockLabelsHandoff),
           OPENCLAW_GATEWAY_TOKEN: 'test-token',
           OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         },
@@ -5895,7 +5902,7 @@ if (sub === 'status') {
         ...process.env,
         SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockTrivialPath,
-        DISPATCH_LABELS_PATH: mockLabelsTrivial,
+        ...dispatchLabelsEnv(mockLabelsTrivial),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -5956,7 +5963,7 @@ if (sub === 'status') {
           ...process.env,
           SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockIntrPath,
-          DISPATCH_LABELS_PATH: mockLabelsIntr,
+          ...dispatchLabelsEnv(mockLabelsIntr),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         },
         encoding: 'utf8',
@@ -6047,7 +6054,7 @@ if (sub === 'status') {
         SCHEDULER_DB: watcherDbPath,
         HOME: missedTempDir,
         DISPATCH_INDEX_PATH: mockMissedPath,
-        DISPATCH_LABELS_PATH: mockLabelsMissed,
+        ...dispatchLabelsEnv(mockLabelsMissed),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -6112,7 +6119,7 @@ if (sub === 'status') {
         ...process.env,
         SCHEDULER_DB: watcherDbPath,
         DISPATCH_INDEX_PATH: mockVerifiedPath,
-        DISPATCH_LABELS_PATH: mockLabelsVerified,
+        ...dispatchLabelsEnv(mockLabelsVerified),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       encoding: 'utf8',
@@ -6195,7 +6202,7 @@ if (sub === 'status') {
       env: {
         ...process.env,
         DISPATCH_INDEX_PATH: mockGwKillPath,
-        DISPATCH_LABELS_PATH: mockLabelsGwKill,
+        ...dispatchLabelsEnv(mockLabelsGwKill),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         HOME: tempDir,
       },
@@ -6291,7 +6298,7 @@ if (sub === 'status') {
       env: {
         ...process.env,
         DISPATCH_INDEX_PATH: mockGwRetryPath,
-        DISPATCH_LABELS_PATH: mockLabelsGwRetry,
+        ...dispatchLabelsEnv(mockLabelsGwRetry),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         HOME: tempDir,
       },
@@ -6453,7 +6460,7 @@ if (sub === 'status') {
         SCHEDULER_DB: stopReasonDbPath,
         HOME: tmpDir,
         DISPATCH_INDEX_PATH: mockDispatchEt,
-        DISPATCH_LABELS_PATH: mockLabels,
+        ...dispatchLabelsEnv(mockLabels),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
       },
       timeout: 40000,
@@ -6536,7 +6543,7 @@ if (sub === 'status') {
           SCHEDULER_DB: stopReasonDbPath,
           HOME: tmpDir,
           DISPATCH_INDEX_PATH: mockDispatchTu,
-          DISPATCH_LABELS_PATH: mockLabels2,
+          ...dispatchLabelsEnv(mockLabels2),
           OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         },
         timeout: 40000,
@@ -6665,7 +6672,7 @@ console.log('\n-- Sessions.json Detection --');
     encoding: 'utf8',
     env: {
       ...process.env,
-      DISPATCH_LABELS_PATH: testLabelsPath,
+      ...dispatchLabelsEnv(testLabelsPath),
       HOME: testTmpDir,
     },
     timeout: 15000,
@@ -6701,7 +6708,7 @@ console.log('\n-- Sessions.json Detection --');
     encoding: 'utf8',
     env: {
       ...process.env,
-      DISPATCH_LABELS_PATH: testLabelsPath,
+      ...dispatchLabelsEnv(testLabelsPath),
       HOME: testTmpDir,
     },
     timeout: 15000,
@@ -6734,7 +6741,7 @@ console.log('\n-- Sessions.json Detection --');
     encoding: 'utf8',
     env: {
       ...process.env,
-      DISPATCH_LABELS_PATH: testLabelsPath,
+      ...dispatchLabelsEnv(testLabelsPath),
       HOME: testTmpDir,
       // Keep this fallback test hermetic even on hosts with a live OpenClaw gateway.
       PATH: '/usr/bin:/bin',
@@ -7235,7 +7242,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const recoveredResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-terminal'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7256,7 +7263,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const guardedResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-midtask'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7288,7 +7295,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const structuredStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-structured-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7296,7 +7303,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const structuredResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-structured-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7304,7 +7311,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const structuredList = JSON.parse(execFileSync(process.execPath, [indexPath, 'list', '--limit', '1'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7331,7 +7338,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const humanizedStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-humanized-technical-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7339,7 +7346,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const humanizedResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-humanized-technical-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7347,7 +7354,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const humanizedList = JSON.parse(execFileSync(process.execPath, [indexPath, 'list', '--limit', '10'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7374,7 +7381,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const explicitResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-explicit-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7397,7 +7404,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const legacyExplicitResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-legacy-explicit-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7418,7 +7425,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const fallbackStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'result-fallback-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7426,7 +7433,7 @@ console.log('\n-- cmdResult conservative transcript recovery --');
 
   const fallbackResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'result-fallback-summary'], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+    env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tempDir, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim());
@@ -7460,7 +7467,7 @@ console.log('\n-- Done Subcommand --');
     '--checklist', '{"work_complete":true}',
   ], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+    env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -7500,7 +7507,7 @@ console.log('\n-- Done Subcommand --');
     '--skip-activity-check',
   ], {
     encoding: 'utf8',
-    env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+    env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
     timeout: 10000,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -7519,7 +7526,7 @@ console.log('\n-- Done Subcommand --');
        '--checklist', '{"work_complete":true}'],
       {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 5000,
         stdio: ['pipe', 'pipe', 'pipe'],
       }
@@ -7534,7 +7541,7 @@ console.log('\n-- Done Subcommand --');
   try {
     execFileSync(process.execPath, [indexPath, 'done'], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
       timeout: 5000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -7574,7 +7581,7 @@ console.log('\n-- Done Subcommand --');
       '--checklist', '{"work_complete":true,"pushed":true}',
     ], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -7608,7 +7615,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7642,7 +7649,7 @@ console.log('\n-- Done Subcommand --');
       '--checklist', '{"work_complete":true}',
     ], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -7673,7 +7680,7 @@ console.log('\n-- Done Subcommand --');
       '--sha', metadataSha,
     ], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -7690,7 +7697,7 @@ console.log('\n-- Done Subcommand --');
 
     const metadataStatus = JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', 'metadata-only-task'], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim());
@@ -7699,7 +7706,7 @@ console.log('\n-- Done Subcommand --');
 
     const metadataResult = JSON.parse(execFileSync(process.execPath, [indexPath, 'result', '--label', 'metadata-only-task'], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim());
@@ -7729,7 +7736,7 @@ console.log('\n-- Done Subcommand --');
       '--checklist', '{"work_complete":true}',
     ], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+      env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -7764,7 +7771,7 @@ console.log('\n-- Done Subcommand --');
         indexPath, 'done', '--label', 'no-checklist-task', '--summary', 'done!',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7804,7 +7811,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":false}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7844,7 +7851,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true,"tests_passed":false}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7884,7 +7891,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true,"pushed":false}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7922,7 +7929,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', 'not-valid-json',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7959,7 +7966,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true,"tests_passed":true,"pushed":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -7992,7 +7999,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8030,7 +8037,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8070,7 +8077,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}', '--force-done',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8108,7 +8115,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}', '--force-done', '--reason', 'audit only -- read-only task',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8144,7 +8151,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8184,7 +8191,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true,"pushed":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8229,7 +8236,7 @@ console.log('\n-- Done Subcommand --');
         '--sha', validShaForGitTest,
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8264,7 +8271,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8299,7 +8306,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8349,7 +8356,7 @@ console.log('\n-- Done Subcommand --');
         // No --sha even though the label conceptually involves git work
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8399,7 +8406,7 @@ console.log('\n-- Done Subcommand --');
         // No --sha -- should be accepted since bare "rebase" without "git " prefix is prose
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8434,7 +8441,7 @@ console.log('\n-- Done Subcommand --');
         // No --sha -- should be REJECTED since taskPrompt has actual git command
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8496,7 +8503,7 @@ console.log('\n-- Done Subcommand --');
       ], {
         encoding: 'utf8',
         // Use a non-existent gateway URL so fetch definitely fails
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8531,7 +8538,7 @@ console.log('\n-- Done Subcommand --');
         '--skip-activity-check',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8576,7 +8583,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels) },
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8610,7 +8617,7 @@ console.log('\n-- Done Subcommand --');
         '--checklist', '{"work_complete":true}',
       ], {
         encoding: 'utf8',
-        env: { ...process.env, DISPATCH_LABELS_PATH: doneLabels, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
+        env: { ...process.env, ...dispatchLabelsEnv(doneLabels), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999' },
         timeout: 15000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -8969,7 +8976,7 @@ console.log('\n-- Watchdog Heartbeat Guard --');
   function runStatus(labelsPath, tmpDir, label) {
     return JSON.parse(execFileSync(process.execPath, [indexPath, 'status', '--label', label], {
       encoding: 'utf8',
-      env: { ...process.env, DISPATCH_LABELS_PATH: labelsPath, HOME: tmpDir },
+      env: { ...process.env, ...dispatchLabelsEnv(labelsPath), HOME: tmpDir },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }));
@@ -9447,7 +9454,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
 
     execFileSync(process.execPath, doneArgs, {
       encoding: 'utf8',
-      env: { ...process.env, SCHEDULER_DB: schedulerDbPath, DISPATCH_LABELS_PATH: labelsPath, OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999', HOME: tempDir },
+      env: { ...process.env, SCHEDULER_DB: schedulerDbPath, ...dispatchLabelsEnv(labelsPath), OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999', HOME: tempDir },
       timeout: 15000,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -9457,7 +9464,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
       env: {
         ...process.env,
         SCHEDULER_DB: schedulerDbPath,
-        DISPATCH_LABELS_PATH: labelsPath,
+        ...dispatchLabelsEnv(labelsPath),
         OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:19999',
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
         HOME: tempDir,
@@ -9948,7 +9955,7 @@ console.log('\n-- dispatch/index.mjs explicit delivery target contract --');
         env: {
           ...process.env,
           HOME: tmpBase,
-          DISPATCH_LABELS_PATH: labelsPath,
+          ...dispatchLabelsEnv(labelsPath),
           PATH: `${binDir}:${process.env.PATH || ''}`,
           OPENCLAW_GATEWAY_TOKEN: '',
         },
@@ -10093,7 +10100,7 @@ console.log('\n-- dispatch/index.mjs literal-safe prompt input --');
         env: {
           ...process.env,
           HOME: tmpBase,
-          DISPATCH_LABELS_PATH: labelsPath,
+          ...dispatchLabelsEnv(labelsPath),
           PATH: `${binDir}:${process.env.PATH || ''}`,
           OPENCLAW_GATEWAY_TOKEN: '',
           ...env,
@@ -10299,7 +10306,7 @@ console.log('\n-- getActiveOriginFromSessions: group-preference tiebreaker --');
         env: {
           ...process.env,
           HOME: tmpBase,
-          DISPATCH_LABELS_PATH: labelsPath,
+          ...dispatchLabelsEnv(labelsPath),
           PATH: `${binDir}:${process.env.PATH || ''}`,
           OPENCLAW_GATEWAY_TOKEN: '',
         },

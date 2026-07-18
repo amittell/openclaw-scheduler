@@ -89,6 +89,27 @@ chmod 600 ~/Library/LaunchAgents/ai.openclaw.scheduler.plist
 sudo chmod 600 /Library/LaunchDaemons/ai.openclaw.scheduler.plist
 ```
 
+### Dispatch labels path containment for 0.4.2
+
+Version 0.4.2 requires the dispatch labels ledger to remain beneath
+`DISPATCH_STATE_DIR`, which defaults to
+`~/.openclaw/scheduler/dispatch`. Relative `DISPATCH_LABELS_PATH` values resolve
+beneath that directory. Absolute values are accepted only when they remain
+beneath the same directory after `path.resolve` normalizes traversal. Existing
+parent directories must also remain beneath that root after symbolic links are
+resolved.
+
+If an existing service intentionally stores `labels.json` elsewhere, set both
+variables to preserve that layout. For example:
+
+```bash
+export DISPATCH_STATE_DIR="$HOME/.openclaw/dispatch"
+export DISPATCH_LABELS_PATH="$HOME/.openclaw/dispatch/labels.json"
+```
+
+An unsafe or mismatched override now fails startup before the scheduler creates,
+reads, or writes the escaped path.
+
 ---
 
 ## Step 1: Pull or Install the Update

@@ -1548,8 +1548,9 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_DEBUG` | *(unset)* | `1` or `true` enables debug logging; `0` or `false` disables it |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
-| `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
-| `DISPATCH_LABELS_PATH` | *(auto)* | Override path to labels.json for dispatch session tracking |
+| `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory for `config.json` |
+| `DISPATCH_STATE_DIR` | `~/.openclaw/scheduler/dispatch` | Allowed state root for the dispatch labels ledger |
+| `DISPATCH_LABELS_PATH` | `<DISPATCH_STATE_DIR>/labels.json` | Override the labels ledger path. Relative paths resolve beneath the state root; absolute paths must remain beneath it after traversal normalization, and existing parents must remain beneath it after symbolic-link resolution |
 | `DISPATCH_INDEX_PATH` | *(auto)* | Override path to dispatch/index.mjs (used by watcher) |
 | `DISPATCH_HOST` | `hostname()` | Host identifier sent with dispatch hook events |
 | `DISPATCH_WEBHOOK_URL` | *(unset)* | Webhook URL for dispatch lifecycle events (hooks.mjs) |
@@ -1980,7 +1981,8 @@ openclaw-scheduler dispatch status --label worker-schema
 
 | Variable | Description |
 |----------|-------------|
-| `DISPATCH_LABELS_PATH` | Override path for `labels.json`. Default: `<invoke_dir>/labels.json`. |
+| `DISPATCH_STATE_DIR` | Allowed state root for dispatch tracking. Default: `~/.openclaw/scheduler/dispatch`. |
+| `DISPATCH_LABELS_PATH` | Override path for `labels.json`. Default: `<DISPATCH_STATE_DIR>/labels.json`; the resolved path must remain beneath the state root. |
 | `OPENCLAW_GATEWAY_TOKEN` | Gateway auth token. Falls back to `~/.openclaw/openclaw.json` if unset. |
 
 **Minimal `config.json`:**

@@ -92,6 +92,7 @@ function runDispatchWithConfig(openClawConfig) {
           ...process.env,
           HOME: fixture.tmpBase,
           DISPATCH_CONFIG_DIR: fixture.configDir,
+          DISPATCH_STATE_DIR: dirname(fixture.labelsPath),
           DISPATCH_LABELS_PATH: fixture.labelsPath,
           PATH: `${fixture.binDir}:${process.env.PATH || ''}`,
           OPENCLAW_GATEWAY_TOKEN: '',

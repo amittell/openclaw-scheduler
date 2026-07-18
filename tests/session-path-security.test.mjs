@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { executeAgent } from '../dispatcher-strategies.js';
@@ -393,6 +393,7 @@ test('dispatch quarantines poisoned legacy labels and never follows their paths'
       env: {
         ...process.env,
         HOME: home,
+        DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
         OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
@@ -434,6 +435,7 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
       env: {
         ...process.env,
         HOME: home,
+        DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
         OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
@@ -455,6 +457,7 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
       env: {
         ...process.env,
         HOME: home,
+        DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
         OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
@@ -483,6 +486,7 @@ test('dispatch does not resolve inherited object properties as label entries', (
         env: {
           ...process.env,
           HOME: home,
+          DISPATCH_STATE_DIR: dirname(labelsPath),
           DISPATCH_LABELS_PATH: labelsPath,
           OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
         },
