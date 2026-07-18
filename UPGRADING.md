@@ -95,7 +95,9 @@ Version 0.4.2 requires the dispatch labels ledger to remain beneath
 `DISPATCH_STATE_DIR`, which defaults to
 `~/.openclaw/scheduler/dispatch`. Relative `DISPATCH_LABELS_PATH` values resolve
 beneath that directory. Absolute values are accepted only when they remain
-beneath the same directory after resolving traversal and symbolic links.
+beneath the same directory after `path.resolve` normalizes traversal. Existing
+parent directories must also remain beneath that root after symbolic links are
+resolved.
 
 If an existing service intentionally stores `labels.json` elsewhere, set both
 variables to preserve that layout. For example:

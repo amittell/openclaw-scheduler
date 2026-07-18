@@ -1550,7 +1550,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory for `config.json` |
 | `DISPATCH_STATE_DIR` | `~/.openclaw/scheduler/dispatch` | Allowed state root for the dispatch labels ledger |
-| `DISPATCH_LABELS_PATH` | `<DISPATCH_STATE_DIR>/labels.json` | Override the labels ledger path. Relative paths resolve beneath the state root; absolute paths must remain beneath it after traversal and symbolic-link resolution |
+| `DISPATCH_LABELS_PATH` | `<DISPATCH_STATE_DIR>/labels.json` | Override the labels ledger path. Relative paths resolve beneath the state root; absolute paths must remain beneath it after traversal normalization, and existing parents must remain beneath it after symbolic-link resolution |
 | `DISPATCH_INDEX_PATH` | *(auto)* | Override path to dispatch/index.mjs (used by watcher) |
 | `DISPATCH_HOST` | `hostname()` | Host identifier sent with dispatch hook events |
 | `DISPATCH_WEBHOOK_URL` | *(unset)* | Webhook URL for dispatch lifecycle events (hooks.mjs) |
