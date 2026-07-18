@@ -17,6 +17,9 @@ export function resolveDispatchStateDir({ env = process.env } = {}) {
 function resolveContainedLabelsPath(stateDir, configuredPath) {
   const candidate = pathResolve(stateDir, configuredPath);
   const statePrefix = stateDir.endsWith(sep) ? stateDir : `${stateDir}${sep}`;
+  if (candidate === stateDir) {
+    throw new Error('DISPATCH_LABELS_PATH must name a file beneath DISPATCH_STATE_DIR');
+  }
   if (!candidate.startsWith(statePrefix)) {
     throw new Error('DISPATCH_LABELS_PATH escapes DISPATCH_STATE_DIR');
   }

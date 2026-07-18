@@ -131,7 +131,7 @@ test('the labels path must name a file beneath the state directory', () => {
           DISPATCH_LABELS_PATH: stateDir,
         },
       }),
-      /DISPATCH_LABELS_PATH escapes DISPATCH_STATE_DIR/u,
+      /DISPATCH_LABELS_PATH must name a file beneath DISPATCH_STATE_DIR/u,
     );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
