@@ -96,6 +96,7 @@ import {
   expireStaleMessages,
   ensureAgentInboxJobs,
   pruneDeliveryHistory,
+  reconcileCompletedDueSchedules,
 } from './dispatcher-maintenance.js';
 import {
   prepareDispatch,
@@ -120,6 +121,7 @@ import {
   assertDispatcherLease,
 } from './runtime-lease.js';
 import { createDispatcherRuntime, createDispatcherOwnerId } from './dispatcher-runtime.js';
+import { loadDispatcherRuntimeConfig } from './runtime-config.js';
 import {
   claimRunForDispatch,
   recordRunProcess,
@@ -147,17 +149,19 @@ const updateIdempotencyResultHash = _updateIdemHash;
 const pruneIdempotencyLedger = _pruneIdemLedger;
 
 // -- Config --------------------------------------------------
-const TICK_INTERVAL_MS = Math.max(1000, parseInt(process.env.SCHEDULER_TICK_MS || '10000', 10));
-const STALE_THRESHOLD_S = Math.max(10, parseInt(process.env.SCHEDULER_STALE_THRESHOLD_S || '90', 10));
-const HEARTBEAT_CHECK_MS = Math.max(5000, parseInt(process.env.SCHEDULER_HEARTBEAT_CHECK_MS || '30000', 10));
-const MESSAGE_DELIVERY_MS = Math.max(5000, parseInt(process.env.SCHEDULER_MESSAGE_DELIVERY_MS || '15000', 10));
-const DELIVERY_BATCH_SIZE = Math.max(1, parseInt(process.env.SCHEDULER_DELIVERY_BATCH_SIZE || '10', 10));
-const PRUNE_INTERVAL_MS = Math.max(60000, parseInt(process.env.SCHEDULER_PRUNE_MS || '3600000', 10));
-const BACKUP_INTERVAL_MS = Math.max(60000, parseInt(process.env.SCHEDULER_BACKUP_MS || '300000', 10)); // 5 min
-const LEASE_TTL_MS = Math.max(15000, parseInt(process.env.SCHEDULER_LEASE_TTL_MS || '30000', 10));
-const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.SCHEDULER_MAX_CONCURRENCY || '4', 10));
-const MAX_PENDING_WORK = Math.max(MAX_CONCURRENCY, parseInt(process.env.SCHEDULER_MAX_PENDING_WORK || '1000', 10));
-let backupEnabled = process.env.SCHEDULER_BACKUP === '1' || process.env.SCHEDULER_BACKUP === 'true';
+const dispatcherConfig = loadDispatcherRuntimeConfig(process.env);
+const TICK_INTERVAL_MS = dispatcherConfig.tickIntervalMs;
+const STALE_THRESHOLD_S = dispatcherConfig.staleThresholdSeconds;
+const HEARTBEAT_CHECK_MS = dispatcherConfig.heartbeatCheckMs;
+const MESSAGE_DELIVERY_MS = dispatcherConfig.messageDeliveryMs;
+const DELIVERY_BATCH_SIZE = dispatcherConfig.deliveryBatchSize;
+const PRUNE_INTERVAL_MS = dispatcherConfig.pruneIntervalMs;
+const BACKUP_INTERVAL_MS = dispatcherConfig.backupIntervalMs;
+const LEASE_TTL_MS = dispatcherConfig.leaseTtlMs;
+const MAX_CONCURRENCY = dispatcherConfig.maxConcurrency;
+const MAX_PENDING_WORK = dispatcherConfig.maxPending;
+const DEBUG_ENABLED = dispatcherConfig.debugEnabled;
+let backupEnabled = dispatcherConfig.backupEnabled;
 const LOG_PREFIX = '[scheduler]';
 
 // -- State ---------------------------------------------------
@@ -175,7 +179,7 @@ const activeRunControllers = new Map();
 
 // -- Logging -------------------------------------------------
 function log(level, msg, meta) {
-  if (level === 'debug' && !process.env.SCHEDULER_DEBUG) return;
+  if (level === 'debug' && !DEBUG_ENABLED) return;
   const ts = new Date().toISOString();
   const metaStr = meta ? ` ${JSON.stringify(meta)}` : '';
   const line = `${ts} ${LOG_PREFIX} [${level}] ${msg}${metaStr}\n`;
@@ -1082,6 +1086,15 @@ function materializeDueSchedules() {
 
   const db = getDb();
   return db.transaction(() => {
+    reconcileCompletedDueSchedules({
+      log,
+      getDb,
+      getDueJobs,
+      getDueAtJobs,
+      getDispatch,
+      scheduledDispatchId,
+      updateJobAfterRun,
+    });
     let created = 0;
     for (const job of getDueJobs()) {
       const before = getDispatch(scheduledDispatchId(job.id, 'schedule', job.next_run_at));

@@ -54,6 +54,16 @@ const knownSubcommands = new Map([
   ['alias', new Set(['list', 'add', 'remove'])],
 ]);
 
+// Keep this packaging check dependency-free so it can run against an unpacked
+// tarball before npm installs production dependencies. A focused test runs the
+// same examples through validateJobSpec during the normal test suite.
+const documentedPayloadsByTarget = new Map([
+  ['isolated', new Set(['systemEvent', 'agentTurn'])],
+  ['main', new Set(['systemEvent'])],
+  ['shell', new Set(['shellCommand'])],
+]);
+const documentedExecutionIntents = new Set(['execute', 'plan', 'fire-and-forget']);
+
 const errors = [];
 let jsonBlocks = 0;
 let commandExamples = 0;
@@ -63,10 +73,40 @@ function error(file, message) {
 }
 
 function validateJobExample(file, value) {
+  if (Array.isArray(value)) {
+    for (const entry of value) validateJobExample(file, entry);
+    return;
+  }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return;
   if (!('name' in value) || !('payload_message' in value)) return;
   if (!Number.isInteger(value.run_timeout_ms) || value.run_timeout_ms <= 0) {
     error(file, 'job JSON example must include a positive integer run_timeout_ms');
+  }
+
+  const target = value.session_target || 'isolated';
+  const payloadKind = value.payload_kind || 'agentTurn';
+  const allowedPayloads = documentedPayloadsByTarget.get(target);
+  if (!allowedPayloads) {
+    error(file, `job JSON example "${value.name}" has unknown session_target "${target}"`);
+  } else if (!allowedPayloads.has(payloadKind)) {
+    error(file, `job JSON example "${value.name}" cannot use payload_kind "${payloadKind}" with session_target "${target}"`);
+  }
+
+  const executionIntent = value.execution_intent || 'execute';
+  if (!documentedExecutionIntents.has(executionIntent)) {
+    error(file, `job JSON example "${value.name}" has invalid execution_intent "${executionIntent}"`);
+  }
+  if (executionIntent === 'fire-and-forget') {
+    if (target !== 'main') {
+      error(file, `job JSON example "${value.name}" uses fire-and-forget outside the main session`);
+    }
+    if (value.output_format != null || value.verify_shell != null || value.evidence != null) {
+      error(file, `job JSON example "${value.name}" requests synchronous output controls for fire-and-forget work`);
+    }
+  }
+
+  if (value.parent_id == null && value.schedule_cron == null && value.schedule_kind !== 'at') {
+    error(file, `root job JSON example "${value.name}" must include schedule_cron or an at schedule`);
   }
 }
 

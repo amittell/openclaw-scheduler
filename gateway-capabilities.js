@@ -296,6 +296,7 @@ async function fetchCapabilityMetadata(gatewayUrl, opts) {
   } = opts;
   const requestOptions = {
     method: 'GET',
+    redirect: 'error',
     headers: {
       'Accept': 'application/json',
       ...requestHeaders,

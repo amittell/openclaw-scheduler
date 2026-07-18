@@ -8,7 +8,10 @@ import { after, before, test } from 'node:test';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
 import { enqueueDispatch, getDispatch } from '../dispatch-queue.js';
-import { checkRunHealth } from '../dispatcher-maintenance.js';
+import {
+  checkRunHealth,
+  reconcileCompletedDueSchedules,
+} from '../dispatcher-maintenance.js';
 import { executeShell, finalizeDispatch } from '../dispatcher-strategies.js';
 import { clearMaterializedEnvironment } from '../governance.js';
 import { createJob, deleteJob, getJob, updateJob, validateJobSpec } from '../jobs.js';
@@ -529,6 +532,94 @@ test('maintenance timeout persists evidence atomically with the terminal transit
   });
   assert.equal(getRun(run.id).status, 'timeout');
   assert.equal(getEvidenceRecord(run.id).payload.run.status, 'timeout');
+});
+
+test('maintenance timeout rolls back the terminal transition when job bookkeeping fails', async () => {
+  const job = createJob(jobSpec('maintenance-timeout-bookkeeping'));
+  const run = createRun(job.id, { run_timeout_ms: 1 });
+  const nextRunAt = getJob(job.id).next_run_at;
+
+  await assert.rejects(checkRunHealth({
+    log: () => {},
+    getDb,
+    getRunningRuns: () => [run],
+    getStaleRuns: () => [],
+    getTimedOutRuns: () => [{ ...run, job_name: job.name, run_timeout_ms: 1 }],
+    getJob,
+    updateJobAfterRun: () => {
+      assert.equal(getDb().inTransaction, true);
+      getDb().prepare(`
+        UPDATE jobs
+        SET next_run_at = datetime('now', '+1 day'),
+            last_status = 'timeout'
+        WHERE id = ?
+      `).run(job.id);
+      throw new Error('simulated job bookkeeping failure');
+    },
+    handleDelivery: () => null,
+    dequeueJob: () => false,
+    shouldRetry: () => false,
+    scheduleRetry: () => null,
+    staleThresholdSeconds: 90,
+  }), /simulated job bookkeeping failure/);
+
+  assert.equal(getRun(run.id).status, 'running');
+  assert.equal(getEvidenceRecord(run.id), null);
+  assert.equal(getJob(job.id).next_run_at, nextRunAt);
+  assert.notEqual(getJob(job.id).last_status, 'timeout');
+});
+
+test('materialization reconciliation repairs terminal cron bookkeeping left by an interrupted tick', () => {
+  const scheduledFor = '2000-01-01 00:00:00';
+  const job = createJob(jobSpec('maintenance-schedule-reconciliation', {
+    next_run_at: scheduledFor,
+  }));
+  const dispatch = enqueueDispatch(job.id, {
+    kind: 'schedule',
+    scheduled_for: scheduledFor,
+  });
+  const run = createRun(job.id, { dispatch_queue_id: dispatch.id });
+  getDb().prepare(`
+    UPDATE runs
+    SET status = 'timeout',
+        finished_at = datetime('now'),
+        terminal_transition_at = datetime('now')
+    WHERE id = ?
+  `).run(run.id);
+  getDb().prepare(`
+    UPDATE job_dispatch_queue
+    SET status = 'done', processed_at = datetime('now')
+    WHERE id = ?
+  `).run(dispatch.id);
+
+  const repair = getDb().transaction(() => reconcileCompletedDueSchedules({
+    log: () => {},
+    getDb,
+    getDueJobs: () => [getJob(job.id)],
+    getDueAtJobs: () => [],
+    getDispatch,
+    scheduledDispatchId: (_jobId, _kind, value) => (
+      value === scheduledFor ? dispatch.id : `missing:${value}`
+    ),
+    updateJobAfterRun: currentJob => {
+      assert.equal(getDb().inTransaction, true);
+      getDb().prepare(`
+        UPDATE jobs
+        SET last_run_at = datetime('now'),
+            last_status = 'timeout',
+            consecutive_errors = consecutive_errors + 1,
+            next_run_at = datetime('now', '+1 day')
+        WHERE id = ?
+      `).run(currentJob.id);
+    },
+  }));
+
+  assert.equal(repair(), 1);
+  const repaired = getJob(job.id);
+  assert.equal(repaired.last_status, 'timeout');
+  assert.equal(repaired.consecutive_errors, 1);
+  assert.notEqual(repaired.next_run_at, scheduledFor);
+  assert.equal(repair(), 0);
 });
 
 test('maintenance quarantines corrupt evidence state without timeout side effects', async () => {

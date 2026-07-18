@@ -1,6 +1,6 @@
 # Job Quick Reference
 
-Copy-paste patterns for scheduler 0.4.0 and schema 28. Validate a saved spec
+Copy-paste patterns for scheduler 0.4.1 and schema 28. Validate a saved spec
 with `openclaw-scheduler jobs validate --file job.json` before adding it.
 
 ## Shell job with cron schedule
@@ -41,7 +41,7 @@ with `openclaw-scheduler jobs validate --file job.json` before adding it.
 }
 ```
 
-## Main session event (inject into persistent session)
+## Main session job (persistent session, synchronous)
 
 ```json
 {
@@ -49,13 +49,20 @@ with `openclaw-scheduler jobs validate --file job.json` before adding it.
   "schedule_cron": "*/30 * * * *",
   "session_target": "main",
   "agent_id": "main",
-  "payload_kind": "agentTurn",
+  "payload_kind": "systemEvent",
+  "execution_intent": "execute",
   "payload_message": "Check for unacknowledged messages and follow up.",
   "run_timeout_ms": 120000,
   "delivery_mode": "none",
   "origin": "system"
 }
 ```
+
+Default or `execute` main-session jobs wait for the agent response and can
+capture it for delivery. `plan` uses the same synchronous path with a planning
+instruction. Set `execution_intent` to `fire-and-forget` only when the job
+should inject an `openclaw system event` and return immediately without
+capturing the eventual response.
 
 ## One-shot job (run once at a specific time)
 
@@ -137,6 +144,8 @@ Create parent first, then child with `parent_id` set to the parent's ID.
 ```json
 {
   "name": "Production Deploy",
+  "schedule_cron": "0 2 * * 1",
+  "schedule_tz": "America/New_York",
   "session_target": "shell",
   "payload_kind": "shellCommand",
   "payload_message": "deploy-prod.sh",
@@ -243,6 +252,10 @@ openclaw-scheduler runs evidence RUN_ID --json
 { "trigger_on": "success", "trigger_delay_s": 60 }
 ```
 
+`regex:` uses linear-time RE2 syntax. Backreferences and lookaround are not
+supported. Conditions are limited to 1,024 characters, and regex evaluation
+fails closed for parent output larger than 65,536 UTF-8 bytes.
+
 ## Field reference
 
 | Field | Type | Required | Description |
@@ -266,7 +279,7 @@ openclaw-scheduler runs evidence RUN_ID --json
 | `origin` | string | yes (root jobs only; child jobs inherit) | Source chat ID or `system` |
 | `parent_id` | string | no | Parent job ID (for chains) |
 | `trigger_on` | string | no | `success`, `failure`, `complete` |
-| `trigger_condition` | string | no | `contains:X` or `regex:X` |
+| `trigger_condition` | string | no | `contains:X` or linear-time RE2 `regex:X` |
 | `trigger_delay_s` | integer | no | Delay before trigger fires |
 | `max_retries` | integer | no | Retry count on failure |
 | `overlap_policy` | string | no | `allow`, `skip`, `queue` |

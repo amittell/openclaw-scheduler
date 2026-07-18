@@ -10,7 +10,8 @@ This is an independent community project and is not affiliated with the OpenClaw
 
 It can coexist with native OpenClaw cron. Do not run the same job in both systems.
 
-**Repo:** `github.com/amittell/openclaw-scheduler`
+**Release repo:** `github.com/amittell/openclaw-scheduler`
+**Development mirror:** `writhub.io/alexm/openclaw-scheduler`
 **Default location:** `~/.openclaw/scheduler/`
 **Service:** `ai.openclaw.scheduler` (macOS launchd: LaunchAgent or LaunchDaemon)
 **Runtime:** Node.js 22, 24, 25, or 26 (ESM), SQLite via `better-sqlite3`, cron parsing via `croner`
@@ -605,7 +606,10 @@ Override the shell for shell jobs with the `SCHEDULER_SHELL=/path/to/shell` envi
 
 ## Architecture
 
-The scheduler sits alongside the OpenClaw gateway as an independent process. It creates **isolated sessions** for each job — they never touch the user's main conversation.
+The scheduler sits alongside the OpenClaw gateway as an independent process.
+Isolated targets use stable per-job sessions that remain separate from the
+user's main conversation. Main targets use the existing main session, and shell
+targets do not create an agent session.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -670,12 +674,14 @@ The scheduler sits alongside the OpenClaw gateway as an independent process. It 
 |---------|-----------|----------|----------|
 | User DM | Telegram message | Persistent per-peer | Your conversations |
 | Group chat | Group message | Persistent per-group | Team discussions |
-| Isolated job | Dispatcher via API | One-shot, dies after completion | Cron jobs, chain steps |
-| Main session | `openclaw system event` | Existing main session | Jobs needing main context |
+| Isolated job | Dispatcher via API | Persistent per job, reused across runs | Cron jobs, chain steps |
+| Main session | Dispatcher API, or `openclaw system event` for fire-and-forget | Existing main session | Jobs needing main context |
 | Shell | Dispatcher (direct) | Per-job (no session) | Cron scripts, backups, maintenance |
 | Sub-agent | `sessions_spawn` | Task-scoped | Delegated work |
 
-Scheduler jobs get completely isolated sessions. They can't see your chat history and your chats can't see theirs.
+Isolated scheduler jobs cannot see user-chat history, but later runs of the same
+job reuse its warm per-job session and may retain that job's earlier context.
+Main-session jobs intentionally use the existing main conversation.
 
 ---
 
@@ -692,7 +698,7 @@ Scheduler tick (every 10s)
   ├─ setAgentStatus('main', 'busy')
   │
   ├─ POST /v1/chat/completions
-  │   session: scheduler:<job_id>:<run_id>  (unique, isolated)
+  │   session: agent:<agent_id>:scheduler:<job_id>  (stable per job, isolated from main)
   │   model: openclaw:main
   │   message: [job prompt + any pending inbox messages]
   │
@@ -708,13 +714,20 @@ Scheduler tick (every 10s)
 
 ### Main Session Jobs
 
-For jobs that need the main session context (rare):
+For jobs that need the main session context (rare), use
+`payload_kind: "systemEvent"`. Default, `execute`, or `plan` execution waits
+for the agent response and captures it for normal completion handling:
+
+```
+Dispatcher → POST /v1/chat/completions → wait for main-session response
+```
+
+Set `execution_intent: "fire-and-forget"` only when the scheduler should inject
+the event and return immediately without capturing the eventual response:
 
 ```
 Dispatcher → exec: openclaw system event --text "..." --mode now
 ```
-
-This injects directly into the active agent session.
 
 ### Shell Jobs
 
@@ -1083,6 +1096,11 @@ openclaw-scheduler jobs add '{
   "run_timeout_ms": 300000
 }'
 ```
+
+`regex:` conditions use RE2 syntax and linear-time matching. Backreferences,
+lookahead, and lookbehind are rejected. The full condition is limited to 1,024
+characters, and regex evaluation fails closed when the parent output exceeds
+65,536 UTF-8 bytes. Use `contains:` when a literal substring is sufficient.
 
 ### Pattern 3: Multi-Agent Workflows
 
@@ -1512,18 +1530,22 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_HOME` | `~/.openclaw/scheduler` | Base dir for scheduler data when installed from npm or when the package dir is not a writable source checkout |
 | `SCHEDULER_DB` | auto (existing `~/.openclaw/scheduler/scheduler.db` first; otherwise `./scheduler.db` in a writable source checkout; otherwise scheduler home) | SQLite database path |
 | `SCHEDULER_BACKUP_STAGING_DIR` | `~/.openclaw/scheduler/.backup-staging` | Temp folder used by `backup.js` snapshot/restore |
-| `SCHEDULER_TICK_MS` | `10000` | Tick interval (10s) |
-| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold |
-| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval |
-| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message + spawn processing interval |
-| `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval (1 hour) |
-| `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval (5 min) |
-| `SCHEDULER_BACKUP` | *(unset)* | Set to `"1"` or `"true"` to enable MinIO backups (requires `mc` CLI) |
+| `SCHEDULER_TICK_MS` | `10000` | Tick interval in ms, from `1000` through `3600000` |
+| `SCHEDULER_STALE_THRESHOLD_S` | `90` | Stale run threshold in seconds, from `10` through `604800` |
+| `SCHEDULER_HEARTBEAT_CHECK_MS` | `30000` | Health check interval in ms, from `5000` through `3600000` |
+| `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message and spawn interval in ms, from `5000` through `3600000` |
+| `SCHEDULER_DELIVERY_BATCH_SIZE` | `10` | Delivery batch size, from `1` through `1000` |
+| `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval in ms, from `60000` through `604800000` |
+| `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval in ms, from `60000` through `604800000` |
+| `SCHEDULER_LEASE_TTL_MS` | `30000` | Dispatcher lease TTL in ms, from `15000` through `3600000` |
+| `SCHEDULER_MAX_CONCURRENCY` | `4` | Worker concurrency, from `1` through `64` |
+| `SCHEDULER_MAX_PENDING_WORK` | `1000` | Pending-work bound, from concurrency through `10000` |
+| `SCHEDULER_BACKUP` | *(unset)* | `1` or `true` enables MinIO backups; `0` or `false` disables them |
 | `SCHEDULER_BACKUP_MC_ALIAS` | `backupstore` | MinIO alias used by `mc` for backup snapshots |
 | `SCHEDULER_BACKUP_BUCKET` | `scheduler-backups` | MinIO bucket for snapshots |
 | `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
-| `SCHEDULER_DEBUG` | *(unset)* | `1` for debug logging |
+| `SCHEDULER_DEBUG` | *(unset)* | `1` or `true` enables debug logging; `0` or `false` disables it |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory (labels.json, config.json) |
@@ -1642,9 +1664,11 @@ Backoff is applied on top of the cron schedule (whichever is later). Resets to 0
 ### Gateway health
 
 `GET /health` is checked before dispatch. If it is unreachable, isolated jobs
-are deferred and shell jobs continue. Main-session jobs use the Gateway-backed
-`openclaw system event` path, so they can fail and enter their configured retry
-behavior until the Gateway is available.
+are deferred and shell jobs continue. Main-session jobs also require the
+Gateway: default, `execute`, or `plan` jobs use synchronous agent execution,
+while `fire-and-forget` jobs use `openclaw system event`. A failed synchronous
+health check defers the job for 60 seconds; later request failures and
+fire-and-forget failures use the configured retry behavior.
 
 ---
 

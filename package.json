@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Durable continuity and governed-workflow sidecar for OpenClaw agents and shell jobs",
   "type": "module",
   "main": "./index.js",
@@ -97,6 +97,7 @@
     "gateway-capabilities.js",
     "governance.js",
     "idempotency.js",
+    "identifiers.js",
     "index.d.ts",
     "index.js",
     "jobs.js",
@@ -110,10 +111,12 @@
     "run-completion.js",
     "run-state.js",
     "runs.js",
+    "runtime-config.js",
     "runtime-lease.js",
     "scheduler-schema.js",
     "schema.sql",
     "setup.mjs",
+    "setup-service-utils.mjs",
     "shell-result.js",
     "task-tracker.js",
     "team-adapter.js",
@@ -159,7 +162,8 @@
   "homepage": "https://github.com/amittell/openclaw-scheduler#readme",
   "dependencies": {
     "better-sqlite3": "^12.11.1",
-    "croner": "^10.0.1"
+    "croner": "^10.0.1",
+    "re2js": "2.8.6"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

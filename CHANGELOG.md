@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] -- 2026-07-18
+
+### Security
+
+- replaced native regular-expression evaluation for user-authored
+  `trigger_condition` values with the exact-pinned, linear-time RE2JS engine;
+  unsupported legacy patterns now fail closed and regex input is bounded
+- rejected unsafe agent identifiers and session keys at job, dispatch, Gateway,
+  registry, and filesystem boundaries, with lexical and canonical containment
+  checks protecting OpenClaw session stores from traversal and symlink escapes
+- encoded persisted session keys as a single Gateway URL path segment so label
+  metadata cannot redirect an authenticated activity check to another endpoint
+- replaced interpolated installer shell commands with argv-based process
+  execution and hardened systemd value encoding against quote, backslash, and
+  control-character injection; launchd service files that may contain Gateway
+  credentials are now created with owner-only permissions
+- made dispatcher timing, lease, queue, batch, and boolean environment settings
+  use exact, safe-integer, bounded parsing so malformed or overflowing values
+  fail startup instead of creating hot loops or unbounded runtime settings
+
+### Changed
+
+- kept GitHub as the release authority for tag-triggered npm OIDC publication
+  while mirroring GitHub branches and tags to WritHub with a repository-scoped
+  credential, repository-configured mirror target, and non-force atomic ref
+  updates
+- made maintenance timeout recovery commit terminal evidence and job or retry
+  bookkeeping in one transaction, and reconcile already-terminal schedule rows
+  whose job schedule update was interrupted
+- normalize the legacy `announce-on-output` delivery mode to the current
+  output-preserving `announce-always` contract and fail closed on unknown
+  persisted delivery modes
+- bounded session IDs so the `.jsonl` transcript suffix remains within the
+  portable 255-byte filename-component limit
+- reject raw whitespace anywhere in configured Gateway base URLs
+- invalid persisted dispatch/session metadata now reports a deterministic error
+  and fails closed without accessing paths outside the configured OpenClaw roots
+- malformed existing dispatch label ledgers remain byte-for-byte intact and
+  reject every mutating command until an operator repairs the ledger
+- malformed or unsupported persisted trigger regexes no longer crash or block
+  the dispatcher and cannot trigger child jobs
+
 ## [0.4.0] -- 2026-07-13
 
 ### Added

@@ -1,0 +1,71 @@
+name: Mirror to WritHub
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: writhub-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror Git refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout GitHub repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Mirror branches and tags to WritHub
+        env:
+          WRITHUB_TOKEN: ${{ secrets.WRITHUB_TOKEN }}
+          WRITHUB_USERNAME: ${{ vars.WRITHUB_USERNAME }}
+          WRITHUB_REPOSITORY: ${{ vars.WRITHUB_REPOSITORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WRITHUB_TOKEN:-}" ]; then
+            echo "WRITHUB_TOKEN is not configured"
+            exit 1
+          fi
+          if [[ ! "${WRITHUB_USERNAME:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "WRITHUB_USERNAME is missing or invalid"
+            exit 1
+          fi
+          if [[ ! "${WRITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "WRITHUB_REPOSITORY is missing or invalid"
+            exit 1
+          fi
+
+          askpass="$RUNNER_TEMP/writhub-askpass.sh"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'case "$1" in' \
+            '  *Username*) printf "%s\\n" "$WRITHUB_USERNAME" ;;' \
+            '  *Password*) printf "%s\\n" "$WRITHUB_TOKEN" ;;' \
+            '  *) exit 1 ;;' \
+            'esac' > "$askpass"
+          chmod 700 "$askpass"
+
+          git fetch --prune --tags origin \
+            '+refs/heads/*:refs/remotes/github/*'
+          git remote add writhub \
+            "https://writhub.io/${WRITHUB_REPOSITORY}.git"
+
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push --atomic writhub \
+              'refs/remotes/github/*:refs/heads/*' \
+              'refs/tags/*:refs/tags/*'

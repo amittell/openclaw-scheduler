@@ -33,7 +33,7 @@ Please report unsafe defaults, credential leaks, or privilege boundary issues.
 
 ## Runtime Boundary
 
-Version 0.4.0 fails closed when a job requests sandbox, filesystem, network, or
+Version 0.4.1 fails closed when a job requests sandbox, filesystem, network, or
 agent cost controls that the selected executor cannot enforce. The default host
 executor does not claim container, namespace, firewall, filesystem, or cost
 metering isolation. A restrictive contract is denied rather than simulated.
@@ -46,6 +46,12 @@ jobs. Materialized task credentials are cleared during cleanup paths.
 Provider cleanup is retried before terminal bookkeeping. Exhausted cleanup is
 recorded as an operator-visible run error and disables the job without
 re-executing its user command.
+
+User-authored trigger regexes run through a linear-time RE2-compatible engine
+with bounded input and no native regular-expression fallback. Agent identifiers,
+session keys, and session-store paths are validated again at each storage or
+Gateway boundary. Installer service commands use argument arrays, and generated
+service configuration rejects syntax-breaking control characters.
 
 Cancellation fencing prevents a stale dispatcher from committing scheduler
 state after cancellation, but it cannot reverse an external side effect that

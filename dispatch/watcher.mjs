@@ -46,6 +46,17 @@ import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { sendMessage } from '../messages.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from '../paths.js';
+import {
+  agentIdFromSessionKey as validatedAgentIdFromSessionKey,
+  assertValidAgentId,
+  assertValidSessionId,
+  assertValidSessionKey,
+  assertValidSessionStore,
+  assertSessionKeyForAgent,
+  resolveAgentSessionsStorePath,
+  resolveSessionTranscriptPath,
+  toNullPrototypeRecord,
+} from '../identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = process.env.DISPATCH_INDEX_PATH || join(__dirname, 'index.mjs');
@@ -53,6 +64,7 @@ const LABELS_PATH = resolveLabelsPath({ legacyCandidates: [join(__dirname, 'labe
 const HOME_DIR = process.env.HOME || homedir();
 let labelsCache = null;
 let labelsCacheSignature = null;
+let labelsCacheError = null;
 
 const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
@@ -165,14 +177,30 @@ function gatewayCall(method, params = {}, opts = {}) {
   }
 }
 
+function agentFromSessionKey(sessionKey, fallbackAgentId = 'main') {
+  try {
+    return validatedAgentIdFromSessionKey(sessionKey, fallbackAgentId, 'watcher sessionKey');
+  } catch (error) {
+    process.stderr.write(`[watcher] refusing unsafe session metadata: ${error.message}\n`);
+    return null;
+  }
+}
+
 /**
  * Get current totalTokens for a session.
  * Tries sessions.json first (ground truth), falls back to sessions.list API.
  * Returns number or null if unavailable.
  */
 function getSessionTokens(sessionKey) {
+  try {
+    assertValidSessionKey(sessionKey, 'watcher sessionKey');
+  } catch (error) {
+    process.stderr.write(`[watcher] refusing unsafe session metadata: ${error.message}\n`);
+    return null;
+  }
   // Primary: sessions.json direct read
-  const agent = sessionKey ? (sessionKey.split(':')[1] || 'main') : 'main';
+  const agent = agentFromSessionKey(sessionKey);
+  if (!agent) return null;
   const store = readSessionsStore(agent);
   if (store && sessionKey in store) {
     const tokens = store[sessionKey]?.totalTokens;
@@ -187,7 +215,14 @@ function getSessionTokens(sessionKey) {
 /** Returns the session entry from sessions.json, or null if not found. */
 function getSessionStoreEntry(sessionKey) {
   if (!sessionKey) return null;
-  const agent = sessionKey.split(':')[1] || 'main';
+  let agent;
+  try {
+    agent = agentFromSessionKey(sessionKey);
+    if (!agent) return null;
+  } catch (error) {
+    process.stderr.write(`[watcher] refusing unsafe session metadata: ${error.message}\n`);
+    return null;
+  }
   const store = readSessionsStore(agent);
   return (store && sessionKey in store) ? store[sessionKey] : null;
 }
@@ -288,19 +323,77 @@ function getLabelsSignature() {
   }
 }
 
+function assertValidWatcherLabelMetadata(name, entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`label ${JSON.stringify(name)} must contain an object`);
+  }
+  const explicitAgent = entry.agent === null || entry.agent === undefined
+    ? null
+    : assertValidAgentId(entry.agent, `agent for label ${JSON.stringify(name)}`);
+  const sessionKey = entry.sessionKey === null || entry.sessionKey === undefined
+    ? null
+    : assertValidSessionKey(entry.sessionKey, `sessionKey for label ${JSON.stringify(name)}`);
+  if (entry.sessionId !== null && entry.sessionId !== undefined) {
+    assertValidSessionId(entry.sessionId, `sessionId for label ${JSON.stringify(name)}`);
+  }
+  if (sessionKey?.startsWith('agent:') && explicitAgent) {
+    assertSessionKeyForAgent(sessionKey, explicitAgent, `sessionKey for label ${JSON.stringify(name)}`);
+  }
+  return entry;
+}
+
+function rejectUnsafeWatcherMetadata(labels) {
+  let changed = false;
+  for (const [name, candidate] of Object.entries(labels)) {
+    try {
+      assertValidWatcherLabelMetadata(name, candidate);
+    } catch (error) {
+      const reason = `Rejected unsafe legacy session metadata for label ${JSON.stringify(name)}: ${error.message}`;
+      const entry = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        ? candidate
+        : {};
+      delete entry.agent;
+      delete entry.sessionKey;
+      delete entry.sessionId;
+      entry.status = 'error';
+      entry.error = reason;
+      entry.summary = reason;
+      entry.metadataRejectedAt = new Date().toISOString();
+      labels[name] = entry;
+      process.stderr.write(`[watcher] ${reason}\n`);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function loadLabels() {
   const signature = getLabelsSignature();
   if (labelsCache && labelsCacheSignature === signature) {
     return labelsCache;
   }
   try {
-    const labels = JSON.parse(readFileSync(LABELS_PATH, 'utf-8'));
+    const labels = toNullPrototypeRecord(
+      JSON.parse(readFileSync(LABELS_PATH, 'utf-8')),
+      'labels ledger',
+    );
+    if (rejectUnsafeWatcherMetadata(labels)) {
+      saveLabels(labels);
+      return labels;
+    }
     labelsCache = labels;
     labelsCacheSignature = signature;
+    labelsCacheError = null;
     return labels;
-  } catch {
-    labelsCache = {};
-    labelsCacheSignature = 'missing';
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      process.stderr.write(`[watcher] Refusing invalid labels ledger: ${error.message}\n`);
+      labelsCacheError = error;
+    } else {
+      labelsCacheError = null;
+    }
+    labelsCache = Object.create(null);
+    labelsCacheSignature = signature;
     return labelsCache;
   }
 }
@@ -314,10 +407,17 @@ function saveLabels(labels) {
   renameSync(tmp, LABELS_PATH);
   labelsCache = labels;
   labelsCacheSignature = getLabelsSignature();
+  labelsCacheError = null;
 }
 
 function mutateLabels(mutator) {
   const labels = loadLabels();
+  if (labelsCacheError) {
+    throw new Error(
+      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+      { cause: labelsCacheError },
+    );
+  }
   const changed = mutator(labels);
   if (changed !== false) {
     saveLabels(labels);
@@ -550,6 +650,12 @@ function respawnAfterGwRestart(label) {
  * Send a steer message into a running session via gateway API (sync).
  */
 function steerSession(sessionKey, message) {
+  try {
+    sessionKey = assertValidSessionKey(sessionKey, 'watcher steer sessionKey');
+  } catch (error) {
+    process.stderr.write(`[watcher] steer refused unsafe session metadata: ${error.message}\n`);
+    return false;
+  }
   if (!GW_TOKEN) {
     process.stderr.write(`[watcher] steer skipped: no gateway token\n`);
     return false;
@@ -572,14 +678,22 @@ function steerSession(sessionKey, message) {
  * Kill a session via gateway subagents API (sync).
  */
 function killSession(sessionKey) {
+  try {
+    sessionKey = assertValidSessionKey(sessionKey, 'watcher kill sessionKey');
+  } catch (error) {
+    process.stderr.write(`[watcher] kill refused unsafe session metadata: ${error.message}\n`);
+    return false;
+  }
   if (!GW_TOKEN) {
     process.stderr.write(`[watcher] kill skipped: no gateway token\n`);
-    return;
+    return false;
   }
   try {
     gatewayCall('subagents.kill', { target: sessionKey }, { timeout: 10000 });
+    return true;
   } catch (err) {
     process.stderr.write(`[watcher] kill failed: ${err.message}\n`);
+    return false;
   }
 }
 
@@ -592,10 +706,21 @@ function killSession(sessionKey) {
  * @returns {Object|null} - Sessions store object, or null on read error
  */
 function readSessionsStore(agent = 'main') {
+  let sessionsPath;
   try {
-    const sessionsPath = join(HOME_DIR, '.openclaw', 'agents', agent, 'sessions', 'sessions.json');
-    return JSON.parse(readFileSync(sessionsPath, 'utf-8'));
-  } catch {
+    sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, agent);
+  } catch (error) {
+    process.stderr.write(`[watcher] refusing unsafe sessions store path: ${error.message}\n`);
+    return null;
+  }
+  try {
+    return assertValidSessionStore(
+      JSON.parse(readFileSync(sessionsPath, 'utf-8')),
+      `sessions store for agent ${JSON.stringify(agent)}`,
+    );
+  } catch (error) {
+    if (error instanceof SyntaxError || error?.code) return null;
+    process.stderr.write(`[watcher] refusing unsafe sessions store metadata: ${error.message}\n`);
     return null;
   }
 }
@@ -622,9 +747,12 @@ function readSessionsStore(agent = 'main') {
 function getSessionJsonlMtime(sessionId, agentDir = 'main') {
   if (!sessionId) return null;
   try {
-    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+    const jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
     return statSync(jsonlPath).mtimeMs;
-  } catch {
+  } catch (error) {
+    if (!error?.code) {
+      process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
+    }
     return null;
   }
 }
@@ -642,7 +770,7 @@ function getSessionJsonlMtime(sessionId, agentDir = 'main') {
 function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
   if (!sessionId) return null;
   try {
-    const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+    const jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
     const content = readFileSync(jsonlPath, 'utf-8');
     return content
       .split('\n')
@@ -650,7 +778,10 @@ function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
       .slice(-n)
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
       .filter(Boolean);
-  } catch {
+  } catch (error) {
+    if (!error?.code) {
+      process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
+    }
     return null;
   }
 }
@@ -804,7 +935,13 @@ function getJsonlArtifactEvidenceFromEntries(entries) {
 function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
   if (!sessionId) return null;
 
-  const jsonlPath = join(HOME_DIR, '.openclaw', 'agents', agentDir, 'sessions', `${sessionId}.jsonl`);
+  let jsonlPath;
+  try {
+    jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
+  } catch (error) {
+    process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
+    return null;
+  }
   let mtimeMs;
   try {
     mtimeMs = statSync(jsonlPath).mtimeMs;
@@ -918,7 +1055,7 @@ function parseTimestampMs(value) {
 function getRunningSessionStallReason(status, thresholdMs) {
   if (!status?.sessionKey) return null;
 
-  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const sessionAgent = agentFromSessionKey(status.sessionKey);
   const entry = getSessionStoreEntry(status.sessionKey);
   if (!entry) return null;
 
@@ -963,7 +1100,7 @@ function getRunningSessionStallReason(status, thresholdMs) {
 function getSessionJsonlEntriesFromStatus(status, maxLines = 200) {
   if (!status?.sessionKey) return null;
 
-  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const sessionAgent = agentFromSessionKey(status.sessionKey);
   const entry = getSessionStoreEntry(status.sessionKey);
   const sessionId = entry?.sessionId || status?.liveness?.sessionId || null;
   return sessionId ? readJsonlTailEntries(sessionId, sessionAgent, maxLines) : null;
@@ -1342,7 +1479,7 @@ function getCleanTerminalReply(status) {
   if (!status?.sessionKey) return null;
   const entry = getSessionStoreEntry(status.sessionKey);
   const sessionId = entry?.sessionId || null;
-  const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+  const sessionAgent = agentFromSessionKey(status.sessionKey);
   const terminalJsonlReply = sessionId ? getSessionTerminalReply(sessionId, sessionAgent) : null;
   if (!sessionId || !terminalJsonlReply) return null;
   return isSessionCleanlyFinished(sessionId, sessionAgent) ? terminalJsonlReply : null;
@@ -1673,7 +1810,7 @@ while (Date.now() < deadline) {
   if (status.sessionKey) {
     const storeEntry = getSessionStoreEntry(status.sessionKey);
     const sessionId = storeEntry?.sessionId || null;
-    const sessionAgent = status.sessionKey.split(':')[1] || 'main';
+    const sessionAgent = agentFromSessionKey(status.sessionKey);
 
     // Reset mtime baseline when the tracked session changes (e.g. after respawn)
     if (sessionId && preDeadlineSessionId !== null && preDeadlineSessionId !== sessionId) {
@@ -1871,7 +2008,7 @@ while (Date.now() < deadline) {
   if (status.sessionKey) {
     const _e2a = getSessionStoreEntry(status.sessionKey);
     const _sid2a = _e2a?.sessionId || null;
-    const _adir2a = (status.sessionKey.split(':')[1]) || 'main';
+    const _adir2a = agentFromSessionKey(status.sessionKey);
     const terminalJsonlReply = _sid2a ? getSessionTerminalReply(_sid2a, _adir2a) : null;
     if (_sid2a && terminalJsonlReply && isSessionCleanlyFinished(_sid2a, _adir2a)) {
       process.stderr.write(`[watcher] stop_reason=end_turn detected -- delivering early\n`);
@@ -1991,7 +2128,7 @@ let flatSince = Date.now();
 // activity signal when sessions.json totalTokens/updatedAt are stale.
 const _deadlineEntry = getSessionStoreEntry(tokenSessionKey);
 const sessionInternalId = _deadlineEntry?.sessionId || null;
-const sessionAgent = (tokenSessionKey?.split(':')[1]) || 'main';
+const sessionAgent = tokenSessionKey ? agentFromSessionKey(tokenSessionKey) : 'main';
 let lastJsonlMtime = getSessionJsonlMtime(sessionInternalId, sessionAgent);
 
 process.stderr.write(`[watcher] deadline hit for ${label} -- watching token activity (baseline: ${baselineTokens})\n`);

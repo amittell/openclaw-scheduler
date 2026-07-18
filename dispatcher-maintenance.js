@@ -32,6 +32,60 @@ export function pruneDeliveryHistory({
   return result;
 }
 
+const RECONCILABLE_TERMINAL_STATUSES = [
+  'ok',
+  'error',
+  'timeout',
+  'skipped',
+  'cancelled',
+  'crashed',
+];
+
+export function reconcileCompletedDueSchedules({
+  log,
+  getDb,
+  getDueJobs,
+  getDueAtJobs,
+  getDispatch,
+  scheduledDispatchId,
+  updateJobAfterRun,
+}) {
+  const db = getDb();
+  const terminalRunForDispatch = db.prepare(`
+    SELECT id, status
+    FROM runs
+    WHERE dispatch_queue_id = ?
+      AND status IN (${RECONCILABLE_TERMINAL_STATUSES.map(() => '?').join(', ')})
+    ORDER BY COALESCE(terminal_transition_at, finished_at, started_at) DESC, id DESC
+    LIMIT 1
+  `);
+  const dueSchedules = [
+    ...getDueJobs().map(job => ({ job, kind: 'schedule', scheduledFor: job.next_run_at })),
+    ...getDueAtJobs().map(job => ({ job, kind: 'at', scheduledFor: job.schedule_at })),
+  ];
+  let repaired = 0;
+  for (const { job, kind, scheduledFor } of dueSchedules) {
+    if (!scheduledFor) continue;
+    const dispatch = getDispatch(scheduledDispatchId(job.id, kind, scheduledFor));
+    if (!dispatch || dispatch.status !== 'done') continue;
+    const terminalRun = terminalRunForDispatch.get(
+      dispatch.id,
+      ...RECONCILABLE_TERMINAL_STATUSES,
+    );
+    if (!terminalRun) continue;
+    updateJobAfterRun(job, terminalRun.status);
+    repaired += 1;
+    log('warn', `Reconciled terminal ${kind} dispatch bookkeeping: ${job.name}`, {
+      jobId: job.id,
+      runId: terminalRun.id,
+      dispatchId: dispatch.id,
+      status: terminalRun.status,
+      scheduledFor,
+    });
+  }
+  return repaired;
+}
+
 export async function checkRunHealth({
   log,
   getDb,
@@ -57,7 +111,7 @@ export async function checkRunHealth({
   const fencing = dispatcherOwnerId && dispatcherFencingToken
     ? { ownerId: dispatcherOwnerId, fencingToken: dispatcherFencingToken }
     : {};
-  const transitionWithEvidence = (run, status, fields) => {
+  const transitionWithEvidence = (run, status, fields, commitTerminalBookkeeping = null) => {
     const db = getDb();
     const persistRecoveryEvidence = (...args) => {
       try {
@@ -70,11 +124,17 @@ export async function checkRunHealth({
     };
     const commit = () => {
       const transition = transitionRunTerminalFn(run.id, status, fields, fencing);
+      let terminalBookkeeping = null;
       if (transition?.changed) {
         const job = getJob(run.job_id);
         persistRecoveryEvidence(job, run.id, transition.run.status, fields, {}, { db });
+        if (typeof commitTerminalBookkeeping === 'function') {
+          terminalBookkeeping = commitTerminalBookkeeping(job, transition);
+        }
       }
-      return transition;
+      return terminalBookkeeping == null
+        ? transition
+        : { ...transition, terminalBookkeeping };
     };
     const transaction = db.transaction(commit);
     try {
@@ -99,6 +159,25 @@ export async function checkRunHealth({
       return quarantine;
     }
   };
+  const commitTimeout = (run, fields) => transitionWithEvidence(
+    run,
+    'timeout',
+    fields,
+    job => {
+      if (!job) return { job: null, retry: null };
+      let retry = null;
+      if (shouldRetry(job, run.id)) {
+        const candidate = scheduleRetry(job, run.id, { lastStatus: 'timeout' });
+        if (candidate && !candidate.skipped) {
+          getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?')
+            .run(candidate.retryCount, run.id);
+          retry = candidate;
+        }
+      }
+      if (!retry) updateJobAfterRun(job, 'timeout');
+      return { job, retry };
+    },
+  );
   const runningRuns = getRunningRuns();
   if (runningRuns.length === 0) return;
 
@@ -113,7 +192,7 @@ export async function checkRunHealth({
       continue;
     }
     log('warn', `Stale run: ${run.job_name}`, { runId: run.id });
-    const transition = transitionWithEvidence(run, 'timeout', {
+    const transition = commitTimeout(run, {
       error_message: `No activity for ${staleThresholdSeconds}s`,
     });
     if (!transition?.changed || transition.run?.status !== 'timeout') {
@@ -123,27 +202,22 @@ export async function checkRunHealth({
       });
       continue;
     }
-    const job = getJob(run.job_id);
+    const { job, retry } = transition.terminalBookkeeping || {};
     if (!job) continue;
-    if (shouldRetry(job, run.id)) {
-      const retry = scheduleRetry(job, run.id, { lastStatus: 'timeout' });
-      if (retry && !retry.skipped) {
-        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
-        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-          await handleDelivery(
-            job,
-            `[timeout] Job timed out (stale, will retry): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
-            { runId: run.id }
-          );
-        }
-        if (dequeueJob(job.id)) {
-          log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout retry scheduling)`);
-        }
-        log('info', `Scheduled retry ${retry.retryCount} for timed-out stale run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
-        continue;
+    if (retry) {
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        await handleDelivery(
+          job,
+          `[timeout] Job timed out (stale, will retry): ${job.name}\n\nNo activity for ${staleThresholdSeconds}s\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
+          { runId: run.id }
+        );
       }
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name} (after stale timeout retry scheduling)`);
+      }
+      log('info', `Scheduled retry ${retry.retryCount} for timed-out stale run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
+      continue;
     }
-    updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
       await handleDelivery(
         job,
@@ -167,7 +241,7 @@ export async function checkRunHealth({
       continue;
     }
     log('warn', `Timed out: ${run.job_name}`, { runId: run.id, timeoutMs: run.run_timeout_ms });
-    const transition = transitionWithEvidence(run, 'timeout', {
+    const transition = commitTimeout(run, {
       error_message: `Exceeded ${run.run_timeout_ms}ms timeout`,
     });
     if (!transition?.changed || transition.run?.status !== 'timeout') {
@@ -177,27 +251,22 @@ export async function checkRunHealth({
       });
       continue;
     }
-    const job = getJob(run.job_id);
+    const { job, retry } = transition.terminalBookkeeping || {};
     if (!job) continue;
-    if (shouldRetry(job, run.id)) {
-      const retry = scheduleRetry(job, run.id, { lastStatus: 'timeout' });
-      if (retry && !retry.skipped) {
-        getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, run.id);
-        if (['announce', 'announce-always'].includes(job.delivery_mode)) {
-          await handleDelivery(
-            job,
-            `[timeout] Job timed out (will retry): ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
-            { runId: run.id }
-          );
-        }
-        if (dequeueJob(job.id)) {
-          log('info', `Dequeued pending dispatch for ${job.name} (after timeout retry scheduling)`);
-        }
-        log('info', `Scheduled retry ${retry.retryCount} for timed-out run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
-        continue;
+    if (retry) {
+      if (['announce', 'announce-always'].includes(job.delivery_mode)) {
+        await handleDelivery(
+          job,
+          `[timeout] Job timed out (will retry): ${job.name}\n\nExceeded ${run.run_timeout_ms}ms timeout\nRetry ${retry.retryCount}/${job.max_retries} in ${retry.delaySec}s`,
+          { runId: run.id }
+        );
       }
+      if (dequeueJob(job.id)) {
+        log('info', `Dequeued pending dispatch for ${job.name} (after timeout retry scheduling)`);
+      }
+      log('info', `Scheduled retry ${retry.retryCount} for timed-out run: ${job.name}`, { runId: run.id, delaySec: retry.delaySec });
+      continue;
     }
-    updateJobAfterRun(job, 'timeout');
     if (['announce', 'announce-always'].includes(job.delivery_mode)) {
       await handleDelivery(
         job,

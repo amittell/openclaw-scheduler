@@ -183,6 +183,50 @@ test('main fire-and-forget delivery instructions use the scheduler post office, 
   assert.equal(result.skipDelivery, true);
 });
 
+test('main execute intent uses synchronous agent routing and restores the preferred session key', async () => {
+  const observedTurns = [];
+  const observedRunSessions = [];
+  let systemEvents = 0;
+  const job = {
+    id: 'main-sync-job',
+    name: 'main-sync-job',
+    agent_id: 'main',
+    session_target: 'main',
+    payload_kind: 'systemEvent',
+    payload_message: 'Return the main sync result.',
+    execution_intent: 'execute',
+    preferred_session_key: null,
+    delivery_mode: 'none',
+    run_timeout_ms: 30_000,
+  };
+
+  const result = await executeMain(job, { run: { id: 'main-sync-run' } }, {
+    waitForGateway: async () => true,
+    updateRunSession: (...args) => { observedRunSessions.push(args); },
+    setAgentStatus: noop,
+    buildJobPrompt: () => ({ prompt: 'main sync prompt', contextMeta: {} }),
+    updateContextSummary: noop,
+    matchesSentinel: () => false,
+    detectTransientError: () => false,
+    sqliteNow: () => '2026-01-01 00:00:00',
+    log: noop,
+    sendSystemEvent: async () => { systemEvents++; },
+    applySessionOverridesToSessionStore: () => ({ ok: true }),
+    runIsolatedAgentTurn: async (options) => {
+      observedTurns.push(options);
+      return { content: 'main sync result', usage: { total_tokens: 1 } };
+    },
+  });
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.content, 'main sync result');
+  assert.equal(systemEvents, 0);
+  assert.equal(observedTurns.length, 1);
+  assert.equal(observedTurns[0].sessionKey, 'agent:main:main');
+  assert.deepEqual(observedRunSessions, [['main-sync-run', 'agent:main:main', null]]);
+  assert.equal(job.preferred_session_key, null);
+});
+
 test('completion watcher shell jobs deliver stdout only and keep stderr diagnostics internal', async () => {
   const result = await executeShell({
     id: 'job-deliver-ok',

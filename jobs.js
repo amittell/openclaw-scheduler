@@ -1,12 +1,14 @@
 // Job CRUD operations
 import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
+import { RE2JS } from 're2js';
 import { getDb } from './db.js';
 import { enqueueDispatch } from './dispatch-queue.js';
 import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js';
 import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
 import { persistTerminalEvidence } from './runs.js';
+import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
 
 const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
@@ -29,10 +31,12 @@ const VALID_CHECKSUM_EVIDENCE_BINDINGS = new Set([
   'identity', 'trust', 'authorization', 'authorization_proof',
   'delegation', 'credential_handoff', 'context',
 ]);
+const MAX_TRIGGER_CONDITION_LENGTH = 1024;
+const MAX_TRIGGER_REGEX_INPUT_BYTES = 65536;
 
 /**
  * Valid payload_kind values for each session_target.
- *   - main:     systemEvent only  (inject into the main session)
+ *   - main:     systemEvent only  (synchronous or fire-and-forget main session)
  *   - shell:    shellCommand only (run a shell command)
  *   - isolated: systemEvent or agentTurn (standalone agent session)
  */
@@ -244,7 +248,7 @@ function validateDelegationChain(name, chain) {
 
 function validateTriggerConditionSyntax(condition) {
   if (condition == null) return;
-  assertSafeString('trigger_condition', condition, { maxLength: 1024 });
+  assertSafeString('trigger_condition', condition, { maxLength: MAX_TRIGGER_CONDITION_LENGTH });
   if (condition.startsWith('contains:')) {
     if (!condition.slice('contains:'.length)) {
       throw new Error('trigger_condition contains: pattern cannot be empty');
@@ -257,7 +261,7 @@ function validateTriggerConditionSyntax(condition) {
       throw new Error('trigger_condition regex pattern cannot be empty');
     }
     try {
-      new RegExp(pattern);
+      RE2JS.compile(pattern);
     } catch (err) {
       throw new Error(`Invalid trigger_condition regex: ${err.message}`, { cause: err });
     }
@@ -292,7 +296,6 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'payload_model',
     'payload_model_fallback',
     'payload_thinking',
-    'trigger_condition',
     'auth_profile',
     'auth_profile_fallback',
     'delivery_opt_out_reason',
@@ -342,7 +345,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     assertSafeString('payload_message', merged.payload_message, { maxLength: 100000 });
   }
   if (mode === 'create' || 'agent_id' in normalized) {
-    assertSafeString('agent_id', merged.agent_id || 'main', { maxLength: 128 });
+    assertValidAgentId(merged.agent_id ?? 'main');
   }
   if (mode === 'create' || 'session_target' in normalized || 'payload_kind' in normalized) {
     const finalTarget = merged.session_target || 'isolated';
@@ -414,7 +417,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // Exempt from this requirement:
   //   - job_type='watchdog' (internal health monitor jobs)
   //   - name starts with 'watchdog:' (watchdog jobs by naming convention)
-  //   - session_target='main' (injects into the main session, no chat routing needed)
+  //   - session_target='main' (the main session is the default delivery surface)
   //   - delivery_mode='none' (explicitly opted out of delivery)
   if (mode === 'create') {
     const _target = merged.session_target || 'isolated';
@@ -438,7 +441,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   // 'announce' or 'announce-always'. Validates on create (when delivery_mode is
   // explicitly provided) and on update (when delivery_mode is being changed or
   // the merged record would end up in announce mode without a delivery_to).
-  // Exempt: watchdog jobs, session_target='main' (no external chat routing needed).
+  // Exempt: watchdog jobs, session_target='main' (the main session is the default delivery surface).
   {
     const modeExplicitlySet = 'delivery_mode' in normalized;
     const deliveryToExplicitlySet = 'delivery_to' in normalized;
@@ -556,7 +559,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     assertSafeString('resource_pool', merged.resource_pool, { allowEmpty: false, maxLength: 128 });
   }
   if (mode === 'create' || 'preferred_session_key' in normalized) {
-    assertSafeString('preferred_session_key', merged.preferred_session_key, { allowEmpty: false, maxLength: 512 });
+    if (merged.preferred_session_key != null) {
+      assertValidSessionKey(merged.preferred_session_key, 'preferred_session_key');
+    }
   }
   if (mode === 'create' || 'payload_model' in normalized) {
     assertSafeString('payload_model', merged.payload_model, { allowEmpty: false, maxLength: 256 });
@@ -1546,8 +1551,20 @@ export function getChildJobs(parentId) {
  * Returns true if the condition matches (or is absent).
  */
 export function evalTriggerCondition(condition, content) {
-  if (!condition) return true;
-  const str = content || '';
+  if (condition == null) return true;
+  if (typeof condition !== 'string') return false;
+  try {
+    validateTriggerConditionSyntax(condition);
+  } catch {
+    return false;
+  }
+
+  let str;
+  try {
+    str = String(content ?? '');
+  } catch {
+    return false;
+  }
   if (condition.startsWith('contains:')) {
     const substr = condition.slice('contains:'.length);
     return str.includes(substr);
@@ -1555,13 +1572,19 @@ export function evalTriggerCondition(condition, content) {
   if (condition.startsWith('regex:')) {
     const pattern = condition.slice('regex:'.length);
     try {
-      return new RegExp(pattern).test(str);
+      const boundedInput = boundedUtf8Input(str, MAX_TRIGGER_REGEX_INPUT_BYTES);
+      if (boundedInput == null) return false;
+      return RE2JS.compile(pattern).test(boundedInput);
     } catch {
-      return false; // Invalid regex never matches
+      return false;
     }
   }
   // Unknown prefix -- unreachable: validateTriggerConditionSyntax rejects these at write time
   return false;
+}
+
+function boundedUtf8Input(value, maxBytes) {
+  return Buffer.byteLength(value, 'utf8') <= maxBytes ? value : null;
 }
 
 /**

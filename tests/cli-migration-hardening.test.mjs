@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { spawnSync } from 'child_process';
@@ -17,6 +17,7 @@ const cliPath = join(root, 'cli.js');
 const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
 const consolidatePath = join(root, 'migrate-consolidate.js');
+const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -66,11 +67,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const version = runNode(cliPath, ['version', '--json'], { env });
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(parseStdout(version).version, '0.4.0');
+  assert.equal(parseStdout(version).version, packageVersion);
 
   const launcherVersion = runNode(binPath, ['--json', 'version'], { env });
   assert.equal(launcherVersion.status, 0, launcherVersion.stderr);
-  assert.equal(parseStdout(launcherVersion).version, '0.4.0');
+  assert.equal(parseStdout(launcherVersion).version, packageVersion);
 
   const schema = runNode(cliPath, ['schema', 'jobs', '--json'], { env });
   assert.equal(schema.status, 0, schema.stderr);
@@ -372,6 +373,59 @@ test('schema consolidation repairs complete baseline objects before its no-op pa
   const noOp = runNode(consolidatePath, [], { env });
   assert.equal(noOp.status, 0, noOp.stderr);
   assert.match(noOp.stdout, /DB already at v28/);
+});
+
+test('schema consolidation normalizes legacy output-triggered delivery and rejects unknown modes', t => {
+  const dir = tempRoot(t, 'scheduler-delivery-mode-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.prepare(`
+      INSERT INTO jobs (
+        id, name, schedule_cron, session_target, payload_kind,
+        payload_message, run_timeout_ms, delivery_mode, delivery_channel,
+        delivery_to, origin
+      ) VALUES (
+        'legacy-output-delivery', 'Legacy output delivery', '0 * * * *',
+        'shell', 'shellCommand', 'printf ready', 5000,
+        'announce-on-output', 'telegram', 'test-target', 'system'
+      )
+    `).run();
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+  const repairedDb = new Database(dbPath);
+  try {
+    assert.equal(
+      repairedDb.prepare("SELECT delivery_mode FROM jobs WHERE id = 'legacy-output-delivery'").get().delivery_mode,
+      'announce-always',
+    );
+    repairedDb.prepare(`
+      UPDATE jobs SET delivery_mode = 'operator-unknown'
+      WHERE id = 'legacy-output-delivery'
+    `).run();
+  } finally {
+    repairedDb.close();
+  }
+
+  const rejected = runNode(consolidatePath, [], { env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Unsupported persisted delivery mode\(s\): operator-unknown/);
+  const unchanged = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(
+      unchanged.prepare("SELECT delivery_mode FROM jobs WHERE id = 'legacy-output-delivery'").get().delivery_mode,
+      'operator-unknown',
+    );
+  } finally {
+    unchanged.close();
+  }
 });
 
 test('schema v28 consolidation strengthens queue binding nullability without losing references', t => {
