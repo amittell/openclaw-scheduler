@@ -30,6 +30,9 @@ All notable changes to this project will be documented in this file.
 - made maintenance timeout recovery commit terminal evidence and job or retry
   bookkeeping in one transaction, and reconcile already-terminal schedule rows
   whose job schedule update was interrupted
+- normalize the legacy `announce-on-output` delivery mode to the current
+  output-preserving `announce-always` contract and fail closed on unknown
+  persisted delivery modes
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
 - malformed existing dispatch label ledgers remain byte-for-byte intact and

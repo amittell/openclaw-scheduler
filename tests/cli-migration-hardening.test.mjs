@@ -375,6 +375,59 @@ test('schema consolidation repairs complete baseline objects before its no-op pa
   assert.match(noOp.stdout, /DB already at v28/);
 });
 
+test('schema consolidation normalizes legacy output-triggered delivery and rejects unknown modes', t => {
+  const dir = tempRoot(t, 'scheduler-delivery-mode-repair-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
+  const db = new Database(dbPath);
+  try {
+    db.prepare(`
+      INSERT INTO jobs (
+        id, name, schedule_cron, session_target, payload_kind,
+        payload_message, run_timeout_ms, delivery_mode, delivery_channel,
+        delivery_to, origin
+      ) VALUES (
+        'legacy-output-delivery', 'Legacy output delivery', '0 * * * *',
+        'shell', 'shellCommand', 'printf ready', 5000,
+        'announce-on-output', 'telegram', 'test-target', 'system'
+      )
+    `).run();
+  } finally {
+    db.close();
+  }
+
+  const repaired = runNode(consolidatePath, [], { env });
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.match(repaired.stdout, /Consolidation migration applied/);
+  const repairedDb = new Database(dbPath);
+  try {
+    assert.equal(
+      repairedDb.prepare("SELECT delivery_mode FROM jobs WHERE id = 'legacy-output-delivery'").get().delivery_mode,
+      'announce-always',
+    );
+    repairedDb.prepare(`
+      UPDATE jobs SET delivery_mode = 'operator-unknown'
+      WHERE id = 'legacy-output-delivery'
+    `).run();
+  } finally {
+    repairedDb.close();
+  }
+
+  const rejected = runNode(consolidatePath, [], { env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Unsupported persisted delivery mode\(s\): operator-unknown/);
+  const unchanged = new Database(dbPath, { readonly: true });
+  try {
+    assert.equal(
+      unchanged.prepare("SELECT delivery_mode FROM jobs WHERE id = 'legacy-output-delivery'").get().delivery_mode,
+      'operator-unknown',
+    );
+  } finally {
+    unchanged.close();
+  }
+});
+
 test('schema v28 consolidation strengthens queue binding nullability without losing references', t => {
   const dir = tempRoot(t, 'scheduler-queue-binding-repair-');
   const dbPath = join(dir, 'scheduler.db');

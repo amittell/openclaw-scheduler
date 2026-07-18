@@ -185,6 +185,15 @@ export default function migrateConsolidate() {
           AND (delivery_opt_out_reason IS NULL OR trim(delivery_opt_out_reason) = '')
       `).get()?.cnt ?? 0)
     : 0;
+  const unsupportedDeliveryModeCount = jobColumns.has('delivery_mode')
+    ? (db.prepare(`
+        SELECT COUNT(*) AS cnt
+        FROM jobs
+        WHERE delivery_mode IS NOT NULL
+          AND trim(delivery_mode) != ''
+          AND delivery_mode NOT IN ('announce', 'announce-always', 'none')
+      `).get()?.cnt ?? 0)
+    : 0;
   const schemaNoOpTables = [
     'agents', 'approvals', 'completion_debts', 'delivery_aliases',
     'delivery_attachments', 'delivery_outbox', 'dispatcher_leases',
@@ -309,6 +318,7 @@ export default function migrateConsolidate() {
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
+    && unsupportedDeliveryModeCount === 0
   ) {
     return false;
   }
@@ -941,9 +951,29 @@ export default function migrateConsolidate() {
         AND payload_kind = 'agentTurn'
         AND delivery_mode = 'none'
         AND (delivery_opt_out_reason IS NULL OR trim(delivery_opt_out_reason) = '');
+
+      UPDATE jobs
+      SET delivery_mode = 'announce-always'
+      WHERE delivery_mode = 'announce-on-output';
     `);
   } catch {
     /* best-effort normalization for legacy rows */
+  }
+
+  const unsupportedDeliveryModes = db.prepare(`
+    SELECT id, delivery_mode
+    FROM jobs
+    WHERE delivery_mode IS NOT NULL
+      AND trim(delivery_mode) != ''
+      AND delivery_mode NOT IN ('announce', 'announce-always', 'none')
+    ORDER BY id
+    LIMIT 10
+  `).all();
+  if (unsupportedDeliveryModes.length > 0) {
+    const modes = [...new Set(unsupportedDeliveryModes.map(row => row.delivery_mode))];
+    const error = new Error(`Unsupported persisted delivery mode(s): ${modes.join(', ')}`);
+    error.code = 'SCHEMA_LEGACY_DELIVERY_MODE_UNSUPPORTED';
+    throw error;
   }
 
   // -- Tables that may be absent on very old installs ---------------------
