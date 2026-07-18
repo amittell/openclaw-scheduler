@@ -33,6 +33,8 @@ All notable changes to this project will be documented in this file.
 - normalize the legacy `announce-on-output` delivery mode to the current
   output-preserving `announce-always` contract and fail closed on unknown
   persisted delivery modes
+- bounded session IDs so the `.jsonl` transcript suffix remains within the
+  portable 255-byte filename-component limit
 - invalid persisted dispatch/session metadata now reports a deterministic error
   and fails closed without accessing paths outside the configured OpenClaw roots
 - malformed existing dispatch label ledgers remain byte-for-byte intact and

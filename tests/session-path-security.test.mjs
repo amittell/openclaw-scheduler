@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test from 'node:test';
 
 import { executeAgent } from '../dispatcher-strategies.js';
@@ -114,6 +114,8 @@ test('session keys preserve documented colon forms and reject URL or path confus
 
 test('session IDs are one safe filename segment', () => {
   assert.equal(assertValidSessionId('2f76fe6c-6041-47d0-bd4f-1de13f470807'), '2f76fe6c-6041-47d0-bd4f-1de13f470807');
+  assert.equal(assertValidSessionId('a'.repeat(249)).length, 249);
+  assert.throws(() => assertValidSessionId('a'.repeat(250)), /session_id/);
   for (const value of ['.', '..', '../sentinel', 'folder/file', 'folder\\file', 'id?query', 'id#fragment']) {
     assert.throws(() => assertValidSessionId(value), /session_id/);
   }
@@ -151,6 +153,10 @@ test('session paths remain lexically and canonically under the agent sessions ro
     assert.equal(
       resolveSessionTranscriptPath(home, 'main', 'legitimate-session'),
       join(sessionsDir, 'legitimate-session.jsonl'),
+    );
+    assert.equal(
+      Buffer.byteLength(basename(resolveSessionTranscriptPath(home, 'main', 'a'.repeat(249))), 'utf8'),
+      255,
     );
     assert.throws(
       () => resolveSessionTranscriptPath(home, 'main', '../sentinel'),

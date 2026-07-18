@@ -3,7 +3,8 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 
 export const MAX_AGENT_ID_LENGTH = 128;
 export const MAX_SESSION_KEY_LENGTH = 512;
-export const MAX_SESSION_ID_LENGTH = 255;
+const SESSION_TRANSCRIPT_SUFFIX = '.jsonl';
+export const MAX_SESSION_ID_LENGTH = 255 - SESSION_TRANSCRIPT_SUFFIX.length;
 
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._@-]*$/i;
 const SESSION_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i;
@@ -192,7 +193,7 @@ export function resolveAgentSessionsStorePath(homeDir, agentId = 'main') {
 export function resolveSessionTranscriptPath(homeDir, agentId, sessionId) {
   const sessionsDirectory = resolveAgentSessionsDirectory(homeDir, agentId);
   const validatedSessionId = assertValidSessionId(sessionId);
-  const transcriptPath = resolve(sessionsDirectory, `${validatedSessionId}.jsonl`);
+  const transcriptPath = resolve(sessionsDirectory, `${validatedSessionId}${SESSION_TRANSCRIPT_SUFFIX}`);
   return assertContainedPath(sessionsDirectory, transcriptPath, 'session transcript path');
 }
 
