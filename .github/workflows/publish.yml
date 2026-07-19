@@ -63,7 +63,7 @@ jobs:
       matrix:
         include:
           - contract: handoff-v4
-            ref: 4c9a7fd35e9a5072cfdfe1909c54f97dbe35628f
+            ref: 3d710f31dff2c27986958a036d2d18f974c16f66
           - contract: handoff-v3
             ref: f1fed6d7d451196bda316b82d6567b174012a4ba
           - contract: handoff-v2
@@ -216,7 +216,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: amittell/agentcli
-          ref: 4c9a7fd35e9a5072cfdfe1909c54f97dbe35628f
+          ref: 3d710f31dff2c27986958a036d2d18f974c16f66
           path: agentcli
           persist-credentials: false
 
