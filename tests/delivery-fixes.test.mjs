@@ -200,7 +200,15 @@ test('main execute intent uses synchronous agent routing and restores the prefer
     run_timeout_ms: 30_000,
   };
 
-  const result = await executeMain(job, { run: { id: 'main-sync-run' } }, {
+  const gatewayCapabilityBinding = {
+    artifactDigest: `sha256:${'a'.repeat(64)}`,
+    runtimeInstanceId: 'main-sync-runtime',
+    nonce: 'main-sync-nonce',
+  };
+  const result = await executeMain(job, {
+    run: { id: 'main-sync-run' },
+    gatewayCapabilityBinding,
+  }, {
     waitForGateway: async () => true,
     updateRunSession: (...args) => { observedRunSessions.push(args); },
     setAgentStatus: noop,
@@ -223,6 +231,7 @@ test('main execute intent uses synchronous agent routing and restores the prefer
   assert.equal(systemEvents, 0);
   assert.equal(observedTurns.length, 1);
   assert.equal(observedTurns[0].sessionKey, 'agent:main:main');
+  assert.deepEqual(observedTurns[0].capabilityBinding, gatewayCapabilityBinding);
   assert.deepEqual(observedRunSessions, [['main-sync-run', 'agent:main:main', null]]);
   assert.equal(job.preferred_session_key, null);
 });

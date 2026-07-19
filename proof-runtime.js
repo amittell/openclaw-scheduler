@@ -210,6 +210,87 @@ function auditResult(result) {
   return allowed;
 }
 
+async function reuseVerifiedProof(job, declaration, profile, run, opts, db, eventBinding) {
+  const result = opts.reuseVerification;
+  const priorRun = opts.priorRun;
+  appendRuntimeEvent('proof.revalidating', {
+    ...eventBinding,
+    payload: {
+      method: declaration.method,
+      prior_run_id: priorRun?.id ?? null,
+      approval_id: opts.approvalId ?? null,
+    },
+  }, { db });
+
+  if (!priorRun
+    || priorRun.job_id !== job.id
+    || priorRun.handoff_artifact_digest !== job.handoff_artifact_digest) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REUSE_MISMATCH',
+      'Approved proof verification is not bound to this job and handoff artifact',
+    );
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REUSE_INVALID',
+      'Approved run does not contain a reusable proof verification result',
+    );
+  }
+  if (result.method !== declaration.method
+    || result.method !== profile.method
+    || result.verified !== true
+    || result.artifact_bound !== true
+    || result.replay_protected !== true
+    || result.revocation_checked !== true
+    || result.signature_verified !== true) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REUSE_INVALID',
+      'Approved proof verification did not satisfy every v4 runtime guard',
+      { result: auditResult(result) },
+    );
+  }
+  if (!result.proof_id && !result.key_id) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REUSE_INVALID',
+      'Approved proof verification has no replay or verification-key identifier',
+    );
+  }
+
+  const revocation = await revocationChecker(db, profile, opts)({
+    method: result.method,
+    issuer: result.issuer ?? null,
+    subject: result.subject ?? null,
+    proofId: result.proof_id ?? null,
+    keyId: result.key_id ?? null,
+    artifactDigest: job.handoff_artifact_digest,
+    runId: run.id,
+    priorRunId: priorRun.id,
+  });
+  if (revocation === true || revocation?.revoked === true) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REVOKED',
+      revocation?.reason || 'Authorization proof or verification key was revoked while awaiting approval',
+    );
+  }
+  if (revocation !== false && revocation?.revoked !== false) {
+    throw proofError(
+      'AUTHORIZATION_PROOF_REVOCATION_INDETERMINATE',
+      'Authorization proof revocation could not be rechecked after approval',
+    );
+  }
+
+  const audited = auditResult(result);
+  appendRuntimeEvent('proof.reused', {
+    ...eventBinding,
+    payload: {
+      ...audited,
+      prior_run_id: priorRun.id,
+      approval_id: opts.approvalId ?? null,
+    },
+  }, { db });
+  return audited;
+}
+
 export async function verifyArtifactBoundProof(job, artifactRecord, run, opts = {}) {
   if (Number(job?.handoff_version) !== 4) return null;
   const artifact = artifactRecord?.payload ? artifactRecord.payload : artifactRecord;
@@ -224,9 +305,7 @@ export async function verifyArtifactBoundProof(job, artifactRecord, run, opts = 
   if (profile.method !== declaration.method) {
     throw proofError('AUTHORIZATION_PROOF_MISMATCH', 'Proof method does not match the handoff artifact');
   }
-  const proof = resolveProofValue(profile, opts);
   const db = opts.db || getDb();
-  const agentcli = await loadAgentcli(opts);
   const eventBinding = {
     jobId: job.id,
     runId: run.id,
@@ -234,6 +313,23 @@ export async function verifyArtifactBoundProof(job, artifactRecord, run, opts = 
     sourceRunId: run.source_run_id,
     sourceRunHandoffArtifactDigest: run.source_run_handoff_artifact_digest,
   };
+  if (opts.reuseVerification != null || opts.priorRun != null) {
+    try {
+      return await reuseVerifiedProof(job, declaration, profile, run, opts, db, eventBinding);
+    } catch (error) {
+      appendRuntimeEvent('proof.failed', {
+        ...eventBinding,
+        payload: {
+          method: declaration.method,
+          code: error.code || 'AUTHORIZATION_PROOF_VERIFICATION_FAILED',
+          reason: String(error.message || 'proof verification failed').slice(0, 500),
+        },
+      }, { db });
+      throw error;
+    }
+  }
+  const proof = resolveProofValue(profile, opts);
+  const agentcli = await loadAgentcli(opts);
   appendRuntimeEvent('proof.verifying', {
     ...eventBinding,
     payload: { method: declaration.method },

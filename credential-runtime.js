@@ -418,14 +418,14 @@ export async function cleanupCredentialMaterialization(materialization, ctx = {}
   if (ctx.runId) {
     for (const row of db.prepare(`
       SELECT id FROM credential_presentations
-      WHERE run_id = ? AND status = 'materialized'
+      WHERE run_id = ? AND status IN ('materialized', 'failed')
     `).all(ctx.runId)) ids.add(row.id);
   }
 
   const failures = [];
   for (const id of ids) {
     const row = db.prepare('SELECT * FROM credential_presentations WHERE id = ?').get(id);
-    if (!row || row.status !== 'materialized') continue;
+    if (!row || !['materialized', 'failed'].includes(row.status)) continue;
     try {
       if (row.temp_path) {
         if (!controlledPath(root, row.temp_path)) {
@@ -439,13 +439,13 @@ export async function cleanupCredentialMaterialization(materialization, ctx = {}
       db.prepare(`
         UPDATE credential_presentations
         SET status = 'cleaned', cleaned_at = datetime('now'), last_error = NULL
-        WHERE id = ? AND status = 'materialized'
+        WHERE id = ? AND status IN ('materialized', 'failed')
       `).run(id);
     } catch (error) {
       failures.push({ id, error: error.message });
       db.prepare(`
         UPDATE credential_presentations SET status = 'failed', last_error = ?
-        WHERE id = ? AND status = 'materialized'
+        WHERE id = ? AND status IN ('materialized', 'failed')
       `).run(error.message, id);
     }
   }
@@ -491,7 +491,7 @@ export function recoverCredentialPresentations(opts = {}) {
     join(resolveSchedulerHome(), 'credentials'),
   );
   const rows = db.prepare(`
-    SELECT * FROM credential_presentations WHERE status = 'materialized'
+    SELECT * FROM credential_presentations WHERE status IN ('materialized', 'failed')
   `).all();
   const recovered = [];
   const failed = [];
@@ -510,7 +510,7 @@ export function recoverCredentialPresentations(opts = {}) {
       db.prepare(`
         UPDATE credential_presentations
         SET status = 'recovery_cleaned', cleaned_at = datetime('now'), last_error = NULL
-        WHERE id = ? AND status = 'materialized'
+        WHERE id = ? AND status IN ('materialized', 'failed')
       `).run(row.id);
       recovered.push(row.id);
       appendRuntimeEvent('credential.recovery_cleaned', {
@@ -522,7 +522,7 @@ export function recoverCredentialPresentations(opts = {}) {
       failed.push({ id: row.id, error: error.message });
       db.prepare(`
         UPDATE credential_presentations SET status = 'failed', last_error = ?
-        WHERE id = ? AND status = 'materialized'
+        WHERE id = ? AND status IN ('materialized', 'failed')
       `).run(error.message, row.id);
     }
   }

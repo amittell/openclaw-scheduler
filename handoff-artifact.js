@@ -176,6 +176,18 @@ function schedulerJobExecutionProjection(job) {
       timeout_s: job.verify_timeout_s ?? null,
       on_failure: job.verify_on_failure ?? null,
     },
+    watchdog: {
+      job_type: job.job_type ?? 'standard',
+      target_label: job.watchdog_target_label ?? null,
+      check_cmd_sha256: job.watchdog_check_cmd == null ? null : sha256(job.watchdog_check_cmd),
+      timeout_min: job.watchdog_timeout_min ?? null,
+      alert_channel: job.watchdog_alert_channel ?? null,
+      alert_target: job.watchdog_alert_target ?? null,
+      self_destruct: job.watchdog_self_destruct == null
+        ? true
+        : Boolean(job.watchdog_self_destruct),
+      started_at: job.watchdog_started_at ?? null,
+    },
     child_credential_policy: job.child_credential_policy ?? null,
     intent: {
       mode: job.execution_intent ?? 'execute',
@@ -360,13 +372,20 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
   }
 
   const proofMethod = payload.authorization_proof?.method;
-  if (['jwt', 'detached-signature', 'certificate'].includes(proofMethod)
-    && (
+  if (!Object.hasOwn(payload.authorization_proof ?? {}, 'verification_context_hash')) {
+    errors.push('authorization_proof.verification_context_hash is required');
+  }
+  if (['jwt', 'detached-signature', 'certificate'].includes(proofMethod)) {
+    if (!SHA256.test(payload.authorization_proof?.verification_context_hash)) {
+      errors.push('authorization_proof.verification_context_hash is required for cryptographic proofs');
+    }
+    if (
       payload.authorization_proof.artifact_binding_required !== true
       || payload.authorization_proof.replay_protection_required !== true
       || payload.authorization_proof.revocation_check_required !== true
-    )) {
-    errors.push('cryptographic proofs must require artifact binding, replay protection, and revocation');
+    ) {
+      errors.push('cryptographic proofs must require artifact binding, replay protection, and revocation');
+    }
   }
   if (payload.evidence?.provider
     && payload.evidence.signed_or_provider_verified_required !== true) {

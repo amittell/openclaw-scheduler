@@ -54,7 +54,7 @@ export async function negotiateCredentialCapabilities(materialized, ctx, opts = 
   const nonce = randomBytes(24).toString('base64url');
   let result;
 
-  if (ctx.sessionTarget === 'isolated') {
+  if (ctx.sessionTarget === 'isolated' || ctx.sessionTarget === 'main') {
     result = await negotiateGatewayEnvironmentInjection(materialized?.gatewayEnv ?? {}, {
       ...(opts.gateway || {}),
       requireEnvInjection: ctx.presentationRequired === true,

@@ -1731,6 +1731,14 @@ export async function prepareDispatch(job, opts, deps) {
         env: process.env,
         cwd: process.cwd(),
         agentcli: deps.agentcliProofRuntime,
+        ...(approvedGate?.gate_kind === 'authorization' ? (() => {
+          const priorRun = getRun(approvedGate.run_id);
+          return {
+            priorRun,
+            reuseVerification: safeParse(priorRun?.authorization_proof_verification),
+            approvalId: approvedGate.id,
+          };
+        })() : {}),
       });
       v02Outcomes.identity_resolved = await (
         deps.resolveArtifactBoundIdentity || resolveArtifactBoundIdentity
@@ -2173,7 +2181,7 @@ export async function prepareDispatch(job, opts, deps) {
           capabilityOptions,
         );
       }
-      if (job.session_target === 'isolated') {
+      if (job.session_target === 'isolated' || job.session_target === 'main') {
         gatewayCapabilityBinding = {
           artifactDigest: job.handoff_artifact_digest,
           runtimeInstanceId: run.runtime_instance_id,

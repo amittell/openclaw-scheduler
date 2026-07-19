@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -41,7 +42,7 @@ import { resolveArtifactBoundIdentity } from '../identity-runtime.js';
 import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
 import { createJob, getJob, updateJob } from '../jobs.js';
-import { claimProofReplay, verifyArtifactBoundProof } from '../proof-runtime.js';
+import { claimProofReplay, revokeProof, verifyArtifactBoundProof } from '../proof-runtime.js';
 import {
   _resetProviderSessionMemoryForTesting,
   adoptProviderSession,
@@ -296,12 +297,29 @@ test('generated v4 artifacts bind the complete persisted scheduler execution pro
     { payload_scope: 'global' },
     { resource_pool: 'different-pool' },
     { job_class: 'pre_compaction_flush' },
+    { watchdog_target_label: 'different target' },
+    { watchdog_check_cmd: 'printf changed' },
+    { watchdog_timeout_min: 15 },
+    { watchdog_alert_channel: 'signal' },
+    { watchdog_alert_target: 'ops-room' },
+    { watchdog_self_destruct: 0 },
+    { watchdog_started_at: '2026-07-19 04:30:00' },
   ]) {
     assert.throws(
       () => updateJob(job.id, patch),
       error => error.code === 'HANDOFF_ARTIFACT_REQUIRED',
     );
   }
+  const watchdogCompatibleManifest = manifest('Watchdog transition binding');
+  delete watchdogCompatibleManifest.workflows[0].tasks[0].output;
+  const watchdogCompatibleJob = createJob(schedulerSpecFromManifest(watchdogCompatibleManifest));
+  assert.throws(
+    () => updateJob(watchdogCompatibleJob.id, {
+      job_type: 'watchdog',
+      watchdog_check_cmd: 'exit 0',
+    }),
+    error => error.code === 'HANDOFF_ARTIFACT_REQUIRED',
+  );
   const persistedArtifact = getHandoffArtifact(job.handoff_artifact_digest);
   const transplanted = {
     ...job,
@@ -321,6 +339,60 @@ test('generated v4 artifacts bind the complete persisted scheduler execution pro
     SCHEDULER_SCHEMAS.proof_replay_ledger.key_fields.includes('created_at'),
     false,
   );
+
+  const missingNoneContext = structuredClone(artifact.payload);
+  delete missingNoneContext.authorization_proof.verification_context_hash;
+  const missingNoneValidation = validateHandoffArtifact(missingNoneContext);
+  assert.equal(missingNoneValidation.ok, false);
+  assert.match(
+    missingNoneValidation.errors.join('; '),
+    /authorization_proof\.verification_context_hash.*required/,
+  );
+
+  for (const missingValue of ['delete', 'null']) {
+    const missingContext = structuredClone(artifact.payload);
+    missingContext.authorization_proof.method = 'jwt';
+    missingContext.authorization_proof.artifact_binding_required = true;
+    missingContext.authorization_proof.replay_protection_required = true;
+    missingContext.authorization_proof.revocation_check_required = true;
+    if (missingValue === 'delete') {
+      delete missingContext.authorization_proof.verification_context_hash;
+    } else {
+      missingContext.authorization_proof.verification_context_hash = null;
+    }
+    const validation = validateHandoffArtifact(missingContext);
+    assert.equal(validation.ok, false, missingValue);
+    assert.match(
+      validation.errors.join('; '),
+      /authorization_proof\.verification_context_hash.*required/,
+    );
+  }
+});
+
+test('v4 main fire-and-forget fails closed while the legacy transport remains available', () => {
+  const v4 = schedulerSpec('Main fire-and-forget refusal');
+  assert.throws(
+    () => createJob({
+      ...v4,
+      session_target: 'main',
+      payload_kind: 'systemEvent',
+      execution_intent: 'fire-and-forget',
+    }),
+    /cannot enforce artifact-bound Gateway requests/,
+  );
+
+  const legacy = createJob({
+    name: 'Legacy main fire-and-forget compatibility',
+    schedule_cron: '0 * * * *',
+    session_target: 'main',
+    payload_kind: 'systemEvent',
+    payload_message: 'legacy event',
+    run_timeout_ms: 30_000,
+    delivery_mode: 'none',
+    origin: 'system',
+    execution_intent: 'fire-and-forget',
+  });
+  assert.equal(legacy.execution_intent, 'fire-and-forget');
 });
 
 test('direct v4 job specs bind the same defaults that job creation persists', () => {
@@ -962,6 +1034,84 @@ test('proof failure audit events are ordered and never claim verification succes
   assert.equal(JSON.stringify(events).includes('opaque-proof-value'), false);
 });
 
+test('approved v4 proof outcomes are reused without replay consumption and recheck revocation', async () => {
+  const artifactDigest = `sha256:${'7'.repeat(64)}`;
+  const job = {
+    id: 'proof-approval-reuse-job',
+    handoff_version: 4,
+    handoff_artifact_digest: artifactDigest,
+    authorization_proof: JSON.stringify({
+      method: 'jwt',
+      proof: { value_from: { env: 'PROOF_MUST_NOT_BE_READ_ON_RESUME' } },
+    }),
+  };
+  const artifact = {
+    manifest: { digest: `sha256:${'6'.repeat(64)}` },
+    authorization_proof: { method: 'jwt', artifact_binding_required: true },
+  };
+  const priorRun = {
+    id: 'proof-approval-prior-run',
+    job_id: job.id,
+    handoff_artifact_digest: artifactDigest,
+  };
+  const verified = {
+    verified: true,
+    method: 'jwt',
+    signature_verified: true,
+    artifact_bound: true,
+    replay_protected: true,
+    revocation_checked: true,
+    issuer: 'https://issuer.example',
+    subject: 'principal:alex',
+    key_id: 'key-1',
+    proof_id: 'proof-approval-id',
+    verified_at: '2026-07-19T04:30:00.000Z',
+  };
+  let revocationChecks = 0;
+  const currentRun = { id: 'proof-approval-resumed-run', source_run_id: null };
+  const reused = await verifyArtifactBoundProof(job, artifact, currentRun, {
+    db: getDb(),
+    env: {},
+    priorRun,
+    reuseVerification: verified,
+    approvalId: 'approval-1',
+    checkProofRevocation(input) {
+      revocationChecks += 1;
+      assert.equal(input.priorRunId, priorRun.id);
+      return { revoked: false };
+    },
+    agentcli: {
+      async verifyAuthorizationProof() {
+        throw new Error('proof must not be verified or replay-claimed twice');
+      },
+    },
+  });
+  assert.deepEqual(reused, verified);
+  assert.equal(revocationChecks, 1);
+  assert.deepEqual(
+    listRuntimeEvents({ runId: currentRun.id }).map(event => event.event_type),
+    ['proof.revalidating', 'proof.reused'],
+  );
+
+  revokeProof({
+    method: 'jwt',
+    proofId: verified.proof_id,
+    reason: 'revoked while approval was pending',
+  }, { db: getDb() });
+  await assert.rejects(
+    () => verifyArtifactBoundProof(job, artifact, {
+      id: 'proof-approval-revoked-run',
+      source_run_id: null,
+    }, {
+      db: getDb(),
+      priorRun,
+      reuseVerification: verified,
+      approvalId: 'approval-1',
+    }),
+    error => error.code === 'AUTHORIZATION_PROOF_REVOKED',
+  );
+});
+
 test('provider session cache and rotation state are scoped to the exact artifact', async () => {
   _resetProviderSessionMemoryForTesting();
   let resolves = 0;
@@ -1006,6 +1156,52 @@ test('provider session cache and rotation state are scoped to the exact artifact
   assert.equal(resolves, 2);
   assert.equal(first.row.handoff_artifact_digest, `sha256:${'e'.repeat(64)}`);
   assert.equal(secondArtifact.row.handoff_artifact_digest, `sha256:${'f'.repeat(64)}`);
+});
+
+test('expired provider sessions re-resolve when refreshSession is unavailable', async () => {
+  _resetProviderSessionMemoryForTesting();
+  let resolves = 0;
+  const provider = {
+    name: 'reresolve-only-provider',
+    type: 'identity',
+    async resolveSession(request) {
+      resolves += 1;
+      return {
+        session: {
+          principal: request.principal,
+          rotation_id: `resolve-${resolves}`,
+          expires_at: new Date(Date.now() + (resolves === 1 ? -1_000 : 60_000)).toISOString(),
+        },
+      };
+    },
+    async checkRevocation() {
+      return { revoked: false };
+    },
+    async resumeSession() {
+      throw new Error('expired sessions must be re-resolved instead of resumed');
+    },
+  };
+  const request = { principal: 'principal:reresolve' };
+  const ctx = {
+    artifactDigest: `sha256:${'3'.repeat(64)}`,
+    jobId: 'reresolve-job',
+    runId: 'reresolve-run-1',
+  };
+  const initial = await resolveProviderSession(provider, request, ctx, { db: getDb() });
+  const replaced = await resolveProviderSession(provider, request, {
+    ...ctx,
+    runId: 'reresolve-run-2',
+  }, { db: getDb() });
+
+  assert.equal(resolves, 2);
+  assert.equal(replaced.row.id, initial.row.id);
+  assert.equal(replaced.row.status, 'active');
+  assert.equal(replaced.row.rotation_counter, 1);
+  assert.equal(replaced.session.rotation_id, 'resolve-2');
+  assert.deepEqual(
+    listRuntimeEvents({ runId: 'reresolve-run-2' }).map(event => event.event_type),
+    ['provider.session.reresolved'],
+  );
 });
 
 test('provider session rotation fails closed on a corrupted persisted summary', () => {
@@ -1296,6 +1492,82 @@ test('temp-file credentials are tracked before write and recover without persist
       runId: 'credential-run',
       artifactDigest: `sha256:${'9'.repeat(64)}`,
     }, { db: getDb() });
+  } finally {
+    if (previousSchedulerHome === undefined) delete process.env.SCHEDULER_HOME;
+    else process.env.SCHEDULER_HOME = previousSchedulerHome;
+    rmSync(schedulerHome, { recursive: true, force: true });
+  }
+});
+
+test('failed credential cleanup remains recoverable on the next cleanup pass', async () => {
+  const schedulerHome = mkdtempSync(join(tmpdir(), 'scheduler-v4-cleanup-retry-'));
+  const previousSchedulerHome = process.env.SCHEDULER_HOME;
+  process.env.SCHEDULER_HOME = schedulerHome;
+  try {
+    const materialization = await materializeCredentials(
+      {
+        name: 'cleanup-retry-provider',
+        async materializeCredentials() {
+          return {
+            bindings: [{
+              name: 'retry-secret',
+              medium: 'temp-file',
+              key: 'RETRY_SECRET_FILE',
+              file_name: 'retry-secret',
+              value: 'cleanup-retry-secret',
+            }],
+          };
+        },
+      },
+      { session: { id: 'cleanup-retry-session' } },
+      {
+        handoff: 'temp-file',
+        bindings: [{
+          name: 'retry-secret',
+          medium: 'temp-file',
+          env_key: 'RETRY_SECRET_FILE',
+          file_name: 'retry-secret',
+          required: true,
+        }],
+      },
+      {
+        jobId: 'cleanup-retry-job',
+        runId: 'cleanup-retry-run',
+        artifactDigest: `sha256:${'2'.repeat(64)}`,
+        sessionTarget: 'shell',
+      },
+      { db: getDb() },
+    );
+    const [presentation] = listCredentialPresentations({ runId: 'cleanup-retry-run' });
+    const tempPath = materialization.tempPaths[0];
+    rmSync(tempPath);
+    mkdirSync(tempPath);
+
+    await assert.rejects(
+      () => cleanupCredentialMaterialization(materialization, {
+        jobId: 'cleanup-retry-job',
+        runId: 'cleanup-retry-run',
+        artifactDigest: `sha256:${'2'.repeat(64)}`,
+      }, { db: getDb() }),
+      error => error.code === 'CREDENTIAL_CLEANUP_FAILED',
+    );
+    assert.equal(
+      getDb().prepare('SELECT status FROM credential_presentations WHERE id = ?')
+        .get(presentation.id).status,
+      'failed',
+    );
+
+    rmSync(tempPath, { recursive: true });
+    writeFileSync(tempPath, 'cleanup-retry-secret');
+    const recovered = recoverCredentialPresentations({ db: getDb() });
+    assert.deepEqual(recovered.failed, []);
+    assert.deepEqual(recovered.recovered, [presentation.id]);
+    assert.equal(existsSync(tempPath), false);
+    assert.equal(
+      getDb().prepare('SELECT status FROM credential_presentations WHERE id = ?')
+        .get(presentation.id).status,
+      'recovery_cleaned',
+    );
   } finally {
     if (previousSchedulerHome === undefined) delete process.env.SCHEDULER_HOME;
     else process.env.SCHEDULER_HOME = previousSchedulerHome;
@@ -1676,9 +1948,19 @@ test('credential capability negotiation fails before release and binds fresh run
     presentationRequired: false,
   }, {
     db: getDb(),
-    localCapabilityResolver: () => ['artifact-bound-runtime-v1'],
+    gateway: {
+      gatewayUrl: 'https://gateway-capability.test',
+      fetchImpl: async () => new Response(JSON.stringify({
+        version: '2026.7.19',
+        protocol: 4,
+        capabilities: ['capability-binding-v1'],
+      }), { headers: { 'content-type': 'application/json' } }),
+    },
   });
-  assert.equal(main.local.capabilities.includes('artifact-bound-runtime-v1'), true);
+  assert.equal(main.gateway.capabilities.includes('capability-binding-v1'), true);
+  assert.equal(main.headers['x-openclaw-handoff-artifact'], context.artifactDigest);
+  assert.equal(main.headers['x-openclaw-runtime-instance'], context.runtimeInstanceId);
+  assert.equal(main.headers['x-openclaw-capability-nonce'], main.nonce);
   await assert.rejects(
     () => negotiateCredentialCapabilities(null, {
       ...context,

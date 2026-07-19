@@ -283,6 +283,13 @@ advertised separately for earlier handoff consumers. Other exact values include
 `multipart_delivery_checkpoints: true`, and
 `completion_delivery_scope: "run"`.
 
+The handoff v4 scheduler-job digest also binds `job_type` and every watchdog
+execution input: target label, a SHA-256 digest of the check command, timeout,
+alert route, self-destruction policy, and start timestamp. Synchronous isolated
+and main-session v4 requests require a fresh artifact-bound Gateway capability
+binding. Main-session fire-and-forget is rejected for v4 because the
+system-event CLI has no binding transport; legacy jobs retain that mode.
+
 ## CLI Contract
 
 `help`, `version`, `schema`, `capabilities`, `jobs validate`, and `jobs add

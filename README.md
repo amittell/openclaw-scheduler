@@ -732,6 +732,12 @@ the event and return immediately without capturing the eventual response:
 Dispatcher → exec: openclaw system event --text "..." --mode now
 ```
 
+Handoff v4 main-session jobs use only the synchronous path because it carries
+the artifact, runtime-instance, and fresh capability-nonce binding through the
+Gateway request. The `openclaw system event` transport cannot carry that
+binding, so v4 fire-and-forget jobs fail validation. Earlier handoff versions
+keep the existing fire-and-forget behavior.
+
 ### Shell Jobs
 
 ```

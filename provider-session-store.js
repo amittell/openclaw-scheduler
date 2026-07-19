@@ -206,25 +206,17 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
 
   let rawSession = row ? memorySessions.get(row.id) : null;
   const mustRefresh = row && (row.status === 'expired' || isPast(row.expires_at, now) || isPast(row.refresh_after, now));
-  if (row && !rawSession && typeof provider.resumeSession === 'function') {
+  if (row
+    && !rawSession
+    && typeof provider.resumeSession === 'function'
+    && (!mustRefresh || typeof provider.refreshSession === 'function')) {
     const resumed = await callProvider('resumeSession', provider, row, { ...ctx, request });
     rawSession = resumed?.session ?? resumed ?? null;
     if (rawSession) memorySessions.set(row.id, rawSession);
   }
 
   if (row && mustRefresh) {
-    if (typeof provider.refreshSession !== 'function') {
-      db.prepare(`
-        UPDATE provider_sessions
-        SET status = 'expired', last_error = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run('Session expired and provider does not implement refreshSession()', row.id);
-      throw providerError(
-        'PROVIDER_SESSION_EXPIRED',
-        `Provider session ${row.id} expired and cannot be refreshed`,
-      );
-    }
-
+    const canRefresh = typeof provider.refreshSession === 'function';
     const claimed = db.prepare(`
       UPDATE provider_sessions
       SET status = 'refreshing', updated_at = datetime('now')
@@ -236,12 +228,14 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
       });
     }
     try {
-      const refreshed = await callProvider(
-        'refreshSession',
-        provider,
-        rawSession ?? row,
-        { ...ctx, request },
-      );
+      const refreshed = canRefresh
+        ? await callProvider(
+            'refreshSession',
+            provider,
+            rawSession ?? row,
+            { ...ctx, request },
+          )
+        : await callProvider('resolveSession', provider, request, ctx);
       row = persistResolvedSession(
         db,
         provider,
@@ -251,7 +245,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
         row,
       );
       rawSession = memorySessions.get(row.id);
-      appendRuntimeEvent('provider.session.refreshed', {
+      appendRuntimeEvent(canRefresh ? 'provider.session.refreshed' : 'provider.session.reresolved', {
         jobId: ctx.jobId,
         runId: ctx.runId,
         handoffArtifactDigest: ctx.artifactDigest,
@@ -269,7 +263,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
       if (exhausted) {
         throw providerError(
           'PROVIDER_SESSION_RETRY_EXHAUSTED',
-          `Provider session refresh exhausted ${maxTransientErrors} transient attempt(s)`,
+          `Provider session ${canRefresh ? 'refresh' : 're-resolution'} exhausted ${maxTransientErrors} transient attempt(s)`,
           { cause: error },
         );
       }

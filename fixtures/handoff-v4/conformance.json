@@ -62,10 +62,10 @@
     ]
   },
   "expected": {
-    "artifact_digest": "sha256:1910808223999c0e2d6cd469cc08b80a8d48fcec76d3e29163ecfb53bd55a2f7",
+    "artifact_digest": "sha256:5bb0727036d352c87b6cad16577eafe4fdb35985ae79c73053474ceadd91f62d",
     "manifest_digest": "sha256:03afcc6f88e60a7e3358578425ee79ff91d31b855e5ae97a8dc20495ef9f2dc4",
     "effective_task_hash": "sha256:0d6b7a63ba7ff75811e5db236b84648dc9547d2ce3d22cdc42eec621c9ff98e4",
-    "scheduler_job_binding_digest": "sha256:1b9e18a83a48d085f0b2bdb03c99365e79cb4de21ffb71358c32c8e0eb71ef7d"
+    "scheduler_job_binding_digest": "sha256:daac076adbaaac470e748f94d66297b3b018910867d817b78c3bc24768ffa2e6"
   },
   "negative_artifact_cases": [
     {

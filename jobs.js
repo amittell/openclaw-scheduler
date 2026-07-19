@@ -58,6 +58,9 @@ const HANDOFF_V4_BOUND_FIELDS = new Set([
   'authorization', 'evidence_ref', 'evidence', 'contract_required_trust_level',
   'contract_trust_enforcement', 'contract_sandbox', 'contract_allowed_paths',
   'contract_network', 'contract_max_cost_usd', 'contract_audit', 'child_credential_policy',
+  'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
+  'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
+  'watchdog_self_destruct', 'watchdog_started_at',
 ]);
 
 /**
@@ -595,6 +598,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (merged.execution_intent === 'fire-and-forget' && (merged.session_target || 'isolated') !== 'main') {
     throw new Error('execution_intent "fire-and-forget" is only supported for session_target "main"');
+  }
+  if (handoffVersion === 4 && merged.execution_intent === 'fire-and-forget') {
+    throw new Error(
+      'Handoff v4 does not support execution_intent "fire-and-forget" because the main-session system-event transport cannot enforce artifact-bound Gateway requests',
+    );
   }
   if (merged.execution_intent === 'fire-and-forget' && merged.output_format != null) {
     throw new Error('output_format is not supported for execution_intent "fire-and-forget" because no synchronous task output exists');

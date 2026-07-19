@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
 import { after, before, test } from 'node:test';
+
+import { compileManifestToScheduler } from '@amittell/agentcli';
 
 import {
   beginApprovalDispatch,
@@ -67,6 +70,52 @@ function jobSpec(name, authorization) {
     origin: 'system',
     authorization: JSON.stringify(authorization),
   };
+}
+
+function v4ProofJobSpec(name) {
+  const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const { jobs } = compileManifestToScheduler({
+    version: '0.2',
+    authorization_proof_profiles: [{
+      id: 'approval-proof',
+      method: 'jwt',
+      issuer: 'approval-issuer',
+      audience: 'scheduler',
+      public_key: publicKey.export({ type: 'spki', format: 'pem' }),
+      proof: { value_from: { env: 'APPROVAL_REPLAY_PROOF' } },
+      verify: { required: true },
+    }],
+    authorization_profiles: [{ id: 'approval-authz', provider: 'none' }],
+    workflows: [{
+      id: 'approval-proof-workflow',
+      name,
+      authorization_proof: { ref: 'approval-proof' },
+      tasks: [{
+        id: 'approval-proof-task',
+        name,
+        target: { session_target: 'shell' },
+        shell: { program: 'printf', args: ['governed'] },
+        schedule: { cron: '0 0 * * *' },
+        runtime: { timeout_ms: 30_000 },
+        delivery: { mode: 'none' },
+        authorization: { ref: 'approval-authz' },
+      }],
+    }],
+  }, {
+    schedulerHandoffVersion: '4',
+    cwd: process.cwd(),
+    env: { PATH: process.env.PATH || '/usr/bin' },
+  });
+  const spec = { ...jobs[0] };
+  delete spec.source;
+  for (const field of [
+    'identity', 'authorization_proof', 'authorization', 'evidence', 'contract_allowed_paths',
+  ]) {
+    if (spec[field] != null && typeof spec[field] !== 'string') {
+      spec[field] = JSON.stringify(spec[field]);
+    }
+  }
+  return spec;
 }
 
 function dispatchDeps(provider, idempotencyKey) {
@@ -166,6 +215,92 @@ test('authorization escalation suspends and resumes the exact durable dispatch',
   assert.equal(getApprovalForDispatch(dispatch.id, { activeOnly: false }).status, 'dispatched');
   finishRun(resumed.run.id, 'cancelled', { summary: 'test cleanup' });
   releaseIdempotencyKey(resumed.idemKey);
+});
+
+test('authorization approval resumes v4 proof without consuming its replay identifier twice', async () => {
+  const previousProof = process.env.APPROVAL_REPLAY_PROOF;
+  process.env.APPROVAL_REPLAY_PROOF = 'opaque-proof-material';
+  try {
+    const provider = {
+      name: 'none',
+      authorize: async () => ({ decision: 'escalate', reason: 'operator proof review required' }),
+    };
+    const job = createJob(v4ProofJobSpec('authorization-v4-proof-resume'));
+    const dispatch = enqueueDispatch(job.id, {
+      id: 'authorization-v4-proof-dispatch',
+      kind: 'manual',
+    });
+    let proofVerifications = 0;
+    const deps = {
+      ...dispatchDeps(provider, 'authorization-v4-proof-idempotency'),
+      agentcliProofRuntime: {
+        async verifyAuthorizationProof(_proof, profile, context) {
+          proofVerifications += 1;
+          const replay = context.claimProofReplay({
+            method: profile.method,
+            issuer: profile.issuer,
+            subject: 'principal:approval-proof',
+            proofId: 'authorization-v4-proof-id',
+            artifactDigest: context.artifactDigest,
+            runId: context.runId,
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          });
+          if (!replay.claimed) {
+            return {
+              verified: false,
+              method: profile.method,
+              reason: replay.reason,
+              signature_verified: true,
+              artifact_bound: true,
+              replay_protected: false,
+              revocation_checked: true,
+            };
+          }
+          return {
+            verified: true,
+            method: profile.method,
+            signature_verified: true,
+            manifest_bound: true,
+            artifact_bound: true,
+            replay_protected: true,
+            revocation_checked: true,
+            issuer: profile.issuer,
+            subject: 'principal:approval-proof',
+            key_id: 'approval-key-1',
+            proof_id: 'authorization-v4-proof-id',
+            verified_at: new Date().toISOString(),
+          };
+        },
+      },
+    };
+
+    assert.equal(await prepareDispatch(getJob(job.id), { dispatchRecord: dispatch }, deps), null);
+    const approval = getApprovalForDispatch(dispatch.id);
+    const firstRun = getRun(approval.run_id);
+    assert.equal(JSON.parse(firstRun.authorization_proof_verification).verified, true);
+    assert.equal(proofVerifications, 1);
+    assert.equal(resolveApproval(approval.id, 'approved', null).status, 'approved');
+
+    const resumed = await prepareDispatch(
+      getJob(job.id),
+      { dispatchRecord: getDispatch(dispatch.id) },
+      deps,
+    );
+    assert.ok(resumed);
+    assert.equal(proofVerifications, 1);
+    assert.equal(resumed.v02Outcomes.authorization_decision.decision, 'permit');
+    assert.equal(resumed.v02Outcomes.authorization_proof_verification.proof_id, 'authorization-v4-proof-id');
+    assert.equal(
+      getDb().prepare('SELECT COUNT(*) AS count FROM proof_replay_ledger WHERE proof_id = ?')
+        .get('authorization-v4-proof-id').count,
+      1,
+    );
+    finishRun(resumed.run.id, 'cancelled', { summary: 'test cleanup' });
+    releaseIdempotencyKey(resumed.idemKey);
+  } finally {
+    if (previousProof === undefined) delete process.env.APPROVAL_REPLAY_PROOF;
+    else process.env.APPROVAL_REPLAY_PROOF = previousProof;
+  }
 });
 
 test('changed provider authorization context creates a fresh approval gate', async () => {
