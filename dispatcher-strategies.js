@@ -2625,13 +2625,11 @@ export async function executeShell(job, ctx, deps) {
   result.errorMessage = shellResult.errorMessage;
   result.content = shellResult.deliveryText;
   result.structuredOutputSource = String(shellExec.stdout ?? '');
-  const rawStdout = String(shellExec.stdout ?? '');
-  const rawStderr = String(shellExec.stderr ?? '');
   result.evidenceOutput = {
-    stdout_sha256: `sha256:${createHash('sha256').update(rawStdout, 'utf8').digest('hex')}`,
-    stderr_sha256: `sha256:${createHash('sha256').update(rawStderr, 'utf8').digest('hex')}`,
-    stdout_bytes: Buffer.byteLength(rawStdout, 'utf8'),
-    stderr_bytes: Buffer.byteLength(rawStderr, 'utf8'),
+    stdout_sha256: shellResult.stdoutSha256,
+    stderr_sha256: shellResult.stderrSha256,
+    stdout_bytes: shellResult.stdoutBytes,
+    stderr_bytes: shellResult.stderrBytes,
   };
   if (shellResult.imageAttachments?.length > 0) {
     result.imageAttachments = shellResult.imageAttachments;

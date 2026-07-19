@@ -449,6 +449,45 @@ test('expired v4 evidence is pruned only after its immutable retention deadline'
   assert.equal(tombstone.reason, 'retention_expired');
 });
 
+test('v4 retention pruning honors an explicit cutoff timestamp', () => {
+  const job = createV4Job('Future retained v4 evidence');
+  const run = createRun(job.id);
+  finishRun(run.id, 'ok', { summary: 'retention completed' });
+  const payload = {
+    execution_id: run.id,
+    bindings: { handoff_artifact_digest: job.handoff_artifact_digest },
+  };
+  const payloadText = canonicalStringify(payload);
+  const envelope = {
+    method: 'test-signature',
+    payload_digest: sha256(payloadText),
+  };
+  const retentionUntil = new Date(Date.now() + 86_400_000).toISOString();
+  getDb().prepare(`
+    INSERT INTO evidence_records (
+      id, run_id, job_id, algorithm, hash, payload, retention_policy,
+      retention_until, handoff_artifact_digest, evidence_method,
+      evidence_verified, evidence_envelope
+    ) VALUES (?, ?, ?, 'sha256', ?, ?, '1d', ?, ?, ?, 1, ?)
+  `).run(
+    `future-evidence-${run.id}`,
+    run.id,
+    job.id,
+    envelope.payload_digest,
+    payloadText,
+    retentionUntil,
+    job.handoff_artifact_digest,
+    envelope.method,
+    canonicalStringify(envelope),
+  );
+
+  assert.equal(pruneEvidenceRecords({ now: Date.now() + 2 * 86_400_000 }).changes, 1);
+  assert.equal(
+    getDb().prepare('SELECT COUNT(*) AS count FROM evidence_records WHERE run_id = ?').get(run.id).count,
+    0,
+  );
+});
+
 test('runtime event inspection reports malformed hash-matching JSON deterministically', () => {
   const payload = 'not-json';
   const result = getDb().prepare(`
@@ -1306,6 +1345,32 @@ test('stdin credential materialization is piped into the shell command', async (
   assert.equal(result.status, 'ok');
   assert.equal(result.runFinishFields.shell_stdout, secret.toString('utf8'));
   assert.equal(result.runFinishFields.shell_stdout_sha256, sha256(secret.toString('utf8')));
+});
+
+test('shell evidence digests bind normalized stdout after image marker extraction', async () => {
+  const result = await executeShell({
+    name: 'image marker shell',
+    payload_message: 'ignored by test double',
+    run_timeout_ms: 5_000,
+    shell_env_policy: 'minimal',
+  }, {
+    run: { id: 'image-marker-shell-run' },
+    executionEnv: {},
+  }, {
+    async runShellCommand() {
+      return {
+        stdout: '[IMAGE:/tmp/chart.png]\nnormalized-output\n',
+        stderr: '',
+      };
+    },
+    normalizeShellResult,
+    log() {},
+  });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.runFinishFields.shell_stdout, 'normalized-output');
+  assert.equal(result.runFinishFields.shell_stdout_sha256, sha256('normalized-output'));
+  assert.equal(result.evidenceOutput.stdout_sha256, sha256('normalized-output'));
+  assert.deepEqual(result.imageAttachments, ['/tmp/chart.png']);
 });
 
 test('credential capability negotiation fails before release and binds fresh runtime nonces', async () => {

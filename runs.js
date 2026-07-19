@@ -840,7 +840,7 @@ export function pruneEvidenceRecords(opts = {}) {
     for (const candidate of candidates) {
       let evidence;
       if (candidate.handoff_artifact_digest) {
-        if (Date.parse(candidate.retention_until) > Date.now()) continue;
+        if (Date.parse(candidate.retention_until) > cutoff.getTime()) continue;
         try {
           const payload = JSON.parse(candidate.payload);
           const envelope = JSON.parse(candidate.evidence_envelope);

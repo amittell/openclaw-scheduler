@@ -703,9 +703,13 @@ test('legacy invalid evidence retention quarantines maintenance recovery', async
   assert.equal(getEvidenceRecord(run.id), null);
 });
 
-test('shell evidence hashes complete raw output before marker removal and storage truncation', async () => {
+test('shell evidence hashes complete normalized output after marker removal and before truncation', async () => {
   const rawStdout = `${'raw-output-'.repeat(200)}\n[IMAGE:/tmp/evidence-image.png]\n`;
   const rawStderr = 'complete diagnostic stream';
+  const normalizedStdout = rawStdout
+    .replace(/^\[IMAGE:(\/[^\]\n]+)\]$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   const job = createJob(jobSpec('raw-shell-output', {
     output_store_limit_bytes: 128,
     output_excerpt_limit_bytes: 128,
@@ -754,13 +758,13 @@ test('shell evidence hashes complete raw output before marker removal and storag
   const evidence = getEvidenceRecord(run.id);
   assert.equal(
     evidence.payload.result.stdout_sha256,
-    `sha256:${createHash('sha256').update(rawStdout).digest('hex')}`,
+    `sha256:${createHash('sha256').update(normalizedStdout).digest('hex')}`,
   );
   assert.equal(
     evidence.payload.result.stderr_sha256,
     `sha256:${createHash('sha256').update(rawStderr).digest('hex')}`,
   );
-  assert.equal(evidence.payload.result.stdout_bytes, Buffer.byteLength(rawStdout));
+  assert.equal(evidence.payload.result.stdout_bytes, Buffer.byteLength(normalizedStdout));
   assert.equal(evidence.payload.result.stderr_bytes, Buffer.byteLength(rawStderr));
   assert.equal(getRun(run.id).shell_stdout.includes('[IMAGE:'), false);
   assert(Buffer.byteLength(getRun(run.id).shell_stdout) < Buffer.byteLength(rawStdout));
