@@ -122,6 +122,7 @@ function normalizedDeclaredBindings(presentation, medium) {
     );
   }
   const declared = new Map();
+  const declaredEnvKeys = new Set();
   for (const [index, binding] of presentation.bindings.entries()) {
     if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
       throw credentialError(
@@ -143,10 +144,20 @@ function normalizedDeclaredBindings(presentation, medium) {
         `Declared credential binding ${name} medium does not match the negotiated presentation`,
       );
     }
+    const envKey = binding.env_key ?? null;
+    if (bindingMedium !== 'none' && envKey != null) {
+      if (declaredEnvKeys.has(envKey)) {
+        throw credentialError(
+          'CREDENTIAL_BINDING_INVALID',
+          `Declared credential binding ${name} collides on environment key ${envKey}`,
+        );
+      }
+      declaredEnvKeys.add(envKey);
+    }
     declared.set(name, {
       name,
       medium: bindingMedium,
-      envKey: binding.env_key ?? null,
+      envKey,
       fileName: binding.file_name ?? null,
       required: binding.required !== false,
     });
@@ -250,6 +261,7 @@ export async function materializeCredentials(
   const db = opts.db || getDb();
   const medium = presentation?.handoff;
   validateMedium(medium, ctx.sessionTarget);
+  normalizedDeclaredBindings(presentation, medium);
   let response;
   try {
     response = await provider.materializeCredentials(

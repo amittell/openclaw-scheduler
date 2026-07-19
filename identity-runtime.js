@@ -30,7 +30,19 @@ function trustLevel(session, profile, row) {
 function assertNotElevated(child, parent) {
   const childIndex = TRUST_ORDER.indexOf(child);
   const parentIndex = TRUST_ORDER.indexOf(parent);
-  if (childIndex >= 0 && parentIndex >= 0 && childIndex > parentIndex) {
+  if (parentIndex < 0) {
+    throw identityError(
+      'CHILD_CREDENTIAL_TRUST_UNAVAILABLE',
+      'Exact source-run trust level is missing or unrecognized',
+    );
+  }
+  if (childIndex < 0) {
+    throw identityError(
+      'CHILD_CREDENTIAL_TRUST_UNAVAILABLE',
+      'Child trust level is missing or unrecognized',
+    );
+  }
+  if (childIndex > parentIndex) {
     throw identityError(
       'CHILD_CREDENTIAL_TRUST_ELEVATION',
       'Child trust level ' + child + ' exceeds exact source-run trust level ' + parent,

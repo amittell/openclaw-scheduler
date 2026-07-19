@@ -2395,6 +2395,7 @@ export async function executeWatchdog(job, ctx, deps) {
     Math.min(job.run_timeout_ms || 300000, 60000),
     ctx.executionEnv || null,
     {
+      stdin: ctx.v4CredentialMaterialization?.stdin ?? null,
       signal: ctx.abortSignal || null,
       envPolicy: job.shell_env_policy || 'minimal',
       onProcess: processInfo => {

@@ -180,7 +180,19 @@ test('authorization escalation suspends and resumes the exact durable dispatch',
 
 test('authorization approval resumes v4 proof without consuming its replay identifier twice', async () => {
   const previousProof = process.env.APPROVAL_REPLAY_PROOF;
-  process.env.APPROVAL_REPLAY_PROOF = 'opaque-proof-material';
+  const proofNowSeconds = Math.floor(Date.now() / 1000);
+  const proofExpiresAt = new Date((proofNowSeconds + 60) * 1000).toISOString();
+  const encoded = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+  process.env.APPROVAL_REPLAY_PROOF = [
+    encoded({ alg: 'RS256', typ: 'JWT' }),
+    encoded({
+      iss: 'https://issuer.example',
+      sub: 'principal:approval-proof',
+      iat: proofNowSeconds - 1,
+      exp: proofNowSeconds + 60,
+    }),
+    'test-signature',
+  ].join('.');
   try {
     const provider = {
       name: 'none',
@@ -204,7 +216,7 @@ test('authorization approval resumes v4 proof without consuming its replay ident
             proofId: 'authorization-v4-proof-id',
             artifactDigest: context.artifactDigest,
             runId: context.runId,
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            expiresAt: proofExpiresAt,
           });
           if (!replay.claimed) {
             return {
@@ -238,7 +250,10 @@ test('authorization approval resumes v4 proof without consuming its replay ident
     assert.equal(await prepareDispatch(getJob(job.id), { dispatchRecord: dispatch }, deps), null);
     const approval = getApprovalForDispatch(dispatch.id);
     const firstRun = getRun(approval.run_id);
-    assert.equal(JSON.parse(firstRun.authorization_proof_verification).verified, true);
+    const firstVerification = JSON.parse(firstRun.authorization_proof_verification);
+    assert.equal(firstVerification.verified, true);
+    assert.equal(firstVerification.proof_valid_until, proofExpiresAt);
+    assert.equal(firstVerification.proof_clock_skew_seconds, 60);
     assert.equal(proofVerifications, 1);
     assert.equal(resolveApproval(approval.id, 'approved', null).status, 'approved');
 

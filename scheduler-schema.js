@@ -132,7 +132,7 @@ export const SCHEDULER_SCHEMAS = {
     key_fields: ['outbox_id', 'message_id', 'ordinal', 'name', 'mime_type', 'source_path', 'content_blob', 'size_bytes', 'sha256'],
   },
   evidence_records: {
-    key_fields: ['run_id', 'job_id', 'evidence_ref', 'algorithm', 'hash', 'payload', 'retention_policy', 'retention_until', 'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest', 'evidence_method', 'evidence_verified', 'evidence_envelope', 'created_at'],
+    key_fields: ['run_id', 'job_id', 'evidence_ref', 'algorithm', 'hash', 'payload', 'retention_policy', 'retention_until', 'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest', 'evidence_method', 'evidence_verified', 'evidence_envelope', 'evidence_provider', 'evidence_principal', 'evidence_allowed_signers_path', 'created_at'],
   },
   handoff_artifacts: {
     immutable: true,

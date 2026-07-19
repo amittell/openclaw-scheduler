@@ -23,8 +23,14 @@ const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const PRESENTATION_MEDIA = new Set(['none', 'env', 'temp-file', 'stdin', 'gateway-env-header']);
 const RAW_SECRET_KEYS = new Set([
   'value', 'credential', 'credentials', 'secret', 'token', 'password',
-  'private_key', 'private-key', 'proof_value', 'raw_value',
+  'privatekey', 'proofvalue', 'rawvalue', 'apikey', 'accesstoken',
+  'refreshtoken', 'idtoken', 'clientsecret', 'clientassertion',
+  'authorizationheader', 'cookie',
 ]);
+
+function normalizedFieldName(value) {
+  return String(value).toLowerCase().replaceAll(/[^a-z0-9]/g, '');
+}
 
 function normalizePrimitive(value) {
   if (value === undefined) return null;
@@ -233,7 +239,7 @@ function findRawSecretPaths(value, path = '$', found = []) {
   if (!value || typeof value !== 'object') return found;
   for (const [key, child] of Object.entries(value)) {
     const childPath = `${path}.${key}`;
-    if (RAW_SECRET_KEYS.has(key.toLowerCase()) && child != null) found.push(childPath);
+    if (RAW_SECRET_KEYS.has(normalizedFieldName(key)) && child != null) found.push(childPath);
     else findRawSecretPaths(child, childPath, found);
   }
   return found;

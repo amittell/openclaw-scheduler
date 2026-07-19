@@ -624,6 +624,10 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
         'delivery_group_id', 'part_index', 'part_count',
         'completion_label', 'completion_scope',
       ],
+      evidence_records: [
+        'evidence_provider', 'evidence_principal',
+        'evidence_allowed_signers_path',
+      ],
     };
     for (const [table, columns] of Object.entries(expectedColumns)) {
       const actual = new Map(

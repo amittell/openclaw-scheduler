@@ -185,7 +185,7 @@ function evidencePrincipal(profile, opts = {}) {
 function providerVerifyOptions(profile, record, opts, principal) {
   const config = profile.provider_config || {};
   return {
-    record,
+    ...(record ? { record } : {}),
     principal,
     allowedSignersPath: config.allowed_signers_path
       || config.allowed_signers
@@ -313,6 +313,8 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     jobId: job.id,
     evidenceRef: profile.ref || job.evidence_ref || null,
     provider: profile.provider,
+    principal,
+    allowedSignersPath: verifyOptions.allowedSignersPath ?? null,
     method: attestation.envelope.method,
     envelopeText,
     envelopeHash,
@@ -367,8 +369,9 @@ export function persistPreparedArtifactBoundEvidence(prepared, opts = {}) {
       + '(id, run_id, job_id, evidence_ref, algorithm, hash, payload, '
       + 'retention_policy, retention_until, handoff_artifact_digest, source_run_id, '
       + 'source_run_handoff_artifact_digest, evidence_method, evidence_verified, '
-      + 'evidence_envelope, created_at) '
-      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
+      + 'evidence_envelope, evidence_provider, evidence_principal, '
+      + 'evidence_allowed_signers_path, created_at) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)',
     ).run(
       rowId,
       run.id,
@@ -384,6 +387,9 @@ export function persistPreparedArtifactBoundEvidence(prepared, opts = {}) {
       prepared.sourceRunHandoffArtifactDigest,
       prepared.method,
       prepared.envelopeText,
+      prepared.provider,
+      prepared.principal,
+      prepared.allowedSignersPath,
       prepared.timestamp,
     );
     db.prepare('UPDATE runs SET evidence_record = ? WHERE id = ?').run(
@@ -445,32 +451,21 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
   let envelope = null;
   try {
     const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
-    if (!run) throw evidenceError('RUN_NOT_FOUND', `Evidence run not found: ${runId}`);
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(run.job_id);
-    if (!job) throw evidenceError('JOB_NOT_FOUND', `Evidence job not found: ${run.job_id}`);
-    if (!run.handoff_artifact_digest) {
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(row.job_id);
+    if (!row.handoff_artifact_digest) {
       throw evidenceError('HANDOFF_V4_REQUIRED', 'Cryptographic evidence verification requires handoff v4');
     }
-    const artifactRecord = getHandoffArtifact(run.handoff_artifact_digest, { db });
+    const artifactRecord = getHandoffArtifact(row.handoff_artifact_digest, { db });
     if (!artifactRecord) {
       throw evidenceError(
         'HANDOFF_ARTIFACT_REQUIRED',
-        `Historical handoff artifact ${run.handoff_artifact_digest} is not retrievable`,
+        `Historical handoff artifact ${row.handoff_artifact_digest} is not retrievable`,
       );
     }
     payload = JSON.parse(row.payload);
     envelope = JSON.parse(row.evidence_envelope);
     if (canonicalStringify(payload) !== row.payload) {
       throw evidenceError('EVIDENCE_PAYLOAD_NONCANONICAL', 'Persisted evidence payload is not canonical JSON');
-    }
-    if (
-      row.job_id !== job.id
-      || row.handoff_artifact_digest !== run.handoff_artifact_digest
-      || (row.source_run_id ?? null) !== (run.source_run_id ?? null)
-      || (row.source_run_handoff_artifact_digest ?? null)
-        !== (run.source_run_handoff_artifact_digest ?? null)
-    ) {
-      throw evidenceError('EVIDENCE_BINDING_MISMATCH', 'Persisted evidence row does not match the run');
     }
     if (row.evidence_verified !== 1) {
       throw evidenceError('EVIDENCE_NOT_VERIFIED', 'Persisted evidence is not marked verified');
@@ -482,13 +477,53 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
     if (row.hash !== expectedHash || envelope.payload_digest !== sha256(row.payload)) {
       throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
     }
+    if (
+      payload.execution_id !== row.run_id
+      || payload.bindings?.handoff_artifact_digest !== row.handoff_artifact_digest
+      || (payload.bindings?.source_run_id ?? null) !== (row.source_run_id ?? null)
+      || (payload.bindings?.source_run_handoff_artifact_digest ?? null)
+        !== (row.source_run_handoff_artifact_digest ?? null)
+      || payload.bindings?.manifest_digest !== artifactRecord.payload.manifest.digest
+      || payload.bindings?.effective_task_hash
+        !== artifactRecord.payload.compiled.effective_task_hash
+      || payload.source?.workflow_id !== artifactRecord.payload.manifest.workflow_id
+      || payload.source?.task_id !== artifactRecord.payload.manifest.task_id
+      || artifactRecord.payload.compiled.job_id !== row.job_id
+    ) {
+      throw evidenceError(
+        'EVIDENCE_BINDING_MISMATCH',
+        'Persisted evidence row, signed payload, and historical artifact do not match',
+      );
+    }
+    if (run && (
+      row.job_id !== run.job_id
+      || row.handoff_artifact_digest !== run.handoff_artifact_digest
+      || (row.source_run_id ?? null) !== (run.source_run_id ?? null)
+      || (row.source_run_handoff_artifact_digest ?? null)
+        !== (run.source_run_handoff_artifact_digest ?? null)
+    )) {
+      throw evidenceError('EVIDENCE_BINDING_MISMATCH', 'Persisted evidence row does not match the run');
+    }
 
-    const profile = parseJson(run.evidence_declaration_snapshot) || parseJson(job.evidence);
+    const retainedProfile = row.evidence_provider
+      ? {
+        provider: row.evidence_provider,
+        provider_config: {
+          principal: row.evidence_principal,
+          allowed_signers_path: row.evidence_allowed_signers_path,
+        },
+      }
+      : null;
+    const profile = run
+      ? (parseJson(run.evidence_declaration_snapshot) || parseJson(job?.evidence))
+      : retainedProfile;
     if (!profile?.provider) {
       throw evidenceError('EVIDENCE_PROVIDER_REQUIRED', 'Persisted evidence provider configuration is missing');
     }
     const agentcli = await loadAgentcli(opts);
-    const record = evidenceRecord(run, artifactRecord.payload, payload.timestamp, opts);
+    const record = run
+      ? evidenceRecord(run, artifactRecord.payload, payload.timestamp, opts)
+      : null;
     const { provider, source } = await resolveProvider(profile, agentcli, {
       env: opts.env || process.env,
     });
@@ -501,11 +536,11 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
     const verification = source === 'agentcli'
       ? await agentcli.verifyEvidenceEnvelope(envelope, verifyOptions, {
           runId,
-          artifactDigest: run.handoff_artifact_digest,
+          artifactDigest: row.handoff_artifact_digest,
         })
       : await provider.verify(envelope, verifyOptions, {
           runId,
-          artifactDigest: run.handoff_artifact_digest,
+          artifactDigest: row.handoff_artifact_digest,
         });
     if (verification?.verified !== true) {
       throw evidenceError(
@@ -513,7 +548,24 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
         verification?.reason || 'Persisted evidence cryptographic verification failed',
       );
     }
-    assertVerifiedEvidencePayload(agentcli, envelope, verification, record);
+    if (run) {
+      assertVerifiedEvidencePayload(agentcli, envelope, verification, record);
+    } else {
+      const verifiedPayload = verification?.payload || parseJson(envelope?.signed_payload);
+      const payloadValidation = agentcli.validateCompleteEvidencePayload(verifiedPayload);
+      if (!payloadValidation.valid) {
+        throw evidenceError(
+          'EVIDENCE_PAYLOAD_INVALID',
+          `Verified evidence payload is invalid: ${payloadValidation.errors.join('; ')}`,
+        );
+      }
+      if (canonicalStringify(verifiedPayload) !== row.payload) {
+        throw evidenceError(
+          'EVIDENCE_BINDING_MISMATCH',
+          'Cryptographically verified evidence payload does not match the retained record',
+        );
+      }
+    }
     return {
       ...row,
       payload,

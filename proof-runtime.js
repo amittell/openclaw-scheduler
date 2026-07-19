@@ -198,15 +198,124 @@ function revocationChecker(db, profile, opts) {
   };
 }
 
-function auditResult(result) {
+function temporalError(message) {
+  return proofError('AUTHORIZATION_PROOF_VALIDITY_INVALID', message);
+}
+
+function validDateMs(value, label) {
+  const parsed = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(parsed)) throw temporalError(`Authorization proof ${label} is invalid`);
+  try {
+    new Date(parsed).toISOString();
+  } catch {
+    throw temporalError(`Authorization proof ${label} is outside the supported date range`);
+  }
+  return parsed;
+}
+
+function normalizedClockSkewSeconds(value) {
+  const input = value ?? 60;
+  const skew = (
+    (typeof input === 'number' || typeof input === 'string')
+    && !(typeof input === 'string' && input.trim() === '')
+  ) ? Number(input) : Number.NaN;
+  if (!Number.isFinite(skew) || skew < 0 || !Number.isFinite(skew * 1000)) {
+    throw temporalError('Authorization proof clock skew must be a finite non-negative number');
+  }
+  return skew;
+}
+
+function normalizedNowMs(value) {
+  const now = value === undefined
+    ? Date.now()
+    : value instanceof Date
+      ? value.getTime()
+      : typeof value === 'number'
+        ? value
+        : Number.NaN;
+  return validDateMs(now, 'verification time');
+}
+
+function parseProofEnvelope(proof, method) {
+  try {
+    if (method === 'jwt') {
+      const parts = String(proof).trim().split('.');
+      if (parts.length !== 3) throw new TypeError('JWT must have three parts');
+      return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    }
+    const parsed = typeof proof === 'string' ? JSON.parse(proof) : proof;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('proof envelope must be an object');
+    }
+    return parsed;
+  } catch (error) {
+    throw temporalError(`Verified ${method} proof validity envelope is invalid: ${error.message}`);
+  }
+}
+
+function verifiedProofTemporalWindow(method, proof, result, clockSkewSeconds) {
+  const parsed = parseProofEnvelope(proof, method);
+  let validFrom;
+  let validUntil;
+  if (method === 'jwt') {
+    if (typeof parsed.iat !== 'number' || typeof parsed.exp !== 'number') {
+      throw temporalError('Verified JWT is missing numeric iat or exp validity claims');
+    }
+    const validFromSeconds = parsed.nbf == null
+      ? parsed.iat
+      : Math.max(parsed.iat, parsed.nbf);
+    validFrom = validDateMs(validFromSeconds * 1000, 'valid-from claim');
+    validUntil = validDateMs(parsed.exp * 1000, 'expiration claim');
+  } else if (method === 'detached-signature' || method === 'certificate') {
+    validFrom = validDateMs(parsed.issued_at, 'issued_at');
+    validUntil = validDateMs(parsed.expires_at, 'expires_at');
+    if (method === 'certificate') {
+      validFrom = Math.max(validFrom, validDateMs(result.not_before, 'certificate not_before'));
+      validUntil = Math.min(validUntil, validDateMs(result.not_after, 'certificate not_after'));
+    }
+  } else {
+    throw temporalError(`Unsupported reusable authorization proof method: ${method}`);
+  }
+  if (validUntil <= validFrom) {
+    throw temporalError('Authorization proof validity window is empty or reversed');
+  }
+  return {
+    proof_valid_from: new Date(validFrom).toISOString(),
+    proof_valid_until: new Date(validUntil).toISOString(),
+    proof_clock_skew_seconds: normalizedClockSkewSeconds(clockSkewSeconds),
+  };
+}
+
+function assertReusableProofTemporalWindow(result, opts = {}) {
+  const validFrom = validDateMs(result?.proof_valid_from, 'stored valid-from claim');
+  const validUntil = validDateMs(result?.proof_valid_until, 'stored expiration claim');
+  if (validUntil <= validFrom) {
+    throw temporalError('Stored authorization proof validity window is empty or reversed');
+  }
+  if (!Object.hasOwn(result, 'proof_clock_skew_seconds')) {
+    throw temporalError('Stored authorization proof clock skew is missing');
+  }
+  const skewMs = normalizedClockSkewSeconds(result.proof_clock_skew_seconds) * 1000;
+  const now = normalizedNowMs(opts.now);
+  if (now + skewMs < validFrom) {
+    throw proofError('AUTHORIZATION_PROOF_NOT_YET_VALID', 'Authorization proof is not yet valid after approval');
+  }
+  if (now >= validUntil + skewMs) {
+    throw proofError('AUTHORIZATION_PROOF_EXPIRED', 'Authorization proof expired while awaiting approval');
+  }
+}
+
+function auditResult(result, temporalWindow = null) {
   const allowed = {};
   for (const key of [
     'verified', 'method', 'reason', 'claims_validated', 'signature_verified',
     'manifest_bound', 'artifact_bound', 'replay_protected', 'revocation_checked',
     'issuer', 'subject', 'key_id', 'proof_id', 'verified_at',
+    'proof_valid_from', 'proof_valid_until', 'proof_clock_skew_seconds',
   ]) {
     if (result?.[key] != null) allowed[key] = result[key];
   }
+  if (temporalWindow) Object.assign(allowed, temporalWindow);
   return allowed;
 }
 
@@ -255,6 +364,7 @@ async function reuseVerifiedProof(job, declaration, profile, run, opts, db, even
       'Approved proof verification has no replay or verification-key identifier',
     );
   }
+  assertReusableProofTemporalWindow(result, opts);
 
   const revocation = await revocationChecker(db, profile, opts)({
     method: result.method,
@@ -351,7 +461,7 @@ export async function verifyArtifactBoundProof(job, artifactRecord, run, opts = 
       checkProofRevocation: revocationChecker(db, profile, opts),
       cwd: opts.cwd || process.cwd(),
     });
-    const audited = auditResult(result);
+    let audited = auditResult(result);
     if (result?.verified !== true
       || result.artifact_bound !== true
       || result.replay_protected !== true
@@ -363,6 +473,15 @@ export async function verifyArtifactBoundProof(job, artifactRecord, run, opts = 
         { result: audited },
       );
     }
+    audited = auditResult(
+      result,
+      verifiedProofTemporalWindow(
+        declaration.method,
+        proof,
+        result,
+        opts.clockSkewSeconds ?? 60,
+      ),
+    );
     appendRuntimeEvent('proof.verified', {
       ...eventBinding,
       payload: audited,

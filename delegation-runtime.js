@@ -46,10 +46,10 @@ function validateSourceSemantics(job, dispatchRecord, sourceRun, policy) {
       );
     }
   } else if (kind === 'retry') {
-    if (sourceRun.job_id !== job.id || sourceRun.status !== 'error') {
+    if (sourceRun.job_id !== job.id || !['error', 'timeout'].includes(sourceRun.status)) {
       throw delegationError(
         'DELEGATION_SOURCE_RUN_INVALID',
-        'Retry dispatch source must be a failed run of the same job',
+        'Retry dispatch source must be an errored or timed-out run of the same job',
       );
     }
   } else if (policy.mode && policy.mode !== 'none' && sourceRun.status !== 'ok') {

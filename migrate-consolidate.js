@@ -343,6 +343,8 @@ export default function migrateConsolidate() {
       'retention_policy', 'retention_until', 'handoff_artifact_digest',
       'source_run_id', 'source_run_handoff_artifact_digest',
       'evidence_method', 'evidence_verified', 'evidence_envelope',
+      'evidence_provider', 'evidence_principal',
+      'evidence_allowed_signers_path',
     ])
     && !evidenceHasForeignKeys
     && hasColumns(completionDebtColumns, ['id', 'task_label', 'delivery_scope'])
@@ -646,6 +648,9 @@ export default function migrateConsolidate() {
     `ALTER TABLE evidence_records ADD COLUMN evidence_method TEXT DEFAULT NULL`,
     `ALTER TABLE evidence_records ADD COLUMN evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1))`,
     `ALTER TABLE evidence_records ADD COLUMN evidence_envelope TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_provider TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_principal TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_allowed_signers_path TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -1027,6 +1032,9 @@ export default function migrateConsolidate() {
         evidence_method TEXT,
         evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
         evidence_envelope TEXT,
+        evidence_provider TEXT,
+        evidence_principal TEXT,
+        evidence_allowed_signers_path TEXT,
         created_at      TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(algorithm, hash, run_id)
       );
@@ -1034,13 +1042,15 @@ export default function migrateConsolidate() {
         id, run_id, job_id, evidence_ref, algorithm, hash, payload,
         retention_policy, retention_until, handoff_artifact_digest,
         source_run_id, source_run_handoff_artifact_digest, evidence_method,
-        evidence_verified, evidence_envelope, created_at
+        evidence_verified, evidence_envelope, evidence_provider,
+        evidence_principal, evidence_allowed_signers_path, created_at
       )
       SELECT
         id, run_id, job_id, evidence_ref, algorithm, hash, payload,
         retention_policy, retention_until, handoff_artifact_digest,
         source_run_id, source_run_handoff_artifact_digest, evidence_method,
-        evidence_verified, evidence_envelope, created_at
+        evidence_verified, evidence_envelope, evidence_provider,
+        evidence_principal, evidence_allowed_signers_path, created_at
       FROM evidence_records;
       DROP TABLE evidence_records;
       ALTER TABLE evidence_records_v28 RENAME TO evidence_records;
@@ -1401,6 +1411,9 @@ export default function migrateConsolidate() {
       evidence_method TEXT,
       evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
       evidence_envelope TEXT,
+      evidence_provider TEXT,
+      evidence_principal TEXT,
+      evidence_allowed_signers_path TEXT,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(algorithm, hash, run_id)
     );

@@ -69,13 +69,15 @@ credentials, proof values, stdin, or environment values. Job creation persists
 the artifact before the job. Replacement persists a new immutable artifact,
 keeps the prior artifact, applies explicit null clears, and atomically cancels
 pending dispatches and approvals bound to the superseded digest. Disabling a v4
-job does not rewrite its artifact.
+job does not rewrite its artifact. Re-enabling is allowed only when the
+resulting job once again matches that same persisted artifact exactly.
 
 Every dispatch, approval, run, evidence row, provider session, credential
 presentation, and runtime event carries the exact artifact digest. Chain and
 retry work additionally bind the exact source run ID and source artifact digest.
 Database triggers prevent binding mutation and artifact deletion while runtime
-state references it.
+state references it. Run pruning retains every source run referenced by an
+immutable v4 dispatch so foreign-key cleanup cannot rewrite that lineage.
 
 ## Dispatcher Ownership
 
@@ -137,6 +139,11 @@ environment variables cannot substitute another identity. Domain scopes are
 rejected. An approve decision for a scoped gate must match, and scoped gates
 cannot timeout-auto-approve. Mutation, disable, or delete cancels the bound
 approval.
+
+Cryptographic proof verification persists the verified not-before and expiry
+window plus the exact clock skew used for the decision. After an approval wait,
+the scheduler rechecks that trusted window and revocation state without
+claiming the proof replay identifier a second time.
 
 `approvals approve/reject APPROVAL_ID` is the primary decision surface. Legacy
 `jobs approve/reject JOB_ID` first resolves that job's current pending approval
@@ -207,6 +214,10 @@ including when completion is observed exactly at the deadline.
 - Identity, trust, proof, authorization, and credential handoff failures remain
   fail closed.
 - Materialized credential values are cleared during cleanup paths.
+- Provider sessions are released only after an explicit not-revoked result;
+  missing, malformed, or indeterminate revocation responses fail closed.
+  Newly resolved, refreshed, or adopted sessions that are already expired are
+  rejected before persistence or credential materialization.
 - Provider results must match every immutable presentation binding by name,
   medium, environment key, file name, cardinality, and required state before
   any value is exposed. Stdin credentials are piped to shell stdin and cleared
@@ -245,6 +256,12 @@ not the job's current artifact, and rejects missing or modified offloaded
 output. A finite v4 retention policy permits deletion only after its persisted
 deadline; pruning first validates the immutable envelope binding and leaves an
 auditable run tombstone.
+
+Cryptographic evidence also snapshots its audit-safe provider, principal, and
+verification trust path. If normal run history or the owning job is removed
+before evidence retention expires, verification uses the retained signed
+payload, immutable evidence row, and historical handoff artifact instead of
+reporting the missing operational rows as an integrity failure.
 
 The SSH provider uses `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the
 declared key, principal, namespace, and allowed-signers file. Provider methods,

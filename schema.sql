@@ -521,6 +521,9 @@ CREATE TABLE IF NOT EXISTS evidence_records (
   evidence_method TEXT,
   evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
   evidence_envelope TEXT,
+  evidence_provider TEXT,
+  evidence_principal TEXT,
+  evidence_allowed_signers_path TEXT,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(algorithm, hash, run_id)
 );

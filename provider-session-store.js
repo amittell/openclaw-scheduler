@@ -25,6 +25,18 @@ function isPast(value, now = Date.now()) {
   return Number.isFinite(parsed) && parsed <= now;
 }
 
+function contextNowMs(value) {
+  const parsed = value === undefined
+    ? Date.now()
+    : value instanceof Date
+      ? value.getTime()
+      : typeof value === 'number'
+        ? value
+        : Number.NaN;
+  if (!Number.isFinite(parsed)) throw new TypeError('provider session current time is invalid');
+  return parsed;
+}
+
 function safeSummary(session) {
   if (!session || typeof session !== 'object') return null;
   const summary = {
@@ -87,7 +99,15 @@ function sessionRow(db, provider, key) {
   `).get(provider.type, provider.name, key);
 }
 
-function persistResolvedSession(db, provider, key, resolved, artifactDigest, current = null) {
+function persistResolvedSession(
+  db,
+  provider,
+  key,
+  resolved,
+  artifactDigest,
+  current = null,
+  opts = {},
+) {
   const session = resolved.session ?? resolved;
   if (!session || typeof session !== 'object' || Array.isArray(session)) {
     throw providerError('PROVIDER_SESSION_INVALID', `Provider ${provider.name} returned no session`);
@@ -95,6 +115,12 @@ function persistResolvedSession(db, provider, key, resolved, artifactDigest, cur
   const id = current?.id ?? randomUUID();
   const summary = safeSummary(session);
   const expiresAt = sqliteTimestamp(resolved.expires_at ?? session.expires_at ?? null);
+  if (expiresAt && isPast(expiresAt, contextNowMs(opts.now))) {
+    throw providerError(
+      'PROVIDER_SESSION_EXPIRED',
+      `Provider ${provider.name} returned an already-expired session`,
+    );
+  }
   const refreshAfter = sqliteTimestamp(resolved.refresh_after ?? session.refresh_after ?? null);
   const nextRotationHash = resolved.rotation_id == null
     ? summary?.rotation_id_hash ?? null
@@ -136,8 +162,16 @@ function persistResolvedSession(db, provider, key, resolved, artifactDigest, cur
     refreshAfter,
     rotationCounter,
   );
-  memorySessions.set(id, session);
-  return db.prepare('SELECT * FROM provider_sessions WHERE id = ?').get(id);
+  const persisted = sessionRow(db, provider, key);
+  if (!persisted) {
+    throw providerError(
+      'PROVIDER_SESSION_PERSIST_FAILED',
+      `Provider session ${provider.name} was not retrievable after persistence`,
+    );
+  }
+  if (persisted.id !== id) memorySessions.delete(id);
+  memorySessions.set(persisted.id, session);
+  return persisted;
 }
 
 async function callProvider(method, provider, ...args) {
@@ -174,7 +208,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
   const db = opts.db || getDb();
   const key = cacheKey(provider, request, ctx.artifactDigest);
   let row = sessionRow(db, provider, key);
-  const now = typeof ctx.now === 'number' ? ctx.now : Date.now();
+  const now = contextNowMs(ctx.now);
   const maxTransientErrors = Number.isInteger(opts.maxTransientErrors) && opts.maxTransientErrors > 0
     ? opts.maxTransientErrors
     : DEFAULT_MAX_TRANSIENT_ERRORS;
@@ -243,6 +277,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
         refreshed,
         ctx.artifactDigest,
         row,
+        { now },
       );
       rawSession = memorySessions.get(row.id);
       appendRuntimeEvent(canRefresh ? 'provider.session.refreshed' : 'provider.session.reresolved', {
@@ -273,7 +308,15 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
 
   if (!row || !rawSession) {
     const resolved = await callProvider('resolveSession', provider, request, ctx);
-    row = persistResolvedSession(db, provider, key, resolved, ctx.artifactDigest, row);
+    row = persistResolvedSession(
+      db,
+      provider,
+      key,
+      resolved,
+      ctx.artifactDigest,
+      row,
+      { now },
+    );
     rawSession = memorySessions.get(row.id);
     appendRuntimeEvent('provider.session.resolved', {
       jobId: ctx.jobId,
@@ -300,6 +343,13 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
     `).run(reason, row.id);
     memorySessions.delete(row.id);
     throw providerError('PROVIDER_SESSION_REVOKED', reason);
+  }
+  if (revocation !== false && revocation?.revoked !== false) {
+    throw providerError(
+      'PROVIDER_SESSION_REVOCATION_INDETERMINATE',
+      `Provider ${provider.name} did not explicitly confirm that the session is not revoked`,
+      { transient: true },
+    );
   }
   db.prepare(`
     UPDATE provider_sessions
@@ -335,7 +385,7 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
       `Provider session ${id} does not belong to the requested handoff artifact`,
     );
   }
-  const now = typeof ctx.now === 'number' ? ctx.now : Date.now();
+  const now = contextNowMs(ctx.now);
   const maxTransientErrors = Number.isInteger(opts.maxTransientErrors) && opts.maxTransientErrors > 0
     ? opts.maxTransientErrors
     : DEFAULT_MAX_TRANSIENT_ERRORS;
@@ -406,6 +456,7 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
         refreshed,
         row.handoff_artifact_digest,
         row,
+        { now },
       );
       session = memorySessions.get(id);
       appendRuntimeEvent('provider.session.refreshed', {
@@ -457,6 +508,13 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
     memorySessions.delete(id);
     throw providerError('PROVIDER_SESSION_REVOKED', reason);
   }
+  if (revocation !== false && revocation?.revoked !== false) {
+    throw providerError(
+      'PROVIDER_SESSION_REVOCATION_INDETERMINATE',
+      `Provider ${provider.name} did not explicitly confirm that the session is not revoked`,
+      { transient: true },
+    );
+  }
   db.prepare(`
     UPDATE provider_sessions
     SET revocation_checked_at = datetime('now'), updated_at = datetime('now')
@@ -476,6 +534,7 @@ export function adoptProviderSession(provider, request, resolved, ctx = {}, opts
     resolved,
     ctx.artifactDigest,
     current,
+    { now: contextNowMs(ctx.now) },
   );
   appendRuntimeEvent('provider.session.adopted', {
     jobId: ctx.jobId,

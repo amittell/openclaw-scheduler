@@ -262,6 +262,11 @@ export function pruneRuns(keepPerJob = 100) {
       DELETE FROM runs
       WHERE job_id = ?
         AND status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed')
+        AND NOT EXISTS (
+          SELECT 1 FROM job_dispatch_queue dispatch
+          WHERE dispatch.source_run_id = runs.id
+            AND dispatch.handoff_artifact_digest IS NOT NULL
+        )
         AND id NOT IN (
         SELECT id FROM runs
         WHERE job_id = ?

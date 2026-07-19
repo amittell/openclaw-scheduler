@@ -37,11 +37,11 @@ import {
 } from '../evidence-runtime.js';
 import { negotiateCredentialCapabilities } from '../capability-negotiation.js';
 import { runShellCommand } from '../dispatcher-shell.js';
-import { executeShell, finalizeDispatch } from '../dispatcher-strategies.js';
+import { executeShell, executeWatchdog, finalizeDispatch } from '../dispatcher-strategies.js';
 import { resolveArtifactBoundIdentity } from '../identity-runtime.js';
 import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
-import { createJob, getJob, updateJob } from '../jobs.js';
+import { createJob, deleteJob, getJob, updateJob } from '../jobs.js';
 import { claimProofReplay, revokeProof, verifyArtifactBoundProof } from '../proof-runtime.js';
 import {
   _resetProviderSessionMemoryForTesting,
@@ -55,6 +55,7 @@ import {
   getRun,
   persistV02Outcomes,
   pruneEvidenceRecords,
+  pruneRuns,
 } from '../runs.js';
 import { getRuntimeEvent, listRuntimeEvents } from '../runtime-events.js';
 import { SCHEDULER_SCHEMAS } from '../scheduler-schema.js';
@@ -470,6 +471,20 @@ test('shared handoff v4 conformance fixtures have exact digest parity and fail c
   }
 });
 
+test('handoff v4 artifacts reject normalized raw-secret field variants', () => {
+  const payload = assertArtifactMatchesJob(createV4Job('Raw secret field variants')).payload;
+  for (const key of [
+    'privateKey', 'proofValue', 'rawValue', 'api_key', 'access_token',
+    'refresh-token', 'clientSecret', 'authorization_header',
+  ]) {
+    const changed = structuredClone(payload);
+    changed.extension = { [key]: 'must-not-persist' };
+    const validation = validateHandoffArtifact(changed);
+    assert.equal(validation.ok, false, key);
+    assert.match(validation.errors.join('; '), /raw credential material/i, key);
+  }
+});
+
 test('sha256 hashes Uint8Array inputs as bytes', () => {
   const bytes = Uint8Array.from([0, 1, 2, 127, 128, 255]);
   const expected = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -494,6 +509,43 @@ test('v4 jobs cannot be downgraded through the API or direct database writes', (
   assert.equal(disabled.enabled, 0);
   assert.equal(disabled.handoff_version, 4);
   assert.equal(disabled.handoff_artifact_digest, job.handoff_artifact_digest);
+  const reenabled = updateJob(job.id, { enabled: 1 });
+  assert.equal(reenabled.enabled, 1);
+  assert.equal(reenabled.handoff_artifact_digest, job.handoff_artifact_digest);
+  assert.equal(assertArtifactMatchesJob(reenabled).digest, job.handoff_artifact_digest);
+});
+
+test('run pruning retains source runs bound to immutable v4 dispatches', () => {
+  const job = createV4Job('Retained dispatch source run');
+  const sourceRun = createRun(job.id);
+  finishRun(sourceRun.id, 'ok');
+  getDb().prepare('UPDATE runs SET started_at = ? WHERE id = ?')
+    .run('2026-07-19 00:00:00', sourceRun.id);
+  const dispatch = enqueueDispatch(job.id, {
+    kind: 'chain',
+    source_run_id: sourceRun.id,
+  });
+  for (let index = 0; index < 3; index++) {
+    const newer = createRun(job.id);
+    finishRun(newer.id, 'ok');
+    getDb().prepare('UPDATE runs SET started_at = ? WHERE id = ?')
+      .run(`2026-07-19 00:0${index + 1}:00`, newer.id);
+  }
+
+  assert.doesNotThrow(() => pruneRuns(1));
+  assert.equal(getRun(sourceRun.id)?.id, sourceRun.id);
+  const retainedDispatch = getDb().prepare(
+    'SELECT * FROM job_dispatch_queue WHERE id = ?',
+  ).get(dispatch.id);
+  assert.equal(retainedDispatch.source_run_id, sourceRun.id);
+  assert.equal(
+    retainedDispatch.source_run_handoff_artifact_digest,
+    job.handoff_artifact_digest,
+  );
+  assert.equal(
+    getDb().prepare('SELECT COUNT(*) AS count FROM runs WHERE job_id = ?').get(job.id).count,
+    2,
+  );
 });
 
 test('v4 replacement preserves both artifacts, clears nulls, and cancels stale work atomically', () => {
@@ -920,6 +972,51 @@ test('inherited and downscoped provider sessions resume against the exact source
   }
 });
 
+test('independent child identity fails closed when the source trust ceiling is unavailable', async () => {
+  const [sourceSpec, childSpec] = schedulerSpecsFromManifest(
+    identityHandoffManifest('identity-missing-source-trust', 'independent'),
+  );
+  const sourceJob = createJob(sourceSpec);
+  const childJob = createJob(childSpec);
+  const provider = {
+    name: 'env-bearer',
+    type: 'identity',
+    async resolveSession(request) {
+      return {
+        session: {
+          subject: { kind: 'service', principal: request.principal },
+          scope: request.scope,
+          trust: { level: 'supervised' },
+        },
+      };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  const providerLookup = () => provider;
+  const sourceRun = createRun(sourceJob.id);
+  const sourceIdentity = await resolveArtifactBoundIdentity(
+    sourceJob,
+    assertArtifactMatchesJob(sourceJob),
+    sourceRun,
+    { db: getDb(), getIdentityProvider: providerLookup },
+  );
+  persistV02Outcomes(sourceRun.id, {
+    identity_resolved: { ...sourceIdentity, trust_level: null },
+  });
+  finishRun(sourceRun.id, 'ok');
+
+  const childRun = createRun(childJob.id, { triggered_by_run: sourceRun.id });
+  await assert.rejects(
+    () => resolveArtifactBoundIdentity(
+      childJob,
+      assertArtifactMatchesJob(childJob),
+      childRun,
+      { db: getDb(), getIdentityProvider: providerLookup },
+    ),
+    error => error.code === 'CHILD_CREDENTIAL_TRUST_UNAVAILABLE',
+  );
+});
+
 test('delegation rejects scope escalation and excessive chain depth', () => {
   const escalatedSpecs = schedulerSpecsFromManifest(delegationManifest(
     'delegation-scope',
@@ -991,6 +1088,25 @@ test('replay validation accepts the exact crashed terminal source before retry s
   assert.equal(validated.source_run_id, source.id);
 });
 
+test('retry validation accepts an exact timed-out run of the same v4 job', () => {
+  const job = createV4Job('Timed-out retry source');
+  const source = createRun(job.id);
+  finishRun(source.id, 'timeout', { summary: 'execution exceeded its timeout' });
+  const dispatch = enqueueDispatch(job.id, {
+    kind: 'retry',
+    source_run_id: source.id,
+    retry_of_run_id: source.id,
+  });
+  const validated = validateArtifactBoundDelegation(
+    job,
+    assertArtifactMatchesJob(job),
+    dispatch,
+    { runId: 'timed-out-retry-run' },
+  );
+  assert.equal(validated.valid, true);
+  assert.equal(validated.source_run_id, source.id);
+});
+
 test('proof failure audit events are ordered and never claim verification success', async () => {
   const artifactDigest = `sha256:${'c'.repeat(64)}`;
   const job = {
@@ -1054,6 +1170,7 @@ test('approved v4 proof outcomes are reused without replay consumption and reche
     job_id: job.id,
     handoff_artifact_digest: artifactDigest,
   };
+  const now = Date.now();
   const verified = {
     verified: true,
     method: 'jwt',
@@ -1065,7 +1182,10 @@ test('approved v4 proof outcomes are reused without replay consumption and reche
     subject: 'principal:alex',
     key_id: 'key-1',
     proof_id: 'proof-approval-id',
-    verified_at: '2026-07-19T04:30:00.000Z',
+    verified_at: new Date(now).toISOString(),
+    proof_valid_from: new Date(now - 60_000).toISOString(),
+    proof_valid_until: new Date(now + 60_000).toISOString(),
+    proof_clock_skew_seconds: 0,
   };
   let revocationChecks = 0;
   const currentRun = { id: 'proof-approval-resumed-run', source_run_id: null };
@@ -1091,6 +1211,20 @@ test('approved v4 proof outcomes are reused without replay consumption and reche
   assert.deepEqual(
     listRuntimeEvents({ runId: currentRun.id }).map(event => event.event_type),
     ['proof.revalidating', 'proof.reused'],
+  );
+
+  await assert.rejects(
+    () => verifyArtifactBoundProof(job, artifact, {
+      id: 'proof-approval-expired-run',
+      source_run_id: null,
+    }, {
+      db: getDb(),
+      priorRun,
+      reuseVerification: verified,
+      approvalId: 'approval-1',
+      now: now + 60_001,
+    }),
+    error => error.code === 'AUTHORIZATION_PROOF_EXPIRED',
   );
 
   revokeProof({
@@ -1158,6 +1292,57 @@ test('provider session cache and rotation state are scoped to the exact artifact
   assert.equal(secondArtifact.row.handoff_artifact_digest, `sha256:${'f'.repeat(64)}`);
 });
 
+test('concurrent provider resolution returns the winning persisted session identity', async () => {
+  _resetProviderSessionMemoryForTesting();
+  let releaseResolvers;
+  const release = new Promise(resolve => { releaseResolvers = resolve; });
+  let started = 0;
+  let bothStarted;
+  const ready = new Promise(resolve => { bothStarted = resolve; });
+  const provider = {
+    name: 'concurrent-session-provider',
+    type: 'identity',
+    async resolveSession() {
+      const call = ++started;
+      if (started === 2) bothStarted();
+      await release;
+      return {
+        session: {
+          principal: `principal:concurrent-${call}`,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  const request = { principal: 'principal:concurrent' };
+  const context = {
+    artifactDigest: `sha256:${'8'.repeat(64)}`,
+    jobId: 'concurrent-session-job',
+  };
+  const firstPromise = resolveProviderSession(provider, request, {
+    ...context,
+    runId: 'concurrent-session-run-1',
+  }, { db: getDb() });
+  const secondPromise = resolveProviderSession(provider, request, {
+    ...context,
+    runId: 'concurrent-session-run-2',
+  }, { db: getDb() });
+  await ready;
+  releaseResolvers();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+  assert.equal(first.row.id, second.row.id);
+  assert.ok(first.session);
+  assert.ok(second.session);
+  assert.equal(
+    getDb().prepare(
+      'SELECT COUNT(*) AS count FROM provider_sessions WHERE provider_name = ?',
+    ).get(provider.name).count,
+    1,
+  );
+});
+
 test('expired provider sessions re-resolve when refreshSession is unavailable', async () => {
   _resetProviderSessionMemoryForTesting();
   let resolves = 0;
@@ -1170,7 +1355,7 @@ test('expired provider sessions re-resolve when refreshSession is unavailable', 
         session: {
           principal: request.principal,
           rotation_id: `resolve-${resolves}`,
-          expires_at: new Date(Date.now() + (resolves === 1 ? -1_000 : 60_000)).toISOString(),
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
         },
       };
     },
@@ -1188,6 +1373,8 @@ test('expired provider sessions re-resolve when refreshSession is unavailable', 
     runId: 'reresolve-run-1',
   };
   const initial = await resolveProviderSession(provider, request, ctx, { db: getDb() });
+  getDb().prepare('UPDATE provider_sessions SET expires_at = ? WHERE id = ?')
+    .run(new Date(Date.now() - 1_000).toISOString(), initial.row.id);
   const replaced = await resolveProviderSession(provider, request, {
     ...ctx,
     runId: 'reresolve-run-2',
@@ -1201,6 +1388,89 @@ test('expired provider sessions re-resolve when refreshSession is unavailable', 
   assert.deepEqual(
     listRuntimeEvents({ runId: 'reresolve-run-2' }).map(event => event.event_type),
     ['provider.session.reresolved'],
+  );
+});
+
+test('provider sessions fail closed on expired output and indeterminate revocation', async () => {
+  _resetProviderSessionMemoryForTesting();
+  const artifactDigest = `sha256:${'d'.repeat(64)}`;
+  const request = { principal: 'principal:provider-fail-closed' };
+  const expiredProvider = {
+    name: 'expired-output-provider',
+    type: 'identity',
+    async resolveSession() {
+      return {
+        session: {
+          principal: request.principal,
+          expires_at: new Date(Date.now() - 1_000).toISOString(),
+        },
+      };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  await assert.rejects(
+    () => resolveProviderSession(expiredProvider, request, {
+      artifactDigest,
+      jobId: 'expired-output-job',
+      runId: 'expired-output-run',
+    }, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_EXPIRED',
+  );
+  assert.equal(
+    getDb().prepare(
+      'SELECT COUNT(*) AS count FROM provider_sessions WHERE provider_name = ?',
+    ).get(expiredProvider.name).count,
+    0,
+  );
+
+  const indeterminateProvider = {
+    name: 'indeterminate-revocation-provider',
+    type: 'identity',
+    async resolveSession() {
+      return {
+        session: {
+          principal: request.principal,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+    },
+    async resumeSession(row) {
+      return { session: { principal: row.subject_principal } };
+    },
+    async checkRevocation() { return {}; },
+  };
+  const indeterminateContext = {
+    artifactDigest,
+    jobId: 'indeterminate-revocation-job',
+    runId: 'indeterminate-revocation-run',
+  };
+  await assert.rejects(
+    () => resolveProviderSession(
+      indeterminateProvider,
+      request,
+      indeterminateContext,
+      { db: getDb() },
+    ),
+    error => error.code === 'PROVIDER_SESSION_REVOCATION_INDETERMINATE',
+  );
+  const persisted = getDb().prepare(
+    'SELECT * FROM provider_sessions WHERE provider_name = ?',
+  ).get(indeterminateProvider.name);
+  assert.equal(persisted.revocation_checked_at, null);
+  _resetProviderSessionMemoryForTesting();
+  await assert.rejects(
+    () => resumeProviderSession(
+      indeterminateProvider,
+      persisted.id,
+      indeterminateContext,
+      { db: getDb() },
+    ),
+    error => error.code === 'PROVIDER_SESSION_REVOCATION_INDETERMINATE',
+  );
+  assert.equal(
+    getDb().prepare('SELECT revocation_checked_at FROM provider_sessions WHERE id = ?')
+      .get(persisted.id).revocation_checked_at,
+    null,
   );
 });
 
@@ -1396,10 +1666,16 @@ test('resumed provider sessions refresh expired state before reuse and then rech
     session: {
       principal: request.principal,
       rotation_id: 'resume-1',
-      expires_at: new Date(Date.now() - 2_000).toISOString(),
-      refresh_after: new Date(Date.now() - 3_000).toISOString(),
+      expires_at: new Date(Date.now() + 120_000).toISOString(),
+      refresh_after: new Date(Date.now() + 60_000).toISOString(),
     },
   }, ctx, { db: getDb() });
+  getDb().prepare('UPDATE provider_sessions SET expires_at = ?, refresh_after = ? WHERE id = ?')
+    .run(
+      new Date(Date.now() - 2_000).toISOString(),
+      new Date(Date.now() - 3_000).toISOString(),
+      adopted.row.id,
+    );
   _resetProviderSessionMemoryForTesting();
 
   const resumed = await resumeProviderSession(provider, adopted.row.id, ctx, { db: getDb() });
@@ -1754,6 +2030,46 @@ test('credential materialization rejects missing, extra, duplicate, and retarget
     ),
     error => error.code === 'CREDENTIAL_BINDING_INVALID',
   );
+  let collidingProviderCalls = 0;
+  await assert.rejects(
+    () => materializeCredentials(
+      {
+        name: 'colliding-environment-provider',
+        async materializeCredentials() {
+          collidingProviderCalls += 1;
+          return { bindings: [] };
+        },
+      },
+      { session: {} },
+      {
+        handoff: 'env',
+        bindings: [
+          {
+            name: 'primary-token',
+            medium: 'env',
+            env_key: 'SHARED_TOKEN',
+            file_name: null,
+            required: true,
+          },
+          {
+            name: 'secondary-token',
+            medium: 'env',
+            env_key: 'SHARED_TOKEN',
+            file_name: null,
+            required: true,
+          },
+        ],
+      },
+      {
+        runId: 'invalid-binding-run-env-collision',
+        artifactDigest: `sha256:${'8'.repeat(64)}`,
+        sessionTarget: 'shell',
+      },
+      { db: getDb() },
+    ),
+    error => error.code === 'CREDENTIAL_BINDING_INVALID',
+  );
+  assert.equal(collidingProviderCalls, 0);
   const optional = await materializeCredentials(
     {
       name: 'optional-binding-provider',
@@ -1805,6 +2121,30 @@ test('stdin credential materialization is piped into the shell command', async (
   assert.equal(result.status, 'ok');
   assert.equal(result.runFinishFields.shell_stdout, secret.toString('utf8'));
   assert.equal(result.runFinishFields.shell_stdout_sha256, sha256(secret.toString('utf8')));
+});
+
+test('stdin credential materialization is piped into watchdog checks', async () => {
+  const secret = Buffer.from('watchdog-stdin-credential', 'utf8');
+  let observedStdin = null;
+  await executeWatchdog({
+    name: 'stdin credential watchdog',
+    watchdog_check_cmd: 'ignored by test double',
+    watchdog_self_destruct: 0,
+    run_timeout_ms: 5_000,
+    shell_env_policy: 'minimal',
+  }, {
+    run: { id: 'stdin-credential-watchdog-run' },
+    executionEnv: {},
+    v4CredentialMaterialization: { stdin: secret },
+  }, {
+    async runShellCommand(_command, _timeout, _env, options) {
+      observedStdin = options.stdin;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+    async handleDelivery() {},
+    log() {},
+  });
+  assert.equal(observedStdin, secret);
 });
 
 test('shell evidence digests bind normalized stdout after image marker extraction', async () => {
@@ -2094,6 +2434,23 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     });
     assert.equal(trustRevoked.integrity.valid, false);
     assert.equal(trustRevoked.integrity.cryptographically_verified, false);
+
+    writeFileSync(
+      allowedSignersPath,
+      `scheduler-test ${readFileSync(`${keyPath}.pub`, 'utf8').trim()}\n`,
+      { mode: 0o600 },
+    );
+    assert.equal(deleteJob(job.id), true);
+    assert.equal(getRun(run.id), undefined);
+    const retainedVerification = await verifyPersistedArtifactBoundEvidence(run.id);
+    assert.equal(
+      retainedVerification.integrity.valid,
+      true,
+      retainedVerification.integrity.error,
+    );
+    assert.equal(retainedVerification.payload.execution_id, run.id);
+    assert.equal(retainedVerification.evidence_provider, 'ssh');
+    assert.equal(retainedVerification.evidence_principal, 'scheduler-test');
 
     assert.throws(
       () => getDb().prepare(

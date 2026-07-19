@@ -34,7 +34,7 @@ import {
   scheduleRetry,
   updateJob,
 } from '../jobs.js';
-import { createRun, finishRun } from '../runs.js';
+import { createRun, finishRun, persistV02Outcomes } from '../runs.js';
 
 const root = resolve(import.meta.dirname, '..');
 const cliPath = join(root, 'cli.js');
@@ -548,6 +548,12 @@ test('handoff v4 applies to a fresh DB, survives restart, and executes every dur
 
   const parent = jobsByTask.get('parent');
   const parentRun = createRun(parent.id);
+  persistV02Outcomes(parentRun.id, {
+    identity_resolved: {
+      principal: 'agent://v4-e2e',
+      trust_level: 'supervised',
+    },
+  });
   finishRun(parentRun.id, 'ok', { summary: 'v4 chain source completed' });
 
   const fixtures = [];
@@ -583,6 +589,12 @@ test('handoff v4 applies to a fresh DB, survives restart, and executes every dur
       state.dispatch = getDispatch(triggered.dispatch_id);
     } else if (kind === 'retry') {
       const predecessor = createRun(job.id);
+      persistV02Outcomes(predecessor.id, {
+        identity_resolved: {
+          principal: 'agent://v4-e2e',
+          trust_level: 'supervised',
+        },
+      });
       finishRun(predecessor.id, 'error', { summary: 'v4 retry predecessor' });
       const retry = scheduleRetry(job, predecessor.id);
       assert(retry.dispatch, 'v4 retry dispatch was not produced');

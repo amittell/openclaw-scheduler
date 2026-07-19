@@ -11,6 +11,7 @@ import { persistTerminalEvidence } from './runs.js';
 import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
 import {
   assertValidHandoffArtifact,
+  getHandoffArtifact,
   persistHandoffArtifact,
 } from './handoff-artifact.js';
 
@@ -1438,9 +1439,28 @@ export function updateJob(id, patch) {
     const disableOnly = changedBoundFields.length === 1
       && changedBoundFields[0] === 'enabled'
       && !normalized.enabled;
+    let restoredOriginalBinding = false;
     if (Number(current.handoff_version) === 4
       && changedBoundFields.length > 0
       && !disableOnly
+      && !payloadProvided) {
+      const persistedArtifact = getHandoffArtifact(current.handoff_artifact_digest, { db });
+      if (persistedArtifact) {
+        try {
+          assertValidHandoffArtifact(persistedArtifact.payload, {
+            expectedDigest: current.handoff_artifact_digest,
+            job: nextJob,
+          });
+          restoredOriginalBinding = true;
+        } catch {
+          restoredOriginalBinding = false;
+        }
+      }
+    }
+    if (Number(current.handoff_version) === 4
+      && changedBoundFields.length > 0
+      && !disableOnly
+      && !restoredOriginalBinding
       && !payloadProvided) {
       throw Object.assign(
         new Error(`Handoff v4 bound fields require a replacement artifact: ${changedBoundFields.join(', ')}`),
