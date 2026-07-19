@@ -2,6 +2,9 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { TERMINAL_RUN_STATUSES, transitionRunTerminal } from './run-state.js';
+import { assertArtifactMatchesJob } from './handoff-artifact.js';
+import { appendRuntimeEvent } from './runtime-events.js';
+import { validatePersistedArtifactBoundEvidenceRecord } from './evidence-runtime.js';
 import {
   buildEvidenceExecutionSnapshot,
   generateEvidence,
@@ -27,6 +30,36 @@ export function createRun(jobId, opts = {}) {
     ? declaredEvidenceRequired
     : Number(Boolean(opts.evidence_required));
   const evidenceExecutionSnapshot = JSON.stringify(buildEvidenceExecutionSnapshot(job));
+  const v4Artifact = Number(job?.handoff_version) === 4
+    ? assertArtifactMatchesJob(job, { db })
+    : null;
+  const dispatch = opts.dispatch_queue_id
+    ? db.prepare('SELECT * FROM job_dispatch_queue WHERE id = ?').get(opts.dispatch_queue_id)
+    : null;
+  if (v4Artifact && opts.dispatch_queue_id
+    && dispatch?.handoff_artifact_digest !== job.handoff_artifact_digest) {
+    throw Object.assign(new Error('Dispatch artifact does not match the job artifact'), {
+      code: 'HANDOFF_ARTIFACT_DIGEST_MISMATCH',
+    });
+  }
+  const sourceRunId = v4Artifact
+    ? (dispatch?.source_run_id ?? opts.triggered_by_run ?? opts.retry_of ?? opts.replay_of ?? null)
+    : null;
+  const sourceRun = sourceRunId
+    ? db.prepare('SELECT id, handoff_artifact_digest FROM runs WHERE id = ?').get(sourceRunId)
+    : null;
+  const sourceArtifactDigest = v4Artifact
+    ? (dispatch?.source_run_handoff_artifact_digest ?? sourceRun?.handoff_artifact_digest ?? null)
+    : null;
+  if (v4Artifact && sourceRunId && (
+    !sourceRun
+    || !sourceRun.handoff_artifact_digest
+    || sourceArtifactDigest !== sourceRun.handoff_artifact_digest
+  )) {
+    throw Object.assign(new Error('Run source artifact does not match the exact source run'), {
+      code: 'DELEGATION_SOURCE_ARTIFACT_MISMATCH',
+    });
+  }
 
   db.prepare(`
     INSERT INTO runs (
@@ -35,9 +68,11 @@ export function createRun(jobId, opts = {}) {
       retry_of, triggered_by_run, dispatch_queue_id,
       dispatcher_owner, dispatcher_token, dispatch_started_at,
       evidence_required, evidence_execution_snapshot,
-      evidence_declaration_snapshot, evidence_ref_snapshot, approval_used
+      evidence_declaration_snapshot, evidence_ref_snapshot, approval_used,
+      handoff_artifact_digest, runtime_instance_id, source_run_id,
+      source_run_handoff_artifact_digest
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -64,9 +99,29 @@ export function createRun(jobId, opts = {}) {
       : typeof opts.approval_used === 'string'
         ? opts.approval_used
         : JSON.stringify(opts.approval_used),
+    v4Artifact ? job.handoff_artifact_digest : null,
+    v4Artifact ? id : null,
+    sourceRunId,
+    sourceArtifactDigest,
   );
 
-  return getRun(id);
+  const created = getRun(id);
+  if (v4Artifact) {
+    appendRuntimeEvent('run.created', {
+      jobId,
+      runId: id,
+      dispatchQueueId: opts.dispatch_queue_id,
+      handoffArtifactDigest: job.handoff_artifact_digest,
+      sourceRunId,
+      sourceRunHandoffArtifactDigest: sourceArtifactDigest,
+      payload: {
+        runtime_instance_id: id,
+        dispatch_kind: dispatch?.dispatch_kind ?? null,
+        status: created.status,
+      },
+    }, { db });
+  }
+  return created;
 }
 
 /**
@@ -208,6 +263,11 @@ export function pruneRuns(keepPerJob = 100) {
       DELETE FROM runs
       WHERE job_id = ?
         AND status IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed')
+        AND NOT EXISTS (
+          SELECT 1 FROM job_dispatch_queue dispatch
+          WHERE dispatch.source_run_id = runs.id
+            AND dispatch.handoff_artifact_digest IS NOT NULL
+        )
         AND id NOT IN (
         SELECT id FROM runs
         WHERE job_id = ?
@@ -592,8 +652,12 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
   const leaseName = dispatcherFence?.leaseName || 'scheduler-dispatcher';
   const hasFence = dispatcherFence != null;
   const allowStaleRunOwner = opts.allowStaleRunOwner === true;
+  const allowPreExecution = opts.allowPreExecution === true;
   if (allowStaleRunOwner && !hasFence) {
     throw new Error('allowStaleRunOwner requires a live dispatcher fence');
+  }
+  if (allowPreExecution && hasFence) {
+    throw new Error('allowPreExecution quarantine does not accept a dispatcher fence');
   }
   if (hasFence && (
     typeof ownerId !== 'string'
@@ -605,7 +669,20 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
   }
 
   const quarantine = () => {
-    const updated = hasFence
+    const updated = allowPreExecution
+      ? db.prepare(`
+          UPDATE runs
+          SET status = 'recovery_blocked',
+              finished_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              terminal_transition_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              duration_ms = MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)),
+              error_message = ?,
+              summary = ?
+          WHERE id = ?
+            AND status IN ('pending', 'awaiting_approval', 'approved')
+          RETURNING *
+        `).get(reason, reason, runId)
+      : hasFence
       ? db.prepare(`
           UPDATE runs
           SET status = 'recovery_blocked',
@@ -659,6 +736,25 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
           last_status = 'recovery_blocked'
       WHERE id = ?
     `).run(updated.job_id);
+    if (allowPreExecution) {
+      const job = db.prepare('SELECT handoff_version, handoff_artifact_digest FROM jobs WHERE id = ?')
+        .get(updated.job_id);
+      if (Number(job?.handoff_version) === 4) {
+        appendRuntimeEvent('job.quarantine.required', {
+          jobId: updated.job_id,
+          runId: updated.id,
+          handoffArtifactDigest: job.handoff_artifact_digest,
+          sourceRunId: updated.source_run_id,
+          sourceRunHandoffArtifactDigest: updated.source_run_handoff_artifact_digest,
+          payload: {
+            reason,
+            intended_status: opts.intendedStatus || null,
+            job_disabled: true,
+            operator_action_required: true,
+          },
+        }, { db });
+      }
+    }
     if (updated.dispatch_queue_id) {
       db.prepare(`
         UPDATE job_dispatch_queue
@@ -768,7 +864,7 @@ export function pruneEvidenceRecords(opts = {}) {
   const cutoff = opts.now == null ? new Date() : new Date(opts.now);
   if (Number.isNaN(cutoff.getTime())) throw new Error('invalid evidence retention cutoff');
   const candidates = db.prepare(`
-    SELECT id, run_id
+    SELECT *
     FROM evidence_records
     WHERE retention_until IS NOT NULL
       AND julianday(retention_until) <= julianday(?)
@@ -784,8 +880,19 @@ export function pruneEvidenceRecords(opts = {}) {
   const prune = () => {
     let changes = 0;
     for (const candidate of candidates) {
-      const evidence = getEvidenceRecord(candidate.run_id, { db });
-      if (evidence?.integrity?.valid !== true) continue;
+      let evidence;
+      if (candidate.handoff_artifact_digest) {
+        if (Date.parse(candidate.retention_until) > Date.now()) continue;
+        try {
+          validatePersistedArtifactBoundEvidenceRecord(candidate, { db });
+          evidence = candidate;
+        } catch {
+          continue;
+        }
+      } else {
+        evidence = getEvidenceRecord(candidate.run_id, { db });
+        if (evidence?.integrity?.valid !== true) continue;
+      }
       markPruned.run(JSON.stringify({
         pruned: true,
         reason: 'retention_expired',

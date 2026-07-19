@@ -249,6 +249,7 @@ export async function runAgentTurn(opts) {
     model,
     authProfile,
     materializedEnv,
+    capabilityBinding,
     timeoutMs = 300000,
     signal,
     cancelOnAbort = true,
@@ -261,6 +262,7 @@ export async function runAgentTurn(opts) {
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
     requestHeaders: authHeaders(),
+    binding: capabilityBinding,
   });
 
   const controller = new AbortController();
@@ -357,6 +359,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     model,
     authProfile,
     materializedEnv,
+    capabilityBinding,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
@@ -372,6 +375,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
     requestHeaders: authHeaders(),
+    binding: capabilityBinding,
   });
 
   const controller = new AbortController();

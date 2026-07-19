@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v28).
+ * Brings any DB from any prior version up to the current schema (v29).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -14,7 +14,83 @@
  */
 
 import { Cron } from 'croner';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { applyBundledSchema, getDb } from './db.js';
+
+function parseObject(value) {
+  if (value == null) return null;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function migrationAllowedSignersPath(value) {
+  const configured = nonEmptyString(value);
+  if (!configured) return null;
+  const canonical = resolve(configured);
+  if (isAbsolute(configured)) return canonical;
+  try {
+    accessSync(canonical, fsConstants.R_OK);
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+function collectEvidenceMetadataBackfills(db) {
+  const rows = db.prepare(`
+    SELECT e.id, e.evidence_method, e.evidence_envelope,
+           e.evidence_provider, e.evidence_principal,
+           e.evidence_allowed_signers_path,
+           r.evidence_declaration_snapshot, j.evidence AS job_evidence
+    FROM evidence_records e
+    LEFT JOIN runs r ON r.id = e.run_id
+    LEFT JOIN jobs j ON j.id = e.job_id
+    WHERE e.handoff_artifact_digest IS NOT NULL
+      AND e.evidence_verified = 1
+      AND (
+        e.evidence_method IS NULL
+        OR e.evidence_provider IS NULL
+        OR e.evidence_principal IS NULL
+        OR e.evidence_allowed_signers_path IS NULL
+      )
+  `).all();
+  return rows.flatMap(row => {
+    const runDeclaration = parseObject(row.evidence_declaration_snapshot);
+    const jobDeclaration = parseObject(row.job_evidence);
+    const declaration = nonEmptyString(runDeclaration?.provider)
+      ? runDeclaration
+      : jobDeclaration;
+    const envelope = parseObject(row.evidence_envelope);
+    const providerConfig = parseObject(declaration?.provider_config) || {};
+    const provider = row.evidence_provider ?? nonEmptyString(declaration?.provider);
+    const method = row.evidence_method ?? nonEmptyString(envelope?.method);
+    const principal = row.evidence_principal
+      ?? nonEmptyString(providerConfig.principal)
+      ?? nonEmptyString(envelope?.principal);
+    const allowedSignersPath = row.evidence_allowed_signers_path
+      ?? (provider === 'ssh'
+        ? migrationAllowedSignersPath(
+            providerConfig.allowed_signers_path ?? providerConfig.allowed_signers,
+          )
+        : null);
+    const hasUpdate = (row.evidence_method == null && method != null)
+      || (row.evidence_provider == null && provider != null)
+      || (row.evidence_principal == null && principal != null)
+      || (row.evidence_allowed_signers_path == null && allowedSignersPath != null);
+    return hasUpdate
+      ? [{ id: row.id, method, provider, principal, allowedSignersPath }]
+      : [];
+  });
+}
 
 function nextRunFromCron(cronExpr, tz) {
   const cron = new Cron(cronExpr, { timezone: tz || 'UTC' });
@@ -37,6 +113,12 @@ export default function migrateConsolidate() {
     WHERE type = 'index' AND name = ?
     LIMIT 1
   `).get(name);
+  const hasTrigger = (name) => !!db.prepare(`
+    SELECT 1
+    FROM sqlite_master
+    WHERE type = 'trigger' AND name = ?
+    LIMIT 1
+  `).get(name);
 
   // Already fully up to date?
   // Note: we can't just check schema_migrations version -- schema.sql inserts
@@ -46,8 +128,8 @@ export default function migrateConsolidate() {
   const current = hasTable('schema_migrations')
     ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
     : 0;
-  if (current > 28) {
-    const error = new Error(`Database schema version ${current} is newer than supported version 28`);
+  if (current > 29) {
+    const error = new Error(`Database schema version ${current} is newer than supported version 29`);
     error.code = 'SCHEMA_VERSION_UNSUPPORTED';
     throw error;
   }
@@ -63,6 +145,9 @@ export default function migrateConsolidate() {
   const queueColumns = columnsFor('job_dispatch_queue');
   const queueBindingIsNotNull = columnInfoFor('job_dispatch_queue')
     .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
+  const queueSourceRunHasForeignKey = hasTable('job_dispatch_queue')
+    && db.prepare('PRAGMA foreign_key_list(job_dispatch_queue)').all()
+      .some((foreignKey) => foreignKey.from === 'source_run_id');
   const trackerColumns = columnsFor('task_tracker');
   const trackerAgentColumns = columnsFor('task_tracker_agents');
   const completionDebtColumns = columnsFor('completion_debts');
@@ -99,11 +184,13 @@ export default function migrateConsolidate() {
       'child_credential_policy',
       'approval_risk_level', 'approval_approver_scope', 'output_format',
       'verify_shell', 'verify_timeout_s', 'verify_on_failure',
+      'handoff_version', 'handoff_artifact_digest', 'effective_task_hash',
     ])
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
       'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path',
-      'shell_stdout_bytes', 'shell_stderr_bytes', 'idempotency_key',
+      'shell_stdout_bytes', 'shell_stderr_bytes', 'shell_stdout_sha256',
+      'shell_stderr_sha256', 'idempotency_key',
       'summary', 'error_message', 'session_key', 'session_id',
       'dispatched_at', 'last_heartbeat',
       'identity_resolved', 'trust_evaluation', 'authorization_decision',
@@ -119,7 +206,9 @@ export default function migrateConsolidate() {
       'cancel_requested_at', 'cancel_requested_by', 'cancel_reason',
       'process_pid', 'process_pgid', 'process_identity', 'process_started_at',
       'process_terminated_at', 'agent_cancel_requested_at',
-      'terminal_transition_at',
+      'terminal_transition_at', 'handoff_artifact_digest',
+      'runtime_instance_id', 'source_run_id',
+      'source_run_handoff_artifact_digest',
     ])
     && hasColumns(agentColumns, ['delivery_channel', 'delivery_to', 'brand_name'])
     && hasColumns(msgColumns, [
@@ -135,11 +224,13 @@ export default function migrateConsolidate() {
       'resolved_at', 'resolved_by', 'notes', 'decision_version',
       'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at',
       'dispatched_at', 'risk_level', 'approver_scope', 'binding_hash',
-      'gate_kind', 'decision_context',
+      'gate_kind', 'decision_context', 'handoff_artifact_digest',
+      'source_run_id', 'source_run_handoff_artifact_digest',
     ])
     && hasColumns(queueColumns, [
       'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count',
       'last_error', 'replay_of_run_id', 'binding_scheduled_for',
+      'handoff_artifact_digest', 'source_run_handoff_artifact_digest',
     ])
     && hasColumns(outboxColumns, [
       'delivery_group_id', 'part_index', 'part_count',
@@ -200,6 +291,8 @@ export default function migrateConsolidate() {
     'evidence_records', 'idempotency_ledger', 'job_dispatch_queue', 'jobs',
     'message_receipts', 'messages', 'runs', 'schema_migrations',
     'task_tracker', 'task_tracker_agents', 'team_mailbox_events', 'team_tasks',
+    'handoff_artifacts', 'runtime_events', 'proof_replay_ledger',
+    'proof_revocations', 'provider_sessions', 'credential_presentations',
   ];
   const schemaNoOpIndexes = [
     'idx_approvals_dispatch_queue', 'idx_approvals_job', 'idx_approvals_status',
@@ -222,11 +315,23 @@ export default function migrateConsolidate() {
     'idx_task_tracker_status', 'idx_team_events_task', 'idx_team_events_team',
     'idx_team_tasks_gate', 'idx_team_tasks_status', 'idx_tta_session_key',
     'idx_tta_status', 'idx_tta_tracker',
+    'idx_handoff_artifacts_job', 'idx_handoff_artifacts_manifest',
+    'idx_runtime_events_run', 'idx_runtime_events_artifact',
+    'idx_runtime_events_type', 'idx_proof_replay_expires',
+    'idx_proof_revocations_lookup', 'idx_provider_sessions_status', 'idx_credential_presentations_run',
+    'idx_credential_presentations_status',
+  ];
+  const schemaNoOpTriggers = [
+    'trg_handoff_artifacts_no_update', 'trg_handoff_artifacts_no_delete',
+    'trg_runtime_events_no_update', 'trg_runtime_events_no_delete',
+    'trg_v4_jobs_no_downgrade', 'trg_v4_runs_binding_immutable', 'trg_v4_approvals_binding_immutable', 'trg_v4_dispatches_binding_immutable', 'trg_v4_evidence_no_update', 'trg_v4_evidence_no_delete', 'trg_proof_revocations_no_update', 'trg_proof_revocations_no_delete',
   ];
   const migrationRequiredTables = [
     'approvals', 'completion_debts', 'delivery_aliases',
     'delivery_attachments', 'delivery_outbox', 'dispatcher_leases',
-    'evidence_records', 'job_dispatch_queue',
+    'evidence_records', 'job_dispatch_queue', 'handoff_artifacts',
+    'runtime_events', 'proof_replay_ledger', 'proof_revocations',
+    'provider_sessions', 'credential_presentations',
   ];
   const migrationRequiredIndexes = [
     'idx_approvals_dispatch_queue', 'idx_completion_debts_scope',
@@ -238,6 +343,11 @@ export default function migrateConsolidate() {
     'idx_dispatch_queue_job', 'idx_dispatch_queue_source_run',
     'idx_dispatcher_leases_expiry', 'idx_evidence_records_created_run',
     'idx_evidence_records_hash', 'idx_evidence_records_job',
+    'idx_handoff_artifacts_job', 'idx_handoff_artifacts_manifest',
+    'idx_runtime_events_run', 'idx_runtime_events_artifact',
+    'idx_runtime_events_type', 'idx_proof_replay_expires',
+    'idx_proof_revocations_lookup', 'idx_provider_sessions_status', 'idx_credential_presentations_run',
+    'idx_credential_presentations_status',
   ];
   const criticalUniqueIndexes = [
     {
@@ -295,30 +405,51 @@ export default function migrateConsolidate() {
     ? db.prepare(`
         SELECT COUNT(DISTINCT version) AS count
         FROM schema_migrations
-        WHERE version BETWEEN 1 AND 28
+        WHERE version BETWEEN 1 AND 29
       `).get().count
     : 0;
+  const evidenceMetadataBackfills = hasTable('evidence_records')
+    && hasTable('runs')
+    && hasTable('jobs')
+    && hasColumns(evidenceColumns, [
+      'handoff_artifact_digest', 'evidence_method', 'evidence_verified',
+      'evidence_envelope', 'evidence_provider', 'evidence_principal',
+      'evidence_allowed_signers_path',
+    ])
+    && runColumns.has('evidence_declaration_snapshot')
+    && jobColumns.has('evidence')
+    ? collectEvidenceMetadataBackfills(db)
+    : [];
   if (
-    current >= 28
-    && recordedVersionCount === 28
+    current >= 29
+    && recordedVersionCount === 29
     && hasLatestColumns
     && queueBindingIsNotNull
+    && !queueSourceRunHasForeignKey
     && hasTable('completion_debts')
     && hasTable('dispatcher_leases')
     && hasTable('delivery_outbox')
     && hasTable('delivery_attachments')
     && hasTable('evidence_records')
-    && hasColumns(evidenceColumns, ['retention_policy', 'retention_until'])
+    && hasColumns(evidenceColumns, [
+      'retention_policy', 'retention_until', 'handoff_artifact_digest',
+      'source_run_id', 'source_run_handoff_artifact_digest',
+      'evidence_method', 'evidence_verified', 'evidence_envelope',
+      'evidence_provider', 'evidence_principal',
+      'evidence_allowed_signers_path',
+    ])
     && !evidenceHasForeignKeys
     && hasColumns(completionDebtColumns, ['id', 'task_label', 'delivery_scope'])
     && !completionDebtHasTableUnique
     && schemaNoOpTables.every(hasTable)
     && schemaNoOpIndexes.every(hasIndex)
+    && schemaNoOpTriggers.every(hasTrigger)
     && criticalUniqueIndexes.every(criticalIndexMatches)
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
     && unsupportedDeliveryModeCount === 0
+    && evidenceMetadataBackfills.length === 0
   ) {
     return false;
   }
@@ -469,6 +600,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN shell_stderr_path TEXT`,
     `ALTER TABLE runs ADD COLUMN shell_stdout_bytes INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN shell_stderr_bytes INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE runs ADD COLUMN shell_stdout_sha256 TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_stderr_sha256 TEXT`,
     // v27: dispatcher ownership, cancellation, and child-process tracking
     `ALTER TABLE runs ADD COLUMN dispatcher_owner TEXT`,
     `ALTER TABLE runs ADD COLUMN dispatcher_token INTEGER`,
@@ -589,6 +722,28 @@ export default function migrateConsolidate() {
     `ALTER TABLE approvals ADD COLUMN approved_at TEXT`,
     `ALTER TABLE approvals ADD COLUMN rejected_at TEXT`,
     `ALTER TABLE approvals ADD COLUMN dispatched_at TEXT`,
+    // v29: agentcli handoff v4 artifact and execution bindings
+    `ALTER TABLE jobs ADD COLUMN handoff_version INTEGER DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN effective_task_hash TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN runtime_instance_id TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN source_run_id TEXT DEFAULT NULL`,
+    `ALTER TABLE runs ADD COLUMN source_run_handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN source_run_id TEXT DEFAULT NULL`,
+    `ALTER TABLE approvals ADD COLUMN source_run_handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE job_dispatch_queue ADD COLUMN source_run_handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN source_run_id TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN source_run_handoff_artifact_digest TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_method TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1))`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_envelope TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_provider TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_principal TEXT DEFAULT NULL`,
+    `ALTER TABLE evidence_records ADD COLUMN evidence_allowed_signers_path TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
@@ -604,10 +759,13 @@ export default function migrateConsolidate() {
   // SQLite cannot strengthen a column to NOT NULL with ALTER TABLE. Rebuild
   // the queue while foreign-key enforcement is temporarily disabled so child
   // approval/run links are preserved rather than receiving ON DELETE effects.
-  const queueNeedsBindingConstraint = hasTable('job_dispatch_queue')
-    && !columnInfoFor('job_dispatch_queue')
-      .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
-  if (queueNeedsBindingConstraint) {
+  const queueNeedsRebuild = hasTable('job_dispatch_queue')
+    && (
+      !columnInfoFor('job_dispatch_queue')
+        .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1)
+      || queueSourceRunHasForeignKey
+    );
+  if (queueNeedsRebuild) {
     const foreignKeysWereEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
     db.pragma('foreign_keys = OFF');
     try {
@@ -624,7 +782,7 @@ export default function migrateConsolidate() {
             status          TEXT NOT NULL DEFAULT 'pending',
             scheduled_for   TEXT NOT NULL,
             binding_scheduled_for TEXT NOT NULL,
-            source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+            source_run_id   TEXT,
             retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             claimed_at      TEXT,
@@ -634,20 +792,24 @@ export default function migrateConsolidate() {
             claim_expires_at TEXT,
             attempt_count   INTEGER NOT NULL DEFAULT 0,
             last_error      TEXT,
-            replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+            replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+            handoff_artifact_digest TEXT,
+            source_run_handoff_artifact_digest TEXT
           );
           INSERT INTO job_dispatch_queue_v28 (
             id, job_id, dispatch_kind, status, scheduled_for,
             binding_scheduled_for, source_run_id, retry_of_run_id, created_at,
             claimed_at, processed_at, claim_owner, claim_token,
-            claim_expires_at, attempt_count, last_error, replay_of_run_id
+            claim_expires_at, attempt_count, last_error, replay_of_run_id,
+            handoff_artifact_digest, source_run_handoff_artifact_digest
           )
           SELECT
             id, job_id, dispatch_kind, status, scheduled_for,
             COALESCE(binding_scheduled_for, scheduled_for), source_run_id,
             retry_of_run_id, created_at, claimed_at, processed_at, claim_owner,
             claim_token, claim_expires_at, attempt_count, last_error,
-            replay_of_run_id
+            replay_of_run_id, handoff_artifact_digest,
+            source_run_handoff_artifact_digest
           FROM job_dispatch_queue;
           DROP TABLE job_dispatch_queue;
           ALTER TABLE job_dispatch_queue_v28 RENAME TO job_dispatch_queue;
@@ -666,6 +828,153 @@ export default function migrateConsolidate() {
   // inserts in a single transaction so that partial backfill cannot occur.
   // ALTER TABLE stays outside because some SQLite builds reject DDL in transactions.
   db.transaction(() => {
+
+  // v29: immutable handoff artifacts, ordered runtime events, proof replay,
+  // provider sessions, and credential presentation recovery state.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS handoff_artifacts (
+      digest TEXT PRIMARY KEY,
+      artifact_schema_version INTEGER NOT NULL CHECK (artifact_schema_version = 1),
+      handoff_version INTEGER NOT NULL CHECK (handoff_version = 4),
+      scheduler_schema_min INTEGER NOT NULL,
+      canonicalization TEXT NOT NULL CHECK (canonicalization = 'json-sort-v1'),
+      canonicalization_version INTEGER NOT NULL CHECK (canonicalization_version = 1),
+      execution_binding_version INTEGER NOT NULL,
+      manifest_digest TEXT NOT NULL,
+      workflow_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      effective_task_hash TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      payload_bytes INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_handoff_artifacts_job
+      ON handoff_artifacts(job_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_handoff_artifacts_manifest
+      ON handoff_artifacts(manifest_digest, workflow_id, task_id);
+    CREATE TRIGGER IF NOT EXISTS trg_handoff_artifacts_no_update
+    BEFORE UPDATE ON handoff_artifacts
+    BEGIN
+      SELECT RAISE(ABORT, 'handoff artifacts are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_handoff_artifacts_no_delete
+    BEFORE DELETE ON handoff_artifacts
+    BEGIN
+      SELECT RAISE(ABORT, 'handoff artifacts are immutable');
+    END;
+
+    CREATE TABLE IF NOT EXISTS runtime_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      event_version INTEGER NOT NULL DEFAULT 1,
+      job_id TEXT,
+      dispatch_queue_id TEXT,
+      run_id TEXT,
+      approval_id TEXT,
+      handoff_artifact_digest TEXT,
+      source_run_id TEXT,
+      source_run_handoff_artifact_digest TEXT,
+      payload TEXT NOT NULL,
+      payload_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_runtime_events_run ON runtime_events(run_id, id);
+    CREATE INDEX IF NOT EXISTS idx_runtime_events_artifact
+      ON runtime_events(handoff_artifact_digest, id);
+    CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(event_type, id);
+    CREATE TRIGGER IF NOT EXISTS trg_runtime_events_no_update
+    BEFORE UPDATE ON runtime_events
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime events are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_runtime_events_no_delete
+    BEFORE DELETE ON runtime_events
+    BEGIN
+      SELECT RAISE(ABORT, 'runtime events are immutable');
+    END;
+
+    CREATE TABLE IF NOT EXISTS proof_replay_ledger (
+      replay_key TEXT PRIMARY KEY,
+      method TEXT NOT NULL,
+      issuer TEXT,
+      subject TEXT,
+      proof_id TEXT NOT NULL,
+      handoff_artifact_digest TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_proof_replay_expires
+      ON proof_replay_ledger(expires_at);
+
+    CREATE TABLE IF NOT EXISTS proof_revocations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      method TEXT NOT NULL,
+      issuer TEXT,
+      proof_id TEXT,
+      key_id TEXT,
+      reason TEXT,
+      revoked_by TEXT,
+      revoked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      CHECK (proof_id IS NOT NULL OR key_id IS NOT NULL)
+    );
+    CREATE INDEX IF NOT EXISTS idx_proof_revocations_lookup
+      ON proof_revocations(method, issuer, proof_id, key_id);
+
+    CREATE TABLE IF NOT EXISTS provider_sessions (
+      id TEXT PRIMARY KEY,
+      provider_type TEXT NOT NULL,
+      provider_name TEXT NOT NULL,
+      cache_key_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('active','refreshing','expired','revoked','failed')),
+      handoff_artifact_digest TEXT,
+      subject_principal TEXT,
+      scope TEXT,
+      session_summary TEXT,
+      expires_at TEXT,
+      refresh_after TEXT,
+      rotation_counter INTEGER NOT NULL DEFAULT 0,
+      revocation_checked_at TEXT,
+      transient_error_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(provider_type, provider_name, cache_key_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_provider_sessions_status
+      ON provider_sessions(status, expires_at);
+
+    CREATE TABLE IF NOT EXISTS credential_presentations (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      handoff_artifact_digest TEXT NOT NULL,
+      provider_session_id TEXT,
+      binding_name TEXT NOT NULL,
+      medium TEXT NOT NULL CHECK (medium IN ('env','temp-file','stdin','gateway-env-header')),
+      env_key TEXT,
+      temp_path TEXT,
+      stdin_sha256 TEXT,
+      value_sha256 TEXT NOT NULL,
+      file_mode TEXT,
+      status TEXT NOT NULL CHECK (status IN ('materialized','cleaned','recovery_cleaned','failed')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT,
+      cleaned_at TEXT,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_credential_presentations_run
+      ON credential_presentations(run_id, status);
+    CREATE INDEX IF NOT EXISTS idx_credential_presentations_status
+      ON credential_presentations(status, created_at);
+
+    CREATE TRIGGER IF NOT EXISTS trg_proof_revocations_no_update
+    BEFORE UPDATE ON proof_revocations
+    BEGIN SELECT RAISE(ABORT, 'proof revocations are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_proof_revocations_no_delete
+    BEFORE DELETE ON proof_revocations
+    BEGIN SELECT RAISE(ABORT, 'proof revocations are immutable'); END;
+  `);
 
   if (hasTable('job_dispatch_queue')) {
     db.prepare(`
@@ -813,16 +1122,31 @@ export default function migrateConsolidate() {
         payload         TEXT NOT NULL,
         retention_policy TEXT,
         retention_until TEXT,
+        handoff_artifact_digest TEXT,
+        source_run_id TEXT,
+        source_run_handoff_artifact_digest TEXT,
+        evidence_method TEXT,
+        evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
+        evidence_envelope TEXT,
+        evidence_provider TEXT,
+        evidence_principal TEXT,
+        evidence_allowed_signers_path TEXT,
         created_at      TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(algorithm, hash, run_id)
       );
       INSERT INTO evidence_records_v28 (
         id, run_id, job_id, evidence_ref, algorithm, hash, payload,
-        retention_policy, retention_until, created_at
+        retention_policy, retention_until, handoff_artifact_digest,
+        source_run_id, source_run_handoff_artifact_digest, evidence_method,
+        evidence_verified, evidence_envelope, evidence_provider,
+        evidence_principal, evidence_allowed_signers_path, created_at
       )
       SELECT
         id, run_id, job_id, evidence_ref, algorithm, hash, payload,
-        retention_policy, retention_until, created_at
+        retention_policy, retention_until, handoff_artifact_digest,
+        source_run_id, source_run_handoff_artifact_digest, evidence_method,
+        evidence_verified, evidence_envelope, evidence_provider,
+        evidence_principal, evidence_allowed_signers_path, created_at
       FROM evidence_records;
       DROP TABLE evidence_records;
       ALTER TABLE evidence_records_v28 RENAME TO evidence_records;
@@ -1007,7 +1331,10 @@ export default function migrateConsolidate() {
       approver_scope  TEXT,
       binding_hash    TEXT,
       gate_kind       TEXT NOT NULL DEFAULT 'job',
-      decision_context TEXT
+      decision_context TEXT,
+      handoff_artifact_digest TEXT,
+      source_run_id TEXT,
+      source_run_handoff_artifact_digest TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_approvals_job ON approvals(job_id);
@@ -1099,7 +1426,7 @@ export default function migrateConsolidate() {
       status          TEXT NOT NULL DEFAULT 'pending',
       scheduled_for   TEXT NOT NULL,
       binding_scheduled_for TEXT NOT NULL,
-      source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      source_run_id   TEXT,
       retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
       claimed_at      TEXT,
@@ -1109,7 +1436,9 @@ export default function migrateConsolidate() {
       claim_expires_at TEXT,
       attempt_count   INTEGER NOT NULL DEFAULT 0,
       last_error      TEXT,
-      replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+      replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      handoff_artifact_digest TEXT,
+      source_run_handoff_artifact_digest TEXT
     );
 
     CREATE TABLE IF NOT EXISTS dispatcher_leases (
@@ -1172,6 +1501,15 @@ export default function migrateConsolidate() {
       payload         TEXT NOT NULL,
       retention_policy TEXT,
       retention_until TEXT,
+      handoff_artifact_digest TEXT,
+      source_run_id TEXT,
+      source_run_handoff_artifact_digest TEXT,
+      evidence_method TEXT,
+      evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
+      evidence_envelope TEXT,
+      evidence_provider TEXT,
+      evidence_principal TEXT,
+      evidence_allowed_signers_path TEXT,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(algorithm, hash, run_id)
     );
@@ -1199,6 +1537,76 @@ export default function migrateConsolidate() {
       created_at              TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
     );
+  `);
+
+  const evidenceBackfills = collectEvidenceMetadataBackfills(db);
+  if (evidenceBackfills.length > 0) {
+    db.exec('DROP TRIGGER IF EXISTS trg_v4_evidence_no_update');
+    const updateEvidenceMetadata = db.prepare(`
+      UPDATE evidence_records
+      SET evidence_method = COALESCE(evidence_method, ?),
+          evidence_provider = COALESCE(evidence_provider, ?),
+          evidence_principal = COALESCE(evidence_principal, ?),
+          evidence_allowed_signers_path = COALESCE(evidence_allowed_signers_path, ?)
+      WHERE id = ?
+    `);
+    for (const backfill of evidenceBackfills) {
+      updateEvidenceMetadata.run(
+        backfill.method,
+        backfill.provider,
+        backfill.principal,
+        backfill.allowedSignersPath,
+        backfill.id,
+      );
+    }
+  }
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_v4_jobs_no_downgrade
+    BEFORE UPDATE ON jobs
+    WHEN OLD.handoff_version = 4 AND (
+      NEW.handoff_version IS NOT 4 OR
+      NEW.handoff_artifact_digest IS NULL OR
+      NEW.effective_task_hash IS NULL
+    )
+    BEGIN SELECT RAISE(ABORT, 'handoff v4 job bindings cannot be downgraded or cleared'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_v4_runs_binding_immutable
+        BEFORE UPDATE ON runs
+        WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+          NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+          NEW.runtime_instance_id IS NOT OLD.runtime_instance_id OR
+          NEW.source_run_id IS NOT OLD.source_run_id OR
+          NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+        )
+        BEGIN SELECT RAISE(ABORT, 'handoff v4 run bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_v4_approvals_binding_immutable
+        BEFORE UPDATE ON approvals
+        WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+          NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+          NEW.source_run_id IS NOT OLD.source_run_id OR
+          NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+        )
+        BEGIN SELECT RAISE(ABORT, 'handoff v4 approval bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_v4_dispatches_binding_immutable
+        BEFORE UPDATE ON job_dispatch_queue
+        WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+          NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+          NEW.source_run_id IS NOT OLD.source_run_id OR
+          NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+        )
+        BEGIN SELECT RAISE(ABORT, 'handoff v4 dispatch bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_update
+        BEFORE UPDATE ON evidence_records
+        WHEN OLD.handoff_artifact_digest IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'handoff v4 evidence is immutable'); END;
+        DROP TRIGGER IF EXISTS trg_v4_evidence_no_delete;
+        CREATE TRIGGER trg_v4_evidence_no_delete
+        BEFORE DELETE ON evidence_records
+        WHEN OLD.handoff_artifact_digest IS NOT NULL AND NOT (
+          OLD.retention_until IS NOT NULL
+          AND julianday(OLD.retention_until) <= julianday('now')
+        )
+        BEGIN SELECT RAISE(ABORT, 'handoff v4 evidence is immutable'); END;
   `);
 
   // -- Indexes that may be absent ----------------------------------------
@@ -1405,21 +1813,26 @@ export default function migrateConsolidate() {
   // treated index creation as best effort; a missing uniqueness or due-work
   // index changes correctness, not just performance.
   for (const table of migrationRequiredTables) {
-    if (!hasTable(table)) throw new Error(`Migration v28 failed to create required table ${table}`);
+    if (!hasTable(table)) throw new Error(`Migration v29 failed to create required table ${table}`);
   }
   for (const index of migrationRequiredIndexes) {
-    if (!hasIndex(index)) throw new Error(`Migration v28 failed to create required index ${index}`);
+    if (!hasIndex(index)) throw new Error(`Migration v29 failed to create required index ${index}`);
   }
   for (const spec of criticalUniqueIndexes) {
     if (hasTable(spec.table) && !criticalIndexMatches(spec)) {
-      throw new Error(`Migration v28 failed to enforce required unique index ${spec.name}`);
+      throw new Error(`Migration v29 failed to enforce required unique index ${spec.name}`);
+    }
+  }
+  for (const trigger of schemaNoOpTriggers) {
+    if (!hasTrigger(trigger)) {
+      throw new Error(`Migration v29 failed to create required trigger ${trigger}`);
     }
   }
 
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]) {
     stmt.run(v);
   }
 
@@ -1438,7 +1851,7 @@ if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
     }
   }
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v28'
-    : 'DB already at v28 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v29'
+    : 'DB already at v29 -- nothing to do'
   );
 }

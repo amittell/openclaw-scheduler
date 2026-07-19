@@ -40,6 +40,10 @@ try {
   const tarball = join(fixture, packResult[0].filename);
   run('tar', ['-xzf', tarball], { cwd: fixture });
   const packageRoot = join(fixture, 'package');
+  const packedManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  if (packedManifest.optionalDependencies?.['@amittell/agentcli'] !== '^0.5.0') {
+    throw new Error('packed artifact must declare @amittell/agentcli ^0.5.0 as an optional dependency');
+  }
 
   const requiredFiles = [
     'index.js',
@@ -49,6 +53,8 @@ try {
     'scripts/verify-published-agentcli.mjs',
     'skills/durable-scheduler/SKILL.md',
     'tests/v04-evidence-lifecycle.test.mjs',
+    'handoff-artifact.js',
+    'evidence-runtime.js',
   ];
   for (const relativePath of requiredFiles) {
     if (!existsSync(join(packageRoot, relativePath))) {
@@ -128,7 +134,7 @@ void snapshot;
       SCHEDULER_DB: join(fixture, 'installed-smoke.db'),
     },
   }));
-  if (doctor.ok !== true || doctor.database?.schema_version !== 28) {
+  if (doctor.ok !== true || doctor.database?.schema_version !== 29) {
     throw new Error(`installed package doctor failed: ${JSON.stringify(doctor)}`);
   }
 

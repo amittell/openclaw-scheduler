@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 
 import {
@@ -8,6 +9,7 @@ import {
   getApprovalForDispatch,
   getPendingApproval,
   markApprovalDispatched,
+  recoverInterruptedApprovalDispatches,
   resolveApproval,
 } from '../approval.js';
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
@@ -29,6 +31,7 @@ import {
   releaseIdempotencyKey,
 } from '../idempotency.js';
 import {
+  cancelJob,
   createJob,
   getDispatchBacklogCount,
   getJob,
@@ -47,6 +50,11 @@ import {
   validateDelegation,
   verifyAuthorizationProof,
 } from '../v02-runtime.js';
+
+const v4ProofJobFixture = JSON.parse(readFileSync(
+  new URL('./fixtures/handoff-v4-approval-proof-job.json', import.meta.url),
+  'utf8',
+));
 
 before(async () => {
   setDbPath(':memory:');
@@ -67,6 +75,10 @@ function jobSpec(name, authorization) {
     origin: 'system',
     authorization: JSON.stringify(authorization),
   };
+}
+
+function v4ProofJobSpec() {
+  return structuredClone(v4ProofJobFixture);
 }
 
 function dispatchDeps(provider, idempotencyKey) {
@@ -166,6 +178,107 @@ test('authorization escalation suspends and resumes the exact durable dispatch',
   assert.equal(getApprovalForDispatch(dispatch.id, { activeOnly: false }).status, 'dispatched');
   finishRun(resumed.run.id, 'cancelled', { summary: 'test cleanup' });
   releaseIdempotencyKey(resumed.idemKey);
+});
+
+test('authorization approval resumes v4 proof without consuming its replay identifier twice', async () => {
+  const previousProof = process.env.APPROVAL_REPLAY_PROOF;
+  const proofNowSeconds = Math.floor(Date.now() / 1000);
+  const proofExpiresAt = new Date((proofNowSeconds + 60) * 1000).toISOString();
+  const encoded = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+  process.env.APPROVAL_REPLAY_PROOF = [
+    encoded({ alg: 'RS256', typ: 'JWT' }),
+    encoded({
+      iss: 'https://issuer.example',
+      sub: 'principal:approval-proof',
+      iat: proofNowSeconds - 1,
+      exp: proofNowSeconds + 60,
+    }),
+    'test-signature',
+  ].join('.');
+  try {
+    const provider = {
+      name: 'none',
+      authorize: async () => ({ decision: 'escalate', reason: 'operator proof review required' }),
+    };
+    const job = createJob(v4ProofJobSpec());
+    const dispatch = enqueueDispatch(job.id, {
+      id: 'authorization-v4-proof-dispatch',
+      kind: 'manual',
+    });
+    let proofVerifications = 0;
+    const deps = {
+      ...dispatchDeps(provider, 'authorization-v4-proof-idempotency'),
+      agentcliProofRuntime: {
+        async verifyAuthorizationProof(_proof, profile, context) {
+          proofVerifications += 1;
+          const replay = context.claimProofReplay({
+            method: profile.method,
+            issuer: profile.issuer,
+            subject: 'principal:approval-proof',
+            proofId: 'authorization-v4-proof-id',
+            artifactDigest: context.artifactDigest,
+            runId: context.runId,
+            expiresAt: proofExpiresAt,
+          });
+          if (!replay.claimed) {
+            return {
+              verified: false,
+              method: profile.method,
+              reason: replay.reason,
+              signature_verified: true,
+              artifact_bound: true,
+              replay_protected: false,
+              revocation_checked: true,
+            };
+          }
+          return {
+            verified: true,
+            method: profile.method,
+            signature_verified: true,
+            manifest_bound: true,
+            artifact_bound: true,
+            replay_protected: true,
+            revocation_checked: true,
+            issuer: profile.issuer,
+            subject: 'principal:approval-proof',
+            key_id: 'approval-key-1',
+            proof_id: 'authorization-v4-proof-id',
+            verified_at: new Date().toISOString(),
+          };
+        },
+      },
+    };
+
+    assert.equal(await prepareDispatch(getJob(job.id), { dispatchRecord: dispatch }, deps), null);
+    const approval = getApprovalForDispatch(dispatch.id);
+    const firstRun = getRun(approval.run_id);
+    const firstVerification = JSON.parse(firstRun.authorization_proof_verification);
+    assert.equal(firstVerification.verified, true);
+    assert.equal(firstVerification.proof_valid_until, proofExpiresAt);
+    assert.equal(firstVerification.proof_clock_skew_seconds, 60);
+    assert.equal(proofVerifications, 1);
+    assert.equal(resolveApproval(approval.id, 'approved', null).status, 'approved');
+
+    const resumed = await prepareDispatch(
+      getJob(job.id),
+      { dispatchRecord: getDispatch(dispatch.id) },
+      deps,
+    );
+    assert.ok(resumed);
+    assert.equal(proofVerifications, 1);
+    assert.equal(resumed.v02Outcomes.authorization_decision.decision, 'permit');
+    assert.equal(resumed.v02Outcomes.authorization_proof_verification.proof_id, 'authorization-v4-proof-id');
+    assert.equal(
+      getDb().prepare('SELECT COUNT(*) AS count FROM proof_replay_ledger WHERE proof_id = ?')
+        .get('authorization-v4-proof-id').count,
+      1,
+    );
+    finishRun(resumed.run.id, 'cancelled', { summary: 'test cleanup' });
+    releaseIdempotencyKey(resumed.idemKey);
+  } finally {
+    if (previousProof === undefined) delete process.env.APPROVAL_REPLAY_PROOF;
+    else process.env.APPROVAL_REPLAY_PROOF = previousProof;
+  }
 });
 
 test('changed provider authorization context creates a fresh approval gate', async () => {
@@ -414,4 +527,125 @@ test('authorization escalation rejection persists the requested authorization bi
   assert.equal(evidence.integrity.valid, true);
   assert.equal(evidence.payload.outcomes.authorization.decision, 'escalate');
   assert(evidence.payload.declaration.enforced_bindings.includes('authorization'));
+});
+
+test('v4 pre-execution terminal paths quarantine required provider evidence instead of downgrading it', () => {
+  const db = getDb();
+  const evidenceDeclaration = JSON.stringify({
+    provider: 'ssh',
+    methods: ['ssh-signature'],
+    payload: { bind: ['result.status', 'result.structured_hash'] },
+    verify_required: true,
+  });
+  const ensureJob = () => {
+    const existing = getJob(v4ProofJobFixture.id);
+    const job = existing || createJob(v4ProofJobSpec());
+    db.prepare(`
+      UPDATE jobs
+      SET enabled = 1, last_status = NULL, last_run_at = NULL
+      WHERE id = ?
+    `).run(job.id);
+    return getJob(job.id);
+  };
+  const createGate = label => {
+    const job = ensureJob();
+    const dispatch = enqueueDispatch(job.id, {
+      id: `v4-required-evidence-${label}-dispatch`,
+      kind: 'manual',
+    });
+    claimDispatch(dispatch.id);
+    const run = createRun(job.id, {
+      status: 'pending',
+      dispatch_queue_id: dispatch.id,
+    });
+    db.prepare(`
+      UPDATE runs
+      SET evidence_required = 1,
+          evidence_declaration_snapshot = ?,
+          evidence_ref_snapshot = ?
+      WHERE id = ?
+    `).run(evidenceDeclaration, `audit:${label}`, run.id);
+    const approval = createApproval(job.id, run.id, dispatch.id);
+    return { job, dispatch, run, approval };
+  };
+  const assertQuarantined = (jobId, runId, intendedStatus) => {
+    const run = getRun(runId);
+    assert.equal(run.status, 'recovery_blocked');
+    assert.equal(getEvidenceRecord(runId), null);
+    assert.equal(getJob(jobId).enabled, 0);
+    assert.equal(getJob(jobId).last_status, 'recovery_blocked');
+    const event = db.prepare(`
+      SELECT payload FROM runtime_events
+      WHERE event_type = 'job.quarantine.required' AND run_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(runId);
+    assert.ok(event);
+    assert.equal(JSON.parse(event.payload).intended_status, intendedStatus);
+  };
+
+  for (const decision of ['rejected', 'timed_out', 'cancelled']) {
+    const gate = createGate(decision);
+    const resolved = resolveApproval(
+      gate.approval.id,
+      decision,
+      'scheduler',
+      `${decision} required evidence`,
+      { automatic: true },
+    );
+    assert.equal(resolved.status, decision);
+    assertQuarantined(gate.job.id, gate.run.id, 'cancelled');
+    assert.equal(getDispatch(gate.dispatch.id).status, 'failed');
+  }
+
+  const consumed = createGate('consumed');
+  assert.equal(resolveApproval(
+    consumed.approval.id,
+    'approved',
+    'scheduler',
+    'approved for dispatch',
+    { automatic: true },
+  ).status, 'approved');
+  assert.equal(claimDispatch(consumed.dispatch.id).status, 'claimed');
+  assert.equal(beginApprovalDispatch(consumed.dispatch.id).changed, true);
+  assert.equal(markApprovalDispatched(consumed.dispatch.id).changed, true);
+  assertQuarantined(consumed.job.id, consumed.run.id, 'skipped');
+
+  const recovered = createGate('recovered-consumed');
+  assert.equal(resolveApproval(
+    recovered.approval.id,
+    'approved',
+    'scheduler',
+    'approved before dispatcher restart',
+    { automatic: true },
+  ).status, 'approved');
+  assert.equal(claimDispatch(recovered.dispatch.id).status, 'claimed');
+  assert.equal(beginApprovalDispatch(recovered.dispatch.id).changed, true);
+  db.prepare(`
+    UPDATE approvals
+    SET status = 'dispatched', dispatched_at = datetime('now')
+    WHERE id = ? AND status = 'dispatching'
+  `).run(recovered.approval.id);
+  assert.equal(recoverInterruptedApprovalDispatches().recovered >= 1, true);
+  assertQuarantined(recovered.job.id, recovered.run.id, 'skipped');
+
+  const cancelledJob = ensureJob();
+  const cancelledDispatch = enqueueDispatch(cancelledJob.id, {
+    id: 'v4-required-evidence-cancel-job-dispatch',
+    kind: 'manual',
+  });
+  claimDispatch(cancelledDispatch.id);
+  const cancelledRun = createRun(cancelledJob.id, {
+    status: 'pending',
+    dispatch_queue_id: cancelledDispatch.id,
+  });
+  db.prepare(`
+    UPDATE runs
+    SET evidence_required = 1,
+        evidence_declaration_snapshot = ?,
+        evidence_ref_snapshot = 'audit:cancel-job'
+    WHERE id = ?
+  `).run(evidenceDeclaration, cancelledRun.id);
+  assert.deepEqual(cancelJob(cancelledJob.id, { cascade: false }), [cancelledJob.id]);
+  assertQuarantined(cancelledJob.id, cancelledRun.id, 'cancelled');
+  assert.equal(getDispatch(cancelledDispatch.id).status, 'cancelled');
 });

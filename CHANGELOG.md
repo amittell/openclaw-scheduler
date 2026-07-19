@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] -- 2026-07-18
+
+### Added
+
+- AgentCLI scheduler handoff v4 with versioned canonical artifacts, complete
+  scheduler execution bindings, immutable digest propagation, and schema v29
+- artifact-bound JWT, detached-signature, and certificate proof verification
+  with replay, revocation, validity, issuer, subject, audience, key, nonce, and
+  cross-artifact transplant enforcement
+- exact source-run delegation, artifact-scoped provider session recovery and
+  rotation, capability-negotiated credential presentation, cleanup recovery,
+  and append-only runtime events
+- signed or provider-verified evidence generation and persisted
+  cryptographic re-verification through `runs evidence`
+- shared positive and negative conformance fixtures plus a public fresh-DB,
+  restart-backed E2E covering schedule, one-shot, manual, chain, and retry work
+
+### Changed
+
+- v4 job replacement retains both immutable artifacts, applies explicit null
+  clears, and atomically cancels queued work and approvals bound to the old
+  digest
+- preparation failures now commit a terminal run and an operator-visible
+  quarantine event without rewriting immutable v4 job state
+- capabilities now advertise handoff v4 and signed evidence while preserving
+  the distinct legacy checksum evidence capability and handoff 1 through 3
+- CI uses Actions checkout 7, setup-node 6, and TypeScript 7
+
+### Security
+
+- no raw credential, proof, environment, stdin, or provider session secret is
+  persisted in artifacts, events, presentations, evidence, or run summaries
+- required proof, authorization, credential, delegation, postcondition, and
+  evidence controls fail closed before delivery or child dispatch
+
 ## [0.4.3] -- 2026-07-18
 
 ### Changed

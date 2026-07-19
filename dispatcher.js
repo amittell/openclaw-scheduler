@@ -68,6 +68,7 @@ import {
   getDispatch, getDueDispatches, claimDispatch, releaseDispatch, setDispatchStatus,
   enqueueDispatch,
 } from './dispatch-queue.js';
+import { recoverCredentialPresentations } from './credential-runtime.js';
 import {
   listActiveTaskGroups, checkDeadAgents, checkGroupCompletion, getTaskGroupStatus,
   touchAgentHeartbeat,
@@ -369,15 +370,30 @@ async function replayOrphanedRuns() {
         ? { status: 'pending', error: 'invalid cleanup safety metadata' }
         : null;
     }
-    if (['pending', 'failed'].includes(credentialCleanup?.status)) {
-      const reason = credentialCleanup.status === 'failed'
+    const credentialPresentationRows = db.prepare(`
+      SELECT status, last_error FROM credential_presentations WHERE run_id = ?
+    `).all(run.id);
+    const presentationFailure = credentialPresentationRows.find(row => row.status === 'failed');
+    const presentationsRecovered = credentialPresentationRows.length > 0
+      && credentialPresentationRows.every(row => ['cleaned', 'recovery_cleaned'].includes(row.status));
+    if (presentationsRecovered && credentialCleanup?.status === 'pending') {
+      credentialCleanup = { ...credentialCleanup, status: 'recovery_cleaned', error: null };
+      let context;
+      try { context = JSON.parse(run.context_summary || '{}'); } catch { context = {}; }
+      context.credential_cleanup = credentialCleanup;
+      db.prepare('UPDATE runs SET context_summary = ? WHERE id = ?').run(JSON.stringify(context), run.id);
+    }
+    if (presentationFailure || ['pending', 'failed'].includes(credentialCleanup?.status)) {
+      const reason = presentationFailure
+        ? `Credential recovery cleanup failed: ${presentationFailure.last_error || 'unknown failure'}`
+        : credentialCleanup.status === 'failed'
         ? `Credential cleanup failed before recovery${credentialCleanup.error ? `: ${credentialCleanup.error}` : ''}`
         : 'Credential cleanup could not be confirmed before recovery';
       if (blockRecovery(run, reason)) {
         log('error', `Blocked orphan replay after unresolved credential cleanup: ${run.job_name}`, {
           runId: run.id,
           jobId: run.job_id,
-          cleanupStatus: credentialCleanup.status,
+          cleanupStatus: presentationFailure ? 'failed' : credentialCleanup?.status || null,
         });
       }
       continue;
@@ -1522,6 +1538,15 @@ async function main() {
     log('warn', `Recovered ${recoveredApprovals.recovered} approval dispatch state(s) before scheduling`);
   }
   requireDispatcherLeadership('startup approval recovery');
+
+  // Remove durable credential presentations before any orphan can be replayed.
+  const credentialRecovery = recoverCredentialPresentations({ db: getDb() });
+  if (credentialRecovery.failed.length > 0) {
+    log('error', `Credential recovery failed for ${credentialRecovery.failed.length} presentation(s)`);
+  } else if (credentialRecovery.recovered.length > 0) {
+    log('warn', `Recovered ${credentialRecovery.recovered.length} credential presentation(s) before orphan replay`);
+  }
+  requireDispatcherLeadership('startup credential recovery');
 
   // Replay orphaned runs from previous crash (delivery guarantee support)
   await replayOrphanedRuns();

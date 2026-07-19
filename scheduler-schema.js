@@ -1,5 +1,5 @@
-export const SCHEDULER_SCHEMA_VERSION = 28;
-export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.4.0';
+export const SCHEDULER_SCHEMA_VERSION = 29;
+export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.5.0';
 
 export const SCHEDULER_SCHEMAS = {
   jobs: {
@@ -96,20 +96,26 @@ export const SCHEDULER_SCHEMAS = {
       contract_max_cost_usd: { type: 'number', nullable: true, min: 0 },
       contract_audit: { type: 'string', nullable: true, description: 'JSON blob: audit configuration' },
       child_credential_policy: { type: 'string', nullable: true, enum: ['none', 'inherit', 'downscope', 'independent'], description: 'Credential flow policy for child tasks' },
+
+      // Agentcli handoff v4
+      handoff_version: { type: 'integer', enum: [4], nullable: true },
+      handoff_artifact_digest: { type: 'string', nullable: true, pattern: '^sha256:[0-9a-f]{64}$' },
+      handoff_artifact_payload: { type: 'object', nullable: true, description: 'Canonical v4 artifact payload accepted on create/update and returned only by opt-in hydrated job reads; persisted immutably outside the job row' },
+      effective_task_hash: { type: 'string', nullable: true, pattern: '^sha256:[0-9a-f]{64}$' },
     },
   },
   runs: {
     statuses: ['pending', 'running', 'ok', 'error', 'timeout', 'skipped', 'awaiting_approval', 'approved', 'cancelled', 'crashed', 'recovery_blocked'],
-    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_required', 'evidence_execution_snapshot', 'evidence_declaration_snapshot', 'evidence_ref_snapshot', 'evidence_record', 'credential_handoff_summary', 'delegation_validation', 'approval_used', 'output_format', 'structured_output', 'structured_output_valid', 'structured_output_warning', 'structured_output_bytes', 'structured_output_sha256', 'structured_output_path', 'verification_result'],
+    key_fields: ['job_id', 'status', 'started_at', 'finished_at', 'summary', 'error_message', 'shell_exit_code', 'shell_signal', 'shell_timed_out', 'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path', 'shell_stdout_bytes', 'shell_stderr_bytes', 'shell_stdout_sha256', 'shell_stderr_sha256', 'dispatcher_owner', 'dispatcher_token', 'dispatch_started_at', 'cancel_requested_at', 'cancel_requested_by', 'cancel_reason', 'process_pid', 'process_pgid', 'process_identity', 'process_started_at', 'process_terminated_at', 'agent_cancel_requested_at', 'terminal_transition_at', 'retry_of', 'triggered_by_run', 'dispatch_queue_id', 'idempotency_key', 'identity_resolved', 'trust_evaluation', 'authorization_decision', 'authorization_proof_verification', 'evidence_required', 'evidence_execution_snapshot', 'evidence_declaration_snapshot', 'evidence_ref_snapshot', 'evidence_record', 'credential_handoff_summary', 'delegation_validation', 'approval_used', 'handoff_artifact_digest', 'runtime_instance_id', 'source_run_id', 'source_run_handoff_artifact_digest', 'output_format', 'structured_output', 'structured_output_valid', 'structured_output_warning', 'structured_output_bytes', 'structured_output_sha256', 'structured_output_path', 'verification_result'],
   },
   approvals: {
     statuses: ['pending', 'approved', 'dispatching', 'dispatched', 'rejected', 'timed_out', 'cancelled'],
-    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes', 'decision_version', 'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at', 'dispatched_at', 'risk_level', 'approver_scope', 'binding_hash', 'gate_kind', 'decision_context'],
+    key_fields: ['job_id', 'run_id', 'dispatch_queue_id', 'requested_at', 'resolved_at', 'resolved_by', 'notes', 'decision_version', 'cancelled_reason', 'expires_at', 'approved_at', 'rejected_at', 'dispatched_at', 'risk_level', 'approver_scope', 'binding_hash', 'gate_kind', 'decision_context', 'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest'],
   },
   dispatches: {
     kinds: ['schedule', 'at', 'manual', 'chain', 'retry'],
     statuses: ['pending', 'claimed', 'awaiting_approval', 'done', 'cancelled', 'failed'],
-    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'binding_scheduled_for', 'source_run_id', 'retry_of_run_id', 'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count', 'last_error', 'replay_of_run_id'],
+    key_fields: ['job_id', 'dispatch_kind', 'status', 'scheduled_for', 'binding_scheduled_for', 'source_run_id', 'retry_of_run_id', 'claim_owner', 'claim_token', 'claim_expires_at', 'attempt_count', 'last_error', 'replay_of_run_id', 'handoff_artifact_digest', 'source_run_handoff_artifact_digest'],
   },
   messages: {
     kinds: ['text', 'task', 'result', 'status', 'system', 'spawn', 'decision', 'constraint', 'fact', 'preference'],
@@ -126,6 +132,25 @@ export const SCHEDULER_SCHEMAS = {
     key_fields: ['outbox_id', 'message_id', 'ordinal', 'name', 'mime_type', 'source_path', 'content_blob', 'size_bytes', 'sha256'],
   },
   evidence_records: {
-    key_fields: ['run_id', 'job_id', 'evidence_ref', 'algorithm', 'hash', 'payload', 'retention_policy', 'retention_until', 'created_at'],
+    key_fields: ['run_id', 'job_id', 'evidence_ref', 'algorithm', 'hash', 'payload', 'retention_policy', 'retention_until', 'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest', 'evidence_method', 'evidence_verified', 'evidence_envelope', 'evidence_provider', 'evidence_principal', 'evidence_allowed_signers_path', 'created_at'],
+  },
+  handoff_artifacts: {
+    immutable: true,
+    key_fields: ['digest', 'artifact_schema_version', 'handoff_version', 'scheduler_schema_min', 'canonicalization', 'canonicalization_version', 'execution_binding_version', 'manifest_digest', 'workflow_id', 'task_id', 'job_id', 'effective_task_hash', 'payload', 'payload_bytes', 'created_at'],
+  },
+  runtime_events: {
+    immutable: true,
+    key_fields: ['event_type', 'event_version', 'job_id', 'dispatch_queue_id', 'run_id', 'approval_id', 'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest', 'payload', 'payload_sha256', 'created_at'],
+  },
+  provider_sessions: {
+    statuses: ['active', 'refreshing', 'expired', 'revoked', 'failed'],
+    key_fields: ['provider_type', 'provider_name', 'cache_key_hash', 'status', 'handoff_artifact_digest', 'subject_principal', 'scope', 'session_summary', 'expires_at', 'refresh_after', 'rotation_counter', 'revocation_checked_at'],
+  },
+  credential_presentations: {
+    statuses: ['materialized', 'cleaned', 'recovery_cleaned', 'failed'],
+    key_fields: ['run_id', 'handoff_artifact_digest', 'provider_session_id', 'binding_name', 'medium', 'env_key', 'stdin_sha256', 'value_sha256', 'file_mode', 'status', 'expires_at', 'cleaned_at'],
+  },
+  proof_replay_ledger: {
+    key_fields: ['replay_key', 'method', 'issuer', 'handoff_artifact_digest', 'run_id', 'expires_at', 'claimed_at'],
   },
 };

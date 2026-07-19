@@ -1,4 +1,5 @@
 import { writeFileSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { join } from 'path';
 import { getResolvedDbPath } from './db.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from './paths.js';
@@ -148,6 +149,8 @@ export function normalizeShellResult(
   const stderrStored = truncateText(stderrText, Math.min(storeLimit, stderrOffloaded ? excerptLimit : storeLimit));
   const stdoutExcerpt = truncateText(stdoutText, excerptLimit);
   const stderrExcerpt = truncateText(stderrText, excerptLimit);
+  const stdoutSha256 = `sha256:${createHash('sha256').update(stdoutText, 'utf8').digest('hex')}`;
+  const stderrSha256 = `sha256:${createHash('sha256').update(stderrText, 'utf8').digest('hex')}`;
 
   const exitCode = Number.isInteger(structuredExitCode)
     ? structuredExitCode
@@ -183,6 +186,8 @@ export function normalizeShellResult(
     stderrPath: stderrOffloaded,
     stdoutBytes,
     stderrBytes,
+    stdoutSha256,
+    stderrSha256,
     stdoutTruncated: stdoutStored.truncated,
     stderrTruncated: stderrStored.truncated,
     summary: truncateText(previewText, summaryLimit).text,

@@ -171,6 +171,13 @@ export interface JobSpec {
   contract_audit?: string | null;
   child_credential_policy?: 'none' | 'inherit' | 'downscope' | 'independent' | null;
 
+  // Handoff v4 immutable execution binding
+  handoff_version?: 4 | null;
+  handoff_artifact_digest?: string | null;
+  /** Create/update input, or opt-in list output when includeHandoffArtifacts is true. */
+  handoff_artifact_payload?: string | Record<string, unknown> | null;
+  effective_task_hash?: string | null;
+
   [key: string]: unknown;
 }
 
@@ -229,6 +236,8 @@ export interface RunRecord {
   shell_stderr_path?: string | null;
   shell_stdout_bytes?: number | null;
   shell_stderr_bytes?: number | null;
+  shell_stdout_sha256?: string | null;
+  shell_stderr_sha256?: string | null;
 
   // Timeout
   run_timeout_ms?: number;
@@ -238,6 +247,10 @@ export interface RunRecord {
   retry_of?: string | null;
   triggered_by_run?: string | null;
   dispatch_queue_id?: string | null;
+  handoff_artifact_digest?: string | null;
+  runtime_instance_id?: string | null;
+  source_run_id?: string | null;
+  source_run_handoff_artifact_digest?: string | null;
   evidence_required?: number | boolean;
   evidence_execution_snapshot?: string | null;
   evidence_declaration_snapshot?: string | null;
@@ -358,6 +371,9 @@ export interface ApprovalRecord {
   binding_hash?: string | null;
   gate_kind: 'job' | 'authorization';
   decision_context?: string | null;
+  handoff_artifact_digest?: string | null;
+  source_run_id?: string | null;
+  source_run_handoff_artifact_digest?: string | null;
   deduped?: boolean;
   [key: string]: unknown;
 }
@@ -372,9 +388,21 @@ export interface EvidenceRecord {
   payload: JsonValue | null;
   retention_policy?: string | null;
   retention_until?: string | null;
+  handoff_artifact_digest?: string | null;
+  source_run_id?: string | null;
+  source_run_handoff_artifact_digest?: string | null;
+  evidence_method?: string | null;
+  evidence_verified?: number | boolean;
+  evidence_envelope?: string | Record<string, unknown> | null;
   created_at: string;
   integrity: {
     valid: boolean;
+    cryptographically_verified?: boolean;
+    provider?: string | null;
+    method?: string | null;
+    principal?: string | null;
+    key_fingerprint?: string | null;
+    code?: string;
     algorithm?: 'sha256';
     expected_hash?: string;
     actual_hash?: string;
@@ -415,6 +443,105 @@ export interface DispatchRecord {
   attempt_count?: number;
   last_error?: string | null;
   replay_of_run_id?: string | null;
+  handoff_artifact_digest?: string | null;
+  source_run_handoff_artifact_digest?: string | null;
+  [key: string]: unknown;
+}
+
+export interface HandoffArtifactRecord {
+  digest: string;
+  artifact_schema_version: 1;
+  handoff_version: 4;
+  scheduler_schema_min: 29;
+  canonicalization: 'json-sort-v1';
+  canonicalization_version: 1;
+  execution_binding_version: 2;
+  manifest_digest: string;
+  workflow_id?: string | null;
+  task_id?: string | null;
+  job_id: string;
+  effective_task_hash: string;
+  payload: Record<string, unknown>;
+  payload_bytes: number;
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+export interface RuntimeEventRecord {
+  id: number;
+  event_type: string;
+  event_version: number;
+  job_id?: string | null;
+  dispatch_queue_id?: string | null;
+  run_id?: string | null;
+  approval_id?: string | null;
+  handoff_artifact_digest?: string | null;
+  source_run_id?: string | null;
+  source_run_handoff_artifact_digest?: string | null;
+  payload: Record<string, unknown>;
+  payload_sha256: string;
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+export interface ProviderSessionRecord {
+  id: string;
+  provider_type: string;
+  provider_name: string;
+  cache_key_hash: string;
+  status: 'active' | 'refreshing' | 'expired' | 'revoked' | 'failed';
+  handoff_artifact_digest: string;
+  subject_principal?: string | null;
+  scope?: string | null;
+  session_summary: string;
+  expires_at?: string | null;
+  refresh_after?: string | null;
+  rotation_counter: number;
+  revocation_checked_at?: string | null;
+  transient_error_count?: number;
+  last_error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface CredentialPresentationRecord {
+  id: string;
+  run_id: string;
+  handoff_artifact_digest: string;
+  provider_session_id?: string | null;
+  binding_name: string;
+  medium: 'env' | 'temp-file' | 'stdin' | 'gateway-env-header';
+  env_key?: string | null;
+  temp_path?: { basename: string; sha256: string } | null;
+  stdin_sha256?: string | null;
+  value_sha256: string;
+  file_mode?: '0600' | null;
+  status: 'materialized' | 'cleaned' | 'recovery_cleaned' | 'failed';
+  expires_at?: string | null;
+  cleaned_at?: string | null;
+  last_error?: string | null;
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+export interface CredentialMaterialization {
+  env: Record<string, string>;
+  gatewayEnv: Record<string, string>;
+  stdin: Uint8Array | null;
+  presentationIds: string[];
+  tempPaths: string[];
+  runtimeRoot: string;
+}
+
+export interface ArtifactEvidenceVerification {
+  id: string;
+  run_id: string;
+  job_id: string;
+  evidence_ref?: string | null;
+  handoff_artifact_digest: string;
+  payload: JsonValue | null;
+  integrity: EvidenceRecord['integrity'];
   [key: string]: unknown;
 }
 
@@ -507,6 +634,8 @@ export interface FinishRunOpts {
   shell_stderr_path?: string | null;
   shell_stdout_bytes?: number | null;
   shell_stderr_bytes?: number | null;
+  shell_stdout_sha256?: string | null;
+  shell_stderr_sha256?: string | null;
 
   // v0.2 Outcomes
   identity_resolved?: string | object | null;
@@ -788,7 +917,7 @@ export const jobs: {
   // CRUD
   createJob(opts: JobSpec): JobRecord;
   getJob(id: string): JobRecord | undefined;
-  listJobs(opts?: { enabledOnly?: boolean }): JobRecord[];
+  listJobs(opts?: { enabledOnly?: boolean; includeHandoffArtifacts?: boolean }): JobRecord[];
   updateJob(id: string, patch: Partial<JobSpec>): JobRecord | null;
   deleteJob(id: string): void;
 
@@ -869,6 +998,8 @@ export const runs: {
         leaseName?: string;
       } | null;
       allowStaleRunOwner?: boolean;
+      allowPreExecution?: boolean;
+      intendedStatus?: string;
     },
   ): { changed: boolean; run: RunRecord | null };
   transitionRunTerminalWithEvidence(
@@ -1069,6 +1200,7 @@ export const shellRuntime: {
   terminateProcessTree(child: { pid: number; kill(signal?: string | number): boolean }, opts?: { pgid?: number; graceMs?: number }): Promise<boolean>;
   runShellCommand(command: string, timeoutMs?: number, env?: Record<string, string> | null, opts?: {
     signal?: AbortSignal;
+    stdin?: string | Uint8Array | null;
     envPolicy?: 'minimal' | 'inherit';
     cwd?: string;
     shell?: string;
@@ -1334,6 +1466,86 @@ export const SCHEDULER_SCHEMAS: {
   delivery_outbox: { statuses: string[]; key_fields: string[] };
   delivery_attachments: { key_fields: string[] };
   evidence_records: { key_fields: string[] };
+};
+
+export const handoffArtifacts: {
+  HANDOFF_V4_SCHEMA: 'openclaw.scheduler.handoff-artifact';
+  HANDOFF_V4_ARTIFACT_SCHEMA_VERSION: 1;
+  HANDOFF_V4_CANONICALIZATION: 'json-sort-v1';
+  HANDOFF_V4_CANONICALIZATION_VERSION: 1;
+  HANDOFF_V4_VERSION: 4;
+  HANDOFF_V4_SCHEMA_MIN: 29;
+  HANDOFF_V4_EXECUTION_BINDING_VERSION: 2;
+  HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION: 1;
+  HANDOFF_V4_RUNTIME_CONTRACT: Readonly<{
+    artifact_schema: 'openclaw.scheduler.handoff-artifact';
+    artifact_schema_version: 1;
+    canonicalization: 'json-sort-v1';
+    canonicalization_version: 1;
+    digest: 'sha256';
+    undefined: 'null';
+    execution_binding_version: 2;
+    scheduler_job_binding_version: 1;
+  }>;
+  sortKeysDeep<T>(value: T): T;
+  canonicalStringify(value: unknown): string;
+  sha256(value: string | Uint8Array): string;
+  artifactDigest(value: unknown): string;
+  validateHandoffArtifact(input: string | Record<string, unknown>, opts?: { expectedDigest?: string | null; job?: JobRecord | null }): { ok: boolean; payload: Record<string, unknown> | null; digest: string | null; errors: string[] };
+  assertValidHandoffArtifact(input: string | Record<string, unknown>, opts?: { expectedDigest?: string | null; job?: JobRecord | null }): { ok: true; payload: Record<string, unknown>; digest: string; errors: [] };
+  persistHandoffArtifact(input: string | Record<string, unknown>, expectedDigest: string, opts?: { db?: SchedulerDatabase }): HandoffArtifactRecord;
+  getHandoffArtifact(digest: string, opts?: { db?: SchedulerDatabase }): HandoffArtifactRecord | null;
+  assertArtifactMatchesJob(job: JobRecord, opts?: { db?: SchedulerDatabase }): HandoffArtifactRecord | null;
+};
+
+export const runtimeEvents: {
+  appendRuntimeEvent(eventType: string, fields?: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): RuntimeEventRecord;
+  getRuntimeEvent(id: number, opts?: { db?: SchedulerDatabase }): RuntimeEventRecord | null;
+  listRuntimeEvents(filter?: { runId?: string; jobId?: string; handoffArtifactDigest?: string; eventType?: string; limit?: number }, opts?: { db?: SchedulerDatabase }): RuntimeEventRecord[];
+};
+
+export const providerSessions: {
+  resolveProviderSession(provider: Record<string, unknown>, request?: Record<string, unknown>, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): Promise<{ row: ProviderSessionRecord; session: Record<string, unknown>; cache_key_hash: string }>;
+  getProviderSession(id: string, opts?: { db?: SchedulerDatabase }): ProviderSessionRecord | null;
+  resumeProviderSession(provider: Record<string, unknown>, id: string, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): Promise<{ row: ProviderSessionRecord; session: Record<string, unknown> }>;
+  adoptProviderSession(provider: Record<string, unknown>, request: Record<string, unknown>, resolved: Record<string, unknown>, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): { row: ProviderSessionRecord; session: Record<string, unknown>; cache_key_hash: string };
+  listProviderSessions(filter?: { status?: ProviderSessionRecord['status'] }, opts?: { db?: SchedulerDatabase }): ProviderSessionRecord[];
+  cleanupProviderSession(provider: Record<string, unknown>, id: string, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): Promise<{ ok: true; missing?: true }>;
+  _resetProviderSessionMemoryForTesting(): void;
+};
+
+export const credentialRuntime: {
+  materializeCredentials(provider: Record<string, unknown>, providerSession: Record<string, unknown>, presentation: Record<string, unknown>, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): Promise<CredentialMaterialization>;
+  cleanupCredentialMaterialization(materialization: CredentialMaterialization, ctx?: Record<string, unknown>, opts?: Record<string, unknown>): Promise<{ ok: true; cleaned: number }>;
+  recoverCredentialPresentations(opts?: Record<string, unknown>): { recovered: string[]; failed: Array<{ id: string; error: string }> };
+  listCredentialPresentations(filter?: { runId?: string }, opts?: { db?: SchedulerDatabase }): CredentialPresentationRecord[];
+};
+
+export const capabilityNegotiation: {
+  LOCAL_ARTIFACT_BINDING_CAPABILITY: 'artifact-bound-runtime-v1';
+  LOCAL_SHELL_CREDENTIAL_CAPABILITY: 'shell-credential-presentation-v1';
+  negotiateCredentialCapabilities(materialized: CredentialMaterialization | null, ctx: Record<string, unknown>, opts?: Record<string, unknown>): Promise<Readonly<Record<string, unknown>>>;
+};
+
+export const delegationRuntime: {
+  validateArtifactBoundDelegation(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, dispatchRecord: DispatchRecord | null, ctx?: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): Readonly<Record<string, unknown>> | null;
+};
+
+export const proofRuntime: {
+  claimProofReplay(db: SchedulerDatabase, input: Record<string, unknown>): { claimed: boolean; reason?: string; existingArtifactDigest?: string | null; existingRunId?: string | null };
+  verifyArtifactBoundProof(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, run: RunRecord, opts?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  revokeProof(input: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): Record<string, unknown>;
+};
+
+export const evidenceRuntime: {
+  prepareArtifactBoundEvidence(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, run: RunRecord, opts?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  persistPreparedArtifactBoundEvidence(prepared: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): EvidenceRecord | null;
+  persistArtifactBoundEvidence(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, runId: string, opts?: Record<string, unknown>): Promise<EvidenceRecord | null>;
+  verifyPersistedArtifactBoundEvidence(runId: string, opts?: Record<string, unknown>): Promise<ArtifactEvidenceVerification | null>;
+};
+
+export const identityRuntime: {
+  resolveArtifactBoundIdentity(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, run: RunRecord, opts?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
 };
 
 // -- v0.2 Runtime result interfaces --

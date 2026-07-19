@@ -7,6 +7,10 @@ import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, getEvidenceRecord } from './runs.js';
 import {
+  validatePersistedArtifactBoundEvidenceRecord,
+  verifyPersistedArtifactBoundEvidence,
+} from './evidence-runtime.js';
+import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, getMessage, listMessageReceipts, getTeamMessages,
 } from './messages.js';
@@ -17,6 +21,7 @@ import {
   SCHEDULER_SCHEMAS,
   SCHEDULER_SCHEMA_VERSION,
 } from './scheduler-schema.js';
+import { HANDOFF_V4_RUNTIME_CONTRACT } from './handoff-artifact.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliArgs = process.argv.slice(2);
@@ -77,7 +82,8 @@ Global:
   --json                             Emit machine-readable JSON
 
 Jobs:
-  jobs list [--type watchdog]        List all jobs (optionally filter by type)
+  jobs list [--type watchdog] [--include-handoff-artifacts]
+                                     List jobs; opt in to validated v4 artifact payloads
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
   jobs add <json>|--file <path>|--stdin [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
@@ -299,7 +305,7 @@ function countByStatus(db, table) {
   ).all().map(row => [row.status, row.count]));
 }
 
-function getOperationalDiagnostics(db, opts = {}) {
+async function getOperationalDiagnostics(db, opts = {}) {
   const lease = tableExists(db, 'dispatcher_leases')
     ? db.prepare(`
         SELECT *, CASE WHEN julianday(expires_at) > julianday('now') THEN 1 ELSE 0 END AS active
@@ -358,22 +364,35 @@ function getOperationalDiagnostics(db, opts = {}) {
       `).get().count
     : null;
   const evidence = tableExists(db, 'evidence_records')
-    ? db.transaction(() => {
+    ? await (async () => {
       const total = db.prepare('SELECT COUNT(*) AS count FROM evidence_records').get().count;
       const deep = opts.deepEvidence === true;
+      const verifyV4Evidence = opts.verifyV4Evidence === true;
       const evidenceLimit = Number.isInteger(opts.evidenceLimit) && opts.evidenceLimit > 0
         ? opts.evidenceLimit
         : 500;
       const rowStatement = deep
-        ? db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC')
-        : db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
-      const rowIterator = deep ? rowStatement.iterate() : rowStatement.iterate(evidenceLimit);
+        ? db.prepare('SELECT * FROM evidence_records ORDER BY created_at DESC, run_id DESC')
+        : db.prepare('SELECT * FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
+      const rows = deep ? rowStatement.all() : rowStatement.all(evidenceLimit);
       let checked = 0;
       let invalidCount = 0;
       const invalidSamples = [];
-      for (const row of rowIterator) {
+      for (const row of rows) {
         checked += 1;
-        const record = getEvidenceRecord(row.run_id, { db });
+        let record;
+        if (row.handoff_artifact_digest && verifyV4Evidence) {
+          record = await verifyPersistedArtifactBoundEvidence(row.run_id, { db });
+        } else if (row.handoff_artifact_digest) {
+          try {
+            validatePersistedArtifactBoundEvidenceRecord(row, { db });
+            record = { integrity: { valid: true } };
+          } catch (error) {
+            record = { integrity: { valid: false, error: error.message } };
+          }
+        } else {
+          record = getEvidenceRecord(row.run_id, { db });
+        }
         if (record?.integrity?.valid !== true) {
           invalidCount += 1;
           if (invalidSamples.length < 20) {
@@ -403,6 +422,7 @@ function getOperationalDiagnostics(db, opts = {}) {
         : [];
       return {
         total,
+        verification_mode: verifyV4Evidence ? 'cryptographic' : 'checksum',
         checked,
         unchecked: Math.max(0, total - checked),
         verification_complete: checked === total,
@@ -414,6 +434,7 @@ function getOperationalDiagnostics(db, opts = {}) {
     })()
     : {
         total: null,
+        verification_mode: opts.verifyV4Evidence === true ? 'cryptographic' : 'checksum',
         checked: null,
         unchecked: null,
         verification_complete: null,
@@ -461,7 +482,9 @@ switch (command) {
   case 'jobs':
     switch (sub) {
       case 'list': {
-        let jobs = listJobs();
+        let jobs = listJobs({
+          includeHandoffArtifacts: args.includes('--include-handoff-artifacts'),
+        });
         // Filter by --type if provided (e.g. --type watchdog)
         const typeFilterIdx = args.indexOf('--type');
         if (typeFilterIdx >= 0 && args[typeFilterIdx + 1]) {
@@ -764,7 +787,12 @@ switch (command) {
       }
       case 'evidence': {
         if (!args[0]) fail('Usage: runs evidence <run-id>');
-        const evidence = getEvidenceRecord(args[0]);
+        const evidenceRow = getDb().prepare(
+          'SELECT handoff_artifact_digest, evidence_verified FROM evidence_records WHERE run_id = ?',
+        ).get(args[0]);
+        const evidence = evidenceRow?.handoff_artifact_digest && evidenceRow.evidence_verified === 1
+          ? await verifyPersistedArtifactBoundEvidence(args[0])
+          : getEvidenceRecord(args[0]);
         if (!evidence) fail(`Evidence not found for run: ${args[0]}`, 1, 'NOT_FOUND');
         emit({ ok: evidence.integrity?.valid === true, evidence });
         if (evidence.integrity?.valid !== true) process.exitCode = 1;
@@ -1374,7 +1402,7 @@ switch (command) {
     const db = getDb();
     const dbPath = getResolvedDbPath();
     const schemaVersion = getSchemaVersion(db);
-    const operational = getOperationalDiagnostics(db);
+    const operational = await getOperationalDiagnostics(db);
     const jobs = listJobs();
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
@@ -1483,7 +1511,10 @@ switch (command) {
     const doctorArgs = [sub, ...args].filter(Boolean);
     const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep');
     if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
-    const diagnostics = getOperationalDiagnostics(db, { deepEvidence: doctorArgs.includes('--deep') });
+    const diagnostics = await getOperationalDiagnostics(db, {
+      deepEvidence: doctorArgs.includes('--deep'),
+      verifyV4Evidence: true,
+    });
     const integrityRows = db.pragma('quick_check');
     const integrityMessages = integrityRows.map(row => String(Object.values(row)[0]));
     const integrityOk = integrityMessages.length === 1 && integrityMessages[0].toLowerCase() === 'ok';
@@ -1581,7 +1612,8 @@ switch (command) {
       product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
       schema_version_source: 'package',
       schema_version_note: 'Run status or doctor to inspect the initialized database schema.',
-      handoff_version: '3',
+      handoff_version: '4',
+      handoff_contract: HANDOFF_V4_RUNTIME_CONTRACT,
       features: {
         approvals: 'runtime',
         model_policy: 'model+thinking',
@@ -1595,10 +1627,10 @@ switch (command) {
         trust_evaluation: true,
         authorization_proof_verification: true,
         authorization_hook: true,
-        evidence_generation: false,
+        evidence_generation: true,
         checksum_evidence_generation: true,
-        evidence_integrity: 'checksum-sha256-v3',
-        evidence_contract: 'openclaw-scheduler-checksum-v3',
+        evidence_integrity: 'artifact-bound-signed-or-provider-verified-v4',
+        evidence_contract: 'agentcli-handoff-v4',
         authorization_ref_resolution: true,
         delegation_validation: true,
         root_approval_gate: true,
@@ -1621,6 +1653,13 @@ switch (command) {
         durable_delivery_attachments: true,
         atomic_approval_state: true,
         governance_enforcement: true,
+        handoff_v4_artifact: true,
+        artifact_bound_proofs: true,
+        signed_or_provider_verified_evidence: true,
+        provider_session_cache: true,
+        credential_presentation: true,
+        source_run_bound_delegation: true,
+        immutable_runtime_events: true,
       },
     };
     emit(capabilities);

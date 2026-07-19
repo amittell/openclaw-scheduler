@@ -15,6 +15,18 @@ const skipAgentcli = argv.has('--skip-agentcli') || process.env.SKIP_AGENTCLI_IN
 const skipAgentcliOwned = argv.has('--skip-agentcli-owned')
   || process.env.SKIP_AGENTCLI_OWNED_INTEGRATION === '1';
 const requireAgentcli = agentcliOnly || argv.has('--require-agentcli') || process.env.REQUIRE_AGENTCLI_INTEGRATION === '1';
+const agentcliContract = process.env.AGENTCLI_CONTRACT || null;
+const agentcliFocusedTests = new Set([
+  'handoff-v4-e2e.test.mjs',
+  'handoff-v4-runtime.test.mjs',
+]);
+const installedAgentcliPackage = join(
+  root,
+  'node_modules',
+  '@amittell',
+  'agentcli',
+  'package.json',
+);
 const failures = [];
 let executed = 0;
 
@@ -48,12 +60,18 @@ if (!focusedOnly && !agentcliOnly) {
   });
 }
 
-const focusedTests = agentcliOnly
-  ? []
-  : readdirSync(join(root, 'tests'), { withFileTypes: true })
+const allFocusedTests = readdirSync(join(root, 'tests'), { withFileTypes: true })
     .filter(entry => entry.isFile() && entry.name.endsWith('.test.mjs'))
     .map(entry => entry.name)
     .sort((a, b) => a.localeCompare(b));
+const canRunAgentcliFocusedTests = existsSync(installedAgentcliPackage);
+const focusedTests = agentcliOnly
+  ? (agentcliContract === 'handoff-v4' && canRunAgentcliFocusedTests
+      ? allFocusedTests.filter(testFile => agentcliFocusedTests.has(testFile))
+      : [])
+  : allFocusedTests.filter(
+      testFile => !agentcliFocusedTests.has(testFile) || canRunAgentcliFocusedTests,
+    );
 
 for (const testFile of focusedTests) {
   const isolatedHome = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-test-'));

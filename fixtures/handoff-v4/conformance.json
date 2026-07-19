@@ -1,0 +1,187 @@
+{
+  "fixture_version": 1,
+  "compile": {
+    "cwd": "/workspace",
+    "env": {
+      "HOME": "/home/fixture",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "LC_CTYPE": "C.UTF-8",
+      "LOGNAME": "fixture",
+      "PATH": "/usr/bin:/bin",
+      "SHELL": "/bin/sh",
+      "TERM": "dumb",
+      "TMPDIR": "/tmp",
+      "USER": "fixture"
+    }
+  },
+  "manifest": {
+    "version": "0.1",
+    "workflows": [
+      {
+        "id": "fixture",
+        "name": "Handoff v4 fixture",
+        "tasks": [
+          {
+            "id": "positive",
+            "name": "Positive artifact fixture",
+            "target": {
+              "session_target": "shell"
+            },
+            "shell": {
+              "program": "/usr/bin/printf",
+              "args": [
+                "%s\\n",
+                "handoff-v4"
+              ]
+            },
+            "schedule": {
+              "cron": "17 3 * * *"
+            },
+            "runtime": {
+              "timeout_ms": 30000
+            },
+            "approval": {
+              "required": true,
+              "policy": "manual",
+              "risk_level": "medium",
+              "timeout_s": 300
+            },
+            "delivery": {
+              "mode": "none"
+            },
+            "output": {
+              "format": "text"
+            },
+            "contract": {
+              "audit": "always"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "artifact_digest": "sha256:ffc67fa20585fd9e6b94f8a12f3be45c6a826f948b577aeb2e28d82fdef5c9d4",
+    "manifest_digest": "sha256:03afcc6f88e60a7e3358578425ee79ff91d31b855e5ae97a8dc20495ef9f2dc4",
+    "effective_task_hash": "sha256:0d6b7a63ba7ff75811e5db236b84648dc9547d2ce3d22cdc42eec621c9ff98e4",
+    "scheduler_job_binding_digest": "sha256:daac076adbaaac470e748f94d66297b3b018910867d817b78c3bc24768ffa2e6"
+  },
+  "negative_artifact_cases": [
+    {
+      "name": "payload tamper",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["runtime", "timeout_ms"],
+          "value": 30001
+        }
+      ],
+      "expected_error": "artifact digest does not match payload",
+      "use_expected_digest": true
+    },
+    {
+      "name": "future artifact schema",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["artifact_schema_version"],
+          "value": 2
+        }
+      ],
+      "expected_error": "artifact_schema_version must be 1"
+    },
+    {
+      "name": "future canonicalization",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["canonicalization", "version"],
+          "value": 2
+        }
+      ],
+      "expected_error": "canonicalization contract is unsupported"
+    },
+    {
+      "name": "invalid scheduler execution binding",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["scheduler_job_binding", "digest"],
+          "value": "sha256:invalid"
+        }
+      ],
+      "expected_error": "scheduler_job_binding.digest must be a lowercase sha256 digest"
+    },
+    {
+      "name": "missing approval binding",
+      "changes": [
+        {
+          "op": "delete",
+          "path": ["approval", "required"]
+        }
+      ],
+      "expected_error": "approval.required must be a boolean"
+    },
+    {
+      "name": "missing evidence payload hash",
+      "changes": [
+        {
+          "op": "delete",
+          "path": ["evidence", "payload_hash"]
+        }
+      ],
+      "expected_error": "evidence.payload_hash is required"
+    },
+    {
+      "name": "missing evidence provider config hash",
+      "changes": [
+        {
+          "op": "delete",
+          "path": ["evidence", "provider_config_hash"]
+        }
+      ],
+      "expected_error": "evidence.provider_config_hash is required"
+    },
+    {
+      "name": "cryptographic proof downgrade",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["authorization_proof", "method"],
+          "value": "jwt"
+        },
+        {
+          "op": "set",
+          "path": ["authorization_proof", "artifact_binding_required"],
+          "value": false
+        }
+      ],
+      "expected_error": "artifact binding, replay protection, and revocation"
+    },
+    {
+      "name": "raw credential material",
+      "changes": [
+        {
+          "op": "set",
+          "path": ["identity", "presentation", "handoff"],
+          "value": "env"
+        },
+        {
+          "op": "set",
+          "path": ["identity", "presentation", "bindings"],
+          "value": [
+            {
+              "name": "token",
+              "medium": "env",
+              "required": true,
+              "redact": true,
+              "value": "must-not-persist"
+            }
+          ]
+        }
+      ],
+      "expected_error": "raw credential material"
+    }
+  ]
+}

@@ -193,6 +193,8 @@ assert(runCols.includes('shell_stderr'), 'runs.shell_stderr column');
 assert(runCols.includes('shell_stdout_path'), 'runs.shell_stdout_path column');
 assert(runCols.includes('shell_stderr_path'), 'runs.shell_stderr_path column');
 assert(runCols.includes('shell_stdout_bytes'), 'runs.shell_stdout_bytes column');
+assert(runCols.includes('shell_stdout_sha256'), 'runs.shell_stdout_sha256 column');
+assert(runCols.includes('shell_stderr_sha256'), 'runs.shell_stderr_sha256 column');
 assert(runCols.includes('shell_stderr_bytes'), 'runs.shell_stderr_bytes column');
 assert(jobCols.includes('execution_intent'), 'jobs.execution_intent column');
 assert(jobCols.includes('execution_read_only'), 'jobs.execution_read_only column');
@@ -5684,9 +5686,14 @@ if (sub === 'status') {
     }, null, 2));
 
     writeFileSync(mockHandoffPath, `
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, renameSync, writeFileSync } from 'fs';
 const statePath = ${JSON.stringify(mockStatePath)};
 const state = JSON.parse(readFileSync(statePath, 'utf8'));
+function writeState(nextState) {
+  const temporaryPath = statePath + '.' + process.pid + '.tmp';
+  writeFileSync(temporaryPath, JSON.stringify(nextState, null, 2));
+  renameSync(temporaryPath, statePath);
+}
 const [,,sub, ...rest] = process.argv;
 const flags = {};
 for (let i = 0; i < rest.length; i++) {
@@ -5703,16 +5710,16 @@ for (let i = 0; i < rest.length; i++) {
 }
 if (sub === 'status') {
   state.statusReads = (state.statusReads || 0) + 1;
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify(state.status) + '\\n');
 } else if (sub === 'result') {
   state.resultReads = (state.resultReads || 0) + 1;
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify(state.result) + '\\n');
 } else if (sub === 'watcher-handoff') {
   state.handoffs = (state.handoffs || 0) + 1;
   state.reasons = [...(state.reasons || []), flags.reason || null];
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify({ ok: true, scheduled: true, jobId: 'handoff-job-1', reason: flags.reason || null }) + '\\n');
 } else if (sub === 'sync') {
   process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
@@ -5757,8 +5764,13 @@ if (sub === 'status') {
     handoffChild.stderr.on('data', chunk => { handoffStderr += chunk.toString(); });
     const handoffReadyDeadline = Date.now() + 5000;
     while (Date.now() < handoffReadyDeadline) {
-      const currentState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
-      if ((currentState.statusReads || 0) > 0) break;
+      let currentState = null;
+      try {
+        currentState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      if ((currentState?.statusReads || 0) > 0) break;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     handoffChild.kill('SIGTERM');
@@ -11394,22 +11406,25 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 28, 'capabilities: schema_version is 28');
-  assert(capsOut.handoff_version === '3', 'capabilities: handoff_version is 3');
+  assert(capsOut.schema_version === 29, 'capabilities: schema_version is 29');
+  assert(capsOut.handoff_version === '4', 'capabilities: handoff_version is 4');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');
   assert(capsOut.features.runtime_identity_resolution === true, 'capabilities: runtime_identity_resolution enabled');
   assert(capsOut.features.trust_evaluation === true, 'capabilities: trust_evaluation enabled');
   assert(capsOut.features.authorization_proof_verification === true, 'capabilities: authorization_proof_verification enabled');
   assert(capsOut.features.authorization_hook === true, 'capabilities: authorization_hook enabled');
-  assert(capsOut.features.evidence_generation === false, 'capabilities: agentcli evidence generation is not advertised');
+  assert(capsOut.features.evidence_generation === true, 'capabilities: signed or provider-verified evidence generation enabled');
   assert(capsOut.features.checksum_evidence_generation === true, 'capabilities: scheduler checksum evidence generation enabled');
   assert(capsOut.features.credential_handoff === true, 'capabilities: credential_handoff enabled');
   assert(capsOut.features.audit_export === true, 'capabilities: audit_export enabled');
   assert(capsOut.features.delegation_validation === true, 'capabilities: delegation_validation enabled');
   assert(capsOut.features.authorization_ref_resolution === true, 'capabilities: authorization_ref_resolution enabled');
-  assert(capsOut.features.evidence_integrity === 'checksum-sha256-v3', 'capabilities: checksum sha256 v3 evidence integrity enabled');
-  assert(capsOut.features.evidence_contract === 'openclaw-scheduler-checksum-v3', 'capabilities: scheduler checksum evidence contract is explicit');
+  assert(capsOut.features.evidence_integrity === 'artifact-bound-signed-or-provider-verified-v4', 'capabilities: artifact-bound v4 evidence integrity enabled');
+  assert(capsOut.features.evidence_contract === 'agentcli-handoff-v4', 'capabilities: agentcli handoff v4 evidence contract is explicit');
+  assert(capsOut.features.handoff_v4_artifact === true, 'capabilities: handoff v4 artifacts enabled');
+  assert(capsOut.features.artifact_bound_proofs === true, 'capabilities: artifact-bound proofs enabled');
+  assert(capsOut.features.signed_or_provider_verified_evidence === true, 'capabilities: signed or provider-verified evidence enabled');
   assert(capsOut.features.root_approval_gate === true, 'capabilities: root approval gate enabled');
   assert(capsOut.features.approval_scope_enforcement === false, 'capabilities: scoped manifests fail negotiation until domain identities are authenticatable');
   assert(capsOut.features.structured_output_format === true, 'capabilities: structured output validation enabled');
@@ -12164,6 +12179,7 @@ console.log('\n-- prepareDispatch v0.2 gating --');
   finishRun(legacyNonShellHandoffCtx.run.id, 'cancelled', { summary: 'isolated handoff test cleanup' });
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(legacyNonShellHandoffJob.id);
   deleteJob(legacyNonShellHandoffJob.id);
+
 }
 
 // ===========================================================
@@ -12323,6 +12339,57 @@ console.log('\n-- Materialization failure abort --');
   const matFalseRun = getRunsForJob(matFalseJob.id, 1)[0];
   assert(matFalseRun.status === 'error', 'prepareDispatch: materialized=false run status is error');
   assert(matFalseRun.error_message.includes('materialized=false'), 'prepareDispatch: materialized=false error message preserved');
+
+  for (const [label, provider] of [
+    ['throw', matFailProvider],
+    ['false', matFalseProvider],
+  ]) {
+    const checkpointProvider = {
+      ...provider,
+      name: `${provider.name}-checkpoint`,
+    };
+    const checkpointJob = createJob({
+      name: `prepare-dispatch-mat-${label}-checkpoint`,
+      schedule_cron: '0 10 * * *',
+      session_target: 'shell',
+      payload_kind: 'shellCommand',
+      payload_message: 'echo must remain blocked',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: JSON.stringify({
+        provider: checkpointProvider.name,
+        scope: 'full',
+        presentation: { mode: 'inject-env' },
+      }),
+    });
+    let cleanupCheckpointCalls = 0;
+    let preparedRunId = null;
+    const preserved = await prepareDispatch(
+      getJob(checkpointJob.id),
+      {},
+      buildPrepareDispatchDeps({
+        getIdentityProvider: name => name === checkpointProvider.name ? checkpointProvider : null,
+        generateIdempotencyKey: () => `idem-mat-${label}-checkpoint`,
+        dispatcherFence: { ownerId: 'cleanup-checkpoint-test', fencingToken: 1 },
+        claimRunForDispatch: runId => getRun(runId),
+        persistV02Outcomes: (runId, outcomes) => persistV02Outcomes(runId, outcomes),
+        onRunPrepared: run => { preparedRunId = run.id; },
+        recordRunCredentialCleanupState: runId => {
+          cleanupCheckpointCalls += 1;
+          return cleanupCheckpointCalls === 1 ? { id: runId } : null;
+        },
+      }),
+    );
+    assert(preserved === null, `prepareDispatch: ${label} checkpoint failure does not execute`);
+    const preservedRun = getRun(preparedRunId);
+    assert(cleanupCheckpointCalls === 2, `prepareDispatch: ${label} records pending and terminal cleanup checkpoints (calls=${cleanupCheckpointCalls})`);
+    assert(preservedRun.status === 'running', `prepareDispatch: ${label} preserves active run when cleanup checkpoint is lost (status=${preservedRun.status})`);
+    finishRun(preservedRun.id, 'cancelled', { summary: 'checkpoint preservation test cleanup' });
+    getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(checkpointJob.id);
+    deleteJob(checkpointJob.id);
+  }
 
   getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(matFailJob.id, matFalseJob.id);
   deleteJob(matFailJob.id);

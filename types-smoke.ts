@@ -7,6 +7,8 @@ import {
   shellRuntime, runtimeLease, dispatcherRuntime, runState, runCompletion,
   governance, deliveryOutbox, deliveryAttachments, approvalState,
   SCHEDULER_SCHEMAS, v02Runtime,
+  handoffArtifacts, runtimeEvents, providerSessions, credentialRuntime,
+  capabilityNegotiation, delegationRuntime, proofRuntime, evidenceRuntime, identityRuntime,
   type JobSpec, type JobRecord, type RunRecord, type MessageRecord,
   type ApprovalRecord, type AgentRecord, type DispatchRecord,
   type ShellResult, type PartialShellResult,
@@ -20,6 +22,9 @@ import {
   type TeamTaskGateOpts,
   type ResolvedIdentity, type TrustEvaluation, type AuthorizationProofResult,
   type AuthorizationResult, type EvidenceResult, type CredentialHandoffSummary,
+  type HandoffArtifactRecord, type RuntimeEventRecord, type ProviderSessionRecord,
+  type CredentialPresentationRecord, type CredentialMaterialization,
+  type ArtifactEvidenceVerification,
 } from './index.js';
 
 // ---- db ----
@@ -43,6 +48,11 @@ const jobSpec: JobSpec = {
 const created: JobRecord = jobs.createJob(jobSpec);
 const fetched: JobRecord | undefined = jobs.getJob('id');
 const listed: JobRecord[] = jobs.listJobs({ enabledOnly: true });
+const listedWithArtifacts: JobRecord[] = jobs.listJobs({
+  enabledOnly: true,
+  includeHandoffArtifacts: true,
+});
+void listedWithArtifacts[0]?.handoff_artifact_payload;
 const updated: JobRecord | null = jobs.updateJob('id', { enabled: 0 });
 jobs.deleteJob('id');
 
@@ -427,6 +437,55 @@ if (evidenceResult) { void evidenceResult.evidence_ref; void evidenceResult.crea
 
 const handoff: CredentialHandoffSummary | null = v02Runtime.summarizeCredentialHandoff({});
 if (handoff) { void handoff.mode; void handoff.bindings_count; void handoff.cleanup_required; }
+
+// ---- Handoff v4 public runtime surface ----
+const v4Spec: JobSpec = {
+  name: 'v4 smoke',
+  payload_message: 'echo v4',
+  run_timeout_ms: 300000,
+  handoff_version: 4,
+  handoff_artifact_digest: 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+  handoff_artifact_payload: { schema: handoffArtifacts.HANDOFF_V4_SCHEMA },
+  effective_task_hash: 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+};
+void v4Spec;
+void handoffArtifacts.HANDOFF_V4_VERSION;
+void handoffArtifacts.HANDOFF_V4_SCHEMA_MIN;
+void handoffArtifacts.HANDOFF_V4_EXECUTION_BINDING_VERSION;
+void handoffArtifacts.HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION;
+void handoffArtifacts.HANDOFF_V4_RUNTIME_CONTRACT.artifact_schema;
+const canonicalV4: string = handoffArtifacts.canonicalStringify({ z: 1, a: 2 });
+const digestV4: string = handoffArtifacts.artifactDigest({ payload: 'v4' });
+const validationV4 = handoffArtifacts.validateHandoffArtifact({ schema: handoffArtifacts.HANDOFF_V4_SCHEMA });
+void validationV4.ok; void validationV4.payload; void validationV4.digest; void validationV4.errors;
+const artifactV4: HandoffArtifactRecord | null = handoffArtifacts.getHandoffArtifact(digestV4);
+if (artifactV4) { void artifactV4.execution_binding_version; void artifactV4.payload_bytes; }
+
+const runtimeEventV4: RuntimeEventRecord | null = runtimeEvents.getRuntimeEvent(1);
+if (runtimeEventV4) { void runtimeEventV4.event_type; void runtimeEventV4.payload_sha256; }
+const runtimeEventListV4: RuntimeEventRecord[] = runtimeEvents.listRuntimeEvents({ runId: 'run-v4', limit: 10 });
+
+const providerSessionV4: ProviderSessionRecord | null = providerSessions.getProviderSession('session-v4');
+if (providerSessionV4) { void providerSessionV4.status; void providerSessionV4.rotation_counter; }
+const providerSessionListV4: ProviderSessionRecord[] = providerSessions.listProviderSessions({ status: 'active' });
+
+const credentialRowsV4: CredentialPresentationRecord[] = credentialRuntime.listCredentialPresentations({ runId: 'run-v4' });
+const materializationV4: CredentialMaterialization = {
+  env: {}, gatewayEnv: {}, stdin: null, presentationIds: [], tempPaths: [], runtimeRoot: '/tmp',
+};
+const capabilityV4 = capabilityNegotiation.negotiateCredentialCapabilities(materializationV4, {
+  artifactDigest: digestV4, runtimeInstanceId: 'runtime-v4', sessionTarget: 'shell',
+});
+const delegationV4 = delegationRuntime.validateArtifactBoundDelegation(created, artifactV4 || {}, dispatch, { runId: 'run-v4' });
+const replayV4 = proofRuntime.claimProofReplay(db.getDb(), {
+  method: 'jwt', proofId: 'proof-v4', artifactDigest: digestV4, runId: 'run-v4', expiresAt: '2099-01-01T00:00:00Z',
+});
+const proofV4 = proofRuntime.verifyArtifactBoundProof(created, artifactV4 || {}, run);
+const evidenceV4: Promise<ArtifactEvidenceVerification | null> = evidenceRuntime.verifyPersistedArtifactBoundEvidence('run-v4');
+const identityV4 = identityRuntime.resolveArtifactBoundIdentity(created, artifactV4 || {}, run);
+void canonicalV4; void runtimeEventListV4; void providerSessionListV4;
+void credentialRowsV4; void capabilityV4; void delegationV4; void replayV4;
+void proofV4; void evidenceV4; void identityV4;
 
 // Suppress unused variable warnings
 void created; void fetched; void listed; void updated;

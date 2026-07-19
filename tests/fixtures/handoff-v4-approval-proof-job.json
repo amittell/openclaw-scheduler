@@ -1,0 +1,243 @@
+{
+  "id": "c9e1eeb6adf7dcce1bf9a635d954ee37",
+  "name": "authorization-v4-proof-resume",
+  "enabled": 1,
+  "schedule_cron": "0 0 * * *",
+  "schedule_tz": "UTC",
+  "session_target": "shell",
+  "agent_id": "main",
+  "payload_kind": "shellCommand",
+  "payload_message": "'printf' 'governed'",
+  "payload_model": null,
+  "payload_thinking": null,
+  "execution_intent": "execute",
+  "execution_read_only": 0,
+  "run_timeout_ms": 30000,
+  "overlap_policy": "skip",
+  "max_retries": 0,
+  "max_queued_dispatches": 25,
+  "max_pending_approvals": 10,
+  "max_trigger_fanout": 25,
+  "delivery_mode": "none",
+  "delivery_channel": null,
+  "delivery_to": null,
+  "delivery_opt_out_reason": null,
+  "delivery_guarantee": "at-most-once",
+  "origin": "system",
+  "parent_id": null,
+  "trigger_on": null,
+  "trigger_delay_s": 0,
+  "trigger_condition": null,
+  "approval_required": 0,
+  "approval_timeout_s": 3600,
+  "approval_auto": "reject",
+  "approval_risk_level": null,
+  "approval_approver_scope": null,
+  "context_retrieval": "none",
+  "context_retrieval_limit": 5,
+  "output_store_limit_bytes": 65536,
+  "output_excerpt_limit_bytes": 2000,
+  "output_summary_limit_bytes": 5000,
+  "output_offload_threshold_bytes": 65536,
+  "output_format": null,
+  "preferred_session_key": null,
+  "auth_profile": null,
+  "identity_principal": null,
+  "identity_run_as": null,
+  "identity_attestation": null,
+  "contract_sandbox": null,
+  "contract_allowed_paths": null,
+  "contract_network": null,
+  "contract_max_cost_usd": null,
+  "contract_audit": null,
+  "identity_ref": null,
+  "identity_subject_kind": null,
+  "identity_subject_principal": null,
+  "identity_trust_level": null,
+  "identity_delegation_mode": null,
+  "identity": null,
+  "authorization_proof_ref": "approval-proof",
+  "authorization_proof": "{\"ref\":\"approval-proof\",\"method\":\"jwt\",\"issuer\":\"approval-issuer\",\"audience\":\"scheduler\",\"jwks_uri\":null,\"public_key\":\"-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAshZzd4tZeNlLdNWN998o\\nAt2leEx5r5Qy7NqwhLR4pnZ79ZuNuiWT4T6ka/w8x8mpmbRo2da9Vgg40gi1EbVq\\n+4lDEvlIigOxTHCfrQm29uWX5AbJRjCtC3dfBVcdBe6QBE0p04pYbDzmxjuUg66u\\nCDUANxR3AzGDiw6ldkBCg5POvqb/qjUMSvJDDGK/O/ED7yISRZPJXRbzNzXRHV7d\\nGrPPMScAcG9DZ3cD4jB8zLVY7Q+Iy07oTkgos6u4firkqxmiYmN6As3XidrQ/rbJ\\nYvjyXOC7Wjc3RfS6z19GqZtXuR+D5tLPLJTBZl4UQpcpWlzbgT3/DankXg2ZcU4t\\nOQIDAQAB\\n-----END PUBLIC KEY-----\\n\",\"allowed_signers\":null,\"principal\":null,\"namespace\":null,\"ca_certificate\":null,\"ca_certificate_from\":null,\"proof\":{\"value_from\":{\"env\":\"APPROVAL_REPLAY_PROOF\"}},\"claims\":null,\"verify\":{\"required\":true}}",
+  "authorization_ref": "approval-authz",
+  "authorization": "{\"ref\":\"approval-authz\",\"provider\":\"none\",\"provider_config\":null,\"on_error\":null,\"request\":null,\"decision\":null}",
+  "evidence_ref": null,
+  "evidence": null,
+  "contract_required_trust_level": null,
+  "contract_trust_enforcement": null,
+  "child_credential_policy": null,
+  "verify_shell": null,
+  "verify_timeout_s": null,
+  "verify_on_failure": null,
+  "delete_after_run": 0,
+  "handoff_version": 4,
+  "handoff_artifact_digest": "sha256:cfb0408b145074e845ebd2a6be364a26e8ee189683b9e83e55cbb5d4f97ee75d",
+  "handoff_artifact_payload": {
+    "schema": "openclaw.scheduler.handoff-artifact",
+    "artifact_schema_version": 1,
+    "handoff_version": 4,
+    "scheduler_schema_min": 29,
+    "canonicalization": {
+      "name": "json-sort-v1",
+      "version": 1,
+      "digest": "sha256",
+      "undefined": "null"
+    },
+    "execution_binding_version": 2,
+    "scheduler_job_binding": {
+      "version": 1,
+      "digest": "sha256:3df3c5dfd527a7636c7d05209cabe9778324d660d9f78ddc8c9cef4d4f0c86c8"
+    },
+    "manifest": {
+      "version": "0.2",
+      "digest": "sha256:2e6d6d6fe450cdac84df3e46562b541fab5ac35dae0d3008d360660ef477f4a2",
+      "workflow_id": "approval-proof-workflow",
+      "task_id": "approval-proof-task"
+    },
+    "compiled": {
+      "target": "openclaw-scheduler",
+      "job_id": "c9e1eeb6adf7dcce1bf9a635d954ee37",
+      "effective_task_hash": "sha256:c56aaa0b6b921bac9e6701b664248257f45bb81b5e0f40ed99bce4d631198d19",
+      "source": {
+        "workflow_id": "approval-proof-workflow",
+        "task_id": "approval-proof-task"
+      }
+    },
+    "lifecycle": {
+      "enabled": true,
+      "delete_after_run": false,
+      "target": {
+        "session_target": "shell",
+        "agent_id": "main",
+        "payload_kind": "shellCommand"
+      }
+    },
+    "command": {
+      "kind": "shell",
+      "program": "printf",
+      "args_count": 1,
+      "args_sha256": [
+        "sha256:c86ab019a28d89b95a9ad43a43cb80f6b5fe60c61410aa52748624117a7f7899"
+      ],
+      "argv_sha256": "sha256:f1ee76a7b09c05ce508e9f9803941a1949e9c583a885df8e0f2e4977863671ff",
+      "cwd": "/workspace",
+      "stdin_sha256": null,
+      "prompt_sha256": null,
+      "input_sha256": null,
+      "payload_message_sha256": "sha256:a16e4c1f8105e1e23364f9ff1bc835f028733878a5b5fbb2fa4dd65932fa04ca",
+      "env": {
+        "declared_env_sha256": null,
+        "effective_env_keys": [
+          "PATH"
+        ],
+        "effective_env_value_sha256": {
+          "PATH": "sha256:ec1f3f84fccbb088a2bd9b9e301469aafc9541e1b357bcbbe00f889ae3c44179"
+        }
+      }
+    },
+    "runtime": {
+      "timeout_ms": 30000,
+      "instance_id": {
+        "kind": "deferred",
+        "source": "run.id"
+      }
+    },
+    "approval": {
+      "required": false,
+      "timeout_s": 3600,
+      "auto": "reject",
+      "risk_level": null,
+      "approver_scope": null
+    },
+    "identity": {
+      "ref": null,
+      "provider": null,
+      "scope": null,
+      "subject_kind": null,
+      "subject_principal": null,
+      "subject_hash": "sha256:b5e38a939e6701f6c552d8e0739e751297c853dbfaa21049ac468d0d1b304a26",
+      "auth_hash": "sha256:5c471a855eb916c943861dabec65e6420876c5c47c347890edf28a0aaf2aa6f8",
+      "trust_level": null,
+      "delegation_mode": null,
+      "presentation": {
+        "mode": "none",
+        "handoff": "none",
+        "bindings": [],
+        "default_redaction": null,
+        "cleanup": "always"
+      }
+    },
+    "contract": {
+      "required_trust_level": null,
+      "trust_enforcement": null,
+      "sandbox": null,
+      "allowed_paths_sha256": null,
+      "network": null,
+      "max_cost_usd": null,
+      "audit": null,
+      "postcondition": {
+        "output_format": null,
+        "verify_shell_sha256": null,
+        "verify_timeout_s": null,
+        "verify_on_failure": null
+      }
+    },
+    "authorization_proof": {
+      "ref": "approval-proof",
+      "method": "jwt",
+      "issuer": "approval-issuer",
+      "audience": "scheduler",
+      "claims_hash": null,
+      "proof_source_hash": "sha256:a132e781d31caf4bd28494bfa784be10c855ee58f087eb3649fa0a51f1903587",
+      "verification_context_hash": "sha256:d8e1c9fefba8fe8bb8ae570d9d0e5167e7937dc800bbff797a76c29e85e10436",
+      "artifact_binding_required": true,
+      "replay_protection_required": true,
+      "revocation_check_required": true
+    },
+    "authorization": {
+      "ref": "approval-authz",
+      "provider": "none",
+      "policy_digest": null,
+      "on_error": null,
+      "request_hash": null,
+      "decision_hash": null
+    },
+    "evidence": {
+      "ref": null,
+      "provider": null,
+      "methods": [],
+      "payload_bind": [],
+      "payload_hash": null,
+      "provider_config_hash": null,
+      "verify_required": false,
+      "retention": null,
+      "signed_or_provider_verified_required": false
+    },
+    "verification": {
+      "shell_sha256": null,
+      "timeout_s": null,
+      "on_failure": null
+    },
+    "output": {
+      "format": null,
+      "store_limit_bytes": 65536,
+      "excerpt_limit_bytes": 2000,
+      "summary_limit_bytes": 5000,
+      "offload_threshold_bytes": 65536
+    },
+    "child_credential_policy": null,
+    "intent": {
+      "mode": "execute",
+      "read_only": false
+    },
+    "delegation": {
+      "mode": null,
+      "source_binding": "source_run_id",
+      "max_depth": 16,
+      "target_scope": null,
+      "allowed_delegators": [],
+      "allowed_delegators_hash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "require_grant_per_hop": false
+    }
+  },
+  "effective_task_hash": "sha256:c56aaa0b6b921bac9e6701b664248257f45bb81b5e0f40ed99bce4d631198d19"
+}

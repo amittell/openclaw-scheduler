@@ -2,7 +2,7 @@
 
 Date: 2026-03-28
 
-Updated: 2026-07-13 for scheduler 0.4.1 and schema 28
+Updated: 2026-07-18 for scheduler 0.5.0 and schema 29
 
 ## Purpose
 
@@ -291,6 +291,9 @@ subagent session:
   Default, `execute`, or `plan` jobs use synchronous agent execution and defer
   for 60 seconds when the health check fails. `fire-and-forget` jobs use
   `openclaw system event`; request failures use configured retry behavior.
+  Handoff v4 requires the synchronous route because the system-event CLI
+  cannot carry an artifact-bound capability contract; v4 fire-and-forget jobs
+  fail validation.
 - Health is re-checked every 60 seconds (`dispatcher.js` `tick()`).
 
 ---
@@ -789,6 +792,12 @@ negotiated header path above. Main-session jobs reject
 `identity.presentation` and `credential_handoff` because a main-session
 dispatch cannot enforce a task-scoped environment boundary.
 
+Handoff v4 synchronous main-session requests still force-refresh Gateway
+capabilities and require `capability-binding-v1`, even when they carry no
+credential material. The request binds the artifact digest, runtime instance,
+and fresh nonce. A Gateway that cannot enforce those headers is rejected before
+the main-session turn begins.
+
 Reference: `gateway.js` (`runAgentTurn()`,
 `runAgentTurnWithActivityTimeout()`) and `dispatcher-strategies.js`
 (`executeAgent()`).
@@ -902,7 +911,7 @@ external side effect already performed by the agent.
 
 ### Current State
 
-Version 0.4 discovers explicit Gateway version, protocol, and capability
+Version 0.5 discovers explicit Gateway version, protocol, and capability
 metadata before using a capability-gated credential surface. Discovery tries,
 in order:
 

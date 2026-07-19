@@ -18,6 +18,12 @@ const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
 const consolidatePath = join(root, 'migrate-consolidate.js');
 const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
+const handoffV4JobFixturePath = join(
+  root,
+  'tests',
+  'fixtures',
+  'handoff-v4-approval-proof-job.json',
+);
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -79,11 +85,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const capabilities = runNode(cliPath, ['capabilities', '--json'], { env });
   assert.equal(capabilities.status, 0, capabilities.stderr);
-  assert.equal(parseStdout(capabilities).schema_version, 28);
+  assert.equal(parseStdout(capabilities).schema_version, 29);
 
   const launcherCapabilities = runNode(binPath, ['--json', 'capabilities'], { env });
   assert.equal(launcherCapabilities.status, 0, launcherCapabilities.stderr);
-  assert.equal(parseStdout(launcherCapabilities).schema_version, 28);
+  assert.equal(parseStdout(launcherCapabilities).schema_version, 29);
 
   const specPath = join(dir, 'job.json');
   writeFileSync(specPath, JSON.stringify(validShellJob()));
@@ -149,7 +155,137 @@ test('jobs add and update accept file and stdin JSON payloads', t => {
   assert.equal(parseStdout(updated).job.name, 'Updated through stdin');
 });
 
-test('doctor reports schema v28 and lease, queue, outbox, and approval diagnostics', t => {
+test('jobs list hydrates persisted v4 artifacts only when explicitly requested', t => {
+  const dir = tempRoot(t, 'scheduler-list-handoff-v4-');
+  const env = { SCHEDULER_DB: join(dir, 'scheduler.db') };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+
+  const addedV4 = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(addedV4.status, 0, addedV4.stderr);
+
+  const addedLegacy = runNode(
+    cliPath,
+    ['jobs', 'add', JSON.stringify(validShellJob({ name: 'Legacy list probe' })), '--json'],
+    { env },
+  );
+  assert.equal(addedLegacy.status, 0, addedLegacy.stderr);
+  const legacyJobId = parseStdout(addedLegacy).job.id;
+
+  const compact = runNode(cliPath, ['jobs', 'list', '--json'], { env });
+  assert.equal(compact.status, 0, compact.stderr);
+  const compactV4 = parseStdout(compact).find(job => job.id === fixture.id);
+  assert.ok(compactV4);
+  assert.equal(compactV4.handoff_artifact_digest, fixture.handoff_artifact_digest);
+  assert.equal(Object.hasOwn(compactV4, 'handoff_artifact_payload'), false);
+
+  const hydrated = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.equal(hydrated.status, 0, hydrated.stderr);
+  const hydratedJobs = parseStdout(hydrated);
+  const hydratedV4 = hydratedJobs.find(job => job.id === fixture.id);
+  const hydratedLegacy = hydratedJobs.find(job => job.id === legacyJobId);
+  assert.deepEqual(hydratedV4.handoff_artifact_payload, fixture.handoff_artifact_payload);
+  assert.equal(Object.hasOwn(hydratedLegacy, 'handoff_artifact_payload'), false);
+
+  const disabled = runNode(cliPath, ['jobs', 'disable', fixture.id, '--json'], { env });
+  assert.equal(disabled.status, 0, disabled.stderr);
+  const hydratedDisabled = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.equal(hydratedDisabled.status, 0, hydratedDisabled.stderr);
+  const disabledV4 = parseStdout(hydratedDisabled).find(job => job.id === fixture.id);
+  assert.equal(disabledV4.enabled, 0);
+  assert.deepEqual(disabledV4.handoff_artifact_payload, fixture.handoff_artifact_payload);
+});
+
+test('hydrated v4 job reads fail closed for invalid or missing persisted artifacts', t => {
+  const dir = tempRoot(t, 'scheduler-list-invalid-handoff-v4-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.exec('DROP TRIGGER trg_handoff_artifacts_no_update');
+    db.prepare('UPDATE handoff_artifacts SET payload = ? WHERE digest = ?')
+      .run('{broken', fixture.handoff_artifact_digest);
+  } finally {
+    db.close();
+  }
+
+  const invalid = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(invalid.status, 0);
+  assert.equal(parseStdout(invalid).code, 'HANDOFF_ARTIFACT_INVALID');
+
+  const missingDb = new Database(dbPath);
+  try {
+    missingDb.exec('DROP TRIGGER trg_handoff_artifacts_no_delete');
+    missingDb.prepare('DELETE FROM handoff_artifacts WHERE digest = ?')
+      .run(fixture.handoff_artifact_digest);
+  } finally {
+    missingDb.close();
+  }
+
+  const missing = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(missing.status, 0);
+  assert.equal(parseStdout(missing).code, 'HANDOFF_ARTIFACT_REQUIRED');
+});
+
+test('hydrated v4 job reads validate the artifact against the persisted job row', t => {
+  const dir = tempRoot(t, 'scheduler-list-mismatched-handoff-v4-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.prepare('UPDATE jobs SET effective_task_hash = ? WHERE id = ?')
+      .run(`sha256:${'f'.repeat(64)}`, fixture.id);
+  } finally {
+    db.close();
+  }
+
+  const mismatched = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(mismatched.status, 0);
+  assert.equal(parseStdout(mismatched).code, 'HANDOFF_ARTIFACT_INVALID');
+  assert.match(parseStdout(mismatched).error, /effective task hash|execution binding/);
+});
+
+test('doctor reports schema v29 and lease, queue, outbox, and approval diagnostics', t => {
   const dir = tempRoot(t, 'scheduler-doctor-');
   const result = runNode(cliPath, ['doctor', '--json'], {
     env: { SCHEDULER_DB: join(dir, 'scheduler.db') },
@@ -157,12 +293,13 @@ test('doctor reports schema v28 and lease, queue, outbox, and approval diagnosti
   assert.equal(result.status, 0, result.stderr);
   const payload = parseStdout(result);
   assert.equal(payload.ok, true);
-  assert.equal(payload.database.schema_version, 28);
-  assert.equal(payload.database.latest_schema_version, 28);
+  assert.equal(payload.database.schema_version, 29);
+  assert.equal(payload.database.latest_schema_version, 29);
   assert.ok('dispatcher_lease' in payload.diagnostics);
   assert.ok('dispatch_queue' in payload.diagnostics);
   assert.ok('delivery_outbox' in payload.diagnostics);
   assert.ok('approvals' in payload.diagnostics);
+  assert.equal(payload.diagnostics.evidence_records.verification_mode, 'cryptographic');
   assert.equal(payload.diagnostics.evidence_records.checked, 0);
   assert.equal(payload.diagnostics.evidence_records.verification_complete, true);
   assert.deepEqual(payload.database.integrity_check, ['ok']);
@@ -227,14 +364,16 @@ test('current databases remain readable while another process holds the write lo
     writer.exec('BEGIN IMMEDIATE');
     const status = runNode(cliPath, ['status', '--json'], { env });
     assert.equal(status.status, 0, status.stderr);
-    assert.equal(parseStdout(status).db_init_ok, true);
+    const statusPayload = parseStdout(status);
+    assert.equal(statusPayload.db_init_ok, true);
+    assert.equal(statusPayload.diagnostics.evidence_records.verification_mode, 'checksum');
   } finally {
     if (writer.inTransaction) writer.exec('ROLLBACK');
     writer.close();
   }
 });
 
-test('schema v28 consolidation repairs missing required indexes before taking the no-op path', t => {
+test('schema v29 consolidation repairs missing required indexes before taking the no-op path', t => {
   const dir = tempRoot(t, 'scheduler-index-repair-');
   const dbPath = join(dir, 'scheduler.db');
   const env = { SCHEDULER_DB: dbPath };
@@ -243,7 +382,7 @@ test('schema v28 consolidation repairs missing required indexes before taking th
 
   const db = new Database(dbPath);
   try {
-    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 28);
+    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 29);
     db.exec('DROP INDEX idx_delivery_outbox_group_part');
     assert.equal(
       db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
@@ -269,7 +408,84 @@ test('schema v28 consolidation repairs missing required indexes before taking th
 
   const noOp = runNode(consolidatePath, [], { env });
   assert.equal(noOp.status, 0, noOp.stderr);
-  assert.match(noOp.stdout, /DB already at v28/);
+  assert.match(noOp.stdout, /DB already at v29/);
+});
+
+test('schema v29 consolidation backfills retained v4 evidence verification metadata', t => {
+  const dir = tempRoot(t, 'scheduler-evidence-metadata-backfill-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const allowedSignersPath = join(dir, 'allowed_signers');
+  const privateKeyPath = join(dir, 'private-signing-key');
+  writeFileSync(allowedSignersPath, 'migration-principal ssh-ed25519 AAAATEST\n');
+  writeFileSync(privateKeyPath, 'PRIVATE-MATERIAL-MUST-NOT-BE-BACKFILLED\n');
+
+  const evidenceDeclaration = {
+    provider: 'ssh',
+    methods: ['ssh-signature'],
+    provider_config: {
+      principal: 'migration-principal',
+      allowed_signers_path: allowedSignersPath,
+      key_path: privateKeyPath,
+    },
+  };
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', JSON.stringify(validShellJob({
+      name: 'Evidence metadata migration probe',
+    })), '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+  const jobId = parseStdout(added).job.id;
+  const runId = 'evidence-metadata-migration-run';
+  const evidenceId = 'evidence-metadata-migration-record';
+  const artifactDigest = `sha256:${'a'.repeat(64)}`;
+  const db = new Database(dbPath);
+  try {
+    db.prepare(`
+      INSERT INTO runs (
+        id, job_id, status, finished_at, evidence_declaration_snapshot,
+        handoff_artifact_digest
+      ) VALUES (?, ?, 'ok', datetime('now'), ?, ?)
+    `).run(runId, jobId, JSON.stringify(evidenceDeclaration), artifactDigest);
+    db.prepare(`
+      INSERT INTO evidence_records (
+        id, run_id, job_id, algorithm, hash, payload,
+        handoff_artifact_digest, evidence_verified, evidence_envelope
+      ) VALUES (?, ?, ?, 'sha256', ?, '{}', ?, 1, ?)
+    `).run(
+      evidenceId,
+      runId,
+      jobId,
+      `sha256:${'b'.repeat(64)}`,
+      artifactDigest,
+      JSON.stringify({ method: 'ssh-signature', principal: 'envelope-principal' }),
+    );
+  } finally {
+    db.close();
+  }
+
+  const migrated = runNode(consolidatePath, [], { env });
+  assert.equal(migrated.status, 0, migrated.stderr);
+  assert.match(migrated.stdout, /Consolidation migration applied/);
+
+  const upgraded = new Database(dbPath, { readonly: true });
+  try {
+    const row = upgraded.prepare('SELECT * FROM evidence_records WHERE id = ?').get(evidenceId);
+    assert.equal(row.evidence_method, 'ssh-signature');
+    assert.equal(row.evidence_provider, 'ssh');
+    assert.equal(row.evidence_principal, 'migration-principal');
+    assert.equal(row.evidence_allowed_signers_path, allowedSignersPath);
+    assert.equal(JSON.stringify(row).includes(privateKeyPath), false);
+    assert.equal(JSON.stringify(row).includes('PRIVATE-MATERIAL'), false);
+  } finally {
+    upgraded.close();
+  }
+
+  const repeated = runNode(consolidatePath, [], { env });
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.match(repeated.stdout, /nothing to do/);
 });
 
 test('schema v28 consolidation repairs malformed correctness-critical unique indexes', t => {
@@ -327,7 +543,7 @@ test('older runtime refuses a database with a newer schema version', t => {
   assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
   const db = new Database(dbPath);
   try {
-    db.prepare('INSERT INTO schema_migrations (version) VALUES (29)').run();
+    db.prepare('INSERT INTO schema_migrations (version) VALUES (30)').run();
   } finally {
     db.close();
   }
@@ -337,10 +553,10 @@ test('older runtime refuses a database with a newer schema version', t => {
   const payload = parseStdout(rejected);
   assert.equal(payload.code, 'DB_INIT_FAILED');
   assert.equal(payload.details.phase, 'consolidation migration');
-  assert.match(payload.error, /newer than supported version 28/);
+  assert.match(payload.error, /newer than supported version 29/);
   const untouched = new Database(dbPath, { readonly: true });
   try {
-    assert.equal(untouched.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 29);
+    assert.equal(untouched.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 30);
   } finally {
     untouched.close();
   }
@@ -372,7 +588,7 @@ test('schema consolidation repairs complete baseline objects before its no-op pa
   }
   const noOp = runNode(consolidatePath, [], { env });
   assert.equal(noOp.status, 0, noOp.stderr);
-  assert.match(noOp.stdout, /DB already at v28/);
+  assert.match(noOp.stdout, /DB already at v29/);
 });
 
 test('schema consolidation normalizes legacy output-triggered delivery and rejects unknown modes', t => {
@@ -428,7 +644,7 @@ test('schema consolidation normalizes legacy output-triggered delivery and rejec
   }
 });
 
-test('schema v28 consolidation strengthens queue binding nullability without losing references', t => {
+test('schema v29 consolidation strengthens queue binding nullability without losing references', t => {
   const dir = tempRoot(t, 'scheduler-queue-binding-repair-');
   const dbPath = join(dir, 'scheduler.db');
   const env = { SCHEDULER_DB: dbPath };
@@ -451,6 +667,10 @@ test('schema v28 consolidation strengthens queue binding nullability without los
     db.prepare(`
       INSERT INTO runs (id, job_id, status, dispatch_queue_id)
       VALUES ('queue-repair-run', 'queue-repair-job', 'awaiting_approval', 'queue-repair-dispatch')
+    `).run();
+    db.prepare(`
+      INSERT INTO runs (id, job_id, status, finished_at)
+      VALUES ('queue-repair-source-run', 'queue-repair-job', 'ok', datetime('now'))
     `).run();
     db.prepare(`
       INSERT INTO approvals (
@@ -478,10 +698,15 @@ test('schema v28 consolidation strengthens queue binding nullability without los
         claim_expires_at TEXT,
         attempt_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
-        replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+        replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        handoff_artifact_digest TEXT,
+        source_run_handoff_artifact_digest TEXT
       );
       INSERT INTO job_dispatch_queue_nullable SELECT * FROM job_dispatch_queue;
       UPDATE job_dispatch_queue_nullable SET binding_scheduled_for = NULL;
+      UPDATE job_dispatch_queue_nullable
+      SET source_run_id = 'queue-repair-source-run'
+      WHERE id = 'queue-repair-dispatch';
       DROP TABLE job_dispatch_queue;
       ALTER TABLE job_dispatch_queue_nullable RENAME TO job_dispatch_queue;
     `);
@@ -493,7 +718,7 @@ test('schema v28 consolidation strengthens queue binding nullability without los
   const repaired = runNode(consolidatePath, [], { env });
   assert.equal(repaired.status, 0, repaired.stderr);
   assert.match(repaired.stdout, /Consolidation migration applied/);
-  const repairedDb = new Database(dbPath, { readonly: true });
+  const repairedDb = new Database(dbPath);
   try {
     const bindingColumn = repairedDb.prepare('PRAGMA table_info(job_dispatch_queue)').all()
       .find(column => column.name === 'binding_scheduled_for');
@@ -509,6 +734,18 @@ test('schema v28 consolidation strengthens queue binding nullability without los
     assert.equal(
       repairedDb.prepare("SELECT dispatch_queue_id FROM approvals WHERE id = 'queue-repair-approval'").get().dispatch_queue_id,
       'queue-repair-dispatch',
+    );
+    assert.equal(
+      repairedDb.pragma('foreign_key_list(job_dispatch_queue)')
+        .some(foreignKey => foreignKey.from === 'source_run_id'),
+      false,
+    );
+    repairedDb.prepare("DELETE FROM runs WHERE id = 'queue-repair-source-run'").run();
+    assert.equal(
+      repairedDb.prepare(
+        "SELECT source_run_id FROM job_dispatch_queue WHERE id = 'queue-repair-dispatch'",
+      ).get().source_run_id,
+      'queue-repair-source-run',
     );
     assert.deepEqual(repairedDb.pragma('foreign_key_check'), []);
   } finally {
@@ -588,15 +825,15 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
       ALTER TABLE delivery_outbox DROP COLUMN part_count;
       ALTER TABLE delivery_outbox DROP COLUMN completion_label;
       ALTER TABLE delivery_outbox DROP COLUMN completion_scope;
-      DELETE FROM schema_migrations WHERE version = 28;
+      DELETE FROM schema_migrations WHERE version >= 28;
     `);
   } finally {
     db.close();
   }
 
   const upgraded = runNode(cliPath, ['doctor', '--deep', '--json'], { env });
-  assert.equal(upgraded.status, 0, upgraded.stderr);
-  assert.equal(parseStdout(upgraded).database.schema_version, 28);
+  assert.equal(upgraded.status, 0, `${upgraded.stderr}\n${upgraded.stdout}`);
+  assert.equal(parseStdout(upgraded).database.schema_version, 29);
   const upgradedDb = new Database(dbPath, { readonly: true });
   try {
     const expectedColumns = {
@@ -621,6 +858,10 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
       delivery_outbox: [
         'delivery_group_id', 'part_index', 'part_count',
         'completion_label', 'completion_scope',
+      ],
+      evidence_records: [
+        'evidence_provider', 'evidence_principal',
+        'evidence_allowed_signers_path',
       ],
     };
     for (const [table, columns] of Object.entries(expectedColumns)) {
@@ -710,7 +951,7 @@ test('schema v28 consolidation removes redundant completion-debt uniqueness', t 
   }
 });
 
-test('schema v28 consolidation recreates a completely missing approvals table', t => {
+test('schema v29 consolidation recreates a completely missing approvals table', t => {
   const dir = tempRoot(t, 'scheduler-approvals-repair-');
   const dbPath = join(dir, 'scheduler.db');
   const env = { SCHEDULER_DB: dbPath };
@@ -734,6 +975,7 @@ test('schema v28 consolidation recreates a completely missing approvals table', 
     for (const column of [
       'dispatch_queue_id', 'decision_version', 'risk_level', 'approver_scope',
       'binding_hash', 'gate_kind', 'decision_context',
+      'handoff_artifact_digest', 'source_run_id', 'source_run_handoff_artifact_digest',
     ]) {
       assert(columns.has(column), `recreated approvals table missing ${column}`);
     }

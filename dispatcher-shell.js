@@ -233,8 +233,8 @@ function makeMaxBufferError(maxBuffer) {
  * Run a shell command with bounded output and real process-tree cancellation.
  *
  * The first three positional arguments retain the historical API. Runtime
- * controls are passed in the fourth argument: signal, onProcess, maxBuffer,
- * killGraceMs, cwd, shell, and envPolicy.
+ * controls are passed in the fourth argument: signal, stdin, onProcess,
+ * maxBuffer, killGraceMs, cwd, shell, and envPolicy.
  */
 export function runShellCommand(cmd, timeoutMs = 300_000, env = null, options = {}) {
   if (!cmd || typeof cmd !== 'string') throw new Error('Shell command must be a non-empty string');
@@ -249,6 +249,18 @@ export function runShellCommand(cmd, timeoutMs = 300_000, env = null, options = 
   const signal = options.signal || null;
   if (signal && typeof signal.addEventListener !== 'function') {
     throw new Error('signal must be an AbortSignal');
+  }
+  const stdin = options.stdin == null
+    ? null
+    : Buffer.isBuffer(options.stdin)
+      ? options.stdin
+      : options.stdin instanceof Uint8Array
+        ? Buffer.from(options.stdin)
+      : typeof options.stdin === 'string'
+        ? Buffer.from(options.stdin, 'utf8')
+        : null;
+  if (options.stdin != null && stdin === null) {
+    throw new Error('stdin must be a string, Uint8Array, or null');
   }
   const startedAt = new Date().toISOString();
 
@@ -346,7 +358,7 @@ export function runShellCommand(cmd, timeoutMs = 300_000, env = null, options = 
         env: buildShellEnvironment(env, options.envPolicy || 'inherit'),
         detached: process.platform !== 'win32',
         windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       closeSeen = true;
@@ -361,6 +373,14 @@ export function runShellCommand(cmd, timeoutMs = 300_000, env = null, options = 
     child.stderr.on('data', chunk => {
       if (appendCapture(stderr, chunk)) beginTermination('maxBuffer');
     });
+    if (stdin !== null) {
+      child.stdin.once('error', err => {
+        if (err?.code !== 'EPIPE' && err?.code !== 'ERR_STREAM_DESTROYED') {
+          beginTermination('stdin', err);
+        }
+      });
+      child.stdin.end(stdin);
+    }
     child.once('error', err => { spawnError = err; });
     child.once('close', (code, childSignal) => {
       closeSeen = true;

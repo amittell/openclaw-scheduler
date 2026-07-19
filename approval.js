@@ -1,6 +1,7 @@
 // Approval gate management for HITL workflows
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
+import { appendRuntimeEvent } from './runtime-events.js';
 import {
   approvalBindingHashForDb,
   approverMatchesScope,
@@ -48,7 +49,7 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
     if (job.enabled !== 1) throw new Error(`Cannot create approval for disabled job '${jobId}'`);
 
     const dispatch = dispatchQueueId
-      ? db.prepare('SELECT id, job_id FROM job_dispatch_queue WHERE id = ?').get(dispatchQueueId)
+      ? db.prepare('SELECT * FROM job_dispatch_queue WHERE id = ?').get(dispatchQueueId)
       : null;
     if (dispatchQueueId && !dispatch) {
       throw approvalAssociationError('Cannot create approval for a missing dispatch');
@@ -58,7 +59,7 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
     }
 
     const run = runId
-      ? db.prepare('SELECT id, job_id, dispatch_queue_id FROM runs WHERE id = ?').get(runId)
+      ? db.prepare('SELECT * FROM runs WHERE id = ?').get(runId)
       : null;
     if (runId && !run) {
       throw approvalAssociationError('Cannot create approval for a missing run');
@@ -84,6 +85,12 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
           existing.job_id !== jobId
           || (existing.run_id || null) !== (runId || null)
           || existing.dispatch_queue_id !== dispatchQueueId
+          || (Number(job.handoff_version) === 4 && (
+            existing.handoff_artifact_digest !== job.handoff_artifact_digest
+            || existing.source_run_id !== (dispatch?.source_run_id || null)
+            || existing.source_run_handoff_artifact_digest
+              !== (dispatch?.source_run_handoff_artifact_digest || null)
+          ))
         ) {
           throw approvalAssociationError('Existing approval belongs to a different job, run, or dispatch');
         }
@@ -113,8 +120,10 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
     db.prepare(`
       INSERT INTO approvals (
         id, job_id, run_id, dispatch_queue_id, status, requested_at, expires_at,
-        risk_level, approver_scope, binding_hash, gate_kind, decision_context
-      ) VALUES (?, ?, ?, ?, 'pending', datetime('now'), ?, ?, ?, ?, ?, ?)
+        risk_level, approver_scope, binding_hash, gate_kind, decision_context,
+        handoff_artifact_digest, source_run_id,
+        source_run_handoff_artifact_digest
+      ) VALUES (?, ?, ?, ?, 'pending', datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       jobId,
@@ -130,7 +139,26 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
         : typeof opts.decisionContext === 'string'
           ? opts.decisionContext
           : JSON.stringify(opts.decisionContext),
+      Number(job.handoff_version) === 4 ? job.handoff_artifact_digest : null,
+      Number(job.handoff_version) === 4 ? (dispatch?.source_run_id || run?.source_run_id || null) : null,
+      Number(job.handoff_version) === 4
+        ? (dispatch?.source_run_handoff_artifact_digest
+          || run?.source_run_handoff_artifact_digest
+          || null)
+        : null,
     );
+
+    if (Number(job.handoff_version) === 4) {
+      if (dispatch?.handoff_artifact_digest !== job.handoff_artifact_digest
+        || (run && run.handoff_artifact_digest !== job.handoff_artifact_digest)) {
+        throw approvalAssociationError('Approval artifact does not match its job, run, and dispatch');
+      }
+      if ((dispatch?.source_run_id || null) !== (run?.source_run_id || null)
+        || (dispatch?.source_run_handoff_artifact_digest || null)
+          !== (run?.source_run_handoff_artifact_digest || null)) {
+        throw approvalAssociationError('Approval source-run binding does not match its run and dispatch');
+      }
+    }
 
     if (runId) {
       db.prepare(`
@@ -165,7 +193,20 @@ export function createApproval(jobId, runId, dispatchQueueId = null, opts = {}) 
       `).run(dispatchQueueId);
     }
 
-    return { ...getApproval(id, { db }), deduped: false };
+    const created = { ...getApproval(id, { db }), deduped: false };
+    if (Number(job.handoff_version) === 4) {
+      appendRuntimeEvent('approval.requested', {
+        jobId,
+        runId,
+        approvalId: id,
+        dispatchQueueId,
+        handoffArtifactDigest: job.handoff_artifact_digest,
+        sourceRunId: created.source_run_id,
+        sourceRunHandoffArtifactDigest: created.source_run_handoff_artifact_digest,
+        payload: { gate_kind: gateKind, binding_hash: created.binding_hash },
+      }, { db });
+    }
+    return created;
   };
   const transaction = db.transaction(create);
   return db.inTransaction ? transaction() : transaction.immediate();

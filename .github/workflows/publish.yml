@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout scheduler
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: scheduler
           fetch-depth: 0
@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24'
           cache: npm
@@ -62,6 +62,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - contract: handoff-v4
+            ref: 6fe2790340ff2294359675f8b3c2d8a9a4aa8fa7
           - contract: handoff-v3
             ref: f1fed6d7d451196bda316b82d6567b174012a4ba
           - contract: handoff-v2
@@ -72,13 +74,13 @@ jobs:
 
     steps:
       - name: Checkout scheduler
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: scheduler
           persist-credentials: false
 
       - name: Checkout pinned public agentcli
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: amittell/agentcli
           ref: ${{ matrix.ref }}
@@ -86,7 +88,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24'
           cache: npm
@@ -95,11 +97,22 @@ jobs:
       - name: Install scheduler dependencies
         run: npm ci
 
+      - name: Link checked-out agentcli for handoff v4 runtime tests
+        if: ${{ matrix.contract == 'handoff-v4' }}
+        run: |
+          mkdir -p node_modules/@amittell
+          rm -rf node_modules/@amittell/agentcli
+          ln -s ../../../agentcli node_modules/@amittell/agentcli
+
       - name: Run required scheduler-agentcli contract checks
         env:
           AGENTCLI_PATH: ${{ github.workspace }}/agentcli
           AGENTCLI_CONTRACT: ${{ matrix.contract }}
         run: npm run test:agentcli
+
+      - name: Verify shared handoff v4 fixture parity
+        if: ${{ matrix.contract == 'handoff-v4' }}
+        run: cmp fixtures/handoff-v4/conformance.json ../agentcli/fixtures/handoff-v4/conformance.json
 
   published-agentcli:
     name: Published agentcli 0.4.1 black-box (Ubuntu / Node 24)
@@ -113,13 +126,13 @@ jobs:
 
     steps:
       - name: Checkout scheduler
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: scheduler
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24'
           cache: npm
@@ -154,7 +167,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
-      contents: read
+      contents: write
       id-token: write
     defaults:
       run:
@@ -162,7 +175,7 @@ jobs:
 
     steps:
       - name: Checkout scheduler
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: scheduler
           fetch-depth: 0
@@ -200,15 +213,15 @@ jobs:
           exit 1
 
       - name: Checkout pinned public agentcli
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: amittell/agentcli
-          ref: f1fed6d7d451196bda316b82d6567b174012a4ba
+          ref: 6fe2790340ff2294359675f8b3c2d8a9a4aa8fa7
           path: agentcli
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24'
           cache: npm
@@ -230,5 +243,10 @@ jobs:
       - name: Publish
         env:
           AGENTCLI_PATH: ${{ github.workspace }}/agentcli
-          AGENTCLI_CONTRACT: handoff-v3
+          AGENTCLI_CONTRACT: handoff-v4
         run: npm publish --access public --provenance
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes

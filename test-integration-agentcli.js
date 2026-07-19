@@ -577,10 +577,10 @@ if (agentcliAvailable && existsSync(agentcliExamples)) {
     const evidenceApplyFailure = applyManifestExpectingFailure(
       resolve(agentcliExamples, 'identity-v2.json'),
     );
-    assert(evidenceApplyFailure?.ok === false, 'agentcli evidence apply fails capability negotiation');
+    assert(evidenceApplyFailure?.ok === false, 'agentcli evidence apply fails closed');
     assert(
-      JSON.stringify(evidenceApplyFailure).includes('evidence_generation'),
-      'agentcli evidence capability failure names evidence_generation',
+      evidenceApplyFailure?.code === 'scheduler_error',
+      'agentcli surfaces the scheduler rejection for unsupported non-checksum evidence',
     );
 
     const supportedManifest = {

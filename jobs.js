@@ -7,8 +7,13 @@ import { enqueueDispatch } from './dispatch-queue.js';
 import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js';
 import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
-import { persistTerminalEvidence } from './runs.js';
+import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
+import {
+  assertValidHandoffArtifact,
+  getHandoffArtifact,
+  persistHandoffArtifact,
+} from './handoff-artifact.js';
 
 const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
@@ -33,6 +38,31 @@ const VALID_CHECKSUM_EVIDENCE_BINDINGS = new Set([
 ]);
 const MAX_TRIGGER_CONDITION_LENGTH = 1024;
 const MAX_TRIGGER_REGEX_INPUT_BYTES = 65536;
+const HANDOFF_V4_BOUND_FIELDS = new Set([
+  'name', 'enabled', 'schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz',
+  'parent_id', 'trigger_on', 'trigger_delay_s', 'trigger_condition', 'origin',
+  'session_target', 'agent_id', 'payload_kind', 'payload_message', 'payload_model',
+  'payload_model_fallback', 'payload_thinking', 'payload_timeout_seconds',
+  'preferred_session_key', 'auth_profile', 'auth_profile_fallback',
+  'overlap_policy', 'max_retries', 'max_queued_dispatches', 'max_pending_approvals',
+  'max_trigger_fanout', 'delivery_guarantee', 'resource_pool', 'job_class',
+  'payload_scope', 'delivery_mode', 'delivery_channel',
+  'delivery_to', 'delivery_opt_out_reason', 'context_retrieval',
+  'context_retrieval_limit', 'run_timeout_ms', 'delete_after_run', 'approval_required', 'approval_timeout_s',
+  'approval_auto', 'approval_risk_level', 'approval_approver_scope', 'output_format',
+  'output_store_limit_bytes', 'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
+  'output_offload_threshold_bytes', 'verify_shell', 'verify_timeout_s', 'verify_on_failure',
+  'execution_intent', 'execution_read_only', 'shell_env_policy', 'identity_principal',
+  'identity_run_as', 'identity_attestation', 'identity_ref', 'identity_subject_kind',
+  'identity_subject_principal', 'identity_trust_level', 'identity_delegation_mode',
+  'identity', 'authorization_proof_ref', 'authorization_proof', 'authorization_ref',
+  'authorization', 'evidence_ref', 'evidence', 'contract_required_trust_level',
+  'contract_trust_enforcement', 'contract_sandbox', 'contract_allowed_paths',
+  'contract_network', 'contract_max_cost_usd', 'contract_audit', 'child_credential_policy',
+  'job_type', 'watchdog_target_label', 'watchdog_check_cmd',
+  'watchdog_timeout_min', 'watchdog_alert_channel', 'watchdog_alert_target',
+  'watchdog_self_destruct', 'watchdog_started_at',
+]);
 
 /**
  * Valid payload_kind values for each session_target.
@@ -75,6 +105,8 @@ const PATCHABLE_COLUMNS = new Set([
   'child_credential_policy',
   'approval_risk_level', 'approval_approver_scope', 'output_format',
   'verify_shell', 'verify_timeout_s', 'verify_on_failure',
+  // Agentcli handoff v4 immutable execution binding
+  'handoff_version', 'handoff_artifact_digest', 'effective_task_hash',
 ]);
 
 function applyJobPatch(jobId, patch) {
@@ -113,9 +145,38 @@ function normalizeSqliteUtcDateTime(name, value) {
 }
 
 function assertParentJobExists(parentId) {
-  const parent = getDb().prepare('SELECT id FROM jobs WHERE id = ?').get(parentId);
+  const parent = getDb().prepare(`
+    SELECT *
+    FROM jobs
+    WHERE id = ?
+  `).get(parentId);
   if (!parent) {
     throw new Error(`parent job does not exist: ${parentId}`);
+  }
+  return parent;
+}
+
+function assertV4ParentLineage(parentId) {
+  const parent = assertParentJobExists(parentId);
+  if (Number(parent.handoff_version) !== 4 || !parent.handoff_artifact_digest) {
+    throw Object.assign(
+      new Error(`Handoff v4 child requires a handoff v4 parent: ${parentId}`),
+      { code: 'HANDOFF_V4_PARENT_REQUIRED' },
+    );
+  }
+  try {
+    const artifact = getHandoffArtifact(parent.handoff_artifact_digest);
+    if (!artifact) throw new Error('persisted artifact is missing');
+    assertValidHandoffArtifact(artifact.payload, {
+      expectedDigest: parent.handoff_artifact_digest,
+      job: parent,
+      allowDisabledStateMismatch: true,
+    });
+  } catch (cause) {
+    throw Object.assign(
+      new Error(`Handoff v4 parent cannot provide valid lineage: ${parentId}`),
+      { code: 'HANDOFF_V4_PARENT_REQUIRED', cause },
+    );
   }
 }
 
@@ -333,6 +394,55 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
 
   const merged = { ...(currentJob || {}), ...normalized };
+  if ('handoff_version' in normalized && normalized.handoff_version != null) {
+    const parsed = Number(normalized.handoff_version);
+    if (!Number.isInteger(parsed)) throw new Error('handoff_version must be an integer');
+    normalized.handoff_version = parsed;
+    merged.handoff_version = parsed;
+  }
+  const handoffVersion = Number(merged.handoff_version || 0);
+  if (Number(currentJob?.handoff_version || 0) === 4 && handoffVersion !== 4) {
+    throw Object.assign(
+      new Error('Handoff v4 jobs cannot be downgraded or cleared'),
+      { code: 'HANDOFF_ARTIFACT_DOWNGRADE_REFUSED' },
+    );
+  }
+  if (handoffVersion !== 0 && handoffVersion !== 4) {
+    throw new Error('Persisted handoff_version must be 4 when supplied');
+  }
+  if (handoffVersion === 4) {
+    for (const [name, value] of [
+      ['handoff_artifact_digest', merged.handoff_artifact_digest],
+      ['effective_task_hash', merged.effective_task_hash],
+    ]) {
+      if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+        throw new Error(`${name} must be a lowercase sha256 digest for handoff v4`);
+      }
+    }
+    const requiresPayload = mode === 'create'
+      || Number(currentJob?.handoff_version || 0) !== 4
+      || 'handoff_artifact_digest' in normalized
+      || 'effective_task_hash' in normalized;
+    if (requiresPayload && normalized.handoff_artifact_payload == null) {
+      throw new Error('handoff_artifact_payload is required when creating or replacing a v4 artifact');
+    }
+    if (normalized.handoff_artifact_payload != null) {
+      const validated = assertValidHandoffArtifact(normalized.handoff_artifact_payload, {
+        expectedDigest: merged.handoff_artifact_digest,
+      });
+      normalized.handoff_artifact_payload = validated.payload;
+      merged.handoff_artifact_payload = validated.payload;
+      if (validated.payload.compiled.effective_task_hash !== merged.effective_task_hash) {
+        throw new Error('effective_task_hash does not match handoff_artifact_payload');
+      }
+    }
+  } else if (
+    normalized.handoff_artifact_digest != null
+    || normalized.handoff_artifact_payload != null
+    || normalized.effective_task_hash != null
+  ) {
+    throw new Error('Handoff artifact fields require handoff_version 4');
+  }
   const isChild = !!merged.parent_id;
   if (mode === 'create' || 'schedule_kind' in normalized) {
     assertEnum('schedule_kind', merged.schedule_kind || 'cron', VALID_SCHEDULE_KINDS);
@@ -518,6 +628,11 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (merged.execution_intent === 'fire-and-forget' && (merged.session_target || 'isolated') !== 'main') {
     throw new Error('execution_intent "fire-and-forget" is only supported for session_target "main"');
+  }
+  if (handoffVersion === 4 && merged.execution_intent === 'fire-and-forget') {
+    throw new Error(
+      'Handoff v4 does not support execution_intent "fire-and-forget" because the main-session system-event transport cannot enforce artifact-bound Gateway requests',
+    );
   }
   if (merged.execution_intent === 'fire-and-forget' && merged.output_format != null) {
     throw new Error('output_format is not supported for execution_intent "fire-and-forget" because no synchronous task output exists');
@@ -709,6 +824,15 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     assertOptionalBoolean('authorization_proof.verify.required', proofBlob.verify?.required);
     assertOptionalObject('authorization_proof.proof', proofBlob.proof, new Set(['value_from']));
     assertOptionalObject('authorization_proof.proof.value_from', proofBlob.proof?.value_from, VALUE_FROM_KEYS);
+    if (handoffVersion === 4 && proofBlob.method && proofBlob.method !== 'none') {
+      const valueFrom = proofBlob.proof?.value_from;
+      const sources = valueFrom && typeof valueFrom === 'object'
+        ? Object.keys(valueFrom).filter(key => valueFrom[key] != null)
+        : [];
+      if (sources.length !== 1 || !['env', 'file'].includes(sources[0])) {
+        throw new Error('handoff v4 authorization proof requires exactly one env or file source');
+      }
+    }
   }
 
   // --- v0.2 Authorization ---
@@ -753,7 +877,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     const evidenceBlob = JSON.parse(merged.evidence);
     assertKnownObjectKeys('evidence', evidenceBlob, new Set([
       'id', 'ref', 'provider', 'methods', 'provider_config', 'payload', 'verify',
-      'collect', 'retention', 'format',
+      'collect', 'retention', 'format', 'payload_hash', 'provider_config_hash',
     ]));
     if (evidenceBlob.id != null) {
       assertSafeString('evidence.id', evidenceBlob.id, { allowEmpty: false, maxLength: 256 });
@@ -773,11 +897,32 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     if (methods === null || methods.some(method => typeof method !== 'string' || !method)) {
       throw new Error('evidence.methods must be an array of non-empty strings');
     }
-    if (evidenceBlob.methods != null && (methods.length !== 1 || methods[0] !== 'sha256')) {
-      throw new Error('evidence.methods must contain exactly one sha256 method');
-    }
-    if (evidenceBlob.verify?.required === true) {
-      throw new Error('evidence.verify.required is not supported by the scheduler checksum evidence backend');
+    if (handoffVersion === 4) {
+      if (!provider) throw new Error('handoff v4 evidence requires a provider');
+      if (methods.length === 0) throw new Error('handoff v4 evidence requires at least one provider method');
+      for (const field of ['payload_hash', 'provider_config_hash']) {
+        if (!Object.hasOwn(evidenceBlob, field)) {
+          throw new Error(`handoff v4 evidence requires ${field}`);
+        }
+        if (evidenceBlob[field] != null
+          && !/^sha256:[0-9a-f]{64}$/.test(evidenceBlob[field])) {
+          throw new Error(`evidence.${field} must be a lowercase sha256 digest or null`);
+        }
+      }
+      if (evidenceBlob.payload && evidenceBlob.payload_hash == null) {
+        throw new Error('handoff v4 evidence payload requires payload_hash');
+      }
+    } else {
+      if (Object.hasOwn(evidenceBlob, 'payload_hash')
+        || Object.hasOwn(evidenceBlob, 'provider_config_hash')) {
+        throw new Error('evidence hash bindings require handoff v4');
+      }
+      if (evidenceBlob.methods != null && (methods.length !== 1 || methods[0] !== 'sha256')) {
+        throw new Error('evidence.methods must contain exactly one sha256 method');
+      }
+      if (evidenceBlob.verify?.required === true) {
+        throw new Error('evidence.verify.required is not supported by the scheduler checksum evidence backend');
+      }
     }
     assertOptionalObject('evidence.verify', evidenceBlob.verify, new Set(['required']));
     assertOptionalBoolean('evidence.verify.required', evidenceBlob.verify?.required);
@@ -851,25 +996,24 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
         }
       }
     }
-    if (provider && !['sha256', 'checksum'].includes(provider)) {
+    if (handoffVersion !== 4 && provider && !['sha256', 'checksum'].includes(provider)) {
       throw new Error(`evidence provider ${JSON.stringify(provider)} is not supported; the scheduler currently supports only sha256 checksum evidence`);
     }
-    if (methods.some(method => method !== 'sha256')) {
+    if (handoffVersion !== 4 && methods.some(method => method !== 'sha256')) {
       throw new Error('evidence.methods contains an unsupported method; the scheduler currently supports only sha256');
     }
-    if (
-      evidenceBlob.provider_config != null
-      && (
-        typeof evidenceBlob.provider_config !== 'object'
-        || Array.isArray(evidenceBlob.provider_config)
-        || Object.keys(evidenceBlob.provider_config).length > 0
-      )
-    ) {
+    if (evidenceBlob.provider_config != null
+      && (typeof evidenceBlob.provider_config !== 'object' || Array.isArray(evidenceBlob.provider_config))) {
+      throw new Error('evidence.provider_config must be an object or null');
+    }
+    if (handoffVersion !== 4
+      && evidenceBlob.provider_config != null
+      && Object.keys(evidenceBlob.provider_config).length > 0) {
       throw new Error('evidence.provider_config is not supported by the scheduler checksum evidence backend');
     }
     const evidenceFormat = evidenceBlob.payload?.format || evidenceBlob.format || null;
     if (evidenceFormat && !['canonical-json', 'json'].includes(evidenceFormat)) {
-      throw new Error('evidence format must be "canonical-json" or "json" for checksum evidence');
+      throw new Error('evidence format must be "canonical-json" or "json"');
     }
     if (evidenceBlob.collect != null) {
       const supportedCollect = new Set([
@@ -887,7 +1031,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
       }
     }
     if (evidenceBlob.payload?.format && !['canonical-json', 'json'].includes(evidenceBlob.payload.format)) {
-      throw new Error('evidence.payload.format must be "canonical-json" or "json" for checksum evidence');
+      throw new Error('evidence.payload.format must be "canonical-json" or "json"');
     }
   }
 
@@ -1051,6 +1195,9 @@ export function createJob(opts) {
   // Cycle detection + depth check for child jobs
   if (isChild) {
     assertParentJobExists(normalized.parent_id);
+    if (Number(normalized.handoff_version) === 4) {
+      assertV4ParentLineage(normalized.parent_id);
+    }
     detectCycle(id, normalized.parent_id);
     const depth = getChainDepth(normalized.parent_id) + 1; // +1 for the new child
     if (depth > MAX_CHAIN_DEPTH) {
@@ -1062,6 +1209,30 @@ export function createJob(opts) {
   const finalTarget = normalized.session_target || 'isolated';
   const finalKind = normalized.payload_kind || (finalTarget === 'main' ? 'systemEvent' : finalTarget === 'shell' ? 'shellCommand' : 'agentTurn');
   validateJobPayload(finalTarget, finalKind);
+
+  if (Number(normalized.handoff_version) === 4) {
+    const artifactJob = {
+      ...normalized,
+      id,
+      session_target: finalTarget,
+      agent_id: normalized.agent_id || 'main',
+      payload_kind: finalKind,
+      payload_message: normalized.payload_message,
+      run_timeout_ms: normalized.run_timeout_ms ?? 300000,
+      enabled: normalized.enabled == null ? 1 : Number(Boolean(normalized.enabled)),
+      delete_after_run: Number(Boolean(normalized.delete_after_run)),
+      effective_task_hash: normalized.effective_task_hash,
+    };
+    assertValidHandoffArtifact(normalized.handoff_artifact_payload, {
+      expectedDigest: normalized.handoff_artifact_digest,
+      job: artifactJob,
+    });
+    persistHandoffArtifact(
+      normalized.handoff_artifact_payload,
+      normalized.handoff_artifact_digest,
+      { db },
+    );
+  }
 
   const nextRun = normalized.next_run_at || deriveNextRunAt({
     ...normalized,
@@ -1106,7 +1277,8 @@ export function createJob(opts) {
       contract_required_trust_level, contract_trust_enforcement,
       contract_sandbox, contract_allowed_paths, contract_network,
       contract_max_cost_usd, contract_audit,
-      child_credential_policy
+      child_credential_policy,
+      handoff_version, handoff_artifact_digest, effective_task_hash
 ) VALUES (
       ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
@@ -1138,7 +1310,8 @@ export function createJob(opts) {
       ?, ?,
       ?, ?, ?,
       ?, ?,
-      ?
+      ?,
+      ?, ?, ?
     )
   `);
 
@@ -1231,7 +1404,10 @@ export function createJob(opts) {
     normalized.contract_network || null,
     normalized.contract_max_cost_usd ?? null,
     normalized.contract_audit || null,
-    normalized.child_credential_policy || null
+    normalized.child_credential_policy || null,
+    Number(normalized.handoff_version) === 4 ? 4 : null,
+    normalized.handoff_artifact_digest || null,
+    normalized.effective_task_hash || null
   );
 
   return getJob(id);
@@ -1249,10 +1425,43 @@ export function getJob(id) {
  */
 export function listJobs(opts = {}) {
   const db = getDb();
-  if (opts.enabledOnly) {
-    return db.prepare('SELECT * FROM jobs WHERE enabled = 1 ORDER BY next_run_at').all();
-  }
-  return db.prepare('SELECT * FROM jobs ORDER BY name').all();
+  const rows = opts.enabledOnly
+    ? db.prepare('SELECT * FROM jobs WHERE enabled = 1 ORDER BY next_run_at').all()
+    : db.prepare('SELECT * FROM jobs ORDER BY name').all();
+  if (opts.includeHandoffArtifacts !== true) return rows;
+
+  return rows.map(job => {
+    if (Number(job.handoff_version) !== 4) return job;
+    if (!job.handoff_artifact_digest) {
+      throw Object.assign(
+        new Error(`Handoff v4 job ${job.id} is missing artifact digest`),
+        { code: 'HANDOFF_ARTIFACT_REQUIRED' },
+      );
+    }
+
+    let artifact;
+    try {
+      artifact = getHandoffArtifact(job.handoff_artifact_digest, { db });
+    } catch (error) {
+      throw Object.assign(
+        new Error(`Persisted handoff v4 artifact for job ${job.id} is not valid JSON`),
+        { code: 'HANDOFF_ARTIFACT_INVALID', cause: error },
+      );
+    }
+    if (!artifact) {
+      throw Object.assign(
+        new Error(`Handoff v4 artifact for job ${job.id} is not persisted`),
+        { code: 'HANDOFF_ARTIFACT_REQUIRED' },
+      );
+    }
+
+    const validation = assertValidHandoffArtifact(artifact.payload, {
+      expectedDigest: job.handoff_artifact_digest,
+      job,
+      allowDisabledStateMismatch: true,
+    });
+    return { ...job, handoff_artifact_payload: validation.payload };
+  });
 }
 
 /**
@@ -1297,7 +1506,60 @@ export function updateJob(id, patch) {
     'contract_sandbox', 'contract_allowed_paths', 'contract_network',
     'contract_max_cost_usd', 'contract_audit',
     'child_credential_policy',
+    // Agentcli handoff v4 immutable execution binding
+    'handoff_version', 'handoff_artifact_digest', 'effective_task_hash',
   ];
+
+  const nextJob = { ...current, ...normalized, id };
+  if (Number(nextJob.handoff_version) === 4 && nextJob.parent_id) {
+    assertV4ParentLineage(nextJob.parent_id);
+  }
+  let artifactReplacing = false;
+  if (Number(nextJob.handoff_version) === 4) {
+    const payloadProvided = normalized.handoff_artifact_payload != null;
+    const changedBoundFields = [...HANDOFF_V4_BOUND_FIELDS].filter(key => (
+      key in normalized && normalized[key] !== current[key]
+    ));
+    const disableOnly = changedBoundFields.length === 1
+      && changedBoundFields[0] === 'enabled'
+      && !normalized.enabled;
+    let restoredOriginalBinding = false;
+    if (Number(current.handoff_version) === 4
+      && changedBoundFields.length > 0
+      && !disableOnly
+      && !payloadProvided) {
+      const persistedArtifact = getHandoffArtifact(current.handoff_artifact_digest, { db });
+      if (persistedArtifact) {
+        try {
+          assertValidHandoffArtifact(persistedArtifact.payload, {
+            expectedDigest: current.handoff_artifact_digest,
+            job: nextJob,
+          });
+          restoredOriginalBinding = true;
+        } catch {
+          restoredOriginalBinding = false;
+        }
+      }
+    }
+    if (Number(current.handoff_version) === 4
+      && changedBoundFields.length > 0
+      && !disableOnly
+      && !restoredOriginalBinding
+      && !payloadProvided) {
+      throw Object.assign(
+        new Error(`Handoff v4 bound fields require a replacement artifact: ${changedBoundFields.join(', ')}`),
+        { code: 'HANDOFF_ARTIFACT_REQUIRED' },
+      );
+    }
+    if (payloadProvided) {
+      assertValidHandoffArtifact(normalized.handoff_artifact_payload, {
+        expectedDigest: nextJob.handoff_artifact_digest,
+        job: nextJob,
+      });
+      artifactReplacing = Number(current.handoff_version) === 4
+        && nextJob.handoff_artifact_digest !== current.handoff_artifact_digest;
+    }
+  }
 
   // Cycle detection if parent_id is being changed
   if (normalized.parent_id) {
@@ -1325,6 +1587,34 @@ export function updateJob(id, patch) {
   values.push(id);
 
   const applyUpdate = () => {
+    if (normalized.handoff_artifact_payload != null) {
+      persistHandoffArtifact(
+        normalized.handoff_artifact_payload,
+        nextJob.handoff_artifact_digest,
+        { db },
+      );
+    }
+
+    if (artifactReplacing) {
+      const reason = 'Job handoff artifact was replaced before dispatch';
+      cancelApprovalsForJob(id, reason, {
+        db,
+        resolvedBy: 'scheduler',
+      });
+      db.prepare(`
+        UPDATE job_dispatch_queue
+        SET status = 'cancelled',
+            processed_at = COALESCE(processed_at, datetime('now')),
+            claim_owner = NULL,
+            claim_token = NULL,
+            claim_expires_at = NULL,
+            last_error = COALESCE(last_error, ?)
+        WHERE job_id = ?
+          AND handoff_artifact_digest = ?
+          AND status IN ('pending', 'claimed', 'awaiting_approval')
+      `).run(reason, id, current.handoff_artifact_digest);
+    }
+
     db.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
     if ('enabled' in normalized && !normalized.enabled && current.enabled) {
@@ -1789,7 +2079,7 @@ export function cancelJob(jobId, opts = {}) {
       cancelDeliveriesForJob(cancelledJobId, reason, { db });
 
       const activeRuns = db.prepare(`
-        SELECT id, status
+        SELECT id, status, evidence_required
         FROM runs
         WHERE job_id = ?
           AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
@@ -1798,6 +2088,18 @@ export function cancelJob(jobId, opts = {}) {
         if (run.status === 'running') {
           requestRunCancellation(run.id, { requestedBy, reason });
         } else {
+          if (Number(cancelledJob?.handoff_version) === 4 && run.evidence_required === 1) {
+            const quarantined = quarantineRunRecovery(
+              run.id,
+              `Handoff v4 cancelled terminal evidence requires asynchronous artifact-bound verification; ${reason}; run quarantined for operator recovery`,
+              {
+                db,
+                allowPreExecution: true,
+                intendedStatus: 'cancelled',
+              },
+            );
+            if (quarantined.changed) continue;
+          }
           const transition = cancelRunBeforeExecution(run.id, { requestedBy, reason });
           if (transition.changed) {
             persistTerminalEvidence(
