@@ -74,7 +74,7 @@ Successful operations return:
 When first interacting with `openclaw-scheduler`, use this sequence:
 
 1. `openclaw-scheduler` -- show usage (plain-text help output)
-2. `openclaw-scheduler doctor --json` -- verify schema 28 and live diagnostics
+2. `openclaw-scheduler doctor --json` -- verify schema 29 and live diagnostics
 3. `openclaw-scheduler status --json` -- inspect lease, queue, outbox, approvals, and runs
 4. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
 5. `openclaw-scheduler agents list --json` -- see registered agents
@@ -250,11 +250,11 @@ invalidity warning, null parsed value, byte count, and SHA-256 digest while
 preserving primary execution success. Retrieve and verify generated evidence
 with `openclaw-scheduler runs evidence RUN_ID --json`.
 
-The built-in evidence backend is SHA-256 checksum-only. It is not agentcli's
-complete evidence payload or signed envelope contract, so the runtime reports
-`evidence_generation: false` and `checksum_evidence_generation: true`.
-External evidence providers, non-SHA-256 methods, and required signature
-verification fail validation rather than being silently downgraded.
+Handoff v4 implements AgentCLI's artifact-bound signed or provider-verified
+evidence contract and reports `evidence_generation: true`. Earlier handoff
+versions retain the separate SHA-256 checksum backend, reported as
+`checksum_evidence_generation: true`. Required v4 verification fails closed and
+is never downgraded to checksum evidence.
 
 ## Multi-Agent
 
@@ -320,9 +320,10 @@ shell crons, agent prompts, and multi-step chains.
 
 agentcli is the control-plane companion. It provides declarative manifests,
 stable job IDs, workflow chain compilation, and v0.2 identity/authorization
-profiles. Scheduler handoff v3 adds root approval gates, approver scopes,
-structured output, delegation validation, provider-resolved authorization
-references, and SHA-256 evidence integrity. The scheduler works without
+profiles. Scheduler handoff v4 adds immutable canonical execution artifacts,
+artifact-bound cryptographic proofs and evidence, exact source-run delegation,
+provider session recovery, credential presentation tracking, and append-only
+runtime events while retaining handoff versions 1 through 3. The scheduler works without
 agentcli, but agentcli is preferred for complex workflows.
 
 ### Installing alongside the scheduler (same time)

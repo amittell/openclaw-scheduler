@@ -9,6 +9,10 @@ const MAX_VERSION_LENGTH = 128;
 
 export const GATEWAY_ENV_INJECT_HEADER = 'x-openclaw-env-inject';
 export const GATEWAY_ENV_INJECT_CAPABILITY = 'chat-completions-env-inject-v1';
+export const GATEWAY_CAPABILITY_BINDING_CAPABILITY = 'capability-binding-v1';
+export const GATEWAY_ARTIFACT_BINDING_HEADER = 'x-openclaw-handoff-artifact';
+export const GATEWAY_RUN_BINDING_HEADER = 'x-openclaw-runtime-instance';
+export const GATEWAY_CAPABILITY_NONCE_HEADER = 'x-openclaw-capability-nonce';
 export const MAX_GATEWAY_ENV_ENTRIES = 64;
 export const MAX_GATEWAY_ENV_KEY_BYTES = 128;
 export const MAX_GATEWAY_ENV_VALUE_BYTES = 4_096;
@@ -150,6 +154,42 @@ export function buildGatewayEnvInjectHeader(materializedEnv) {
   }
 
   return { [GATEWAY_ENV_INJECT_HEADER]: serialized };
+}
+
+export function buildGatewayCapabilityBindingHeaders(binding) {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+    throw compatibilityError(
+      'GATEWAY_CAPABILITY_BINDING_INVALID',
+      'Gateway capability binding requires an object',
+    );
+  }
+  const artifactDigest = binding.artifactDigest;
+  const runtimeInstanceId = binding.runtimeInstanceId;
+  const nonce = binding.nonce;
+  if (typeof artifactDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(artifactDigest)) {
+    throw compatibilityError(
+      'GATEWAY_CAPABILITY_BINDING_INVALID',
+      'Gateway capability binding requires a lowercase SHA-256 artifact digest',
+    );
+  }
+  for (const [name, value] of [['runtimeInstanceId', runtimeInstanceId], ['nonce', nonce]]) {
+    if (
+      typeof value !== 'string'
+      || value.length === 0
+      || value.length > 128
+      || !/^[A-Za-z0-9._:-]+$/.test(value)
+    ) {
+      throw compatibilityError(
+        'GATEWAY_CAPABILITY_BINDING_INVALID',
+        `Gateway capability binding ${name} is invalid`,
+      );
+    }
+  }
+  return {
+    [GATEWAY_ARTIFACT_BINDING_HEADER]: artifactDigest,
+    [GATEWAY_RUN_BINDING_HEADER]: runtimeInstanceId,
+    [GATEWAY_CAPABILITY_NONCE_HEADER]: nonce,
+  };
 }
 
 function invalidDiscovery(source, message, cause) {
@@ -441,32 +481,49 @@ export function clearGatewayCapabilityCache(gatewayUrl) {
  * A non-empty materialized map is an enforcement requirement, never a hint.
  */
 export async function negotiateGatewayEnvironmentInjection(materializedEnv, opts = {}) {
-  const headers = buildGatewayEnvInjectHeader(materializedEnv);
-  if (!Object.hasOwn(headers, GATEWAY_ENV_INJECT_HEADER)) {
+  const envHeaders = buildGatewayEnvInjectHeader(materializedEnv);
+  const bindingHeaders = opts.binding
+    ? buildGatewayCapabilityBindingHeaders(opts.binding)
+    : {};
+  const requiresEnvInjection = opts.requireEnvInjection === true
+    || Object.hasOwn(envHeaders, GATEWAY_ENV_INJECT_HEADER);
+  const requiresBinding = Object.hasOwn(bindingHeaders, GATEWAY_ARTIFACT_BINDING_HEADER);
+  if (!requiresEnvInjection && !requiresBinding) {
     return Object.freeze({ headers: Object.freeze({}), gateway: null });
   }
 
-  // Revalidate immediately before every credential-bearing request. A cached
-  // positive result must not survive a Gateway restart or capability downgrade.
+  // Revalidate immediately before every credential-bearing or artifact-bound
+  // request. A cached positive result must not survive a Gateway restart or
+  // capability downgrade.
   const gateway = await discoverGatewayCapabilities({ ...opts, forceRefresh: true });
-  if (!gateway.capabilities.includes(GATEWAY_ENV_INJECT_CAPABILITY)) {
+  const requiredCapabilities = [
+    ...(requiresEnvInjection ? [GATEWAY_ENV_INJECT_CAPABILITY] : []),
+    ...(requiresBinding ? [GATEWAY_CAPABILITY_BINDING_CAPABILITY] : []),
+  ];
+  const missing = requiredCapabilities.filter(capability => !gateway.capabilities.includes(capability));
+  if (missing.length > 0) {
     const gatewayLabel = gateway.version ? `Gateway ${gateway.version}` : 'The connected Gateway';
+    const envOnlyFailure = missing.length === 1 && missing[0] === GATEWAY_ENV_INJECT_CAPABILITY;
     throw compatibilityError(
-      'GATEWAY_ENV_INJECT_UNSUPPORTED',
-      `${gatewayLabel} does not advertise ${GATEWAY_ENV_INJECT_CAPABILITY}, which is required `
-        + 'to enforce materialized credentials for this agent turn. Dispatch was refused so credentials '
-        + 'cannot be silently dropped. Upgrade the Gateway receiver or use auth_profile without a '
-        + 'materialized environment.',
+      envOnlyFailure ? 'GATEWAY_ENV_INJECT_UNSUPPORTED' : 'GATEWAY_CAPABILITY_BINDING_UNSUPPORTED',
+      `${gatewayLabel} does not advertise ${missing.join(', ')}, which is required to enforce this `
+        + 'credential-bearing artifact-bound agent turn. Dispatch was refused so credentials or the '
+        + 'artifact binding cannot be silently dropped.',
       {
         gatewayVersion: gateway.version,
         gatewayProtocol: gateway.protocol,
         gatewayCapabilities: [...gateway.capabilities],
         discoverySource: gateway.source,
         legacyGateway: gateway.legacy,
-        requiredCapability: GATEWAY_ENV_INJECT_CAPABILITY,
+          requiredCapability: missing[0],
+          requiredCapabilities,
+          missingCapabilities: missing,
       },
     );
   }
 
-  return Object.freeze({ headers: Object.freeze(headers), gateway });
+  return Object.freeze({
+    headers: Object.freeze({ ...envHeaders, ...bindingHeaders }),
+    gateway,
+  });
 }

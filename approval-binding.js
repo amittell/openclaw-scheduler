@@ -49,11 +49,29 @@ function stableDispatch(dispatch) {
     source_run_id: dispatch.source_run_id || null,
     retry_of_run_id: dispatch.retry_of_run_id || null,
     replay_of_run_id: dispatch.replay_of_run_id || null,
+    handoff_artifact_digest: dispatch.handoff_artifact_digest || null,
+    source_run_handoff_artifact_digest: dispatch.source_run_handoff_artifact_digest || null,
   });
 }
 
 export function approvalBindingPayload(job, opts = {}) {
   const lineage = Array.isArray(opts.lineage) ? opts.lineage : [];
+  if (Number(job?.handoff_version) === 4) {
+    if (!job.handoff_artifact_digest) {
+      throw new Error('handoff v4 approval binding requires an artifact digest');
+    }
+    return canonicalize({
+      version: 4,
+      job_id: job.id,
+      handoff_artifact_digest: job.handoff_artifact_digest,
+      effective_task_hash: job.effective_task_hash,
+      parent_lineage: lineage.map(parent => ({
+        job_id: parent.id,
+        handoff_artifact_digest: parent.handoff_artifact_digest || null,
+      })),
+      dispatch: stableDispatch(opts.dispatch),
+    });
+  }
   return canonicalize({
     version: 3,
     job: stableJob(job),

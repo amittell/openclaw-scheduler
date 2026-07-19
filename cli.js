@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, getEvidenceRecord } from './runs.js';
+import { verifyPersistedArtifactBoundEvidence } from './evidence-runtime.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, getMessage, listMessageReceipts, getTeamMessages,
@@ -764,7 +765,12 @@ switch (command) {
       }
       case 'evidence': {
         if (!args[0]) fail('Usage: runs evidence <run-id>');
-        const evidence = getEvidenceRecord(args[0]);
+        const evidenceRow = getDb().prepare(
+          'SELECT handoff_artifact_digest, evidence_verified FROM evidence_records WHERE run_id = ?',
+        ).get(args[0]);
+        const evidence = evidenceRow?.handoff_artifact_digest && evidenceRow.evidence_verified === 1
+          ? await verifyPersistedArtifactBoundEvidence(args[0])
+          : getEvidenceRecord(args[0]);
         if (!evidence) fail(`Evidence not found for run: ${args[0]}`, 1, 'NOT_FOUND');
         emit({ ok: evidence.integrity?.valid === true, evidence });
         if (evidence.integrity?.valid !== true) process.exitCode = 1;
@@ -1581,7 +1587,7 @@ switch (command) {
       product_schema: SCHEDULER_PRODUCT_SCHEMA_LABEL,
       schema_version_source: 'package',
       schema_version_note: 'Run status or doctor to inspect the initialized database schema.',
-      handoff_version: '3',
+      handoff_version: '4',
       features: {
         approvals: 'runtime',
         model_policy: 'model+thinking',
@@ -1595,10 +1601,10 @@ switch (command) {
         trust_evaluation: true,
         authorization_proof_verification: true,
         authorization_hook: true,
-        evidence_generation: false,
+        evidence_generation: true,
         checksum_evidence_generation: true,
-        evidence_integrity: 'checksum-sha256-v3',
-        evidence_contract: 'openclaw-scheduler-checksum-v3',
+        evidence_integrity: 'artifact-bound-signed-or-provider-verified-v4',
+        evidence_contract: 'agentcli-handoff-v4',
         authorization_ref_resolution: true,
         delegation_validation: true,
         root_approval_gate: true,
@@ -1621,6 +1627,13 @@ switch (command) {
         durable_delivery_attachments: true,
         atomic_approval_state: true,
         governance_enforcement: true,
+        handoff_v4_artifact: true,
+        artifact_bound_proofs: true,
+        signed_or_provider_verified_evidence: true,
+        provider_session_cache: true,
+        credential_presentation: true,
+        source_run_bound_delegation: true,
+        immutable_runtime_events: true,
       },
     };
     emit(capabilities);

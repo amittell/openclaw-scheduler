@@ -31,12 +31,21 @@ function normalizeClaimIdentity(opts = {}, { generateToken = false } = {}) {
   return hasOwner ? { owner, token } : null;
 }
 
-function verifyIdempotentDispatch(existing, jobId, kind) {
+function verifyIdempotentDispatch(existing, jobId, kind, binding = {}) {
   if (existing.job_id !== jobId || existing.dispatch_kind !== kind) {
     throw new Error(
       `Dispatch id "${existing.id}" already exists for job "${existing.job_id}" ` +
       `with kind "${existing.dispatch_kind}"`,
     );
+  }
+  for (const [column, expected] of [
+    ['handoff_artifact_digest', binding.artifactDigest],
+    ['source_run_id', binding.sourceRunId],
+    ['source_run_handoff_artifact_digest', binding.sourceArtifactDigest],
+  ]) {
+    if (expected !== undefined && (existing[column] ?? null) !== (expected ?? null)) {
+      throw new Error(`Dispatch id "${existing.id}" already exists with a different ${column}`);
+    }
   }
   return existing;
 }
@@ -61,8 +70,41 @@ export function enqueueDispatch(jobId, opts = {}) {
   assertKind(kind);
   assertStatus(status);
 
+  const jobBinding = db.prepare(`
+    SELECT handoff_version, handoff_artifact_digest FROM jobs WHERE id = ?
+  `).get(jobId);
+  if (!jobBinding) throw new Error(`Job "${jobId}" not found`);
+  const v4 = Number(jobBinding.handoff_version) === 4;
+  const artifactDigest = v4 ? jobBinding.handoff_artifact_digest : null;
+  if (v4 && !artifactDigest) {
+    throw Object.assign(new Error('Handoff v4 dispatch requires a persisted artifact'), {
+      code: 'HANDOFF_ARTIFACT_REQUIRED',
+    });
+  }
+  const sourceRunId = opts.source_run_id || null;
+  const sourceRun = sourceRunId
+    ? db.prepare('SELECT id, handoff_artifact_digest FROM runs WHERE id = ?').get(sourceRunId)
+    : null;
+  if (v4 && sourceRunId && !sourceRun) {
+    throw Object.assign(new Error(`Source run "${sourceRunId}" not found`), {
+      code: 'DELEGATION_SOURCE_RUN_MISSING',
+    });
+  }
+  const sourceArtifactDigest = v4 && sourceRun ? sourceRun.handoff_artifact_digest : null;
+  if (v4 && sourceRun && !sourceArtifactDigest) {
+    throw Object.assign(new Error(`Source run "${sourceRunId}" has no handoff artifact`), {
+      code: 'DELEGATION_SOURCE_ARTIFACT_REQUIRED',
+    });
+  }
+  if (v4 && opts.source_run_handoff_artifact_digest
+    && opts.source_run_handoff_artifact_digest !== sourceArtifactDigest) {
+    throw Object.assign(new Error('Requested source artifact does not match the exact source run'), {
+      code: 'DELEGATION_SOURCE_ARTIFACT_MISMATCH',
+    });
+  }
+  const binding = { artifactDigest, sourceRunId, sourceArtifactDigest };
   const existing = opts.id ? getDispatch(id) : null;
-  if (existing) return verifyIdempotentDispatch(existing, jobId, kind);
+  if (existing) return verifyIdempotentDispatch(existing, jobId, kind, binding);
   const scheduledFor = opts.scheduled_for || sqliteNow(-1000);
 
   db.prepare(`
@@ -70,8 +112,9 @@ export function enqueueDispatch(jobId, opts = {}) {
       id, job_id, dispatch_kind, status, scheduled_for, binding_scheduled_for,
       source_run_id, retry_of_run_id, created_at, claimed_at, processed_at,
       claim_owner, claim_token, claim_expires_at, attempt_count, last_error,
-      replay_of_run_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)
+      replay_of_run_id, handoff_artifact_digest,
+      source_run_handoff_artifact_digest
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO NOTHING
   `).run(
     id,
@@ -90,11 +133,13 @@ export function enqueueDispatch(jobId, opts = {}) {
     opts.attempt_count ?? 0,
     opts.last_error || null,
     opts.replay_of_run_id || null,
+    artifactDigest,
+    sourceArtifactDigest,
   );
 
   const inserted = getDispatch(id);
   if (!inserted) throw new Error(`Failed to enqueue dispatch "${id}"`);
-  return verifyIdempotentDispatch(inserted, jobId, kind);
+  return verifyIdempotentDispatch(inserted, jobId, kind, binding);
 }
 
 export function getDispatch(id) {

@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 const identityProviders = new Map();
 const authorizationProviders = new Map();
 const proofVerifiers = new Map();
+const evidenceProviders = new Map();
 
 /**
  * Load provider plugins from a directory. Every *.js file is imported and
@@ -50,6 +51,8 @@ export async function loadProviders(dirPath) {
         authorizationProviders.set(provider.name, provider);
       } else if (provider.type === 'proof-verifier') {
         proofVerifiers.set(provider.name, provider);
+      } else if (provider.type === 'evidence') {
+        evidenceProviders.set(provider.name, provider);
       } else {
         console.warn(`[provider-registry] Skipping ${file}: unknown type "${provider.type}"`);
       }
@@ -58,7 +61,10 @@ export async function loadProviders(dirPath) {
     }
   }
 
-  const total = identityProviders.size + authorizationProviders.size + proofVerifiers.size;
+  const total = identityProviders.size
+    + authorizationProviders.size
+    + proofVerifiers.size
+    + evidenceProviders.size;
   console.log(`[provider-registry] Loaded ${total} provider(s) from ${absPath}`);
 }
 
@@ -72,6 +78,38 @@ export function getAuthorizationProvider(name) {
 
 export function getProofVerifier(name) {
   return proofVerifiers.get(name) || null;
+}
+
+export function getEvidenceProvider(name) {
+  return evidenceProviders.get(name) || null;
+}
+
+export function registerProvider(provider) {
+  if (!provider || typeof provider.name !== 'string' || !provider.name
+    || typeof provider.type !== 'string') {
+    throw new TypeError('provider must declare non-empty name and type');
+  }
+  const registries = {
+    identity: identityProviders,
+    authorization: authorizationProviders,
+    'proof-verifier': proofVerifiers,
+    evidence: evidenceProviders,
+  };
+  const registry = registries[provider.type];
+  if (!registry) throw new TypeError(`unsupported provider type: ${provider.type}`);
+  registry.set(provider.name, provider);
+  return provider;
+}
+
+export function describeProviderLifecycle(provider) {
+  if (!provider) return null;
+  return {
+    resolve_session: typeof provider.resolveSession === 'function',
+    refresh_session: typeof provider.refreshSession === 'function',
+    check_revocation: typeof provider.checkRevocation === 'function',
+    materialize_credentials: typeof provider.materializeCredentials === 'function',
+    cleanup_session: typeof provider.cleanupSession === 'function',
+  };
 }
 
 function parseAuthorizationReference(ref) {
@@ -149,7 +187,10 @@ export async function resolveAuthorizationRef(ref, ctx = {}) {
 }
 
 export function hasProvider(name) {
-  return identityProviders.has(name) || authorizationProviders.has(name) || proofVerifiers.has(name);
+  return identityProviders.has(name)
+    || authorizationProviders.has(name)
+    || proofVerifiers.has(name)
+    || evidenceProviders.has(name);
 }
 
 export function listProviders() {
@@ -163,6 +204,11 @@ export function listProviders() {
     });
   }
   for (const [name, p] of proofVerifiers) result.push({ name, type: p.type });
+  for (const [name, p] of evidenceProviders) result.push({
+    name,
+    type: p.type,
+    lifecycle: describeProviderLifecycle(p),
+  });
   return result;
 }
 
@@ -171,4 +217,5 @@ export function _resetForTesting() {
   identityProviders.clear();
   authorizationProviders.clear();
   proofVerifiers.clear();
+  evidenceProviders.clear();
 }

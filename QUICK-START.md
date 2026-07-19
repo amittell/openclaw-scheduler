@@ -26,7 +26,7 @@ ocs doctor
 ocs status --json
 ```
 
-`doctor` verifies schema version 28, required tables, database writability, the singleton dispatcher lease, dispatch queue claims, delivery outbox claims, approval state, immutable evidence storage, and pending cancellations. A missing active lease is a warning when the dispatcher is intentionally stopped.
+`doctor` verifies schema version 29, required tables, database writability, the singleton dispatcher lease, dispatch queue claims, delivery outbox claims, approval state, immutable handoff artifacts and evidence, and pending cancellations. A missing active lease is a warning when the dispatcher is intentionally stopped.
 
 ## 3. Create a shell job
 

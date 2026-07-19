@@ -1,11 +1,11 @@
-# Implementation Specification: Scheduler 0.4.0
+# Implementation Specification: Scheduler 0.5.0
 
 This document records the current runtime contract. The executable schema is
 `schema.sql`; the idempotent upgrade path is `migrate-consolidate.js`.
 
 ## Database Contract
 
-Schema version: 28
+Schema version: 29
 
 Initialization is fail closed:
 
@@ -16,7 +16,7 @@ Initialization is fail closed:
 4. Throw `DB_INIT_FAILED` on open, schema, or consolidation failure. Do not run
    the dispatcher against a partial schema.
 
-The v28 ownership, governance, evidence, and delivery tables are:
+The v29 ownership, governance, evidence, and delivery tables are:
 
 - `dispatcher_leases`: named owner, monotonically increasing fencing token,
   acquisition, renewal, and expiry times.
@@ -34,9 +34,47 @@ The v28 ownership, governance, evidence, and delivery tables are:
 - `completion_debts`: run-scoped completion delivery ownership and recovery
   state.
 - `evidence_records`: one immutable canonical SHA-256 evidence row per run.
+- `handoff_artifacts`: immutable canonical AgentCLI handoff v4 payloads keyed by
+  their SHA-256 digest.
+- `runtime_events`: append-only, artifact-bound execution and audit events.
+- `provider_sessions`: resumable provider session state scoped to an exact
+  artifact and runtime instance.
+- `credential_presentations`: cleanup-tracked credential release metadata that
+  never stores the credential value.
+- `authorization_proof_replay`: proof nonce/JTI claims that reject replay and
+  cross-artifact transplantation.
 
 Agent prompt messages remain in `messages`. `prompt_claimed` means a dispatcher
 owns prompt injection. An external delivery never enters that route.
+
+## AgentCLI Handoff Version 4
+
+Handoff v4 is an additive protocol. Existing direct scheduler jobs and AgentCLI
+handoff versions 1 through 3 retain their previous storage and execution paths.
+A v4 job is accepted only when all of the following agree exactly:
+
+- artifact schema `openclaw.scheduler.handoff-artifact`, version 1;
+- handoff version 4 and minimum scheduler schema 29;
+- canonicalization `json-sort-v1`, version 1, SHA-256, with undefined values
+  normalized to JSON null;
+- execution binding version 2;
+- scheduler job binding version 1;
+- canonical artifact digest, manifest digest, effective task hash, command
+  hashes, policy hashes, and the complete persisted scheduler execution
+  projection.
+
+The artifact contains resolved execution semantics and hashes, never raw
+credentials, proof values, stdin, or environment values. Job creation persists
+the artifact before the job. Replacement persists a new immutable artifact,
+keeps the prior artifact, applies explicit null clears, and atomically cancels
+pending dispatches and approvals bound to the superseded digest. Disabling a v4
+job does not rewrite its artifact.
+
+Every dispatch, approval, run, evidence row, provider session, credential
+presentation, and runtime event carries the exact artifact digest. Chain and
+retry work additionally bind the exact source run ID and source artifact digest.
+Database triggers prevent binding mutation and artifact deletion while runtime
+state references it.
 
 ## Dispatcher Ownership
 
@@ -182,22 +220,26 @@ filesystem, or agent-cost isolation.
 
 ## Evidence Contract
 
-The built-in evidence backend is checksum-only. It accepts a legacy checksum
-declaration or `provider: "sha256"`/`"checksum"`, omitted methods or exactly
-`methods: ["sha256"]`, `verify.required: false`, and canonical JSON payload
-format. Unsupported providers such as `ssh` or `none`, non-SHA-256 methods, and
-required external verification fail job validation. The scheduler does not
-silently downgrade those declarations.
+Handoff versions 1 through 3 retain the scheduler-native checksum backend. It
+accepts a legacy checksum declaration or `provider: "sha256"`/`"checksum"`,
+omitted methods or exactly `methods: ["sha256"]`, `verify.required: false`, and
+canonical JSON payload format.
 
-Supported evidence uses `json-sort-v1` canonical JSON with SHA-256. The payload
-contains job/run identity, status, a hash of output, and redacted governance
-outcomes. It never contains raw materialized credentials. Persistence and the
-run outcome update share a transaction. A different replacement row for the
-same run fails with `EVIDENCE_RECORD_IMMUTABLE`.
+Handoff v4 consumes the complete AgentCLI evidence declaration. The runtime
+builds a canonical evidence payload from the exact artifact, runtime instance,
+source lineage, identity, proof, authorization, command result, structured
+output, postcondition, and terminal status. The selected AgentCLI evidence
+provider signs or externally verifies that payload. The scheduler persists the
+envelope only after verification succeeds when verification is required. It
+never downgrades a signed or provider-verified declaration to checksum evidence.
 
-`runs evidence RUN_ID --json` reparses the payload, recomputes its hash, and
-exits nonzero on an integrity mismatch. This is checksum verification, not a
-signature or third-party attestation.
+The SSH provider uses `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the
+declared key, principal, namespace, and allowed-signers file. Provider methods,
+verification metadata, payload hash, artifact digest, and verification outcome
+are immutable. `runs evidence RUN_ID --json` reconstructs the persisted
+execution input and cryptographically re-verifies the envelope. Tampering,
+transplantation, a stale artifact, or unavailable required verification exits
+nonzero.
 
 ## Gateway Compatibility
 
@@ -212,11 +254,16 @@ fails before the credential-bearing chat request with
 capability declaration, and current OpenClaw Gateway 2026.6.11 therefore
 advertise no capabilities and fail closed for this surface.
 
-`capabilities --json` advertises handoff version 3. Relevant exact feature
-values are `evidence_generation: false`,
+`capabilities --json` advertises handoff version 4. Relevant exact feature
+values are `evidence_generation: true`,
 `checksum_evidence_generation: true`,
-`evidence_integrity: "checksum-sha256-v3"`,
-`evidence_contract: "openclaw-scheduler-checksum-v3"`,
+`evidence_integrity: "artifact-bound-signed-or-provider-verified-v4"`,
+`evidence_contract: "agentcli-handoff-v4"`,
+`handoff_v4_artifact: true`, `artifact_bound_proofs: true`,
+`signed_or_provider_verified_evidence: true`, `provider_session_cache: true`,
+`credential_presentation: true`, `source_run_bound_delegation: true`, and
+`immutable_runtime_events: true`. The legacy checksum capability remains
+advertised separately for earlier handoff consumers. Other exact values include
 `approval_scope_enforcement: false`,
 `gateway_capability_discovery: true`,
 `gateway_env_injection_negotiation: true`,
@@ -262,10 +309,14 @@ per-job structured report and exits nonzero when any job fails.
 2. every `tests/*.test.mjs` file in its own process and isolated database,
    sequentially;
 3. documentation example validation;
-4. both scheduler-agentcli integration suites when a checkout is present.
+4. both scheduler-agentcli integration suites when a checkout is present;
+5. shared positive and negative v4 conformance fixtures in both repositories;
+6. a public fresh-database v4 E2E that restarts the runtime, executes schedule,
+   one-shot, manual, chain, and retry dispatches, and cryptographically verifies
+   persisted evidence and exactly-once delivery.
 
 `npm run verify:local` adds lint, type checking, coverage, and a package dry run.
 An absent local agentcli checkout is reported explicitly. `npm run
 test:agentcli` requires it. CI uses the smoke gate without the extra coverage
-pass and has a separate required compatibility job pinned to public agentcli
-commit `317cc0eea8b4c65bc3213f5f329124a45c958bd3`.
+pass and has separate required compatibility jobs against the exact published
+AgentCLI package and the retained handoff v2 compatibility commit.

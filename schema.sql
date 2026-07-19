@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v0.4.0, schema version: 28)
+-- OpenClaw Scheduler Schema (current: v0.5.0, schema version: 29)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -145,6 +145,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- v0.2 Child Credential Policy (v23)
   child_credential_policy   TEXT DEFAULT NULL,
 
+  -- Agentcli handoff v4 immutable compiled artifact (v29)
+  handoff_version           INTEGER DEFAULT NULL,
+  handoff_artifact_digest   TEXT DEFAULT NULL,
+  effective_task_hash       TEXT DEFAULT NULL,
+
   -- Watchdog monitoring (v13)
   job_type              TEXT NOT NULL DEFAULT 'standard',  -- 'standard' | 'watchdog'
   watchdog_target_label TEXT,                         -- label of the task being monitored
@@ -246,6 +251,12 @@ CREATE TABLE IF NOT EXISTS runs (
   credential_handoff_summary       TEXT DEFAULT NULL,
   delegation_validation            TEXT DEFAULT NULL,
   approval_used                     TEXT DEFAULT NULL,
+
+  -- Agentcli handoff v4 execution binding (v29)
+  handoff_artifact_digest            TEXT DEFAULT NULL,
+  runtime_instance_id                TEXT DEFAULT NULL,
+  source_run_id                      TEXT DEFAULT NULL,
+  source_run_handoff_artifact_digest TEXT DEFAULT NULL,
 
   -- Structured output contract result (v28)
   output_format                     TEXT DEFAULT NULL,
@@ -385,7 +396,10 @@ CREATE TABLE IF NOT EXISTS approvals (
   approver_scope  TEXT,
   binding_hash    TEXT,
   gate_kind       TEXT NOT NULL DEFAULT 'job',         -- job|authorization
-  decision_context TEXT                                -- audit-safe JSON context for escalation
+  decision_context TEXT,                               -- audit-safe JSON context for escalation
+  handoff_artifact_digest TEXT,
+  source_run_id TEXT,
+  source_run_handoff_artifact_digest TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status) WHERE status = 'pending';
@@ -412,7 +426,9 @@ CREATE TABLE IF NOT EXISTS job_dispatch_queue (
   claim_expires_at TEXT,
   attempt_count   INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
-  replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL
+  replay_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  handoff_artifact_digest TEXT,
+  source_run_handoff_artifact_digest TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_due ON job_dispatch_queue(status, scheduled_for);
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job ON job_dispatch_queue(job_id, created_at DESC);
@@ -497,12 +513,214 @@ CREATE TABLE IF NOT EXISTS evidence_records (
   payload         TEXT NOT NULL,
   retention_policy TEXT,
   retention_until TEXT,
+  handoff_artifact_digest TEXT,
+  source_run_id TEXT,
+  source_run_handoff_artifact_digest TEXT,
+  evidence_method TEXT,
+  evidence_verified INTEGER DEFAULT NULL CHECK (evidence_verified IN (0,1)),
+  evidence_envelope TEXT,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(algorithm, hash, run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_records_job ON evidence_records(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_evidence_records_hash ON evidence_records(algorithm, hash);
 CREATE INDEX IF NOT EXISTS idx_evidence_records_created_run ON evidence_records(created_at DESC, run_id DESC);
+
+-- ============================================================
+-- HANDOFF V4 ARTIFACTS AND RUNTIME SECURITY STATE (v29)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS handoff_artifacts (
+  digest TEXT PRIMARY KEY,
+  artifact_schema_version INTEGER NOT NULL CHECK (artifact_schema_version = 1),
+  handoff_version INTEGER NOT NULL CHECK (handoff_version = 4),
+  scheduler_schema_min INTEGER NOT NULL,
+  canonicalization TEXT NOT NULL CHECK (canonicalization = 'json-sort-v1'),
+  canonicalization_version INTEGER NOT NULL CHECK (canonicalization_version = 1),
+  execution_binding_version INTEGER NOT NULL,
+  manifest_digest TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  effective_task_hash TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_bytes INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_handoff_artifacts_job ON handoff_artifacts(job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_handoff_artifacts_manifest ON handoff_artifacts(manifest_digest, workflow_id, task_id);
+CREATE TRIGGER IF NOT EXISTS trg_handoff_artifacts_no_update
+BEFORE UPDATE ON handoff_artifacts
+BEGIN
+  SELECT RAISE(ABORT, 'handoff artifacts are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_handoff_artifacts_no_delete
+BEFORE DELETE ON handoff_artifacts
+BEGIN
+  SELECT RAISE(ABORT, 'handoff artifacts are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  event_version INTEGER NOT NULL DEFAULT 1,
+  job_id TEXT,
+  dispatch_queue_id TEXT,
+  run_id TEXT,
+  approval_id TEXT,
+  handoff_artifact_digest TEXT,
+  source_run_id TEXT,
+  source_run_handoff_artifact_digest TEXT,
+  payload TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run ON runtime_events(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_artifact ON runtime_events(handoff_artifact_digest, id);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_type ON runtime_events(event_type, id);
+CREATE TRIGGER IF NOT EXISTS trg_runtime_events_no_update
+BEFORE UPDATE ON runtime_events
+BEGIN
+  SELECT RAISE(ABORT, 'runtime events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_runtime_events_no_delete
+BEFORE DELETE ON runtime_events
+BEGIN
+  SELECT RAISE(ABORT, 'runtime events are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS proof_replay_ledger (
+  replay_key TEXT PRIMARY KEY,
+  method TEXT NOT NULL,
+  issuer TEXT,
+  subject TEXT,
+  proof_id TEXT NOT NULL,
+  handoff_artifact_digest TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_proof_replay_expires ON proof_replay_ledger(expires_at);
+
+CREATE TABLE IF NOT EXISTS proof_revocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  method TEXT NOT NULL,
+  issuer TEXT,
+  proof_id TEXT,
+  key_id TEXT,
+  reason TEXT,
+  revoked_by TEXT,
+  revoked_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (proof_id IS NOT NULL OR key_id IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_proof_revocations_lookup
+  ON proof_revocations(method, issuer, proof_id, key_id);
+
+CREATE TABLE IF NOT EXISTS provider_sessions (
+  id TEXT PRIMARY KEY,
+  provider_type TEXT NOT NULL,
+  provider_name TEXT NOT NULL,
+  cache_key_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','refreshing','expired','revoked','failed')),
+  handoff_artifact_digest TEXT,
+  subject_principal TEXT,
+  scope TEXT,
+  session_summary TEXT,
+  expires_at TEXT,
+  refresh_after TEXT,
+  rotation_counter INTEGER NOT NULL DEFAULT 0,
+  revocation_checked_at TEXT,
+  transient_error_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(provider_type, provider_name, cache_key_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_sessions_status ON provider_sessions(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS credential_presentations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  handoff_artifact_digest TEXT NOT NULL,
+  provider_session_id TEXT,
+  binding_name TEXT NOT NULL,
+  medium TEXT NOT NULL CHECK (medium IN ('env','temp-file','stdin','gateway-env-header')),
+  env_key TEXT,
+  temp_path TEXT,
+  stdin_sha256 TEXT,
+  value_sha256 TEXT NOT NULL,
+  file_mode TEXT,
+  status TEXT NOT NULL CHECK (status IN ('materialized','cleaned','recovery_cleaned','failed')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT,
+  cleaned_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_credential_presentations_run ON credential_presentations(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_credential_presentations_status ON credential_presentations(status, created_at);
+
+  CREATE TRIGGER IF NOT EXISTS trg_v4_jobs_no_downgrade
+  BEFORE UPDATE ON jobs
+  WHEN OLD.handoff_version = 4 AND (
+    NEW.handoff_version IS NOT 4 OR
+    NEW.handoff_artifact_digest IS NULL OR
+    NEW.effective_task_hash IS NULL
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'handoff v4 job bindings cannot be downgraded or cleared');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_v4_runs_binding_immutable
+BEFORE UPDATE ON runs
+WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+  NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+  NEW.runtime_instance_id IS NOT OLD.runtime_instance_id OR
+  NEW.source_run_id IS NOT OLD.source_run_id OR
+  NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'handoff v4 run bindings are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_v4_approvals_binding_immutable
+BEFORE UPDATE ON approvals
+WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+  NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+  NEW.source_run_id IS NOT OLD.source_run_id OR
+  NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'handoff v4 approval bindings are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_v4_dispatches_binding_immutable
+BEFORE UPDATE ON job_dispatch_queue
+WHEN OLD.handoff_artifact_digest IS NOT NULL AND (
+  NEW.handoff_artifact_digest IS NOT OLD.handoff_artifact_digest OR
+  NEW.source_run_id IS NOT OLD.source_run_id OR
+  NEW.source_run_handoff_artifact_digest IS NOT OLD.source_run_handoff_artifact_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'handoff v4 dispatch bindings are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_update
+BEFORE UPDATE ON evidence_records
+WHEN OLD.handoff_artifact_digest IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'handoff v4 evidence is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_delete
+BEFORE DELETE ON evidence_records
+WHEN OLD.handoff_artifact_digest IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'handoff v4 evidence is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_proof_revocations_no_update
+BEFORE UPDATE ON proof_revocations
+BEGIN
+  SELECT RAISE(ABORT, 'proof revocations are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_proof_revocations_no_delete
+BEFORE DELETE ON proof_revocations
+BEGIN
+  SELECT RAISE(ABORT, 'proof revocations are immutable');
+END;
 
 -- ============================================================
 -- IDEMPOTENCY LEDGER: tracks claimed idempotency keys (v7)
@@ -645,8 +863,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-28 (all columns already in schema above).
--- Existing installs are brought up to v28 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-29 (all columns already in schema above).
+-- Existing installs are brought up to v29 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -675,3 +893,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (25);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (26);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (27);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (28);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (29);

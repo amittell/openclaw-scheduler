@@ -127,7 +127,7 @@ Do not use it merely to obtain run history, command jobs, or basic retries. Nati
 
 ---
 
-## Version 0.4.0 Runtime Safety
+## Version 0.5.0 Runtime Safety
 
 - A singleton dispatcher lease and fencing token prevent a second dispatcher from taking ownership of live work.
 - Active runs carry dispatcher ownership. Only the owning fence can commit the terminal transition or trigger downstream work.
@@ -138,6 +138,9 @@ Do not use it merely to obtain run history, command jobs, or basic retries. Nati
 - Approval decisions use atomic versioned transitions and cannot dispatch disabled, rejected, expired, or cancelled work.
 - Governance declarations are enforced at execution time. Unsupported sandbox, path, network, credential, trust, proof, or cost requirements fail closed.
 - Database schema and consolidation failures stop startup. `openclaw-scheduler doctor --json` reports schema, lease, queue, outbox, approval, and cancellation diagnostics.
+- AgentCLI handoff v4 binds the complete canonical execution artifact to every
+  dispatch, approval, run, provider session, credential presentation, runtime
+  event, and signed evidence record. Versions 1 through 3 remain supported.
 
 These controls do not make arbitrary side effects idempotent. Destructive commands must still detect prior completion and be safe to retry.
 
@@ -891,7 +894,7 @@ openclaw-scheduler approvals reject APPROVAL_ID --reason "Postponing until the n
 - `approval_approver_scope` accepts an unprefixed exact identity or
   `exact:`, `user:`, `uid:`, or `principal:` matching for the local OS account.
   Domain scopes are not supported.
-- AgentCLI handoff v3 exposes approval-scope enforcement as one coarse capability
+- AgentCLI handoff v4 exposes approval-scope enforcement as one coarse capability
   while its manifests may contain domain scopes. The scheduler therefore
   advertises `approval_scope_enforcement: false` so scoped agentcli manifests
   fail capability negotiation instead of being partially enforced. Direct
@@ -1686,10 +1689,10 @@ Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old export.
 
 ### Schema baseline
 
-Version 0.4.0 uses schema version 28.
+Version 0.5.0 uses schema version 29.
 
 - Net-new installs apply `schema.sql` transactionally.
-- Existing databases run the idempotent consolidation migration, then reapply the current schema. Migration 28 preserves existing state while rebuilding legacy completion debt rows with a derived delivery scope, adding multipart outbox group/part coordinates, and adding immutable evidence storage.
+- Existing databases run the idempotent consolidation migration, then reapply the current schema. Migration 28 preserves existing state while rebuilding legacy completion debt rows with a derived delivery scope, multipart outbox coordinates, and immutable checksum evidence. Migration 29 adds handoff v4 artifacts, proof replay claims, runtime events, provider sessions, credential presentations, exact source-run bindings, and signed evidence metadata without rewriting earlier jobs or runs.
 - Any schema or consolidation error aborts startup. It is never logged and ignored.
 
 ### Native-job ownership and release history
@@ -2028,7 +2031,7 @@ agent itself when a user requests a scheduled task via Telegram or another
 messaging channel, and operators can also create jobs directly via the CLI.
 Adding agentcli on top gives you declarative workflow manifests, stable job IDs,
 v0.2 identity and authorization support, evidence capability negotiation,
-handoff v3 capability negotiation, and repeatable applies for
+handoff v4 capability negotiation, and repeatable applies for
 workflows that outgrow ad-hoc job creation.
 
 ### Installing agentcli
@@ -2200,41 +2203,40 @@ is sent. Main-session jobs reject `identity.presentation` and
 `credential_handoff`. Auth-profile-only isolated turns remain compatible with
 Gateways that do not provide env injection.
 
-Handoff v3 also validates delegated identity chains before execution and resolves
-`authorization_ref` only through a configured provider resolver. Independently,
-direct scheduler job specifications can request checksum evidence, stored as one
-immutable canonical SHA-256 record per run.
-Evidence contains redacted outcome summaries and an output hash, never raw
-credentials. The built-in evidence backend accepts legacy checksum declarations
-or `provider: "sha256"`/`"checksum"` with only the `sha256` method and
-`verify.required: false`. External envelope providers such as `ssh` or `none`,
-non-SHA-256 methods, and required signature verification fail validation because
-the scheduler has no signer/verifier for them. Use `openclaw-scheduler runs
-evidence RUN_ID --json` to retrieve and checksum-verify the stored record.
+Handoff v4 validates delegated identity chains against the exact source run,
+resolves `authorization_ref` only through a configured provider, presents
+credentials through one negotiated medium, and records append-only runtime
+events. Its evidence envelope binds the canonical artifact, runtime instance,
+identity, proof, authorization, result, postcondition, and lineage. The SSH
+provider signs and verifies with `ssh-keygen -Y`; other declared providers must
+implement equivalent verification. `openclaw-scheduler runs evidence RUN_ID
+--json` re-verifies the persisted envelope against the stored execution.
 
-The scheduler does not implement agentcli's complete evidence payload and
-envelope contract, which binds the manifest digest and effective task hash and
-may require provider signing. It therefore reports `evidence_generation: false`
-to agentcli and fails capability negotiation for agentcli evidence declarations.
-This is intentionally distinct from the scheduler-native checksum facility.
+Earlier handoff consumers and direct scheduler job specifications retain the
+immutable canonical SHA-256 checksum backend. That legacy path remains a
+separate capability and is never used to downgrade a v4 signed-evidence
+declaration.
 
-`openclaw-scheduler capabilities --json` reports `handoff_version: "3"` and
+`openclaw-scheduler capabilities --json` reports `handoff_version: "4"` and
 the enforcement features `root_approval_gate`,
 `approval_scope_enforcement: false`,
 `structured_output_format`, `delegation_validation`,
-`authorization_ref_resolution`, `evidence_generation: false`,
+`authorization_ref_resolution`, `evidence_generation: true`,
 `checksum_evidence_generation: true`,
-`evidence_integrity: "checksum-sha256-v3"`,
-`evidence_contract: "openclaw-scheduler-checksum-v3"`,
+`evidence_integrity: "artifact-bound-signed-or-provider-verified-v4"`,
+`evidence_contract: "agentcli-handoff-v4"`, `handoff_v4_artifact`,
+`artifact_bound_proofs`, `signed_or_provider_verified_evidence`,
+`provider_session_cache`, `credential_presentation`,
+`source_run_bound_delegation`, `immutable_runtime_events`,
 `gateway_capability_discovery`, `gateway_env_injection_negotiation`,
 `multipart_delivery_checkpoints: true`, and
 `completion_delivery_scope: "run"`.
 
 See the [agentcli examples directory](https://github.com/amittell/agentcli/tree/main/examples)
 for fully annotated manifests covering Stripe, Fly.io, Terraform, GitHub CLI,
-and more. Examples declaring an external evidence provider require a runtime
-that implements that provider; this scheduler rejects those declarations rather
-than silently treating them as built-in checksum evidence.
+and more. The executable public v4 flow is
+[`tests/handoff-v4-e2e.test.mjs`](tests/handoff-v4-e2e.test.mjs); shared positive
+and negative protocol vectors are under `fixtures/handoff-v4/`.
 
 ### Environment variables
 

@@ -51,8 +51,8 @@ before(async () => {
 
 after(() => closeDb());
 
-test('schema v28 persists handoff v3 fields', () => {
-  assert.equal(SCHEDULER_SCHEMA_VERSION, 28);
+test('schema v29 preserves handoff v3 fields', () => {
+  assert.equal(SCHEDULER_SCHEMA_VERSION, 29);
   const job = createJob(jobSpec('v04-fields', {
     approval_required: true,
     approval_risk_level: 'high',
@@ -493,23 +493,30 @@ test('large whitespace text output remains offloadable with digest parity', () =
   }
 });
 
-test('capabilities advertise authoritative handoff v3 enforcement', () => {
+test('capabilities advertise authoritative handoff v4 enforcement', () => {
   const output = execFileSync(process.execPath, ['cli.js', 'capabilities', '--json'], {
     cwd: new URL('..', import.meta.url),
     encoding: 'utf8',
   });
   const capabilities = JSON.parse(output);
-  assert.equal(capabilities.handoff_version, '3');
-  assert.equal(capabilities.schema_version, 28);
+  assert.equal(capabilities.handoff_version, '4');
+  assert.equal(capabilities.schema_version, 29);
   assert.equal(capabilities.features.root_approval_gate, true);
   assert.equal(capabilities.features.approval_scope_enforcement, false);
   assert.equal(capabilities.features.structured_output_format, true);
   assert.equal(capabilities.features.delegation_validation, true);
   assert.equal(capabilities.features.authorization_ref_resolution, true);
-  assert.equal(capabilities.features.evidence_generation, false);
+  assert.equal(capabilities.features.evidence_generation, true);
   assert.equal(capabilities.features.checksum_evidence_generation, true);
-  assert.equal(capabilities.features.evidence_integrity, 'checksum-sha256-v3');
-  assert.equal(capabilities.features.evidence_contract, 'openclaw-scheduler-checksum-v3');
+  assert.equal(capabilities.features.evidence_integrity, 'artifact-bound-signed-or-provider-verified-v4');
+  assert.equal(capabilities.features.evidence_contract, 'agentcli-handoff-v4');
+  assert.equal(capabilities.features.handoff_v4_artifact, true);
+  assert.equal(capabilities.features.artifact_bound_proofs, true);
+  assert.equal(capabilities.features.signed_or_provider_verified_evidence, true);
+  assert.equal(capabilities.features.provider_session_cache, true);
+  assert.equal(capabilities.features.credential_presentation, true);
+  assert.equal(capabilities.features.source_run_bound_delegation, true);
+  assert.equal(capabilities.features.immutable_runtime_events, true);
   assert.equal(capabilities.features.gateway_capability_discovery, true);
   assert.equal(capabilities.features.gateway_env_injection_negotiation, true);
   assert.equal(capabilities.features.multipart_delivery_checkpoints, true);

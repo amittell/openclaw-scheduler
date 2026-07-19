@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Durable continuity and governed-workflow sidecar for OpenClaw agents and shell jobs",
   "type": "module",
   "main": "./index.js",
@@ -71,6 +71,7 @@
     "test.js",
     "test-integration-agentcli.js",
     "tests",
+    "fixtures",
     "test-providers",
     "eslint.config.js",
     "tsconfig.json",
@@ -95,6 +96,15 @@
     "dispatcher.js",
     "gateway.js",
     "gateway-capabilities.js",
+    "handoff-artifact.js",
+    "runtime-events.js",
+    "provider-session-store.js",
+    "credential-runtime.js",
+    "capability-negotiation.js",
+    "delegation-runtime.js",
+    "proof-runtime.js",
+    "evidence-runtime.js",
+    "identity-runtime.js",
     "governance.js",
     "idempotency.js",
     "identifiers.js",
@@ -170,6 +180,6 @@
     "c8": "^11.0.0",
     "eslint": "^10.7.0",
     "globals": "^17.7.0",
-    "typescript": "^5.9.2"
+    "typescript": "^7.0.2"
   }
 }

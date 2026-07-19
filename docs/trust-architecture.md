@@ -3,7 +3,7 @@
 Date: 2026-03-30
 Status: Accepted
 
-Updated: 2026-07-12 for scheduler 0.4.0 and schema 28
+Updated: 2026-07-18 for scheduler 0.5.0 and schema 29
 
 ## Purpose
 
@@ -11,7 +11,7 @@ This document describes the trust architecture of the scheduler/sub-agent
 execution model: what the boundary guarantees, what it does not, and how
 operators reason about the security properties of scheduled workflows.
 
-## Version 0.4.0 Enforcement Status
+## Version 0.5.0 Enforcement Status
 
 Governance fields are no longer treated as prompt-only metadata. Every dispatch
 evaluates the stored policy before execution. The runtime currently enforces a
@@ -24,8 +24,10 @@ This is deliberate fail-closed behavior, not an assertion that the host process
 has container, namespace, firewall, filesystem, or cost-metering isolation.
 `contract_audit` is parsed and recorded, while identity, trust, authorization
 proof, and credential handoff retain their provider-specific runtime
-enforcement. Evidence declared for a run is reduced to a redacted canonical
-payload, hashed, and stored immutably by the scheduler.
+enforcement. Handoff v4 evidence declared for a run is reduced to a redacted
+canonical payload, bound to the immutable execution artifact, signed or
+externally verified, and stored immutably by the scheduler. Earlier handoff
+versions retain the separate checksum evidence path.
 
 Fresh shell jobs use `shell_env_policy: "minimal"`, which passes only a small
 operating-system allowlist plus explicitly materialized task credentials.
@@ -280,30 +282,25 @@ Cleanup runs even on error paths.
 
 ## Evidence Integrity
 
-The built-in evidence backend is checksum-only. A declaration may omit a
-provider for legacy checksum behavior or select `sha256`/`checksum` with only
-the `sha256` method and without required external verification. Unsupported
-providers such as `ssh` or `none`, non-SHA-256 methods, and
-`verify.required: true` fail validation because the scheduler has no matching
-signer or verifier. They are never silently downgraded.
+Handoff versions 1 through 3 may omit a provider for legacy checksum behavior
+or select `sha256`/`checksum` with only the `sha256` method and without required
+external verification. The scheduler advertises this path separately as
+`checksum_evidence_generation: true`.
 
-This checksum record is not agentcli's complete evidence payload or signed
-envelope contract. The scheduler therefore advertises
-`evidence_generation: false` for agentcli capability negotiation and the
-separate `checksum_evidence_generation: true` capability for its native record.
-Agentcli evidence declarations fail capability negotiation instead of being
-accepted as equivalent checksum evidence.
+Handoff v4 implements AgentCLI's complete evidence payload and verification
+envelope. The canonical payload binds the immutable artifact, runtime instance,
+exact lineage, identity, proof, authorization, command result, structured
+output, postcondition, and terminal status. The selected provider must sign or
+externally verify the payload when verification is required. SSH evidence uses
+`ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the declared principal and
+allowed signers. Required evidence is never silently downgraded to the checksum
+backend.
 
-For a supported declaration, the scheduler creates a `json-sort-v1` canonical
-payload containing job and run identity, status, an output SHA-256 hash, and
-redacted outcome summaries. It computes a SHA-256 content hash over that
-payload and transactionally inserts one immutable `evidence_records` row for
-the run. A second, different record for the same run is rejected.
-
-`openclaw-scheduler runs evidence RUN_ID --json` recomputes the checksum and
-exits nonzero if it does not match. It does not verify a signature or external
-principal. The evidence payload never includes raw materialized credentials,
-bearer tokens, or provider secrets.
+`openclaw-scheduler runs evidence RUN_ID --json` reconstructs the persisted
+execution input and re-verifies the cryptographic envelope. Payload, signature,
+artifact, or execution transplant tampering exits nonzero. Evidence never
+includes raw materialized credentials, bearer tokens, proof values, private
+keys, or provider secrets.
 
 ## Trust Boundary Definition
 

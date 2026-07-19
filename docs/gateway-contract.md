@@ -2,7 +2,7 @@
 
 Date: 2026-03-28
 
-Updated: 2026-07-13 for scheduler 0.4.1 and schema 28
+Updated: 2026-07-18 for scheduler 0.5.0 and schema 29
 
 ## Purpose
 
@@ -902,7 +902,7 @@ external side effect already performed by the agent.
 
 ### Current State
 
-Version 0.4 discovers explicit Gateway version, protocol, and capability
+Version 0.5 discovers explicit Gateway version, protocol, and capability
 metadata before using a capability-gated credential surface. Discovery tries,
 in order:
 

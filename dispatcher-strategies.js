@@ -9,6 +9,21 @@ import {
   assertValidSessionKey,
   assertSessionKeyForAgent,
 } from './identifiers.js';
+import { assertArtifactMatchesJob } from './handoff-artifact.js';
+import { validateArtifactBoundDelegation } from './delegation-runtime.js';
+import { verifyArtifactBoundProof } from './proof-runtime.js';
+import { resolveArtifactBoundIdentity } from './identity-runtime.js';
+import {
+  cleanupCredentialMaterialization,
+  materializeCredentials,
+} from './credential-runtime.js';
+import { getProviderSession } from './provider-session-store.js';
+import { negotiateCredentialCapabilities } from './capability-negotiation.js';
+import { appendRuntimeEvent } from './runtime-events.js';
+import {
+  prepareArtifactBoundEvidence,
+  persistPreparedArtifactBoundEvidence,
+} from './evidence-runtime.js';
 
 /**
  * DispatchResult shape (returned by every strategy):
@@ -340,7 +355,34 @@ function hasIdentityDeclaration(job) {
  * otherwise strips the credentials key directly.
  */
 export function redactOutcomesForPersistence(outcomes, deps) {
-  if (!outcomes?.identity_resolved?.session?.credentials) return outcomes;
+  const resolved = outcomes?.identity_resolved;
+  if (resolved?.provider_session_id && resolved.session) {
+    const redacted = { ...outcomes };
+    const ir = { ...resolved };
+    const provider = ir.provider && deps?.getIdentityProvider?.(ir.provider);
+    if (provider && typeof provider.describeSession === 'function') {
+      const described = provider.describeSession(ir.session);
+      ir.session = described && typeof described === 'object' && !Array.isArray(described)
+        ? described
+        : {};
+    } else {
+      ir.session = Object.fromEntries(
+        ['id', 'subject', 'principal', 'scope', 'audience', 'resource', 'issuer',
+          'trust', 'trust_level', 'expires_at', 'refresh_after', 'rotation_id',
+          'delegation_chain']
+          .filter(key => ir.session[key] != null)
+          .map(key => [key, ir.session[key]]),
+      );
+    }
+    ir.session = ir.session_summary && typeof ir.session_summary === 'object'
+      ? ir.session_summary
+      : ir.session;
+    delete ir.session_summary;
+    delete ir.raw;
+    redacted.identity_resolved = ir;
+    return redacted;
+  }
+  if (!resolved?.session?.credentials) return outcomes;
   const redacted = { ...outcomes };
   const ir = { ...redacted.identity_resolved };
   const session = { ...ir.session };
@@ -380,7 +422,27 @@ export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
   let attempts = 0;
   let lastError = null;
   try {
-    if (ctx.materializationCleanup) {
+    if (ctx.v4CredentialMaterialization) {
+      attempts += 1;
+      try {
+        await (deps.cleanupCredentialMaterialization || cleanupCredentialMaterialization)(
+          ctx.v4CredentialMaterialization,
+          {
+            jobId: job.id,
+            runId: ctx.run?.id,
+            artifactDigest: job.handoff_artifact_digest,
+          },
+          { db: deps.getDb?.() },
+        );
+      } catch (error) {
+        lastError = error;
+        deps.log?.('error', `Credential cleanup failed for ${job.name}: ${error.message}`, {
+          jobId: job.id,
+          runId: ctx.run?.id || null,
+        });
+      }
+    }
+    if (!lastError && ctx.materializationCleanup) {
       const { provider, cleanupState } = ctx.materializationCleanup;
       if (typeof provider.cleanup === 'function') {
         for (const retryDelay of retryDelays) {
@@ -422,7 +484,7 @@ export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
     if (fence) {
       const status = lastError
         ? 'failed'
-        : ctx.materializationCleanup
+        : (ctx.materializationCleanup || ctx.v4CredentialMaterialization)
           ? 'cleaned'
           : 'not_required';
       try {
@@ -498,7 +560,9 @@ function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
         ...interruptedEvidenceOutcomes(job),
         ...redactOutcomesForPersistence(outcomes || {}, deps),
       };
-      if (run.evidence_required === 1 && (job.evidence || job.evidence_ref)) {
+      if (Number(job.handoff_version) !== 4
+        && run.evidence_required === 1
+        && (job.evidence || job.evidence_ref)) {
         const emptyHash = `sha256:${createHash('sha256').update('', 'utf8').digest('hex')}`;
         const evidence = deps.generateEvidence({
           ...job,
@@ -530,7 +594,23 @@ function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
       return { completion, dequeued: false };
     }
     if (!opts.skipJobUpdate) updateJobAfterRun(job, requestedStatus);
-    if (opts.disableJob && typeof updateJob === 'function') {
+    if (opts.disableJob && Number(job.handoff_version) === 4) {
+      appendRuntimeEvent('job.quarantine.required', {
+        jobId: job.id,
+        runId: run.id,
+        handoffArtifactDigest: job.handoff_artifact_digest,
+        payload: {
+          reason: summary,
+          job_disabled: false,
+          operator_action_required: true,
+        },
+      }, { db: getDb() });
+      log(
+        'warn',
+        `Handoff v4 job ${job.name} requires operator quarantine; its artifact-bound enabled state was not mutated`,
+        { jobId: job.id, runId: run.id },
+      );
+    } else if (opts.disableJob && typeof updateJob === 'function') {
       updateJob(job.id, { enabled: 0 });
     }
     if (state.dispatchRecord) setDispatchStatus(state.dispatchRecord.id, 'done');
@@ -863,12 +943,104 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       ? { credential_cleanup: currentRunContext.credential_cleanup }
       : {}),
   };
-  const finishFields = {
+  let finishFields = {
     summary: result.summary,
     error_message: result.errorMessage,
     ...result.runFinishFields,
     ...(Object.keys(mergedRunContext).length > 0 ? { context_summary: mergedRunContext } : {}),
   };
+  let preparedV4Evidence = null;
+  if (Number(job.handoff_version) === 4 && ctx.v4Artifact) {
+    try {
+      const evidenceTimestamp = new Date().toISOString();
+      const currentRun = getDb().prepare('SELECT * FROM runs WHERE id = ?').get(ctx.run.id);
+      const startedAt = currentRun.started_at
+        ? Date.parse(currentRun.started_at.includes('T')
+          ? currentRun.started_at
+          : `${currentRun.started_at.replace(' ', 'T')}Z`)
+        : Date.now();
+      const evidenceDurationMs = Number.isInteger(finishFields.duration_ms)
+        && finishFields.duration_ms >= 0
+        ? finishFields.duration_ms
+        : Math.max(0, Date.parse(evidenceTimestamp) - (
+            Number.isFinite(startedAt) ? startedAt : Date.parse(evidenceTimestamp)
+          ));
+      finishFields = { ...finishFields, duration_ms: evidenceDurationMs };
+      preparedV4Evidence = await (
+        deps.prepareArtifactBoundEvidence || prepareArtifactBoundEvidence
+      )(job, ctx.v4Artifact, {
+        ...currentRun,
+        ...finishFields,
+        status: result.status,
+        finished_at: evidenceTimestamp,
+        terminal_transition_at: evidenceTimestamp,
+      }, {
+        db: getDb(),
+        env: process.env,
+        cwd: process.cwd(),
+        timestamp: evidenceTimestamp,
+        agentcli: deps.agentcliEvidenceRuntime,
+        allowedSignersPath: deps.allowedSignersPath,
+      });
+    } catch (error) {
+      const evidenceRequired = ctx.v4Artifact.payload.evidence?.verify_required === true;
+      const evidenceFailure = String(error.message || 'evidence provider failed').slice(0, 500);
+      appendRuntimeEvent('evidence.failed', {
+        jobId: job.id,
+        runId: ctx.run.id,
+        handoffArtifactDigest: job.handoff_artifact_digest,
+        sourceRunId: ctx.run.source_run_id,
+        sourceRunHandoffArtifactDigest: ctx.run.source_run_handoff_artifact_digest,
+        payload: {
+          required: evidenceRequired,
+          code: error.code || 'EVIDENCE_VERIFICATION_FAILED',
+          reason: evidenceFailure,
+        },
+      }, { db: getDb() });
+      if (evidenceRequired) {
+        const reason = `Required handoff v4 evidence failed: ${evidenceFailure}`;
+        result = {
+          ...result,
+          status: 'recovery_blocked',
+          summary: reason,
+          content: reason,
+          errorMessage: reason,
+          skipDelivery: true,
+          skipJobUpdate: true,
+          skipChildren: true,
+          skipDequeue: true,
+          disableJob: true,
+          idemAction: 'release',
+        };
+        finishFields = {
+          ...finishFields,
+          summary: reason,
+          error_message: reason,
+          context_summary: {
+            ...mergedRunContext,
+            evidence: {
+              status: 'failed',
+              error: evidenceFailure,
+              operator_action_required: true,
+            },
+          },
+        };
+      } else {
+        finishFields = {
+          ...finishFields,
+          context_summary: {
+            ...mergedRunContext,
+            evidence: {
+              status: 'warning',
+              error: evidenceFailure,
+              operator_action_required: false,
+            },
+          },
+        };
+      }
+    }
+  }
+
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
   const enqueueCompletionDelivery = (retryScheduled) => {
     if (result.skipDelivery) return null;
@@ -916,10 +1088,19 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       ? shouldRunPostCompletionEffects(completion)
       : completion.changed && !completion.cancelled;
 
+    if (completion.changed && !completion.fenced && preparedV4Evidence) {
+      (deps.persistPreparedArtifactBoundEvidence || persistPreparedArtifactBoundEvidence)(
+        preparedV4Evidence,
+        { db: getDb() },
+      );
+    }
+
     if (completion.changed && !completion.fenced && ctx.v02Outcomes) {
       const { generateEvidence, persistV02Outcomes } = deps;
       const persistedOutcomes = redactOutcomesForPersistence(ctx.v02Outcomes, deps);
-      if (ctx.run.evidence_required === 1 && (job.evidence || job.evidence_ref)) {
+      if (Number(job.handoff_version) !== 4
+        && ctx.run.evidence_required === 1
+        && (job.evidence || job.evidence_ref)) {
         const runMetadata = {
           id: ctx.run.id,
           status: completion.status,
@@ -1030,7 +1211,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     }
 
     if (!result.skipJobUpdate) updateJobAfterRun(job, result.status);
-    if (result.cleanupFailed) {
+    if (result.cleanupFailed || result.disableJob) {
       updateJob(job.id, { enabled: 0 });
     }
     if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
@@ -1528,10 +1709,54 @@ export async function prepareDispatch(job, opts, deps) {
   };
 
   const v02Outcomes = {};
+  const handoffV4 = Number(job.handoff_version) === 4;
+  let v4Artifact = null;
+  if (handoffV4) {
+    try {
+      v4Artifact = (deps.assertArtifactMatchesJob || assertArtifactMatchesJob)(job, {
+        db: getDb(),
+      });
+      v02Outcomes.delegation_validation = (
+        deps.validateArtifactBoundDelegation || validateArtifactBoundDelegation
+      )(job, v4Artifact, dispatchRecord, {
+        runId: run.id,
+        sourceArtifactDigest: run.source_run_handoff_artifact_digest,
+      }, { db: getDb() });
+      v02Outcomes.authorization_proof_verification = await (
+        deps.verifyArtifactBoundProof || verifyArtifactBoundProof
+      )(job, v4Artifact, run, {
+        db: getDb(),
+        env: process.env,
+        cwd: process.cwd(),
+        agentcli: deps.agentcliProofRuntime,
+      });
+      v02Outcomes.identity_resolved = await (
+        deps.resolveArtifactBoundIdentity || resolveArtifactBoundIdentity
+      )(job, v4Artifact, run, {
+        db: getDb(),
+        env: process.env,
+        cwd: process.cwd(),
+        getIdentityProvider: deps.getIdentityProvider,
+      });
+    } catch (error) {
+      return abortPreparedRun(
+        job,
+        run,
+        `Handoff v4 preparation failed: ${error.message}`,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true, disableJob: error.transient !== true },
+      );
+    }
+    if (abortPreparationIfCancelled(v02Outcomes)) return null;
+  }
+
   const hasV02Identity = hasIdentityDeclaration(job);
   const hasV02Contract = job.contract_required_trust_level;
   const needsAuthorization = job.authorization || job.authorization_ref;
-  const shouldResolveIdentity = hasV02Identity || hasV02Contract || needsAuthorization;
+  const shouldResolveIdentity = !handoffV4
+    && (hasV02Identity || hasV02Contract || needsAuthorization);
 
   if (shouldResolveIdentity) {
     v02Outcomes.identity_resolved = await resolveIdentity(job, providerCtx);
@@ -1563,7 +1788,7 @@ export async function prepareDispatch(job, opts, deps) {
   // identity that will actually be materialized for the run. The policy can
   // narrow (downscope) or remove (none) credentials, and it may also inherit
   // the parent's auth_profile for downstream gateway calls.
-  if (job.parent_id) {
+  if (job.parent_id && !handoffV4) {
     const { getDb: getDatabase } = deps;
     const parentJob = getDatabase().prepare(
       'SELECT id, child_credential_policy, identity, identity_trust_level, auth_profile FROM jobs WHERE id = ?'
@@ -1713,7 +1938,7 @@ export async function prepareDispatch(job, opts, deps) {
     );
   }
 
-  if (v02Outcomes.identity_resolved && typeof validateDelegation === 'function') {
+  if (!handoffV4 && v02Outcomes.identity_resolved && typeof validateDelegation === 'function') {
     v02Outcomes.delegation_validation = validateDelegation(job, v02Outcomes.identity_resolved);
     if (v02Outcomes.delegation_validation?.valid === false) {
       return abortPreparedRun(
@@ -1751,7 +1976,7 @@ export async function prepareDispatch(job, opts, deps) {
     }
   }
 
-  if (job.authorization_proof || job.authorization_proof_ref) {
+  if (!handoffV4 && (job.authorization_proof || job.authorization_proof_ref)) {
     v02Outcomes.authorization_proof_verification = await verifyAuthorizationProof(job, providerCtx);
     if (abortPreparationIfCancelled(v02Outcomes)) return null;
     if (v02Outcomes.authorization_proof_verification?.verified === false) {
@@ -1876,8 +2101,110 @@ export async function prepareDispatch(job, opts, deps) {
   let materializedEnv = null;
   let materializationCleanup = null;
   let credentialCleanupTracked = false;
+  let v4CredentialMaterialization = null;
+  let gatewayCapabilityBinding = null;
 
-  if (v02Outcomes.identity_resolved?.source === 'provider' && v02Outcomes.identity_resolved.session) {
+  if (handoffV4) {
+    try {
+      const presentation = v4Artifact.payload.identity?.presentation || { handoff: 'none' };
+      const presentationRequired = presentation.handoff !== 'none';
+      const capabilityContext = {
+        jobId: job.id,
+        runId: run.id,
+        artifactDigest: job.handoff_artifact_digest,
+        runtimeInstanceId: run.runtime_instance_id,
+        sessionTarget: job.session_target,
+        presentationRequired,
+      };
+      const capabilityOptions = {
+        db: getDb(),
+        gateway: deps.gatewayCapabilityOptions,
+        localCapabilityResolver: deps.localCapabilityResolver,
+      };
+      const negotiate = deps.negotiateCredentialCapabilities || negotiateCredentialCapabilities;
+
+      // Prove the receiver can enforce the declared presentation before asking
+      // a provider to release any credential material.
+      let negotiation = await negotiate(null, capabilityContext, capabilityOptions);
+      if (presentationRequired) {
+        const resolvedIdentity = v02Outcomes.identity_resolved;
+        if (!resolvedIdentity?.provider_session_id || !resolvedIdentity?.session) {
+          throw new Error('Artifact credential presentation requires a resolved provider session');
+        }
+        const provider = deps.getIdentityProvider?.(resolvedIdentity.provider);
+        if (!provider) throw new Error(`Identity provider not loaded: ${resolvedIdentity.provider}`);
+        if (typeof deps.recordRunCredentialCleanupState === 'function' && deps.dispatcherFence) {
+          const tracked = deps.recordRunCredentialCleanupState(run.id, {
+            status: 'pending',
+            attempts: 0,
+          }, deps.dispatcherFence);
+          if (!tracked) throw new Error('Dispatcher ownership changed before credential materialization');
+          credentialCleanupTracked = true;
+        }
+        v4CredentialMaterialization = await (
+          deps.materializeCredentials || materializeCredentials
+        )(
+          provider,
+          {
+            row: getProviderSession(resolvedIdentity.provider_session_id, { db: getDb() }),
+            session: resolvedIdentity.session,
+          },
+          presentation,
+          {
+            jobId: job.id,
+            runId: run.id,
+            artifactDigest: job.handoff_artifact_digest,
+            sessionTarget: job.session_target,
+            runtimeInstanceId: run.runtime_instance_id,
+          },
+          { db: getDb(), env: process.env },
+        );
+        materializedEnv = job.session_target === 'isolated'
+          ? v4CredentialMaterialization.gatewayEnv
+          : v4CredentialMaterialization.env;
+
+        // Revalidate immediately after materialization. The isolated Gateway
+        // performs one final forced refresh at the request boundary as well.
+        negotiation = await negotiate(
+          v4CredentialMaterialization,
+          capabilityContext,
+          capabilityOptions,
+        );
+      }
+      if (job.session_target === 'isolated') {
+        gatewayCapabilityBinding = {
+          artifactDigest: job.handoff_artifact_digest,
+          runtimeInstanceId: run.runtime_instance_id,
+          nonce: negotiation.nonce,
+        };
+      }
+    } catch (error) {
+      if (v4CredentialMaterialization) {
+        try {
+          await (deps.cleanupCredentialMaterialization || cleanupCredentialMaterialization)(
+            v4CredentialMaterialization,
+            {
+              jobId: job.id,
+              runId: run.id,
+              artifactDigest: job.handoff_artifact_digest,
+            },
+            { db: getDb() },
+          );
+        } catch (cleanupError) {
+          error.message += `; credential cleanup failed: ${cleanupError.message}`;
+        }
+      }
+      return abortPreparedRun(
+        job,
+        run,
+        `Handoff v4 credential preparation failed: ${error.message}`,
+        v02Outcomes,
+        { dispatchRecord, idemKey },
+        deps,
+        { skipChildren: true, disableJob: error.transient !== true },
+      );
+    }
+  } else if (v02Outcomes.identity_resolved?.source === 'provider' && v02Outcomes.identity_resolved.session) {
     const providerName = v02Outcomes.identity_resolved.provider;
     const provider = deps.getIdentityProvider?.(providerName);
     const identityBlob = safeParse(job.identity) || {};
@@ -2017,6 +2344,9 @@ export async function prepareDispatch(job, opts, deps) {
     v02Outcomes,
     materializedEnv,
     materializationCleanup,
+    v4CredentialMaterialization,
+    gatewayCapabilityBinding,
+    v4Artifact,
     credentialCleanupTracked,
     executionEnv,
     governanceDecision,
@@ -2448,6 +2778,7 @@ async function runAgentTurnForSelection(
   selection,
   dispatchAgentTurn,
   materializedEnv = null,
+  capabilityBinding = null,
   signal = null,
 ) {
   const { log } = deps;
@@ -2484,6 +2815,7 @@ async function runAgentTurnForSelection(
     sessionKey: validatedSessionKey,
     authProfile: selection.authProfile,
     materializedEnv: materializedEnv || undefined,
+    capabilityBinding: capabilityBinding || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
     pollIntervalMs: 60000,
     absoluteTimeoutMs: job.run_timeout_ms || 300000,
@@ -2583,6 +2915,7 @@ export async function executeAgent(job, ctx, deps) {
       primarySelection,
       dispatchAgentTurn,
       ctx.materializedEnv || null,
+      ctx.gatewayCapabilityBinding || null,
       ctx.abortSignal || null,
     );
   } catch (primaryError) {
@@ -2607,6 +2940,7 @@ export async function executeAgent(job, ctx, deps) {
         fallbackSelection,
         dispatchAgentTurn,
         ctx.materializedEnv || null,
+        ctx.gatewayCapabilityBinding || null,
         ctx.abortSignal || null,
       );
       log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });

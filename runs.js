@@ -2,6 +2,8 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { TERMINAL_RUN_STATUSES, transitionRunTerminal } from './run-state.js';
+import { assertArtifactMatchesJob } from './handoff-artifact.js';
+import { appendRuntimeEvent } from './runtime-events.js';
 import {
   buildEvidenceExecutionSnapshot,
   generateEvidence,
@@ -27,6 +29,36 @@ export function createRun(jobId, opts = {}) {
     ? declaredEvidenceRequired
     : Number(Boolean(opts.evidence_required));
   const evidenceExecutionSnapshot = JSON.stringify(buildEvidenceExecutionSnapshot(job));
+  const v4Artifact = Number(job?.handoff_version) === 4
+    ? assertArtifactMatchesJob(job, { db })
+    : null;
+  const dispatch = opts.dispatch_queue_id
+    ? db.prepare('SELECT * FROM job_dispatch_queue WHERE id = ?').get(opts.dispatch_queue_id)
+    : null;
+  if (v4Artifact && opts.dispatch_queue_id
+    && dispatch?.handoff_artifact_digest !== job.handoff_artifact_digest) {
+    throw Object.assign(new Error('Dispatch artifact does not match the job artifact'), {
+      code: 'HANDOFF_ARTIFACT_DIGEST_MISMATCH',
+    });
+  }
+  const sourceRunId = v4Artifact
+    ? (dispatch?.source_run_id ?? opts.triggered_by_run ?? opts.retry_of ?? opts.replay_of ?? null)
+    : null;
+  const sourceRun = sourceRunId
+    ? db.prepare('SELECT id, handoff_artifact_digest FROM runs WHERE id = ?').get(sourceRunId)
+    : null;
+  const sourceArtifactDigest = v4Artifact
+    ? (dispatch?.source_run_handoff_artifact_digest ?? sourceRun?.handoff_artifact_digest ?? null)
+    : null;
+  if (v4Artifact && sourceRunId && (
+    !sourceRun
+    || !sourceRun.handoff_artifact_digest
+    || sourceArtifactDigest !== sourceRun.handoff_artifact_digest
+  )) {
+    throw Object.assign(new Error('Run source artifact does not match the exact source run'), {
+      code: 'DELEGATION_SOURCE_ARTIFACT_MISMATCH',
+    });
+  }
 
   db.prepare(`
     INSERT INTO runs (
@@ -35,9 +67,11 @@ export function createRun(jobId, opts = {}) {
       retry_of, triggered_by_run, dispatch_queue_id,
       dispatcher_owner, dispatcher_token, dispatch_started_at,
       evidence_required, evidence_execution_snapshot,
-      evidence_declaration_snapshot, evidence_ref_snapshot, approval_used
+      evidence_declaration_snapshot, evidence_ref_snapshot, approval_used,
+      handoff_artifact_digest, runtime_instance_id, source_run_id,
+      source_run_handoff_artifact_digest
     )
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     jobId,
@@ -64,9 +98,29 @@ export function createRun(jobId, opts = {}) {
       : typeof opts.approval_used === 'string'
         ? opts.approval_used
         : JSON.stringify(opts.approval_used),
+    v4Artifact ? job.handoff_artifact_digest : null,
+    v4Artifact ? id : null,
+    sourceRunId,
+    sourceArtifactDigest,
   );
 
-  return getRun(id);
+  const created = getRun(id);
+  if (v4Artifact) {
+    appendRuntimeEvent('run.created', {
+      jobId,
+      runId: id,
+      dispatchQueueId: opts.dispatch_queue_id,
+      handoffArtifactDigest: job.handoff_artifact_digest,
+      sourceRunId,
+      sourceRunHandoffArtifactDigest: sourceArtifactDigest,
+      payload: {
+        runtime_instance_id: id,
+        dispatch_kind: dispatch?.dispatch_kind ?? null,
+        status: created.status,
+      },
+    }, { db });
+  }
+  return created;
 }
 
 /**
