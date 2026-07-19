@@ -18,6 +18,7 @@ import {
   SCHEDULER_SCHEMAS,
   SCHEDULER_SCHEMA_VERSION,
 } from './scheduler-schema.js';
+import { HANDOFF_V4_RUNTIME_CONTRACT } from './handoff-artifact.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliArgs = process.argv.slice(2);
@@ -1588,6 +1589,7 @@ switch (command) {
       schema_version_source: 'package',
       schema_version_note: 'Run status or doctor to inspect the initialized database schema.',
       handoff_version: '4',
+      handoff_contract: HANDOFF_V4_RUNTIME_CONTRACT,
       features: {
         approvals: 'runtime',
         model_policy: 'model+thinking',

@@ -501,6 +501,16 @@ test('capabilities advertise authoritative handoff v4 enforcement', () => {
   const capabilities = JSON.parse(output);
   assert.equal(capabilities.handoff_version, '4');
   assert.equal(capabilities.schema_version, 29);
+  assert.deepEqual(capabilities.handoff_contract, {
+    artifact_schema: 'openclaw.scheduler.handoff-artifact',
+    artifact_schema_version: 1,
+    canonicalization: 'json-sort-v1',
+    canonicalization_version: 1,
+    digest: 'sha256',
+    undefined: 'null',
+    execution_binding_version: 2,
+    scheduler_job_binding_version: 1,
+  });
   assert.equal(capabilities.features.root_approval_gate, true);
   assert.equal(capabilities.features.approval_scope_enforcement, false);
   assert.equal(capabilities.features.structured_output_format, true);

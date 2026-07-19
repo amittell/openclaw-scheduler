@@ -27,7 +27,12 @@ function credentialError(code, message, details = null) {
 }
 
 function ensurePrivateDirectory(path) {
+  // SCHEDULER_HOME is an operator-owned local process setting. The directory
+  // remains intentionally configurable and is checked for type, symlinks, and
+  // private permissions immediately after creation.
+  // codeql[js/path-injection]
   mkdirSync(path, { recursive: true, mode: 0o700 });
+  // codeql[js/path-injection]
   const stat = lstatSync(path);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
     throw credentialError('CREDENTIAL_DIRECTORY_UNSAFE', 'Credential runtime path must be a directory');
@@ -109,6 +114,100 @@ function validateMedium(medium, sessionTarget) {
   }
 }
 
+function normalizedDeclaredBindings(presentation, medium) {
+  if (!Array.isArray(presentation?.bindings)) {
+    throw credentialError(
+      'CREDENTIAL_BINDING_INVALID',
+      'Artifact credential presentation must declare an exact bindings array',
+    );
+  }
+  const declared = new Map();
+  for (const [index, binding] of presentation.bindings.entries()) {
+    if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Declared credential binding ${index} must be an object`,
+      );
+    }
+    const name = binding.name;
+    if (typeof name !== 'string' || name.length === 0 || declared.has(name)) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Declared credential binding ${index} must have a unique non-empty name`,
+      );
+    }
+    const bindingMedium = binding.medium ?? medium;
+    if (bindingMedium !== 'none' && bindingMedium !== medium) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Declared credential binding ${name} medium does not match the negotiated presentation`,
+      );
+    }
+    declared.set(name, {
+      name,
+      medium: bindingMedium,
+      envKey: binding.env_key ?? null,
+      fileName: binding.file_name ?? null,
+      required: binding.required !== false,
+    });
+  }
+  return declared;
+}
+
+function validateProviderBindings(bindings, presentation, medium) {
+  const declared = normalizedDeclaredBindings(presentation, medium);
+  const returned = new Set();
+  for (const [index, binding] of bindings.entries()) {
+    if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+      throw credentialError('CREDENTIAL_BINDING_INVALID', `Binding ${index} must be an object`);
+    }
+    const name = binding.name;
+    if (typeof name !== 'string' || name.length === 0 || returned.has(name)) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider binding ${index} must have a unique non-empty declared name`,
+      );
+    }
+    returned.add(name);
+    const expected = declared.get(name);
+    if (!expected || expected.medium === 'none') {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider returned undeclared credential binding ${name}`,
+      );
+    }
+    const bindingMedium = binding.medium ?? medium;
+    const envKey = binding.key ?? binding.env_key ?? null;
+    const fileName = binding.file_name ?? null;
+    if (bindingMedium !== expected.medium) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider binding ${name} medium does not match the artifact declaration`,
+      );
+    }
+    if (envKey !== expected.envKey) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider binding ${name} environment key does not match the artifact declaration`,
+      );
+    }
+    if (fileName !== expected.fileName) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider binding ${name} file name does not match the artifact declaration`,
+      );
+    }
+  }
+  for (const expected of declared.values()) {
+    if (expected.medium !== 'none' && expected.required && !returned.has(expected.name)) {
+      throw credentialError(
+        'CREDENTIAL_BINDING_INVALID',
+        `Provider omitted required credential binding ${expected.name}`,
+      );
+    }
+  }
+}
+
 function insertPresentation(db, values) {
   db.prepare(`
     INSERT INTO credential_presentations (
@@ -173,12 +272,13 @@ export async function materializeCredentials(
     );
   }
   const bindings = response?.bindings;
-  if (!Array.isArray(bindings) || bindings.length === 0) {
+  if (!Array.isArray(bindings)) {
     throw credentialError(
       'CREDENTIAL_MATERIALIZATION_FAILED',
-      'Credential provider returned no bindings',
+      'Credential provider returned an invalid bindings result',
     );
   }
+  validateProviderBindings(bindings, presentation, medium);
 
   const runtimeRoot = ensurePrivateDirectory(
     join(resolveSchedulerHome(), 'credentials'),
@@ -205,7 +305,7 @@ export async function materializeCredentials(
           `Binding ${index} medium does not match negotiated presentation`,
         );
       }
-      const name = binding.name || `binding-${index + 1}`;
+      const name = binding.name;
       const valueBuffer = Buffer.isBuffer(binding.value)
         ? Buffer.from(binding.value)
         : Buffer.from(String(binding.value ?? ''), 'utf8');

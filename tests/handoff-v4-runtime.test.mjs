@@ -15,6 +15,7 @@ import { compileManifestToScheduler } from '@amittell/agentcli';
 
 import {
   assertArtifactMatchesJob,
+  canonicalStringify,
   getHandoffArtifact,
   sha256,
   validateHandoffArtifact,
@@ -33,6 +34,9 @@ import {
   verifyPersistedArtifactBoundEvidence,
 } from '../evidence-runtime.js';
 import { negotiateCredentialCapabilities } from '../capability-negotiation.js';
+import { runShellCommand } from '../dispatcher-shell.js';
+import { executeShell } from '../dispatcher-strategies.js';
+import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
 import { createJob, updateJob } from '../jobs.js';
 import { claimProofReplay, verifyArtifactBoundProof } from '../proof-runtime.js';
@@ -40,8 +44,15 @@ import {
   _resetProviderSessionMemoryForTesting,
   adoptProviderSession,
   resolveProviderSession,
+  resumeProviderSession,
 } from '../provider-session-store.js';
-import { createRun, finishRun, getRun, persistV02Outcomes } from '../runs.js';
+import {
+  createRun,
+  finishRun,
+  getRun,
+  persistV02Outcomes,
+  pruneEvidenceRecords,
+} from '../runs.js';
 import { getRuntimeEvent, listRuntimeEvents } from '../runtime-events.js';
 
 const JSON_FIELDS = [
@@ -236,6 +247,16 @@ test('generated v4 artifacts bind the complete persisted scheduler execution pro
     () => updateJob(job.id, { payload_model: 'different-model' }),
     error => error.code === 'HANDOFF_ARTIFACT_REQUIRED',
   );
+  for (const patch of [
+    { payload_scope: 'global' },
+    { resource_pool: 'different-pool' },
+    { job_class: 'pre_compaction_flush' },
+  ]) {
+    assert.throws(
+      () => updateJob(job.id, patch),
+      error => error.code === 'HANDOFF_ARTIFACT_REQUIRED',
+    );
+  }
   const persistedArtifact = getHandoffArtifact(job.handoff_artifact_digest);
   const transplanted = {
     ...job,
@@ -384,6 +405,48 @@ test('artifact bindings remain immutable across dispatches, runs, approvals, evi
     () => db.prepare('UPDATE runtime_events SET payload = ? WHERE id = ?').run('{}', event.id),
     /runtime events are immutable/,
   );
+});
+
+test('expired v4 evidence is pruned only after its immutable retention deadline', () => {
+  const job = createV4Job('Expired v4 evidence');
+  const run = createRun(job.id);
+  finishRun(run.id, 'ok', { summary: 'retention completed' });
+  const payload = {
+    execution_id: run.id,
+    bindings: { handoff_artifact_digest: job.handoff_artifact_digest },
+  };
+  const payloadText = canonicalStringify(payload);
+  const envelope = {
+    method: 'test-signature',
+    payload_digest: sha256(payloadText),
+  };
+  const retentionUntil = new Date(Date.now() - 1_000).toISOString();
+  getDb().prepare(`
+    INSERT INTO evidence_records (
+      id, run_id, job_id, algorithm, hash, payload, retention_policy,
+      retention_until, handoff_artifact_digest, evidence_method,
+      evidence_verified, evidence_envelope
+    ) VALUES (?, ?, ?, 'sha256', ?, ?, '1m', ?, ?, ?, 1, ?)
+  `).run(
+    `expired-evidence-${run.id}`,
+    run.id,
+    job.id,
+    envelope.payload_digest,
+    payloadText,
+    retentionUntil,
+    job.handoff_artifact_digest,
+    envelope.method,
+    canonicalStringify(envelope),
+  );
+
+  assert.equal(pruneEvidenceRecords().changes, 1);
+  assert.equal(
+    getDb().prepare('SELECT COUNT(*) AS count FROM evidence_records WHERE run_id = ?').get(run.id).count,
+    0,
+  );
+  const tombstone = JSON.parse(getRun(run.id).evidence_record);
+  assert.equal(tombstone.pruned, true);
+  assert.equal(tombstone.reason, 'retention_expired');
 });
 
 test('runtime event inspection reports malformed hash-matching JSON deterministically', () => {
@@ -605,6 +668,28 @@ test('delegation rejects scope escalation and excessive chain depth', () => {
     ),
     error => error.code === 'DELEGATION_DEPTH_EXCEEDED',
   );
+});
+
+test('replay validation accepts the exact crashed terminal source before retry semantics', () => {
+  const job = createV4Job('Crashed replay source');
+  const source = createRun(job.id);
+  finishRun(source.id, 'crashed', { summary: 'dispatcher recovery marked the run crashed' });
+  const dispatch = {
+    id: 'crashed-replay-dispatch',
+    job_id: job.id,
+    dispatch_kind: 'retry',
+    source_run_id: source.id,
+    replay_of_run_id: source.id,
+    source_run_handoff_artifact_digest: job.handoff_artifact_digest,
+  };
+  const validated = validateArtifactBoundDelegation(
+    job,
+    assertArtifactMatchesJob(job),
+    dispatch,
+    { runId: 'crashed-replay-run' },
+  );
+  assert.equal(validated.valid, true);
+  assert.equal(validated.source_run_id, source.id);
 });
 
 test('proof failure audit events are ordered and never claim verification success', async () => {
@@ -855,6 +940,61 @@ test('provider session transient retry exhaustion and terminal errors are determ
   assert.equal(refreshes, 1);
 });
 
+test('resumed provider sessions refresh expired state before reuse and then recheck revocation', async () => {
+  _resetProviderSessionMemoryForTesting();
+  const artifactDigest = `sha256:${'3'.repeat(64)}`;
+  const request = { principal: 'principal:resume-refresh' };
+  const ctx = { artifactDigest, jobId: 'resume-refresh-job', runId: 'resume-refresh-run' };
+  let refreshes = 0;
+  let revocationChecks = 0;
+  const provider = {
+    name: 'resume-refresh-provider',
+    type: 'identity',
+    async resumeSession() {
+      return { session: { principal: request.principal, rotation_id: 'resume-1' } };
+    },
+    async refreshSession() {
+      refreshes += 1;
+      return {
+        session: {
+          principal: request.principal,
+          rotation_id: 'resume-2',
+          expires_at: new Date(Date.now() + 120_000).toISOString(),
+          refresh_after: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+    },
+    async checkRevocation() {
+      revocationChecks += 1;
+      return { revoked: false };
+    },
+  };
+  const adopted = adoptProviderSession(provider, request, {
+    session: {
+      principal: request.principal,
+      rotation_id: 'resume-1',
+      expires_at: new Date(Date.now() - 2_000).toISOString(),
+      refresh_after: new Date(Date.now() - 3_000).toISOString(),
+    },
+  }, ctx, { db: getDb() });
+  _resetProviderSessionMemoryForTesting();
+
+  const resumed = await resumeProviderSession(provider, adopted.row.id, ctx, { db: getDb() });
+  assert.equal(refreshes, 1);
+  assert.equal(revocationChecks, 1);
+  assert.equal(resumed.row.status, 'active');
+  assert.equal(resumed.row.rotation_counter, 1);
+  assert.equal(resumed.session.rotation_id, 'resume-2');
+
+  await assert.rejects(
+    () => resumeProviderSession(provider, adopted.row.id, {
+      ...ctx,
+      artifactDigest: `sha256:${'4'.repeat(64)}`,
+    }, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_ARTIFACT_MISMATCH',
+  );
+});
+
 test('temp-file credentials are tracked before write and recover without persisting secrets', async () => {
   const schedulerHome = mkdtempSync(join(tmpdir(), 'scheduler-v4-credentials-'));
   const previousSchedulerHome = process.env.SCHEDULER_HOME;
@@ -878,7 +1018,16 @@ test('temp-file credentials are tracked before write and recover without persist
     const materialization = await materializeCredentials(
       provider,
       { session: { id: 'opaque-session' } },
-      { handoff: 'temp-file' },
+      {
+        handoff: 'temp-file',
+        bindings: [{
+          name: 'api-key',
+          medium: 'temp-file',
+          env_key: 'API_KEY_FILE',
+          file_name: 'api-key',
+          required: true,
+        }],
+      },
       {
         jobId: 'credential-job',
         runId: 'credential-run',
@@ -961,7 +1110,16 @@ test('credential presentation enforces target media and never persists env, stdi
       const materialized = await materializeCredentials(
         provider,
         { session: { id: `session-${index}` } },
-        { handoff: item.medium },
+        {
+          handoff: item.medium,
+          bindings: [{
+            name: `binding-${index}`,
+            medium: item.medium,
+            env_key: item.key,
+            file_name: null,
+            required: true,
+          }],
+        },
         {
           jobId: `credential-media-job-${index}`,
           runId,
@@ -1023,6 +1181,133 @@ test('credential presentation enforces target media and never persists env, stdi
   }
 });
 
+test('credential materialization rejects missing, extra, duplicate, and retargeted provider bindings', async () => {
+  const presentation = {
+    handoff: 'env',
+    bindings: [{
+      name: 'token',
+      medium: 'env',
+      env_key: 'EXACT_TOKEN',
+      file_name: null,
+      required: true,
+    }],
+  };
+  const invalidBindings = [
+    [],
+    [{ name: 'extra', medium: 'env', key: 'EXACT_TOKEN', value: 'secret' }],
+    [
+      { name: 'token', medium: 'env', key: 'EXACT_TOKEN', value: 'secret' },
+      { name: 'token', medium: 'env', key: 'EXACT_TOKEN', value: 'secret' },
+    ],
+    [{ name: 'token', medium: 'env', key: 'OTHER_TOKEN', value: 'secret' }],
+    [{ name: 'token', medium: 'stdin', key: 'EXACT_TOKEN', value: 'secret' }],
+  ];
+  for (const [index, bindings] of invalidBindings.entries()) {
+    await assert.rejects(
+      () => materializeCredentials(
+        {
+          name: `invalid-binding-provider-${index}`,
+          async materializeCredentials() { return { bindings }; },
+        },
+        { session: {} },
+        presentation,
+        {
+          runId: `invalid-binding-run-${index}`,
+          artifactDigest: `sha256:${String(index + 1).repeat(64)}`,
+          sessionTarget: 'shell',
+        },
+        { db: getDb() },
+      ),
+      error => error.code === 'CREDENTIAL_BINDING_INVALID',
+    );
+  }
+  await assert.rejects(
+    () => materializeCredentials(
+      {
+        name: 'invalid-file-binding-provider',
+        async materializeCredentials() {
+          return { bindings: [{
+            name: 'token-file',
+            medium: 'temp-file',
+            key: 'TOKEN_FILE',
+            file_name: 'provider-selected-name',
+            value: 'secret',
+          }] };
+        },
+      },
+      { session: {} },
+      {
+        handoff: 'temp-file',
+        bindings: [{
+          name: 'token-file',
+          medium: 'temp-file',
+          env_key: 'TOKEN_FILE',
+          file_name: 'artifact-selected-name',
+          required: true,
+        }],
+      },
+      {
+        runId: 'invalid-binding-run-file-name',
+        artifactDigest: `sha256:${'6'.repeat(64)}`,
+        sessionTarget: 'shell',
+      },
+      { db: getDb() },
+    ),
+    error => error.code === 'CREDENTIAL_BINDING_INVALID',
+  );
+  const optional = await materializeCredentials(
+    {
+      name: 'optional-binding-provider',
+      async materializeCredentials() { return { bindings: [] }; },
+    },
+    { session: {} },
+    {
+      handoff: 'env',
+      bindings: [{
+        name: 'optional-token',
+        medium: 'env',
+        env_key: 'OPTIONAL_TOKEN',
+        file_name: null,
+        required: false,
+      }],
+    },
+    {
+      runId: 'optional-binding-run',
+      artifactDigest: `sha256:${'7'.repeat(64)}`,
+      sessionTarget: 'shell',
+    },
+    { db: getDb() },
+  );
+  assert.deepEqual(optional.env, {});
+  assert.equal(optional.presentationIds.length, 0);
+  await cleanupCredentialMaterialization(optional, { runId: 'optional-binding-run' }, { db: getDb() });
+  assert.equal(
+    getDb().prepare("SELECT COUNT(*) AS count FROM credential_presentations WHERE run_id LIKE 'invalid-binding-run-%'").get().count,
+    0,
+  );
+});
+
+test('stdin credential materialization is piped into the shell command', async () => {
+  const secret = Buffer.from('stdin-credential-value', 'utf8');
+  const result = await executeShell({
+    name: 'stdin credential shell',
+    payload_message: 'IFS= read -r value; printf "%s" "$value"',
+    run_timeout_ms: 5_000,
+    shell_env_policy: 'minimal',
+  }, {
+    run: { id: 'stdin-credential-shell-run' },
+    executionEnv: {},
+    v4CredentialMaterialization: { stdin: secret },
+  }, {
+    runShellCommand,
+    normalizeShellResult,
+    log() {},
+  });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.runFinishFields.shell_stdout, secret.toString('utf8'));
+  assert.equal(result.runFinishFields.shell_stdout_sha256, sha256(secret.toString('utf8')));
+});
+
 test('credential capability negotiation fails before release and binds fresh runtime nonces', async () => {
   const context = {
     jobId: 'capability-job',
@@ -1056,6 +1341,26 @@ test('credential capability negotiation fails before release and binds fresh run
   });
   assert.notEqual(first.nonce, second.nonce);
   assert.equal(JSON.stringify(listRuntimeEvents({ runId: context.runId })).includes('redacted'), false);
+
+  const main = await negotiateCredentialCapabilities(null, {
+    ...context,
+    runId: 'capability-main-run',
+    sessionTarget: 'main',
+    presentationRequired: false,
+  }, {
+    db: getDb(),
+    localCapabilityResolver: () => ['artifact-bound-runtime-v1'],
+  });
+  assert.equal(main.local.capabilities.includes('artifact-bound-runtime-v1'), true);
+  await assert.rejects(
+    () => negotiateCredentialCapabilities(null, {
+      ...context,
+      runId: 'capability-main-credential-run',
+      sessionTarget: 'main',
+      presentationRequired: true,
+    }, { db: getDb() }),
+    error => error.code === 'CREDENTIAL_MAIN_SESSION_REFUSED',
+  );
 });
 
 test('persisted SSH evidence is cryptographically reverified against the exact execution', async () => {
@@ -1093,13 +1398,19 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     input.workflows[0].tasks[0].contract = { audit: 'always' };
     const job = createJob(schedulerSpecFromManifest(input));
     const run = createRun(job.id);
+    const fullStdout = 'expected-output-from-the-complete-offloaded-artifact';
+    const stdoutPath = join(workdir, 'full-stdout.txt');
+    writeFileSync(stdoutPath, fullStdout, { mode: 0o600 });
     finishRun(run.id, 'ok', {
       summary: 'signed evidence completed',
       shell_exit_code: 0,
-      shell_stdout: 'expected-output',
+      shell_stdout: 'expected-output\n...[truncated]',
       shell_stderr: '',
-      shell_stdout_bytes: 15,
+      shell_stdout_path: stdoutPath,
+      shell_stdout_bytes: Buffer.byteLength(fullStdout, 'utf8'),
       shell_stderr_bytes: 0,
+      shell_stdout_sha256: sha256(fullStdout),
+      shell_stderr_sha256: sha256(''),
       verification_result: JSON.stringify({ passed: true }),
     });
 
@@ -1133,6 +1444,35 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       job.handoff_artifact_digest,
     );
     assert.equal(getRun(run.id).evidence_record.includes(stored.id), true);
+
+    const replacementInput = structuredClone(input);
+    replacementInput.workflows[0].tasks[0].schedule.cron = '5 * * * *';
+    const replacementSpec = schedulerSpecFromManifest(replacementInput);
+    delete replacementSpec.id;
+    const replacedJob = updateJob(job.id, replacementSpec);
+    assert.notEqual(replacedJob.handoff_artifact_digest, job.handoff_artifact_digest);
+    const verifiedAfterReplacement = await verifyPersistedArtifactBoundEvidence(run.id, {
+      allowedSignersPath,
+      principal: 'scheduler-test',
+    });
+    assert.equal(
+      verifiedAfterReplacement.integrity.valid,
+      true,
+      verifiedAfterReplacement.integrity.error,
+    );
+    assert.equal(
+      verifiedAfterReplacement.payload.bindings.handoff_artifact_digest,
+      job.handoff_artifact_digest,
+    );
+
+    writeFileSync(stdoutPath, 'tampered-output-with-a-different-complete-value', { mode: 0o600 });
+    const tamperedOutput = await verifyPersistedArtifactBoundEvidence(run.id, {
+      allowedSignersPath,
+      principal: 'scheduler-test',
+    });
+    assert.equal(tamperedOutput.integrity.valid, false);
+    assert.equal(tamperedOutput.integrity.code, 'EVIDENCE_OUTPUT_DIGEST_MISMATCH');
+    writeFileSync(stdoutPath, fullStdout, { mode: 0o600 });
 
     writeFileSync(
       allowedSignersPath,

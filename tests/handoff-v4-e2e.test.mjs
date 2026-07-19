@@ -25,6 +25,7 @@ import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
 import { enqueueDispatch, getDispatch } from '../dispatch-queue.js';
+import { HANDOFF_V4_RUNTIME_CONTRACT } from '../handoff-artifact.js';
 import {
   fireTriggeredChildren,
   createJob,
@@ -380,6 +381,7 @@ function schedulerRunner() {
         scheduler_version: '0.5.0-e2e',
         schema_version: 29,
         handoff_version: '4',
+        handoff_contract: HANDOFF_V4_RUNTIME_CONTRACT,
         features: V4_FEATURES,
       };
     },

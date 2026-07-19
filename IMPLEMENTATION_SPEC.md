@@ -23,7 +23,8 @@ The v29 ownership, governance, evidence, and delivery tables are:
 - `job_dispatch_queue`: owner/token/expiry for claims plus attempt, replay, and
   error state.
 - `runs`: dispatcher fence, cancellation fields, process identity and lifecycle,
-  agent-abort audit, and one terminal transition timestamp.
+  agent-abort audit, full-output SHA-256 digests, and one terminal transition
+  timestamp.
 - `approvals`: versioned decisions and explicit approved, rejected, cancelled,
   timed-out, dispatching, and dispatched timestamps/state, plus risk, approver
   scope, and the bound execution-contract hash.
@@ -206,6 +207,10 @@ including when completion is observed exactly at the deadline.
 - Identity, trust, proof, authorization, and credential handoff failures remain
   fail closed.
 - Materialized credential values are cleared during cleanup paths.
+- Provider results must match every immutable presentation binding by name,
+  medium, environment key, file name, cardinality, and required state before
+  any value is exposed. Stdin credentials are piped to shell stdin and cleared
+  with the rest of the materialization.
 - Delegation validation enforces declared mode, maximum depth, allowed
   delegators, per-hop grants, cycles, and provider denial before execution.
 - `authorization_ref` resolves only through a loaded provider implementing
@@ -232,6 +237,14 @@ output, postcondition, and terminal status. The selected AgentCLI evidence
 provider signs or externally verifies that payload. The scheduler persists the
 envelope only after verification succeeds when verification is required. It
 never downgrades a signed or provider-verified declaration to checksum evidence.
+
+Result evidence binds the SHA-256 digest and byte count of complete stdout and
+stderr, including offloaded artifacts rather than their database excerpts.
+Re-verification reloads the immutable artifact named by the historical run,
+not the job's current artifact, and rejects missing or modified offloaded
+output. A finite v4 retention policy permits deletion only after its persisted
+deadline; pruning first validates the immutable envelope binding and leaves an
+auditable run tombstone.
 
 The SSH provider uses `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the
 declared key, principal, namespace, and allowed-signers file. Provider methods,

@@ -193,6 +193,8 @@ assert(runCols.includes('shell_stderr'), 'runs.shell_stderr column');
 assert(runCols.includes('shell_stdout_path'), 'runs.shell_stdout_path column');
 assert(runCols.includes('shell_stderr_path'), 'runs.shell_stderr_path column');
 assert(runCols.includes('shell_stdout_bytes'), 'runs.shell_stdout_bytes column');
+assert(runCols.includes('shell_stdout_sha256'), 'runs.shell_stdout_sha256 column');
+assert(runCols.includes('shell_stderr_sha256'), 'runs.shell_stderr_sha256 column');
 assert(runCols.includes('shell_stderr_bytes'), 'runs.shell_stderr_bytes column');
 assert(jobCols.includes('execution_intent'), 'jobs.execution_intent column');
 assert(jobCols.includes('execution_read_only'), 'jobs.execution_read_only column');

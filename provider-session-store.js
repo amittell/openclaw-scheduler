@@ -327,26 +327,123 @@ export function getProviderSession(id, opts = {}) {
 
 export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
   const db = opts.db || getDb();
-  const row = getProviderSession(id, { db });
+  let row = getProviderSession(id, { db });
   if (!row) throw providerError('PROVIDER_SESSION_NOT_FOUND', `Provider session ${id} not found`);
-  if (TERMINAL_STATUSES.has(row.status) || row.status === 'expired') {
+  if (!provider || provider.name !== row.provider_name || provider.type !== row.provider_type) {
     throw providerError(
-      row.status === 'revoked' ? 'PROVIDER_SESSION_REVOKED' : 'PROVIDER_SESSION_EXPIRED',
+      'PROVIDER_SESSION_MISMATCH',
+      `Provider session ${id} does not belong to ${provider?.type || '(unknown)'}/${provider?.name || '(unknown)'}`,
+    );
+  }
+  if (ctx.artifactDigest != null && ctx.artifactDigest !== row.handoff_artifact_digest) {
+    throw providerError(
+      'PROVIDER_SESSION_ARTIFACT_MISMATCH',
+      `Provider session ${id} does not belong to the requested handoff artifact`,
+    );
+  }
+  const now = typeof ctx.now === 'number' ? ctx.now : Date.now();
+  const maxTransientErrors = Number.isInteger(opts.maxTransientErrors) && opts.maxTransientErrors > 0
+    ? opts.maxTransientErrors
+    : DEFAULT_MAX_TRANSIENT_ERRORS;
+  const refreshClaimTimeoutMs = Number.isInteger(opts.refreshClaimTimeoutMs) && opts.refreshClaimTimeoutMs > 0
+    ? opts.refreshClaimTimeoutMs
+    : DEFAULT_REFRESH_CLAIM_TIMEOUT_MS;
+
+  if (row.status === 'refreshing') {
+    const updatedAt = Date.parse(`${row.updated_at.replace(' ', 'T')}Z`);
+    if (Number.isFinite(updatedAt) && now - updatedAt >= refreshClaimTimeoutMs) {
+      db.prepare(`
+        UPDATE provider_sessions SET status = 'expired', last_error = ?, updated_at = datetime('now')
+        WHERE id = ? AND status = 'refreshing'
+      `).run('Recovered stale provider refresh claim', row.id);
+      row = getProviderSession(id, { db });
+    } else {
+      throw providerError('PROVIDER_SESSION_BUSY', 'Provider session refresh is already owned', {
+        transient: true,
+      });
+    }
+  }
+  if (TERMINAL_STATUSES.has(row.status)) {
+    throw providerError(
+      row.status === 'revoked' ? 'PROVIDER_SESSION_REVOKED' : 'PROVIDER_SESSION_FAILED',
       row.last_error || `Provider session ${id} is ${row.status}`,
     );
   }
   let session = memorySessions.get(id);
-  if (!session) {
-    if (typeof provider?.resumeSession !== 'function') {
-      throw providerError(
-        'PROVIDER_SESSION_RESUME_UNSUPPORTED',
-        `Provider ${provider?.name || '(unknown)'} cannot resume session ${id}`,
-      );
-    }
+  if (!session && typeof provider.resumeSession === 'function') {
     const resumed = await callProvider('resumeSession', provider, row, ctx);
     session = resumed?.session ?? resumed;
-    if (!session) throw providerError('PROVIDER_SESSION_INVALID', 'Provider resumed no session');
-    memorySessions.set(id, session);
+    if (session) memorySessions.set(id, session);
+  }
+
+  const mustRefresh = row.status === 'expired'
+    || isPast(row.expires_at, now)
+    || isPast(row.refresh_after, now);
+  if (mustRefresh) {
+    if (typeof provider.refreshSession !== 'function') {
+      const reason = 'Session expired or reached refresh_after and provider does not implement refreshSession()';
+      db.prepare(`
+        UPDATE provider_sessions
+        SET status = 'expired', last_error = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(reason, id);
+      memorySessions.delete(id);
+      throw providerError(
+        'PROVIDER_SESSION_EXPIRED',
+        `Provider session ${id} expired and cannot be refreshed`,
+      );
+    }
+    const claimed = db.prepare(`
+      UPDATE provider_sessions
+      SET status = 'refreshing', updated_at = datetime('now')
+      WHERE id = ? AND status IN ('active','expired')
+    `).run(id);
+    if (claimed.changes !== 1) {
+      throw providerError('PROVIDER_SESSION_BUSY', 'Provider session refresh is already owned', {
+        transient: true,
+      });
+    }
+    try {
+      const refreshed = await callProvider('refreshSession', provider, session ?? row, ctx);
+      row = persistResolvedSession(
+        db,
+        provider,
+        row.cache_key_hash,
+        refreshed,
+        row.handoff_artifact_digest,
+        row,
+      );
+      session = memorySessions.get(id);
+      appendRuntimeEvent('provider.session.refreshed', {
+        jobId: ctx.jobId,
+        runId: ctx.runId,
+        handoffArtifactDigest: row.handoff_artifact_digest,
+        payload: { provider: provider.name, session_id: id, rotation_counter: row.rotation_counter },
+      }, { db });
+    } catch (error) {
+      const nextTransientErrors = (row.transient_error_count ?? 0) + (error.transient ? 1 : 0);
+      const exhausted = error.transient && nextTransientErrors >= maxTransientErrors;
+      db.prepare(`
+        UPDATE provider_sessions
+        SET status = ?, transient_error_count = ?, last_error = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(error.transient && !exhausted ? 'expired' : 'failed', nextTransientErrors, error.message, id);
+      memorySessions.delete(id);
+      if (exhausted) {
+        throw providerError(
+          'PROVIDER_SESSION_RETRY_EXHAUSTED',
+          `Provider session refresh exhausted ${maxTransientErrors} transient attempt(s)`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+  if (!session) {
+    throw providerError(
+      'PROVIDER_SESSION_RESUME_UNSUPPORTED',
+      `Provider ${provider.name} cannot resume session ${id}`,
+    );
   }
   if (typeof provider.checkRevocation !== 'function') {
     throw providerError(

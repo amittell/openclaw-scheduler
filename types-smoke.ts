@@ -446,6 +446,9 @@ const v4Spec: JobSpec = {
 void v4Spec;
 void handoffArtifacts.HANDOFF_V4_VERSION;
 void handoffArtifacts.HANDOFF_V4_SCHEMA_MIN;
+void handoffArtifacts.HANDOFF_V4_EXECUTION_BINDING_VERSION;
+void handoffArtifacts.HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION;
+void handoffArtifacts.HANDOFF_V4_RUNTIME_CONTRACT.artifact_schema;
 const canonicalV4: string = handoffArtifacts.canonicalStringify({ z: 1, a: 2 });
 const digestV4: string = handoffArtifacts.artifactDigest({ payload: 'v4' });
 const validationV4 = handoffArtifacts.validateHandoffArtifact({ schema: handoffArtifacts.HANDOFF_V4_SCHEMA });

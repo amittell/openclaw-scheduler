@@ -7,6 +7,18 @@ export const HANDOFF_V4_CANONICALIZATION = 'json-sort-v1';
 export const HANDOFF_V4_CANONICALIZATION_VERSION = 1;
 export const HANDOFF_V4_VERSION = 4;
 export const HANDOFF_V4_SCHEMA_MIN = 29;
+export const HANDOFF_V4_EXECUTION_BINDING_VERSION = 2;
+export const HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION = 1;
+export const HANDOFF_V4_RUNTIME_CONTRACT = Object.freeze({
+  artifact_schema: HANDOFF_V4_SCHEMA,
+  artifact_schema_version: HANDOFF_V4_ARTIFACT_SCHEMA_VERSION,
+  canonicalization: HANDOFF_V4_CANONICALIZATION,
+  canonicalization_version: HANDOFF_V4_CANONICALIZATION_VERSION,
+  digest: 'sha256',
+  undefined: 'null',
+  execution_binding_version: HANDOFF_V4_EXECUTION_BINDING_VERSION,
+  scheduler_job_binding_version: HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION,
+});
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const PRESENTATION_MEDIA = new Set(['none', 'env', 'temp-file', 'stdin', 'gateway-env-header']);
 const RAW_SECRET_KEYS = new Set([
@@ -68,6 +80,8 @@ function schedulerJobExecutionProjection(job) {
     },
     reliability: {
       overlap_policy: job.overlap_policy ?? 'skip',
+      resource_pool: job.resource_pool ?? null,
+      job_class: job.job_class ?? 'standard',
       max_retries: job.max_retries ?? 0,
       max_queued_dispatches: job.max_queued_dispatches ?? 25,
       max_pending_approvals: job.max_pending_approvals ?? 10,
@@ -92,6 +106,7 @@ function schedulerJobExecutionProjection(job) {
       session_target: job.session_target ?? null,
       agent_id: job.agent_id ?? 'main',
       payload_kind: job.payload_kind ?? null,
+      payload_scope: job.payload_scope ?? 'own',
     },
     command: {
       payload_message_sha256: sha256(job.payload_message ?? ''),
@@ -233,10 +248,10 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
     || payload.canonicalization?.undefined !== 'null') {
     errors.push('canonicalization contract is unsupported');
   }
-  if (payload.execution_binding_version !== 2) {
+  if (payload.execution_binding_version !== HANDOFF_V4_EXECUTION_BINDING_VERSION) {
     errors.push('execution_binding_version must be 2');
   }
-  if (payload.scheduler_job_binding?.version !== 1) {
+  if (payload.scheduler_job_binding?.version !== HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION) {
     errors.push('scheduler_job_binding.version must be 1');
   }
   for (const [path, value, nullable] of [

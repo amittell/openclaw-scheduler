@@ -979,6 +979,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
         env: process.env,
         cwd: process.cwd(),
         timestamp: evidenceTimestamp,
+        evidenceOutput: result.evidenceOutput || null,
         agentcli: deps.agentcliEvidenceRuntime,
         allowedSignersPath: deps.allowedSignersPath,
       });
@@ -2598,6 +2599,7 @@ export async function executeShell(job, ctx, deps) {
     {
       signal: ctx.abortSignal || null,
       envPolicy: job.shell_env_policy || 'minimal',
+      stdin: ctx.v4CredentialMaterialization?.stdin ?? null,
       onProcess: processInfo => {
         if (!recordRunProcess) return;
         const recorded = recordRunProcess(ctx.run.id, processInfo, ctx.dispatcherFence || {});
@@ -2648,6 +2650,8 @@ export async function executeShell(job, ctx, deps) {
     shell_stderr_path: shellResult.stderrPath,
     shell_stdout_bytes: shellResult.stdoutBytes,
     shell_stderr_bytes: shellResult.stderrBytes,
+    shell_stdout_sha256: result.evidenceOutput.stdout_sha256,
+    shell_stderr_sha256: result.evidenceOutput.stderr_sha256,
   };
 
   if (isCompletionDeliveryWatcherJob(job)) {
@@ -2985,6 +2989,13 @@ export async function executeAgent(job, ctx, deps) {
     stderr_sha256: null,
     stdout_bytes: Buffer.byteLength(content, 'utf8'),
     stderr_bytes: 0,
+  };
+  result.runFinishFields = {
+    ...(result.runFinishFields || {}),
+    shell_stdout_bytes: result.evidenceOutput.stdout_bytes,
+    shell_stderr_bytes: result.evidenceOutput.stderr_bytes,
+    shell_stdout_sha256: result.evidenceOutput.stdout_sha256,
+    shell_stderr_sha256: result.evidenceOutput.stderr_sha256,
   };
   result.errorMessage = effectiveStatus === 'error'
     ? (isTaskFailed ? 'Agent signalled TASK_FAILED' : 'Transient error in agent reply')

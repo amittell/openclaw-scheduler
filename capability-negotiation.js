@@ -15,10 +15,16 @@ function assertContext(ctx) {
   if (typeof ctx?.runtimeInstanceId !== 'string' || ctx.runtimeInstanceId.length === 0) {
     throw new TypeError('runtimeInstanceId is required');
   }
-  if (!['shell', 'isolated'].includes(ctx.sessionTarget)) {
+  if (!['shell', 'isolated', 'main'].includes(ctx.sessionTarget)) {
     throw negotiationError(
       'CAPABILITY_NEGOTIATION_UNSUPPORTED_TARGET',
       `Artifact-bound credential negotiation is not supported for ${ctx.sessionTarget || 'unknown'} jobs`,
+    );
+  }
+  if (ctx.sessionTarget === 'main' && ctx.presentationRequired === true) {
+    throw negotiationError(
+      'CREDENTIAL_MAIN_SESSION_REFUSED',
+      'Credential materialization is not allowed for main-session jobs',
     );
   }
 }
@@ -68,7 +74,7 @@ export async function negotiateCredentialCapabilities(materialized, ctx, opts = 
     const capabilities = localCapabilities(opts);
     const required = [
       LOCAL_ARTIFACT_BINDING_CAPABILITY,
-      ...(ctx.presentationRequired === true || materialized
+      ...(ctx.sessionTarget === 'shell' && (ctx.presentationRequired === true || materialized)
         ? [LOCAL_SHELL_CREDENTIAL_CAPABILITY]
         : []),
     ];

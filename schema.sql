@@ -207,6 +207,8 @@ CREATE TABLE IF NOT EXISTS runs (
   shell_stderr_path TEXT,
   shell_stdout_bytes INTEGER NOT NULL DEFAULT 0,
   shell_stderr_bytes INTEGER NOT NULL DEFAULT 0,
+  shell_stdout_sha256 TEXT,
+  shell_stderr_sha256 TEXT,
   dispatched_at   TEXT,
   run_timeout_ms  INTEGER NOT NULL DEFAULT 300000,
 
@@ -707,7 +709,10 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_delete
 BEFORE DELETE ON evidence_records
-WHEN OLD.handoff_artifact_digest IS NOT NULL
+WHEN OLD.handoff_artifact_digest IS NOT NULL AND NOT (
+  OLD.retention_until IS NOT NULL
+  AND julianday(OLD.retention_until) <= julianday('now')
+)
 BEGIN
   SELECT RAISE(ABORT, 'handoff v4 evidence is immutable');
 END;

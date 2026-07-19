@@ -236,6 +236,8 @@ export interface RunRecord {
   shell_stderr_path?: string | null;
   shell_stdout_bytes?: number | null;
   shell_stderr_bytes?: number | null;
+  shell_stdout_sha256?: string | null;
+  shell_stderr_sha256?: string | null;
 
   // Timeout
   run_timeout_ms?: number;
@@ -632,6 +634,8 @@ export interface FinishRunOpts {
   shell_stderr_path?: string | null;
   shell_stdout_bytes?: number | null;
   shell_stderr_bytes?: number | null;
+  shell_stdout_sha256?: string | null;
+  shell_stderr_sha256?: string | null;
 
   // v0.2 Outcomes
   identity_resolved?: string | object | null;
@@ -1194,6 +1198,7 @@ export const shellRuntime: {
   terminateProcessTree(child: { pid: number; kill(signal?: string | number): boolean }, opts?: { pgid?: number; graceMs?: number }): Promise<boolean>;
   runShellCommand(command: string, timeoutMs?: number, env?: Record<string, string> | null, opts?: {
     signal?: AbortSignal;
+    stdin?: string | Uint8Array | null;
     envPolicy?: 'minimal' | 'inherit';
     cwd?: string;
     shell?: string;
@@ -1468,6 +1473,18 @@ export const handoffArtifacts: {
   HANDOFF_V4_CANONICALIZATION_VERSION: 1;
   HANDOFF_V4_VERSION: 4;
   HANDOFF_V4_SCHEMA_MIN: 29;
+  HANDOFF_V4_EXECUTION_BINDING_VERSION: 2;
+  HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION: 1;
+  HANDOFF_V4_RUNTIME_CONTRACT: Readonly<{
+    artifact_schema: 'openclaw.scheduler.handoff-artifact';
+    artifact_schema_version: 1;
+    canonicalization: 'json-sort-v1';
+    canonicalization_version: 1;
+    digest: 'sha256';
+    undefined: 'null';
+    execution_binding_version: 2;
+    scheduler_job_binding_version: 1;
+  }>;
   sortKeysDeep<T>(value: T): T;
   canonicalStringify(value: unknown): string;
   sha256(value: string | Uint8Array): string;

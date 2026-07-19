@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { getDb } from './db.js';
 import {
-  assertArtifactMatchesJob,
   canonicalStringify,
+  getHandoffArtifact,
   sha256,
 } from './handoff-artifact.js';
 import { getEvidenceProvider as getRuntimeEvidenceProvider } from './provider-registry.js';
@@ -41,7 +42,7 @@ function retentionUntil(policy, now = Date.now()) {
   return new Date(now + Number(match[1]) * unitMs[match[2].toLowerCase()]).toISOString();
 }
 
-function evidenceRecord(run, job, artifact, timestamp) {
+function evidenceRecord(run, artifact, timestamp, opts = {}) {
   return {
     execution_id: run.id,
     timestamp,
@@ -54,7 +55,7 @@ function evidenceRecord(run, job, artifact, timestamp) {
     handoff_artifact_digest: run.handoff_artifact_digest,
     source_run_id: run.source_run_id,
     source_run_handoff_artifact_digest: run.source_run_handoff_artifact_digest,
-    declared_identity: parseJson(job.identity),
+    declared_identity: artifact.identity ?? null,
     resolved_identity: parseJson(run.identity_resolved),
     authorization_proof: parseJson(run.authorization_proof_verification),
     authorization: parseJson(run.authorization_decision),
@@ -65,7 +66,7 @@ function evidenceRecord(run, job, artifact, timestamp) {
     },
     contract: artifact.contract,
     command: commandEvidence(artifact),
-    result: resultEvidence(run),
+    result: resultEvidence(run, opts),
     verify: parseJson(run.verification_result),
   };
 }
@@ -106,12 +107,48 @@ function commandEvidence(artifact) {
   };
 }
 
-function resultEvidence(run) {
+function outputDigest(run, kind, opts = {}) {
+  const digestField = `shell_${kind}_sha256`;
+  const pathField = `shell_${kind}_path`;
+  const textField = `shell_${kind}`;
+  const bytesField = `shell_${kind}_bytes`;
+  const supplied = opts.evidenceOutput?.[`${kind}_sha256`] ?? run[digestField] ?? null;
+  const path = run[pathField];
+  if (path) {
+    let content;
+    try {
+      content = readFileSync(path);
+    } catch (error) {
+      throw evidenceError(
+        'EVIDENCE_OUTPUT_UNAVAILABLE',
+        `Cannot read full ${kind} artifact ${path}: ${error.message}`,
+      );
+    }
+    const actual = `sha256:${createHash('sha256').update(content).digest('hex')}`;
+    if (supplied && supplied !== actual) {
+      throw evidenceError(
+        'EVIDENCE_OUTPUT_DIGEST_MISMATCH',
+        `Full ${kind} artifact does not match its persisted digest`,
+      );
+    }
+    if (run[bytesField] != null && Number(run[bytesField]) !== content.length) {
+      throw evidenceError(
+        'EVIDENCE_OUTPUT_SIZE_MISMATCH',
+        `Full ${kind} artifact does not match its persisted byte count`,
+      );
+    }
+    return actual;
+  }
+  if (supplied) return supplied;
+  return run[textField] == null ? null : sha256(run[textField]);
+}
+
+function resultEvidence(run, opts = {}) {
   const output = {
     status: run.status,
     summary: run.summary,
-    stdout_sha256: run.shell_stdout == null ? null : sha256(run.shell_stdout),
-    stderr_sha256: run.shell_stderr == null ? null : sha256(run.shell_stderr),
+    stdout_sha256: outputDigest(run, 'stdout', opts),
+    stderr_sha256: outputDigest(run, 'stderr', opts),
     structured_output_sha256: run.structured_output_sha256,
   };
   return {
@@ -180,7 +217,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
   if (Number(job?.handoff_version) !== 4) return null;
   if (!run?.id) throw evidenceError('RUN_NOT_FOUND', 'Evidence preparation requires a run');
   const artifact = artifactRecord?.payload ? artifactRecord.payload : artifactRecord;
-  const profile = parseJson(job.evidence);
+  const profile = parseJson(run.evidence_declaration_snapshot) || parseJson(job.evidence);
   if (!profile) {
     if (artifact.evidence?.signed_or_provider_verified_required) {
       throw evidenceError('EVIDENCE_PROVIDER_REQUIRED', 'Artifact requires signed or provider-verified evidence');
@@ -207,7 +244,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     handoffArtifactDigest: run.handoff_artifact_digest,
     sourceRunId: run.source_run_id,
     sourceRunHandoffArtifactDigest: run.source_run_handoff_artifact_digest,
-    declaredIdentity: parseJson(job.identity),
+    declaredIdentity: artifact.identity ?? null,
     resolvedIdentity: parseJson(run.identity_resolved),
     authorizationProof: parseJson(run.authorization_proof_verification),
     authorization: parseJson(run.authorization_decision),
@@ -218,7 +255,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     },
     contract: artifact.contract,
     command: commandEvidence(artifact),
-    result: resultEvidence(run),
+    result: resultEvidence(run, opts),
     verify: parseJson(run.verification_result),
     complianceContext: profile.payload?.context || {},
   });
@@ -249,7 +286,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     );
   }
 
-  const record = evidenceRecord(run, job, artifact, timestamp);
+  const record = evidenceRecord(run, artifact, timestamp, opts);
   const verifyOptions = providerVerifyOptions(profile, record, opts, principal);
   const verification = source === 'agentcli'
     ? await agentcli.verifyEvidenceEnvelope(attestation.envelope, verifyOptions, {
@@ -411,10 +448,16 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
     if (!run) throw evidenceError('RUN_NOT_FOUND', `Evidence run not found: ${runId}`);
     const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(run.job_id);
     if (!job) throw evidenceError('JOB_NOT_FOUND', `Evidence job not found: ${run.job_id}`);
-    if (Number(job.handoff_version) !== 4) {
+    if (!run.handoff_artifact_digest) {
       throw evidenceError('HANDOFF_V4_REQUIRED', 'Cryptographic evidence verification requires handoff v4');
     }
-    const artifactRecord = assertArtifactMatchesJob(job, { db });
+    const artifactRecord = getHandoffArtifact(run.handoff_artifact_digest, { db });
+    if (!artifactRecord) {
+      throw evidenceError(
+        'HANDOFF_ARTIFACT_REQUIRED',
+        `Historical handoff artifact ${run.handoff_artifact_digest} is not retrievable`,
+      );
+    }
     payload = JSON.parse(row.payload);
     envelope = JSON.parse(row.evidence_envelope);
     if (canonicalStringify(payload) !== row.payload) {
@@ -440,12 +483,12 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
       throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
     }
 
-    const profile = parseJson(job.evidence);
+    const profile = parseJson(run.evidence_declaration_snapshot) || parseJson(job.evidence);
     if (!profile?.provider) {
       throw evidenceError('EVIDENCE_PROVIDER_REQUIRED', 'Persisted evidence provider configuration is missing');
     }
     const agentcli = await loadAgentcli(opts);
-    const record = evidenceRecord(run, job, artifactRecord.payload, payload.timestamp);
+    const record = evidenceRecord(run, artifactRecord.payload, payload.timestamp, opts);
     const { provider, source } = await resolveProvider(profile, agentcli, {
       env: opts.env || process.env,
     });

@@ -2,7 +2,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { TERMINAL_RUN_STATUSES, transitionRunTerminal } from './run-state.js';
-import { assertArtifactMatchesJob } from './handoff-artifact.js';
+import { assertArtifactMatchesJob, canonicalStringify, sha256 } from './handoff-artifact.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 import {
   buildEvidenceExecutionSnapshot,
@@ -822,7 +822,7 @@ export function pruneEvidenceRecords(opts = {}) {
   const cutoff = opts.now == null ? new Date() : new Date(opts.now);
   if (Number.isNaN(cutoff.getTime())) throw new Error('invalid evidence retention cutoff');
   const candidates = db.prepare(`
-    SELECT id, run_id
+    SELECT *
     FROM evidence_records
     WHERE retention_until IS NOT NULL
       AND julianday(retention_until) <= julianday(?)
@@ -838,8 +838,38 @@ export function pruneEvidenceRecords(opts = {}) {
   const prune = () => {
     let changes = 0;
     for (const candidate of candidates) {
-      const evidence = getEvidenceRecord(candidate.run_id, { db });
-      if (evidence?.integrity?.valid !== true) continue;
+      let evidence;
+      if (candidate.handoff_artifact_digest) {
+        if (Date.parse(candidate.retention_until) > Date.now()) continue;
+        try {
+          const payload = JSON.parse(candidate.payload);
+          const envelope = JSON.parse(candidate.evidence_envelope);
+          const canonicalPayload = canonicalStringify(payload);
+          const envelopeHash = envelope.payload_digest || sha256(canonicalStringify(envelope));
+          const run = db.prepare(
+            'SELECT handoff_artifact_digest, source_run_id, source_run_handoff_artifact_digest FROM runs WHERE id = ?',
+          ).get(candidate.run_id);
+          if (
+            candidate.evidence_verified !== 1
+            || canonicalPayload !== candidate.payload
+            || envelope.payload_digest !== sha256(candidate.payload)
+            || candidate.hash !== envelopeHash
+            || payload.execution_id !== candidate.run_id
+            || payload.bindings?.handoff_artifact_digest !== candidate.handoff_artifact_digest
+            || !run
+            || run.handoff_artifact_digest !== candidate.handoff_artifact_digest
+            || (run.source_run_id ?? null) !== (candidate.source_run_id ?? null)
+            || (run.source_run_handoff_artifact_digest ?? null)
+              !== (candidate.source_run_handoff_artifact_digest ?? null)
+          ) continue;
+          evidence = candidate;
+        } catch {
+          continue;
+        }
+      } else {
+        evidence = getEvidenceRecord(candidate.run_id, { db });
+        if (evidence?.integrity?.valid !== true) continue;
+      }
       markPruned.run(JSON.stringify({
         pruned: true,
         reason: 'retention_expired',

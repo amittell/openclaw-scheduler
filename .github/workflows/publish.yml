@@ -63,7 +63,7 @@ jobs:
       matrix:
         include:
           - contract: handoff-v4
-            ref: e6f9dc538c7784897062a07c1e06717458d5802d
+            ref: 3bd1aab69d5d8b78816e1c7adb0c8b57e18bf025
           - contract: handoff-v3
             ref: f1fed6d7d451196bda316b82d6567b174012a4ba
           - contract: handoff-v2
@@ -96,6 +96,12 @@ jobs:
 
       - name: Install scheduler dependencies
         run: npm ci
+
+      - name: Link checked-out agentcli for handoff v4 runtime tests
+        if: ${{ matrix.contract == 'handoff-v4' }}
+        run: |
+          mkdir -p node_modules/@amittell
+          ln -s ../../../agentcli node_modules/@amittell/agentcli
 
       - name: Run required scheduler-agentcli contract checks
         env:
@@ -209,7 +215,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: amittell/agentcli
-          ref: e6f9dc538c7784897062a07c1e06717458d5802d
+          ref: 3bd1aab69d5d8b78816e1c7adb0c8b57e18bf025
           path: agentcli
           persist-credentials: false
 

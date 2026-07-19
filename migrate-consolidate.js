@@ -110,7 +110,8 @@ export default function migrateConsolidate() {
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
       'shell_stdout', 'shell_stderr', 'shell_stdout_path', 'shell_stderr_path',
-      'shell_stdout_bytes', 'shell_stderr_bytes', 'idempotency_key',
+      'shell_stdout_bytes', 'shell_stderr_bytes', 'shell_stdout_sha256',
+      'shell_stderr_sha256', 'idempotency_key',
       'summary', 'error_message', 'session_key', 'session_id',
       'dispatched_at', 'last_heartbeat',
       'identity_resolved', 'trust_evaluation', 'authorization_decision',
@@ -504,6 +505,8 @@ export default function migrateConsolidate() {
     `ALTER TABLE runs ADD COLUMN shell_stderr_path TEXT`,
     `ALTER TABLE runs ADD COLUMN shell_stdout_bytes INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE runs ADD COLUMN shell_stderr_bytes INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE runs ADD COLUMN shell_stdout_sha256 TEXT`,
+    `ALTER TABLE runs ADD COLUMN shell_stderr_sha256 TEXT`,
     // v27: dispatcher ownership, cancellation, and child-process tracking
     `ALTER TABLE runs ADD COLUMN dispatcher_owner TEXT`,
     `ALTER TABLE runs ADD COLUMN dispatcher_token INTEGER`,
@@ -1465,9 +1468,13 @@ export default function migrateConsolidate() {
         BEFORE UPDATE ON evidence_records
         WHEN OLD.handoff_artifact_digest IS NOT NULL
         BEGIN SELECT RAISE(ABORT, 'handoff v4 evidence is immutable'); END;
-        CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_delete
+        DROP TRIGGER IF EXISTS trg_v4_evidence_no_delete;
+        CREATE TRIGGER trg_v4_evidence_no_delete
         BEFORE DELETE ON evidence_records
-        WHEN OLD.handoff_artifact_digest IS NOT NULL
+        WHEN OLD.handoff_artifact_digest IS NOT NULL AND NOT (
+          OLD.retention_until IS NOT NULL
+          AND julianday(OLD.retention_until) <= julianday('now')
+        )
         BEGIN SELECT RAISE(ABORT, 'handoff v4 evidence is immutable'); END;
   `);
 

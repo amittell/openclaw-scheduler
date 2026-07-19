@@ -2194,8 +2194,11 @@ at dispatch time:
 }
 ```
 
-Credential materialization is target-specific. Shell jobs receive a scoped
-environment locally. Isolated agent jobs first require the connected Gateway
+Credential materialization is target-specific. Shell jobs receive the exact
+declared environment, temporary-file, or stdin bindings locally. Provider
+output must match every artifact binding by name, medium, environment key,
+file name, cardinality, and required state before any secret is exposed.
+Isolated agent jobs first require the connected Gateway
 to advertise `chat-completions-env-inject-v1`, then send the validated scoped
 map through `x-openclaw-env-inject`. If the capability is absent, dispatch fails
 closed with `GATEWAY_ENV_INJECT_UNSUPPORTED` before a credential-bearing request
@@ -2207,7 +2210,10 @@ Handoff v4 validates delegated identity chains against the exact source run,
 resolves `authorization_ref` only through a configured provider, presents
 credentials through one negotiated medium, and records append-only runtime
 events. Its evidence envelope binds the canonical artifact, runtime instance,
-identity, proof, authorization, result, postcondition, and lineage. The SSH
+identity, proof, authorization, complete output digests, postcondition, and
+lineage. Offloaded stdout and stderr are hashed in full, not from their stored
+excerpts. Historical verification reloads the exact artifact bound to the run.
+The SSH
 provider signs and verifies with `ssh-keygen -Y`; other declared providers must
 implement equivalent verification. `openclaw-scheduler runs evidence RUN_ID
 --json` re-verifies the persisted envelope against the stored execution.
@@ -2217,7 +2223,8 @@ immutable canonical SHA-256 checksum backend. That legacy path remains a
 separate capability and is never used to downgrade a v4 signed-evidence
 declaration.
 
-`openclaw-scheduler capabilities --json` reports `handoff_version: "4"` and
+`openclaw-scheduler capabilities --json` reports `handoff_version: "4"`, the
+exact top-level `handoff_contract` canonicalization and binding versions, and
 the enforcement features `root_approval_gate`,
 `approval_scope_enforcement: false`,
 `structured_output_format`, `delegation_validation`,
