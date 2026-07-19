@@ -1377,10 +1377,41 @@ export function getJob(id) {
  */
 export function listJobs(opts = {}) {
   const db = getDb();
-  if (opts.enabledOnly) {
-    return db.prepare('SELECT * FROM jobs WHERE enabled = 1 ORDER BY next_run_at').all();
-  }
-  return db.prepare('SELECT * FROM jobs ORDER BY name').all();
+  const rows = opts.enabledOnly
+    ? db.prepare('SELECT * FROM jobs WHERE enabled = 1 ORDER BY next_run_at').all()
+    : db.prepare('SELECT * FROM jobs ORDER BY name').all();
+  if (opts.includeHandoffArtifacts !== true) return rows;
+
+  return rows.map(job => {
+    if (Number(job.handoff_version) !== 4) return job;
+    if (!job.handoff_artifact_digest) {
+      throw Object.assign(
+        new Error(`Handoff v4 job ${job.id} is missing artifact digest`),
+        { code: 'HANDOFF_ARTIFACT_REQUIRED' },
+      );
+    }
+
+    let artifact;
+    try {
+      artifact = getHandoffArtifact(job.handoff_artifact_digest, { db });
+    } catch (error) {
+      throw Object.assign(
+        new Error(`Persisted handoff v4 artifact for job ${job.id} is not valid JSON`),
+        { code: 'HANDOFF_ARTIFACT_INVALID', cause: error },
+      );
+    }
+    if (!artifact) {
+      throw Object.assign(
+        new Error(`Handoff v4 artifact for job ${job.id} is not persisted`),
+        { code: 'HANDOFF_ARTIFACT_REQUIRED' },
+      );
+    }
+
+    const validation = assertValidHandoffArtifact(artifact.payload, {
+      expectedDigest: job.handoff_artifact_digest,
+    });
+    return { ...job, handoff_artifact_payload: validation.payload };
+  });
 }
 
 /**

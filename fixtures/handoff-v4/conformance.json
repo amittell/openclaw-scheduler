@@ -62,7 +62,7 @@
     ]
   },
   "expected": {
-    "artifact_digest": "sha256:5bb0727036d352c87b6cad16577eafe4fdb35985ae79c73053474ceadd91f62d",
+    "artifact_digest": "sha256:ffc67fa20585fd9e6b94f8a12f3be45c6a826f948b577aeb2e28d82fdef5c9d4",
     "manifest_digest": "sha256:03afcc6f88e60a7e3358578425ee79ff91d31b855e5ae97a8dc20495ef9f2dc4",
     "effective_task_hash": "sha256:0d6b7a63ba7ff75811e5db236b84648dc9547d2ce3d22cdc42eec621c9ff98e4",
     "scheduler_job_binding_digest": "sha256:daac076adbaaac470e748f94d66297b3b018910867d817b78c3bc24768ffa2e6"
@@ -122,6 +122,26 @@
         }
       ],
       "expected_error": "approval.required must be a boolean"
+    },
+    {
+      "name": "missing evidence payload hash",
+      "changes": [
+        {
+          "op": "delete",
+          "path": ["evidence", "payload_hash"]
+        }
+      ],
+      "expected_error": "evidence.payload_hash is required"
+    },
+    {
+      "name": "missing evidence provider config hash",
+      "changes": [
+        {
+          "op": "delete",
+          "path": ["evidence", "provider_config_hash"]
+        }
+      ],
+      "expected_error": "evidence.provider_config_hash is required"
     },
     {
       "name": "cryptographic proof downgrade",

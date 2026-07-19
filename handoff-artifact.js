@@ -275,6 +275,12 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
   if (payload.scheduler_job_binding?.version !== HANDOFF_V4_SCHEDULER_JOB_BINDING_VERSION) {
     errors.push('scheduler_job_binding.version must be 1');
   }
+  if (!Object.hasOwn(payload.evidence ?? {}, 'payload_hash')) {
+    errors.push('evidence.payload_hash is required');
+  }
+  if (!Object.hasOwn(payload.evidence ?? {}, 'provider_config_hash')) {
+    errors.push('evidence.provider_config_hash is required');
+  }
   for (const [path, value, nullable] of [
     ['scheduler_job_binding.digest', payload.scheduler_job_binding?.digest, false],
     ['manifest.digest', payload.manifest?.digest, false],

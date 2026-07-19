@@ -18,6 +18,12 @@ const binPath = join(root, 'bin', 'openclaw-scheduler.js');
 const migratePath = join(root, 'migrate.js');
 const consolidatePath = join(root, 'migrate-consolidate.js');
 const packageVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
+const handoffV4JobFixturePath = join(
+  root,
+  'tests',
+  'fixtures',
+  'handoff-v4-approval-proof-job.json',
+);
 
 function tempRoot(t, prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -147,6 +153,106 @@ test('jobs add and update accept file and stdin JSON payloads', t => {
   });
   assert.equal(updated.status, 0, updated.stderr);
   assert.equal(parseStdout(updated).job.name, 'Updated through stdin');
+});
+
+test('jobs list hydrates persisted v4 artifacts only when explicitly requested', t => {
+  const dir = tempRoot(t, 'scheduler-list-handoff-v4-');
+  const env = { SCHEDULER_DB: join(dir, 'scheduler.db') };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+
+  const addedV4 = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(addedV4.status, 0, addedV4.stderr);
+
+  const addedLegacy = runNode(
+    cliPath,
+    ['jobs', 'add', JSON.stringify(validShellJob({ name: 'Legacy list probe' })), '--json'],
+    { env },
+  );
+  assert.equal(addedLegacy.status, 0, addedLegacy.stderr);
+  const legacyJobId = parseStdout(addedLegacy).job.id;
+
+  const compact = runNode(cliPath, ['jobs', 'list', '--json'], { env });
+  assert.equal(compact.status, 0, compact.stderr);
+  const compactV4 = parseStdout(compact).find(job => job.id === fixture.id);
+  assert.ok(compactV4);
+  assert.equal(compactV4.handoff_artifact_digest, fixture.handoff_artifact_digest);
+  assert.equal(Object.hasOwn(compactV4, 'handoff_artifact_payload'), false);
+
+  const hydrated = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.equal(hydrated.status, 0, hydrated.stderr);
+  const hydratedJobs = parseStdout(hydrated);
+  const hydratedV4 = hydratedJobs.find(job => job.id === fixture.id);
+  const hydratedLegacy = hydratedJobs.find(job => job.id === legacyJobId);
+  assert.deepEqual(hydratedV4.handoff_artifact_payload, fixture.handoff_artifact_payload);
+  assert.equal(Object.hasOwn(hydratedLegacy, 'handoff_artifact_payload'), false);
+
+  const disabled = runNode(cliPath, ['jobs', 'disable', fixture.id, '--json'], { env });
+  assert.equal(disabled.status, 0, disabled.stderr);
+  const hydratedDisabled = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.equal(hydratedDisabled.status, 0, hydratedDisabled.stderr);
+  const disabledV4 = parseStdout(hydratedDisabled).find(job => job.id === fixture.id);
+  assert.equal(disabledV4.enabled, 0);
+  assert.deepEqual(disabledV4.handoff_artifact_payload, fixture.handoff_artifact_payload);
+});
+
+test('hydrated v4 job reads fail closed for invalid or missing persisted artifacts', t => {
+  const dir = tempRoot(t, 'scheduler-list-invalid-handoff-v4-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.exec('DROP TRIGGER trg_handoff_artifacts_no_update');
+    db.prepare('UPDATE handoff_artifacts SET payload = ? WHERE digest = ?')
+      .run('{broken', fixture.handoff_artifact_digest);
+  } finally {
+    db.close();
+  }
+
+  const invalid = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(invalid.status, 0);
+  assert.equal(parseStdout(invalid).code, 'HANDOFF_ARTIFACT_INVALID');
+
+  const missingDb = new Database(dbPath);
+  try {
+    missingDb.exec('DROP TRIGGER trg_handoff_artifacts_no_delete');
+    missingDb.prepare('DELETE FROM handoff_artifacts WHERE digest = ?')
+      .run(fixture.handoff_artifact_digest);
+  } finally {
+    missingDb.close();
+  }
+
+  const missing = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(missing.status, 0);
+  assert.equal(parseStdout(missing).code, 'HANDOFF_ARTIFACT_REQUIRED');
 });
 
 test('doctor reports schema v29 and lease, queue, outbox, and approval diagnostics', t => {

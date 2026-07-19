@@ -48,6 +48,11 @@ const jobSpec: JobSpec = {
 const created: JobRecord = jobs.createJob(jobSpec);
 const fetched: JobRecord | undefined = jobs.getJob('id');
 const listed: JobRecord[] = jobs.listJobs({ enabledOnly: true });
+const listedWithArtifacts: JobRecord[] = jobs.listJobs({
+  enabledOnly: true,
+  includeHandoffArtifacts: true,
+});
+void listedWithArtifacts[0]?.handoff_artifact_payload;
 const updated: JobRecord | null = jobs.updateJob('id', { enabled: 0 });
 jobs.deleteJob('id');
 

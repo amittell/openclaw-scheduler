@@ -70,7 +70,7 @@
   "verify_on_failure": null,
   "delete_after_run": 0,
   "handoff_version": 4,
-  "handoff_artifact_digest": "sha256:bf9f0dad97e9e02e9f5157b087c48c1a886d03c878c0b946bfb03d1781627358",
+  "handoff_artifact_digest": "sha256:cfb0408b145074e845ebd2a6be364a26e8ee189683b9e83e55cbb5d4f97ee75d",
   "handoff_artifact_payload": {
     "schema": "openclaw.scheduler.handoff-artifact",
     "artifact_schema_version": 1,
@@ -206,6 +206,8 @@
       "provider": null,
       "methods": [],
       "payload_bind": [],
+      "payload_hash": null,
+      "provider_config_hash": null,
       "verify_required": false,
       "retention": null,
       "signed_or_provider_verified_required": false
@@ -239,4 +241,3 @@
   },
   "effective_task_hash": "sha256:c56aaa0b6b921bac9e6701b664248257f45bb81b5e0f40ed99bce4d631198d19"
 }
-

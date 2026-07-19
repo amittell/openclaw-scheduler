@@ -1433,7 +1433,8 @@ delivery_channel, delivery_to, brand_name, created_at
 
 ```bash
 # ── Jobs ──────────────────────────────────────────
-openclaw-scheduler jobs list                     # List all (shows agent, parent, trigger; supports --type <type>)
+openclaw-scheduler jobs list                     # List all (supports --type <type>)
+openclaw-scheduler jobs list --include-handoff-artifacts --json # Validate and hydrate persisted v4 artifacts
 openclaw-scheduler jobs get <id>                 # Full details as JSON
 openclaw-scheduler jobs add --file job.json      # Inline JSON and --stdin are also supported
 openclaw-scheduler jobs update <id> --stdin      # Partial update from standard input
@@ -2039,6 +2040,13 @@ Adding agentcli on top gives you declarative workflow manifests, stable job IDs,
 v0.2 identity and authorization support, evidence capability negotiation,
 handoff v4 capability negotiation, and repeatable applies for
 workflows that outgrow ad-hoc job creation.
+
+Default job listings omit immutable v4 artifact payloads. Control-plane clients
+that must validate an existing v4 job before updating it use
+`openclaw-scheduler jobs list --include-handoff-artifacts --json`. The opt-in
+read validates each persisted payload against its digest and fails the complete
+request if any v4 artifact is missing or invalid; legacy jobs are returned
+unchanged.
 
 ### Installing agentcli
 

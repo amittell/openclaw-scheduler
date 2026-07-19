@@ -100,7 +100,7 @@ export const SCHEDULER_SCHEMAS = {
       // Agentcli handoff v4
       handoff_version: { type: 'integer', enum: [4], nullable: true },
       handoff_artifact_digest: { type: 'string', nullable: true, pattern: '^sha256:[0-9a-f]{64}$' },
-      handoff_artifact_payload: { type: 'object', nullable: true, description: 'Create/update-only canonical artifact payload; persisted immutably outside the job row' },
+      handoff_artifact_payload: { type: 'object', nullable: true, description: 'Canonical v4 artifact payload accepted on create/update and returned only by opt-in hydrated job reads; persisted immutably outside the job row' },
       effective_task_hash: { type: 'string', nullable: true, pattern: '^sha256:[0-9a-f]{64}$' },
     },
   },

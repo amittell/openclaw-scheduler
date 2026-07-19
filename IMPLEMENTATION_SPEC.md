@@ -72,6 +72,13 @@ pending dispatches and approvals bound to the superseded digest. Disabling a v4
 job does not rewrite its artifact. Re-enabling is allowed only when the
 resulting job once again matches that same persisted artifact exactly.
 
+Default job-list reads omit the artifact payload stored outside the job row.
+`jobs list --include-handoff-artifacts --json` explicitly hydrates every v4 row
+with its canonical `handoff_artifact_payload`. Hydration validates the stored
+payload against the row's artifact digest before returning any result. A
+missing, malformed, invalid, or digest-mismatched v4 artifact fails the complete
+read with a nonzero structured error; legacy rows remain unchanged.
+
 Every dispatch, approval, run, evidence row, provider session, credential
 presentation, and runtime event carries the exact artifact digest. Chain and
 retry work additionally bind the exact source run ID and source artifact digest.

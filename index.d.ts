@@ -174,7 +174,7 @@ export interface JobSpec {
   // Handoff v4 immutable execution binding
   handoff_version?: 4 | null;
   handoff_artifact_digest?: string | null;
-  /** Create/update input only. Persisted artifacts are addressed by digest. */
+  /** Create/update input, or opt-in list output when includeHandoffArtifacts is true. */
   handoff_artifact_payload?: string | Record<string, unknown> | null;
   effective_task_hash?: string | null;
 
@@ -917,7 +917,7 @@ export const jobs: {
   // CRUD
   createJob(opts: JobSpec): JobRecord;
   getJob(id: string): JobRecord | undefined;
-  listJobs(opts?: { enabledOnly?: boolean }): JobRecord[];
+  listJobs(opts?: { enabledOnly?: boolean; includeHandoffArtifacts?: boolean }): JobRecord[];
   updateJob(id: string, patch: Partial<JobSpec>): JobRecord | null;
   deleteJob(id: string): void;
 

@@ -79,7 +79,8 @@ Global:
   --json                             Emit machine-readable JSON
 
 Jobs:
-  jobs list [--type watchdog]        List all jobs (optionally filter by type)
+  jobs list [--type watchdog] [--include-handoff-artifacts]
+                                     List jobs; opt in to validated v4 artifact payloads
   jobs tree                          Show jobs as parent/child tree
   jobs get <id>                      Get job details
   jobs add <json>|--file <path>|--stdin [--watchdog] [--at <datetime>] [--in <duration>] [--profile <id>]
@@ -463,7 +464,9 @@ switch (command) {
   case 'jobs':
     switch (sub) {
       case 'list': {
-        let jobs = listJobs();
+        let jobs = listJobs({
+          includeHandoffArtifacts: args.includes('--include-handoff-artifacts'),
+        });
         // Filter by --type if provided (e.g. --type watchdog)
         const typeFilterIdx = args.indexOf('--type');
         if (typeFilterIdx >= 0 && args[typeFilterIdx + 1]) {
