@@ -143,7 +143,11 @@ export async function resolveArtifactBoundIdentity(job, artifactRecord, run, opt
     const parentHandle = await resumeProviderSession(
       provider,
       parentIdentity.provider_session_id,
-      { ...ctx, sourceArtifactDigest: source.run.handoff_artifact_digest },
+      {
+        ...ctx,
+        artifactDigest: source.run.handoff_artifact_digest,
+        childArtifactDigest: ctx.artifactDigest,
+      },
       { db },
     );
     if (policy === 'inherit') {

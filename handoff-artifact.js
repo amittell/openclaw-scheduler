@@ -48,7 +48,10 @@ export function canonicalStringify(value) {
 }
 
 export function sha256(value) {
-  return `sha256:${createHash('sha256').update(String(value), 'utf8').digest('hex')}`;
+  const hash = createHash('sha256');
+  if (value instanceof Uint8Array) hash.update(value);
+  else hash.update(String(value), 'utf8');
+  return `sha256:${hash.digest('hex')}`;
 }
 
 export function artifactDigest(payload) {
@@ -85,11 +88,11 @@ function schedulerJobExecutionProjection(job) {
       max_retries: job.max_retries ?? 0,
       max_queued_dispatches: job.max_queued_dispatches ?? 25,
       max_pending_approvals: job.max_pending_approvals ?? 10,
-      max_trigger_fanout: job.max_trigger_fanout ?? 100,
+      max_trigger_fanout: job.max_trigger_fanout ?? 25,
       delivery_guarantee: job.delivery_guarantee ?? 'at-most-once',
     },
     delivery: {
-      mode: job.delivery_mode ?? 'none',
+      mode: job.delivery_mode ?? 'announce',
       channel: job.delivery_channel ?? null,
       to: job.delivery_to ?? null,
       opt_out_reason: job.delivery_opt_out_reason ?? null,
@@ -124,17 +127,17 @@ function schedulerJobExecutionProjection(job) {
     },
     approval: {
       required: Boolean(job.approval_required),
-      timeout_s: job.approval_timeout_s ?? null,
-      auto: job.approval_auto ?? null,
+      timeout_s: job.approval_timeout_s ?? 3600,
+      auto: job.approval_auto ?? 'reject',
       risk_level: job.approval_risk_level ?? null,
       approver_scope: job.approval_approver_scope ?? null,
     },
     output: {
       format: job.output_format ?? null,
-      store_limit_bytes: job.output_store_limit_bytes ?? null,
-      excerpt_limit_bytes: job.output_excerpt_limit_bytes ?? null,
-      summary_limit_bytes: job.output_summary_limit_bytes ?? null,
-      offload_threshold_bytes: job.output_offload_threshold_bytes ?? null,
+      store_limit_bytes: job.output_store_limit_bytes ?? 65536,
+      excerpt_limit_bytes: job.output_excerpt_limit_bytes ?? 65536,
+      summary_limit_bytes: job.output_summary_limit_bytes ?? 65536,
+      offload_threshold_bytes: job.output_offload_threshold_bytes ?? 65536,
     },
     identity: {
       principal: job.identity_principal ?? null,
@@ -402,10 +405,10 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
     if (payload.approval?.required !== Boolean(job.approval_required)) {
       errors.push('approval required does not match job');
     }
-    if ((payload.approval?.timeout_s ?? null) !== (job.approval_timeout_s ?? null)) {
+    if ((payload.approval?.timeout_s ?? 3600) !== (job.approval_timeout_s ?? 3600)) {
       errors.push('approval timeout does not match job');
     }
-    if ((payload.approval?.auto ?? null) !== (job.approval_auto ?? null)) {
+    if ((payload.approval?.auto ?? 'reject') !== (job.approval_auto ?? 'reject')) {
       errors.push('approval auto policy does not match job');
     }
     if ((payload.approval?.risk_level ?? null) !== (job.approval_risk_level ?? null)) {

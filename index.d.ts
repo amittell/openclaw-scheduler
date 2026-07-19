@@ -1539,7 +1539,7 @@ export const evidenceRuntime: {
   prepareArtifactBoundEvidence(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, run: RunRecord, opts?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
   persistPreparedArtifactBoundEvidence(prepared: Record<string, unknown>, opts?: { db?: SchedulerDatabase }): EvidenceRecord | null;
   persistArtifactBoundEvidence(job: JobRecord, artifactRecord: HandoffArtifactRecord | Record<string, unknown>, runId: string, opts?: Record<string, unknown>): Promise<EvidenceRecord | null>;
-  verifyPersistedArtifactBoundEvidence(runId: string, opts?: Record<string, unknown>): Promise<ArtifactEvidenceVerification>;
+  verifyPersistedArtifactBoundEvidence(runId: string, opts?: Record<string, unknown>): Promise<ArtifactEvidenceVerification | null>;
 };
 
 export const identityRuntime: {

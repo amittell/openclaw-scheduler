@@ -476,7 +476,7 @@ const replayV4 = proofRuntime.claimProofReplay(db.getDb(), {
   method: 'jwt', proofId: 'proof-v4', artifactDigest: digestV4, runId: 'run-v4', expiresAt: '2099-01-01T00:00:00Z',
 });
 const proofV4 = proofRuntime.verifyArtifactBoundProof(created, artifactV4 || {}, run);
-const evidenceV4: Promise<ArtifactEvidenceVerification> = evidenceRuntime.verifyPersistedArtifactBoundEvidence('run-v4');
+const evidenceV4: Promise<ArtifactEvidenceVerification | null> = evidenceRuntime.verifyPersistedArtifactBoundEvidence('run-v4');
 const identityV4 = identityRuntime.resolveArtifactBoundIdentity(created, artifactV4 || {}, run);
 void canonicalV4; void runtimeEventListV4; void providerSessionListV4;
 void credentialRowsV4; void capabilityV4; void delegationV4; void replayV4;

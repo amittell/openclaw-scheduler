@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdtempSync,
@@ -35,10 +36,11 @@ import {
 } from '../evidence-runtime.js';
 import { negotiateCredentialCapabilities } from '../capability-negotiation.js';
 import { runShellCommand } from '../dispatcher-shell.js';
-import { executeShell } from '../dispatcher-strategies.js';
+import { executeShell, finalizeDispatch } from '../dispatcher-strategies.js';
+import { resolveArtifactBoundIdentity } from '../identity-runtime.js';
 import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
-import { createJob, updateJob } from '../jobs.js';
+import { createJob, getJob, updateJob } from '../jobs.js';
 import { claimProofReplay, verifyArtifactBoundProof } from '../proof-runtime.js';
 import {
   _resetProviderSessionMemoryForTesting,
@@ -54,6 +56,7 @@ import {
   pruneEvidenceRecords,
 } from '../runs.js';
 import { getRuntimeEvent, listRuntimeEvents } from '../runtime-events.js';
+import { SCHEDULER_SCHEMAS } from '../scheduler-schema.js';
 
 const JSON_FIELDS = [
   'identity',
@@ -205,6 +208,48 @@ function delegationManifest(prefix, {
   };
 }
 
+function identityHandoffManifest(prefix, childCredentialPolicy) {
+  return {
+    version: '0.2',
+    identity_profiles: [{
+      id: `${prefix}-identity`,
+      provider: 'env-bearer',
+      subject: { kind: 'service', principal: `service:${prefix}` },
+      auth: {
+        mode: 'service',
+        required: true,
+        provider_config: {
+          token_env: `${prefix.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}_TOKEN`,
+        },
+      },
+      trust: { level: 'supervised' },
+      presentation: { handoff: 'none', cleanup: 'always' },
+    }],
+    workflows: [{
+      id: `${prefix}-workflow`,
+      name: `${prefix} workflow`,
+      tasks: [{
+        id: 'source',
+        name: `${prefix} source`,
+        target: { session_target: 'shell' },
+        shell: { program: 'printf', args: ['source'] },
+        schedule: { cron: '0 * * * *' },
+        runtime: { timeout_ms: 30_000 },
+        identity: { ref: `${prefix}-identity`, scope: 'full' },
+      }, {
+        id: 'child',
+        name: `${prefix} child`,
+        target: { session_target: 'shell' },
+        shell: { program: 'printf', args: ['child'] },
+        trigger: { parent: 'source', on: 'success' },
+        runtime: { timeout_ms: 30_000 },
+        identity: { ref: `${prefix}-identity`, scope: 'read' },
+        child_credential_policy: childCredentialPolicy,
+      }],
+    }],
+  };
+}
+
 function recordDelegationIdentity(runId, principal = 'agent://source') {
   persistV02Outcomes(runId, {
     identity_resolved: {
@@ -268,6 +313,55 @@ test('generated v4 artifacts bind the complete persisted scheduler execution pro
   });
   assert.equal(mismatch.ok, false);
   assert.match(mismatch.errors.join('; '), /scheduler job execution binding/);
+  assert.equal(
+    SCHEDULER_SCHEMAS.proof_replay_ledger.key_fields.includes('claimed_at'),
+    true,
+  );
+  assert.equal(
+    SCHEDULER_SCHEMAS.proof_replay_ledger.key_fields.includes('created_at'),
+    false,
+  );
+});
+
+test('direct v4 job specs bind the same defaults that job creation persists', () => {
+  const input = manifest('Direct v4 defaults');
+  input.workflows[0].tasks[0].delivery = {
+    mode: 'announce',
+    channel: 'telegram',
+    to: '@default_delivery',
+  };
+  input.workflows[0].tasks[0].output = { format: 'text', preview_bytes: 65_536 };
+  const spec = schedulerSpecFromManifest(input);
+  for (const field of [
+    'max_trigger_fanout',
+    'delivery_mode',
+    'approval_required',
+    'approval_timeout_s',
+    'approval_auto',
+    'output_store_limit_bytes',
+    'output_excerpt_limit_bytes',
+    'output_summary_limit_bytes',
+  ]) {
+    delete spec[field];
+  }
+
+  const job = createJob(spec);
+  assert.equal(job.max_trigger_fanout, 25);
+  assert.equal(job.delivery_mode, 'announce');
+  assert.equal(job.approval_required, 0);
+  assert.equal(job.approval_timeout_s, 3600);
+  assert.equal(job.approval_auto, 'reject');
+  assert.equal(job.output_store_limit_bytes, 65_536);
+  assert.equal(job.output_excerpt_limit_bytes, 65_536);
+  assert.equal(job.output_summary_limit_bytes, 65_536);
+  assert.equal(job.output_offload_threshold_bytes, 524_288);
+  assert.equal(assertArtifactMatchesJob(job).digest, job.handoff_artifact_digest);
+
+  const offloadSpec = schedulerSpec('Direct v4 offload default');
+  delete offloadSpec.output_offload_threshold_bytes;
+  const offloadJob = createJob(offloadSpec);
+  assert.equal(offloadJob.output_offload_threshold_bytes, 65_536);
+  assert.equal(assertArtifactMatchesJob(offloadJob).digest, offloadJob.handoff_artifact_digest);
 });
 
 test('shared handoff v4 conformance fixtures have exact digest parity and fail closed', () => {
@@ -302,6 +396,13 @@ test('shared handoff v4 conformance fixtures have exact digest parity and fail c
       negative.name,
     );
   }
+});
+
+test('sha256 hashes Uint8Array inputs as bytes', () => {
+  const bytes = Uint8Array.from([0, 1, 2, 127, 128, 255]);
+  const expected = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  assert.equal(sha256(bytes), expected);
+  assert.notEqual(sha256(bytes), sha256(String(bytes)));
 });
 
 test('v4 jobs cannot be downgraded through the API or direct database writes', () => {
@@ -658,6 +759,93 @@ test('delegation uses the exact source run and rejects transplant, stale parent,
     ),
     error => error.code === 'DELEGATION_STALE_PARENT',
   );
+});
+
+test('inherited and downscoped provider sessions resume against the exact source artifact', async () => {
+  for (const policy of ['inherit', 'downscope']) {
+    const prefix = `identity-${policy}`;
+    const [sourceSpec, childSpec] = schedulerSpecsFromManifest(
+      identityHandoffManifest(prefix, policy),
+    );
+    const sourceJob = createJob(sourceSpec);
+    const childJob = createJob(childSpec);
+    let resumeContext = null;
+    let handoffContext = null;
+    const provider = {
+      name: 'env-bearer',
+      type: 'identity',
+      async resolveSession(request) {
+        return {
+          session: {
+            subject: { kind: 'service', principal: `service:${prefix}` },
+            scope: request.scope,
+            trust: { level: 'supervised' },
+          },
+        };
+      },
+      async resumeSession(row, ctx) {
+        resumeContext = ctx;
+        return {
+          session: {
+            subject: { kind: 'service', principal: row.subject_principal },
+            scope: row.scope,
+            trust: { level: 'supervised' },
+          },
+        };
+      },
+      async checkRevocation() { return { revoked: false }; },
+      async prepareHandoff(session, request, ctx) {
+        handoffContext = ctx;
+        return {
+          prepared: true,
+          session: {
+            ...session,
+            scope: request.target_scope,
+            trust: { level: 'restricted' },
+          },
+        };
+      },
+    };
+    const providerLookup = () => provider;
+    const sourceRun = createRun(sourceJob.id);
+    const sourceIdentity = await resolveArtifactBoundIdentity(
+      sourceJob,
+      assertArtifactMatchesJob(sourceJob),
+      sourceRun,
+      { db: getDb(), getIdentityProvider: providerLookup },
+    );
+    persistV02Outcomes(sourceRun.id, { identity_resolved: sourceIdentity });
+    finishRun(sourceRun.id, 'ok');
+    _resetProviderSessionMemoryForTesting();
+
+    const childRun = createRun(childJob.id, { triggered_by_run: sourceRun.id });
+    const childIdentity = await resolveArtifactBoundIdentity(
+      childJob,
+      assertArtifactMatchesJob(childJob),
+      childRun,
+      { db: getDb(), getIdentityProvider: providerLookup },
+    );
+    assert.equal(resumeContext.artifactDigest, sourceJob.handoff_artifact_digest);
+    assert.equal(resumeContext.childArtifactDigest, childJob.handoff_artifact_digest);
+    assert.equal(childIdentity.source_run_id, sourceRun.id);
+    assert.equal(
+      childIdentity.source_run_handoff_artifact_digest,
+      sourceJob.handoff_artifact_digest,
+    );
+    if (policy === 'inherit') {
+      assert.equal(childIdentity.provider_session_id, sourceIdentity.provider_session_id);
+      assert.equal(handoffContext, null);
+    } else {
+      assert.notEqual(childIdentity.provider_session_id, sourceIdentity.provider_session_id);
+      assert.equal(childIdentity.trust_level, 'restricted');
+      assert.equal(handoffContext.artifactDigest, childJob.handoff_artifact_digest);
+      assert.equal(
+        getDb().prepare('SELECT handoff_artifact_digest FROM provider_sessions WHERE id = ?')
+          .get(childIdentity.provider_session_id).handoff_artifact_digest,
+        childJob.handoff_artifact_digest,
+      );
+    }
+  }
 });
 
 test('delegation rejects scope escalation and excessive chain depth', () => {
@@ -1371,6 +1559,80 @@ test('shell evidence digests bind normalized stdout after image marker extractio
   assert.equal(result.runFinishFields.shell_stdout_sha256, sha256('normalized-output'));
   assert.equal(result.evidenceOutput.stdout_sha256, sha256('normalized-output'));
   assert.deepEqual(result.imageAttachments, ['/tmp/chart.png']);
+});
+
+test('required signed v4 evidence failures durably block recovery', async () => {
+  const input = manifest('Required signed evidence failure');
+  input.evidence_profiles = [{
+    id: 'required-signed-evidence',
+    provider: 'ssh',
+    methods: ['ssh-signature'],
+    provider_config: {
+      key_path: '/tmp/unavailable-scheduler-evidence-key',
+      principal: 'scheduler-test',
+      allowed_signers_path: '/tmp/unavailable-scheduler-allowed-signers',
+    },
+    payload: { format: 'canonical-json' },
+    verify: { required: true },
+  }];
+  input.workflows[0].tasks[0].evidence = { ref: 'required-signed-evidence' };
+  input.workflows[0].tasks[0].contract = { audit: 'always' };
+  const job = createJob(schedulerSpecFromManifest(input));
+  const run = createRun(job.id);
+  const ctx = {
+    run,
+    idemKey: null,
+    dispatchRecord: null,
+    v02Outcomes: null,
+    v4Artifact: assertArtifactMatchesJob(job),
+  };
+  await finalizeDispatch(job, ctx, {
+    status: 'ok',
+    summary: 'primary execution completed',
+    content: 'primary execution completed',
+    errorMessage: null,
+    runFinishFields: {},
+    skipDelivery: true,
+    skipJobUpdate: false,
+    skipChildren: false,
+    skipDequeue: true,
+    skipAgentCleanup: true,
+    idemAction: 'noop',
+    retryFiresChildren: false,
+    earlyReturn: false,
+  }, {
+    finishRun,
+    updateIdempotencyResultHash: () => {},
+    releaseIdempotencyKey: () => {},
+    setAgentStatus: () => {},
+    handleDelivery: () => null,
+    shouldRetry: () => false,
+    scheduleRetry: () => null,
+    getDb,
+    updateJobAfterRun: () => {},
+    updateJob,
+    setDispatchStatus: () => null,
+    handleTriggeredChildren: () => {},
+    dequeueJob: () => false,
+    log: () => {},
+    clearMaterializedEnvironment: () => {},
+    async prepareArtifactBoundEvidence() {
+      throw Object.assign(new Error('evidence signer unavailable'), {
+        code: 'EVIDENCE_SIGNING_FAILED',
+      });
+    },
+  });
+
+  const blocked = getRun(run.id);
+  assert.equal(blocked.status, 'recovery_blocked');
+  assert.match(blocked.error_message, /Required handoff v4 evidence failed/);
+  assert.equal(getJob(job.id).enabled, 0);
+  assert.equal(await verifyPersistedArtifactBoundEvidence(run.id), null);
+  const failedEvent = listRuntimeEvents({
+    runId: run.id,
+    eventType: 'evidence.failed',
+  }).at(-1);
+  assert.equal(failedEvent.payload.required, true);
 });
 
 test('credential capability negotiation fails before release and binds fresh runtime nonces', async () => {

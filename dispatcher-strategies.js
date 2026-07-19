@@ -984,7 +984,8 @@ export async function finalizeDispatch(job, ctx, result, deps) {
         allowedSignersPath: deps.allowedSignersPath,
       });
     } catch (error) {
-      const evidenceRequired = ctx.v4Artifact.payload.evidence?.verify_required === true;
+      const evidenceRequired = ctx.v4Artifact.payload.evidence
+        ?.signed_or_provider_verified_required === true;
       const evidenceFailure = String(error.message || 'evidence provider failed').slice(0, 500);
       appendRuntimeEvent('evidence.failed', {
         jobId: job.id,

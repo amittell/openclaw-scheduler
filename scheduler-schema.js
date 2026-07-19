@@ -151,6 +151,6 @@ export const SCHEDULER_SCHEMAS = {
     key_fields: ['run_id', 'handoff_artifact_digest', 'provider_session_id', 'binding_name', 'medium', 'env_key', 'stdin_sha256', 'value_sha256', 'file_mode', 'status', 'expires_at', 'cleaned_at'],
   },
   proof_replay_ledger: {
-    key_fields: ['replay_key', 'method', 'issuer', 'handoff_artifact_digest', 'run_id', 'expires_at', 'created_at'],
+    key_fields: ['replay_key', 'method', 'issuer', 'handoff_artifact_digest', 'run_id', 'expires_at', 'claimed_at'],
   },
 };
