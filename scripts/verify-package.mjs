@@ -40,6 +40,10 @@ try {
   const tarball = join(fixture, packResult[0].filename);
   run('tar', ['-xzf', tarball], { cwd: fixture });
   const packageRoot = join(fixture, 'package');
+  const packedManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  if (packedManifest.optionalDependencies?.['@amittell/agentcli'] !== '^0.5.0') {
+    throw new Error('packed artifact must declare @amittell/agentcli ^0.5.0 as an optional dependency');
+  }
 
   const requiredFiles = [
     'index.js',

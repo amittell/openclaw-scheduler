@@ -30,9 +30,9 @@ function ensurePrivateDirectory(path) {
   // SCHEDULER_HOME is an operator-owned local process setting. The directory
   // remains intentionally configurable and is checked for type, symlinks, and
   // private permissions immediately after creation.
-  // codeql[js/path-injection]
+  // lgtm[js/path-injection]
   mkdirSync(path, { recursive: true, mode: 0o700 });
-  // codeql[js/path-injection]
+  // lgtm[js/path-injection]
   const stat = lstatSync(path);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
     throw credentialError('CREDENTIAL_DIRECTORY_UNSAFE', 'Credential runtime path must be a directory');
