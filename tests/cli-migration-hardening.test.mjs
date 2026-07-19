@@ -378,6 +378,83 @@ test('schema v29 consolidation repairs missing required indexes before taking th
   assert.match(noOp.stdout, /DB already at v29/);
 });
 
+test('schema v29 consolidation backfills retained v4 evidence verification metadata', t => {
+  const dir = tempRoot(t, 'scheduler-evidence-metadata-backfill-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const allowedSignersPath = join(dir, 'allowed_signers');
+  const privateKeyPath = join(dir, 'private-signing-key');
+  writeFileSync(allowedSignersPath, 'migration-principal ssh-ed25519 AAAATEST\n');
+  writeFileSync(privateKeyPath, 'PRIVATE-MATERIAL-MUST-NOT-BE-BACKFILLED\n');
+
+  const evidenceDeclaration = {
+    provider: 'ssh',
+    methods: ['ssh-signature'],
+    provider_config: {
+      principal: 'migration-principal',
+      allowed_signers_path: allowedSignersPath,
+      key_path: privateKeyPath,
+    },
+  };
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', JSON.stringify(validShellJob({
+      name: 'Evidence metadata migration probe',
+    })), '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+  const jobId = parseStdout(added).job.id;
+  const runId = 'evidence-metadata-migration-run';
+  const evidenceId = 'evidence-metadata-migration-record';
+  const artifactDigest = `sha256:${'a'.repeat(64)}`;
+  const db = new Database(dbPath);
+  try {
+    db.prepare(`
+      INSERT INTO runs (
+        id, job_id, status, finished_at, evidence_declaration_snapshot,
+        handoff_artifact_digest
+      ) VALUES (?, ?, 'ok', datetime('now'), ?, ?)
+    `).run(runId, jobId, JSON.stringify(evidenceDeclaration), artifactDigest);
+    db.prepare(`
+      INSERT INTO evidence_records (
+        id, run_id, job_id, algorithm, hash, payload,
+        handoff_artifact_digest, evidence_verified, evidence_envelope
+      ) VALUES (?, ?, ?, 'sha256', ?, '{}', ?, 1, ?)
+    `).run(
+      evidenceId,
+      runId,
+      jobId,
+      `sha256:${'b'.repeat(64)}`,
+      artifactDigest,
+      JSON.stringify({ method: 'ssh-signature', principal: 'envelope-principal' }),
+    );
+  } finally {
+    db.close();
+  }
+
+  const migrated = runNode(consolidatePath, [], { env });
+  assert.equal(migrated.status, 0, migrated.stderr);
+  assert.match(migrated.stdout, /Consolidation migration applied/);
+
+  const upgraded = new Database(dbPath, { readonly: true });
+  try {
+    const row = upgraded.prepare('SELECT * FROM evidence_records WHERE id = ?').get(evidenceId);
+    assert.equal(row.evidence_method, 'ssh-signature');
+    assert.equal(row.evidence_provider, 'ssh');
+    assert.equal(row.evidence_principal, 'migration-principal');
+    assert.equal(row.evidence_allowed_signers_path, allowedSignersPath);
+    assert.equal(JSON.stringify(row).includes(privateKeyPath), false);
+    assert.equal(JSON.stringify(row).includes('PRIVATE-MATERIAL'), false);
+  } finally {
+    upgraded.close();
+  }
+
+  const repeated = runNode(consolidatePath, [], { env });
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.match(repeated.stdout, /nothing to do/);
+});
+
 test('schema v28 consolidation repairs malformed correctness-critical unique indexes', t => {
   const dir = tempRoot(t, 'scheduler-index-definition-repair-');
   const dbPath = join(dir, 'scheduler.db');
@@ -703,7 +780,7 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
   }
 
   const upgraded = runNode(cliPath, ['doctor', '--deep', '--json'], { env });
-  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.equal(upgraded.status, 0, `${upgraded.stderr}\n${upgraded.stdout}`);
   assert.equal(parseStdout(upgraded).database.schema_version, 29);
   const upgradedDb = new Database(dbPath, { readonly: true });
   try {

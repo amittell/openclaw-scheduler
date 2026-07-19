@@ -14,7 +14,83 @@
  */
 
 import { Cron } from 'croner';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { applyBundledSchema, getDb } from './db.js';
+
+function parseObject(value) {
+  if (value == null) return null;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function migrationAllowedSignersPath(value) {
+  const configured = nonEmptyString(value);
+  if (!configured) return null;
+  const canonical = resolve(configured);
+  if (isAbsolute(configured)) return canonical;
+  try {
+    accessSync(canonical, fsConstants.R_OK);
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+function collectEvidenceMetadataBackfills(db) {
+  const rows = db.prepare(`
+    SELECT e.id, e.evidence_method, e.evidence_envelope,
+           e.evidence_provider, e.evidence_principal,
+           e.evidence_allowed_signers_path,
+           r.evidence_declaration_snapshot, j.evidence AS job_evidence
+    FROM evidence_records e
+    LEFT JOIN runs r ON r.id = e.run_id
+    LEFT JOIN jobs j ON j.id = e.job_id
+    WHERE e.handoff_artifact_digest IS NOT NULL
+      AND e.evidence_verified = 1
+      AND (
+        e.evidence_method IS NULL
+        OR e.evidence_provider IS NULL
+        OR e.evidence_principal IS NULL
+        OR e.evidence_allowed_signers_path IS NULL
+      )
+  `).all();
+  return rows.flatMap(row => {
+    const runDeclaration = parseObject(row.evidence_declaration_snapshot);
+    const jobDeclaration = parseObject(row.job_evidence);
+    const declaration = nonEmptyString(runDeclaration?.provider)
+      ? runDeclaration
+      : jobDeclaration;
+    const envelope = parseObject(row.evidence_envelope);
+    const providerConfig = parseObject(declaration?.provider_config) || {};
+    const provider = row.evidence_provider ?? nonEmptyString(declaration?.provider);
+    const method = row.evidence_method ?? nonEmptyString(envelope?.method);
+    const principal = row.evidence_principal
+      ?? nonEmptyString(providerConfig.principal)
+      ?? nonEmptyString(envelope?.principal);
+    const allowedSignersPath = row.evidence_allowed_signers_path
+      ?? (provider === 'ssh'
+        ? migrationAllowedSignersPath(
+            providerConfig.allowed_signers_path ?? providerConfig.allowed_signers,
+          )
+        : null);
+    const hasUpdate = (row.evidence_method == null && method != null)
+      || (row.evidence_provider == null && provider != null)
+      || (row.evidence_principal == null && principal != null)
+      || (row.evidence_allowed_signers_path == null && allowedSignersPath != null);
+    return hasUpdate
+      ? [{ id: row.id, method, provider, principal, allowedSignersPath }]
+      : [];
+  });
+}
 
 function nextRunFromCron(cronExpr, tz) {
   const cron = new Cron(cronExpr, { timezone: tz || 'UTC' });
@@ -329,6 +405,18 @@ export default function migrateConsolidate() {
         WHERE version BETWEEN 1 AND 29
       `).get().count
     : 0;
+  const evidenceMetadataBackfills = hasTable('evidence_records')
+    && hasTable('runs')
+    && hasTable('jobs')
+    && hasColumns(evidenceColumns, [
+      'handoff_artifact_digest', 'evidence_method', 'evidence_verified',
+      'evidence_envelope', 'evidence_provider', 'evidence_principal',
+      'evidence_allowed_signers_path',
+    ])
+    && runColumns.has('evidence_declaration_snapshot')
+    && jobColumns.has('evidence')
+    ? collectEvidenceMetadataBackfills(db)
+    : [];
   if (
     current >= 29
     && recordedVersionCount === 29
@@ -357,6 +445,7 @@ export default function migrateConsolidate() {
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
     && unsupportedDeliveryModeCount === 0
+    && evidenceMetadataBackfills.length === 0
   ) {
     return false;
   }
@@ -1442,6 +1531,28 @@ export default function migrateConsolidate() {
       updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  const evidenceBackfills = collectEvidenceMetadataBackfills(db);
+  if (evidenceBackfills.length > 0) {
+    db.exec('DROP TRIGGER IF EXISTS trg_v4_evidence_no_update');
+    const updateEvidenceMetadata = db.prepare(`
+      UPDATE evidence_records
+      SET evidence_method = COALESCE(evidence_method, ?),
+          evidence_provider = COALESCE(evidence_provider, ?),
+          evidence_principal = COALESCE(evidence_principal, ?),
+          evidence_allowed_signers_path = COALESCE(evidence_allowed_signers_path, ?)
+      WHERE id = ?
+    `);
+    for (const backfill of evidenceBackfills) {
+      updateEvidenceMetadata.run(
+        backfill.method,
+        backfill.provider,
+        backfill.principal,
+        backfill.allowedSignersPath,
+        backfill.id,
+      );
+    }
+  }
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_v4_jobs_no_downgrade

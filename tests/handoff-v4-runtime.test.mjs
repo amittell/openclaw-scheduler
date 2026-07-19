@@ -1296,15 +1296,15 @@ test('concurrent provider resolution returns the winning persisted session ident
   _resetProviderSessionMemoryForTesting();
   let releaseResolvers;
   const release = new Promise(resolve => { releaseResolvers = resolve; });
-  let started = 0;
-  let bothStarted;
-  const ready = new Promise(resolve => { bothStarted = resolve; });
+  let signalStarted;
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  let resolves = 0;
   const provider = {
     name: 'concurrent-session-provider',
     type: 'identity',
     async resolveSession() {
-      const call = ++started;
-      if (started === 2) bothStarted();
+      const call = ++resolves;
+      signalStarted();
       await release;
       return {
         session: {
@@ -1324,22 +1324,190 @@ test('concurrent provider resolution returns the winning persisted session ident
     ...context,
     runId: 'concurrent-session-run-1',
   }, { db: getDb() });
+  await started;
   const secondPromise = resolveProviderSession(provider, request, {
     ...context,
     runId: 'concurrent-session-run-2',
   }, { db: getDb() });
-  await ready;
   releaseResolvers();
   const [first, second] = await Promise.all([firstPromise, secondPromise]);
 
+  assert.equal(resolves, 1);
   assert.equal(first.row.id, second.row.id);
   assert.ok(first.session);
   assert.ok(second.session);
+  assert.equal(first.session.principal, second.session.principal);
+  assert.equal(first.session.principal, first.row.subject_principal);
+  assert.equal(
+    JSON.parse(first.row.session_summary).subject_principal,
+    first.session.principal,
+  );
   assert.equal(
     getDb().prepare(
       'SELECT COUNT(*) AS count FROM provider_sessions WHERE provider_name = ?',
     ).get(provider.name).count,
     1,
+  );
+});
+
+test('concurrent cold writers resume the persisted session winner', async () => {
+  _resetProviderSessionMemoryForTesting();
+  const db = getDb();
+  const secondDbIdentity = { prepare: (...args) => db.prepare(...args) };
+  const releases = [];
+  const starts = [];
+  let resolveCalls = 0;
+  let resumeCalls = 0;
+  const provider = {
+    name: 'cross-process-session-provider',
+    type: 'identity',
+    async resolveSession() {
+      const call = ++resolveCalls;
+      let release;
+      const wait = new Promise(resolve => { release = resolve; });
+      releases[call] = release;
+      starts[call]?.();
+      await wait;
+      return {
+        session: {
+          principal: `principal:writer-${call}`,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        },
+      };
+    },
+    async resumeSession(row) {
+      resumeCalls += 1;
+      const summary = JSON.parse(row.session_summary);
+      return {
+        session: {
+          principal: summary.subject_principal,
+          expires_at: summary.expires_at,
+        },
+      };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  const startedOne = new Promise(resolve => { starts[1] = resolve; });
+  const startedTwo = new Promise(resolve => { starts[2] = resolve; });
+  const request = { principal: 'principal:writer-race' };
+  const context = {
+    artifactDigest: `sha256:${'5'.repeat(64)}`,
+    jobId: 'cross-process-session-job',
+  };
+  const firstPromise = resolveProviderSession(provider, request, {
+    ...context,
+    runId: 'cross-process-session-run-1',
+  }, { db });
+  await startedOne;
+  const secondPromise = resolveProviderSession(provider, request, {
+    ...context,
+    runId: 'cross-process-session-run-2',
+  }, { db: secondDbIdentity });
+  await startedTwo;
+  releases[1]();
+  const first = await firstPromise;
+  _resetProviderSessionMemoryForTesting();
+  releases[2]();
+  const second = await secondPromise;
+
+  assert.equal(resolveCalls, 2);
+  assert.equal(resumeCalls, 1);
+  assert.equal(first.row.id, second.row.id);
+  assert.equal(first.session.principal, 'principal:writer-1');
+  assert.equal(second.session.principal, first.session.principal);
+  assert.equal(second.row.subject_principal, first.session.principal);
+});
+
+test('provider result expiry uses completion time unless a clock is explicit', async () => {
+  _resetProviderSessionMemoryForTesting();
+  const expiringProvider = {
+    name: 'completion-expiry-provider',
+    type: 'identity',
+    async resolveSession() {
+      const expiresAt = new Date(Date.now() + 10).toISOString();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return { session: { principal: 'principal:expired-at-completion', expires_at: expiresAt } };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  await assert.rejects(
+    () => resolveProviderSession(
+      expiringProvider,
+      { principal: 'principal:expired-at-completion' },
+      {
+        artifactDigest: `sha256:${'6'.repeat(64)}`,
+        jobId: 'completion-expiry-job',
+        runId: 'completion-expiry-run',
+      },
+      { db: getDb() },
+    ),
+    error => error.code === 'PROVIDER_SESSION_EXPIRED',
+  );
+
+  const deterministicProvider = {
+    name: 'explicit-clock-provider',
+    type: 'identity',
+    async resolveSession() {
+      return {
+        session: {
+          principal: 'principal:explicit-clock',
+          expires_at: new Date(1_000).toISOString(),
+        },
+      };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  const deterministic = await resolveProviderSession(
+    deterministicProvider,
+    { principal: 'principal:explicit-clock' },
+    {
+      artifactDigest: `sha256:${'7'.repeat(64)}`,
+      jobId: 'explicit-clock-job',
+      runId: 'explicit-clock-run',
+      now: new Date(0),
+    },
+    { db: getDb() },
+  );
+  assert.equal(deterministic.session.principal, 'principal:explicit-clock');
+
+  const refreshProvider = {
+    name: 'completion-expiry-refresh-provider',
+    type: 'identity',
+    async resolveSession() {
+      return {
+        session: {
+          principal: 'principal:refresh-expiry',
+          expires_at: new Date(1_000).toISOString(),
+        },
+      };
+    },
+    async refreshSession() {
+      const expiresAt = new Date(Date.now() + 10).toISOString();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return { session: { principal: 'principal:refresh-expiry', expires_at: expiresAt } };
+    },
+    async checkRevocation() { return { revoked: false }; },
+  };
+  const refreshRequest = { principal: 'principal:refresh-expiry' };
+  const refreshContext = {
+    artifactDigest: `sha256:${'4'.repeat(64)}`,
+    jobId: 'completion-expiry-refresh-job',
+    runId: 'completion-expiry-refresh-run',
+  };
+  await resolveProviderSession(
+    refreshProvider,
+    refreshRequest,
+    { ...refreshContext, now: new Date(0) },
+    { db: getDb() },
+  );
+  await assert.rejects(
+    () => resolveProviderSession(
+      refreshProvider,
+      refreshRequest,
+      refreshContext,
+      { db: getDb() },
+    ),
+    error => error.code === 'PROVIDER_SESSION_EXPIRED',
   );
 });
 
@@ -2314,6 +2482,7 @@ test('credential capability negotiation fails before release and binds fresh run
 
 test('persisted SSH evidence is cryptographically reverified against the exact execution', async () => {
   const workdir = mkdtempSync(join(tmpdir(), 'scheduler-v4-evidence-'));
+  const unrelatedCwd = mkdtempSync(join(tmpdir(), 'scheduler-v4-evidence-cwd-'));
   const keyPath = join(workdir, 'evidence-key');
   const allowedSignersPath = join(workdir, 'allowed_signers');
   const untrustedKeyPath = join(workdir, 'untrusted-key');
@@ -2338,7 +2507,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       provider_config: {
         key_path: keyPath,
         principal: 'scheduler-test',
-        allowed_signers_path: allowedSignersPath,
+        allowed_signers_path: 'allowed_signers',
       },
       payload: { format: 'canonical-json' },
       verify: { required: true },
@@ -2368,6 +2537,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       assertArtifactMatchesJob(job),
       run.id,
       {
+        cwd: workdir,
         allowedSignersPath,
         principal: 'scheduler-test',
         env: {
@@ -2379,6 +2549,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     );
     assert.equal(stored.evidence_verified, 1);
     assert.equal(stored.handoff_artifact_digest, job.handoff_artifact_digest);
+    assert.equal(stored.evidence_allowed_signers_path, allowedSignersPath);
     assert.equal(stored.payload.includes('expected-output'), false);
 
     const verified = await verifyPersistedArtifactBoundEvidence(run.id, {
@@ -2442,7 +2613,14 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     );
     assert.equal(deleteJob(job.id), true);
     assert.equal(getRun(run.id), undefined);
-    const retainedVerification = await verifyPersistedArtifactBoundEvidence(run.id);
+    const originalCwd = process.cwd();
+    let retainedVerification;
+    try {
+      process.chdir(unrelatedCwd);
+      retainedVerification = await verifyPersistedArtifactBoundEvidence(run.id);
+    } finally {
+      process.chdir(originalCwd);
+    }
     assert.equal(
       retainedVerification.integrity.valid,
       true,
@@ -2460,5 +2638,6 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     );
   } finally {
     rmSync(workdir, { recursive: true, force: true });
+    rmSync(unrelatedCwd, { recursive: true, force: true });
   }
 });

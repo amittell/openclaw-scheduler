@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { getDb } from './db.js';
 import {
   canonicalStringify,
@@ -184,13 +185,16 @@ function evidencePrincipal(profile, opts = {}) {
 
 function providerVerifyOptions(profile, record, opts, principal) {
   const config = profile.provider_config || {};
+  const configuredPath = config.allowed_signers_path
+    || config.allowed_signers
+    || opts.allowedSignersPath
+    || (opts.env || process.env).AGENTCLI_ALLOWED_SIGNERS;
   return {
     ...(record ? { record } : {}),
     principal,
-    allowedSignersPath: config.allowed_signers_path
-      || config.allowed_signers
-      || opts.allowedSignersPath
-      || (opts.env || process.env).AGENTCLI_ALLOWED_SIGNERS,
+    allowedSignersPath: configuredPath
+      ? resolve(opts.cwd || process.cwd(), configuredPath)
+      : null,
   };
 }
 
@@ -503,6 +507,16 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
         !== (run.source_run_handoff_artifact_digest ?? null)
     )) {
       throw evidenceError('EVIDENCE_BINDING_MISMATCH', 'Persisted evidence row does not match the run');
+    }
+    if (!run && (
+      !row.evidence_provider
+      || !row.evidence_principal
+      || (row.evidence_provider === 'ssh' && !row.evidence_allowed_signers_path)
+    )) {
+      throw evidenceError(
+        'EVIDENCE_RETAINED_METADATA_REQUIRED',
+        'Retained evidence verification metadata is incomplete',
+      );
     }
 
     const retainedProfile = row.evidence_provider

@@ -4,6 +4,7 @@ import { canonicalStringify, sha256 } from './handoff-artifact.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 
 const memorySessions = new Map();
+let pendingColdSessionResolutions = new WeakMap();
 const TERMINAL_STATUSES = new Set(['revoked', 'failed']);
 const DEFAULT_MAX_TRANSIENT_ERRORS = 3;
 const DEFAULT_REFRESH_CLAIM_TIMEOUT_MS = 30_000;
@@ -35,6 +36,10 @@ function contextNowMs(value) {
         : Number.NaN;
   if (!Number.isFinite(parsed)) throw new TypeError('provider session current time is invalid');
   return parsed;
+}
+
+function completionNowMs(explicitNow, startNow) {
+  return explicitNow ? startNow : Date.now();
 }
 
 function safeSummary(session) {
@@ -69,6 +74,21 @@ function parseStoredSessionSummary(current) {
       { cause: error },
     );
   }
+}
+
+function sessionMatchesPersistedRow(session, row) {
+  if (!session || !row) return false;
+  return canonicalStringify(safeSummary(session) ?? {})
+    === canonicalStringify(parseStoredSessionSummary(row));
+}
+
+function pendingResolutionsFor(db) {
+  let pending = pendingColdSessionResolutions.get(db);
+  if (!pending) {
+    pending = new Map();
+    pendingColdSessionResolutions.set(db, pending);
+  }
+  return pending;
 }
 
 function cacheKey(provider, request, artifactDigest) {
@@ -130,14 +150,9 @@ function persistResolvedSession(
     && nextRotationHash !== currentSummary.rotation_id_hash;
   const rotationCounter = (current?.rotation_counter ?? 0) + (rotationChanged ? 1 : 0);
 
-  db.prepare(`
-    INSERT INTO provider_sessions (
-      id, provider_type, provider_name, cache_key_hash, status,
-      handoff_artifact_digest, subject_principal, scope, session_summary,
-      expires_at, refresh_after, rotation_counter, revocation_checked_at,
-      transient_error_count, last_error, updated_at
-    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, datetime('now'))
-    ON CONFLICT(provider_type, provider_name, cache_key_hash) DO UPDATE SET
+  const conflictAction = opts.insertOnly
+    ? 'DO NOTHING'
+    : `DO UPDATE SET
       status = 'active',
       handoff_artifact_digest = excluded.handoff_artifact_digest,
       subject_principal = excluded.subject_principal,
@@ -148,7 +163,15 @@ function persistResolvedSession(
       rotation_counter = excluded.rotation_counter,
       transient_error_count = 0,
       last_error = NULL,
-      updated_at = datetime('now')
+      updated_at = datetime('now')`;
+  const write = db.prepare(`
+    INSERT INTO provider_sessions (
+      id, provider_type, provider_name, cache_key_hash, status,
+      handoff_artifact_digest, subject_principal, scope, session_summary,
+      expires_at, refresh_after, rotation_counter, revocation_checked_at,
+      transient_error_count, last_error, updated_at
+    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, datetime('now'))
+    ON CONFLICT(provider_type, provider_name, cache_key_hash) ${conflictAction}
   `).run(
     id,
     provider.type,
@@ -168,6 +191,17 @@ function persistResolvedSession(
       'PROVIDER_SESSION_PERSIST_FAILED',
       `Provider session ${provider.name} was not retrievable after persistence`,
     );
+  }
+  if (opts.insertOnly && write.changes !== 1) {
+    const winnerSession = memorySessions.get(persisted.id);
+    if (winnerSession && sessionMatchesPersistedRow(winnerSession, persisted)) return persisted;
+    const error = providerError(
+      'PROVIDER_SESSION_CONFLICT',
+      `Provider session ${provider.name} was resolved concurrently`,
+      { transient: true },
+    );
+    error.persistedRow = persisted;
+    throw error;
   }
   if (persisted.id !== id) memorySessions.delete(id);
   memorySessions.set(persisted.id, session);
@@ -195,6 +229,55 @@ async function callProvider(method, provider, ...args) {
   }
 }
 
+async function resolveColdProviderSession(
+  db,
+  provider,
+  request,
+  ctx,
+  key,
+  startNow,
+  explicitNow,
+) {
+  const resolved = await callProvider('resolveSession', provider, request, ctx);
+  try {
+    const row = persistResolvedSession(
+      db,
+      provider,
+      key,
+      resolved,
+      ctx.artifactDigest,
+      null,
+      { now: completionNowMs(explicitNow, startNow), insertOnly: true },
+    );
+    return { row, session: memorySessions.get(row.id) };
+  } catch (error) {
+    if (error?.code !== 'PROVIDER_SESSION_CONFLICT') throw error;
+    const row = error.persistedRow || sessionRow(db, provider, key);
+    if (!row) {
+      throw providerError(
+        'PROVIDER_SESSION_PERSIST_FAILED',
+        `Concurrent provider session ${provider.name} was not retrievable`,
+        { cause: error },
+      );
+    }
+    let session = memorySessions.get(row.id);
+    if (!session && typeof provider.resumeSession === 'function') {
+      const resumed = await callProvider('resumeSession', provider, row, { ...ctx, request });
+      session = resumed?.session ?? resumed ?? null;
+    }
+    if (!session || !sessionMatchesPersistedRow(session, row)) {
+      memorySessions.delete(row.id);
+      throw providerError(
+        'PROVIDER_SESSION_CONFLICT',
+        `Provider ${provider.name} cannot resume the persisted concurrent session winner`,
+        { transient: true, cause: error },
+      );
+    }
+    memorySessions.set(row.id, session);
+    return { row, session };
+  }
+}
+
 export async function resolveProviderSession(provider, request = {}, ctx = {}, opts = {}) {
   if (!provider || typeof provider.name !== 'string' || typeof provider.type !== 'string') {
     throw new TypeError('provider with name and type is required');
@@ -208,6 +291,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
   const db = opts.db || getDb();
   const key = cacheKey(provider, request, ctx.artifactDigest);
   let row = sessionRow(db, provider, key);
+  const explicitNow = ctx.now !== undefined;
   const now = contextNowMs(ctx.now);
   const maxTransientErrors = Number.isInteger(opts.maxTransientErrors) && opts.maxTransientErrors > 0
     ? opts.maxTransientErrors
@@ -277,7 +361,7 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
         refreshed,
         ctx.artifactDigest,
         row,
-        { now },
+        { now: completionNowMs(explicitNow, now) },
       );
       rawSession = memorySessions.get(row.id);
       appendRuntimeEvent(canRefresh ? 'provider.session.refreshed' : 'provider.session.reresolved', {
@@ -307,17 +391,40 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
   }
 
   if (!row || !rawSession) {
-    const resolved = await callProvider('resolveSession', provider, request, ctx);
-    row = persistResolvedSession(
-      db,
-      provider,
-      key,
-      resolved,
-      ctx.artifactDigest,
-      row,
-      { now },
-    );
-    rawSession = memorySessions.get(row.id);
+    if (!row) {
+      const pending = pendingResolutionsFor(db);
+      let resolution = pending.get(key);
+      const ownsResolution = !resolution;
+      if (!resolution) {
+        resolution = resolveColdProviderSession(
+          db,
+          provider,
+          request,
+          ctx,
+          key,
+          now,
+          explicitNow,
+        );
+        pending.set(key, resolution);
+      }
+      try {
+        ({ row, session: rawSession } = await resolution);
+      } finally {
+        if (ownsResolution && pending.get(key) === resolution) pending.delete(key);
+      }
+    } else {
+      const resolved = await callProvider('resolveSession', provider, request, ctx);
+      row = persistResolvedSession(
+        db,
+        provider,
+        key,
+        resolved,
+        ctx.artifactDigest,
+        row,
+        { now: completionNowMs(explicitNow, now) },
+      );
+      rawSession = memorySessions.get(row.id);
+    }
     appendRuntimeEvent('provider.session.resolved', {
       jobId: ctx.jobId,
       runId: ctx.runId,
@@ -385,6 +492,7 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
       `Provider session ${id} does not belong to the requested handoff artifact`,
     );
   }
+  const explicitNow = ctx.now !== undefined;
   const now = contextNowMs(ctx.now);
   const maxTransientErrors = Number.isInteger(opts.maxTransientErrors) && opts.maxTransientErrors > 0
     ? opts.maxTransientErrors
@@ -456,7 +564,7 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
         refreshed,
         row.handoff_artifact_digest,
         row,
-        { now },
+        { now: completionNowMs(explicitNow, now) },
       );
       session = memorySessions.get(id);
       appendRuntimeEvent('provider.session.refreshed', {
@@ -569,4 +677,5 @@ export async function cleanupProviderSession(provider, id, ctx = {}, opts = {}) 
 
 export function _resetProviderSessionMemoryForTesting() {
   memorySessions.clear();
+  pendingColdSessionResolutions = new WeakMap();
 }
