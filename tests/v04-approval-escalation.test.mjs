@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict';
-import { generateKeyPairSync } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
-
-import { compileManifestToScheduler } from '@amittell/agentcli';
 
 import {
   beginApprovalDispatch,
@@ -51,6 +49,11 @@ import {
   verifyAuthorizationProof,
 } from '../v02-runtime.js';
 
+const v4ProofJobFixture = JSON.parse(readFileSync(
+  new URL('./fixtures/handoff-v4-approval-proof-job.json', import.meta.url),
+  'utf8',
+));
+
 before(async () => {
   setDbPath(':memory:');
   await initDb();
@@ -72,50 +75,8 @@ function jobSpec(name, authorization) {
   };
 }
 
-function v4ProofJobSpec(name) {
-  const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const { jobs } = compileManifestToScheduler({
-    version: '0.2',
-    authorization_proof_profiles: [{
-      id: 'approval-proof',
-      method: 'jwt',
-      issuer: 'approval-issuer',
-      audience: 'scheduler',
-      public_key: publicKey.export({ type: 'spki', format: 'pem' }),
-      proof: { value_from: { env: 'APPROVAL_REPLAY_PROOF' } },
-      verify: { required: true },
-    }],
-    authorization_profiles: [{ id: 'approval-authz', provider: 'none' }],
-    workflows: [{
-      id: 'approval-proof-workflow',
-      name,
-      authorization_proof: { ref: 'approval-proof' },
-      tasks: [{
-        id: 'approval-proof-task',
-        name,
-        target: { session_target: 'shell' },
-        shell: { program: 'printf', args: ['governed'] },
-        schedule: { cron: '0 0 * * *' },
-        runtime: { timeout_ms: 30_000 },
-        delivery: { mode: 'none' },
-        authorization: { ref: 'approval-authz' },
-      }],
-    }],
-  }, {
-    schedulerHandoffVersion: '4',
-    cwd: process.cwd(),
-    env: { PATH: process.env.PATH || '/usr/bin' },
-  });
-  const spec = { ...jobs[0] };
-  delete spec.source;
-  for (const field of [
-    'identity', 'authorization_proof', 'authorization', 'evidence', 'contract_allowed_paths',
-  ]) {
-    if (spec[field] != null && typeof spec[field] !== 'string') {
-      spec[field] = JSON.stringify(spec[field]);
-    }
-  }
-  return spec;
+function v4ProofJobSpec() {
+  return structuredClone(v4ProofJobFixture);
 }
 
 function dispatchDeps(provider, idempotencyKey) {
@@ -225,7 +186,7 @@ test('authorization approval resumes v4 proof without consuming its replay ident
       name: 'none',
       authorize: async () => ({ decision: 'escalate', reason: 'operator proof review required' }),
     };
-    const job = createJob(v4ProofJobSpec('authorization-v4-proof-resume'));
+    const job = createJob(v4ProofJobSpec());
     const dispatch = enqueueDispatch(job.id, {
       id: 'authorization-v4-proof-dispatch',
       kind: 'manual',
