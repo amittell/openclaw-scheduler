@@ -16,6 +16,28 @@ function sanitizeValue(value, key = '') {
   return sanitized;
 }
 
+function deserializeRuntimeEvent(row) {
+  const expected = sha256(row.payload);
+  if (row.payload_sha256 !== expected) {
+    throw Object.assign(new Error(`Runtime event ${row.id} payload hash mismatch`), {
+      code: 'RUNTIME_EVENT_TAMPERED',
+    });
+  }
+  try {
+    const payload = JSON.parse(row.payload);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new TypeError('payload must be a JSON object');
+    }
+    return { ...row, payload };
+  } catch (error) {
+    throw Object.assign(new Error(`Runtime event ${row.id} payload is invalid JSON`, {
+      cause: error,
+    }), {
+      code: 'RUNTIME_EVENT_INVALID',
+    });
+  }
+}
+
 export function appendRuntimeEvent(eventType, fields = {}, opts = {}) {
   if (typeof eventType !== 'string' || eventType.trim() === '') {
     throw new TypeError('runtime event type must be a non-empty string');
@@ -49,13 +71,7 @@ export function getRuntimeEvent(id, opts = {}) {
   const db = opts.db || getDb();
   const row = db.prepare('SELECT * FROM runtime_events WHERE id = ?').get(id);
   if (!row) return null;
-  const expected = sha256(row.payload);
-  if (row.payload_sha256 !== expected) {
-    throw Object.assign(new Error(`Runtime event ${id} payload hash mismatch`), {
-      code: 'RUNTIME_EVENT_TAMPERED',
-    });
-  }
-  return { ...row, payload: JSON.parse(row.payload) };
+  return deserializeRuntimeEvent(row);
 }
 
 export function listRuntimeEvents(filter = {}, opts = {}) {
@@ -80,13 +96,5 @@ export function listRuntimeEvents(filter = {}, opts = {}) {
     ORDER BY id ASC
     LIMIT ?
   `).all(...params, limit);
-  return rows.map(row => {
-    const expected = sha256(row.payload);
-    if (row.payload_sha256 !== expected) {
-      throw Object.assign(new Error(`Runtime event ${row.id} payload hash mismatch`), {
-        code: 'RUNTIME_EVENT_TAMPERED',
-      });
-    }
-    return { ...row, payload: JSON.parse(row.payload) };
-  });
+  return rows.map(deserializeRuntimeEvent);
 }

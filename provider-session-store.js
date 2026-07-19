@@ -42,6 +42,23 @@ function safeSummary(session) {
   return Object.fromEntries(Object.entries(summary).filter(([, value]) => value != null));
 }
 
+function parseStoredSessionSummary(current) {
+  if (!current?.session_summary) return {};
+  try {
+    const parsed = JSON.parse(current.session_summary);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('expected an object');
+    }
+    return parsed;
+  } catch (error) {
+    throw providerError(
+      'PROVIDER_SESSION_CORRUPT',
+      `Provider session ${current.id} summary is invalid`,
+      { cause: error },
+    );
+  }
+}
+
 function cacheKey(provider, request, artifactDigest) {
   if (typeof artifactDigest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(artifactDigest)) {
     throw providerError(
@@ -82,8 +99,9 @@ function persistResolvedSession(db, provider, key, resolved, artifactDigest, cur
   const nextRotationHash = resolved.rotation_id == null
     ? summary?.rotation_id_hash ?? null
     : sha256(String(resolved.rotation_id));
+  const currentSummary = parseStoredSessionSummary(current);
   const rotationChanged = current && nextRotationHash != null
-    && nextRotationHash !== JSON.parse(current.session_summary || '{}').rotation_id_hash;
+    && nextRotationHash !== currentSummary.rotation_id_hash;
   const rotationCounter = (current?.rotation_counter ?? 0) + (rotationChanged ? 1 : 0);
 
   db.prepare(`

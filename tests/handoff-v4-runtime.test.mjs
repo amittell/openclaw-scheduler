@@ -16,6 +16,7 @@ import { compileManifestToScheduler } from '@amittell/agentcli';
 import {
   assertArtifactMatchesJob,
   getHandoffArtifact,
+  sha256,
   validateHandoffArtifact,
 } from '../handoff-artifact.js';
 import {
@@ -37,10 +38,11 @@ import { createJob, updateJob } from '../jobs.js';
 import { claimProofReplay, verifyArtifactBoundProof } from '../proof-runtime.js';
 import {
   _resetProviderSessionMemoryForTesting,
+  adoptProviderSession,
   resolveProviderSession,
 } from '../provider-session-store.js';
 import { createRun, finishRun, getRun, persistV02Outcomes } from '../runs.js';
-import { listRuntimeEvents } from '../runtime-events.js';
+import { getRuntimeEvent, listRuntimeEvents } from '../runtime-events.js';
 
 const JSON_FIELDS = [
   'identity',
@@ -273,7 +275,11 @@ test('shared handoff v4 conformance fixtures have exact digest parity and fail c
         : {},
     );
     assert.equal(validation.ok, false, negative.name);
-    assert.match(validation.errors.join('; '), new RegExp(negative.expected_error), negative.name);
+    assert.equal(
+      validation.errors.some(message => message.includes(negative.expected_error)),
+      true,
+      negative.name,
+    );
   }
 });
 
@@ -377,6 +383,26 @@ test('artifact bindings remain immutable across dispatches, runs, approvals, evi
   assert.throws(
     () => db.prepare('UPDATE runtime_events SET payload = ? WHERE id = ?').run('{}', event.id),
     /runtime events are immutable/,
+  );
+});
+
+test('runtime event inspection reports malformed hash-matching JSON deterministically', () => {
+  const payload = 'not-json';
+  const result = getDb().prepare(`
+    INSERT INTO runtime_events (event_type, payload, payload_sha256)
+    VALUES ('fixture.invalid-json', ?, ?)
+  `).run(payload, sha256(payload));
+  const eventId = Number(result.lastInsertRowid);
+
+  assert.throws(
+    () => getRuntimeEvent(eventId),
+    error => error.code === 'RUNTIME_EVENT_INVALID'
+      && error.cause instanceof SyntaxError,
+  );
+  assert.throws(
+    () => listRuntimeEvents({ eventType: 'fixture.invalid-json' }),
+    error => error.code === 'RUNTIME_EVENT_INVALID'
+      && error.cause instanceof SyntaxError,
   );
 });
 
@@ -670,6 +696,41 @@ test('provider session cache and rotation state are scoped to the exact artifact
   assert.equal(secondArtifact.row.handoff_artifact_digest, `sha256:${'f'.repeat(64)}`);
 });
 
+test('provider session rotation fails closed on a corrupted persisted summary', () => {
+  _resetProviderSessionMemoryForTesting();
+  const provider = { name: 'corrupt-summary-provider', type: 'identity' };
+  const request = { principal: 'principal:corrupt-summary' };
+  const ctx = {
+    artifactDigest: `sha256:${'4'.repeat(64)}`,
+    jobId: 'corrupt-summary-job',
+    runId: 'corrupt-summary-run',
+  };
+  const initial = adoptProviderSession(provider, request, {
+    session: {
+      principal: request.principal,
+      rotation_id: 'rotation-1',
+    },
+  }, ctx, { db: getDb() });
+  getDb().prepare('UPDATE provider_sessions SET session_summary = ? WHERE id = ?')
+    .run('not-json', initial.row.id);
+
+  assert.throws(
+    () => adoptProviderSession(provider, request, {
+      session: {
+        principal: request.principal,
+        rotation_id: 'rotation-2',
+      },
+    }, ctx, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_CORRUPT'
+      && error.cause instanceof SyntaxError,
+  );
+  assert.equal(
+    getDb().prepare('SELECT session_summary FROM provider_sessions WHERE id = ?')
+      .get(initial.row.id).session_summary,
+    'not-json',
+  );
+});
+
 test('provider session refresh rotates safely, bounds transient retries, and terminates on revocation', async () => {
   _resetProviderSessionMemoryForTesting();
   const artifactDigest = `sha256:${'7'.repeat(64)}`;
@@ -795,7 +856,9 @@ test('provider session transient retry exhaustion and terminal errors are determ
 });
 
 test('temp-file credentials are tracked before write and recover without persisting secrets', async () => {
-  const runtimeDir = mkdtempSync(join(tmpdir(), 'scheduler-v4-credentials-'));
+  const schedulerHome = mkdtempSync(join(tmpdir(), 'scheduler-v4-credentials-'));
+  const previousSchedulerHome = process.env.SCHEDULER_HOME;
+  process.env.SCHEDULER_HOME = schedulerHome;
   let observedPath = null;
   try {
     const provider = {
@@ -824,7 +887,6 @@ test('temp-file credentials are tracked before write and recover without persist
       },
       {
         db: getDb(),
-        runtimeDir,
         onPresentationPersisted({ id, tempPath }) {
           observedPath = tempPath;
           const row = getDb().prepare(
@@ -844,7 +906,7 @@ test('temp-file credentials are tracked before write and recover without persist
     assert.equal(JSON.stringify(rows).includes('credential-value-must-not-persist'), false);
     assert.match(rows[0].value_sha256, /^[0-9a-f]{64}$/);
 
-    const recovered = recoverCredentialPresentations({ db: getDb(), runtimeDir });
+    const recovered = recoverCredentialPresentations({ db: getDb() });
     assert.deepEqual(recovered.failed, []);
     assert.deepEqual(recovered.recovered, [rows[0].id]);
     assert.equal(existsSync(observedPath), false);
@@ -857,14 +919,18 @@ test('temp-file credentials are tracked before write and recover without persist
       jobId: 'credential-job',
       runId: 'credential-run',
       artifactDigest: `sha256:${'9'.repeat(64)}`,
-    }, { db: getDb(), runtimeDir });
+    }, { db: getDb() });
   } finally {
-    rmSync(runtimeDir, { recursive: true, force: true });
+    if (previousSchedulerHome === undefined) delete process.env.SCHEDULER_HOME;
+    else process.env.SCHEDULER_HOME = previousSchedulerHome;
+    rmSync(schedulerHome, { recursive: true, force: true });
   }
 });
 
 test('credential presentation enforces target media and never persists env, stdin, or gateway secrets', async () => {
-  const runtimeDir = mkdtempSync(join(tmpdir(), 'scheduler-v4-media-'));
+  const schedulerHome = mkdtempSync(join(tmpdir(), 'scheduler-v4-media-'));
+  const previousSchedulerHome = process.env.SCHEDULER_HOME;
+  process.env.SCHEDULER_HOME = schedulerHome;
   const cases = [
     { medium: 'env', target: 'shell', key: 'ENV_SECRET', field: 'env' },
     { medium: 'stdin', target: 'shell', key: null, field: 'stdin' },
@@ -902,21 +968,19 @@ test('credential presentation enforces target media and never persists env, stdi
           artifactDigest: `sha256:${String(index + 1).repeat(64)}`,
           sessionTarget: item.target,
         },
-        { db: getDb(), runtimeDir },
+        { db: getDb() },
       );
       if (item.field === 'stdin') {
         const stdinBuffer = materialized.stdin;
         assert.equal(stdinBuffer.toString('utf8'), secret);
         await cleanupCredentialMaterialization(materialized, { runId }, {
           db: getDb(),
-          runtimeDir,
         });
         assert.equal(stdinBuffer.every(value => value === 0), true);
       } else {
         assert.equal(materialized[item.field][item.key], secret);
         await cleanupCredentialMaterialization(materialized, { runId }, {
           db: getDb(),
-          runtimeDir,
         });
       }
       const rows = listCredentialPresentations({ runId });
@@ -946,14 +1010,16 @@ test('credential presentation enforces target media and never persists env, stdi
             artifactDigest: `sha256:${'5'.repeat(64)}`,
             sessionTarget: item.target,
           },
-          { db: getDb(), runtimeDir },
+          { db: getDb() },
         ),
         error => error.code === item.code,
       );
     }
     assert.equal(providerCalls, 0);
   } finally {
-    rmSync(runtimeDir, { recursive: true, force: true });
+    if (previousSchedulerHome === undefined) delete process.env.SCHEDULER_HOME;
+    else process.env.SCHEDULER_HOME = previousSchedulerHome;
+    rmSync(schedulerHome, { recursive: true, force: true });
   }
 });
 

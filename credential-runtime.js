@@ -181,7 +181,7 @@ export async function materializeCredentials(
   }
 
   const runtimeRoot = ensurePrivateDirectory(
-    opts.runtimeDir || join(resolveSchedulerHome(opts.env || process.env), 'credentials'),
+    join(resolveSchedulerHome(), 'credentials'),
   );
   const materialization = {
     env: {},
@@ -312,7 +312,7 @@ export async function cleanupCredentialMaterialization(materialization, ctx = {}
   const root = materialization?.runtimeRoot
     ? resolve(materialization.runtimeRoot)
     : ensurePrivateDirectory(
-        opts.runtimeDir || join(resolveSchedulerHome(opts.env || process.env), 'credentials'),
+        join(resolveSchedulerHome(), 'credentials'),
       );
   const ids = new Set(materialization?.presentationIds ?? []);
   if (ctx.runId) {
@@ -388,7 +388,7 @@ export async function cleanupCredentialMaterialization(materialization, ctx = {}
 export function recoverCredentialPresentations(opts = {}) {
   const db = opts.db || getDb();
   const root = ensurePrivateDirectory(
-    opts.runtimeDir || join(resolveSchedulerHome(opts.env || process.env), 'credentials'),
+    join(resolveSchedulerHome(), 'credentials'),
   );
   const rows = db.prepare(`
     SELECT * FROM credential_presentations WHERE status = 'materialized'
