@@ -145,9 +145,38 @@ function normalizeSqliteUtcDateTime(name, value) {
 }
 
 function assertParentJobExists(parentId) {
-  const parent = getDb().prepare('SELECT id FROM jobs WHERE id = ?').get(parentId);
+  const parent = getDb().prepare(`
+    SELECT *
+    FROM jobs
+    WHERE id = ?
+  `).get(parentId);
   if (!parent) {
     throw new Error(`parent job does not exist: ${parentId}`);
+  }
+  return parent;
+}
+
+function assertV4ParentLineage(parentId) {
+  const parent = assertParentJobExists(parentId);
+  if (Number(parent.handoff_version) !== 4 || !parent.handoff_artifact_digest) {
+    throw Object.assign(
+      new Error(`Handoff v4 child requires a handoff v4 parent: ${parentId}`),
+      { code: 'HANDOFF_V4_PARENT_REQUIRED' },
+    );
+  }
+  try {
+    const artifact = getHandoffArtifact(parent.handoff_artifact_digest);
+    if (!artifact) throw new Error('persisted artifact is missing');
+    assertValidHandoffArtifact(artifact.payload, {
+      expectedDigest: parent.handoff_artifact_digest,
+      job: parent,
+      allowDisabledStateMismatch: true,
+    });
+  } catch (cause) {
+    throw Object.assign(
+      new Error(`Handoff v4 parent cannot provide valid lineage: ${parentId}`),
+      { code: 'HANDOFF_V4_PARENT_REQUIRED', cause },
+    );
   }
 }
 
@@ -848,7 +877,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     const evidenceBlob = JSON.parse(merged.evidence);
     assertKnownObjectKeys('evidence', evidenceBlob, new Set([
       'id', 'ref', 'provider', 'methods', 'provider_config', 'payload', 'verify',
-      'collect', 'retention', 'format',
+      'collect', 'retention', 'format', 'payload_hash', 'provider_config_hash',
     ]));
     if (evidenceBlob.id != null) {
       assertSafeString('evidence.id', evidenceBlob.id, { allowEmpty: false, maxLength: 256 });
@@ -871,7 +900,23 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     if (handoffVersion === 4) {
       if (!provider) throw new Error('handoff v4 evidence requires a provider');
       if (methods.length === 0) throw new Error('handoff v4 evidence requires at least one provider method');
+      for (const field of ['payload_hash', 'provider_config_hash']) {
+        if (!Object.hasOwn(evidenceBlob, field)) {
+          throw new Error(`handoff v4 evidence requires ${field}`);
+        }
+        if (evidenceBlob[field] != null
+          && !/^sha256:[0-9a-f]{64}$/.test(evidenceBlob[field])) {
+          throw new Error(`evidence.${field} must be a lowercase sha256 digest or null`);
+        }
+      }
+      if (evidenceBlob.payload && evidenceBlob.payload_hash == null) {
+        throw new Error('handoff v4 evidence payload requires payload_hash');
+      }
     } else {
+      if (Object.hasOwn(evidenceBlob, 'payload_hash')
+        || Object.hasOwn(evidenceBlob, 'provider_config_hash')) {
+        throw new Error('evidence hash bindings require handoff v4');
+      }
       if (evidenceBlob.methods != null && (methods.length !== 1 || methods[0] !== 'sha256')) {
         throw new Error('evidence.methods must contain exactly one sha256 method');
       }
@@ -1150,6 +1195,9 @@ export function createJob(opts) {
   // Cycle detection + depth check for child jobs
   if (isChild) {
     assertParentJobExists(normalized.parent_id);
+    if (Number(normalized.handoff_version) === 4) {
+      assertV4ParentLineage(normalized.parent_id);
+    }
     detectCycle(id, normalized.parent_id);
     const depth = getChainDepth(normalized.parent_id) + 1; // +1 for the new child
     if (depth > MAX_CHAIN_DEPTH) {
@@ -1409,6 +1457,8 @@ export function listJobs(opts = {}) {
 
     const validation = assertValidHandoffArtifact(artifact.payload, {
       expectedDigest: job.handoff_artifact_digest,
+      job,
+      allowDisabledStateMismatch: true,
     });
     return { ...job, handoff_artifact_payload: validation.payload };
   });
@@ -1461,6 +1511,9 @@ export function updateJob(id, patch) {
   ];
 
   const nextJob = { ...current, ...normalized, id };
+  if (Number(nextJob.handoff_version) === 4 && nextJob.parent_id) {
+    assertV4ParentLineage(nextJob.parent_id);
+  }
   let artifactReplacing = false;
   if (Number(nextJob.handoff_version) === 4) {
     const payloadProvided = normalized.handoff_artifact_payload != null;

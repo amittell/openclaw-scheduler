@@ -255,6 +255,36 @@ test('hydrated v4 job reads fail closed for invalid or missing persisted artifac
   assert.equal(parseStdout(missing).code, 'HANDOFF_ARTIFACT_REQUIRED');
 });
 
+test('hydrated v4 job reads validate the artifact against the persisted job row', t => {
+  const dir = tempRoot(t, 'scheduler-list-mismatched-handoff-v4-');
+  const dbPath = join(dir, 'scheduler.db');
+  const env = { SCHEDULER_DB: dbPath };
+  const fixture = JSON.parse(readFileSync(handoffV4JobFixturePath, 'utf8'));
+  const added = runNode(
+    cliPath,
+    ['jobs', 'add', '--file', handoffV4JobFixturePath, '--json'],
+    { env },
+  );
+  assert.equal(added.status, 0, added.stderr);
+
+  const db = new Database(dbPath);
+  try {
+    db.prepare('UPDATE jobs SET effective_task_hash = ? WHERE id = ?')
+      .run(`sha256:${'f'.repeat(64)}`, fixture.id);
+  } finally {
+    db.close();
+  }
+
+  const mismatched = runNode(
+    cliPath,
+    ['jobs', 'list', '--include-handoff-artifacts', '--json'],
+    { env },
+  );
+  assert.notEqual(mismatched.status, 0);
+  assert.equal(parseStdout(mismatched).code, 'HANDOFF_ARTIFACT_INVALID');
+  assert.match(parseStdout(mismatched).error, /effective task hash|execution binding/);
+});
+
 test('doctor reports schema v29 and lease, queue, outbox, and approval diagnostics', t => {
   const dir = tempRoot(t, 'scheduler-doctor-');
   const result = runNode(cliPath, ['doctor', '--json'], {
@@ -636,6 +666,10 @@ test('schema v29 consolidation strengthens queue binding nullability without los
       VALUES ('queue-repair-run', 'queue-repair-job', 'awaiting_approval', 'queue-repair-dispatch')
     `).run();
     db.prepare(`
+      INSERT INTO runs (id, job_id, status, finished_at)
+      VALUES ('queue-repair-source-run', 'queue-repair-job', 'ok', datetime('now'))
+    `).run();
+    db.prepare(`
       INSERT INTO approvals (
         id, job_id, run_id, dispatch_queue_id, status, binding_hash
       ) VALUES ('queue-repair-approval', 'queue-repair-job', 'queue-repair-run',
@@ -667,6 +701,9 @@ test('schema v29 consolidation strengthens queue binding nullability without los
       );
       INSERT INTO job_dispatch_queue_nullable SELECT * FROM job_dispatch_queue;
       UPDATE job_dispatch_queue_nullable SET binding_scheduled_for = NULL;
+      UPDATE job_dispatch_queue_nullable
+      SET source_run_id = 'queue-repair-source-run'
+      WHERE id = 'queue-repair-dispatch';
       DROP TABLE job_dispatch_queue;
       ALTER TABLE job_dispatch_queue_nullable RENAME TO job_dispatch_queue;
     `);
@@ -678,7 +715,7 @@ test('schema v29 consolidation strengthens queue binding nullability without los
   const repaired = runNode(consolidatePath, [], { env });
   assert.equal(repaired.status, 0, repaired.stderr);
   assert.match(repaired.stdout, /Consolidation migration applied/);
-  const repairedDb = new Database(dbPath, { readonly: true });
+  const repairedDb = new Database(dbPath);
   try {
     const bindingColumn = repairedDb.prepare('PRAGMA table_info(job_dispatch_queue)').all()
       .find(column => column.name === 'binding_scheduled_for');
@@ -694,6 +731,18 @@ test('schema v29 consolidation strengthens queue binding nullability without los
     assert.equal(
       repairedDb.prepare("SELECT dispatch_queue_id FROM approvals WHERE id = 'queue-repair-approval'").get().dispatch_queue_id,
       'queue-repair-dispatch',
+    );
+    assert.equal(
+      repairedDb.pragma('foreign_key_list(job_dispatch_queue)')
+        .some(foreignKey => foreignKey.from === 'source_run_id'),
+      false,
+    );
+    repairedDb.prepare("DELETE FROM runs WHERE id = 'queue-repair-source-run'").run();
+    assert.equal(
+      repairedDb.prepare(
+        "SELECT source_run_id FROM job_dispatch_queue WHERE id = 'queue-repair-dispatch'",
+      ).get().source_run_id,
+      'queue-repair-source-run',
     );
     assert.deepEqual(repairedDb.pragma('foreign_key_check'), []);
   } finally {

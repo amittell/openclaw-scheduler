@@ -310,7 +310,20 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
   assertVerifiedEvidencePayload(agentcli, attestation.envelope, verification, record);
 
   const envelopeText = canonicalStringify(attestation.envelope);
-  const envelopeHash = attestation.envelope.payload_digest || sha256(envelopeText);
+  const payloadDigest = attestation.envelope.payload_digest;
+  if (payloadDigest != null && !/^sha256:[0-9a-f]{64}$/.test(payloadDigest)) {
+    throw evidenceError(
+      'EVIDENCE_DIGEST_INVALID',
+      'Evidence envelope payload digest must be a lowercase SHA-256 digest',
+    );
+  }
+  if (payloadDigest != null && payloadDigest !== sha256(serialized)) {
+    throw evidenceError(
+      'EVIDENCE_DIGEST_MISMATCH',
+      'Evidence envelope payload digest does not match its verified payload',
+    );
+  }
+  const envelopeHash = payloadDigest ?? sha256(envelopeText);
   const retentionPolicy = profile.retention || artifact.evidence.retention || null;
   return Object.freeze({
     runId: run.id,
@@ -477,8 +490,12 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
     if (row.evidence_method !== envelope.method) {
       throw evidenceError('EVIDENCE_METHOD_MISMATCH', 'Persisted evidence method does not match its envelope');
     }
-    const expectedHash = envelope.payload_digest || sha256(canonicalStringify(envelope));
-    if (row.hash !== expectedHash || envelope.payload_digest !== sha256(row.payload)) {
+    const hasPayloadDigest = envelope.payload_digest != null;
+    const expectedHash = hasPayloadDigest
+      ? envelope.payload_digest
+      : sha256(canonicalStringify(envelope));
+    if (row.hash !== expectedHash
+      || (hasPayloadDigest && envelope.payload_digest !== sha256(row.payload))) {
       throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
     }
     if (
@@ -528,12 +545,35 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
         },
       }
       : null;
-    const profile = run
+    const declaredProfile = run
       ? (parseJson(run.evidence_declaration_snapshot) || parseJson(job?.evidence))
       : retainedProfile;
-    if (!profile?.provider) {
+    if (!declaredProfile?.provider) {
       throw evidenceError('EVIDENCE_PROVIDER_REQUIRED', 'Persisted evidence provider configuration is missing');
     }
+    if (row.evidence_provider && declaredProfile.provider !== row.evidence_provider) {
+      throw evidenceError(
+        'EVIDENCE_PROVIDER_MISMATCH',
+        'Persisted evidence provider does not match its declaration snapshot',
+      );
+    }
+    const parsedProviderConfig = parseJson(declaredProfile.provider_config);
+    const declaredProviderConfig = parsedProviderConfig
+      && typeof parsedProviderConfig === 'object'
+      && !Array.isArray(parsedProviderConfig)
+      ? parsedProviderConfig
+      : {};
+    const profile = {
+      ...declaredProfile,
+      provider: row.evidence_provider || declaredProfile.provider,
+      provider_config: {
+        ...declaredProviderConfig,
+        ...(row.evidence_principal ? { principal: row.evidence_principal } : {}),
+        ...(row.evidence_allowed_signers_path
+          ? { allowed_signers_path: row.evidence_allowed_signers_path }
+          : {}),
+      },
+    };
     const agentcli = await loadAgentcli(opts);
     const record = run
       ? evidenceRecord(run, artifactRecord.payload, payload.timestamp, opts)

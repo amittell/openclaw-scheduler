@@ -418,7 +418,7 @@ CREATE TABLE IF NOT EXISTS job_dispatch_queue (
   status          TEXT NOT NULL DEFAULT 'pending', -- pending|claimed|awaiting_approval|done|cancelled|failed
   scheduled_for   TEXT NOT NULL,
   binding_scheduled_for TEXT NOT NULL,              -- immutable occurrence timestamp used by approval bindings
-  source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  source_run_id   TEXT,                              -- immutable lineage survives source-run retention cleanup
   retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
   claimed_at      TEXT,

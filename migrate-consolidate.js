@@ -145,6 +145,9 @@ export default function migrateConsolidate() {
   const queueColumns = columnsFor('job_dispatch_queue');
   const queueBindingIsNotNull = columnInfoFor('job_dispatch_queue')
     .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
+  const queueSourceRunHasForeignKey = hasTable('job_dispatch_queue')
+    && db.prepare('PRAGMA foreign_key_list(job_dispatch_queue)').all()
+      .some((foreignKey) => foreignKey.from === 'source_run_id');
   const trackerColumns = columnsFor('task_tracker');
   const trackerAgentColumns = columnsFor('task_tracker_agents');
   const completionDebtColumns = columnsFor('completion_debts');
@@ -422,6 +425,7 @@ export default function migrateConsolidate() {
     && recordedVersionCount === 29
     && hasLatestColumns
     && queueBindingIsNotNull
+    && !queueSourceRunHasForeignKey
     && hasTable('completion_debts')
     && hasTable('dispatcher_leases')
     && hasTable('delivery_outbox')
@@ -755,10 +759,13 @@ export default function migrateConsolidate() {
   // SQLite cannot strengthen a column to NOT NULL with ALTER TABLE. Rebuild
   // the queue while foreign-key enforcement is temporarily disabled so child
   // approval/run links are preserved rather than receiving ON DELETE effects.
-  const queueNeedsBindingConstraint = hasTable('job_dispatch_queue')
-    && !columnInfoFor('job_dispatch_queue')
-      .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1);
-  if (queueNeedsBindingConstraint) {
+  const queueNeedsRebuild = hasTable('job_dispatch_queue')
+    && (
+      !columnInfoFor('job_dispatch_queue')
+        .some((column) => column.name === 'binding_scheduled_for' && column.notnull === 1)
+      || queueSourceRunHasForeignKey
+    );
+  if (queueNeedsRebuild) {
     const foreignKeysWereEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
     db.pragma('foreign_keys = OFF');
     try {
@@ -775,7 +782,7 @@ export default function migrateConsolidate() {
             status          TEXT NOT NULL DEFAULT 'pending',
             scheduled_for   TEXT NOT NULL,
             binding_scheduled_for TEXT NOT NULL,
-            source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+            source_run_id   TEXT,
             retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             claimed_at      TEXT,
@@ -1419,7 +1426,7 @@ export default function migrateConsolidate() {
       status          TEXT NOT NULL DEFAULT 'pending',
       scheduled_for   TEXT NOT NULL,
       binding_scheduled_for TEXT NOT NULL,
-      source_run_id   TEXT REFERENCES runs(id) ON DELETE SET NULL,
+      source_run_id   TEXT,
       retry_of_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
       created_at      TEXT NOT NULL DEFAULT (datetime('now')),
       claimed_at      TEXT,

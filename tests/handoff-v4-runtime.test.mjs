@@ -485,6 +485,69 @@ test('handoff v4 artifacts reject normalized raw-secret field variants', () => {
   }
 });
 
+test('handoff v4 artifact collection validation never throws on malformed shapes', () => {
+  const payload = assertArtifactMatchesJob(createV4Job('Malformed artifact collections')).payload;
+  for (const [path, mutate, expected] of [
+    [
+      'command.args_sha256',
+      value => { value.command.args_sha256 = { invalid: true }; },
+      /command\.args_sha256 must be an array/,
+    ],
+    [
+      'command.env.effective_env_value_sha256',
+      value => { value.command.env.effective_env_value_sha256 = []; },
+      /command\.env\.effective_env_value_sha256 must be an object/,
+    ],
+    [
+      'identity.presentation.bindings',
+      value => { value.identity.presentation.bindings = { invalid: true }; },
+      /identity\.presentation\.bindings must be an array/,
+    ],
+  ]) {
+    const malformed = structuredClone(payload);
+    mutate(malformed);
+    let validation;
+    assert.doesNotThrow(() => { validation = validateHandoffArtifact(malformed); }, path);
+    assert.equal(validation.ok, false, path);
+    assert.match(validation.errors.join('; '), expected, path);
+  }
+});
+
+test('handoff v4 evidence hashes match the persisted audit-safe job declaration', () => {
+  const input = manifest('Evidence hash binding');
+  input.evidence_profiles = [{
+    id: 'evidence-hash-binding',
+    provider: 'ssh',
+    methods: ['ssh-signature'],
+    provider_config: {
+      key_path: '/secret/signing-key',
+      principal: 'evidence-hash-principal',
+      allowed_signers_path: '/trusted/allowed-signers',
+    },
+    payload: { format: 'canonical-json', bind: ['result'] },
+    verify: { required: true },
+  }];
+  input.workflows[0].tasks[0].evidence = { ref: 'evidence-hash-binding' };
+  const job = createJob(schedulerSpecFromManifest(input));
+  const declaration = JSON.parse(job.evidence);
+  const artifact = assertArtifactMatchesJob(job).payload;
+  assert.equal(declaration.provider_config, null);
+  assert.equal(JSON.stringify(declaration).includes('/secret/signing-key'), false);
+  assert.equal(artifact.evidence.payload_hash, declaration.payload_hash);
+  assert.equal(artifact.evidence.provider_config_hash, declaration.provider_config_hash);
+
+  for (const [field, expectedError] of [
+    ['payload_hash', /evidence payload hash.*job declaration/],
+    ['provider_config_hash', /evidence provider configuration hash.*job declaration/],
+  ]) {
+    const tamperedArtifact = structuredClone(artifact);
+    tamperedArtifact.evidence[field] = null;
+    const validation = validateHandoffArtifact(tamperedArtifact, { job });
+    assert.equal(validation.ok, false, field);
+    assert.match(validation.errors.join('; '), expectedError);
+  }
+});
+
 test('sha256 hashes Uint8Array inputs as bytes', () => {
   const bytes = Uint8Array.from([0, 1, 2, 127, 128, 255]);
   const expected = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -513,6 +576,51 @@ test('v4 jobs cannot be downgraded through the API or direct database writes', (
   assert.equal(reenabled.enabled, 1);
   assert.equal(reenabled.handoff_artifact_digest, job.handoff_artifact_digest);
   assert.equal(assertArtifactMatchesJob(reenabled).digest, job.handoff_artifact_digest);
+});
+
+test('v4 child jobs reject legacy parents at create and update time', () => {
+  const legacyParent = createJob({
+    name: 'Legacy lineage parent',
+    schedule_cron: '0 * * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'printf legacy-parent',
+    run_timeout_ms: 30_000,
+    delivery_mode: 'none',
+    origin: 'system',
+  });
+  const childSpec = schedulerSpec('V4 lineage child');
+  assert.throws(
+    () => createJob({
+      ...childSpec,
+      parent_id: legacyParent.id,
+      trigger_on: 'success',
+    }),
+    error => error.code === 'HANDOFF_V4_PARENT_REQUIRED',
+  );
+
+  const root = createV4Job('V4 lineage update');
+  assert.throws(
+    () => updateJob(root.id, {
+      parent_id: legacyParent.id,
+      trigger_on: 'success',
+    }),
+    error => error.code === 'HANDOFF_V4_PARENT_REQUIRED',
+  );
+
+  const corruptParent = createV4Job('Corrupt lineage parent');
+  getDb().prepare('UPDATE jobs SET handoff_artifact_digest = ? WHERE id = ?').run(
+    `sha256:${'e'.repeat(64)}`,
+    corruptParent.id,
+  );
+  assert.throws(
+    () => createJob({
+      ...schedulerSpec('Corrupt lineage child'),
+      parent_id: corruptParent.id,
+      trigger_on: 'success',
+    }),
+    error => error.code === 'HANDOFF_V4_PARENT_REQUIRED',
+  );
 });
 
 test('run pruning retains source runs bound to immutable v4 dispatches', () => {
@@ -545,6 +653,44 @@ test('run pruning retains source runs bound to immutable v4 dispatches', () => {
   assert.equal(
     getDb().prepare('SELECT COUNT(*) AS count FROM runs WHERE job_id = ?').get(job.id).count,
     2,
+  );
+});
+
+test('source-run deletion preserves immutable v4 dispatch lineage', () => {
+  const chain = manifest('Immutable lineage');
+  chain.workflows[0].tasks.push({
+    id: 'child',
+    name: 'Immutable lineage child',
+    target: { session_target: 'shell' },
+    shell: { program: 'printf', args: ['child'] },
+    trigger: { parent: 'root', on: 'success' },
+    runtime: { timeout_ms: 30_000 },
+  });
+  const [parentSpec, childSpec] = schedulerSpecsFromManifest(chain);
+  const parent = createJob(parentSpec);
+  const child = createJob(childSpec);
+  const sourceRun = createRun(parent.id);
+  finishRun(sourceRun.id, 'ok');
+  const dispatch = enqueueDispatch(child.id, {
+    kind: 'chain',
+    source_run_id: sourceRun.id,
+  });
+
+  assert.equal(deleteJob(parent.id), true);
+  assert.equal(getRun(sourceRun.id), undefined);
+  const retained = getDb().prepare(
+    'SELECT * FROM job_dispatch_queue WHERE id = ?',
+  ).get(dispatch.id);
+  assert.equal(retained.source_run_id, sourceRun.id);
+  assert.equal(
+    retained.source_run_handoff_artifact_digest,
+    parent.handoff_artifact_digest,
+  );
+  assert.throws(
+    () => getDb().prepare(
+      'UPDATE job_dispatch_queue SET source_run_id = NULL WHERE id = ?',
+    ).run(dispatch.id),
+    /handoff v4 dispatch bindings are immutable/,
   );
 });
 
@@ -2415,6 +2561,70 @@ test('required signed v4 evidence failures durably block recovery', async () => 
   assert.equal(failedEvent.payload.required, true);
 });
 
+test('verified evidence envelopes without payload digests use one consistent hash fallback', async () => {
+  const job = createV4Job('Envelope digest fallback');
+  const artifact = assertArtifactMatchesJob(job);
+  const run = createRun(job.id);
+  const profile = {
+    ref: 'envelope-digest-fallback',
+    provider: 'test-envelope-provider',
+    provider_config: { principal: 'fallback-principal' },
+    payload: { format: 'canonical-json' },
+    verify: { required: true },
+  };
+  getDb().prepare('UPDATE runs SET evidence_ref_snapshot = ?, evidence_declaration_snapshot = ? WHERE id = ?').run(
+    profile.ref,
+    JSON.stringify(profile),
+    run.id,
+  );
+  finishRun(run.id, 'ok', {
+    summary: 'fallback evidence complete',
+    shell_exit_code: 0,
+    shell_stdout: 'fallback-output',
+    shell_stderr: '',
+    shell_stdout_sha256: sha256('fallback-output'),
+    shell_stderr_sha256: sha256(''),
+  });
+
+  const [evidenceApi, payloadApi] = await Promise.all([
+    import('@amittell/agentcli/evidence'),
+    import('@amittell/agentcli/evidence/payload'),
+  ]);
+  const provider = {
+    resolve() { return {}; },
+    attest(serialized) {
+      return {
+        attested: true,
+        envelope: {
+          method: 'test-envelope',
+          signed_payload: serialized,
+        },
+      };
+    },
+  };
+  const agentcli = {
+    ...evidenceApi,
+    ...payloadApi,
+    resolveEvidenceProvider() { return provider; },
+    async verifyEvidenceEnvelope(envelope) {
+      return { verified: true, payload: JSON.parse(envelope.signed_payload) };
+    },
+  };
+  const stored = await persistArtifactBoundEvidence(
+    { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
+    artifact,
+    run.id,
+    { agentcli, principal: 'fallback-principal' },
+  );
+  const envelope = JSON.parse(stored.evidence_envelope);
+  assert.equal(Object.hasOwn(envelope, 'payload_digest'), false);
+  assert.equal(stored.hash, sha256(canonicalStringify(envelope)));
+
+  const verified = await verifyPersistedArtifactBoundEvidence(run.id, { agentcli });
+  assert.equal(verified.integrity.valid, true, verified.integrity.error);
+  assert.equal(verified.integrity.cryptographically_verified, true);
+});
+
 test('credential capability negotiation fails before release and binds fresh runtime nonces', async () => {
   const context = {
     jobId: 'capability-job',
@@ -2553,8 +2763,9 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     assert.equal(stored.payload.includes('expected-output'), false);
 
     const verified = await verifyPersistedArtifactBoundEvidence(run.id, {
-      allowedSignersPath,
-      principal: 'scheduler-test',
+      allowedSignersPath: join(unrelatedCwd, 'wrong-allowed-signers'),
+      principal: 'wrong-principal',
+      env: { USER: 'wrong-principal' },
     });
     assert.equal(verified.integrity.valid, true, verified.integrity.error);
     assert.equal(verified.integrity.cryptographically_verified, true);

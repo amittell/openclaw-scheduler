@@ -231,6 +231,10 @@ function requireBoolean(value, path, errors) {
   if (typeof value !== 'boolean') errors.push(`${path} must be a boolean`);
 }
 
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function findRawSecretPaths(value, path = '$', found = []) {
   if (Array.isArray(value)) {
     value.forEach((item, index) => findRawSecretPaths(item, `${path}[${index}]`, found));
@@ -245,7 +249,11 @@ function findRawSecretPaths(value, path = '$', found = []) {
   return found;
 }
 
-export function validateHandoffArtifact(input, { expectedDigest = null, job = null } = {}) {
+export function validateHandoffArtifact(input, {
+  expectedDigest = null,
+  job = null,
+  allowDisabledStateMismatch = false,
+} = {}) {
   let payload;
   try {
     payload = parsePayload(input);
@@ -307,12 +315,22 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
     ['delegation.allowed_delegators_hash', payload.delegation?.allowed_delegators_hash, true],
   ]) requireDigest(value, path, errors, nullable);
 
-  for (const [index, value] of (payload.command?.args_sha256 ?? []).entries()) {
-    requireDigest(value, `command.args_sha256[${index}]`, errors, false);
+  const argumentHashes = payload.command?.args_sha256;
+  if (!Array.isArray(argumentHashes)) {
+    errors.push('command.args_sha256 must be an array');
+  } else {
+    for (const [index, value] of argumentHashes.entries()) {
+      requireDigest(value, `command.args_sha256[${index}]`, errors, false);
+    }
   }
-  for (const [key, value] of Object.entries(
-    payload.command?.env?.effective_env_value_sha256 ?? {},
-  )) requireDigest(value, `command.env.effective_env_value_sha256.${key}`, errors, false);
+  const effectiveEnvironmentHashes = payload.command?.env?.effective_env_value_sha256;
+  if (!isPlainObject(effectiveEnvironmentHashes)) {
+    errors.push('command.env.effective_env_value_sha256 must be an object');
+  } else {
+    for (const [key, value] of Object.entries(effectiveEnvironmentHashes)) {
+      requireDigest(value, `command.env.effective_env_value_sha256.${key}`, errors, false);
+    }
+  }
 
   requireBoolean(payload.lifecycle?.enabled, 'lifecycle.enabled', errors);
   requireBoolean(payload.lifecycle?.delete_after_run, 'lifecycle.delete_after_run', errors);
@@ -346,30 +364,35 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
   for (const secretPath of findRawSecretPaths(payload)) {
     errors.push(`${secretPath} contains raw credential material`);
   }
-  for (const [index, binding] of (payload.identity?.presentation?.bindings ?? []).entries()) {
-    if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
-      errors.push(`identity.presentation.bindings[${index}] must be an object`);
-    } else if (
-      Object.hasOwn(binding, 'value')
-      || Object.hasOwn(binding, 'credential')
-      || Object.hasOwn(binding, 'secret')
-      || Object.hasOwn(binding, 'token')
-    ) {
-      errors.push(`identity.presentation.bindings[${index}] contains raw credential material`);
-    } else {
-      if (!PRESENTATION_MEDIA.has(binding.medium)) {
-        errors.push(`identity.presentation.bindings[${index}].medium is unsupported`);
-      } else if (binding.medium !== 'none'
-        && binding.medium !== payload.identity.presentation.handoff) {
-        errors.push(`identity.presentation.bindings[${index}].medium does not match presentation handoff`);
+  const presentationBindings = payload.identity?.presentation?.bindings;
+  if (!Array.isArray(presentationBindings)) {
+    errors.push('identity.presentation.bindings must be an array');
+  } else {
+    for (const [index, binding] of presentationBindings.entries()) {
+      if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+        errors.push(`identity.presentation.bindings[${index}] must be an object`);
+      } else if (
+        Object.hasOwn(binding, 'value')
+        || Object.hasOwn(binding, 'credential')
+        || Object.hasOwn(binding, 'secret')
+        || Object.hasOwn(binding, 'token')
+      ) {
+        errors.push(`identity.presentation.bindings[${index}] contains raw credential material`);
+      } else {
+        if (!PRESENTATION_MEDIA.has(binding.medium)) {
+          errors.push(`identity.presentation.bindings[${index}].medium is unsupported`);
+        } else if (binding.medium !== 'none'
+          && binding.medium !== payload.identity.presentation.handoff) {
+          errors.push(`identity.presentation.bindings[${index}].medium does not match presentation handoff`);
+        }
+        requireDigest(
+          binding.source_hash,
+          `identity.presentation.bindings[${index}].source_hash`,
+          errors,
+        );
+        requireBoolean(binding.required, `identity.presentation.bindings[${index}].required`, errors);
+        requireBoolean(binding.redact, `identity.presentation.bindings[${index}].redact`, errors);
       }
-      requireDigest(
-        binding.source_hash,
-        `identity.presentation.bindings[${index}].source_hash`,
-        errors,
-      );
-      requireBoolean(binding.required, `identity.presentation.bindings[${index}].required`, errors);
-      requireBoolean(binding.redact, `identity.presentation.bindings[${index}].redact`, errors);
     }
   }
 
@@ -465,7 +488,10 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
     if ((payload.child_credential_policy ?? null) !== (job.child_credential_policy ?? null)) {
       errors.push('child credential policy does not match job');
     }
-    if (payload.lifecycle?.enabled !== Boolean(job.enabled)) {
+    const disabledStateMismatch = allowDisabledStateMismatch
+      && !job.enabled
+      && payload.lifecycle?.enabled === true;
+    if (payload.lifecycle?.enabled !== Boolean(job.enabled) && !disabledStateMismatch) {
       errors.push('lifecycle enabled does not match job');
     }
     if (payload.lifecycle?.delete_after_run !== Boolean(job.delete_after_run)) {
@@ -477,7 +503,35 @@ export function validateHandoffArtifact(input, { expectedDigest = null, job = nu
     if (payload.compiled?.effective_task_hash !== job.effective_task_hash) {
       errors.push('effective task hash does not match job');
     }
-    const jobBindingDigest = artifactDigest(schedulerJobExecutionProjection(job));
+    const evidenceDeclaration = normalizeJsonValue(job.evidence);
+    const persistedEvidence = isPlainObject(evidenceDeclaration) ? evidenceDeclaration : null;
+    const evidencePayload = isPlainObject(persistedEvidence?.payload)
+      ? persistedEvidence.payload
+      : null;
+    const expectedPayloadHash = evidencePayload == null ? null : artifactDigest(evidencePayload);
+    const persistedProviderConfigHash = persistedEvidence?.provider_config_hash;
+    const expectedProviderConfigHash = SHA256.test(persistedProviderConfigHash)
+      ? persistedProviderConfigHash
+      : isPlainObject(persistedEvidence?.provider_config)
+        ? artifactDigest(persistedEvidence.provider_config)
+        : null;
+    if ((payload.evidence?.provider ?? null) !== (persistedEvidence?.provider ?? null)) {
+      errors.push('evidence provider does not match job declaration');
+    }
+    if ((payload.evidence?.payload_hash ?? null) !== expectedPayloadHash) {
+      errors.push('evidence payload hash does not match job declaration');
+    }
+    if ((payload.evidence?.provider_config_hash ?? null) !== expectedProviderConfigHash) {
+      errors.push('evidence provider configuration hash does not match job declaration');
+    }
+    if ((evidencePayload != null || expectedProviderConfigHash != null)
+      && payload.evidence?.signed_or_provider_verified_required !== true) {
+      errors.push('declared evidence requires signed or provider-verified evidence');
+    }
+    const bindingJob = disabledStateMismatch
+      ? { ...job, enabled: Number(payload.lifecycle.enabled) }
+      : job;
+    const jobBindingDigest = artifactDigest(schedulerJobExecutionProjection(bindingJob));
     if (payload.scheduler_job_binding?.digest !== jobBindingDigest) {
       errors.push('scheduler job execution binding does not match artifact');
     }
