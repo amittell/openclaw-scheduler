@@ -37,7 +37,13 @@ import {
 } from '../evidence-runtime.js';
 import { negotiateCredentialCapabilities } from '../capability-negotiation.js';
 import { runShellCommand } from '../dispatcher-shell.js';
-import { executeShell, executeWatchdog, finalizeDispatch } from '../dispatcher-strategies.js';
+import {
+  cleanupDispatchMaterialization,
+  executeShell,
+  executeWatchdog,
+  finalizeDispatch,
+  prepareDispatch,
+} from '../dispatcher-strategies.js';
 import { resolveArtifactBoundIdentity } from '../identity-runtime.js';
 import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
@@ -897,9 +903,53 @@ test('expired retained v4 evidence prunes without a live run or envelope payload
     envelope.method,
     canonicalStringify(envelope),
   );
+  const originalArtifactPayload = getDb().prepare(
+    'SELECT payload FROM handoff_artifacts WHERE digest = ?',
+  ).get(job.handoff_artifact_digest).payload;
 
   assert.equal(deleteJob(job.id), true);
   assert.equal(getRun(run.id), undefined);
+  const tamperedPayload = canonicalStringify({ ...payload, unbound_tamper: true });
+  getDb().exec('DROP TRIGGER trg_v4_evidence_no_update');
+  try {
+    getDb().prepare('UPDATE evidence_records SET payload = ? WHERE run_id = ?')
+      .run(tamperedPayload, run.id);
+    assert.equal(pruneEvidenceRecords().changes, 0);
+    getDb().prepare('UPDATE evidence_records SET payload = ? WHERE run_id = ?')
+      .run(payloadText, run.id);
+  } finally {
+    getDb().exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_v4_evidence_no_update
+      BEFORE UPDATE ON evidence_records
+      WHEN OLD.handoff_artifact_digest IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'handoff v4 evidence is immutable');
+      END
+    `);
+  }
+
+  const tamperedArtifact = structuredClone(artifact);
+  tamperedArtifact.lifecycle = {
+    ...tamperedArtifact.lifecycle,
+    unbound_tamper: true,
+  };
+  getDb().exec('DROP TRIGGER trg_handoff_artifacts_no_update');
+  try {
+    getDb().prepare('UPDATE handoff_artifacts SET payload = ? WHERE digest = ?')
+      .run(canonicalStringify(tamperedArtifact), job.handoff_artifact_digest);
+    assert.equal(pruneEvidenceRecords().changes, 0);
+    getDb().prepare('UPDATE handoff_artifacts SET payload = ? WHERE digest = ?')
+      .run(originalArtifactPayload, job.handoff_artifact_digest);
+  } finally {
+    getDb().exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_handoff_artifacts_no_update
+      BEFORE UPDATE ON handoff_artifacts
+      BEGIN
+        SELECT RAISE(ABORT, 'handoff artifacts are immutable');
+      END
+    `);
+  }
+
   assert.equal(pruneEvidenceRecords().changes, 1);
   assert.equal(
     getDb().prepare('SELECT COUNT(*) AS count FROM evidence_records WHERE run_id = ?').get(run.id).count,
@@ -1142,11 +1192,15 @@ test('inherited and downscoped provider sessions resume against the exact source
       },
       async resumeSession(row, ctx) {
         resumeContext = ctx;
+        const summary = JSON.parse(row.session_summary);
         return {
           session: {
-            subject: { kind: 'service', principal: row.subject_principal },
-            scope: row.scope,
-            trust: { level: 'supervised' },
+            subject: {
+              kind: summary.subject_kind,
+              principal: summary.subject_principal,
+            },
+            scope: summary.scope,
+            trust: { level: summary.trust_level },
           },
         };
       },
@@ -1836,7 +1890,13 @@ test('provider sessions fail closed on expired output and indeterminate revocati
       };
     },
     async resumeSession(row) {
-      return { session: { principal: row.subject_principal } };
+      const summary = JSON.parse(row.session_summary);
+      return {
+        session: {
+          principal: summary.subject_principal,
+          expires_at: summary.expires_at,
+        },
+      };
     },
     async checkRevocation() { return {}; },
   };
@@ -1873,6 +1933,96 @@ test('provider sessions fail closed on expired output and indeterminate revocati
       .get(persisted.id).revocation_checked_at,
     null,
   );
+});
+
+test('resumed provider sessions must preserve persisted identity and temporal validity', async () => {
+  _resetProviderSessionMemoryForTesting();
+  const request = { principal: 'principal:resume-bound', scope: ['read'] };
+  const ctx = {
+    artifactDigest: `sha256:${'e'.repeat(64)}`,
+    jobId: 'resume-bound-job',
+    runId: 'resume-bound-run',
+  };
+  let revocationChecks = 0;
+  const provider = {
+    name: 'resume-bound-provider',
+    type: 'identity',
+    async resolveSession() {
+      throw new Error('cached session validation must run before re-resolution');
+    },
+    async resumeSession(row) {
+      const summary = JSON.parse(row.session_summary);
+      return {
+        session: {
+          principal: 'principal:substituted',
+          scope: summary.scope,
+          trust: { level: summary.trust_level },
+          expires_at: summary.expires_at,
+        },
+      };
+    },
+    async checkRevocation() {
+      revocationChecks += 1;
+      return { revoked: false };
+    },
+  };
+  const adopted = adoptProviderSession(provider, request, {
+    session: {
+      principal: request.principal,
+      scope: request.scope,
+      trust: { level: 'supervised' },
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    },
+  }, ctx, { db: getDb() });
+  adopted.session.principal = 'principal:mutated-cache';
+  await assert.rejects(
+    () => resumeProviderSession(provider, adopted.row.id, ctx, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_RESUME_MISMATCH',
+  );
+  assert.equal(revocationChecks, 0);
+
+  const readopted = adoptProviderSession(provider, request, {
+    session: {
+      principal: request.principal,
+      scope: [...request.scope],
+      trust: { level: 'supervised' },
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    },
+  }, ctx, { db: getDb() });
+  readopted.session.principal = 'principal:mutated-resolve-cache';
+  await assert.rejects(
+    () => resolveProviderSession(provider, request, ctx, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_RESUME_MISMATCH',
+  );
+  assert.equal(revocationChecks, 0);
+
+  _resetProviderSessionMemoryForTesting();
+  await assert.rejects(
+    () => resumeProviderSession(provider, adopted.row.id, ctx, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_RESUME_MISMATCH',
+  );
+  assert.equal(revocationChecks, 0);
+
+  const summary = JSON.parse(
+    getDb().prepare('SELECT session_summary FROM provider_sessions WHERE id = ?')
+      .get(adopted.row.id).session_summary,
+  );
+  provider.resumeSession = async () => ({
+    session: {
+      principal: summary.subject_principal,
+      scope: summary.scope,
+      trust: { level: summary.trust_level },
+      expires_at: summary.expires_at,
+    },
+  });
+  getDb().prepare('UPDATE provider_sessions SET expires_at = ? WHERE id = ?')
+    .run(new Date(Date.now() - 1_000).toISOString(), adopted.row.id);
+  _resetProviderSessionMemoryForTesting();
+  await assert.rejects(
+    () => resumeProviderSession(provider, adopted.row.id, ctx, { db: getDb() }),
+    error => error.code === 'PROVIDER_SESSION_EXPIRED',
+  );
+  assert.equal(revocationChecks, 0);
 });
 
 test('provider session rotation fails closed on a corrupted persisted summary', () => {
@@ -2044,8 +2194,16 @@ test('resumed provider sessions refresh expired state before reuse and then rech
   const provider = {
     name: 'resume-refresh-provider',
     type: 'identity',
-    async resumeSession() {
-      return { session: { principal: request.principal, rotation_id: 'resume-1' } };
+    async resumeSession(row) {
+      const summary = JSON.parse(row.session_summary);
+      return {
+        session: {
+          principal: summary.subject_principal,
+          rotation_id: 'resume-1',
+          expires_at: summary.expires_at,
+          refresh_after: summary.refresh_after,
+        },
+      };
     },
     async refreshSession() {
       refreshes += 1;
@@ -2255,6 +2413,255 @@ test('credential materialization audit failures immediately clean written secret
     else process.env.SCHEDULER_HOME = previousSchedulerHome;
     rmSync(schedulerHome, { recursive: true, force: true });
   }
+});
+
+test('credential materialization surfaces unresolved internal cleanup for durable retry', async () => {
+  const schedulerHome = mkdtempSync(join(tmpdir(), 'scheduler-v4-audit-cleanup-failure-'));
+  const previousSchedulerHome = process.env.SCHEDULER_HOME;
+  process.env.SCHEDULER_HOME = schedulerHome;
+  const db = getDb();
+  let credentialPath = null;
+  db.exec(`
+    CREATE TEMP TRIGGER fail_credential_materialized_event_with_cleanup_debt
+    BEFORE INSERT ON runtime_events
+    WHEN NEW.event_type = 'credential.materialized'
+    BEGIN
+      SELECT RAISE(ABORT, 'credential materialized audit failure with cleanup debt');
+    END
+  `);
+  try {
+    let failure = null;
+    try {
+      await materializeCredentials(
+        {
+          name: 'audit-cleanup-debt-provider',
+          async materializeCredentials() {
+            return {
+              bindings: [{
+                name: 'audit-cleanup-debt-secret',
+                medium: 'temp-file',
+                key: 'AUDIT_CLEANUP_DEBT_FILE',
+                file_name: 'audit-cleanup-debt-secret',
+                value: 'audit-cleanup-debt-secret-must-not-persist',
+              }],
+            };
+          },
+        },
+        { session: { id: 'audit-cleanup-debt-session' } },
+        {
+          handoff: 'temp-file',
+          bindings: [{
+            name: 'audit-cleanup-debt-secret',
+            medium: 'temp-file',
+            env_key: 'AUDIT_CLEANUP_DEBT_FILE',
+            file_name: 'audit-cleanup-debt-secret',
+            required: true,
+          }],
+        },
+        {
+          jobId: 'audit-cleanup-debt-job',
+          runId: 'audit-cleanup-debt-run',
+          artifactDigest: `sha256:${'b'.repeat(64)}`,
+          sessionTarget: 'shell',
+        },
+        {
+          db,
+          onCredentialFileWritten({ tempPath }) {
+            credentialPath = tempPath;
+            rmSync(tempPath);
+            mkdirSync(tempPath);
+          },
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.ok(failure);
+    assert.equal(failure.credentialCleanupCompleted, false);
+    assert.equal(failure.cleanupError?.code, 'CREDENTIAL_CLEANUP_FAILED');
+    assert.ok(failure.credentialMaterialization);
+    assert.equal(
+      Object.prototype.propertyIsEnumerable.call(failure, 'credentialMaterialization'),
+      false,
+    );
+    assert.equal(JSON.stringify(failure).includes('audit-cleanup-debt-secret-must-not-persist'), false);
+    assert.equal(
+      db.prepare("SELECT status FROM credential_presentations WHERE run_id = 'audit-cleanup-debt-run'")
+        .get().status,
+      'failed',
+    );
+    assert.equal(existsSync(credentialPath), true);
+
+    rmSync(credentialPath, { recursive: true });
+    await cleanupCredentialMaterialization(
+      failure.credentialMaterialization,
+      {
+        jobId: 'audit-cleanup-debt-job',
+        runId: 'audit-cleanup-debt-run',
+        artifactDigest: `sha256:${'b'.repeat(64)}`,
+      },
+      { db },
+    );
+    assert.equal(
+      db.prepare("SELECT status FROM credential_presentations WHERE run_id = 'audit-cleanup-debt-run'")
+        .get().status,
+      'cleaned',
+    );
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS fail_credential_materialized_event_with_cleanup_debt');
+    if (previousSchedulerHome === undefined) delete process.env.SCHEDULER_HOME;
+    else process.env.SCHEDULER_HOME = previousSchedulerHome;
+    rmSync(schedulerHome, { recursive: true, force: true });
+  }
+});
+
+test('dispatch abort cleanup records the durable outcome before terminalization can continue', async () => {
+  for (const scenario of [
+    { name: 'cleaned', cleanupFails: false, checkpointRecorded: true },
+    { name: 'failed', cleanupFails: true, checkpointRecorded: true },
+    { name: 'checkpoint-failed', cleanupFails: false, checkpointRecorded: false },
+  ]) {
+    const sequence = [];
+    const recorded = [];
+    const ctx = {
+      run: { id: `cleanup-before-abort-${scenario.name}` },
+      v4CredentialMaterialization: { presentationIds: ['presentation-id'] },
+      credentialCleanupTracked: true,
+      dispatcherFence: { ownerId: 'dispatcher', fencingToken: 7 },
+      materializedEnv: { SECRET: 'redacted' },
+    };
+    const cleaned = await cleanupDispatchMaterialization(
+      {
+        id: 'cleanup-before-abort-job',
+        name: 'cleanup-before-abort-job',
+        handoff_artifact_digest: `sha256:${'c'.repeat(64)}`,
+      },
+      ctx,
+      {
+        getDb,
+        async cleanupCredentialMaterialization() {
+          sequence.push('cleanup');
+          if (scenario.cleanupFails) throw new Error('cleanup remains unresolved');
+        },
+        recordRunCredentialCleanupState(runId, state, fence) {
+          sequence.push('record');
+          recorded.push({ runId, state, fence });
+          return scenario.checkpointRecorded ? { id: runId } : null;
+        },
+        clearMaterializedEnvironment() {},
+        log() {},
+      },
+    );
+    sequence.push('terminalize');
+
+    assert.equal(cleaned, !scenario.cleanupFails && scenario.checkpointRecorded);
+    assert.deepEqual(sequence, ['cleanup', 'record', 'terminalize']);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].runId, ctx.run.id);
+    assert.equal(recorded[0].state.status, scenario.cleanupFails ? 'failed' : 'cleaned');
+    assert.equal(recorded[0].state.attempts, 1);
+    assert.equal(recorded[0].fence.allowAfterLeaseLoss, true);
+    assert.equal(ctx.materializationCleanupResult.checkpointRecorded, scenario.checkpointRecorded);
+    if (!scenario.checkpointRecorded) {
+      assert.match(ctx.materializationCleanupResult.error, /not durably recorded/);
+    }
+    assert.equal(JSON.stringify(recorded).includes('redacted'), false);
+  }
+});
+
+test('missing cleanup checkpoint preserves the active run instead of terminalizing it', async () => {
+  const job = createV4Job('Cleanup checkpoint recovery');
+  const run = createRun(job.id);
+  const ctx = {
+    run,
+    v4CredentialMaterialization: { presentationIds: ['checkpoint-presentation'] },
+    credentialCleanupTracked: true,
+    dispatcherFence: { ownerId: 'dispatcher', fencingToken: 11 },
+  };
+  await finalizeDispatch(job, ctx, {
+    status: 'ok',
+    summary: 'must not commit without cleanup checkpoint',
+    content: 'must not commit without cleanup checkpoint',
+    errorMessage: null,
+    runFinishFields: {},
+    skipDelivery: true,
+    skipJobUpdate: true,
+    skipChildren: true,
+    skipDequeue: true,
+    skipAgentCleanup: true,
+    idemAction: 'noop',
+    retryFiresChildren: false,
+    earlyReturn: false,
+  }, {
+    getDb,
+    async cleanupCredentialMaterialization() {},
+    recordRunCredentialCleanupState() { return false; },
+    clearMaterializedEnvironment() {},
+    log() {},
+  });
+
+  assert.equal(ctx.preserveForRecovery, true);
+  assert.equal(ctx.materializationCleanupResult.checkpointRecorded, false);
+  assert.equal(getRun(run.id).status, 'running');
+  finishRun(run.id, 'cancelled', { summary: 'test cleanup after recovery preservation' });
+});
+
+test('non-transient v4 preparation failures durably disable the quarantined job', async () => {
+  const job = createV4Job('Preparation quarantine disablement');
+  const prepared = await prepareDispatch(job, {}, {
+    claimDispatch: () => null,
+    releaseDispatch: () => null,
+    setDispatchStatus: () => null,
+    countPendingApprovalsForJob: () => 0,
+    getPendingApproval: () => null,
+    createApproval: () => { throw new Error('approval must not be created'); },
+    createRun,
+    getRun,
+    hasRunningRunForPool: () => false,
+    hasRunningRun: () => false,
+    enqueueJob: () => ({ queued: false }),
+    getDispatchBacklogCount: () => 0,
+    generateIdempotencyKey: () => `v4-quarantine:${job.id}`,
+    generateChainIdempotencyKey: () => `v4-quarantine-chain:${job.id}`,
+    generateRunNowIdempotencyKey: () => `v4-quarantine-manual:${job.id}`,
+    claimIdempotencyKey: () => true,
+    finishRun,
+    getDb,
+    sqliteNow: () => '2099-01-01 00:00:00',
+    adaptiveDeferralMs: () => 100,
+    handleDelivery: () => null,
+    advanceNextRun: () => null,
+    updateJobAfterRun: () => null,
+    TICK_INTERVAL_MS: 100,
+    log: () => null,
+    evaluateGovernance: () => ({ allowed: true, violations: [], warnings: [] }),
+    buildShellEnvironment: (_job, env) => env || null,
+    summarizeGovernance: () => null,
+    persistV02Outcomes,
+    releaseIdempotencyKey: () => null,
+    updateJob,
+    handleTriggeredChildren: () => null,
+    dequeueJob: () => false,
+    assertArtifactMatchesJob() {
+      throw Object.assign(new Error('stored artifact failed integrity validation'), {
+        code: 'HANDOFF_ARTIFACT_INVALID',
+        transient: false,
+      });
+    },
+  });
+
+  assert.equal(prepared, null);
+  const run = getDb().prepare(
+    'SELECT * FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1',
+  ).get(job.id);
+  assert.equal(run.status, 'error');
+  assert.equal(getJob(job.id).enabled, 0);
+  const event = listRuntimeEvents({
+    runId: run.id,
+    eventType: 'job.quarantine.required',
+  }).at(-1);
+  assert.equal(event.payload.job_disabled, true);
 });
 
 test('failed credential cleanup remains recoverable on the next cleanup pass', async () => {
@@ -2726,6 +3133,132 @@ test('cancellation-winning v4 finalization prepares evidence for the effective t
   assert.equal(getRun(run.id).status, 'cancelled');
 });
 
+test('cancellation racing the terminal transaction regenerates stale prepared v4 evidence', async () => {
+  const job = createV4Job('Cancellation-racing v4 evidence');
+  const run = createRun(job.id);
+  const preparedStatuses = [];
+  let persistedStatus = null;
+  let commitAttempts = 0;
+
+  await finalizeDispatch(job, {
+    run,
+    idemKey: null,
+    dispatchRecord: null,
+    v02Outcomes: null,
+    v4Artifact: assertArtifactMatchesJob(job),
+  }, {
+    status: 'ok',
+    summary: 'success raced by cancellation',
+    content: 'success raced by cancellation',
+    errorMessage: null,
+    runFinishFields: {},
+    skipDelivery: true,
+    skipJobUpdate: true,
+    skipChildren: true,
+    skipDequeue: true,
+    skipAgentCleanup: true,
+    idemAction: 'noop',
+    retryFiresChildren: false,
+    earlyReturn: false,
+  }, {
+    finishRun,
+    transitionRunTerminal,
+    completeRunFenced,
+    commitCompletionBookkeeping(db, callback) {
+      commitAttempts += 1;
+      if (commitAttempts === 1) {
+        requestRunCancellation(run.id, {
+          requestedBy: 'scheduler-test',
+          reason: 'operator cancelled after asynchronous attestation',
+        });
+      }
+      return db.transaction(callback)();
+    },
+    shouldRunPostCompletionEffects,
+    prepareArtifactBoundEvidence(_job, _artifact, evidenceRun) {
+      preparedStatuses.push(evidenceRun.status);
+      return {
+        runId: run.id,
+        jobId: job.id,
+        status: evidenceRun.status,
+        handoffArtifactDigest: job.handoff_artifact_digest,
+      };
+    },
+    persistPreparedArtifactBoundEvidence(prepared, { db }) {
+      persistedStatus = prepared.status;
+      assert.equal(
+        db.prepare('SELECT status FROM runs WHERE id = ?').get(run.id).status,
+        prepared.status,
+      );
+      return prepared;
+    },
+    updateIdempotencyResultHash: () => {},
+    releaseIdempotencyKey: () => {},
+    setAgentStatus: () => {},
+    handleDelivery: () => null,
+    shouldRetry: () => false,
+    scheduleRetry: () => null,
+    getDb,
+    updateJobAfterRun: () => {},
+    updateJob,
+    setDispatchStatus: () => null,
+    handleTriggeredChildren: () => {},
+    dequeueJob: () => false,
+    log: () => {},
+    clearMaterializedEnvironment: () => {},
+  });
+
+  assert.deepEqual(preparedStatuses, ['ok', 'cancelled']);
+  assert.equal(commitAttempts, 2);
+  assert.equal(persistedStatus, 'cancelled');
+  assert.equal(getRun(run.id).status, 'cancelled');
+});
+
+test('prepared v4 evidence refuses non-atomic terminal bookkeeping', async () => {
+  const job = createV4Job('Atomic v4 evidence completion');
+  const run = createRun(job.id);
+
+  await assert.rejects(
+    () => finalizeDispatch(job, {
+      run,
+      idemKey: null,
+      dispatchRecord: null,
+      v02Outcomes: null,
+      v4Artifact: assertArtifactMatchesJob(job),
+    }, {
+      status: 'ok',
+      summary: 'must remain recoverable',
+      content: 'must remain recoverable',
+      errorMessage: null,
+      runFinishFields: {},
+      skipDelivery: true,
+      skipJobUpdate: true,
+      skipChildren: true,
+      skipDequeue: true,
+      skipAgentCleanup: true,
+      idemAction: 'noop',
+      retryFiresChildren: false,
+      earlyReturn: false,
+    }, {
+      getDb,
+      prepareArtifactBoundEvidence(_job, _artifact, evidenceRun) {
+        return {
+          runId: run.id,
+          jobId: job.id,
+          status: evidenceRun.status,
+          handoffArtifactDigest: job.handoff_artifact_digest,
+        };
+      },
+      clearMaterializedEnvironment: () => {},
+      log: () => {},
+    }),
+    error => error.code === 'EVIDENCE_ATOMIC_COMMIT_REQUIRED',
+  );
+
+  assert.equal(getRun(run.id).status, 'running');
+  finishRun(run.id, 'cancelled', { summary: 'test cleanup after atomic refusal' });
+});
+
 test('required signed v4 evidence failures durably block recovery', async () => {
   const input = manifest('Required signed evidence failure');
   input.evidence_profiles = [{
@@ -2767,6 +3300,7 @@ test('required signed v4 evidence failures durably block recovery', async () => 
     earlyReturn: false,
   }, {
     finishRun,
+    commitCompletionBookkeeping,
     updateIdempotencyResultHash: () => {},
     releaseIdempotencyKey: () => {},
     setAgentStatus: () => {},
@@ -2849,6 +3383,43 @@ test('verified evidence envelopes without payload digests use one consistent has
       return { verified: true, payload: JSON.parse(envelope.signed_payload) };
     },
   };
+  let mismatchedPreparedPayload = null;
+  const mismatchedAgentcli = {
+    ...agentcli,
+    resolveEvidenceProvider() {
+      return {
+        ...provider,
+        attest(serialized) {
+          mismatchedPreparedPayload = serialized;
+          return {
+            attested: true,
+            envelope: {
+              method: 'test-envelope',
+              signed_payload: canonicalStringify({
+                ...JSON.parse(serialized),
+                execution_id: 'different-execution',
+              }),
+            },
+          };
+        },
+      };
+    },
+    async verifyEvidenceEnvelope() {
+      return {
+        verified: true,
+        payload: JSON.parse(mismatchedPreparedPayload),
+      };
+    },
+  };
+  await assert.rejects(
+    () => persistArtifactBoundEvidence(
+      { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
+      artifact,
+      run.id,
+      { agentcli: mismatchedAgentcli, principal: 'fallback-principal' },
+    ),
+    error => error.code === 'EVIDENCE_PAYLOAD_MISMATCH',
+  );
   const stored = await persistArtifactBoundEvidence(
     { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
     artifact,
@@ -3033,6 +3604,24 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
         .some(sample => sample.run_id === run.id),
       false,
       doctorResult.stderr,
+    );
+    const statusResult = spawnSync(
+      process.execPath,
+      ['cli.js', 'status', '--json'],
+      {
+        cwd: join(import.meta.dirname, '..'),
+        env: { ...process.env, SCHEDULER_DB: doctorDbPath },
+        encoding: 'utf8',
+      },
+    );
+    const statusPayload = JSON.parse(statusResult.stdout);
+    assert.equal(statusResult.status, 0, statusResult.stderr);
+    assert.equal(statusPayload.diagnostics.evidence_records.verification_mode, 'checksum');
+    assert.equal(
+      statusPayload.diagnostics.evidence_records.invalid_samples
+        .some(sample => sample.run_id === run.id),
+      false,
+      statusResult.stderr,
     );
 
     const replacementInput = structuredClone(input);

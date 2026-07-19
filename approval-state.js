@@ -5,7 +5,7 @@ import {
   approverMatchesScope,
   getAuthenticatedApprovalActor,
 } from './approval-binding.js';
-import { persistTerminalEvidence } from './runs.js';
+import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 
 export const APPROVAL_STATUSES = Object.freeze({
   PENDING: 'pending',
@@ -95,6 +95,22 @@ function normalizeText(value, fallback = null, maxLength = 4000) {
   return normalized ? normalized.slice(0, maxLength) : fallback;
 }
 
+function quarantineSynchronousV4TerminalEvidence(db, job, runId, intendedStatus, message) {
+  if (Number(job?.handoff_version) !== 4 || !runId) return null;
+  const run = db.prepare('SELECT evidence_required FROM runs WHERE id = ?').get(runId);
+  if (run?.evidence_required !== 1) return null;
+  const reason = [
+    `Handoff v4 ${intendedStatus} terminal evidence requires asynchronous artifact-bound verification`,
+    normalizeText(message, null),
+    'run quarantined for operator recovery',
+  ].filter(Boolean).join('; ');
+  return quarantineRunRecovery(runId, reason, {
+    db,
+    allowPreExecution: true,
+    intendedStatus,
+  });
+}
+
 function finishApprovalRun(db, approval, status, message) {
   if (!approval.run_id) return 0;
   const summary = status === APPROVAL_STATUSES.APPROVED ? message : null;
@@ -103,6 +119,17 @@ function finishApprovalRun(db, approval, status, message) {
   const eligibleStatuses = status === APPROVAL_STATUSES.APPROVED
     ? "'awaiting_approval', 'pending'"
     : "'awaiting_approval', 'pending', 'approved'";
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(approval.job_id);
+  if (runStatus === 'cancelled') {
+    const quarantine = quarantineSynchronousV4TerminalEvidence(
+      db,
+      job,
+      approval.run_id,
+      runStatus,
+      message,
+    );
+    if (quarantine) return Number(quarantine.changed);
+  }
   const changes = db.prepare(`
     UPDATE runs
     SET status = ?,
@@ -117,7 +144,6 @@ function finishApprovalRun(db, approval, status, message) {
     WHERE id = ? AND status IN (${eligibleStatuses})
   `).run(runStatus, summary, error, status, approval.run_id).changes;
   if (changes === 1 && runStatus === 'cancelled') {
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(approval.job_id);
     persistTerminalEvidence(
       job,
       approval.run_id,
@@ -136,6 +162,15 @@ function finishDispatchedApprovalRun(db, approval, message) {
     message,
     'Approval gate consumed by a separate execution run',
   );
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(approval.job_id);
+  const quarantine = quarantineSynchronousV4TerminalEvidence(
+    db,
+    job,
+    approval.run_id,
+    'skipped',
+    summary,
+  );
+  if (quarantine) return Number(quarantine.changed);
   const changes = db.prepare(`
     UPDATE runs
     SET status = 'skipped',
@@ -146,7 +181,6 @@ function finishDispatchedApprovalRun(db, approval, message) {
     WHERE id = ? AND status = 'approved'
   `).run(summary, approval.run_id).changes;
   if (changes === 1) {
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(approval.job_id);
     persistTerminalEvidence(job, approval.run_id, 'skipped', { summary }, {}, { db });
   }
   return changes;
@@ -618,11 +652,14 @@ export function recoverInterruptedApprovalDispatches(opts = {}) {
     `).all();
     let recovered = 0;
     for (const approval of historicalGates) {
-      db.prepare(`
-        UPDATE runs
-        SET evidence_required = 0
-        WHERE id = ? AND status = 'approved'
-      `).run(approval.run_id);
+      const job = db.prepare('SELECT handoff_version FROM jobs WHERE id = ?').get(approval.job_id);
+      if (Number(job?.handoff_version) !== 4) {
+        db.prepare(`
+          UPDATE runs
+          SET evidence_required = 0
+          WHERE id = ? AND status = 'approved'
+        `).run(approval.run_id);
+      }
       recovered += finishDispatchedApprovalRun(
         db,
         approval,

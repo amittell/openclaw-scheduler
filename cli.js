@@ -6,7 +6,10 @@ import { fileURLToPath } from 'url';
 import { initDb, getDb, getResolvedDbPath } from './db.js';
 import { createJob, getJob, listJobs, updateJob, deleteJob, cancelJob, runJobNow, validateJobSpec, parseInDuration, AT_JOB_CRON_SENTINEL } from './jobs.js';
 import { getRun, getRunsForJob, getRunningRuns, getStaleRuns, getEvidenceRecord } from './runs.js';
-import { verifyPersistedArtifactBoundEvidence } from './evidence-runtime.js';
+import {
+  validatePersistedArtifactBoundEvidenceRecord,
+  verifyPersistedArtifactBoundEvidence,
+} from './evidence-runtime.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, getMessage, listMessageReceipts, getTeamMessages,
@@ -364,21 +367,32 @@ async function getOperationalDiagnostics(db, opts = {}) {
     ? await (async () => {
       const total = db.prepare('SELECT COUNT(*) AS count FROM evidence_records').get().count;
       const deep = opts.deepEvidence === true;
+      const verifyV4Evidence = opts.verifyV4Evidence === true;
       const evidenceLimit = Number.isInteger(opts.evidenceLimit) && opts.evidenceLimit > 0
         ? opts.evidenceLimit
         : 500;
       const rowStatement = deep
-        ? db.prepare('SELECT run_id, handoff_artifact_digest FROM evidence_records ORDER BY created_at DESC, run_id DESC')
-        : db.prepare('SELECT run_id, handoff_artifact_digest FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
+        ? db.prepare('SELECT * FROM evidence_records ORDER BY created_at DESC, run_id DESC')
+        : db.prepare('SELECT * FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
       const rows = deep ? rowStatement.all() : rowStatement.all(evidenceLimit);
       let checked = 0;
       let invalidCount = 0;
       const invalidSamples = [];
       for (const row of rows) {
         checked += 1;
-        const record = row.handoff_artifact_digest
-          ? await verifyPersistedArtifactBoundEvidence(row.run_id, { db })
-          : getEvidenceRecord(row.run_id, { db });
+        let record;
+        if (row.handoff_artifact_digest && verifyV4Evidence) {
+          record = await verifyPersistedArtifactBoundEvidence(row.run_id, { db });
+        } else if (row.handoff_artifact_digest) {
+          try {
+            validatePersistedArtifactBoundEvidenceRecord(row, { db });
+            record = { integrity: { valid: true } };
+          } catch (error) {
+            record = { integrity: { valid: false, error: error.message } };
+          }
+        } else {
+          record = getEvidenceRecord(row.run_id, { db });
+        }
         if (record?.integrity?.valid !== true) {
           invalidCount += 1;
           if (invalidSamples.length < 20) {
@@ -408,6 +422,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
         : [];
       return {
         total,
+        verification_mode: verifyV4Evidence ? 'cryptographic' : 'checksum',
         checked,
         unchecked: Math.max(0, total - checked),
         verification_complete: checked === total,
@@ -419,6 +434,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
     })()
     : {
         total: null,
+        verification_mode: opts.verifyV4Evidence === true ? 'cryptographic' : 'checksum',
         checked: null,
         unchecked: null,
         verification_complete: null,
@@ -1495,7 +1511,10 @@ switch (command) {
     const doctorArgs = [sub, ...args].filter(Boolean);
     const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep');
     if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
-    const diagnostics = await getOperationalDiagnostics(db, { deepEvidence: doctorArgs.includes('--deep') });
+    const diagnostics = await getOperationalDiagnostics(db, {
+      deepEvidence: doctorArgs.includes('--deep'),
+      verifyV4Evidence: true,
+    });
     const integrityRows = db.pragma('quick_check');
     const integrityMessages = integrityRows.map(row => String(Object.values(row)[0]));
     const integrityOk = integrityMessages.length === 1 && integrityMessages[0].toLowerCase() === 'ok';

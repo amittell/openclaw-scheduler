@@ -828,12 +828,11 @@ test('handoff v4 applies to a fresh DB, survives restart, and executes every dur
       .get(replayRun.id).count,
     1,
   );
-  assert.equal(
-    probe.prepare("SELECT COUNT(*) AS count FROM runtime_events WHERE run_id = ? AND event_type = 'job.quarantine.required'")
-      .get(replayRun.id).count,
-    1,
-  );
-  assert.equal(probe.prepare('SELECT enabled FROM jobs WHERE id = ?').get(manualState.job.id).enabled, 1);
+  const quarantineEvent = probe.prepare(
+    "SELECT payload FROM runtime_events WHERE run_id = ? AND event_type = 'job.quarantine.required'",
+  ).get(replayRun.id);
+  assert.equal(JSON.parse(quarantineEvent.payload).job_disabled, true);
+  assert.equal(probe.prepare('SELECT enabled FROM jobs WHERE id = ?').get(manualState.job.id).enabled, 0);
   assert.equal(readFileSync(manualState.marker, 'utf8'), 'complete\n');
 
   await waitFor(

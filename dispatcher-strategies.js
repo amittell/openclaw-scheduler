@@ -421,6 +421,8 @@ export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
   const retryDelays = configuredRetryDelays.length > 0 ? configuredRetryDelays : [0];
   let attempts = 0;
   let lastError = null;
+  let checkpointRecorded = ctx.credentialCleanupTracked ? false : null;
+  let checkpointError = null;
   try {
     if (ctx.v4CredentialMaterialization) {
       attempts += 1;
@@ -496,7 +498,9 @@ export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
           ...fence,
           allowAfterLeaseLoss: true,
         });
-        if (!recorded) {
+        checkpointRecorded = Boolean(recorded);
+        if (!checkpointRecorded) {
+          checkpointError = new Error('Credential cleanup state was not durably recorded');
           deps.log?.('warn', `Credential cleanup state was not recorded for ${job.name}`, {
             jobId: job.id,
             runId: ctx.run.id,
@@ -504,19 +508,33 @@ export async function cleanupDispatchMaterialization(job, ctx, deps = {}) {
           });
         }
       } catch (error) {
+        checkpointError = error;
         deps.log?.('error', `Credential cleanup state persistence failed for ${job.name}: ${error.message}`, {
           jobId: job.id,
           runId: ctx.run.id,
           status,
         });
       }
+    } else {
+      checkpointError = new Error('Credential cleanup state requires a dispatcher fence');
     }
+  }
+
+  if (checkpointError) {
+    lastError = lastError
+      ? new AggregateError(
+          [lastError, checkpointError],
+          'Credential cleanup or its durable checkpoint did not complete',
+          { cause: lastError },
+        )
+      : checkpointError;
   }
 
   ctx.materializationCleanupResult = {
     cleaned: lastError == null,
     attempts,
     error: lastError?.message || null,
+    checkpointRecorded,
   };
   return ctx.materializationCleanupResult.cleaned;
 }
@@ -595,19 +613,23 @@ function abortPreparedRun(job, run, summary, outcomes, state, deps, opts = {}) {
     }
     if (!opts.skipJobUpdate) updateJobAfterRun(job, requestedStatus);
     if (opts.disableJob && Number(job.handoff_version) === 4) {
+      if (typeof updateJob !== 'function') {
+        throw new Error('Handoff v4 quarantine requires a durable job update');
+      }
+      updateJob(job.id, { enabled: 0 });
       appendRuntimeEvent('job.quarantine.required', {
         jobId: job.id,
         runId: run.id,
         handoffArtifactDigest: job.handoff_artifact_digest,
         payload: {
           reason: summary,
-          job_disabled: false,
+          job_disabled: true,
           operator_action_required: true,
         },
       }, { db: getDb() });
       log(
         'warn',
-        `Handoff v4 job ${job.name} requires operator quarantine; its artifact-bound enabled state was not mutated`,
+        `Handoff v4 job ${job.name} was disabled pending operator quarantine`,
         { jobId: job.id, runId: run.id },
       );
     } else if (opts.disableJob && typeof updateJob === 'function') {
@@ -897,6 +919,14 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const materializationCleaned = await cleanupDispatchMaterialization(job, ctx, deps);
+  if (ctx.materializationCleanupResult?.checkpointRecorded === false) {
+    ctx.preserveForRecovery = true;
+    log('error', `Credential cleanup checkpoint failed for ${job.name}; preserving the run for recovery`, {
+      jobId: job.id,
+      runId: ctx.run.id,
+    });
+    return;
+  }
   if (!materializationCleaned) {
     const attempts = ctx.materializationCleanupResult?.attempts || 1;
     const cleanupSummary = `Credential cleanup failed after ${attempts} attempt${attempts === 1 ? '' : 's'}`;
@@ -950,36 +980,39 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     ...(Object.keys(mergedRunContext).length > 0 ? { context_summary: mergedRunContext } : {}),
   };
   let preparedV4Evidence = null;
-  if (Number(job.handoff_version) === 4 && ctx.v4Artifact) {
-    try {
-      const evidenceTimestamp = new Date().toISOString();
-      const currentRun = getDb().prepare('SELECT * FROM runs WHERE id = ?').get(ctx.run.id);
-      if (!currentRun) throw new Error(`Evidence run not found: ${ctx.run.id}`);
-      const evidenceStatus = currentRun.cancel_requested_at != null
-        || currentRun.status === 'cancelled'
+  const preparesV4Evidence = Number(job.handoff_version) === 4 && ctx.v4Artifact;
+  const prepareV4EvidenceForStatus = async requestedStatus => {
+    const evidenceTimestamp = new Date().toISOString();
+    const currentRun = getDb().prepare('SELECT * FROM runs WHERE id = ?').get(ctx.run.id);
+    if (!currentRun) throw new Error(`Evidence run not found: ${ctx.run.id}`);
+    const evidenceStatus = requestedStatus || (
+      currentRun.cancel_requested_at != null || currentRun.status === 'cancelled'
         ? 'cancelled'
-        : result.status;
-      const startedAt = currentRun.started_at
-        ? Date.parse(currentRun.started_at.includes('T')
-          ? currentRun.started_at
-          : `${currentRun.started_at.replace(' ', 'T')}Z`)
-        : Date.now();
-      const evidenceDurationMs = Number.isInteger(finishFields.duration_ms)
-        && finishFields.duration_ms >= 0
-        ? finishFields.duration_ms
-        : Math.max(0, Date.parse(evidenceTimestamp) - (
-            Number.isFinite(startedAt) ? startedAt : Date.parse(evidenceTimestamp)
-          ));
-      finishFields = { ...finishFields, duration_ms: evidenceDurationMs };
-      preparedV4Evidence = await (
-        deps.prepareArtifactBoundEvidence || prepareArtifactBoundEvidence
-      )(job, ctx.v4Artifact, {
+        : result.status
+    );
+    const startedAt = currentRun.started_at
+      ? Date.parse(currentRun.started_at.includes('T')
+        ? currentRun.started_at
+        : `${currentRun.started_at.replace(' ', 'T')}Z`)
+      : Date.now();
+    const evidenceDurationMs = Number.isInteger(finishFields.duration_ms)
+      && finishFields.duration_ms >= 0
+      ? finishFields.duration_ms
+      : Math.max(0, Date.parse(evidenceTimestamp) - (
+          Number.isFinite(startedAt) ? startedAt : Date.parse(evidenceTimestamp)
+        ));
+    finishFields = { ...finishFields, duration_ms: evidenceDurationMs };
+    return (deps.prepareArtifactBoundEvidence || prepareArtifactBoundEvidence)(
+      job,
+      ctx.v4Artifact,
+      {
         ...currentRun,
         ...finishFields,
         status: evidenceStatus,
         finished_at: evidenceTimestamp,
         terminal_transition_at: evidenceTimestamp,
-      }, {
+      },
+      {
         db: getDb(),
         env: process.env,
         cwd: process.cwd(),
@@ -987,65 +1020,90 @@ export async function finalizeDispatch(job, ctx, result, deps) {
         evidenceOutput: result.evidenceOutput || null,
         agentcli: deps.agentcliEvidenceRuntime,
         allowedSignersPath: deps.allowedSignersPath,
-      });
-    } catch (error) {
-      const evidenceRequired = ctx.v4Artifact.payload.evidence
-        ?.signed_or_provider_verified_required === true;
-      const evidenceFailure = String(error.message || 'evidence provider failed').slice(0, 500);
-      appendRuntimeEvent('evidence.failed', {
-        jobId: job.id,
-        runId: ctx.run.id,
-        handoffArtifactDigest: job.handoff_artifact_digest,
-        sourceRunId: ctx.run.source_run_id,
-        sourceRunHandoffArtifactDigest: ctx.run.source_run_handoff_artifact_digest,
-        payload: {
-          required: evidenceRequired,
-          code: error.code || 'EVIDENCE_VERIFICATION_FAILED',
-          reason: evidenceFailure,
+      },
+    );
+  };
+  const handleV4EvidenceFailure = error => {
+    preparedV4Evidence = null;
+    const evidenceRequired = ctx.v4Artifact.payload.evidence
+      ?.signed_or_provider_verified_required === true;
+    const evidenceFailure = String(error.message || 'evidence provider failed').slice(0, 500);
+    appendRuntimeEvent('evidence.failed', {
+      jobId: job.id,
+      runId: ctx.run.id,
+      handoffArtifactDigest: job.handoff_artifact_digest,
+      sourceRunId: ctx.run.source_run_id,
+      sourceRunHandoffArtifactDigest: ctx.run.source_run_handoff_artifact_digest,
+      payload: {
+        required: evidenceRequired,
+        code: error.code || 'EVIDENCE_VERIFICATION_FAILED',
+        reason: evidenceFailure,
+      },
+    }, { db: getDb() });
+    if (evidenceRequired) {
+      const reason = `Required handoff v4 evidence failed: ${evidenceFailure}`;
+      result = {
+        ...result,
+        status: 'recovery_blocked',
+        summary: reason,
+        content: reason,
+        errorMessage: reason,
+        skipDelivery: true,
+        skipJobUpdate: true,
+        skipChildren: true,
+        skipDequeue: true,
+        disableJob: true,
+        idemAction: 'release',
+      };
+      finishFields = {
+        ...finishFields,
+        summary: reason,
+        error_message: reason,
+        context_summary: {
+          ...mergedRunContext,
+          evidence: {
+            status: 'failed',
+            error: evidenceFailure,
+            operator_action_required: true,
+          },
         },
-      }, { db: getDb() });
-      if (evidenceRequired) {
-        const reason = `Required handoff v4 evidence failed: ${evidenceFailure}`;
-        result = {
-          ...result,
-          status: 'recovery_blocked',
-          summary: reason,
-          content: reason,
-          errorMessage: reason,
-          skipDelivery: true,
-          skipJobUpdate: true,
-          skipChildren: true,
-          skipDequeue: true,
-          disableJob: true,
-          idemAction: 'release',
-        };
-        finishFields = {
-          ...finishFields,
-          summary: reason,
-          error_message: reason,
-          context_summary: {
-            ...mergedRunContext,
-            evidence: {
-              status: 'failed',
-              error: evidenceFailure,
-              operator_action_required: true,
-            },
+      };
+    } else {
+      finishFields = {
+        ...finishFields,
+        context_summary: {
+          ...mergedRunContext,
+          evidence: {
+            status: 'warning',
+            error: evidenceFailure,
+            operator_action_required: false,
           },
-        };
-      } else {
-        finishFields = {
-          ...finishFields,
-          context_summary: {
-            ...mergedRunContext,
-            evidence: {
-              status: 'warning',
-              error: evidenceFailure,
-              operator_action_required: false,
-            },
-          },
-        };
-      }
+        },
+      };
     }
+  };
+  if (preparesV4Evidence) {
+    try {
+      preparedV4Evidence = await prepareV4EvidenceForStatus(null);
+      const refreshedRun = getDb().prepare(
+        'SELECT status, cancel_requested_at FROM runs WHERE id = ?',
+      ).get(ctx.run.id);
+      const refreshedStatus = refreshedRun?.cancel_requested_at != null
+        || refreshedRun?.status === 'cancelled'
+        ? 'cancelled'
+        : result.status;
+      if (preparedV4Evidence?.status !== refreshedStatus) {
+        preparedV4Evidence = await prepareV4EvidenceForStatus(refreshedStatus);
+      }
+    } catch (error) {
+      handleV4EvidenceFailure(error);
+    }
+  }
+  if (preparedV4Evidence && typeof commitCompletionBookkeeping !== 'function') {
+    throw Object.assign(
+      new Error('Handoff v4 evidence finalization requires atomic completion bookkeeping'),
+      { code: 'EVIDENCE_ATOMIC_COMMIT_REQUIRED' },
+    );
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
@@ -1096,6 +1154,15 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       : completion.changed && !completion.cancelled;
 
     if (completion.changed && !completion.fenced && preparedV4Evidence) {
+      if (preparedV4Evidence.status !== completion.status) {
+        throw Object.assign(
+          new Error('Prepared handoff v4 evidence status became stale before terminal commit'),
+          {
+            code: 'EVIDENCE_STATUS_REPREPARE_REQUIRED',
+            effectiveStatus: completion.status,
+          },
+        );
+      }
       (deps.persistPreparedArtifactBoundEvidence || persistPreparedArtifactBoundEvidence)(
         preparedV4Evidence,
         { db: getDb() },
@@ -1243,9 +1310,25 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     return { completion, suppressed: false, retry: null, drainDispatch: null, dequeued, delivery };
   };
 
-  const bookkeeping = commitCompletionBookkeeping
+  const commitBookkeeping = () => commitCompletionBookkeeping
     ? commitCompletionBookkeeping(getDb(), performBookkeeping)
     : performBookkeeping();
+  let bookkeeping;
+  try {
+    bookkeeping = commitBookkeeping();
+  } catch (error) {
+    if (
+      error?.code !== 'EVIDENCE_STATUS_REPREPARE_REQUIRED'
+      || !preparesV4Evidence
+      || !commitCompletionBookkeeping
+    ) throw error;
+    try {
+      preparedV4Evidence = await prepareV4EvidenceForStatus(error.effectiveStatus);
+    } catch (preparationError) {
+      handleV4EvidenceFailure(preparationError);
+    }
+    bookkeeping = commitBookkeeping();
+  }
 
   if (bookkeeping.suppressed) {
     log(bookkeeping.completion.cancelled ? 'info' : 'warn',
@@ -2194,19 +2277,28 @@ export async function prepareDispatch(job, opts, deps) {
         };
       }
     } catch (error) {
-      if (v4CredentialMaterialization) {
-        try {
-          await (deps.cleanupCredentialMaterialization || cleanupCredentialMaterialization)(
-            v4CredentialMaterialization,
-            {
-              jobId: job.id,
-              runId: run.id,
-              artifactDigest: job.handoff_artifact_digest,
-            },
-            { db: getDb() },
-          );
-        } catch (cleanupError) {
-          error.message += `; credential cleanup failed: ${cleanupError.message}`;
+      v4CredentialMaterialization ||= error?.credentialMaterialization || null;
+      if (credentialCleanupTracked || v4CredentialMaterialization) {
+        const cleanupContext = {
+          run,
+          v4CredentialMaterialization,
+          credentialCleanupTracked,
+          dispatcherFence: deps.dispatcherFence || null,
+          materializedEnv,
+        };
+        const cleaned = await cleanupDispatchMaterialization(job, cleanupContext, deps);
+        if (cleanupContext.materializationCleanupResult?.checkpointRecorded === false) {
+          log('error', `Credential cleanup checkpoint failed for ${job.name}; preserving the run for recovery`, {
+            jobId: job.id,
+            runId: run.id,
+          });
+          return null;
+        }
+        if (!cleaned) {
+          const cleanupMessage = cleanupContext.materializationCleanupResult?.error
+            || error?.cleanupError?.message
+            || 'credential cleanup did not complete';
+          error.message += `; credential cleanup failed: ${cleanupMessage}`;
         }
       }
       return abortPreparedRun(
@@ -2264,13 +2356,21 @@ export async function prepareDispatch(job, opts, deps) {
           }
         } else if (hasPresentation) {
           // Materialization returned false but credentials were declared required
-          await cleanupDispatchMaterialization(job, {
+          const cleanupContext = {
             run,
             materializedEnv,
             materializationCleanup,
             credentialCleanupTracked,
             dispatcherFence: deps.dispatcherFence || null,
-          }, deps);
+          };
+          await cleanupDispatchMaterialization(job, cleanupContext, deps);
+          if (cleanupContext.materializationCleanupResult?.checkpointRecorded === false) {
+            log('error', `Credential cleanup checkpoint failed for ${job.name}; preserving the run for recovery`, {
+              jobId: job.id,
+              runId: run.id,
+            });
+            return null;
+          }
           return abortPreparedRun(
             job,
             run,
@@ -2282,22 +2382,31 @@ export async function prepareDispatch(job, opts, deps) {
           );
         }
       } catch (err) {
+        let checkpointRecorded = !credentialCleanupTracked;
         if (credentialCleanupTracked) {
           try {
-            deps.recordRunCredentialCleanupState(run.id, {
+            checkpointRecorded = Boolean(deps.recordRunCredentialCleanupState(run.id, {
               status: 'failed',
               attempts: 1,
               error: err.message,
             }, {
               ...deps.dispatcherFence,
               allowAfterLeaseLoss: true,
-            });
+            }));
           } catch (recordError) {
+            checkpointRecorded = false;
             log('error', `Credential materialization failure state could not be persisted for ${job.name}: ${recordError.message}`, {
               jobId: job.id,
               runId: run.id,
             });
           }
+        }
+        if (!checkpointRecorded) {
+          log('error', `Credential cleanup checkpoint failed for ${job.name}; preserving the run for recovery`, {
+            jobId: job.id,
+            runId: run.id,
+          });
+          return null;
         }
         return abortPreparedRun(
           job,
@@ -2337,6 +2446,13 @@ export async function prepareDispatch(job, opts, deps) {
         executionEnv: null,
       };
       const cleaned = await cleanupDispatchMaterialization(job, cleanupContext, deps);
+      if (cleanupContext.materializationCleanupResult?.checkpointRecorded === false) {
+        log('error', `Credential cleanup checkpoint failed for ${job.name}; preserving the run for recovery`, {
+          jobId: job.id,
+          runId: run.id,
+        });
+        return null;
+      }
       return abortPreparedRun(
         job,
         run,

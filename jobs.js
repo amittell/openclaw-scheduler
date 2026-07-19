@@ -7,7 +7,7 @@ import { enqueueDispatch } from './dispatch-queue.js';
 import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js';
 import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
-import { persistTerminalEvidence } from './runs.js';
+import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
 import {
   assertValidHandoffArtifact,
@@ -2079,7 +2079,7 @@ export function cancelJob(jobId, opts = {}) {
       cancelDeliveriesForJob(cancelledJobId, reason, { db });
 
       const activeRuns = db.prepare(`
-        SELECT id, status
+        SELECT id, status, evidence_required
         FROM runs
         WHERE job_id = ?
           AND status IN ('pending', 'running', 'awaiting_approval', 'approved')
@@ -2088,6 +2088,18 @@ export function cancelJob(jobId, opts = {}) {
         if (run.status === 'running') {
           requestRunCancellation(run.id, { requestedBy, reason });
         } else {
+          if (Number(cancelledJob?.handoff_version) === 4 && run.evidence_required === 1) {
+            const quarantined = quarantineRunRecovery(
+              run.id,
+              `Handoff v4 cancelled terminal evidence requires asynchronous artifact-bound verification; ${reason}; run quarantined for operator recovery`,
+              {
+                db,
+                allowPreExecution: true,
+                intendedStatus: 'cancelled',
+              },
+            );
+            if (quarantined.changed) continue;
+          }
           const transition = cancelRunBeforeExecution(run.id, { requestedBy, reason });
           if (transition.changed) {
             persistTerminalEvidence(

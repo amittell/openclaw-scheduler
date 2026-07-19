@@ -12169,6 +12169,7 @@ console.log('\n-- prepareDispatch v0.2 gating --');
   finishRun(legacyNonShellHandoffCtx.run.id, 'cancelled', { summary: 'isolated handoff test cleanup' });
   getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(legacyNonShellHandoffJob.id);
   deleteJob(legacyNonShellHandoffJob.id);
+
 }
 
 // ===========================================================
@@ -12328,6 +12329,57 @@ console.log('\n-- Materialization failure abort --');
   const matFalseRun = getRunsForJob(matFalseJob.id, 1)[0];
   assert(matFalseRun.status === 'error', 'prepareDispatch: materialized=false run status is error');
   assert(matFalseRun.error_message.includes('materialized=false'), 'prepareDispatch: materialized=false error message preserved');
+
+  for (const [label, provider] of [
+    ['throw', matFailProvider],
+    ['false', matFalseProvider],
+  ]) {
+    const checkpointProvider = {
+      ...provider,
+      name: `${provider.name}-checkpoint`,
+    };
+    const checkpointJob = createJob({
+      name: `prepare-dispatch-mat-${label}-checkpoint`,
+      schedule_cron: '0 10 * * *',
+      session_target: 'shell',
+      payload_kind: 'shellCommand',
+      payload_message: 'echo must remain blocked',
+      delivery_mode: 'none',
+      delivery_opt_out_reason: 'test',
+      run_timeout_ms: 300_000,
+      origin: 'system',
+      identity: JSON.stringify({
+        provider: checkpointProvider.name,
+        scope: 'full',
+        presentation: { mode: 'inject-env' },
+      }),
+    });
+    let cleanupCheckpointCalls = 0;
+    let preparedRunId = null;
+    const preserved = await prepareDispatch(
+      getJob(checkpointJob.id),
+      {},
+      buildPrepareDispatchDeps({
+        getIdentityProvider: name => name === checkpointProvider.name ? checkpointProvider : null,
+        generateIdempotencyKey: () => `idem-mat-${label}-checkpoint`,
+        dispatcherFence: { ownerId: 'cleanup-checkpoint-test', fencingToken: 1 },
+        claimRunForDispatch: runId => getRun(runId),
+        persistV02Outcomes: (runId, outcomes) => persistV02Outcomes(runId, outcomes),
+        onRunPrepared: run => { preparedRunId = run.id; },
+        recordRunCredentialCleanupState: runId => {
+          cleanupCheckpointCalls += 1;
+          return cleanupCheckpointCalls === 1 ? { id: runId } : null;
+        },
+      }),
+    );
+    assert(preserved === null, `prepareDispatch: ${label} checkpoint failure does not execute`);
+    const preservedRun = getRun(preparedRunId);
+    assert(cleanupCheckpointCalls === 2, `prepareDispatch: ${label} records pending and terminal cleanup checkpoints (calls=${cleanupCheckpointCalls})`);
+    assert(preservedRun.status === 'running', `prepareDispatch: ${label} preserves active run when cleanup checkpoint is lost (status=${preservedRun.status})`);
+    finishRun(preservedRun.id, 'cancelled', { summary: 'checkpoint preservation test cleanup' });
+    getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(checkpointJob.id);
+    deleteJob(checkpointJob.id);
+  }
 
   getDb().prepare('DELETE FROM runs WHERE job_id IN (?, ?)').run(matFailJob.id, matFalseJob.id);
   deleteJob(matFailJob.id);

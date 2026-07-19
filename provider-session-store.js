@@ -82,6 +82,59 @@ function sessionMatchesPersistedRow(session, row) {
     === canonicalStringify(parseStoredSessionSummary(row));
 }
 
+function persistedTimestampMs(row, field) {
+  const value = row?.[field];
+  if (value == null) return null;
+  const normalized = typeof value === 'string' && !value.endsWith('Z')
+    ? `${value.replace(' ', 'T')}Z`
+    : value;
+  const parsed = Date.parse(normalized);
+  if (!Number.isFinite(parsed)) {
+    throw providerError(
+      'PROVIDER_SESSION_CORRUPT',
+      `Provider session ${row.id} has an invalid ${field}`,
+    );
+  }
+  return parsed;
+}
+
+function persistedTemporalState(row, now) {
+  const expiresAt = persistedTimestampMs(row, 'expires_at');
+  const refreshAfter = persistedTimestampMs(row, 'refresh_after');
+  return {
+    expired: expiresAt != null && expiresAt <= now,
+    refreshDue: refreshAfter != null && refreshAfter <= now,
+  };
+}
+
+function assertResumedSessionValid(session, row, now, { allowExpiredForRefresh = false } = {}) {
+  if (!session || !sessionMatchesPersistedRow(session, row)) {
+    throw providerError(
+      'PROVIDER_SESSION_RESUME_MISMATCH',
+      `Provider session ${row.id} resume result does not match its persisted identity`,
+    );
+  }
+  const temporal = persistedTemporalState(row, now);
+  if (temporal.expired && !allowExpiredForRefresh) {
+    throw providerError(
+      'PROVIDER_SESSION_EXPIRED',
+      `Provider session ${row.id} resume result is expired`,
+    );
+  }
+  return temporal;
+}
+
+function assertCachedSessionValid(session, row, now, opts = {}) {
+  if (!session) return null;
+  try {
+    assertResumedSessionValid(session, row, now, opts);
+    return session;
+  } catch (error) {
+    memorySessions.delete(row.id);
+    throw error;
+  }
+}
+
 function pendingResolutionsFor(db) {
   let pending = pendingColdSessionResolutions.get(db);
   if (!pending) {
@@ -265,12 +318,14 @@ async function resolveColdProviderSession(
       const resumed = await callProvider('resumeSession', provider, row, { ...ctx, request });
       session = resumed?.session ?? resumed ?? null;
     }
-    if (!session || !sessionMatchesPersistedRow(session, row)) {
+    try {
+      assertResumedSessionValid(session, row, completionNowMs(explicitNow, startNow));
+    } catch (resumeError) {
       memorySessions.delete(row.id);
       throw providerError(
         'PROVIDER_SESSION_CONFLICT',
         `Provider ${provider.name} cannot resume the persisted concurrent session winner`,
-        { transient: true, cause: error },
+        { transient: true, cause: resumeError },
       );
     }
     memorySessions.set(row.id, session);
@@ -323,14 +378,23 @@ export async function resolveProviderSession(provider, request = {}, ctx = {}, o
   }
 
   let rawSession = row ? memorySessions.get(row.id) : null;
-  const mustRefresh = row && (row.status === 'expired' || isPast(row.expires_at, now) || isPast(row.refresh_after, now));
+  const temporal = row ? persistedTemporalState(row, now) : null;
+  const mustRefresh = row && (row.status === 'expired' || temporal.expired || temporal.refreshDue);
+  if (row && rawSession) {
+    assertCachedSessionValid(rawSession, row, now, {
+      allowExpiredForRefresh: mustRefresh,
+    });
+  }
   if (row
     && !rawSession
     && typeof provider.resumeSession === 'function'
     && (!mustRefresh || typeof provider.refreshSession === 'function')) {
     const resumed = await callProvider('resumeSession', provider, row, { ...ctx, request });
     rawSession = resumed?.session ?? resumed ?? null;
-    if (rawSession) memorySessions.set(row.id, rawSession);
+    assertResumedSessionValid(rawSession, row, now, {
+      allowExpiredForRefresh: mustRefresh && typeof provider.refreshSession === 'function',
+    });
+    if (!mustRefresh) memorySessions.set(row.id, rawSession);
   }
 
   if (row && mustRefresh) {
@@ -521,16 +585,23 @@ export async function resumeProviderSession(provider, id, ctx = {}, opts = {}) {
       row.last_error || `Provider session ${id} is ${row.status}`,
     );
   }
+  const temporal = persistedTemporalState(row, now);
+  const mustRefresh = row.status === 'expired' || temporal.expired || temporal.refreshDue;
   let session = memorySessions.get(id);
+  if (session) {
+    assertCachedSessionValid(session, row, now, {
+      allowExpiredForRefresh: mustRefresh,
+    });
+  }
   if (!session && typeof provider.resumeSession === 'function') {
     const resumed = await callProvider('resumeSession', provider, row, ctx);
     session = resumed?.session ?? resumed;
-    if (session) memorySessions.set(id, session);
+    assertResumedSessionValid(session, row, now, {
+      allowExpiredForRefresh: mustRefresh && typeof provider.refreshSession === 'function',
+    });
+    if (!mustRefresh) memorySessions.set(id, session);
   }
 
-  const mustRefresh = row.status === 'expired'
-    || isPast(row.expires_at, now)
-    || isPast(row.refresh_after, now);
   if (mustRefresh) {
     if (typeof provider.refreshSession !== 'function') {
       const reason = 'Session expired or reached refresh_after and provider does not implement refreshSession()';

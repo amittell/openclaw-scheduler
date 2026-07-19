@@ -414,24 +414,41 @@ export async function materializeCredentials(
     }, { db });
     return materialization;
   } catch (error) {
+    let cleanupError = null;
     try {
       await cleanupCredentialMaterialization(materialization, ctx, { db });
-    } catch (cleanupError) {
-      if (error && typeof error === 'object') {
-        Object.defineProperty(error, 'cleanupError', {
+    } catch (caughtCleanupError) {
+      cleanupError = caughtCleanupError;
+    }
+    const failure = error && typeof error === 'object'
+      ? error
+      : new AggregateError(
+          cleanupError ? [error, cleanupError] : [error],
+          cleanupError
+            ? 'Credential materialization failed and cleanup did not complete'
+            : 'Credential materialization failed',
+          { cause: cleanupError || undefined },
+        );
+    Object.defineProperties(failure, {
+      credentialMaterialization: {
+        value: materialization,
+        configurable: true,
+        enumerable: false,
+      },
+      credentialCleanupCompleted: {
+        value: cleanupError == null,
+        configurable: true,
+        enumerable: false,
+      },
+      ...(cleanupError ? {
+        cleanupError: {
           value: cleanupError,
           configurable: true,
           enumerable: false,
-        });
-      } else {
-        throw new AggregateError(
-          [error, cleanupError],
-          'Credential materialization failed and cleanup did not complete',
-          { cause: cleanupError },
-        );
-      }
-    }
-    throw error;
+        },
+      } : {}),
+    });
+    throw failure;
   }
 }
 

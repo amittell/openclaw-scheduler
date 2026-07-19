@@ -998,6 +998,8 @@ export const runs: {
         leaseName?: string;
       } | null;
       allowStaleRunOwner?: boolean;
+      allowPreExecution?: boolean;
+      intendedStatus?: string;
     },
   ): { changed: boolean; run: RunRecord | null };
   transitionRunTerminalWithEvidence(

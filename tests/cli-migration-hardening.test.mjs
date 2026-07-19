@@ -299,6 +299,7 @@ test('doctor reports schema v29 and lease, queue, outbox, and approval diagnosti
   assert.ok('dispatch_queue' in payload.diagnostics);
   assert.ok('delivery_outbox' in payload.diagnostics);
   assert.ok('approvals' in payload.diagnostics);
+  assert.equal(payload.diagnostics.evidence_records.verification_mode, 'cryptographic');
   assert.equal(payload.diagnostics.evidence_records.checked, 0);
   assert.equal(payload.diagnostics.evidence_records.verification_complete, true);
   assert.deepEqual(payload.database.integrity_check, ['ok']);
@@ -363,7 +364,9 @@ test('current databases remain readable while another process holds the write lo
     writer.exec('BEGIN IMMEDIATE');
     const status = runNode(cliPath, ['status', '--json'], { env });
     assert.equal(status.status, 0, status.stderr);
-    assert.equal(parseStdout(status).db_init_ok, true);
+    const statusPayload = parseStdout(status);
+    assert.equal(statusPayload.db_init_ok, true);
+    assert.equal(statusPayload.diagnostics.evidence_records.verification_mode, 'checksum');
   } finally {
     if (writer.inTransaction) writer.exec('ROLLBACK');
     writer.close();

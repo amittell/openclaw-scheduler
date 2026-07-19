@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { getDb } from './db.js';
 import {
+  assertValidHandoffArtifact,
   canonicalStringify,
   getHandoffArtifact,
   sha256,
@@ -310,7 +311,19 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
       verification?.reason || 'Evidence provider verification failed',
     );
   }
-  assertVerifiedEvidencePayload(agentcli, attestation.envelope, verification, record);
+  const verifiedPayload = assertVerifiedEvidencePayload(
+    agentcli,
+    attestation.envelope,
+    verification,
+    record,
+  );
+  const verifiedPayloadText = agentcli.serializePayload(verifiedPayload, 'canonical-json');
+  if (verifiedPayloadText !== serialized) {
+    throw evidenceError(
+      'EVIDENCE_PAYLOAD_MISMATCH',
+      'Verified evidence payload does not match the prepared execution payload',
+    );
+  }
 
   const envelopeText = canonicalStringify(attestation.envelope);
   const payloadDigest = attestation.envelope.payload_digest;
@@ -324,6 +337,12 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     throw evidenceError(
       'EVIDENCE_DIGEST_MISMATCH',
       'Evidence envelope payload digest does not match its verified payload',
+    );
+  }
+  if (payloadDigest == null && attestation.envelope.signed_payload !== serialized) {
+    throw evidenceError(
+      'EVIDENCE_PAYLOAD_MISMATCH',
+      'Digestless evidence envelope signed payload does not match the prepared execution payload',
     );
   }
   const envelopeHash = payloadDigest ?? sha256(envelopeText);
@@ -478,6 +497,10 @@ export function validatePersistedArtifactBoundEvidenceRecord(row, opts = {}) {
       `Historical handoff artifact ${row.handoff_artifact_digest} is not retrievable`,
     );
   }
+  const artifactValidation = assertValidHandoffArtifact(artifactRecord.payload, {
+    expectedDigest: row.handoff_artifact_digest,
+  });
+  artifactRecord.payload = artifactValidation.payload;
 
   let payload;
   let envelope;
@@ -512,6 +535,15 @@ export function validatePersistedArtifactBoundEvidenceRecord(row, opts = {}) {
   if (row.hash !== expectedHash
     || (hasPayloadDigest && envelope.payload_digest !== sha256(row.payload))) {
     throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
+  }
+  if (!hasPayloadDigest && (
+    typeof envelope.signed_payload !== 'string'
+    || envelope.signed_payload !== row.payload
+  )) {
+    throw evidenceError(
+      'EVIDENCE_SIGNED_PAYLOAD_MISMATCH',
+      'Persisted digestless evidence payload does not match its signed envelope payload',
+    );
   }
   if (
     payload.execution_id !== row.run_id

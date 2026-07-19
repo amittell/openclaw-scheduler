@@ -652,8 +652,12 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
   const leaseName = dispatcherFence?.leaseName || 'scheduler-dispatcher';
   const hasFence = dispatcherFence != null;
   const allowStaleRunOwner = opts.allowStaleRunOwner === true;
+  const allowPreExecution = opts.allowPreExecution === true;
   if (allowStaleRunOwner && !hasFence) {
     throw new Error('allowStaleRunOwner requires a live dispatcher fence');
+  }
+  if (allowPreExecution && hasFence) {
+    throw new Error('allowPreExecution quarantine does not accept a dispatcher fence');
   }
   if (hasFence && (
     typeof ownerId !== 'string'
@@ -665,7 +669,20 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
   }
 
   const quarantine = () => {
-    const updated = hasFence
+    const updated = allowPreExecution
+      ? db.prepare(`
+          UPDATE runs
+          SET status = 'recovery_blocked',
+              finished_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              terminal_transition_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+              duration_ms = MAX(0, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)),
+              error_message = ?,
+              summary = ?
+          WHERE id = ?
+            AND status IN ('pending', 'awaiting_approval', 'approved')
+          RETURNING *
+        `).get(reason, reason, runId)
+      : hasFence
       ? db.prepare(`
           UPDATE runs
           SET status = 'recovery_blocked',
@@ -719,6 +736,25 @@ export function quarantineRunRecovery(runId, reason, opts = {}) {
           last_status = 'recovery_blocked'
       WHERE id = ?
     `).run(updated.job_id);
+    if (allowPreExecution) {
+      const job = db.prepare('SELECT handoff_version, handoff_artifact_digest FROM jobs WHERE id = ?')
+        .get(updated.job_id);
+      if (Number(job?.handoff_version) === 4) {
+        appendRuntimeEvent('job.quarantine.required', {
+          jobId: updated.job_id,
+          runId: updated.id,
+          handoffArtifactDigest: job.handoff_artifact_digest,
+          sourceRunId: updated.source_run_id,
+          sourceRunHandoffArtifactDigest: updated.source_run_handoff_artifact_digest,
+          payload: {
+            reason,
+            intended_status: opts.intendedStatus || null,
+            job_disabled: true,
+            operator_action_required: true,
+          },
+        }, { db });
+      }
+    }
     if (updated.dispatch_queue_id) {
       db.prepare(`
         UPDATE job_dispatch_queue
