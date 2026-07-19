@@ -401,22 +401,38 @@ export async function materializeCredentials(
       }
       if (bindingMedium !== 'stdin') valueBuffer.fill(0);
     }
+
+    appendRuntimeEvent('credential.materialized', {
+      jobId: ctx.jobId,
+      runId: ctx.runId,
+      handoffArtifactDigest: ctx.artifactDigest,
+      payload: {
+        provider: provider.name,
+        presentation_ids: materialization.presentationIds,
+        media: bindings.map(binding => binding.medium ?? medium),
+      },
+    }, { db });
+    return materialization;
   } catch (error) {
-    await cleanupCredentialMaterialization(materialization, ctx, { db });
+    try {
+      await cleanupCredentialMaterialization(materialization, ctx, { db });
+    } catch (cleanupError) {
+      if (error && typeof error === 'object') {
+        Object.defineProperty(error, 'cleanupError', {
+          value: cleanupError,
+          configurable: true,
+          enumerable: false,
+        });
+      } else {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Credential materialization failed and cleanup did not complete',
+          { cause: cleanupError },
+        );
+      }
+    }
     throw error;
   }
-
-  appendRuntimeEvent('credential.materialized', {
-    jobId: ctx.jobId,
-    runId: ctx.runId,
-    handoffArtifactDigest: ctx.artifactDigest,
-    payload: {
-      provider: provider.name,
-      presentation_ids: materialization.presentationIds,
-      media: bindings.map(binding => binding.medium ?? medium),
-    },
-  }, { db });
-  return materialization;
 }
 
 export async function cleanupCredentialMaterialization(materialization, ctx = {}, opts = {}) {

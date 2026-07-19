@@ -11,6 +11,7 @@ import { getEvidenceProvider as getRuntimeEvidenceProvider } from './provider-re
 import { appendRuntimeEvent } from './runtime-events.js';
 
 let agentcliPromise = null;
+const SHA256 = /^sha256:[0-9a-f]{64}$/;
 
 function evidenceError(code, message, details = {}) {
   return Object.assign(new Error(message), { code, details });
@@ -153,12 +154,14 @@ function resultEvidence(run, opts = {}) {
     structured_output_sha256: run.structured_output_sha256,
   };
   return {
+    status: run.status,
     exit_code: run.shell_exit_code ?? (run.status === 'ok' ? 0 : 1),
     signal: run.shell_signal ?? null,
     timed_out: run.status === 'timeout' || Boolean(run.shell_timed_out),
     duration_ms: durationMs(run),
     stdout_bytes: run.shell_stdout_bytes ?? 0,
     stderr_bytes: run.shell_stderr_bytes ?? 0,
+    structured_hash: run.structured_output_sha256 ?? null,
     output_hash: sha256(canonicalStringify(output)),
   };
 }
@@ -460,6 +463,86 @@ export async function persistArtifactBoundEvidence(job, artifactRecord, runId, o
   return persistPreparedArtifactBoundEvidence(prepared, { db });
 }
 
+export function validatePersistedArtifactBoundEvidenceRecord(row, opts = {}) {
+  if (!row) throw evidenceError('EVIDENCE_RECORD_REQUIRED', 'Persisted evidence row is required');
+  const db = opts.db || getDb();
+  const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(row.run_id);
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(row.job_id);
+  if (!row.handoff_artifact_digest) {
+    throw evidenceError('HANDOFF_V4_REQUIRED', 'Cryptographic evidence verification requires handoff v4');
+  }
+  const artifactRecord = getHandoffArtifact(row.handoff_artifact_digest, { db });
+  if (!artifactRecord) {
+    throw evidenceError(
+      'HANDOFF_ARTIFACT_REQUIRED',
+      `Historical handoff artifact ${row.handoff_artifact_digest} is not retrievable`,
+    );
+  }
+
+  let payload;
+  let envelope;
+  try {
+    payload = JSON.parse(row.payload);
+    envelope = JSON.parse(row.evidence_envelope);
+  } catch (error) {
+    throw evidenceError(
+      'EVIDENCE_JSON_INVALID',
+      `Persisted evidence payload or envelope is invalid JSON: ${error.message}`,
+    );
+  }
+  if (canonicalStringify(payload) !== row.payload) {
+    throw evidenceError('EVIDENCE_PAYLOAD_NONCANONICAL', 'Persisted evidence payload is not canonical JSON');
+  }
+  if (row.evidence_verified !== 1) {
+    throw evidenceError('EVIDENCE_NOT_VERIFIED', 'Persisted evidence is not marked verified');
+  }
+  if (row.evidence_method !== envelope.method) {
+    throw evidenceError('EVIDENCE_METHOD_MISMATCH', 'Persisted evidence method does not match its envelope');
+  }
+  const hasPayloadDigest = envelope.payload_digest != null;
+  if (hasPayloadDigest && !SHA256.test(envelope.payload_digest)) {
+    throw evidenceError(
+      'EVIDENCE_DIGEST_INVALID',
+      'Persisted evidence payload digest must be a lowercase SHA-256 digest',
+    );
+  }
+  const expectedHash = hasPayloadDigest
+    ? envelope.payload_digest
+    : sha256(canonicalStringify(envelope));
+  if (row.hash !== expectedHash
+    || (hasPayloadDigest && envelope.payload_digest !== sha256(row.payload))) {
+    throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
+  }
+  if (
+    payload.execution_id !== row.run_id
+    || payload.bindings?.handoff_artifact_digest !== row.handoff_artifact_digest
+    || (payload.bindings?.source_run_id ?? null) !== (row.source_run_id ?? null)
+    || (payload.bindings?.source_run_handoff_artifact_digest ?? null)
+      !== (row.source_run_handoff_artifact_digest ?? null)
+    || payload.bindings?.manifest_digest !== artifactRecord.payload.manifest.digest
+    || payload.bindings?.effective_task_hash
+      !== artifactRecord.payload.compiled.effective_task_hash
+    || payload.source?.workflow_id !== artifactRecord.payload.manifest.workflow_id
+    || payload.source?.task_id !== artifactRecord.payload.manifest.task_id
+    || artifactRecord.payload.compiled.job_id !== row.job_id
+  ) {
+    throw evidenceError(
+      'EVIDENCE_BINDING_MISMATCH',
+      'Persisted evidence row, signed payload, and historical artifact do not match',
+    );
+  }
+  if (run && (
+    row.job_id !== run.job_id
+    || row.handoff_artifact_digest !== run.handoff_artifact_digest
+    || (row.source_run_id ?? null) !== (run.source_run_id ?? null)
+    || (row.source_run_handoff_artifact_digest ?? null)
+      !== (run.source_run_handoff_artifact_digest ?? null)
+  )) {
+    throw evidenceError('EVIDENCE_BINDING_MISMATCH', 'Persisted evidence row does not match the run');
+  }
+  return { row, run, job, artifactRecord, payload, envelope };
+}
+
 export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
   const db = opts.db || getDb();
   const row = db.prepare('SELECT * FROM evidence_records WHERE run_id = ?').get(runId);
@@ -467,64 +550,9 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
   let payload = null;
   let envelope = null;
   try {
-    const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(row.job_id);
-    if (!row.handoff_artifact_digest) {
-      throw evidenceError('HANDOFF_V4_REQUIRED', 'Cryptographic evidence verification requires handoff v4');
-    }
-    const artifactRecord = getHandoffArtifact(row.handoff_artifact_digest, { db });
-    if (!artifactRecord) {
-      throw evidenceError(
-        'HANDOFF_ARTIFACT_REQUIRED',
-        `Historical handoff artifact ${row.handoff_artifact_digest} is not retrievable`,
-      );
-    }
-    payload = JSON.parse(row.payload);
-    envelope = JSON.parse(row.evidence_envelope);
-    if (canonicalStringify(payload) !== row.payload) {
-      throw evidenceError('EVIDENCE_PAYLOAD_NONCANONICAL', 'Persisted evidence payload is not canonical JSON');
-    }
-    if (row.evidence_verified !== 1) {
-      throw evidenceError('EVIDENCE_NOT_VERIFIED', 'Persisted evidence is not marked verified');
-    }
-    if (row.evidence_method !== envelope.method) {
-      throw evidenceError('EVIDENCE_METHOD_MISMATCH', 'Persisted evidence method does not match its envelope');
-    }
-    const hasPayloadDigest = envelope.payload_digest != null;
-    const expectedHash = hasPayloadDigest
-      ? envelope.payload_digest
-      : sha256(canonicalStringify(envelope));
-    if (row.hash !== expectedHash
-      || (hasPayloadDigest && envelope.payload_digest !== sha256(row.payload))) {
-      throw evidenceError('EVIDENCE_DIGEST_MISMATCH', 'Persisted evidence digest does not match its envelope');
-    }
-    if (
-      payload.execution_id !== row.run_id
-      || payload.bindings?.handoff_artifact_digest !== row.handoff_artifact_digest
-      || (payload.bindings?.source_run_id ?? null) !== (row.source_run_id ?? null)
-      || (payload.bindings?.source_run_handoff_artifact_digest ?? null)
-        !== (row.source_run_handoff_artifact_digest ?? null)
-      || payload.bindings?.manifest_digest !== artifactRecord.payload.manifest.digest
-      || payload.bindings?.effective_task_hash
-        !== artifactRecord.payload.compiled.effective_task_hash
-      || payload.source?.workflow_id !== artifactRecord.payload.manifest.workflow_id
-      || payload.source?.task_id !== artifactRecord.payload.manifest.task_id
-      || artifactRecord.payload.compiled.job_id !== row.job_id
-    ) {
-      throw evidenceError(
-        'EVIDENCE_BINDING_MISMATCH',
-        'Persisted evidence row, signed payload, and historical artifact do not match',
-      );
-    }
-    if (run && (
-      row.job_id !== run.job_id
-      || row.handoff_artifact_digest !== run.handoff_artifact_digest
-      || (row.source_run_id ?? null) !== (run.source_run_id ?? null)
-      || (row.source_run_handoff_artifact_digest ?? null)
-        !== (run.source_run_handoff_artifact_digest ?? null)
-    )) {
-      throw evidenceError('EVIDENCE_BINDING_MISMATCH', 'Persisted evidence row does not match the run');
-    }
+    const validated = validatePersistedArtifactBoundEvidenceRecord(row, { db });
+    const { run, job, artifactRecord } = validated;
+    ({ payload, envelope } = validated);
     if (!run && (
       !row.evidence_provider
       || !row.evidence_principal

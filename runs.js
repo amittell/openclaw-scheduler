@@ -2,8 +2,9 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { TERMINAL_RUN_STATUSES, transitionRunTerminal } from './run-state.js';
-import { assertArtifactMatchesJob, canonicalStringify, sha256 } from './handoff-artifact.js';
+import { assertArtifactMatchesJob } from './handoff-artifact.js';
 import { appendRuntimeEvent } from './runtime-events.js';
+import { validatePersistedArtifactBoundEvidenceRecord } from './evidence-runtime.js';
 import {
   buildEvidenceExecutionSnapshot,
   generateEvidence,
@@ -847,26 +848,7 @@ export function pruneEvidenceRecords(opts = {}) {
       if (candidate.handoff_artifact_digest) {
         if (Date.parse(candidate.retention_until) > Date.now()) continue;
         try {
-          const payload = JSON.parse(candidate.payload);
-          const envelope = JSON.parse(candidate.evidence_envelope);
-          const canonicalPayload = canonicalStringify(payload);
-          const envelopeHash = envelope.payload_digest || sha256(canonicalStringify(envelope));
-          const run = db.prepare(
-            'SELECT handoff_artifact_digest, source_run_id, source_run_handoff_artifact_digest FROM runs WHERE id = ?',
-          ).get(candidate.run_id);
-          if (
-            candidate.evidence_verified !== 1
-            || canonicalPayload !== candidate.payload
-            || envelope.payload_digest !== sha256(candidate.payload)
-            || candidate.hash !== envelopeHash
-            || payload.execution_id !== candidate.run_id
-            || payload.bindings?.handoff_artifact_digest !== candidate.handoff_artifact_digest
-            || !run
-            || run.handoff_artifact_digest !== candidate.handoff_artifact_digest
-            || (run.source_run_id ?? null) !== (candidate.source_run_id ?? null)
-            || (run.source_run_handoff_artifact_digest ?? null)
-              !== (candidate.source_run_handoff_artifact_digest ?? null)
-          ) continue;
+          validatePersistedArtifactBoundEvidenceRecord(candidate, { db });
           evidence = candidate;
         } catch {
           continue;

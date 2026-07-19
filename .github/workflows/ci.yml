@@ -67,7 +67,7 @@ jobs:
       matrix:
         include:
           - contract: handoff-v4
-            ref: 3d710f31dff2c27986958a036d2d18f974c16f66
+            ref: 3c859782daacc599183d44ceca83a0dfd78cd6b9
           - contract: handoff-v3
             ref: f1fed6d7d451196bda316b82d6567b174012a4ba
           - contract: handoff-v2

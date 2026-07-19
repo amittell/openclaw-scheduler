@@ -954,6 +954,11 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     try {
       const evidenceTimestamp = new Date().toISOString();
       const currentRun = getDb().prepare('SELECT * FROM runs WHERE id = ?').get(ctx.run.id);
+      if (!currentRun) throw new Error(`Evidence run not found: ${ctx.run.id}`);
+      const evidenceStatus = currentRun.cancel_requested_at != null
+        || currentRun.status === 'cancelled'
+        ? 'cancelled'
+        : result.status;
       const startedAt = currentRun.started_at
         ? Date.parse(currentRun.started_at.includes('T')
           ? currentRun.started_at
@@ -971,7 +976,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       )(job, ctx.v4Artifact, {
         ...currentRun,
         ...finishFields,
-        status: result.status,
+        status: evidenceStatus,
         finished_at: evidenceTimestamp,
         terminal_transition_at: evidenceTimestamp,
       }, {

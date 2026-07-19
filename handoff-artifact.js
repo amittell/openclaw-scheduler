@@ -44,7 +44,7 @@ function normalizePrimitive(value) {
 export function sortKeysDeep(value) {
   if (value === null || typeof value !== 'object') return normalizePrimitive(value);
   if (Array.isArray(value)) return value.map(sortKeysDeep);
-  const sorted = {};
+  const sorted = Object.create(null);
   for (const key of Object.keys(value).sort()) sorted[key] = sortKeysDeep(value[key]);
   return sorted;
 }

@@ -302,7 +302,7 @@ function countByStatus(db, table) {
   ).all().map(row => [row.status, row.count]));
 }
 
-function getOperationalDiagnostics(db, opts = {}) {
+async function getOperationalDiagnostics(db, opts = {}) {
   const lease = tableExists(db, 'dispatcher_leases')
     ? db.prepare(`
         SELECT *, CASE WHEN julianday(expires_at) > julianday('now') THEN 1 ELSE 0 END AS active
@@ -361,22 +361,24 @@ function getOperationalDiagnostics(db, opts = {}) {
       `).get().count
     : null;
   const evidence = tableExists(db, 'evidence_records')
-    ? db.transaction(() => {
+    ? await (async () => {
       const total = db.prepare('SELECT COUNT(*) AS count FROM evidence_records').get().count;
       const deep = opts.deepEvidence === true;
       const evidenceLimit = Number.isInteger(opts.evidenceLimit) && opts.evidenceLimit > 0
         ? opts.evidenceLimit
         : 500;
       const rowStatement = deep
-        ? db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC')
-        : db.prepare('SELECT run_id FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
-      const rowIterator = deep ? rowStatement.iterate() : rowStatement.iterate(evidenceLimit);
+        ? db.prepare('SELECT run_id, handoff_artifact_digest FROM evidence_records ORDER BY created_at DESC, run_id DESC')
+        : db.prepare('SELECT run_id, handoff_artifact_digest FROM evidence_records ORDER BY created_at DESC, run_id DESC LIMIT ?');
+      const rows = deep ? rowStatement.all() : rowStatement.all(evidenceLimit);
       let checked = 0;
       let invalidCount = 0;
       const invalidSamples = [];
-      for (const row of rowIterator) {
+      for (const row of rows) {
         checked += 1;
-        const record = getEvidenceRecord(row.run_id, { db });
+        const record = row.handoff_artifact_digest
+          ? await verifyPersistedArtifactBoundEvidence(row.run_id, { db })
+          : getEvidenceRecord(row.run_id, { db });
         if (record?.integrity?.valid !== true) {
           invalidCount += 1;
           if (invalidSamples.length < 20) {
@@ -1384,7 +1386,7 @@ switch (command) {
     const db = getDb();
     const dbPath = getResolvedDbPath();
     const schemaVersion = getSchemaVersion(db);
-    const operational = getOperationalDiagnostics(db);
+    const operational = await getOperationalDiagnostics(db);
     const jobs = listJobs();
     const runningRuns = getRunningRuns();
     const stale = getStaleRuns();
@@ -1493,7 +1495,7 @@ switch (command) {
     const doctorArgs = [sub, ...args].filter(Boolean);
     const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep');
     if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
-    const diagnostics = getOperationalDiagnostics(db, { deepEvidence: doctorArgs.includes('--deep') });
+    const diagnostics = await getOperationalDiagnostics(db, { deepEvidence: doctorArgs.includes('--deep') });
     const integrityRows = db.pragma('quick_check');
     const integrityMessages = integrityRows.map(row => String(Object.values(row)[0]));
     const integrityOk = integrityMessages.length === 1 && integrityMessages[0].toLowerCase() === 'ok';
