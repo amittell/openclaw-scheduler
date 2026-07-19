@@ -449,7 +449,7 @@ test('expired v4 evidence is pruned only after its immutable retention deadline'
   assert.equal(tombstone.reason, 'retention_expired');
 });
 
-test('v4 retention pruning honors an explicit cutoff timestamp', () => {
+test('v4 retention pruning cannot use a caller cutoff to bypass the persisted deadline', () => {
   const job = createV4Job('Future retained v4 evidence');
   const run = createRun(job.id);
   finishRun(run.id, 'ok', { summary: 'retention completed' });
@@ -481,10 +481,10 @@ test('v4 retention pruning honors an explicit cutoff timestamp', () => {
     canonicalStringify(envelope),
   );
 
-  assert.equal(pruneEvidenceRecords({ now: Date.now() + 2 * 86_400_000 }).changes, 1);
+  assert.equal(pruneEvidenceRecords({ now: Date.now() + 2 * 86_400_000 }).changes, 0);
   assert.equal(
     getDb().prepare('SELECT COUNT(*) AS count FROM evidence_records WHERE run_id = ?').get(run.id).count,
-    0,
+    1,
   );
 });
 
