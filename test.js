@@ -5686,9 +5686,14 @@ if (sub === 'status') {
     }, null, 2));
 
     writeFileSync(mockHandoffPath, `
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, renameSync, writeFileSync } from 'fs';
 const statePath = ${JSON.stringify(mockStatePath)};
 const state = JSON.parse(readFileSync(statePath, 'utf8'));
+function writeState(nextState) {
+  const temporaryPath = statePath + '.' + process.pid + '.tmp';
+  writeFileSync(temporaryPath, JSON.stringify(nextState, null, 2));
+  renameSync(temporaryPath, statePath);
+}
 const [,,sub, ...rest] = process.argv;
 const flags = {};
 for (let i = 0; i < rest.length; i++) {
@@ -5705,16 +5710,16 @@ for (let i = 0; i < rest.length; i++) {
 }
 if (sub === 'status') {
   state.statusReads = (state.statusReads || 0) + 1;
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify(state.status) + '\\n');
 } else if (sub === 'result') {
   state.resultReads = (state.resultReads || 0) + 1;
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify(state.result) + '\\n');
 } else if (sub === 'watcher-handoff') {
   state.handoffs = (state.handoffs || 0) + 1;
   state.reasons = [...(state.reasons || []), flags.reason || null];
-  writeFileSync(statePath, JSON.stringify(state, null, 2));
+  writeState(state);
   process.stdout.write(JSON.stringify({ ok: true, scheduled: true, jobId: 'handoff-job-1', reason: flags.reason || null }) + '\\n');
 } else if (sub === 'sync') {
   process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
@@ -5759,8 +5764,13 @@ if (sub === 'status') {
     handoffChild.stderr.on('data', chunk => { handoffStderr += chunk.toString(); });
     const handoffReadyDeadline = Date.now() + 5000;
     while (Date.now() < handoffReadyDeadline) {
-      const currentState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
-      if ((currentState.statusReads || 0) > 0) break;
+      let currentState = null;
+      try {
+        currentState = JSON.parse(readFileSync(mockStatePath, 'utf8'));
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      if ((currentState?.statusReads || 0) > 0) break;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     handoffChild.kill('SIGTERM');
