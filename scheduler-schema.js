@@ -1,4 +1,4 @@
-export const SCHEDULER_SCHEMA_VERSION = 29;
+export const SCHEDULER_SCHEMA_VERSION = 30;
 export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.5.0';
 
 export const SCHEDULER_SCHEMAS = {
@@ -61,6 +61,10 @@ export const SCHEDULER_SCHEMAS = {
       auth_profile_fallback: { type: 'string', nullable: true, description: 'Optional fallback auth profile for a same-run retry after primary selection failure' },
       delivery_opt_out_reason: { type: 'string', nullable: true, maxLength: 256 },
       origin: { type: 'string', requiredFor: 'root jobs', description: 'Request source or system identity' },
+      source_channel: { type: 'string', nullable: true, description: 'Authoritative inbound channel/provider identifier' },
+      source_target: { type: 'string', nullable: true, description: 'Authoritative inbound chat/target identifier' },
+      source_message_id: { type: 'string', nullable: true, description: 'Authoritative inbound message identifier' },
+      source_thread_id: { type: 'string', nullable: true, description: 'Authoritative inbound thread/topic identifier' },
       delete_after_run: { type: 'boolean', default: false },
       run_now: { type: 'boolean', default: false, note: 'create-time convenience flag' },
 

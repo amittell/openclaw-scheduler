@@ -2,7 +2,7 @@
 
 Date: 2026-03-28
 
-Updated: 2026-07-18 for scheduler 0.5.0 and schema 29
+Updated: 2026-08-15 for scheduler 0.5.0 and schema 30
 
 ## Purpose
 

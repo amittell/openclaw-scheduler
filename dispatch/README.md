@@ -15,7 +15,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 
 | File | Purpose |
 |---|---|
-| `index.mjs` | CLI entry point — 10 subcommands |
+| `index.mjs` | CLI entry point — 12 subcommands |
 | `hooks.mjs` | Lifecycle event emitter (Loki + optional HTTP webhook) |
 | `watcher.mjs` | Delivery monitoring process |
 | `529-recovery.mjs` | Transient error recovery |
@@ -80,6 +80,7 @@ node dispatch/index.mjs enqueue \
   --model   anthropic/claude-sonnet-4-6 \
   --thinking high                   \
   --timeout  300                    \
+  --source-context '{"channel":"telegram","target":"YOUR_CHAT_ID","messageId":"INBOUND_MESSAGE_ID","threadId":null}' \
   --deliver-to YOUR_CHAT_ID     \
   --deliver-channel telegram        \
   --delivery-mode announce
@@ -88,8 +89,17 @@ node dispatch/index.mjs enqueue \
 cat prompt.md | node dispatch/index.mjs enqueue \
   --label "ticket-43" \
   --message-stdin \
+  --origin system \
   --delivery-mode none
 ```
+
+`--source-context` is evidence about where the inbound request actually arrived;
+`--deliver-to` and `--deliver-channel` are the durable completion destination.
+For chat-triggered calls the source envelope is mandatory and authoritative. If
+legacy `--origin` or explicit delivery metadata disagrees after normalization,
+enqueue exits 2 before Gateway calls, ledger writes, watcher jobs, or
+notifications. Manual/local calls may omit source context when inbound metadata
+is genuinely unavailable.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -104,10 +114,11 @@ cat prompt.md | node dispatch/index.mjs enqueue \
 | `--model` | configured dispatch default | Model override (e.g. `anthropic/claude-sonnet-4-6`). When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
 | `--thinking` | — | Reasoning level: `low`, `high`, `xhigh` |
 | `--timeout` | `300` | Seconds before run times out |
-| `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
+| `--source-context` | — | Authoritative inbound JSON envelope: `channel`, `target`, `messageId`, and optional `threadId`. Chat-triggered callers must pass it. Only identifier fields are accepted. |
+| `--deliver-to` | — | Durable completion delivery target (chat ID, channel ID, handle, etc.). With `--source-context`, it must match `target` or enqueue exits 2 before any side effect. Manual/local callers without inbound metadata retain the legacy fallback. |
 | `--deliver-channel` | `telegram` | Delivery channel for `--deliver-to` (telegram, slack, etc.) |
 | `--delivery-mode` | `announce` | `announce`, `announce-always`, `none` |
-| `--origin` | -- | Dispatch origin (e.g. `telegram:12345`). If omitted but `--deliver-to` is explicit, dispatch derives origin from that target. Active-session auto-detect is fallback for manual/local use only. |
+| `--origin` | -- | Legacy audit origin (e.g. `telegram:12345`). With `--source-context`, it must normalize to the same channel and target. Without source context, existing derivation and manual/local active-session fallback remain compatible. |
 | `--no-monitor` | false | Skip watcher monitoring |
 | `--monitor-interval` | -- | Watcher cron expression |
 | `--monitor-timeout` | -- | Watcher timeout in minutes |
@@ -122,6 +133,8 @@ node dispatch/index.mjs status --label "ticket-42"
 ```
 
 Returns ledger info + live session data from gateway (model, age, token usage).
+The JSON includes `sourceContext` when the dispatch had authoritative inbound
+metadata.
 
 ### `stuck` — find stuck running sessions
 
@@ -142,7 +155,18 @@ node dispatch/index.mjs result --label "ticket-42"
 ```
 
 Reads the session transcript via `chat.history` and returns the last assistant
-message.
+message. The JSON includes the stored `sourceContext` even after completion.
+
+### `route` — durable source route for follow-up
+
+```bash
+node dispatch/index.mjs route --label "ticket-42"
+```
+
+Returns `sourceContext`, legacy `origin`, and the durable completion `delivery`
+route. For a chat-triggered dispatch, use `sourceContext.channel`,
+`sourceContext.target`, and, when present, `sourceContext.threadId` for later
+follow-up instead of a remembered group map.
 
 ### `done` — mark a tracked session complete
 
@@ -260,6 +284,15 @@ Local JSON file mapping labels to session keys:
     "mode": "fresh",
     "model": null,
     "thinking": null,
+    "origin": "telegram:YOUR_CHAT_ID",
+    "sourceContext": {
+      "channel": "telegram",
+      "target": "YOUR_CHAT_ID",
+      "messageId": "INBOUND_MESSAGE_ID",
+      "threadId": null
+    },
+    "deliverTo": "YOUR_CHAT_ID",
+    "deliverChannel": "telegram",
     "spawnedAt": "2026-03-01T04:27:52.181Z",
     "status": "running",
     "summary": null,

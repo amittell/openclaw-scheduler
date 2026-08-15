@@ -9893,7 +9893,7 @@ console.log('\n-- dispatch/index.mjs --deliver-to error message --');
   assert(indexSrc.includes('123456789'), 'dispatch error: generic DM example present');
   assert(indexSrc.includes('--origin telegram:<chat_id>'), 'dispatch error: --origin auto-derive guidance present');
   assert(indexSrc.includes('audit trail required'), 'dispatch error: --no-monitor audit trail note present');
-  assert(indexSrc.includes('inbound metadata chat_id'), 'dispatch error: inbound metadata chat_id guidance present');
+  assert(indexSrc.includes('must pass --source-context'), 'dispatch error: authoritative source-context guidance present');
 
   // Verify the old confusing message is gone
   assert(!indexSrc.includes('--origin is required for agentTurn jobs'), 'dispatch error: old confusing --origin message removed');
@@ -11406,7 +11406,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 29, 'capabilities: schema_version is 29');
+  assert(capsOut.schema_version === 30, 'capabilities: schema_version is 30');
   assert(capsOut.handoff_version === '4', 'capabilities: handoff_version is 4');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');

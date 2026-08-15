@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- Origin tracking (v20)
   origin          TEXT DEFAULT NULL,                  -- where job was dispatched from: "telegram:<chat_id>", "system", etc.
 
+  -- Authoritative inbound source envelope (v30; identifier fields only)
+  source_channel    TEXT DEFAULT NULL,
+  source_target     TEXT DEFAULT NULL,
+  source_message_id TEXT DEFAULT NULL,
+  source_thread_id  TEXT DEFAULT NULL,
+
   -- v0.2 Identity (v22)
   identity_principal         TEXT DEFAULT NULL,
   identity_run_as            TEXT DEFAULT NULL,
@@ -871,8 +877,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Fresh installs seed all versions 1-29 (all columns already in schema above).
--- Existing installs are brought up to v29 by migrate-consolidate.js.
+-- Fresh installs seed all versions 1-30 (all columns already in schema above).
+-- Existing installs are brought up to v30 by migrate-consolidate.js.
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
@@ -902,3 +908,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (26);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (27);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (28);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (29);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (30);

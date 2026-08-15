@@ -134,6 +134,10 @@ export interface JobSpec {
 
   // Origin tracking
   origin?: string | null;
+  source_channel?: string | null;
+  source_target?: string | null;
+  source_message_id?: string | null;
+  source_thread_id?: string | null;
 
   // Convenience flag (create-time only)
   run_now?: boolean;

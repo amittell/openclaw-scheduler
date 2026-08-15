@@ -10,6 +10,7 @@
  *   status     Query session status by label
  *   stuck      Find sessions running past threshold with no activity
  *   result     Get last assistant message from a session
+ *   route      Get durable authoritative source route for follow-up
  *   send       Send a message INTO a running session (mid-session steering)
  *   steer      Alias for send -- explicitly for mid-session course correction
  *   heartbeat  Check session liveness
@@ -57,6 +58,14 @@ import {
 } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
+import {
+  assertRouteMatchesSource,
+  normalizeRoute,
+  parseOriginRoute,
+  parseSourceContext,
+  sourceContextToOrigin,
+  sourceContextToSchedulerFields,
+} from './source-context.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
 import {
   agentIdFromSessionKey as validatedAgentIdFromSessionKey,
@@ -350,6 +359,28 @@ function assertValidLabelSessionMetadata(name, entry) {
   if (sessionKey?.startsWith('agent:') && explicitAgent) {
     assertSessionKeyForAgent(sessionKey, explicitAgent, `sessionKey for label ${JSON.stringify(name)}`);
   }
+  if (entry.sourceContext != null) {
+    const sourceContext = parseSourceContext(
+      entry.sourceContext,
+      `sourceContext for label ${JSON.stringify(name)}`,
+    );
+    assertRouteMatchesSource(
+      sourceContext,
+      entry.deliverChannel,
+      entry.deliverTo,
+      `delivery route for label ${JSON.stringify(name)}`,
+    );
+    const originRoute = parseOriginRoute(entry.origin, `origin for label ${JSON.stringify(name)}`);
+    if (!originRoute) {
+      throw new Error(`origin for label ${JSON.stringify(name)} must match its authoritative sourceContext`);
+    }
+    assertRouteMatchesSource(
+      sourceContext,
+      originRoute.channel,
+      originRoute.target,
+      `origin for label ${JSON.stringify(name)}`,
+    );
+  }
   return entry;
 }
 
@@ -363,6 +394,13 @@ function quarantineLabelSessionMetadata(name, error) {
     delete current[name].agent;
     delete current[name].sessionKey;
     delete current[name].sessionId;
+    delete current[name].origin;
+    delete current[name].deliverTo;
+    delete current[name].deliverChannel;
+    delete current[name].sourceContext;
+    current[name].deliveryMode = 'none';
+    current[name].deliveryDisabled = true;
+    current[name].deliveryDisabledReason = 'unsafe persisted routing metadata';
     current[name].status = 'error';
     current[name].error = reason;
     current[name].summary = reason;
@@ -715,15 +753,78 @@ function inferChatType(key, session) {
   return "";
 }
 
-function parseOriginTarget(origin) {
-  const match = /^([^:]+):(.+)$/.exec(origin || '');
-  if (!match) return { channel: null, target: null };
-  return { channel: match[1], target: match[2] };
-}
-
 function originFromDeliveryTarget(deliverTo, deliverChannel = 'telegram') {
   if (!deliverTo) return null;
   return `${deliverChannel || 'telegram'}:${deliverTo}`;
+}
+
+function resolveDispatchRoute({
+  sourceContextInput = null,
+  inheritedSourceContext = null,
+  explicitOrigin = null,
+  explicitDeliverTo = null,
+  explicitDeliverChannel = null,
+}) {
+  const sourceContext = sourceContextInput != null
+    ? parseSourceContext(sourceContextInput)
+    : inheritedSourceContext != null
+      ? parseSourceContext(inheritedSourceContext, 'stored sourceContext')
+      : null;
+
+  if (sourceContext) {
+    if (explicitOrigin != null) {
+      const originRoute = parseOriginRoute(explicitOrigin);
+      if (!originRoute) {
+        throw new Error(
+          `--origin ${JSON.stringify(explicitOrigin)} conflicts with authoritative --source-context; ` +
+          `use ${sourceContextToOrigin(sourceContext)}`,
+        );
+      }
+      assertRouteMatchesSource(sourceContext, originRoute.channel, originRoute.target, '--origin');
+    }
+    if (explicitDeliverTo != null || explicitDeliverChannel != null) {
+      assertRouteMatchesSource(
+        sourceContext,
+        explicitDeliverChannel || sourceContext.channel,
+        explicitDeliverTo || sourceContext.target,
+        'explicit delivery route',
+      );
+    }
+    return {
+      sourceContext,
+      origin: sourceContextToOrigin(sourceContext),
+      deliverTo: sourceContext.target,
+      deliverChannel: sourceContext.channel,
+    };
+  }
+
+  let origin = explicitOrigin;
+  if (!origin && explicitDeliverTo) {
+    origin = originFromDeliveryTarget(explicitDeliverTo, explicitDeliverChannel || 'telegram');
+  }
+
+  let defaultDeliverTo = null;
+  let defaultDeliverChannel = explicitDeliverChannel || 'telegram';
+  if (origin) {
+    const originRoute = parseOriginRoute(origin);
+    if (originRoute) {
+      if (!explicitDeliverChannel) defaultDeliverChannel = originRoute.channel;
+      defaultDeliverTo = originRoute.target;
+    }
+  }
+
+  const deliverTo = explicitDeliverTo || defaultDeliverTo;
+  const deliverChannel = explicitDeliverChannel || defaultDeliverChannel || 'telegram';
+  if (deliverTo) {
+    const normalized = normalizeRoute(deliverChannel, deliverTo, 'delivery route');
+    return {
+      sourceContext: null,
+      origin,
+      deliverTo: normalized.target,
+      deliverChannel: normalized.channel,
+    };
+  }
+  return { sourceContext: null, origin, deliverTo: null, deliverChannel };
 }
 
 function getActiveOriginFromSessions() {
@@ -1208,6 +1309,7 @@ function scheduleDeliveryWatcherJob({
   label,
   deliverTo,
   deliverChannel = 'telegram',
+  sourceContext = null,
   timeoutSeconds = 300,
   idleThresholdSeconds = 300,
   origin = 'system',
@@ -1216,6 +1318,9 @@ function scheduleDeliveryWatcherJob({
 }) {
   if (!label) throw new Error('label is required');
   if (!deliverTo) throw new Error('deliverTo is required');
+  if (sourceContext) {
+    assertRouteMatchesSource(sourceContext, deliverChannel, deliverTo, 'watcher delivery route');
+  }
 
   const schedulerCli = resolveSchedulerCliPath();
   const watcherPath = resolveDispatchScriptPath('watcher.mjs');
@@ -1251,6 +1356,7 @@ function scheduleDeliveryWatcherJob({
     run_timeout_ms:           120_000,
     delete_after_run:         1,
     origin:                   origin || 'system',
+    ...sourceContextToSchedulerFields(sourceContext),
   };
 
   const raw = execFileSync(process.execPath, [schedulerCli, '--json', 'jobs', 'add', JSON.stringify(jobSpec)], {
@@ -1285,11 +1391,13 @@ function makeSessionKey(agentId) {
  *   --agent <string>         Agent ID (default: main)
  *   --thinking <string>      Reasoning level: low|high|xhigh (default: not set)
  *   --timeout <seconds>      Run timeout in seconds (default: 300)
+ *   --source-context <json> Authoritative inbound envelope with channel, target,
+ *                            messageId, and optional threadId. Required for chat-triggered calls.
  *   --origin <origin>        Explicit dispatch origin for audit/retries (e.g. "telegram:<chat_id>", "system")
  *                            If omitted but --deliver-to is explicit, dispatch derives origin from that target.
  *                            Active-session auto-detect is preserved only as a manual/local fallback when both are absent.
  *   --deliver-to <target>    Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher for durable final delivery.
- *                            Chat-triggered callers should pass inbound metadata chat_id here, especially for group chats.
+ *                            Must match authoritative source target when --source-context is present.
  *                            Defaults to origin chat ID when --origin is a "telegram:<id>" string.
  *   --deliver-channel <ch>   Delivery channel for --deliver-to (default: telegram)
  *   --delivery-mode <mode>   announce|announce-always|none (default: announce)
@@ -1348,43 +1456,41 @@ async function cmdEnqueue(flags) {
   const explicitOrigin = flags.origin || null;
   const explicitDeliverTo = flags['deliver-to'] || null;
   const explicitDeliverChannel = flags['deliver-channel'] || null;
-  let origin = explicitOrigin;
-
-  // Contract: chat-triggered callers should pass --deliver-to from inbound
-  // metadata chat_id. If they omit --origin, derive it from that explicit
-  // delivery target so dispatch never falls back to whichever session happened
-  // to be active most recently.
-  if (!origin && explicitDeliverTo) {
-    origin = originFromDeliveryTarget(explicitDeliverTo, explicitDeliverChannel || 'telegram');
+  const deliverMode    = flags['delivery-mode']     || 'announce';
+  const mode        = flags.mode             || 'fresh';
+  const inheritedSourceContext = mode === 'reuse' && flags['source-context'] == null
+    ? getLabel(label)?.sourceContext || null
+    : null;
+  let route;
+  try {
+    route = resolveDispatchRoute({
+      sourceContextInput: flags['source-context'] ?? null,
+      inheritedSourceContext,
+      explicitOrigin,
+      explicitDeliverTo,
+      explicitDeliverChannel,
+    });
+  } catch (error) {
+    die(`REJECTED: ${error.message}`, 2);
   }
+  const { sourceContext } = route;
+  let { origin, deliverTo, deliverChannel } = route;
 
   // Preserve active-session inference only as a manual/local fallback when the
-  // caller truly omitted both origin and delivery target.
-  if (!origin && !explicitDeliverTo) {
+  // caller truly omitted source context, origin, and delivery metadata.
+  if (!sourceContext && !origin && !explicitDeliverTo) {
     origin = getActiveOriginFromSessions();
     if (origin) {
       process.stderr.write(`[${BRAND}] auto-detected origin from active session: ${origin}\n`);
       process.stderr.write(`[${BRAND}] NOTE: active-session origin detection is a manual/local fallback. ` +
-        `Chat-triggered callers should pass --deliver-to from inbound metadata chat_id.\n`);
+        `Chat-triggered callers must pass --source-context from inbound metadata.\n`);
+      try {
+        ({ deliverTo, deliverChannel } = resolveDispatchRoute({ explicitOrigin: origin }));
+      } catch (error) {
+        die(`REJECTED: invalid auto-detected origin: ${error.message}`, 2);
+      }
     }
   }
-
-  // -- Auto-derive deliver-to from origin ---------------------------------
-  // If origin is "telegram:<id>", use <id> as the default deliver-to target.
-  let defaultDeliverTo   = null;
-  let defaultDeliverCh   = explicitDeliverChannel || 'telegram';
-  if (origin) {
-    const { channel, target } = parseOriginTarget(origin);
-    if (channel && target) {
-      if (!explicitDeliverChannel) defaultDeliverCh = channel;
-      defaultDeliverTo = target;
-    }
-  }
-
-  const deliverTo      = explicitDeliverTo         || defaultDeliverTo;
-  const deliverChannel = explicitDeliverChannel     || defaultDeliverCh || 'telegram';
-  const deliverMode    = flags['delivery-mode']     || 'announce';
-  const mode        = flags.mode             || 'fresh';
 
   // -- Auto-inject ORIGIN_CHAT_ID into prompt message ---------
   // Ensures the spawned agent always knows where to send message tool calls,
@@ -1416,7 +1522,7 @@ async function cmdEnqueue(flags) {
       "REJECTED: --deliver-to is required for dispatch jobs.\n" +
       "Pass --deliver-to <chat_id> (e.g. --deliver-to -100200000000 for a group, " +
       "or --deliver-to 123456789 for a DM).\n" +
-      "Chat-triggered callers should pass inbound metadata chat_id here, especially for group chats.\n" +
+      "Chat-triggered callers must pass --source-context with the inbound channel, target, and message ID.\n" +
       "Alternatively, pass --origin telegram:<chat_id> to auto-derive the delivery target.\n" +
       "Pass --no-monitor \"<reason>\" only if you explicitly want to skip delivery (audit trail required).",
       2
@@ -1585,6 +1691,7 @@ async function cmdEnqueue(flags) {
       model:     model || null,
       thinking,
       origin:         origin || null,
+      sourceContext:  sourceContext || null,
       deliverTo:      deliverTo || null,
       deliverChannel: deliverChannel || null,
       deliveryMode:   deliverMode || null,
@@ -1660,6 +1767,7 @@ async function cmdEnqueue(flags) {
           label,
           deliverTo,
           deliverChannel,
+          sourceContext,
           timeoutSeconds: timeoutS,
           idleThresholdSeconds: flags['idle-threshold'] || '300',
           origin: origin || 'system',
@@ -1708,6 +1816,7 @@ async function cmdEnqueue(flags) {
           watchdog_started_at:      new Date().toISOString(),
           delete_after_run:         1,             // auto-delete after watchdog fires
           origin:                   origin || 'system',
+          ...sourceContextToSchedulerFields(sourceContext),
         });
         const schedulerCli = resolveSchedulerCliPath();
         const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
@@ -1752,6 +1861,7 @@ async function cmdEnqueue(flags) {
       mode:       isFresh ? 'fresh' : 'reuse',
       agent,
       status:     'accepted',
+      sourceContext: sourceContext || null,
       delivery,
       watchdog:   monitorEnabled ? {
         enabled:  watchdogJobOk,
@@ -1980,6 +2090,7 @@ function cmdStatus(flags) {
     updatedAt:  current.updatedAt,
     summary:    effectiveCompletionSummary(current),
     completion: current.completion || null,
+    sourceContext: current.sourceContext || null,
     gatewayTimeoutSeconds: Number(current.gatewayTimeoutSeconds ?? current.timeoutSeconds) || null,
     delivery:   buildDispatchDeliverySurface(current),
     error:      current.error || null,
@@ -2378,6 +2489,7 @@ function cmdResult(flags) {
     spawnedAt:  entry.spawnedAt,
     summary:    effectiveCompletionSummary(entry, lastReply),
     completion: entry.completion || null,
+    sourceContext: entry.sourceContext || null,
     delivery:   buildDispatchDeliverySurface(entry),
     lastReply:  lastReply || null,
     diagnosticReply: diagnosticReply || lastReply || null,
@@ -2387,6 +2499,30 @@ function cmdResult(flags) {
     } : null,
     artifactEvidence: artifactEvidence || null,
     error:      entry.error || null,
+  });
+}
+
+/**
+ * route -- return the durable source and delivery route for safe follow-up.
+ */
+function cmdRoute(flags) {
+  const label = flags.label;
+  if (!label) die('--label is required', 2);
+
+  const entry = getLabel(label);
+  if (!entry) {
+    out({ ok: true, label, found: false, message: 'No session found for this label' });
+    return;
+  }
+
+  out({
+    ok: true,
+    label,
+    found: true,
+    authoritative: entry.sourceContext != null,
+    sourceContext: entry.sourceContext || null,
+    origin: entry.origin || null,
+    delivery: buildDispatchDeliverySurface(entry),
   });
 }
 
@@ -2421,6 +2557,7 @@ function cmdWatcherHandoff(flags) {
     label,
     deliverTo: entry.deliverTo,
     deliverChannel: entry.deliverChannel || 'telegram',
+    sourceContext: entry.sourceContext || null,
     timeoutSeconds: Number(entry.timeoutSeconds ?? entry.timeout) || 300,
     idleThresholdSeconds: Number(entry.idleThresholdSeconds) || 300,
     origin: entry.origin || 'system',
@@ -2434,6 +2571,7 @@ function cmdWatcherHandoff(flags) {
     label,
     jobId: watcherJob?.id || null,
     reason,
+    sourceContext: entry.sourceContext || null,
   });
 
   if (watcherJob?.id) {
@@ -2679,6 +2817,7 @@ async function cmdDone(flags) {
       sessionKey: existing.sessionKey || null,
       runId: existing.runId || null,
       origin: existing.origin || null,
+      sourceContext: existing.sourceContext || null,
       metadata: {
         last_label_status: 'done',
         timeout_seconds: Number(existing.timeoutSeconds ?? existing.timeout) || null,
@@ -2711,6 +2850,7 @@ async function cmdDone(flags) {
     status: 'done',
     summary,
     completion,
+    sourceContext: existing.sourceContext || null,
     delivery: completionDelivery ? {
       attempted: true,
       delivered: !!completionDelivery.ok,
@@ -2887,9 +3027,10 @@ Usage: openclaw-scheduler <subcommand> [flags]
 Subcommands:
   enqueue  --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
            [--agent <a>] [--thinking <t>] [--timeout <s>] [--mode fresh|reuse] [--model <m>]
+           [--source-context <json>]  ({"channel":"telegram","target":"<chat_id>","messageId":"<id>","threadId":"<optional>"})
            [--origin <o>]  (recommended explicit value, e.g. "telegram:<chat_id>" or "system")
            [--deliver-to <id>] [--deliver-channel <ch>] [--delivery-mode <m>]
-           (--deliver-to should come from inbound metadata chat_id; explicit --deliver-to becomes origin when --origin is omitted)
+           (chat-triggered calls must pass --source-context; conflicting explicit origin/delivery fails closed)
            (active-session auto-detect is preserved only as a manual/local fallback)
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
            [--verify-cmd <shell_cmd>]
@@ -2900,6 +3041,8 @@ Subcommands:
   stuck    [--threshold-min <n>]      (exits 1 if stuck sessions found)
 
   result   --label <l>
+
+  route    --label <l>               (durable source route for safe follow-up)
 
   watcher-handoff --label <l> [--reason <text>]
 
@@ -2929,6 +3072,7 @@ switch (subcommand) {
   case 'status':    cmdStatus(flags);          break;
   case 'stuck':     await cmdStuck(flags);     break;
   case 'result':    cmdResult(flags);          break;
+  case 'route':     cmdRoute(flags);           break;
   case 'watcher-handoff': cmdWatcherHandoff(flags); break;
   case 'send':      await cmdSend(flags);      break;
   case 'steer':     await cmdSend(flags);      break;

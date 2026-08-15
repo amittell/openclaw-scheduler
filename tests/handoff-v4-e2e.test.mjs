@@ -379,7 +379,7 @@ function schedulerRunner() {
     queryCapabilities() {
       return {
         scheduler_version: '0.5.0-e2e',
-        schema_version: 29,
+        schema_version: 30,
         handoff_version: '4',
         handoff_contract: HANDOFF_V4_RUNTIME_CONTRACT,
         features: V4_FEATURES,
