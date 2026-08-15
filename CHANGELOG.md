@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] -- 2026-08-15
+
 ### Added
 
 - authoritative dispatch `--source-context` envelopes with channel, target,
