@@ -383,7 +383,8 @@ buffer on the `execFileSync` call.
 
 **Response parsing**: stdout is parsed as JSON. Non-JSON prefix lines (e.g.
 plugin init logs) are stripped. On error, stderr and stdout are both checked for
-parseable JSON before throwing.
+parseable JSON before throwing. A parsed RPC error envelope such as
+`{"ok":false,"error":{...}}` is an error even when the CLI exits zero.
 
 #### Methods called:
 
@@ -392,9 +393,6 @@ parseable JSON before throwing.
 Called in `cmdEnqueue()` for fresh sessions:
 
 ```json
-// Set spawn depth
-{ "key": "<sessionKey>", "spawnDepth": 1 }
-
 // Set model override (when --model is provided)
 { "key": "<sessionKey>", "model": "<model>" }
 
@@ -421,6 +419,11 @@ Called in `cmdEnqueue()` and `cmdSend()`:
   "replyChannel": "telegram"
 }
 ```
+
+OpenClaw's current `sessions.patch` schema does not accept `spawnDepth`.
+Native session creation and sub-agent runtime policy derive and enforce the
+depth, so dispatch does not patch that field. Rejection of an explicitly
+requested model or thinking override aborts enqueue before the agent call.
 
 For `cmdSend` (mid-session steering), the call uses `lane: 'nested'` and
 `deliver: false`.
@@ -449,16 +452,15 @@ The scheduler scans backwards to find the last assistant message.
 **`sessions.list`** -- List active sessions (gateway API fallback).
 
 Called in `checkSessionDone()` when a session is not found in the
-local sessions.json store:
+local SQLite-first compatibility store:
 
 ```json
 { "activeMinutes": 1440 }
 ```
 
-Used to confirm whether a session is still active in the gateway before
-auto-resolving it as done. This handles the case where subagent sessions
-(openclaw 2026.3.13+) are tracked via SessionBindingService and are NOT
-written to sessions.json.
+Used as an additional liveness signal. Tree visibility can hide an externally
+spawned child, so an absent result is never the only reason to declare an
+accepted dispatch failed.
 
 ---
 
@@ -478,9 +480,11 @@ that key.
 
 Before dispatching a new CLI sub-agent, `cmdEnqueue` patches the session via
 `openclaw gateway call sessions.patch` to set:
-- `spawnDepth: 1` (always, for fresh sessions)
 - `model` (if `--model` flag was provided)
 - `thinkingLevel` (if `--thinking` flag was provided)
+
+Spawn depth is owned by OpenClaw's native session/runtime policy. The current
+Gateway rejects `spawnDepth` on `sessions.patch`, so dispatch does not send it.
 
 ### Dispatch
 
@@ -507,25 +511,29 @@ agent is still active.
 
 `dispatch/index.mjs` checks session state through two mechanisms:
 
-1. **Local sessions store**: Reads
-   `~/.openclaw/agents/<agent>/sessions/sessions.json` directly from disk
-   (`readSessionsStore()`). This is treated as ground truth for
-   sessions that appear there.
+1. **Local sessions store**: Opens
+   `~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite` read-only and maps
+   `session_nodes` plus the current `session_windows` row. Transcript fallback
+   reads a bounded `transcript_events` tail. SQLite is authoritative when the
+   current tables are present; older installs fall back to
+   `sessions/sessions.json` and JSONL transcripts.
 
-2. **Gateway API fallback**: When a session is not found in the local store
-   (common for subagent sessions in openclaw 2026.3.13+),
-   `checkSessionDone()` falls back to `openclaw gateway call sessions.list`
-   to confirm whether the session is still active.
+2. **Gateway API fallback**: `sessions.list` and `chat.history` supplement local
+   state when visibility permits. They cannot be authoritative for children
+   outside the caller's configured session tree.
 
 ### Completion Detection
 
 A session is considered done when:
-- It is not found in either the sessions store or the gateway API (and is not
-  within the 5-minute young session grace period).
-- It is found but has been idle past the threshold (default: max of job timeout
-  or 10 minutes).
+- SQLite/legacy lifecycle state carries a supported terminal signal, including
+  current SQLite `status=done`.
+- A terminal assistant transcript or explicit completion payload is observed.
 - The agent explicitly calls the `done` subcommand, which sets the label status
   in labels.json.
+
+After an accepted `agent` RPC, delayed persistence or API invisibility leaves
+the label running; the watcher and configured job timeout own eventual failure.
+Only an explicit gateway lane error fails post-spawn verification immediately.
 
 ### Patching (Post-completion)
 
@@ -593,9 +601,10 @@ Each agent has its own configuration directory at
   the auth-profile store. Legacy Gateway versions may instead use
   `auth-profiles.json` in this directory.
 
-The per-agent session store is a sibling at
-`~/.openclaw/agents/<agentId>/sessions/` and contains `sessions.json` plus
-JSONL transcripts.
+Current session lifecycle and ConvMem transcript events are stored in that same
+per-agent `openclaw-agent.sqlite` database (`session_nodes`, `session_windows`,
+and `transcript_events`). Older Gateway versions may instead use the sibling
+`sessions/` directory with `sessions.json` and JSONL transcripts.
 
 The Gateway resolves effective model and auth state for the selected agent.
 Depending on Gateway version and configuration, that effective state may use
@@ -1006,7 +1015,7 @@ request headers.
 | `GET /health` | HTTP | `gateway.js` | Gateway reachability check |
 | `GET /sessions/:key` | HTTP | `dispatch/index.mjs` | Session activity validation (done guard) |
 | `openclaw system event` | CLI | `gateway.js` | Fire-and-forget main-session event injection |
-| `openclaw gateway call sessions.patch` | CLI | `dispatch/index.mjs` | Session configuration (model, thinking, spawnDepth) |
+| `openclaw gateway call sessions.patch` | CLI | `dispatch/index.mjs` | Supported session overrides (model, thinking) |
 | `openclaw gateway call agent` | CLI | `dispatch/index.mjs` | Subagent session dispatch |
 | `openclaw gateway call chat.history` | CLI | `dispatch/index.mjs` | Session transcript retrieval |
 | `openclaw gateway call sessions.list` | CLI | `dispatch/index.mjs` | Session existence verification (fallback) |
@@ -1016,4 +1025,5 @@ request headers.
 | `x-openclaw-session-key` | Header (resp) | `gateway.js` | Session key propagation |
 | `x-openclaw-auth-profile` | Header | `gateway.js` | Auth profile override |
 | `x-openclaw-env-inject` | Header | `gateway.js`, `gateway-capabilities.js` | Capability-gated task-scoped env materialization for isolated turns |
-| `~/.openclaw/agents/<agent>/sessions/sessions.json` | File | `dispatch/index.mjs` | Local session state (ground truth) |
+| `~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite` | SQLite (read-only) | `dispatch/session-store.mjs` | Current session lifecycle and transcript state |
+| `~/.openclaw/agents/<agent>/sessions/` | Legacy file fallback | `dispatch/session-store.mjs` | Older `sessions.json` and JSONL session state |

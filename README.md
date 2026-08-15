@@ -1909,9 +1909,9 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `--message-stdin` | -- | Read the prompt from stdin explicitly. If stdin is piped and no explicit prompt source is set, dispatch auto-reads stdin. |
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
-| `--model` | configured dispatch default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
+| `--model` | configured OpenClaw default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, or `agents.defaults.model`; otherwise the Gateway selects its configured default. Rejected explicit overrides fail enqueue. |
 | `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher job for durable final delivery. The gateway spawn itself stays fire-and-forget so raw tool output and internal done payloads cannot leak directly to chat. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
-| `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
+| `--delivery-mode` | `announce` | `announce` delivers errors with non-empty output. `announce-always` delivers any non-empty result. A successful zero-byte shell result stays quiet; `none` suppresses scheduler delivery. |
 | `--timeout` | `300` | Session timeout in seconds. |
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
 | `--no-monitor` | -- | Disable watchdog registration for this dispatch. |
@@ -1937,7 +1937,7 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 
 The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are enqueued for durable outbox delivery to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
 
-**Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. The dispatcher sets `spawnDepth: 1` on each fresh session automatically.
+**Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. Current OpenClaw derives and enforces depth in its native session/runtime policy; dispatch does not send the obsolete `sessions.patch spawnDepth` field.
 
 **Example: 3 parallel workers**
 

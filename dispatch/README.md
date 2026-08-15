@@ -21,6 +21,8 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 | `529-recovery.mjs` | Transient error recovery |
 | `deliver-watcher.sh` | Shell wrapper for result retrieval |
 | `chilisaus.mjs` | Branded chilisaus wrapper over this dispatch engine |
+| `gateway-rpc.mjs` | Gateway CLI parsing and RPC error-envelope validation |
+| `session-store.mjs` | Read-only SQLite-first session/transcript compatibility layer |
 | `config.example.json` | Example config |
 | `chilisaus.config.example.json` | Chilisaus branding config example |
 | `test-done-postoffice.mjs` | Done handler test |
@@ -33,7 +35,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 
 dispatch calls the OpenClaw Gateway RPC API directly:
 
-1. **`sessions.patch`** — configure the session (model, thinking level, spawn depth)
+1. **`sessions.patch`** — configure supported session overrides (model, thinking level)
 2. **`agent`** — send a message into the session (spawning it if new)
 3. **`sessions.list`** — query session status and liveness
 4. **`chat.history`** — read session transcripts for results
@@ -43,7 +45,7 @@ Orchestrator calls:
   dispatch enqueue --label ticket-42 --message "Fix the deploy script"
 
   → Creates session key: agent:main:subagent:<uuid>
-  → Patches session with model/thinking/spawnDepth
+  → Patches supported model/thinking overrides when requested
   → Calls gateway `agent` method with the task
   → Session starts immediately (no scheduler tick delay)
   → Tracks label→sessionKey in the durable labels ledger
@@ -101,7 +103,7 @@ cat prompt.md | node dispatch/index.mjs enqueue \
 | `--mode` | `fresh` | `fresh` = new session; `reuse` = continue last session for this label |
 | `--session-key` | — | Explicit session key (bypasses ledger lookup) |
 | `--agent` | `main` | Agent ID |
-| `--model` | configured dispatch default | Model override (e.g. `anthropic/claude-sonnet-4-6`). When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
+| `--model` | configured OpenClaw default | Model override (e.g. `anthropic/claude-sonnet-4-6`). When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, or `agents.defaults.model`; otherwise the Gateway selects its configured default. An explicitly rejected override fails enqueue instead of silently falling back. |
 | `--thinking` | — | Reasoning level: `low`, `high`, `xhigh` |
 | `--timeout` | `300` | Seconds before run times out |
 | `--deliver-to` | — | Delivery target (chat ID, channel ID, handle, etc.). Enables `deliver:true` on the gateway call. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
@@ -132,8 +134,8 @@ node dispatch/index.mjs stuck --threshold-min 15
 Exit 0 = nothing stuck (silent).
 Exit 1 = stuck sessions found (triggers announce delivery).
 
-Checks the labels ledger for sessions marked `running`, cross-references gateway
-session store for last activity timestamp.
+Checks the labels ledger for sessions marked `running` and cross-references the
+SQLite-first local compatibility store plus visible Gateway state for activity.
 
 ### `result` — last assistant reply from a session
 
@@ -141,8 +143,8 @@ session store for last activity timestamp.
 node dispatch/index.mjs result --label "ticket-42"
 ```
 
-Reads the session transcript via `chat.history` and returns the last assistant
-message.
+Reads the current SQLite transcript first, with legacy JSONL and visible
+`chat.history` fallbacks, and returns the last assistant message.
 
 ### `done` — mark a tracked session complete
 
@@ -352,12 +354,21 @@ outbox rows with deterministic `:part:i/N` idempotency keys, allowing retries
 to resume from the durable per-part checkpoint.
 
 Quiet sessions are treated conservatively. The watcher does not mark a running
-job failed just because `sessions.json` or the JSONL transcript has been quiet
-for 60 seconds. For high/xhigh reasoning work, the first idle result probe waits
+job failed just because the local SQLite session/transcript state (or the legacy
+JSON/JSONL fallback) has been quiet for 60 seconds. For high/xhigh reasoning work, the first idle result probe waits
 at least 10 minutes, idle auto-resolution waits at least 20 minutes, and the hard
 failure ceiling is longer than the requested task timeout. Missing or ambiguous
 gateway/session liveness fails open to "still monitoring" until the hard timeout
 window or a clear terminal error.
+
+Current OpenClaw stores session lifecycle in the per-agent read-only database
+`~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite` (`session_nodes`,
+`session_windows`, and `transcript_events`). Dispatch reads that database with
+WAL-compatible SQLite access and never mutates it. Older OpenClaw installs may
+fall back to `sessions/sessions.json` and JSONL transcripts. Gateway
+`sessions.list` and `chat.history` remain useful fallbacks, but tree visibility
+can intentionally hide a child created outside the caller's current session
+tree, so API absence alone is not a failure signal.
 
 While a label is still `running`, a plain assistant reply is diagnostic only.
 Successful final delivery prefers the agent-side local `done` signal and its

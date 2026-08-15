@@ -5309,11 +5309,14 @@ console.log('\n-- Dispatch Spawn Failure Detection --');
   assert(!indexSrc.includes("subagents/runs.json"), 'dead registry: no reference to subagents/runs.json');
   // checkSessionDone now has sessionEverFound param
   assert(indexSrc.includes('sessionEverFound'), 'Fix 4: checkSessionDone has sessionEverFound param');
-  assert(indexSrc.includes('session never found'), 'Fix 4: distinct reason for spawn-failure case');
+  assert(
+    indexSrc.includes('accepted session not observable yet; deferring to timeout policy'),
+    'Fix 4: invisible accepted sessions defer to the timeout owner',
+  );
   assert(indexSrc.includes('inspectSessionBootstrapFailure'), 'bootstrap reconciliation helper is present');
   assert(indexSrc.includes('Auto-resolved as spawn failure'), 'cmdStatus can surface local bootstrap failures as errors');
   assert(indexSrc.includes('Synced as spawn failure'), 'cmdSync can reconcile local bootstrap failures as errors');
-  assert(indexSrc.includes('never produced transcript/history within'), 'cmdEnqueue escalates silent bootstrap failures');
+  assert(indexSrc.includes('leaving accepted run active'), 'cmdEnqueue preserves accepted sessions during delayed persistence');
   // post-spawn poll code exists
   assert(indexSrc.includes("status: 'error'"), 'Fix 3: post-spawn poll escalates missing startup signal to error');
   assert(indexSrc.includes('SPAWN_POLL_MAX'), 'Fix 3: post-spawn poll loop present');
@@ -6369,7 +6372,8 @@ console.log('\n-- Watcher pre-deadline JSONL mtime extension --');
   assert(watcherSrc.includes('MAX_DEADLINE_EXTENSION'), 'jsonl-extend: caps extension at MAX_DEADLINE_EXTENSION');
   assert(watcherSrc.includes("preDeadlineSessionId !== sessionId"), 'jsonl-extend: resets baseline on session change');
   assert(watcherSrc.includes('function getSessionJsonlMtime(sessionId, agentDir'), 'jsonl-extend: getSessionJsonlMtime function signature present');
-  assert(watcherSrc.includes('statSync(jsonlPath).mtimeMs'), 'jsonl-extend: getSessionJsonlMtime reads mtimeMs via statSync');
+  assert(watcherSrc.includes('readOpenClawTranscriptTail(agentDir, sessionId'), 'jsonl-extend: transcript freshness uses compatibility layer');
+  assert(watcherSrc.includes('}).updatedAtMs'), 'jsonl-extend: compatibility layer exposes transcript activity time');
 }
 
 // -- Watcher stop_reason early delivery --
@@ -9272,7 +9276,7 @@ console.log('\n-- Watchdog Heartbeat Guard --');
     }) + '\n');
 
     const result = runStatus(labelsPath, tmpDir, 'wdg-t8');
-    assert(result.status === 'running', 'watchdog guard t8: clean done status does not force interrupted while the watcher ping is fresh');
+    assert(result.status === 'done', 'watchdog guard t8: canonical done status resolves successfully even while watcher ping is fresh');
     assert(
       !String(result.summary || '').includes('without done signal'),
       'watchdog guard t8: clean done status is not narrated as an abnormal terminal resolution',
