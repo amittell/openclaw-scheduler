@@ -14,6 +14,12 @@ import {
   getHandoffArtifact,
   persistHandoffArtifact,
 } from './handoff-artifact.js';
+import {
+  assertRouteMatchesSource,
+  parseOriginRoute,
+  parseSourceContext,
+  sameSourceContext,
+} from './dispatch/source-context.mjs';
 
 const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
@@ -41,6 +47,7 @@ const MAX_TRIGGER_REGEX_INPUT_BYTES = 65536;
 const HANDOFF_V4_BOUND_FIELDS = new Set([
   'name', 'enabled', 'schedule_kind', 'schedule_at', 'schedule_cron', 'schedule_tz',
   'parent_id', 'trigger_on', 'trigger_delay_s', 'trigger_condition', 'origin',
+  'source_channel', 'source_target', 'source_message_id', 'source_thread_id',
   'session_target', 'agent_id', 'payload_kind', 'payload_message', 'payload_model',
   'payload_model_fallback', 'payload_thinking', 'payload_timeout_seconds',
   'preferred_session_key', 'auth_profile', 'auth_profile_fallback',
@@ -88,6 +95,7 @@ const PATCHABLE_COLUMNS = new Set([
   'max_retries', 'consecutive_errors',
   'delivery_mode', 'delivery_channel', 'delivery_to', 'delivery_opt_out_reason',
   'delete_after_run', 'ttl_hours', 'auth_profile', 'auth_profile_fallback', 'origin',
+  'source_channel', 'source_target', 'source_message_id', 'source_thread_id',
   'output_excerpt_limit_bytes', 'output_summary_limit_bytes',
   'watchdog_check_cmd', 'watchdog_timeout_min', 'watchdog_started_at',
   'watchdog_target_label', 'watchdog_alert_channel', 'watchdog_alert_target',
@@ -361,6 +369,10 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     'auth_profile_fallback',
     'delivery_opt_out_reason',
     'origin',
+    'source_channel',
+    'source_target',
+    'source_message_id',
+    'source_thread_id',
     // v0.2 nullable strings
     'identity_principal',
     'identity_run_as',
@@ -719,6 +731,58 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   }
   if (mode === 'create' || 'origin' in normalized) {
     assertSafeString('origin', merged.origin, { allowEmpty: false, maxLength: 256 });
+  }
+  const sourceFields = ['source_channel', 'source_target', 'source_message_id', 'source_thread_id'];
+  const hasSourceEnvelope = sourceFields.some(field => merged[field] != null);
+  if (hasSourceEnvelope) {
+    for (const field of ['source_channel', 'source_target', 'source_message_id']) {
+      if (merged[field] == null) {
+        throw new Error(`${field} is required when any authoritative source field is set`);
+      }
+    }
+    assertSafeString('source_channel', merged.source_channel, { allowEmpty: false, maxLength: 64 });
+    assertSafeString('source_target', merged.source_target, { allowEmpty: false, maxLength: 256 });
+    assertSafeString('source_message_id', merged.source_message_id, { allowEmpty: false, maxLength: 256 });
+    assertSafeString('source_thread_id', merged.source_thread_id, { allowEmpty: false, maxLength: 256 });
+    const sourceContext = parseSourceContext({
+      channel: merged.source_channel,
+      target: merged.source_target,
+      messageId: merged.source_message_id,
+      threadId: merged.source_thread_id,
+    }, 'authoritative job source');
+    const deliveryChannel = merged.job_type === 'watchdog'
+      ? merged.watchdog_alert_channel
+      : merged.delivery_channel;
+    const deliveryTarget = merged.job_type === 'watchdog'
+      ? merged.watchdog_alert_target
+      : merged.delivery_to;
+    assertRouteMatchesSource(sourceContext, deliveryChannel, deliveryTarget, 'job delivery route');
+    const originRoute = parseOriginRoute(merged.origin, 'job origin');
+    if (!originRoute) throw new Error('job origin must match the authoritative source envelope');
+    assertRouteMatchesSource(sourceContext, originRoute.channel, originRoute.target, 'job origin');
+    normalized.source_channel = sourceContext.channel;
+    normalized.source_target = sourceContext.target;
+    normalized.source_message_id = sourceContext.messageId;
+    normalized.source_thread_id = sourceContext.threadId;
+  }
+  if (mode === 'update' && currentJob && sourceFields.some(field => currentJob[field] != null)) {
+    const sourceWasPatched = sourceFields.some(field => Object.hasOwn(opts, field));
+    if (sourceWasPatched) {
+      const previousSource = parseSourceContext({
+        channel: currentJob.source_channel,
+        target: currentJob.source_target,
+        messageId: currentJob.source_message_id,
+        threadId: currentJob.source_thread_id,
+      }, 'stored authoritative job source');
+      if (!hasSourceEnvelope || !sameSourceContext(previousSource, {
+        channel: merged.source_channel,
+        target: merged.source_target,
+        messageId: merged.source_message_id,
+        threadId: merged.source_thread_id,
+      })) {
+        throw new Error('authoritative job source fields are immutable once persisted');
+      }
+    }
   }
 
   // --- v0.2 Identity ---
@@ -1268,6 +1332,7 @@ export function createJob(opts) {
       auth_profile, auth_profile_fallback,
       delivery_opt_out_reason,
       origin,
+      source_channel, source_target, source_message_id, source_thread_id,
       identity_principal, identity_run_as, identity_attestation, identity_ref,
       identity_subject_kind, identity_subject_principal, identity_trust_level,
       identity_delegation_mode, identity,
@@ -1301,6 +1366,7 @@ export function createJob(opts) {
       ?,
       ?,
       ?,
+      ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?,
@@ -1382,6 +1448,10 @@ export function createJob(opts) {
     normalized.auth_profile_fallback || null,
     normalized.delivery_opt_out_reason || null,
     normalized.origin || null,
+    normalized.source_channel || null,
+    normalized.source_target || null,
+    normalized.source_message_id || null,
+    normalized.source_thread_id || null,
     normalized.identity_principal || null,
     normalized.identity_run_as || null,
     normalized.identity_attestation || null,
@@ -1495,6 +1565,7 @@ export function updateJob(id, patch) {
     'auth_profile', 'auth_profile_fallback',
     'delivery_opt_out_reason',
     'origin',
+    'source_channel', 'source_target', 'source_message_id', 'source_thread_id',
     // v0.2 fields
     'identity_principal', 'identity_run_as', 'identity_attestation', 'identity_ref',
     'identity_subject_kind', 'identity_subject_principal', 'identity_trust_level',

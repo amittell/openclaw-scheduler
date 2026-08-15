@@ -15,6 +15,7 @@ const DISPATCH_SUBCOMMANDS = new Set([
   'enqueue',
   'stuck',
   'result',
+  'route',
   'sync',
   'done',
   'send',
@@ -44,6 +45,7 @@ Dispatch subcommands (routed to dispatch/index.mjs):
   dispatch status  Query session status by label
   stuck            Find sessions running past threshold
   result           Get last assistant reply from a session
+  route            Get durable authoritative source route for follow-up
   send / steer     Send/steer a running session
   heartbeat        Check session liveness
   list             List all tracked labels

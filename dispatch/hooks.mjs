@@ -19,6 +19,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { resolveCompletionDelivery } from './completion.mjs';
+import { assertRouteMatchesSource, parseSourceContext } from './source-context.mjs';
 import { getDb } from '../db.js';
 import { enqueueMultipartDelivery } from '../delivery-outbox.js';
 
@@ -502,9 +503,21 @@ export function enqueueCompletionNotification({
   deliveryScope = null,
   resolvedDelivery = null,
   origin = null,
+  sourceContext = null,
   metadata = null,
   maxPartBytes = null,
 } = {}) {
+  const authoritativeSource = sourceContext == null
+    ? null
+    : parseSourceContext(sourceContext, 'sourceContext');
+  if (authoritativeSource) {
+    assertRouteMatchesSource(
+      authoritativeSource,
+      deliveryChannel,
+      deliverTo,
+      'completion delivery route',
+    );
+  }
   const delivery = resolvedDelivery && typeof resolvedDelivery === 'object'
     ? resolvedDelivery
     : resolveCompletionDelivery({ completion, fallbackSummary: summary });
@@ -515,6 +528,7 @@ export function enqueueCompletionNotification({
     delivery_channel: deliveryChannel,
     delivery_to: deliverTo,
     origin: origin || null,
+    source_context: authoritativeSource,
     delivery_source: delivery.source || null,
     delivery_scope: scope,
     run_id: runId || null,
@@ -696,6 +710,7 @@ export async function onFinished(opts) {
           sessionKey: opts.session_key || null,
           runId: opts.run_id || null,
           origin: opts.origin || null,
+          sourceContext: opts.sourceContext || null,
         },
       )
     );

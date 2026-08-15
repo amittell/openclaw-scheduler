@@ -53,6 +53,7 @@
     "dispatch/liveness.mjs",
     "dispatch/message-input.mjs",
     "dispatch/paths.mjs",
+    "dispatch/source-context.mjs",
     "dispatch/README.md",
     "dispatch/watcher.mjs",
     "scripts/dispatch-cli-utils.mjs",

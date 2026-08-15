@@ -44,6 +44,7 @@ import {
 } from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
+import { assertRouteMatchesSource, parseOriginRoute, parseSourceContext } from './source-context.mjs';
 import { sendMessage } from '../messages.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from '../paths.js';
 import {
@@ -339,6 +340,18 @@ function assertValidWatcherLabelMetadata(name, entry) {
   if (sessionKey?.startsWith('agent:') && explicitAgent) {
     assertSessionKeyForAgent(sessionKey, explicitAgent, `sessionKey for label ${JSON.stringify(name)}`);
   }
+  if (entry.sourceContext != null) {
+    const source = parseSourceContext(entry.sourceContext, `sourceContext for label ${JSON.stringify(name)}`);
+    assertRouteMatchesSource(
+      source,
+      entry.deliverChannel,
+      entry.deliverTo,
+      `delivery route for label ${JSON.stringify(name)}`,
+    );
+    const origin = parseOriginRoute(entry.origin, `origin for label ${JSON.stringify(name)}`);
+    if (!origin) throw new Error(`origin for label ${JSON.stringify(name)} must match sourceContext`);
+    assertRouteMatchesSource(source, origin.channel, origin.target, `origin for label ${JSON.stringify(name)}`);
+  }
   return entry;
 }
 
@@ -355,6 +368,13 @@ function rejectUnsafeWatcherMetadata(labels) {
       delete entry.agent;
       delete entry.sessionKey;
       delete entry.sessionId;
+      delete entry.origin;
+      delete entry.deliverTo;
+      delete entry.deliverChannel;
+      delete entry.sourceContext;
+      entry.deliveryMode = 'none';
+      entry.deliveryDisabled = true;
+      entry.deliveryDisabledReason = 'unsafe persisted routing metadata';
       entry.status = 'error';
       entry.error = reason;
       entry.summary = reason;
@@ -573,6 +593,7 @@ function respawnSession(label) {
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
       if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
+      if (entry?.sourceContext) enqueueArgs.push('--source-context', JSON.stringify(entry.sourceContext));
       if (entry?.deliverTo) {
         enqueueArgs.push('--deliver-to', entry.deliverTo);
         if (entry?.deliveryMode) enqueueArgs.push('--delivery-mode', entry.deliveryMode);
@@ -619,6 +640,7 @@ function respawnAfterGwRestart(label) {
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
     if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
+    if (entry?.sourceContext) enqueueArgs.push('--source-context', JSON.stringify(entry.sourceContext));
     if (entry?.deliverTo) {
       enqueueArgs.push('--deliver-to', entry.deliverTo);
       if (entry?.deliveryMode) enqueueArgs.push('--delivery-mode', entry.deliveryMode);
@@ -1299,6 +1321,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
         sessionKey: claimEntry.sessionKey || null,
         runId: claimEntry.runId || null,
         origin: claimEntry.origin || null,
+        sourceContext: claimEntry.sourceContext || null,
         metadata: {
           delivery_source: completion.source || 'watcher',
           last_label_status: claimEntry.status || 'done',

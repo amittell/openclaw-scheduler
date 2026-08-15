@@ -51,8 +51,8 @@ before(async () => {
 
 after(() => closeDb());
 
-test('schema v29 preserves handoff v3 fields', () => {
-  assert.equal(SCHEDULER_SCHEMA_VERSION, 29);
+test('schema v30 preserves handoff v3 fields', () => {
+  assert.equal(SCHEDULER_SCHEMA_VERSION, 30);
   const job = createJob(jobSpec('v04-fields', {
     approval_required: true,
     approval_risk_level: 'high',
@@ -500,7 +500,7 @@ test('capabilities advertise authoritative handoff v4 enforcement', () => {
   });
   const capabilities = JSON.parse(output);
   assert.equal(capabilities.handoff_version, '4');
-  assert.equal(capabilities.schema_version, 29);
+  assert.equal(capabilities.schema_version, 30);
   assert.deepEqual(capabilities.handoff_contract, {
     artifact_schema: 'openclaw.scheduler.handoff-artifact',
     artifact_schema_version: 1,

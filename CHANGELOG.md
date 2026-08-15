@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- authoritative dispatch `--source-context` envelopes with channel, target,
+  message, and optional thread/topic identifiers persisted in the labels ledger,
+  schema v30 watcher/watchdog jobs, completion metadata, and status/result/route
+  JSON for safe post-completion follow-up
+- `dispatch route --label <label>` for retrieving the stored source route without
+  relying on remembered chat maps
+
+### Security
+
+- chat-triggered dispatches now fail closed with argument exit code 2 when an
+  explicit origin or delivery route conflicts with the authoritative inbound
+  source, before Gateway spawn, label mutation, watcher creation, or notification
+- completion enqueue, retry, and watcher-handoff paths preserve and revalidate
+  authoritative source identifiers; source envelopes reject unknown fields so
+  message content and secrets cannot enter routing metadata
+
 ## [0.5.0] -- 2026-07-18
 
 ### Added

@@ -74,7 +74,7 @@ Successful operations return:
 When first interacting with `openclaw-scheduler`, use this sequence:
 
 1. `openclaw-scheduler` -- show usage (plain-text help output)
-2. `openclaw-scheduler doctor --json` -- verify schema 29 and live diagnostics
+2. `openclaw-scheduler doctor --json` -- verify schema 30 and live diagnostics
 3. `openclaw-scheduler status --json` -- inspect lease, queue, outbox, approvals, and runs
 4. `openclaw-scheduler jobs list --json` -- enumerate existing jobs
 5. `openclaw-scheduler agents list --json` -- see registered agents

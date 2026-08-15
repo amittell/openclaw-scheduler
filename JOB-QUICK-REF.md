@@ -1,6 +1,6 @@
 # Job Quick Reference
 
-Copy-paste patterns for scheduler 0.5.0 and schema 29. Validate a saved spec
+Copy-paste patterns for scheduler 0.5.0 and schema 30. Validate a saved spec
 with `openclaw-scheduler jobs validate --file job.json` before adding it.
 
 ## Shell job with cron schedule

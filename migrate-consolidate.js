@@ -1,7 +1,7 @@
 /**
  * migrate-consolidate.js -- Single idempotent migration for existing databases
  *
- * Brings any DB from any prior version up to the current schema (v29).
+ * Brings any DB from any prior version up to the current schema (v30).
  * Fresh installs get everything from schema.sql directly -- this only
  * runs ALTER TABLEs needed for DBs created before the current schema.
  *
@@ -128,8 +128,8 @@ export default function migrateConsolidate() {
   const current = hasTable('schema_migrations')
     ? (db.prepare('SELECT MAX(version) as v FROM schema_migrations').get()?.v ?? 0)
     : 0;
-  if (current > 29) {
-    const error = new Error(`Database schema version ${current} is newer than supported version 29`);
+  if (current > 30) {
+    const error = new Error(`Database schema version ${current} is newer than supported version 30`);
     error.code = 'SCHEMA_VERSION_UNSUPPORTED';
     throw error;
   }
@@ -170,6 +170,7 @@ export default function migrateConsolidate() {
       'payload_model_fallback', 'auth_profile_fallback',
       'schedule_kind', 'schedule_at', 'delivery_channel', 'delivery_to',
       'delivery_opt_out_reason', 'origin', 'parent_id', 'created_at',
+      'source_channel', 'source_target', 'source_message_id', 'source_thread_id',
       'updated_at', 'delete_after_run', 'next_run_at', 'last_run_at',
       'last_status', 'consecutive_errors',
       'identity_principal', 'identity_run_as', 'identity_attestation',
@@ -405,7 +406,7 @@ export default function migrateConsolidate() {
     ? db.prepare(`
         SELECT COUNT(DISTINCT version) AS count
         FROM schema_migrations
-        WHERE version BETWEEN 1 AND 29
+        WHERE version BETWEEN 1 AND 30
       `).get().count
     : 0;
   const evidenceMetadataBackfills = hasTable('evidence_records')
@@ -421,8 +422,8 @@ export default function migrateConsolidate() {
     ? collectEvidenceMetadataBackfills(db)
     : [];
   if (
-    current >= 29
-    && recordedVersionCount === 29
+    current >= 30
+    && recordedVersionCount === 30
     && hasLatestColumns
     && queueBindingIsNotNull
     && !queueSourceRunHasForeignKey
@@ -726,6 +727,11 @@ export default function migrateConsolidate() {
     `ALTER TABLE jobs ADD COLUMN handoff_version INTEGER DEFAULT NULL`,
     `ALTER TABLE jobs ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
     `ALTER TABLE jobs ADD COLUMN effective_task_hash TEXT DEFAULT NULL`,
+    // v30: authoritative inbound source envelope (identifiers only)
+    `ALTER TABLE jobs ADD COLUMN source_channel TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN source_target TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN source_message_id TEXT DEFAULT NULL`,
+    `ALTER TABLE jobs ADD COLUMN source_thread_id TEXT DEFAULT NULL`,
     `ALTER TABLE runs ADD COLUMN handoff_artifact_digest TEXT DEFAULT NULL`,
     `ALTER TABLE runs ADD COLUMN runtime_instance_id TEXT DEFAULT NULL`,
     `ALTER TABLE runs ADD COLUMN source_run_id TEXT DEFAULT NULL`,
@@ -1813,26 +1819,26 @@ export default function migrateConsolidate() {
   // treated index creation as best effort; a missing uniqueness or due-work
   // index changes correctness, not just performance.
   for (const table of migrationRequiredTables) {
-    if (!hasTable(table)) throw new Error(`Migration v29 failed to create required table ${table}`);
+    if (!hasTable(table)) throw new Error(`Migration v30 failed to create required table ${table}`);
   }
   for (const index of migrationRequiredIndexes) {
-    if (!hasIndex(index)) throw new Error(`Migration v29 failed to create required index ${index}`);
+    if (!hasIndex(index)) throw new Error(`Migration v30 failed to create required index ${index}`);
   }
   for (const spec of criticalUniqueIndexes) {
     if (hasTable(spec.table) && !criticalIndexMatches(spec)) {
-      throw new Error(`Migration v29 failed to enforce required unique index ${spec.name}`);
+      throw new Error(`Migration v30 failed to enforce required unique index ${spec.name}`);
     }
   }
   for (const trigger of schemaNoOpTriggers) {
     if (!hasTrigger(trigger)) {
-      throw new Error(`Migration v29 failed to create required trigger ${trigger}`);
+      throw new Error(`Migration v30 failed to create required trigger ${trigger}`);
     }
   }
 
   // -- Record all versions -----------------------------------------------
 
   const stmt = db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)');
-  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]) {
+  for (const v of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]) {
     stmt.run(v);
   }
 
@@ -1851,7 +1857,7 @@ if (process.argv[1] && process.argv[1].endsWith('migrate-consolidate.js')) {
     }
   }
   console.log(applied
-    ? 'Consolidation migration applied -- DB is now at schema v29'
-    : 'DB already at v29 -- nothing to do'
+    ? 'Consolidation migration applied -- DB is now at schema v30'
+    : 'DB already at v30 -- nothing to do'
   );
 }

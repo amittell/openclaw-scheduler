@@ -1385,6 +1385,7 @@ max_retries, delivery_mode, delivery_channel,
 delivery_to, delivery_guarantee, delete_after_run, ttl_hours,
 parent_id, trigger_on, trigger_delay_s, trigger_condition,
 resource_pool, auth_profile, auth_profile_fallback,
+origin, source_channel, source_target, source_message_id, source_thread_id,
 approval_required, approval_timeout_s, approval_auto,
 approval_risk_level, approval_approver_scope, output_format,
 verify_shell, verify_timeout_s, verify_on_failure,
@@ -1696,7 +1697,8 @@ Use `--legacy-json ~/.openclaw/cron/jobs.json` only for an old export.
 
 ### Schema baseline
 
-Version 0.5.0 uses schema version 29.
+The current package uses schema version 30. Schema v30 adds identifier-only
+authoritative inbound source fields to durable watcher and watchdog jobs.
 
 - Net-new installs apply `schema.sql` transactionally.
 - Existing databases run the idempotent consolidation migration, then reapply the current schema. Migration 28 preserves existing state while rebuilding legacy completion debt rows with a derived delivery scope, multipart outbox coordinates, and immutable checksum evidence. Migration 29 adds handoff v4 artifacts, proof replay claims, runtime events, provider sessions, credential presentations, exact source-run bindings, and signed evidence metadata without rewriting earlier jobs or runs.
@@ -1882,21 +1884,33 @@ openclaw-scheduler enqueue \
   --mode        fresh                                                         \
   --thinking    high                                                          \
   --timeout     3600                                                          \
+  --source-context '{"channel":"telegram","target":"YOUR_CHAT_ID","messageId":"INBOUND_MESSAGE_ID","threadId":null}' \
   --deliver-to  YOUR_CHAT_ID                                                     \
   --delivery-mode announce
 
 # Fallback (if openclaw-scheduler is not in PATH):
 node ~/.openclaw/scheduler/dispatch/index.mjs enqueue \
-  --label "fix-deploy-script" --message "..." --deliver-to YOUR_CHAT_ID
+  --label "fix-deploy-script" --message "..." \
+  --source-context '{"channel":"telegram","target":"YOUR_CHAT_ID","messageId":"INBOUND_MESSAGE_ID"}' \
+  --deliver-to YOUR_CHAT_ID
 
 # Literal-safe prompt input when the text contains shell metacharacters:
 cat prompt.md | openclaw-scheduler enqueue \
   --label "fix-deploy-script" \
   --message-stdin \
+  --source-context '{"channel":"telegram","target":"YOUR_CHAT_ID","messageId":"INBOUND_MESSAGE_ID"}' \
   --deliver-to YOUR_CHAT_ID
 ```
 
-For normal chat-triggered dispatches, always pass `--deliver-to` from the inbound metadata `chat_id`. If you omit `--origin`, dispatch now derives it from that explicit delivery target instead of guessing from whichever session was active most recently. The old active-session lookup is kept only as a manual/local fallback when both values are absent.
+For every chat-triggered dispatch, pass `--source-context` from the actual
+inbound event. Its `channel`, `target`, and `messageId` are required;
+`threadId` is optional. This envelope is the authoritative request source.
+`--deliver-to` and `--deliver-channel` describe the durable completion target
+and must match the source when both are present. A mismatch exits 2 before any
+Gateway spawn, label mutation, watcher job, or notification. Legacy `--origin`
+and delivery-only behavior remain available for manual/local calls where inbound
+metadata is genuinely unavailable; active-session lookup is only such a
+fallback.
 
 ### Flag Reference
 
@@ -1910,7 +1924,8 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
 | `--model` | configured dispatch default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
-| `--deliver-to` | -- | Delivery target (e.g. Telegram chat ID). Registers the scheduler watcher job for durable final delivery. The gateway spawn itself stays fire-and-forget so raw tool output and internal done payloads cannot leak directly to chat. Chat-triggered callers should pass inbound metadata `chat_id` here, especially for group chats. |
+| `--source-context` | -- | Authoritative inbound JSON envelope containing `channel`, `target`, `messageId`, and optional `threadId`. Required for chat-triggered callers; unknown fields are rejected so only identifiers are persisted. |
+| `--deliver-to` | -- | Durable completion target (e.g. Telegram chat ID). Registers the scheduler watcher job for final delivery. With source context it must match `target`; delivery channel must also match. |
 | `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
 | `--timeout` | `300` | Session timeout in seconds. |
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
@@ -1926,12 +1941,27 @@ For normal chat-triggered dispatches, always pass `--deliver-to` from the inboun
 | `status` | Show current status for a label: session key, spawn time, running/done/error, and liveness data from the sessions store. |
 | `stuck` | Check all running sessions against the stuck threshold. Exits 1 if genuinely stuck sessions remain after auto-resolving completed ones. |
 | `result` | Retrieve the last assistant reply from a session transcript via `chat.history`. |
+| `route` | Return the stored authoritative source envelope and durable delivery route for safe follow-up. |
 | `sync` | Reconcile `labels.json` with sessions store state. Auto-marks sessions as done or error based on idle time. Supports `--dry-run`. |
 | `done` | Agent-side completion signal. The agent calls this as its final action from the originating local dispatch shell to mark itself done immediately (push-based; no idle timeout wait). Do not call it from inside a remote or nested shell, because the label lookup is local to the dispatch host. The stored completion payload is normalized for channel-safe delivery, with checklist/sha metadata used as a fallback when the raw summary is generic or noisy. |
 | `send` | Inject a message into a running session for mid-run steering. The agent sees it as a new user turn. |
 | `steer` | Alias for `send`. The name makes steering intent explicit. |
 | `heartbeat` | Check whether a session has been active within the last 10 minutes. Accepts `--label` or `--session-key`. |
 | `list` | List all tracked labels in `labels.json`, sorted by most recent. Accepts `--status running|done|error` and `--limit`. |
+
+`status`, `result`, and `route` expose `sourceContext` in machine-readable JSON
+after completion. For a later follow-up, resolve the route from the ledger
+instead of a remembered chat map:
+
+```bash
+route_json=$(openclaw-scheduler route --label fix-deploy-script)
+source_channel=$(printf '%s' "$route_json" | jq -r '.sourceContext.channel')
+source_target=$(printf '%s' "$route_json" | jq -r '.sourceContext.target')
+source_thread=$(printf '%s' "$route_json" | jq -r '.sourceContext.threadId // empty')
+```
+
+Pass those stored identifiers to the messaging API used by the caller. The
+scheduler never stores inbound message text or credentials in this envelope.
 
 ### Multi-agent Orchestration
 
@@ -1944,21 +1974,22 @@ The main agent acts as the orchestrator and delegates parallel units of work to 
 ```bash
 # Orchestrator dispatches three workers in parallel.
 # All three run concurrently in isolated sessions.
+SOURCE_CONTEXT='{"channel":"telegram","target":"YOUR_CHAT_ID","messageId":"INBOUND_MESSAGE_ID"}'
 
 openclaw-scheduler enqueue \
   --label   "worker-schema"   \
   --message "Review the DB schema and write documentation for all tables" \
-  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
+  --thinking high --timeout 600 --source-context "$SOURCE_CONTEXT" --deliver-to YOUR_CHAT_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-frontend" \
   --message "Audit the React components for accessibility issues" \
-  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
+  --thinking high --timeout 600 --source-context "$SOURCE_CONTEXT" --deliver-to YOUR_CHAT_ID
 
 openclaw-scheduler enqueue \
   --label   "worker-docs"     \
   --message "Update the API docs to reflect the new /v2 endpoints" \
-  --thinking high --timeout 600 --deliver-to YOUR_CHAT_ID
+  --thinking high --timeout 600 --source-context "$SOURCE_CONTEXT" --deliver-to YOUR_CHAT_ID
 
 # Each worker gets an outbox-delivered, channel-safe completion summary when done.
 # No polling needed. Watchdog jobs are auto-registered for each.
