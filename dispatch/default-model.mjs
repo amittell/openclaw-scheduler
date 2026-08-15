@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
 
-export const STATIC_DISPATCH_DEFAULT_MODEL = 'openai/gpt-5.5';
+// No static model fallback: OpenClaw's configured agent default is the only
+// safe fallback because the gateway's allowlist can change independently.
+export const STATIC_DISPATCH_DEFAULT_MODEL = null;
 
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
