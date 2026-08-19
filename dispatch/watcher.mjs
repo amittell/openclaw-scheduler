@@ -45,6 +45,12 @@ import {
 import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
 import { assertRouteMatchesSource, parseOriginRoute, parseSourceContext } from './source-context.mjs';
+import { callGatewayRpc } from './gateway-rpc.mjs';
+import {
+  projectOpenClawTranscriptEntries,
+  readOpenClawSessionStore,
+  readOpenClawTranscriptTail,
+} from './session-store.mjs';
 import { sendMessage } from '../messages.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from '../paths.js';
 import {
@@ -52,10 +58,7 @@ import {
   assertValidAgentId,
   assertValidSessionId,
   assertValidSessionKey,
-  assertValidSessionStore,
   assertSessionKeyForAgent,
-  resolveAgentSessionsStorePath,
-  resolveSessionTranscriptPath,
   toNullPrototypeRecord,
 } from '../identifiers.js';
 
@@ -157,23 +160,12 @@ const GW_TOKEN = getGatewayToken();
  * Returns parsed JSON or null on failure.
  */
 function gatewayCall(method, params = {}, opts = {}) {
-  const timeout = opts.timeout || 15000;
-  const args = ['gateway', 'call', method, '--json'];
-  args.push('--params', JSON.stringify(params));
-  args.push('--timeout', String(timeout));
-  const childEnv = GW_TOKEN ? { ...process.env, OPENCLAW_GATEWAY_TOKEN: GW_TOKEN } : process.env;
-
   try {
-    const result = execFileSync('openclaw', args, {
-      encoding: 'utf-8',
-      timeout: timeout + 5000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: childEnv,
+    return callGatewayRpc(method, params, {
+      ...opts,
+      gatewayToken: GW_TOKEN,
     });
-    return JSON.parse(result.trim());
-  } catch (err) {
-    const stdout = err.stdout?.trim() || '';
-    if (stdout) try { return JSON.parse(stdout); } catch {}
+  } catch {
     return null;
   }
 }
@@ -189,7 +181,7 @@ function agentFromSessionKey(sessionKey, fallbackAgentId = 'main') {
 
 /**
  * Get current totalTokens for a session.
- * Tries sessions.json first (ground truth), falls back to sessions.list API.
+ * Tries the SQLite-first compatibility store, then sessions.list.
  * Returns number or null if unavailable.
  */
 function getSessionTokens(sessionKey) {
@@ -199,7 +191,7 @@ function getSessionTokens(sessionKey) {
     process.stderr.write(`[watcher] refusing unsafe session metadata: ${error.message}\n`);
     return null;
   }
-  // Primary: sessions.json direct read
+  // Primary: canonical local store read
   const agent = agentFromSessionKey(sessionKey);
   if (!agent) return null;
   const store = readSessionsStore(agent);
@@ -213,7 +205,7 @@ function getSessionTokens(sessionKey) {
   return session?.totalTokens ?? null;
 }
 
-/** Returns the session entry from sessions.json, or null if not found. */
+/** Returns the canonical local session entry, or null if not found. */
 function getSessionStoreEntry(sessionKey) {
   if (!sessionKey) return null;
   let agent;
@@ -294,7 +286,7 @@ function is529Error(errorMsg) {
  * Regex patterns that indicate the session was not found in the sessions store.
  * This is the telltale signature of a gateway-restart-kill: the gateway restarted,
  * wiped in-flight sessions, and the status command auto-resolved the label as 'done'
- * because the sessionKey disappeared from sessions.json.
+ * because the sessionKey disappeared from the canonical local store.
  */
 const GW_KILL_PATTERNS = [
   /session not found in sessions store/i,
@@ -720,57 +712,53 @@ function killSession(sessionKey) {
 }
 
 /**
- * Read the sessions.json store for an agent directly from disk.
- * Primary ground truth for session state -- sessions spawned via dispatcher
- * HTTP agent endpoint appear here but NOT in sessions_list API results.
+ * Read the current OpenClaw SQLite session store, with legacy JSON fallback.
  *
  * @param {string} agent - Agent ID (default: 'main')
  * @returns {Object|null} - Sessions store object, or null on read error
  */
 function readSessionsStore(agent = 'main') {
-  let sessionsPath;
   try {
-    sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, agent);
+    const snapshot = readOpenClawSessionStore(agent, {
+      env: process.env,
+      homeDir: HOME_DIR,
+    });
+    if (snapshot.entries) return snapshot.entries;
+    if (snapshot.error && !snapshot.error?.code) {
+      process.stderr.write(`[watcher] session store unavailable: ${snapshot.error.message}\n`);
+    }
+    return null;
   } catch (error) {
     process.stderr.write(`[watcher] refusing unsafe sessions store path: ${error.message}\n`);
-    return null;
-  }
-  try {
-    return assertValidSessionStore(
-      JSON.parse(readFileSync(sessionsPath, 'utf-8')),
-      `sessions store for agent ${JSON.stringify(agent)}`,
-    );
-  } catch (error) {
-    if (error instanceof SyntaxError || error?.code) return null;
-    process.stderr.write(`[watcher] refusing unsafe sessions store metadata: ${error.message}\n`);
     return null;
   }
 }
 
 /**
- * Get the mtime (in milliseconds) of a session's JSONL file.
+ * Get the latest transcript activity timestamp in milliseconds.
  *
- * Unlike sessions.json (which is NOT flushed during active turns), the JSONL
- * file at ~/.openclaw/agents/<agentDir>/sessions/<sessionId>.jsonl is written
- * continuously as the session processes messages. Use this as a reliable
- * activity signal when totalTokens and updatedAt are flat.
+ * Current OpenClaw exposes transcript freshness through SQLite; older versions
+ * fall back to the JSONL file mtime. Use this as an activity signal when token
+ * counters and session-entry timestamps are flat.
  *
- * Fix rationale: for spawned subagent sessions, OpenClaw does NOT flush
- * totalTokens or updatedAt during active turns -- so sessions.json stays stale
- * while the session is actively working. The JSONL mtime advances on every
- * tool call, model reply, and streaming chunk, making it a much more reliable
+ * Fix rationale: for spawned subagent sessions, OpenClaw may not refresh
+ * totalTokens or session-entry timestamps during active turns. Transcript
+ * activity advances on model/tool events, making it a much more reliable
  * liveness signal. Without this, the watcher hits FLAT_WINDOW_MS mid-turn and
  * marks the session done prematurely, causing zombie sessions with no delivery.
  *
- * @param {string} sessionId - Internal session UUID (entry.sessionId from sessions.json)
+ * @param {string} sessionId - Internal session UUID from the local session entry
  * @param {string} agentDir - Agent directory (default: 'main')
  * @returns {number|null} mtimeMs if file exists, null otherwise
  */
 function getSessionJsonlMtime(sessionId, agentDir = 'main') {
   if (!sessionId) return null;
   try {
-    const jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
-    return statSync(jsonlPath).mtimeMs;
+    return readOpenClawTranscriptTail(agentDir, sessionId, {
+      env: process.env,
+      homeDir: HOME_DIR,
+      limit: 1,
+    }).updatedAtMs;
   } catch (error) {
     if (!error?.code) {
       process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
@@ -792,14 +780,12 @@ function getSessionJsonlMtime(sessionId, agentDir = 'main') {
 function readJsonlLastLines(sessionId, agentDir = 'main', n = 3) {
   if (!sessionId) return null;
   try {
-    const jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
-    const content = readFileSync(jsonlPath, 'utf-8');
-    return content
-      .split('\n')
-      .filter(l => l.trim())
-      .slice(-n)
-      .map(l => { try { return JSON.parse(l); } catch { return null; } })
-      .filter(Boolean);
+    const transcript = readOpenClawTranscriptTail(agentDir, sessionId, {
+      env: process.env,
+      homeDir: HOME_DIR,
+      limit: n,
+    });
+    return projectOpenClawTranscriptEntries(transcript.events);
   } catch (error) {
     if (!error?.code) {
       process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
@@ -956,20 +942,8 @@ function getJsonlArtifactEvidenceFromEntries(entries) {
  */
 function getJsonlMidTurnReason(sessionId, agentDir = 'main') {
   if (!sessionId) return null;
-
-  let jsonlPath;
-  try {
-    jsonlPath = resolveSessionTranscriptPath(HOME_DIR, agentDir, sessionId);
-  } catch (error) {
-    process.stderr.write(`[watcher] refusing unsafe session transcript path: ${error.message}\n`);
-    return null;
-  }
-  let mtimeMs;
-  try {
-    mtimeMs = statSync(jsonlPath).mtimeMs;
-  } catch {
-    return null; // File doesn't exist -- session is genuinely gone, safe to proceed
-  }
+  const mtimeMs = getSessionJsonlMtime(sessionId, agentDir);
+  if (mtimeMs === null) return null;
 
   // If JSONL hasn't been modified in >FLAT_WINDOW_MS, session isn't actively running
   if (Date.now() - mtimeMs > FLAT_WINDOW_MS) {
@@ -1851,17 +1825,17 @@ while (Date.now() < deadline) {
   }
 
   // Track session presence -- two independent signals, either is sufficient.
-  // 1. Sessions.json store (primary ground truth for dispatcher-spawned sessions)
-  // 2. Liveness field from dispatch status (secondary; also built from sessions.json
+  // 1. SQLite-first local store (primary ground truth for dispatcher-spawned sessions)
+  // 2. Liveness field from dispatch status (secondary; also built from local state
   //    in production, but test mocks may provide it directly)
   if (!sessionEverFound && status.sessionKey) {
     const sessionAgent = status.agent || 'main';
     const watcherStore = readSessionsStore(sessionAgent);
     if (watcherStore !== null && status.sessionKey in watcherStore) {
-      // Found in sessions.json -- authoritative
+      // Found in the local store -- authoritative
       sessionEverFound = true;
     } else if (status.liveness && !status.liveness.error) {
-      // Not in sessions.json (or store unavailable) but liveness signal says alive --
+      // Not in local state (or store unavailable) but liveness says alive --
       // session may still be initializing. Trust liveness as a secondary signal.
       sessionEverFound = true;
     }
@@ -1938,11 +1912,9 @@ while (Date.now() < deadline) {
     }
 
     // -- Gateway-restart-kill detection ----------------------------------
-    // When a gateway restart kills an in-flight session, the session disappears
-    // from sessions.json and the status command auto-resolves it as 'done' with
-    // a "session not found in sessions store" summary. This is NOT a real
-    // completion -- the task was interrupted mid-run. Detect this pattern and
-    // re-dispatch up to MAX_GW_RESTART_RETRIES times.
+    // Older status implementations could auto-resolve a disappeared in-flight
+    // session with a "session not found" summary. This is NOT a real completion.
+    // Retain recovery handling for those durable legacy label records.
     //
     // Key distinction vs spawn failure:
     //   spawn failure:          sessionEverFound=false (session never appeared)
@@ -2145,10 +2117,9 @@ let tokenSessionKey = statusAtDeadline?.sessionKey || recoverySessionKey || null
 let baselineTokens = getTokenCount(tokenSessionKey);
 let flatSince = Date.now();
 
-// Capture the internal sessionId (UUID) from sessions.json -- this is the filename
-// of the JSONL file, distinct from the sessionKey (agent:main:subagent:UUID).
-// The JSONL is updated continuously during active turns, making it a reliable
-// activity signal when sessions.json totalTokens/updatedAt are stale.
+// Capture the internal sessionId (UUID) from the local store. It is distinct
+// from the sessionKey (agent:main:subagent:UUID). Transcript freshness is a
+// reliable activity signal when token counters/session timestamps are stale.
 const _deadlineEntry = getSessionStoreEntry(tokenSessionKey);
 const sessionInternalId = _deadlineEntry?.sessionId || null;
 const sessionAgent = tokenSessionKey ? agentFromSessionKey(tokenSessionKey) : 'main';

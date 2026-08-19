@@ -174,6 +174,11 @@ export function normalizeShellResult(
   ].filter(Boolean);
   if (blocks.length === 0 && errorMessage) blocks.push(errorMessage);
   const previewText = blocks.join('\n\n').trim() || '(no output)';
+  // Keep an explicit summary for operators and run history, but do not turn a
+  // successful zero-byte result into a user-facing placeholder. This also
+  // makes an accidentally configured announce-always job quiet when the
+  // script intentionally communicates only through its own durable outbox.
+  const deliveryText = status === 'ok' && blocks.length === 0 ? '' : previewText;
 
   return {
     status,
@@ -191,7 +196,7 @@ export function normalizeShellResult(
     stdoutTruncated: stdoutStored.truncated,
     stderrTruncated: stderrStored.truncated,
     summary: truncateText(previewText, summaryLimit).text,
-    deliveryText: previewText,
+    deliveryText,
     imageAttachments,
     errorMessage,
     contextSummary: {

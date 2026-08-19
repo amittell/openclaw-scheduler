@@ -1923,7 +1923,7 @@ fallback.
 | `--message-stdin` | -- | Read the prompt from stdin explicitly. If stdin is piped and no explicit prompt source is set, dispatch auto-reads stdin. |
 | `--mode` | `fresh` | `fresh` creates a new session. `reuse` continues the last session recorded for this label. |
 | `--thinking` | -- | Reasoning budget: `low`, `high`, or `xhigh`. |
-| `--model` | configured dispatch default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, `agents.defaults.model`, then the built-in fallback. |
+| `--model` | configured OpenClaw default | Model override, e.g. `anthropic/claude-sonnet-4-6`. When omitted, dispatch uses wrapper `config.defaultModel`, wrapper `config.dispatch.model`, `DISPATCH_DEFAULT_MODEL`, `agents.defaults.dispatch.model`, or `agents.defaults.model`; otherwise the Gateway selects its configured default. Rejected explicit overrides fail enqueue. |
 | `--source-context` | -- | Authoritative inbound JSON envelope containing `channel`, `target`, `messageId`, and optional `threadId`. Required for chat-triggered callers; unknown fields are rejected so only identifiers are persisted. |
 | `--deliver-to` | -- | Durable completion target (e.g. Telegram chat ID). Registers the scheduler watcher job for final delivery. With source context it must match `target`; delivery channel must also match. |
 | `--delivery-mode` | `announce` | `announce` delivers only when output is non-empty. `announce-always` delivers unconditionally. `none` suppresses delivery. |
@@ -1967,7 +1967,7 @@ scheduler never stores inbound message text or credentials in this envelope.
 
 The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are enqueued for durable outbox delivery to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
 
-**Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. The dispatcher sets `spawnDepth: 1` on each fresh session automatically.
+**Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. Current OpenClaw derives and enforces depth in its native session/runtime policy; dispatch does not send the obsolete `sessions.patch spawnDepth` field.
 
 **Example: 3 parallel workers**
 

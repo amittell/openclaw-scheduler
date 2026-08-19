@@ -66,19 +66,22 @@ import {
   sourceContextToOrigin,
   sourceContextToSchedulerFields,
 } from './source-context.mjs';
+import { callGatewayRpc } from './gateway-rpc.mjs';
+import {
+  projectOpenClawTranscriptEntries,
+  readOpenClawSessionStore,
+  readOpenClawTranscriptTail,
+} from './session-store.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
 import {
   agentIdFromSessionKey as validatedAgentIdFromSessionKey,
   assertValidAgentId,
   assertValidSessionId,
   assertValidSessionKey,
-  assertValidSessionStore,
   assertSessionKeyForAgent,
   buildGatewayEndpointUrl,
   buildGatewaySessionUrl,
   parseGatewayBaseUrl,
-  resolveAgentSessionsStorePath,
-  resolveSessionTranscriptPath,
   toNullPrototypeRecord,
 } from '../identifiers.js';
 
@@ -486,39 +489,10 @@ function effectiveCompletionSummary(entry, lastReply = null) {
  * Returns parsed JSON response.
  */
 function gatewayCall(method, params = {}, opts = {}) {
-  const timeout     = opts.timeout || 15000;
-  const expectFinal = opts.expectFinal || false;
-
-  const args = ['gateway', 'call', method, '--json'];
-  args.push('--params', JSON.stringify(params));
-  args.push('--timeout', String(timeout));
-  if (expectFinal) args.push('--expect-final');
-  const childEnv = GATEWAY_TOKEN ? { ...process.env, OPENCLAW_GATEWAY_TOKEN: GATEWAY_TOKEN } : process.env;
-
-  try {
-    const result = execFileSync('openclaw', args, {
-      encoding: 'utf-8',
-      timeout:  timeout + 5000,
-      stdio:    ['pipe', 'pipe', 'pipe'],
-      env:      childEnv,
-    });
-    // Strip non-JSON prefix lines (e.g. plugin init logs leaking to stdout)
-    const trimmed = result.trim();
-    const jsonStart = trimmed.indexOf('{');
-    const cleaned = jsonStart > 0 ? trimmed.slice(jsonStart) : trimmed;
-    return JSON.parse(cleaned);
-  } catch (err) {
-    const stderr = err.stderr?.trim() || '';
-    const stdout = err.stdout?.trim() || '';
-    if (stdout) {
-      const idx = stdout.indexOf('{');
-      const cleanStdout = idx > 0 ? stdout.slice(idx) : stdout;
-      try { return JSON.parse(cleanStdout); } catch {}
-    }
-    throw new Error(`gateway call ${method} failed: ${stderr || stdout || err.message}`, {
-      cause: err,
-    });
-  }
+  return callGatewayRpc(method, params, {
+    ...opts,
+    gatewayToken: GATEWAY_TOKEN,
+  });
 }
 
 // -- Gateway Error Log Check ----------------------------------
@@ -598,44 +572,28 @@ function check529InGatewayLog(sessionKey) {
   };
 }
 
-// -- Sessions Store (Direct Read) -----------------------------
+// -- OpenClaw Session Store (SQLite-first, legacy fallback) ---
 
 /**
- * Read the sessions.json store for an agent directly from disk.
- * This is the ground truth for session state -- sessions spawned via the
- * dispatcher HTTP agent endpoint appear here but NOT in sessions_list API.
- *
- * Sessions are NOT pruned on completion -- completed sessions stay in the file.
+ * Read the current per-agent SQLite session store, with sessions.json fallback
+ * for older OpenClaw installations.
  *
  * @param {string} agent - Agent ID (default: 'main')
  * @returns {Object|null} - The sessions store object, or null on error
  */
 function readSessionsStore(agent = 'main') {
-  let sessionsPath;
   try {
-    sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, agent);
+    const snapshot = readOpenClawSessionStore(agent, {
+      env: process.env,
+      homeDir: HOME_DIR,
+    });
+    if (snapshot.entries) return snapshot.entries;
+    if (snapshot.error && !snapshot.error?.code) {
+      process.stderr.write(`[${BRAND}] session store unavailable: ${snapshot.error.message}\n`);
+    }
+    return null;
   } catch (error) {
     process.stderr.write(`[${BRAND}] Refusing unsafe sessions store path: ${error.message}\n`);
-    return null;
-  }
-  try {
-    return assertValidSessionStore(
-      JSON.parse(readFileSync(sessionsPath, 'utf-8')),
-      `sessions store for agent ${JSON.stringify(agent)}`,
-    );
-  } catch (error) {
-    if (error instanceof SyntaxError || error?.code) return null;
-    process.stderr.write(`[${BRAND}] Refusing unsafe sessions store metadata: ${error.message}\n`);
-    return null;
-  }
-}
-
-function getSessionJsonlPath(agent = 'main', sessionId) {
-  if (!sessionId) return null;
-  try {
-    return resolveSessionTranscriptPath(HOME_DIR, agent, sessionId);
-  } catch (error) {
-    process.stderr.write(`[${BRAND}] Refusing unsafe session transcript path: ${error.message}\n`);
     return null;
   }
 }
@@ -657,8 +615,14 @@ function inspectSessionActivitySignal(sessionKey, sessionsStore) {
 
   const agent = agentFromSessionKey(sessionKey) || 'main';
   const entry = sessionsStore[sessionKey];
-  const jsonlPath = getSessionJsonlPath(agent, entry.sessionId);
-  const jsonlExists = jsonlPath ? existsSync(jsonlPath) : false;
+  const transcript = entry.sessionId
+    ? readOpenClawTranscriptTail(agent, entry.sessionId, {
+        env: process.env,
+        homeDir: HOME_DIR,
+        limit: 1,
+      })
+    : null;
+  const transcriptExists = Boolean(transcript?.events?.length);
   const hasTokens = typeof entry.totalTokens === 'number' && entry.totalTokens > 0;
   const sessionStartedAtMs = toTimestampMs(entry.sessionStartedAt || entry.startedAt);
   const updatedAtMs = toTimestampMs(entry.updatedAt);
@@ -675,9 +639,9 @@ function inspectSessionActivitySignal(sessionKey, sessionsStore) {
   return {
     found: true,
     hasStartedSignal,
-    hasActivitySignal: jsonlExists || hasTokens || (typeof messageCount === 'number' && messageCount > 0),
+    hasActivitySignal: transcriptExists || hasTokens || (typeof messageCount === 'number' && messageCount > 0),
     messageCount,
-    jsonlExists,
+    jsonlExists: transcriptExists,
     hasTokens,
     updatedAtMs,
     sessionStartedAtMs,
@@ -714,28 +678,23 @@ function inspectSessionBootstrapFailure(sessionKey, sessionsStore, spawnedAtMs, 
 function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
   if (!sessionId) return null;
   try {
-    const jsonlPath = getSessionJsonlPath(agent, sessionId);
-    if (!jsonlPath) return null;
-    return readFileSync(jsonlPath, 'utf-8')
-      .split('\n')
-      .filter(line => line.trim())
-      .slice(-maxLines)
-      .map(line => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  } catch {
+    const transcript = readOpenClawTranscriptTail(agent, sessionId, {
+      env: process.env,
+      homeDir: HOME_DIR,
+      limit: maxLines,
+    });
+    return projectOpenClawTranscriptEntries(transcript.events);
+  } catch (error) {
+    if (!error?.code) {
+      process.stderr.write(`[${BRAND}] transcript read failed: ${error.message}\n`);
+    }
     return null;
   }
 }
 
 /**
  * Auto-detect the originating channel from the most recently active main session.
- * Reads sessions.json, finds sessions active within the last 10 minutes,
+ * Reads the SQLite-first compatibility store, finds sessions active within the last 10 minutes,
  * excludes subagent sessions, returns deliveryContext.to of the most recent one.
  *
  * @returns {string|null} - e.g. "telegram:-100200000000", or null if not found
@@ -895,10 +854,12 @@ function agentFromSessionKey(sessionKey) {
 }
 
 function getSessionJsonlMtimeMs(agent, sessionId) {
-  const jsonlPath = getSessionJsonlPath(agent, sessionId);
-  if (!jsonlPath) return null;
   try {
-    return statSync(jsonlPath).mtimeMs;
+    return readOpenClawTranscriptTail(agent, sessionId, {
+      env: process.env,
+      homeDir: HOME_DIR,
+      limit: 1,
+    }).updatedAtMs;
   } catch {
     return null;
   }
@@ -1079,16 +1040,16 @@ function checkSessionTurnAborted(labelEntry, sessionsStore) {
 // -- Gateway Session State Check ------------------------------
 
 /**
- * Determine if a session should be auto-resolved as "done" based on sessions.json state.
+ * Determine whether canonical local/session signals justify auto-resolution.
  *
  * Decision logic (in priority order):
  *   1. Store unavailable (null)                    -> do NOT resolve (safe default)
- *   2. Session key NOT in store                    -> resolve (never spawned or spawn failure)
+ *   2. Session key NOT in store                    -> defer unless an explicit lane error exists
  *   3. Session found but idle past threshold       -> resolve (completed)
  *   4. Session has recent activity                 -> do NOT resolve
  *
  * @param {string}      sessionKey       - The session key to check
- * @param {Object|null} sessionsStore    - Sessions.json object (null = unavailable)
+ * @param {Object|null} sessionsStore    - SQLite-first compatibility snapshot (null = unavailable)
  * @param {number}      thresholdMs      - Silence threshold in ms
  * @param {boolean}     [sessionEverFound=true] - Whether the session was ever seen in the store.
  *                                                Pass false to get a distinct "spawn likely failed"
@@ -1110,12 +1071,12 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     };
   }
 
-  // 1. Not in sessions store -> session never appeared or already cleaned up
+  // 1. Not in sessions store -> session may be delayed, hidden, or cleaned up.
   //    BUT: young sessions (<5 min old) may simply not have propagated yet,
   //    especially right after a gateway restart. Don't auto-resolve those.
-  //    Also: in openclaw 2026.3.13+, subagent sessions are tracked via
-  //    SessionBindingService and are NOT written to sessions.json. Fall back
-  //    to the gateway sessions.list API before concluding the session is done.
+  //    Fall back to the gateway sessions.list API for a positive liveness
+  //    signal, but never treat an empty list as authoritative: tree visibility
+  //    can intentionally hide an externally spawned child.
   const YOUNG_SESSION_MS = 5 * 60 * 1000;
   if (!sessionsStore[sessionKey]) {
     const ageMs = spawnedAtMs ? Date.now() - spawnedAtMs : Infinity;
@@ -1127,9 +1088,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
       };
     }
 
-    // Gateway API fallback: check if session is actually still active.
-    // Subagents in 2026.3.13+ are NOT written to sessions.json, so absence
-    // from the store does not mean the session is gone.
+    // Gateway API fallback: check if session is visibly active.
     try {
       const listResult = gatewayCall('sessions.list', { activeMinutes: 1440 }, { timeout: 8000 });
       const liveSession = listResult?.sessions?.find(s => s.key === sessionKey);
@@ -1137,7 +1096,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
         // Session is alive in gateway -- do NOT auto-resolve
         return {
           shouldResolve: false,
-          reason:       'session not in sessions.json but confirmed active via gateway API',
+          reason:       'session absent from local store but confirmed active via gateway API',
           lastActivity:  liveSession.updatedAt || null,
         };
       }
@@ -1150,16 +1109,22 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
       };
     }
 
+    if (logCheck.found) {
+      return {
+        shouldResolve: true,
+        reason: `529/overload error detected: ${logCheck.error}`,
+        lastActivity: null,
+        is529: true,
+        errorMsg: logCheck.error || null,
+      };
+    }
+
     return {
-      shouldResolve: true,
-      reason:       logCheck.found
-        ? `529/overload error detected: ${logCheck.error}`
-        : sessionEverFound
-          ? 'session not found in sessions store or gateway API'
-          : 'session never found -- spawn likely failed',
-      lastActivity:  null,
-      is529:         logCheck.found,
-      errorMsg:      logCheck.error || null,
+      shouldResolve: false,
+      reason: sessionEverFound
+        ? 'session absent from local store and not visible through gateway; deferring to timeout policy'
+        : 'accepted session not observable yet; deferring to timeout policy',
+      lastActivity: null,
     };
   }
 
@@ -1181,6 +1146,16 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
     return {
       shouldResolve: true,
       reason: terminalReason,
+      lastActivity,
+      sessionStatus,
+    };
+  }
+
+  if (sessionStatus === 'done') {
+    return {
+      shouldResolve: true,
+      completed: true,
+      reason: 'OpenClaw SQLite session status=done',
       lastActivity,
       sessionStatus,
     };
@@ -1238,6 +1213,34 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   };
 }
 
+function isRecoverableSpawnFailure(entry) {
+  if (!entry || !['error', 'spawn-warning'].includes(entry.status)) return false;
+  return /spawn[- ]failure|never (?:produced|appeared)|never found/i.test(
+    `${entry.error || ''} ${entry.summary || ''}`,
+  );
+}
+
+function recoverFalseSpawnFailure(label, entry, sessionsStore) {
+  if (!isRecoverableSpawnFailure(entry) || !entry.sessionKey) return null;
+  const canonicalEntry = sessionsStore?.[entry.sessionKey];
+  if (!canonicalEntry) return null;
+  const canonicalStatus = typeof canonicalEntry.status === 'string'
+    ? canonicalEntry.status.trim().toLowerCase()
+    : '';
+  if (isTerminalAbnormalSessionStatus(canonicalStatus)) return null;
+
+  const recoveredStatus = canonicalStatus === 'done' ? 'done' : 'running';
+  setLabel(label, {
+    status: recoveredStatus,
+    error: null,
+    summary: recoveredStatus === 'done'
+      ? 'Recovered completed session from OpenClaw SQLite state'
+      : null,
+    ...(canonicalEntry.sessionId ? { sessionId: canonicalEntry.sessionId } : {}),
+  });
+  return recoveredStatus;
+}
+
 // openclaw's SessionEntry.status vocabulary is exactly
 // running|done|failed|killed|timeout (src/config/sessions/types.ts,
 // isTerminalSessionStatus). Only the abnormal terminal states mean the agent
@@ -1246,6 +1249,7 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
 // idle liveness -- treating it as terminal here would race a late cmdDone and
 // emit a spurious "interrupted" announce.
 const TERMINAL_ABNORMAL_SESSION_STATUSES = new Set(['timeout', 'failed', 'killed']);
+const TERMINAL_SESSION_STATUSES = new Set(['done', ...TERMINAL_ABNORMAL_SESSION_STATUSES]);
 
 function isTerminalAbnormalSessionStatus(status) {
   return TERMINAL_ABNORMAL_SESSION_STATUSES.has(status);
@@ -1254,7 +1258,7 @@ function isTerminalAbnormalSessionStatus(status) {
 function hasTerminalSessionStoreStatus(sessionEntry) {
   const sessionStatus =
     typeof sessionEntry?.status === 'string' ? sessionEntry.status.trim().toLowerCase() : '';
-  return isTerminalAbnormalSessionStatus(sessionStatus);
+  return TERMINAL_SESSION_STATUSES.has(sessionStatus);
 }
 
 // -- Watchdog Helpers -----------------------------------------
@@ -1565,14 +1569,10 @@ async function cmdEnqueue(flags) {
 
   const idem = randomUUID();
 
-  // -- Patch session (model, thinking, spawnDepth) if fresh ----
+  // -- Patch supported session preferences if fresh -----------
+  // Spawn lineage is owned by OpenClaw's sessions.create/sessions_spawn
+  // runtime. Current sessions.patch intentionally rejects spawnDepth.
   if (isFresh) {
-    try {
-      gatewayCall('sessions.patch', { key: sessionKey, spawnDepth: 1 }, { timeout: 10000 });
-    } catch (err) {
-      die(`sessions.patch (spawnDepth) failed: ${err.message}`);
-    }
-
     if (model) {
       try {
         gatewayCall('sessions.patch', { key: sessionKey, model }, { timeout: 10000 });
@@ -1588,7 +1588,7 @@ async function cmdEnqueue(flags) {
           thinkingLevel: thinking === 'off' ? null : thinking,
         }, { timeout: 10000 });
       } catch (err) {
-        process.stderr.write(`[${agentBrand}] sessions.patch (thinking) warning: ${err.message}\n`);
+        die(`sessions.patch (thinking) failed: ${err.message}`);
       }
     }
   }
@@ -1880,13 +1880,20 @@ async function cmdEnqueue(flags) {
     });
 
     // -- Post-spawn verification (Fix 3) --------------------------------
-    // Canary: inspect sessions.json immediately, then wait up to 3 intervals to
+    // Canary: inspect the SQLite-first compatibility store immediately, then
+    // wait up to 3 intervals to
     // confirm the session appeared in the store. A session store entry with
     // sessionId or startedAt/sessionStartedAt is enough: long first turns may not
     // flush JSONL, token counts, or chat.history until the model call completes.
     // The delivery watcher owns later completion/failure handling.
-    const SPAWN_POLL_MAX = 3;
-    const SPAWN_POLL_DELAY_MS = 10_000;
+    const configuredSpawnPollMax = Number(config.spawnPollMax);
+    const configuredSpawnPollDelayMs = Number(config.spawnPollDelayMs);
+    const SPAWN_POLL_MAX = Number.isInteger(configuredSpawnPollMax)
+      ? Math.min(12, Math.max(0, configuredSpawnPollMax))
+      : 3;
+    const SPAWN_POLL_DELAY_MS = Number.isFinite(configuredSpawnPollDelayMs)
+      ? Math.min(60_000, Math.max(1, configuredSpawnPollDelayMs))
+      : 10_000;
     let spawnConfirmed = false;
     for (let spawnPoll = 0; spawnPoll <= SPAWN_POLL_MAX; spawnPoll++) {
       const spawnStore = readSessionsStore(agent);
@@ -1901,17 +1908,24 @@ async function cmdEnqueue(flags) {
     }
     if (!spawnConfirmed) {
       const laneError = getGatewayLaneTaskError(sessionKey);
-      const spawnError = laneError.found && laneError.error
-        ? `spawn-failure: ${laneError.error}`
-        : `spawn-failure: session ${sessionKey} never produced transcript/history within ` +
-          `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s`;
-      process.stderr.write(`[${agentBrand}] WARNING: ${spawnError}\n`);
-      setLabel(label, {
-        status: 'error',
-        error: spawnError,
-        summary: spawnError,
-      });
-      disarmWatchdog(label);
+      if (laneError.found && laneError.error) {
+        const spawnError = `spawn-failure: ${laneError.error}`;
+        process.stderr.write(`[${agentBrand}] WARNING: ${spawnError}\n`);
+        setLabel(label, {
+          status: 'error',
+          error: spawnError,
+          summary: spawnError,
+        });
+        disarmWatchdog(label);
+      } else {
+        // The agent RPC was accepted. Visibility policies and delayed database
+        // persistence can hide a healthy child from both local and gateway
+        // reads, so the watcher/job timeout owns eventual failure.
+        process.stderr.write(
+          `[${agentBrand}] session ${sessionKey} is not observable yet after ` +
+          `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s; leaving accepted run active\n`,
+        );
+      }
     }
   } catch (err) {
     die(`gateway agent call failed: ${err.message}`);
@@ -1929,7 +1943,7 @@ function cmdStatus(flags) {
   const label = flags.label;
   if (!label) die('--label is required', 2);
 
-  const entry = getLabel(label);
+  let entry = getLabel(label);
   if (!entry) {
     out({ ok: true, label, found: false, message: 'No session found for this label' });
     return;
@@ -1938,9 +1952,15 @@ function cmdStatus(flags) {
   let liveness   = null;
   let syncAction = null;
 
-  // Read sessions.json store for state checks (replaces sessions_list API call)
+  // Read the SQLite-first local store for state checks.
   const statusAgent = entry.agent || agentFromSessionKey(entry.sessionKey) || 'main';
   const sessionsStore = readSessionsStore(statusAgent);
+
+  const recoveredStatus = recoverFalseSpawnFailure(label, entry, sessionsStore);
+  if (recoveredStatus) {
+    syncAction = `recovered false spawn failure from OpenClaw SQLite state (${recoveredStatus})`;
+    entry = getLabel(label);
+  }
 
   // For "running" sessions, check sessions store and auto-resolve if done
   if (entry.status === 'running' && entry.sessionKey) {
@@ -2032,6 +2052,11 @@ function cmdStatus(flags) {
               summary: `Auto-resolved as error: ${check.reason}`,
             });
             syncAction = `auto-resolved as 529 error: ${check.reason}`;
+          } else if (check.completed) {
+            setLabelDone(label, {
+              summary: 'Recovered completed session from OpenClaw SQLite state',
+            });
+            syncAction = `auto-resolved as done: ${check.reason}`;
           } else {
             setLabel(label, {
               status:  'interrupted',
@@ -2049,7 +2074,7 @@ function cmdStatus(flags) {
     }
   }
 
-  // Build liveness from sessions.json store
+  // Build liveness from the canonical local store.
   if (entry.sessionKey && sessionsStore) {
     const sessionEntry = sessionsStore[entry.sessionKey];
     if (sessionEntry) {
@@ -2152,7 +2177,19 @@ async function cmdStuck(flags) {
     return sessionsStoreByAgent[ag];
   }
 
-  for (const [name, entry] of Object.entries(labels)) {
+  for (const [name, originalEntry] of Object.entries(labels)) {
+    let entry = originalEntry;
+    if (isRecoverableSpawnFailure(entry)) {
+      const recoveryStore = getSessionsStoreForEntry(entry);
+      const recovered = recoverFalseSpawnFailure(name, entry, recoveryStore);
+      if (recovered) {
+        autoResolved.push({
+          label: name,
+          reason: `recovered false spawn failure from OpenClaw SQLite state (${recovered})`,
+        });
+        entry = getLabel(name) || entry;
+      }
+    }
     if (entry.status !== 'running') continue;
 
     // -- Per-job timeout: don't flag until the job's own timeout has elapsed --
@@ -2187,6 +2224,11 @@ async function cmdStuck(flags) {
           summary: `Auto-resolved as error: ${check.reason}`,
         });
         autoResolved.push({ label: name, reason: `529 error: ${check.reason}` });
+      } else if (check.completed) {
+        setLabelDone(name, {
+          summary: 'Recovered completed session from OpenClaw SQLite state',
+        });
+        autoResolved.push({ label: name, reason: check.reason });
       } else {
         setLabel(name, {
           status:  'interrupted',
@@ -2277,10 +2319,24 @@ function cmdSync(flags) {
     return syncStoreByAgent[ag];
   }
 
-  for (const [name, entry] of Object.entries(labels)) {
+  for (const [name, originalEntry] of Object.entries(labels)) {
+    let entry = originalEntry;
+    const syncStore = getSyncStore(entry);
+    if (isRecoverableSpawnFailure(entry) && syncStore?.[entry.sessionKey]) {
+      const canonicalStatus = syncStore[entry.sessionKey]?.status;
+      const targetStatus = canonicalStatus === 'done' ? 'done' : 'running';
+      changes.push({
+        label: name,
+        from: entry.status,
+        to: targetStatus,
+        reason: 'canonical OpenClaw SQLite session exists',
+      });
+      if (dryRun) continue;
+      recoverFalseSpawnFailure(name, entry, syncStore);
+      entry = getLabel(name) || entry;
+    }
     if (entry.status !== 'running') continue;
 
-    const syncStore = getSyncStore(entry);
     const spawnedAtMs = entry.spawnedAt ? new Date(entry.spawnedAt).getTime() : 0;
     const elapsedMs   = Date.now() - spawnedAtMs;
     const STARTUP_GRACE_MS_SYNC = config.startupGraceMs ?? 300_000;
@@ -2337,7 +2393,7 @@ function cmdSync(flags) {
     if (hasTerminalSessionStoreStatus(sessionEntry)) {
       const check = checkSessionDone(entry.sessionKey, syncStore, idleThresholdMsSync, true, spawnedAtMs);
       if (!check.shouldResolve) continue;
-      const newStatus = check.is529 ? 'error' : 'interrupted';
+      const newStatus = check.is529 ? 'error' : check.completed ? 'done' : 'interrupted';
       changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
       if (!dryRun) {
         if (check.is529) {
@@ -2345,6 +2401,10 @@ function cmdSync(flags) {
             status:  'error',
             error:   check.errorMsg || `529/overload: ${check.reason}`,
             summary: `Synced as error: ${check.reason}`,
+          });
+        } else if (check.completed) {
+          setLabelDone(name, {
+            summary: 'Recovered completed session from OpenClaw SQLite state',
           });
         } else {
           setLabel(name, {
@@ -2372,7 +2432,7 @@ function cmdSync(flags) {
     const check = checkSessionDone(entry.sessionKey, syncStore, syncThresh, true, spawnedAtMs);
 
     if (check.shouldResolve) {
-      const newStatus = check.is529 ? 'error' : 'interrupted';
+      const newStatus = check.is529 ? 'error' : check.completed ? 'done' : 'interrupted';
       changes.push({ label: name, from: 'running', to: newStatus, reason: check.reason });
       if (!dryRun) {
         if (check.is529) {
@@ -2380,6 +2440,10 @@ function cmdSync(flags) {
             status:  'error',
             error:   check.errorMsg || `529/overload: ${check.reason}`,
             summary: `Synced as error: ${check.reason}`,
+          });
+        } else if (check.completed) {
+          setLabelDone(name, {
+            summary: 'Recovered completed session from OpenClaw SQLite state',
           });
         } else {
           setLabel(name, {
@@ -2452,6 +2516,17 @@ function cmdResult(flags) {
     if (jsonlDiagnostic) {
       diagnosticReply = jsonlDiagnostic;
       if (!recoverySource) recoverySource = 'jsonl-diagnostic';
+    }
+    if (
+      !lastReply
+      && jsonlDiagnostic
+      && typeof resultSessionEntry?.status === 'string'
+      && resultSessionEntry.status.trim().toLowerCase() === 'done'
+    ) {
+      // A canonical SQLite lifecycle status of done is terminal evidence even
+      // when provider-specific transcript rows omit legacy stop_reason fields.
+      lastReply = jsonlDiagnostic;
+      recoverySource = 'sqlite-done';
     }
   }
 
@@ -2956,26 +3031,30 @@ function cmdHeartbeat(flags) {
   const hbStore = readSessionsStore(hbAgent || 'main');
 
   if (!hbStore) {
-    out({ ok: false, sessionKey, alive: false, message: 'Sessions store unavailable' });
+    out({ ok: false, sessionKey, alive: false, message: 'Canonical local session store unavailable' });
     return;
   }
 
   const sessionEntry = hbStore[sessionKey];
   if (!sessionEntry) {
-    out({ ok: false, sessionKey, alive: false, message: 'Session not found in sessions store' });
+    out({ ok: false, sessionKey, alive: false, message: 'Session not found in canonical local store' });
     return;
   }
 
   const ageMs = sessionEntry.updatedAt
     ? Date.now() - (typeof sessionEntry.updatedAt === 'number' ? sessionEntry.updatedAt : new Date(sessionEntry.updatedAt).getTime())
     : null;
+  const sessionStatus = typeof sessionEntry.status === 'string'
+    ? sessionEntry.status.trim().toLowerCase()
+    : null;
 
   out({
     ok:        true,
     sessionKey,
     label:     label || null,
-    alive:     ageMs !== null && ageMs < 10 * 60 * 1000,
+    alive:     !TERMINAL_SESSION_STATUSES.has(sessionStatus) && ageMs !== null && ageMs < 10 * 60 * 1000,
     ageMs,
+    status:    sessionStatus,
     updatedAt: sessionEntry.updatedAt ? new Date(sessionEntry.updatedAt).toISOString() : null,
     sessionId: sessionEntry.sessionId,
     model:     sessionEntry.model || null,
@@ -2993,7 +3072,16 @@ function cmdList(flags) {
   const filterStatus = flags.status || null;
   const limit        = parseInt(flags.limit || '20', 10);
 
-  const labels = loadValidatedLabels();
+  let labels = loadValidatedLabels();
+  let recoveredAny = false;
+  const storesByAgent = {};
+  for (const [name, entry] of Object.entries(labels)) {
+    if (!isRecoverableSpawnFailure(entry) || !entry.sessionKey) continue;
+    const agent = entry.agent || agentFromSessionKey(entry.sessionKey) || 'main';
+    if (!(agent in storesByAgent)) storesByAgent[agent] = readSessionsStore(agent);
+    if (recoverFalseSpawnFailure(name, entry, storesByAgent[agent])) recoveredAny = true;
+  }
+  if (recoveredAny) labels = loadValidatedLabels();
   let entries = Object.entries(labels).map(([name, data]) => ({
     label: name,
     ...data,
