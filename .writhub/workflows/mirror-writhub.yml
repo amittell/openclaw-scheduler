@@ -1,0 +1,55 @@
+name: Mirror to WritHub
+#
+# WritHub-side shadow of `.github/workflows/mirror-writhub.yml`, whose only
+# purpose is to make that workflow STOP AUTO-DISPATCHING ON WRITHUB.
+#
+# The GitHub workflow mirrors GitHub refs INTO WritHub using a `WRITHUB_TOKEN`
+# secret. On WritHub that job is meaningless by construction -- it would mirror
+# this repository into itself -- and the secret does not exist there, so it
+# failed on every single push with:
+#
+#     WRITHUB_TOKEN is not configured
+#     exitcode '1': failure
+#
+# A workflow that runs and always fails is worse than one that does not run:
+# it trains everyone to ignore red. No credential is added here, and none
+# should be: the job has nothing useful to do on this forge even with one.
+#
+# HOW THIS DISABLES IT, precisely. WritHub's push dispatcher enumerates every
+# top-level `.yml` under BOTH workflow roots, deduplicates by filename with
+# `.writhub` winning, and evaluates the `on: push:` trigger of the WINNING file.
+# `.github/workflows/mirror-writhub.yml` declares `push: branches: ['**']`, so it
+# matched every branch. This shadow declares only `workflow_dispatch`, so the
+# trigger matcher finds no `push` key and the workflow is never auto-dispatched
+# on WritHub at all.
+#
+# COVERAGE LOST: none. The GitHub file is untouched and still mirrors on every
+# GitHub push, which is the only place that mirroring means anything. The
+# workflow also remains runnable on demand here (`POST /ci/dispatch`), and when
+# it is run it says why it did nothing instead of failing.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this GitHub-only workflow is being run on WritHub'
+        required: false
+
+jobs:
+  explain:
+    name: GitHub-only workflow (no-op on WritHub)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Explain why there is nothing to do
+        run: |
+          echo "mirror-writhub is a GitHub Actions workflow: it pushes GitHub"
+          echo "refs to writhub.io using the WRITHUB_TOKEN secret."
+          echo
+          echo "Running it on WritHub would mirror this repository into itself,"
+          echo "and the secret is deliberately absent here. Nothing to do."
+          echo
+          echo "The real mirror runs on GitHub Actions from"
+          echo ".github/workflows/mirror-writhub.yml, which this file shadows"
+          echo "only on WritHub."
