@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] -- 2026-08-19
+
+### Changed
+
+- dispatch session liveness reads the OpenClaw agent SQLite store
+  (`openclaw-agent.sqlite`: session_nodes + transcript_events) first, with the
+  legacy sessions.json / JSONL paths retained as a fallback fast-path for older
+  OpenClaw. Fixes four evidenced regressions after OpenClaw 2026.8.1 deprecated
+  the file store: spawn canary false-negatives, completion detection stuck
+  forever, stuck-detector false alerts, and unrecoverable terminal replies.
+
+### Added
+
+- `dispatch/session-store.mjs` (read-only, WAL-safe SQLite-first compatibility
+  layer) and `dispatch/gateway-rpc.mjs` (gateway CLI/RPC envelope parsing)
+- regression tests T1-T4 (canary / completion / stuck / terminal reply) in
+  `tests/dispatch-session-store.test.mjs`
+- `REVIEW-NOTES.md` (per-path coverage audit)
+
+### Security
+
+- new identifier validation helpers (`assertValidAgentId`,
+  `assertValidSessionId`, `assertContainedPath`) confine every store path and
+  transcript file lookup; all SQL is parameterized (CodeQL path-injection
+  alerts on this change audited as false positives, threads resolved with
+  the audit on the PR record).
 ## [0.5.1] -- 2026-08-15
 
 ### Added
