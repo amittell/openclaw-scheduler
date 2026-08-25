@@ -184,12 +184,6 @@ export function resolveAgentSessionsDirectory(homeDir, agentId = 'main') {
   return assertContainedPath(agentsRoot, sessionsDirectory, 'agent sessions directory');
 }
 
-export function resolveAgentSessionsStorePath(homeDir, agentId = 'main') {
-  const sessionsDirectory = resolveAgentSessionsDirectory(homeDir, agentId);
-  const sessionsPath = resolve(sessionsDirectory, 'sessions.json');
-  return assertContainedPath(sessionsDirectory, sessionsPath, 'sessions store path');
-}
-
 export function resolveSessionTranscriptPath(homeDir, agentId, sessionId) {
   const sessionsDirectory = resolveAgentSessionsDirectory(homeDir, agentId);
   const validatedSessionId = assertValidSessionId(sessionId);

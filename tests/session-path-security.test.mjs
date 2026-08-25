@@ -17,7 +17,6 @@ import {
   buildGatewayEndpointUrl,
   buildGatewaySessionUrl,
   parseGatewayBaseUrl,
-  resolveAgentSessionsStorePath,
   resolveSessionTranscriptPath,
   toNullPrototypeRecord,
 } from '../identifiers.js';
@@ -147,10 +146,6 @@ test('session paths remain lexically and canonically under the agent sessions ro
     writeFileSync(sentinel, 'sentinel-safe\n');
 
     assert.equal(
-      resolveAgentSessionsStorePath(home, 'main'),
-      join(sessionsDir, 'sessions.json'),
-    );
-    assert.equal(
       resolveSessionTranscriptPath(home, 'main', 'legitimate-session'),
       join(sessionsDir, 'legitimate-session.jsonl'),
     );
@@ -170,10 +165,6 @@ test('session paths remain lexically and canonically under the agent sessions ro
     );
 
     symlinkSync(outside, join(home, '.openclaw', 'agents', 'escaped-agent'));
-    assert.throws(
-      () => resolveAgentSessionsStorePath(home, 'escaped-agent'),
-      /symbolic link/,
-    );
     assert.equal(readFileSync(sentinel, 'utf8'), 'sentinel-safe\n');
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -314,35 +305,6 @@ test('Gateway response session keys require exact agent binding', async () => {
   }
 });
 
-test('Gateway session-store writes reject symlink escapes without touching a sentinel', async () => {
-  const home = makeTempDir('scheduler-store-write-home-');
-  const outside = makeTempDir('scheduler-store-write-outside-');
-  const outsideSessions = join(outside, 'sessions');
-  const sentinel = join(outsideSessions, 'sessions.json');
-  try {
-    mkdirSync(join(home, '.openclaw', 'agents'), { recursive: true });
-    mkdirSync(outsideSessions, { recursive: true });
-    writeFileSync(sentinel, '{}');
-    symlinkSync(outside, join(home, '.openclaw', 'agents', 'main'));
-
-    await withRestoredEnv(['HOME', 'OPENCLAW_GATEWAY_URL'], async () => {
-      process.env.HOME = home;
-      process.env.OPENCLAW_GATEWAY_URL = 'http://127.0.0.1:18789';
-      const gateway = await import(`../gateway.js?store-path-security=${Date.now()}`);
-      const result = gateway.applySessionOverridesToSessionStore(
-        'agent:main:scheduler:test',
-        { modelRef: 'openai/gpt-5.4' },
-        'main',
-      );
-      assert.equal(result.ok, false);
-      assert.match(result.error, /symbolic link/);
-    });
-    assert.equal(readFileSync(sentinel, 'utf8'), '{}');
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(outside, { recursive: true, force: true });
-  }
-});
 
 test('dispatcher rejects poisoned legacy job identity before Gateway activity', async () => {
   let gatewayChecked = false;

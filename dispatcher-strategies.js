@@ -2915,7 +2915,7 @@ async function runAgentTurnForSelection(
   signal = null,
 ) {
   const { log } = deps;
-  const { applySessionOverridesToSessionStore: applySessionOverrides } = deps;
+  const { applySessionOverridesViaGateway: applySessionOverrides } = deps;
   const agentId = assertValidAgentId(job.agent_id ?? 'main', 'job agent_id');
   const validatedSessionKey = assertSessionKeyForAgent(sessionKey, agentId, 'job session_key');
 
@@ -2928,16 +2928,21 @@ async function runAgentTurnForSelection(
       },
       agentId,
     );
-    if (applyResult.ok) {
+    if (!applyResult.ok) {
+      // Warn-and-continue dispatched the turn on whatever model/credential the
+      // session already had, so a failed override looked like a success. Fail
+      // instead: executeAgent's configured-fallback path catches this, and that
+      // retry is now meaningful because each selection patches a different model
+      // ref rather than re-sending a byte-identical request.
+      throw new Error(
+        `Session override failed for ${validatedSessionKey}: ${applyResult.error}`,
+      );
+    }
+    if (applyResult.applied) {
       log('debug', `Applied session overrides for ${validatedSessionKey}`, {
         jobId: job.id,
         authProfile: selection.authProfile || null,
         modelRef: selection.model || null,
-      });
-    } else {
-      log('warn', `Failed to apply session overrides: ${applyResult.error}`, {
-        jobId: job.id,
-        sessionKey: validatedSessionKey,
       });
     }
   }
@@ -2946,7 +2951,6 @@ async function runAgentTurnForSelection(
     message: prompt,
     agentId,
     sessionKey: validatedSessionKey,
-    authProfile: selection.authProfile,
     materializedEnv: materializedEnv || undefined,
     capabilityBinding: capabilityBinding || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,

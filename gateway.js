@@ -1,20 +1,17 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFile, execFileSync } from 'child_process';
-import {
-  readFileSync, writeFileSync, existsSync, realpathSync,
-} from 'fs';
+import { readFileSync, realpathSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
+import { callGatewayRpc } from './dispatch/gateway-rpc.mjs';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
 import {
   assertValidAgentId,
   assertValidSessionKey,
-  assertValidSessionStore,
   assertSessionKeyForAgent,
   buildGatewayEndpointUrl,
   parseGatewayBaseUrl,
-  resolveAgentSessionsStorePath,
 } from './identifiers.js';
 
 export {
@@ -36,7 +33,6 @@ const GATEWAY_BASE_URL = parseGatewayBaseUrl(
 );
 const GATEWAY_URL = GATEWAY_BASE_URL.href;
 const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL, endpoint);
-const HOME_DIR = process.env.HOME || homedir();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 // -- Isolated dispatch primitive contract --------------------
@@ -247,7 +243,6 @@ export async function runAgentTurn(opts) {
     agentId = 'main',
     sessionKey,
     model,
-    authProfile,
     materializedEnv,
     capabilityBinding,
     timeoutMs = 300000,
@@ -282,7 +277,6 @@ export async function runAgentTurn(opts) {
         ...authHeaders('operator.write'),
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
-        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
@@ -357,7 +351,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     agentId = 'main',
     sessionKey,
     model,
-    authProfile,
     materializedEnv,
     capabilityBinding,
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
@@ -476,7 +469,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...authHeaders('operator.write'),
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
-        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
@@ -874,145 +866,60 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
 }
 
 /**
- * Resolve the canonical and flat gateway aliases for a scheduler session key.
+ * Apply scheduler-managed session overrides through the gateway's own
+ * sessions.patch RPC.
  *
- * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
- * @param {string} [agentId='main'] - Agent ID used to construct and validate the canonical key
- * @returns {string[]} Unique session-key aliases, canonical first
+ * The previous implementation wrote ~/.openclaw/agents/<id>/sessions/sessions.json
+ * directly. OpenClaw retired that store when session state moved to SQLite --
+ * doctor archives the file on import, so the write landed nowhere and BOTH
+ * overrides were silently dead. sessions.patch is the canonical owner: a model
+ * ref of `<provider>/<model>@<authProfile>` sets model, provider,
+ * authProfileOverride and its source in a single call, because core splits the
+ * trailing `@profile` (gateway/sessions-patch.ts -> sessions/model-overrides.ts).
+ *
+ * @param {string} sessionKey
+ * @param {{ authProfile?: string | null, modelRef?: string | null }} overrides
+ * @param {string} [agentId='main']
+ * @param {{ callGatewayRpc?: Function }} [deps]
+ * @returns {{ ok: boolean, applied?: boolean, error?: string }}
  */
-function resolveSessionKeyAliases(sessionKey, agentId = 'main') {
+export function applySessionOverridesViaGateway(
+  sessionKey,
+  overrides = {},
+  agentId = 'main',
+  deps = {},
+) {
+  const rpc = deps.callGatewayRpc || callGatewayRpc;
   const validatedAgentId = assertValidAgentId(agentId, 'agentId');
-  const validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
-  const canonicalMatch = validatedSessionKey.match(/^agent:[^:]+:(.+)$/);
-  if (canonicalMatch) assertSessionKeyForAgent(validatedSessionKey, validatedAgentId, 'sessionKey');
-  const canonicalKey = validatedSessionKey.startsWith('agent:')
-    ? validatedSessionKey
-    : `agent:${validatedAgentId}:${validatedSessionKey}`;
-  const flatSessionKey = canonicalMatch?.[1] || validatedSessionKey;
-  return Array.from(new Set([canonicalKey, flatSessionKey]));
-}
+  const validatedSessionKey = assertSessionKeyForAgent(sessionKey, validatedAgentId, 'sessionKey');
+  const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
+  const wantsAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
+  const modelRef = typeof overrides.modelRef === 'string' ? overrides.modelRef.trim() : '';
 
-function parseSessionModelRef(modelRef) {
-  const trimmed = typeof modelRef === 'string' ? modelRef.trim() : '';
-  if (!trimmed) {
-    return { providerOverride: undefined, modelOverride: undefined };
+  if (!modelRef && !wantsAuthProfile) {
+    return { ok: true, applied: false };
   }
-  const slashIndex = trimmed.indexOf('/');
-  if (slashIndex <= 0 || slashIndex >= trimmed.length - 1) {
-    return { providerOverride: undefined, modelOverride: trimmed };
+  // An auth profile rides on the model ref as a trailing `@profile`; there is no
+  // way to express profile-only through sessions.patch. Report it rather than
+  // dispatching on the wrong credential, which is the failure this repair exists
+  // to remove.
+  if (!modelRef) {
+    return {
+      ok: false,
+      error: 'authProfile override requires a model override: sessions.patch carries the '
+        + 'profile only as a trailing @profile on the model ref',
+    };
   }
-  const providerOverride = trimmed.slice(0, slashIndex).trim();
-  const modelOverride = trimmed.slice(slashIndex + 1).trim();
-  return {
-    providerOverride: providerOverride || undefined,
-    modelOverride: modelOverride || undefined,
-  };
-}
 
-/**
- * Write scheduler-managed session overrides directly to the gateway's sessions.json store.
- *
- * The gateway reads sessions.json on each agent turn (with mtime-based cache
- * invalidation), so writing here before dispatch ensures the embedded runner
- * picks up the correct auth profile and model selection.
- *
- * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
- * @param {{ authProfile?: string | null, modelRef?: string | null }} overrides - Desired session overrides
- * @param {string} [agentId='main'] - Agent ID for store path resolution
- * @returns {{ ok: boolean, error?: string }}
- */
-export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, agentId = 'main') {
+  const model = wantsAuthProfile ? `${modelRef}@${authProfile}` : modelRef;
   try {
-    const validatedAgentId = assertValidAgentId(agentId, 'agentId');
-    const keyAliases = resolveSessionKeyAliases(sessionKey, validatedAgentId);
-    const sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, validatedAgentId);
-    const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
-    const shouldSetAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
-    const { providerOverride, modelOverride } = parseSessionModelRef(overrides.modelRef);
-    const shouldSetModelOverride = Boolean(modelOverride);
-
-    if (!existsSync(sessionsPath)) {
-      return { ok: false, error: `sessions.json not found at ${sessionsPath}` };
-    }
-
-    const raw = readFileSync(sessionsPath, 'utf-8');
-    const store = assertValidSessionStore(JSON.parse(raw), 'gateway sessions store');
-
-    const now = Date.now();
-    let changed = false;
-
-    for (const key of keyAliases) {
-      const existingEntry = store[key];
-      if (!existingEntry && !shouldSetAuthProfile && !shouldSetModelOverride) {
-        continue;
-      }
-
-      const entry = existingEntry || { updatedAt: now };
-      let entryChanged = false;
-
-      if (shouldSetAuthProfile) {
-        if (entry.authProfileOverride !== authProfile || entry.authProfileOverrideSource !== 'user') {
-          entry.authProfileOverride = authProfile;
-          entry.authProfileOverrideSource = 'user';
-          delete entry.authProfileOverrideCompactionCount;
-          entryChanged = true;
-        }
-      } else if (
-        entry.authProfileOverride !== undefined ||
-        entry.authProfileOverrideSource !== undefined ||
-        entry.authProfileOverrideCompactionCount !== undefined
-      ) {
-        delete entry.authProfileOverride;
-        delete entry.authProfileOverrideSource;
-        delete entry.authProfileOverrideCompactionCount;
-        entryChanged = true;
-      }
-
-      if (shouldSetModelOverride) {
-        if (entry.modelOverride !== modelOverride) {
-          entry.modelOverride = modelOverride;
-          entryChanged = true;
-        }
-        if (providerOverride) {
-          if (entry.providerOverride !== providerOverride) {
-            entry.providerOverride = providerOverride;
-            entryChanged = true;
-          }
-        } else if (entry.providerOverride !== undefined) {
-          delete entry.providerOverride;
-          entryChanged = true;
-        }
-      } else if (entry.modelOverride !== undefined || entry.providerOverride !== undefined) {
-        delete entry.modelOverride;
-        delete entry.providerOverride;
-        entryChanged = true;
-      }
-
-      if (!entryChanged) {
-        continue;
-      }
-
-      entry.updatedAt = now;
-      store[key] = entry;
-      changed = true;
-    }
-
-    if (!changed) {
-      return { ok: true };
-    }
-
-    writeFileSync(sessionsPath, JSON.stringify(store), 'utf-8');
-    return { ok: true };
+    rpc('sessions.patch', { key: validatedSessionKey, agentId: validatedAgentId, model }, {
+      timeout: 10000,
+    });
+    return { ok: true, applied: true };
   } catch (err) {
-    return { ok: false, error: `Failed to update sessions.json: ${err.message}` };
+    return { ok: false, error: `sessions.patch failed: ${err.message}` };
   }
-}
-
-export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
-  if (!sessionKey || !authProfile) {
-    return { ok: false, error: 'sessionKey and authProfile are required' };
-  }
-  return applySessionOverridesToSessionStore(sessionKey, { authProfile }, agentId);
 }
 
 /**

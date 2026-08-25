@@ -229,7 +229,7 @@ function makeAgentStrategyDeps(runIsolatedAgentTurn) {
     syncAuthStoreToSession: () => {
       throw new Error('agent strategy must not copy Gateway credential stores');
     },
-    applySessionOverridesToSessionStore: () => ({ ok: true }),
+    applySessionOverridesViaGateway: () => ({ ok: true }),
     runIsolatedAgentTurn,
   };
 }
@@ -299,7 +299,6 @@ test('capable Gateway receives validated credentials and revalidates before each
   const chatCalls = callsFor('/v1/chat/completions');
   for (const [index, call] of chatCalls.entries()) {
     assert.equal(call.headers.authorization, 'Bearer stub-gateway-token');
-    assert.equal(call.headers['x-openclaw-auth-profile'], 'provider:production');
     assert.deepEqual(JSON.parse(call.headers['x-openclaw-env-inject']), {
       STRIPE_API_KEY: index === 0 ? 'secret-one' : 'secret-two',
     });
@@ -375,7 +374,6 @@ test('legacy Gateway keeps auth_profile compatibility when no env injection is r
   assert.equal(callsFor('/health').length, 0);
   const [chatCall] = callsFor('/v1/chat/completions');
   assert.ok(chatCall);
-  assert.equal(chatCall.headers['x-openclaw-auth-profile'], 'provider:legacy-compatible');
   assert.equal(chatCall.headers['x-openclaw-env-inject'], undefined);
 });
 

@@ -219,7 +219,7 @@ test('main execute intent uses synchronous agent routing and restores the prefer
     sqliteNow: () => '2026-01-01 00:00:00',
     log: noop,
     sendSystemEvent: async () => { systemEvents++; },
-    applySessionOverridesToSessionStore: () => ({ ok: true }),
+    applySessionOverridesViaGateway: () => ({ ok: true }),
     runIsolatedAgentTurn: async (options) => {
       observedTurns.push(options);
       return { content: 'main sync result', usage: { total_tokens: 1 } };
