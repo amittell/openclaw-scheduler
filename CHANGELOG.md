@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Pin explicit `agentId` on bare-`main` `/tools/invoke` request bodies
+  (durable outbox delivery, CHECK_IN template, starting-notification) so
+  delivery works on multi-agent gateways instead of 400ing with
+  `session key "main" has no explicit owner`. The owner is derived from the
+  session key (`agentIdFromSessionKey`), matching the existing fallback
+  contract. Regression test added (`tests/durable-delivery-agentid.test.mjs`).
+  Note: dispatched agents keep their embedded CHECK_IN template until
+  re-dispatched; already-running prompts carry the pre-fix template.
+
 ## [0.5.2] -- 2026-08-19
 
 ### Changed

@@ -8,6 +8,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
 import {
+  agentIdFromSessionKey,
   assertValidAgentId,
   assertValidSessionKey,
   assertValidSessionStore,
@@ -598,7 +599,7 @@ export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ tool, args, sessionKey: validatedSessionKey, agentId: 'main' }),
+    body: JSON.stringify({ tool, args, sessionKey: validatedSessionKey, agentId: agentIdFromSessionKey(validatedSessionKey) }),
     signal: AbortSignal.timeout(30_000),
   });
 
