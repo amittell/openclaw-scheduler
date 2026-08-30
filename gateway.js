@@ -589,6 +589,14 @@ export async function sendSystemEvent(text, mode = 'now') {
 
 /**
  * Invoke a tool via the Gateway's /tools/invoke endpoint.
+ *
+ * The request body always carries an explicit `agentId` owner, derived from
+ * the session key via agentIdFromSessionKey (bare keys such as "main" fall
+ * back to "main"). Multi-agent gateways reject bare keys without an explicit
+ * owner ("session key \"main\" has no explicit owner"), so pinning it here is
+ * a hard requirement of /tools/invoke, not an optimization. Callers passing
+ * a non-bare `agent:<id>:...` key are routed to that key's owner by
+ * construction — the body never disagrees with the session key.
  */
 export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
   const validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
