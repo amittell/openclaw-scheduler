@@ -155,9 +155,14 @@ and session management.
 {
   "tool": "<tool_name>",
   "args": { ... },
-  "sessionKey": "<session_key>"
+  "sessionKey": "<session_key>",
+  "agentId": "<owner_id>"
 }
 ```
+
+`agentId` is always included: it is the owner pinned for the session key
+(`agentIdFromSessionKey`), so bare keys like `"main"` resolve on multi-agent
+gateways instead of 400ing with `session key "main" has no explicit owner`.
 
 **Timeout**: 30 seconds via `AbortSignal.timeout(30_000)`.
 
@@ -258,7 +263,8 @@ subagent session:
     "target": "<deliverTo>",
     "message": "<brand> [<label>] starting..."
   },
-  "sessionKey": "main"
+  "sessionKey": "main",
+  "agentId": "main"
 }
 ```
 

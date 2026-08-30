@@ -424,7 +424,7 @@ GW_TOKEN=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser(
 curl -s -X POST http://127.0.0.1:18789/tools/invoke \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $GW_TOKEN" \
-  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"<telegram-user-id>","message":"<label>: <progress update>"},"sessionKey":"main"}'
+  -d '{"tool":"message","args":{"action":"send","channel":"telegram","target":"<telegram-user-id>","message":"<label>: <progress update>"},"sessionKey":"main","agentId":"main"}'
 ```
 ---
 
