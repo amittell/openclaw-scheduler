@@ -598,7 +598,7 @@ export async function invokeGatewayTool(tool, args, sessionKey = 'main') {
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ tool, args, sessionKey: validatedSessionKey }),
+    body: JSON.stringify({ tool, args, sessionKey: validatedSessionKey, agentId: 'main' }),
     signal: AbortSignal.timeout(30_000),
   });
 

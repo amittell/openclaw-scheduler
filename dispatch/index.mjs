@@ -1615,7 +1615,7 @@ async function cmdEnqueue(flags) {
     const safeChannel = safeJson(deliverChannel || 'telegram');
     const safeTarget = safeJson(deliverTo);
     const safeLabel = safeJson(label);
-    parts.push(`curl -s -X POST '${GATEWAY_TOOLS_INVOKE_URL}' -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main"}'`);
+    parts.push(`curl -s -X POST '${GATEWAY_TOOLS_INVOKE_URL}' -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main","agentId":"main"}'`);
     parts.push(`Call this every ~5 minutes with a brief progress update.`);
     parts.push(`---`);
     parts.push(``);
@@ -1746,6 +1746,7 @@ async function cmdEnqueue(flags) {
               message: `🌶️ *${agentBrand}* [${label}] starting...`,
             },
             sessionKey: 'main',
+            agentId: 'main',
           }),
           signal: AbortSignal.timeout(5000),
         });
