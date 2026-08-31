@@ -941,7 +941,16 @@ export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, 
     const shouldSetModelOverride = Boolean(modelOverride);
 
     if (!existsSync(sessionsPath)) {
-      return { ok: false, error: `sessions.json not found at ${sessionsPath}` };
+      // The gateway keeps its session store in per-agent SQLite (see
+      // dispatch/session-store.mjs); sessions.json is a legacy fallback that
+      // is absent on modern gateways. A missing file means the override has
+      // no legacy store to land in: the dispatch still runs with authProfile
+      // carried explicitly via the x-openclaw-auth-profile header, and a
+      // modelRef without a store is dropped exactly as it was when this
+      // check returned { ok: false } (callers only log the result and
+      // dispatch either way). Treat the legacy-store miss as a successful
+      // no-op so the dispatcher does not warn on every isolated dispatch.
+      return { ok: true };
     }
 
     const raw = readFileSync(sessionsPath, 'utf-8');
