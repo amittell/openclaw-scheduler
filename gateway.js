@@ -602,7 +602,16 @@ export async function sendSystemEvent(text, mode = 'now') {
 // belong in the x-openclaw-model header, which the gateway resolves via
 // parseModelRef with a visibility-policy check. splitModelOverride routes a
 // requested model into those two channels without ever mixing them.
-const ROUTING_MODEL_ID_PATTERN = /^(?:openclaw|openclaw\/default|openclaw:[a-z0-9][a-z0-9_-]{0,63}|agent:[a-z0-9][a-z0-9_-]{0,63})$/i;
+// Mirrors the gateway's routing-model acceptance exactly (isOpenClawAgentModelId,
+// src/gateway/http-utils.ts, using the assertValidAgentId charset/length):
+// the body accepts only these routing model ids; anything else is a provider/model
+// ref and belongs in the x-openclaw-model header. Agent ids may contain dots and
+// at-signs (e.g. openclaw:ops.team), so the charset must match assertValidAgentId
+// or the no-model default (openclaw:<agentId>) would be misrouted into the header.
+const ROUTING_AGENT_ID = '[a-z0-9][a-z0-9._@-]{0,127}';
+const ROUTING_MODEL_ID_PATTERN = new RegExp(
+  `^(?:openclaw|openclaw\\/default|openclaw[:/]${ROUTING_AGENT_ID}|agent:${ROUTING_AGENT_ID})$`, 'i',
+);
 
 function splitModelOverride(model, agentId) {
   const trimmed = typeof model === 'string' ? model.trim() : '';

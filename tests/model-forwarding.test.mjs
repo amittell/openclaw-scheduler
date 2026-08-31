@@ -4,10 +4,11 @@ import test from 'node:test';
 
 // Regression: the gateway's /v1/chat/completions endpoint rejects concrete
 // provider/model refs in the request body (only routing ids: openclaw,
-// openclaw/default, openclaw/<agentId>, agent/<agentId>). Before this fix the
+// openclaw/default, openclaw/<agentId>, agent/<agentId> — see the gateway's
+// isOpenClawAgentModelId, src/gateway/http-utils.ts). Before this fix the
 // isolated-dispatch path sent `model: model || openclaw:<agentId>` in the
-// body, so a job payload_model of e.g. "gpufarm/qwen3.8-27b" was either
-// dropped (session overrides only) or would 400 if sent directly.
+// body and never forwarded payload_model, so a job payload_model of e.g.
+// "gpufarm/qwen3.8-27b" only took effect via the legacy sessions.json store.
 //
 // splitModelOverride routes non-routing refs into the x-openclaw-model header
 // (the gateway's model-override channel, resolved via parseModelRef with the
@@ -61,7 +62,7 @@ async function captureChatCompletions(call) {
     process.env.OPENCLAW_GATEWAY_URL = sink.url;
     const gateway = await import(`../gateway.js?model-forwarding-test-${Date.now()}`);
     const result = await call(gateway);
-    return { result, captured, sink };
+    return { result, captured };
   } finally {
     if (savedUrl === undefined) delete process.env.OPENCLAW_GATEWAY_URL;
     else process.env.OPENCLAW_GATEWAY_URL = savedUrl;
@@ -107,4 +108,32 @@ test('no model: body defaults to the per-agent routing id, no override header', 
   assert.equal(result.ok, true, 'turn should succeed against the sink');
   assert.equal(captured.modelHeader, null, 'no override header when no model is requested');
   assert.equal(captured.body.model, 'openclaw:main', 'body defaults to openclaw:<agentId>');
+});
+
+test('explicit routes identical to the default path stay in the body (P2)', async () => {
+  // Agent ids may contain dots and at-signs (assertValidAgentId, up to 128
+  // chars), and the no-model default path emits openclaw:<agentId> into the
+  // body for them. Supplying that identical route explicitly must behave
+  // exactly like the default: body only, NO x-openclaw-model header.
+  for (const route of ['openclaw:ops.team', 'agent:user@example']) {
+    const { result, captured } = await captureChatCompletions(async (gateway) => gateway.runAgentTurn({
+      message: 'explicit route identical to default',
+      agentId: 'main',
+      model: route,
+      timeoutMs: 3_000,
+    }));
+    assert.equal(result.ok, true, `${route} turn should succeed`);
+    assert.equal(captured.modelHeader, null, `${route} must NOT add x-openclaw-model`);
+    assert.equal(captured.body.model, route, `${route} stays in the body as a routing id`);
+  }
+  // A true provider/model ref still routes to the header.
+  const { result, captured } = await captureChatCompletions(async (gateway) => gateway.runAgentTurn({
+    message: 'provider ref still header-routed',
+    agentId: 'main',
+    model: 'gpufarm/qwen3.8-27b',
+    timeoutMs: 3_000,
+  }));
+  assert.equal(result.ok, true, 'provider ref turn should succeed');
+  assert.equal(captured.modelHeader, 'gpufarm/qwen3.8-27b', 'provider ref still travels in the header');
+  assert.equal(captured.body.model, 'openclaw:main', 'provider ref body stays a valid routing id');
 });
