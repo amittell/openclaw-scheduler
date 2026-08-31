@@ -2946,6 +2946,7 @@ async function runAgentTurnForSelection(
     message: prompt,
     agentId,
     sessionKey: validatedSessionKey,
+    model: selection.model || undefined,
     authProfile: selection.authProfile,
     materializedEnv: materializedEnv || undefined,
     capabilityBinding: capabilityBinding || undefined,

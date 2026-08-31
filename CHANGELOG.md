@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Forward job `payload_model` selections to the gateway via the
+  `x-openclaw-model` header on the chat-completions dispatch. The gateway
+  rejects concrete `provider/model` refs in the request body (routing ids
+  only), so `payload_model` values (e.g. `gpufarm/qwen3.8-27b`) previously
+  never took effect on gateways without the legacy `sessions.json` store
+  (SQLite-only). `splitModelOverride` routes provider/model refs into the
+  header and keeps a valid routing id in the body; routing ids are sent
+  unchanged. The legacy `sessions.json` override write remains as a dual
+  path. Regression tests added (`tests/model-forwarding.test.mjs`); the
+  legacy contract test (`test.js`) updated to assert the model is
+  forwarded. Requires owner-equivalent HTTP auth for the model override
+  (the shared-secret gateway token qualifies).
+
 - Pin explicit `agentId` on bare-`main` `/tools/invoke` request bodies
   (durable outbox delivery, CHECK_IN template, starting-notification) so
   delivery works on multi-agent gateways instead of 400ing with

@@ -274,6 +274,8 @@ export async function runAgentTurn(opts) {
     controller.abort();
   }, timeoutMs);
 
+  const modelRoute = splitModelOverride(model, validatedAgentId);
+
   try {
     const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
@@ -284,10 +286,11 @@ export async function runAgentTurn(opts) {
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...(modelRoute.overrideHeader ? { 'x-openclaw-model': modelRoute.overrideHeader } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
-        model: model || `openclaw:${validatedAgentId}`,
+        model: modelRoute.bodyModel,
         messages: [{ role: 'user', content: message }],
         stream: false,
       }),
@@ -468,6 +471,8 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   // Start polling after the first interval (gives session time to initialise)
   const pollTimer = setInterval(checkActivity, pollIntervalMs);
 
+  const modelRoute = splitModelOverride(model, validatedAgentId);
+
   try {
     const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
@@ -478,10 +483,11 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
         ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
+        ...(modelRoute.overrideHeader ? { 'x-openclaw-model': modelRoute.overrideHeader } : {}),
         ...envInjection.headers,
       },
       body: JSON.stringify({
-        model: model || `openclaw:${validatedAgentId}`,
+        model: modelRoute.bodyModel,
         messages: [{ role: 'user', content: message }],
         stream: false,
       }),
@@ -586,6 +592,28 @@ export async function sendSystemEvent(text, mode = 'now') {
 }
 
 // -- Tools Invoke (for session listing, messages) ------------
+
+// -- Chat-completions model routing ----------------------------------------
+//
+// The gateway's /v1/chat/completions endpoint only accepts routing model ids
+// in the request body ("openclaw", "openclaw/default", "openclaw/<agentId>",
+// "agent/<agentId>" -- see the gateway's isOpenClawAgentModelId). Concrete
+// provider/model refs (e.g. "gpufarm/qwen3.8-27b") are rejected there and
+// belong in the x-openclaw-model header, which the gateway resolves via
+// parseModelRef with a visibility-policy check. splitModelOverride routes a
+// requested model into those two channels without ever mixing them.
+const ROUTING_MODEL_ID_PATTERN = /^(?:openclaw|openclaw\/default|openclaw:[a-z0-9][a-z0-9_-]{0,63}|agent:[a-z0-9][a-z0-9_-]{0,63})$/i;
+
+function splitModelOverride(model, agentId) {
+  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!trimmed) {
+    return { bodyModel: `openclaw:${agentId}`, overrideHeader: undefined };
+  }
+  if (ROUTING_MODEL_ID_PATTERN.test(trimmed)) {
+    return { bodyModel: trimmed, overrideHeader: undefined };
+  }
+  return { bodyModel: `openclaw:${agentId}`, overrideHeader: trimmed };
+}
 
 /**
  * Invoke a tool via the Gateway's /tools/invoke endpoint.
@@ -945,11 +973,12 @@ export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, 
       // dispatch/session-store.mjs); sessions.json is a legacy fallback that
       // is absent on modern gateways. A missing file means the override has
       // no legacy store to land in: the dispatch still runs with authProfile
-      // carried explicitly via the x-openclaw-auth-profile header, and a
-      // modelRef without a store is dropped exactly as it was when this
-      // check returned { ok: false } (callers only log the result and
-      // dispatch either way). Treat the legacy-store miss as a successful
-      // no-op so the dispatcher does not warn on every isolated dispatch.
+      // carried explicitly via the x-openclaw-auth-profile header and the
+      // model via the x-openclaw-model header (splitModelOverride), so the
+      // selected model takes effect without the legacy store. Callers only
+      // log the result and dispatch either way. Treat the legacy-store miss
+      // as a successful no-op so the dispatcher does not warn on every
+      // isolated dispatch.
       return { ok: true };
     }
 

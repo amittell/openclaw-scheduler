@@ -79,6 +79,7 @@ single user message to an agent and receives the complete assistant response.
 | `x-openclaw-agent-id` | Conditional | Agent ID string (e.g. `main`). Omitted when falsy. |
 | `x-openclaw-session-key` | Conditional | Session key for continuity. Omitted when not provided. |
 | `x-openclaw-auth-profile` | Conditional | Auth profile override. Omitted when null. See "Auth-Profile Forwarding" below. |
+| `x-openclaw-model` | Conditional | Model ref override (e.g. `gpufarm/qwen3.8-27b`) for non-routing model refs. Omitted when `payload_model` is empty or is itself a routing id. See "Model Forwarding" below. |
 
 **Request body**:
 
@@ -92,8 +93,25 @@ single user message to an agent and receives the complete assistant response.
 }
 ```
 
-The `model` field defaults to `openclaw:<agentId>` but can be overridden via
-`job.payload_model`.
+The `model` field defaults to `openclaw:<agentId>`; see "Model Forwarding" below for
+how `job.payload_model` values are routed.
+
+### Model Forwarding
+
+The gateway's `/v1/chat/completions` endpoint accepts only **routing model ids** in
+the request body (`openclaw`, `openclaw/default`, `openclaw/<agentId>`,
+`agent/<agentId>`); concrete `provider/model` refs (e.g. `gpufarm/qwen3.8-27b`)
+are rejected there. The scheduler therefore splits the requested model before
+dispatch (`splitModelOverride` in `gateway.js`):
+
+- **Routing id** (or empty) → sent in the body's `model` field as before.
+- **Provider/model ref** → body carries `openclaw:<agentId>` and the ref is
+  forwarded in the `x-openclaw-model` header, which the gateway resolves via
+  `parseModelRef` with its model visibility-policy check. This requires
+  owner-equivalent HTTP auth (the shared-secret gateway token qualifies).
+
+The legacy `sessions.json` override write still runs as a dual path so
+gateways with the legacy store keep working unchanged.
 
 If `job.payload_model_fallback` and/or `job.auth_profile_fallback` are set, the
 scheduler retries once in the same run with the configured fallback selection

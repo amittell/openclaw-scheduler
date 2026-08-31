@@ -3789,8 +3789,8 @@ console.log('\n-- executeAgent fallback selection --');
 
   assert(result.status === 'ok', 'executeAgent fallback: returns ok after fallback turn succeeds');
   assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
-  assert(turnAttempts[0].model === null && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary dispatch uses primary auth profile and keeps model in session overrides');
-  assert(turnAttempts[1].model === null && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry dispatch uses fallback auth profile and keeps model in session overrides');
+  assert(turnAttempts[0].model === 'gpt-5-mini' && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary dispatch forwards the selected model and auth profile explicitly');
+  assert(turnAttempts[1].model === 'gpt-4.1-mini' && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry dispatch forwards the fallback model and auth profile explicitly');
   assert(JSON.stringify(appliedSelections) === JSON.stringify([
     { authProfile: 'anthropic:primary', modelRef: 'gpt-5-mini' },
     { authProfile: 'openai:backup', modelRef: 'gpt-4.1-mini' },
