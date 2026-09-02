@@ -31,6 +31,7 @@ import { readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { withLabelsLock } from './label-lock.mjs';
 import {
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
@@ -423,18 +424,26 @@ function saveLabels(labels) {
 }
 
 function mutateLabels(mutator) {
-  const labels = loadLabels();
-  if (labelsCacheError) {
-    throw new Error(
-      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
-      { cause: labelsCacheError },
-    );
-  }
-  const changed = mutator(labels);
-  if (changed !== false) {
-    saveLabels(labels);
-  }
-  return labels;
+  // Cross-process lock: every watcher tick, heartbeat ping, and terminal
+  // marker is a read-modify-write on labels.json shared with the enqueue CLI
+  // and status/result/sync CLIs. Serializing here is what keeps concurrent
+  // writers from dropping each other's fields (sessionKey, delivery route,
+  // lastPing) — the cascade that turned a benign read race into a false
+  // "terminal failure (unknown)" alarm.
+  return withLabelsLock(LABELS_PATH, () => {
+    const labels = loadLabels();
+    if (labelsCacheError) {
+      throw new Error(
+        `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+        { cause: labelsCacheError },
+      );
+    }
+    const changed = mutator(labels);
+    if (changed !== false) {
+      saveLabels(labels);
+    }
+    return labels;
+  });
 }
 
 function updateExistingLabel(label, mutator) {
@@ -1575,6 +1584,17 @@ function runOnceAndExit() {
     markWatcherPending(label, 'status unavailable');
   }
 
+  // A missing / unrecognized status is NEVER terminal. It means the read
+  // failed transiently, the label is mid-write, or a field was lost to a
+  // concurrent writer. Treat it as "still running, retry next tick" — this is
+  // what stops a healthy session from being killed by a false
+  // "terminal failure (unknown)" alarm that also disarms delivery.
+  if (status.found === false || !status.status) {
+    markWatcherPending(label, status.found === false
+      ? 'label not observable yet (found=false); retrying next tick'
+      : 'status field missing (transient read/write race); retrying next tick');
+  }
+
   if (status.status === 'error') {
     const errorMsg = status.error || status.summary || '';
     if (is529Error(errorMsg)) {
@@ -1582,7 +1602,12 @@ function runOnceAndExit() {
     }
   }
 
-  if (status.status !== 'running') {
+  // Only recognized terminal states end this watcher. `running` and
+  // `spawn-warning` (and any unknown value) stay pending and retry.
+  const isRecognizedTerminalStatus = status.status === 'done'
+    || status.status === 'interrupted'
+    || status.status === 'error';
+  if (isRecognizedTerminalStatus) {
     const terminalResult = dispatch('result', ['--label', label]);
     const terminalCompletion = terminalResult?.completion || status?.completion || null;
 

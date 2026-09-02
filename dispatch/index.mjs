@@ -33,6 +33,7 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
+import { withLabelsLock } from './label-lock.mjs';
 import {
   buildCompletionSignalInstructions,
   buildTerminalCompletionPayload,
@@ -331,18 +332,25 @@ function saveLabels(labels) {
 }
 
 function mutateLabels(mutator) {
-  const labels = loadLabels();
-  if (labelsCacheError) {
-    throw new Error(
-      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
-      { cause: labelsCacheError },
-    );
-  }
-  const changed = mutator(labels);
-  if (changed !== false) {
-    saveLabels(labels);
-  }
-  return labels;
+  // Cross-process lock: labels.json is mutated by the enqueue CLI, per-tick
+  // watcher processes, and status/result/sync CLIs concurrently. The lock
+  // serializes the read-modify-write window so a stale reader can no longer
+  // clobber fields another process just wrote. The ledger is re-read inside
+  // the lock (loadLabels invalidates on file signature change).
+  return withLabelsLock(LABELS_PATH, () => {
+    const labels = loadLabels();
+    if (labelsCacheError) {
+      throw new Error(
+        `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+        { cause: labelsCacheError },
+      );
+    }
+    const changed = mutator(labels);
+    if (changed !== false) {
+      saveLabels(labels);
+    }
+    return labels;
+  });
 }
 
 function assertValidLabelSessionMetadata(name, entry) {
@@ -1152,10 +1160,37 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   }
 
   if (sessionStatus === 'done') {
+    // A session reaching store status=done means the *turn* ended — it does
+    // NOT by itself prove the *task* completed. The dispatch contract treats
+    // "done" as authoritative only when the agent produced a clean terminal
+    // end_turn reply (or called the explicit done/checklist signal, which is a
+    // separate code path). Without a terminal reply this is most likely a
+    // context-limit / silent-stop / gateway-recycled session, and marking the
+    // label done yields a false success announce with no artifacts (observed
+    // 2026-09-02: #728 finisher reported "done" with 0 commits / no push).
+    let terminalReply = null;
+    if (entry.sessionId) {
+      try {
+        terminalReply = getJsonlTerminalReplyReason(readJsonlTailEntries(entry.sessionId, agent, 20));
+      } catch {
+        terminalReply = null; // unreadable transcript -> fall through to conservative branch
+      }
+    }
+    if (terminalReply) {
+      return {
+        shouldResolve: true,
+        completed: true,
+        reason: 'OpenClaw SQLite session status=done with terminal end_turn reply',
+        lastActivity,
+        sessionStatus,
+      };
+    }
+    // No terminal reply observed: resolve as interrupted (verify-manually path)
+    // rather than a false done.
     return {
       shouldResolve: true,
-      completed: true,
-      reason: 'OpenClaw SQLite session status=done',
+      completed: false,
+      reason: 'OpenClaw SQLite session status=done but no terminal reply observed (possible incomplete run)',
       lastActivity,
       sessionStatus,
     };
