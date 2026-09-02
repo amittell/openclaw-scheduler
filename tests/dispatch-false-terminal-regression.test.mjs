@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -12,7 +12,6 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withLabelsLock } from '../dispatch/label-lock.mjs';
 import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -136,41 +135,59 @@ test('(A2) watcher: found=false label also stays pending, not terminal', () => {
   }
 });
 
-test('(B) labels lock: concurrent mutations never drop each other fields', () => {
-  const { root, stateDir, labelsPath } = makeFixture();
+test('(B) labels lock: genuinely concurrent workers never lose increments', async () => {
+  const { root, labelsPath } = makeFixture();
+  const workers = [];
   try {
     writeFileSync(labelsPath, JSON.stringify({ a: { v: 0 } }, null, 2));
 
-    const childScript = `
+    // 4 real OS processes hammer the same label concurrently. Async spawn()
+    // (NOT spawnSync) means all four run at the same time — a broken lock lets
+    // two of them interleave their read-modify-write windows and lose updates,
+    // so final v < 800 or the file tears. The lock must keep v exact.
+    const WORKER_SCRIPT = `
       import { withLabelsLock } from ${JSON.stringify(join(REPO_DIR, 'dispatch', 'label-lock.mjs'))};
-      import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-      const fs = { readFileSync, writeFileSync, renameSync };
+      import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
       const labelsPath = process.argv[2];
-      const n = Number(process.argv[3]);
-      for (let i = 0; i < n; i++) {
+      const iterations = Number(process.argv[3]);
+      for (let i = 0; i < iterations; i++) {
         withLabelsLock(labelsPath, () => {
-          const labels = JSON.parse(fs.readFileSync(labelsPath, 'utf8'));
+          const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
           labels.a = { ...(labels.a || {}), v: (labels.a?.v || 0) + 1, field: 'writer' };
           const tmp = labelsPath + '.tmp.' + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\\n');
-          fs.renameSync(tmp, labelsPath);
+          writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\\n');
+          renameSync(tmp, labelsPath);
         });
       }
+      process.stdout.write('done ' + iterations + (existsSync(labelsPath + '.lock') ? ' LOCKLEAK' : '') + '\\n');
     `;
-    const scriptPath = join(root, 'concurrent.mjs');
-    writeFileSync(scriptPath, childScript);
+    const scriptPath = join(root, 'worker.mjs');
+    writeFileSync(scriptPath, WORKER_SCRIPT);
 
-    // 4 processes x 50 locked increments. Without serialization the read-
-    // modify-write races and the final v < 200 or the field is lost.
-    const procs = Array.from({ length: 4 }, (_, i) =>
-      runChild([scriptPath, labelsPath, '50'], {}));
-    assert(procs.every((p) => p.status === 0), `child failed: ${procs.map((p) => p.stderr).join(' | ')}`);
+    for (let w = 0; w < 4; w++) {
+      const child = spawn(process.execPath, [scriptPath, labelsPath, '200'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      workers.push(child);
+    }
+
+    const finished = await Promise.all(workers.map((child) => new Promise((resolve) => {
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => resolve({ status: 1, stdout, stderr: stderr + ' worker timed out' }), 120_000);
+      child.stdout.on('data', (c) => { stdout += c; });
+      child.stderr.on('data', (c) => { stderr += c; });
+      child.on('close', (code) => { clearTimeout(timer); resolve({ status: code, stdout, stderr }); });
+    })));
+
+    assert(finished.every((f) => f.status === 0), `worker failed: ${finished.map((f) => f.stderr || f.stdout || 'status ' + f.status).join(' | ')}`);
 
     const final = JSON.parse(readFileSync(labelsPath, 'utf8')).a;
-    assert.equal(final.v, 200, `lock must serialize all increments; got ${JSON.stringify(final)}`);
+    assert.equal(final.v, 800, `lock must serialize all concurrent increments; got ${JSON.stringify(final)}`);
     assert.equal(final.field, 'writer');
-    assert.equal(existsSync(labelsPath + '.lock'), false, 'lock must be released');
+    assert.equal(existsSync(labelsPath + '.lock'), false, 'lock must be released after all workers finish');
   } finally {
+    for (const child of workers) { try { child.kill('SIGKILL'); } catch {} }
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -19,7 +19,11 @@
  *   => break the lock. (Alive holder past STALE_MS => keep waiting; a live
  *   process stuck mid-mutation must not be clobbered.)
  * - Retry: backoff up to TIMEOUT_MS, then throw.
- * - release(): only removes the lock if we still own it (compare pid+ts).
+ * - release(): only removes the lock if we still own it (compare pid). The
+ *   O_EXCL acquisition already guarantees at most one live holder, and a
+ *   stale lock is only broken when its holder pid is dead — so a pid check
+ *   on release is sufficient; comparing ts as well would require carrying
+ *   the acquisition timestamp through every call and adds no safety.
  * - fn() runs inside the lock and MUST re-read the ledger (any cached copy
  *   predates acquisition).
  */
@@ -44,7 +48,7 @@ function ownerAlive(pid) {
 
 function tryAcquire(lockPath) {
   if (existsSync(lockPath)) {
-    let stale = false;
+    let stale;
     try {
       const info = JSON.parse(readFileSync(lockPath, 'utf8'));
       const age = Date.now() - (Number(info.ts) || 0);
