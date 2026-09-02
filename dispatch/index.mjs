@@ -1161,36 +1161,46 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
 
   if (sessionStatus === 'done') {
     // A session reaching store status=done means the *turn* ended — it does
-    // NOT by itself prove the *task* completed. The dispatch contract treats
-    // "done" as authoritative only when the agent produced a clean terminal
-    // end_turn reply (or called the explicit done/checklist signal, which is a
-    // separate code path). Without a terminal reply this is most likely a
-    // context-limit / silent-stop / gateway-recycled session, and marking the
-    // label done yields a false success announce with no artifacts (observed
-    // 2026-09-02: #728 finisher reported "done" with 0 commits / no push).
-    let terminalReply = null;
+    // NOT by itself prove the *task* completed. Require the terminal reply
+    // wherever one is observable:
+    //   - transcript readable + terminal end_turn reply -> completed
+    //   - transcript readable + NO terminal reply       -> interrupted
+    //     (silently-ended session: context limit / silent stop / gateway
+    //      recycled; observed 2026-09-02: #728 finisher reported "done"
+    //      with 0 commits / no push)
+    //   - transcript unavailable (no sessionId, legacy/missing store) ->
+    //     completed (preserves the legacy contract the t8 watchdog test
+    //     pins: a clean canonical done must not be narrated as abnormal)
+    let entries = null;
     if (entry.sessionId) {
       try {
-        terminalReply = getJsonlTerminalReplyReason(readJsonlTailEntries(entry.sessionId, agent, 20));
+        entries = readJsonlTailEntries(entry.sessionId, agent, 20);
       } catch {
-        terminalReply = null; // unreadable transcript -> fall through to conservative branch
+        entries = null; // unreadable -> legacy branch below
       }
     }
-    if (terminalReply) {
+    if (entries) {
+      if (getJsonlTerminalReplyReason(entries)) {
+        return {
+          shouldResolve: true,
+          completed: true,
+          reason: 'OpenClaw session status=done with terminal end_turn reply',
+          lastActivity,
+          sessionStatus,
+        };
+      }
       return {
         shouldResolve: true,
-        completed: true,
-        reason: 'OpenClaw SQLite session status=done with terminal end_turn reply',
+        completed: false,
+        reason: 'OpenClaw session status=done but no terminal reply observed (possible incomplete run)',
         lastActivity,
         sessionStatus,
       };
     }
-    // No terminal reply observed: resolve as interrupted (verify-manually path)
-    // rather than a false done.
     return {
       shouldResolve: true,
-      completed: false,
-      reason: 'OpenClaw SQLite session status=done but no terminal reply observed (possible incomplete run)',
+      completed: true,
+      reason: 'OpenClaw SQLite session status=done',
       lastActivity,
       sessionStatus,
     };

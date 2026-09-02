@@ -19,16 +19,14 @@
  *   => break the lock. (Alive holder past STALE_MS => keep waiting; a live
  *   process stuck mid-mutation must not be clobbered.)
  * - Retry: backoff up to TIMEOUT_MS, then throw.
- * - release(): only removes the lock if we still own it (compare pid). The
- *   O_EXCL acquisition already guarantees at most one live holder, and a
- *   stale lock is only broken when its holder pid is dead — so a pid check
- *   on release is sufficient; comparing ts as well would require carrying
- *   the acquisition timestamp through every call and adds no safety.
+ * - release(): only removes the lock if we still own it (compare pid AND the
+ *   acquisition timestamp captured at acquire). If a stale-break raced us and
+ *   the file now holds another process's lock, we never unlink it.
  * - fn() runs inside the lock and MUST re-read the ledger (any cached copy
  *   predates acquisition).
  */
 
-import { existsSync, openSync, readFileSync, unlinkSync, writeFileSync, closeSync } from 'node:fs';
+import { existsSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, closeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const LABELS_LOCK_STALE_MS = 15_000;
@@ -46,24 +44,38 @@ function ownerAlive(pid) {
   }
 }
 
+let lockedAs = null;
+
 function tryAcquire(lockPath) {
   if (existsSync(lockPath)) {
+    let age;
+    try {
+      age = Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      age = Infinity; // file vanished between existsSync and stat — O_EXCL re-checks
+    }
     let stale;
     try {
       const info = JSON.parse(readFileSync(lockPath, 'utf8'));
-      const age = Date.now() - (Number(info.ts) || 0);
       stale = age > LABELS_LOCK_STALE_MS && !ownerAlive(info.pid);
     } catch {
-      stale = true; // unparseable lock => treat as stale
+      // Empty (mid-write) or corrupt lock file. A fresh empty file is a live
+      // holder between openSync('wx') and writeFileSync — breaking it would
+      // admit a second holder and lose updates (observed in the concurrent
+      // regression test on CI). Only break once old enough to be a crash
+      // orphan.
+      stale = age > LABELS_LOCK_STALE_MS;
     }
     if (stale) {
       try { unlinkSync(lockPath); } catch {}
     }
   }
   let fd = null;
+  const acquiredTs = Date.now();
   try {
     fd = openSync(lockPath, 'wx'); // O_CREAT | O_EXCL
-    writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: acquiredTs }));
+    lockedAs = acquiredTs;
     return true;
   } catch (error) {
     if (error && error.code !== 'EEXIST') throw error;
@@ -76,7 +88,10 @@ function tryAcquire(lockPath) {
 function releaseLock(lockPath) {
   try {
     const info = JSON.parse(readFileSync(lockPath, 'utf8'));
-    if (info.pid === process.pid) unlinkSync(lockPath);
+    // Verify pid AND the acquisition timestamp: if the file was replaced
+    // after we read it (stale-break race), it belongs to another process —
+    // never unlink it.
+    if (info.pid === process.pid && info.ts === lockedAs) unlinkSync(lockPath);
   } catch {
     // Lock already gone or unreadable; nothing to release.
   }
