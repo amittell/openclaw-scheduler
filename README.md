@@ -1557,6 +1557,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_BACKUP_PREFIX` | `scheduler` | Object prefix inside bucket |
 | `SCHEDULER_ARTIFACTS_DIR` | `~/.openclaw/scheduler/artifacts` | Directory for offloaded shell stdout/stderr files |
 | `SCHEDULER_DEBUG` | *(unset)* | `1` or `true` enables debug logging; `0` or `false` disables it |
+| `SCHEDULER_ALERT_TARGET` | *(unset; alerts disabled)* | Explicit numeric Telegram operator chat ID for repeated isolated-job failures. Surrounding whitespace is trimmed; zero, usernames, prefixes, embedded whitespace and unsafe integers are rejected. No default recipient or fallback route is used. Alerts are attempted only after successful completion bookkeeping commits. |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory for `config.json` |
