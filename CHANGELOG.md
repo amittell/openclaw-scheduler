@@ -44,9 +44,6 @@ All notable changes to this project will be documented in this file.
 - Treat missing `sessions.json` as a no-op override write instead of an
   error, for gateways on the SQLite-only session store. (#34)
 
-
-### Fixed
-
 - Forward job `payload_model` selections to the gateway via the
   `x-openclaw-model` header on the chat-completions dispatch. The gateway
   rejects concrete `provider/model` refs in the request body (routing ids
