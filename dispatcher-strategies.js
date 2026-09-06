@@ -24,6 +24,7 @@ import {
   prepareArtifactBoundEvidence,
   persistPreparedArtifactBoundEvidence,
 } from './evidence-runtime.js';
+import { detectTransientError } from './dispatcher-utils.js';
 
 /**
  * DispatchResult shape (returned by every strategy):
@@ -898,7 +899,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     getDb, updateJobAfterRun, setDispatchStatus, handleTriggeredChildren,
     dequeueJob, log, transitionRunTerminal, completeRunFenced,
     commitCompletionBookkeeping, shouldRunPostCompletionEffects,
-    enqueueDispatch, getJob, getDispatchBacklogCount, sqliteNow,
+    enqueueDispatch, getJob, getDispatchBacklogCount, canEnqueueDispatch, sqliteNow,
     releaseDispatch, updateJob, deleteJob,
   } = deps;
 
@@ -1107,6 +1108,46 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
+  // One conservative retry for transient LLM failures (5xx / gateway timeout /
+  // aborted-class) on isolated agent-turn jobs. Retry bookkeeping and delivery
+  // validation share this transaction, so a later validation error rolls back
+  // the retry and its occurrence/counter updates together.
+  const scheduleTransientRetry = () => {
+    if (result.status !== 'error' || result.cleanupFailed || result.skipJobUpdate) return null;
+    if (job.session_target !== 'isolated' || job.job_type === 'watchdog') return null;
+    if (result.drainRetry || result.deferUntil || result.transientRetryScheduled) return null;
+    if (typeof getJob !== 'function' || typeof scheduleRetry !== 'function' || typeof canEnqueueDispatch !== 'function') return null;
+    const errorMessage = String(result.errorMessage || result.content || '');
+    if (!detectTransientError(errorMessage)) return null;
+    const freshJob = getJob(job.id);
+    if (!freshJob || !freshJob.enabled) return null;
+    if (Number(ctx.run.retry_count || 0) >= 1) return null; // at most one retry
+    if (!canEnqueueDispatch(job.id, freshJob.max_queued_dispatches || 25)) return null;
+    const retry = scheduleRetry(job, ctx.run.id, { delaySec: 300 });
+    if (!retry?.dispatch) return null;
+    getDb().prepare('UPDATE runs SET retry_count = ? WHERE id = ?').run(retry.retryCount, ctx.run.id);
+    // Record this failed attempt without terminalizing a one-shot job. Its
+    // retry can then produce the second failure or reset the count on success.
+    updateJob(job.id, { consecutive_errors: (freshJob.consecutive_errors || 0) + 1 });
+    return { ...retry, reason: errorMessage.slice(0, 200) };
+  };
+  const buildTransientFailureAlert = () => {
+    if (result.status !== 'error') return null;
+    if (job.session_target !== 'isolated' || job.job_type === 'watchdog') return null;
+    if (typeof getJob !== 'function') return null;
+    const freshJob = getJob(job.id);
+    if (!freshJob || (freshJob.consecutive_errors || 0) < 2) return null;
+    // Return data in the transaction outcome. No external effect may escape a
+    // later delivery-validation failure or completion-bookkeeping rollback.
+    return {
+      jobName: job.name,
+      jobId: job.id,
+      runId: ctx.run.id,
+      status: result.status,
+      errorMessage: String(result.errorMessage || result.content || '').slice(0, 300),
+      consecutiveErrors: freshJob.consecutive_errors,
+    };
+  };
   const enqueueCompletionDelivery = (retryScheduled) => {
     if (result.skipDelivery) return null;
     const deliveryContent = result.deliveryOverride ?? result.content;
@@ -1284,7 +1325,24 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       }
     }
 
+    const transientRetry = scheduleTransientRetry();
+    if (transientRetry) {
+      if (ctx.dispatchRecord) setDispatchStatus(ctx.dispatchRecord.id, 'done');
+      const dequeued = !result.skipDequeue && dequeueJob(job.id);
+      const delivery = enqueueCompletionDelivery(true);
+      return {
+        completion,
+        suppressed: false,
+        retry: null,
+        transientRetry,
+        drainDispatch: null,
+        dequeued,
+        delivery,
+      };
+    }
+
     if (!result.skipJobUpdate) updateJobAfterRun(job, result.status);
+    const failureAlert = buildTransientFailureAlert();
     if (result.cleanupFailed || result.disableJob) {
       updateJob(job.id, { enabled: 0 });
     }
@@ -1307,7 +1365,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     }
     const dequeued = !result.skipDequeue && dequeueJob(job.id);
     const delivery = enqueueCompletionDelivery(false);
-    return { completion, suppressed: false, retry: null, drainDispatch: null, dequeued, delivery };
+    return { completion, suppressed: false, retry: null, drainDispatch: null, dequeued, delivery, failureAlert };
   };
 
   const commitBookkeeping = () => commitCompletionBookkeeping
@@ -1340,12 +1398,39 @@ export async function finalizeDispatch(job, ctx, result, deps) {
     return;
   }
 
+  if (bookkeeping.failureAlert) {
+    // A nested transaction can return after releasing a savepoint while its
+    // outer transaction remains uncommitted. Suppress rather than leak a send.
+    if (getDb().inTransaction) {
+      log('warn', `Failure alert skipped while an outer transaction is open: ${job.name}`, { jobId: job.id, runId: ctx.run.id });
+    } else if (typeof deps.alertTransitFailure === 'function') {
+      try {
+        const alert = await deps.alertTransitFailure(bookkeeping.failureAlert);
+        if (alert?.sent === false) {
+          log('warn', `Failure alert skipped for ${job.name}: ${alert.reason}`, { jobId: job.id, runId: ctx.run.id });
+        } else {
+          log('warn', `Failure alert sent for ${job.name}`, { jobId: job.id, runId: ctx.run.id });
+        }
+      } catch (alertErr) {
+        log('warn', `Failure alert for ${job.name} failed to send: ${alertErr?.message || alertErr}`, { jobId: job.id, runId: ctx.run.id });
+      }
+    }
+  }
+
   if (bookkeeping.dequeued) log('info', `Dequeued pending dispatch for ${job.name}`);
   if (bookkeeping.drainDispatch) {
     log('info', `[drain-retry] scheduling retry for ${job.name} in 90s`, {
       jobId: job.id,
       runId: ctx.run.id,
       dispatchId: bookkeeping.drainDispatch.id,
+    });
+  } else if (bookkeeping.transientRetry) {
+    const tr = bookkeeping.transientRetry;
+    log('info', `[transient-retry] retrying ${job.name} in ${tr.delaySec}s after transient LLM error`, {
+      jobId: job.id,
+      runId: ctx.run.id,
+      dispatchId: tr.dispatch.id,
+      reason: tr.reason,
     });
   } else if (result.drainRetry) {
     log('info', `[drain-retry] retry not scheduled for ${job.name}`, {
@@ -2946,6 +3031,7 @@ async function runAgentTurnForSelection(
     message: prompt,
     agentId,
     sessionKey: validatedSessionKey,
+    model: selection.model || undefined,
     authProfile: selection.authProfile,
     materializedEnv: materializedEnv || undefined,
     capabilityBinding: capabilityBinding || undefined,

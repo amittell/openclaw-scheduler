@@ -2060,7 +2060,10 @@ export function scheduleRetry(job, failedRunId, opts = {}) {
   const failedRun = db.prepare('SELECT retry_count FROM runs WHERE id = ?').get(failedRunId);
   const retryCount = (failedRun?.retry_count || 0) + 1;
   // Exponential backoff: 30s, 60s, 120s, etc.
-  const delaySec = 30 * Math.pow(2, retryCount - 1);
+  const delaySec = opts.delaySec ?? 30 * Math.pow(2, retryCount - 1);
+  if (!Number.isFinite(delaySec) || delaySec <= 0) {
+    throw new Error('Retry delay must be a positive finite number of seconds');
+  }
   const retryPatch = {
     last_run_at: sqliteNow(),
     last_status: opts.lastStatus || 'error',
