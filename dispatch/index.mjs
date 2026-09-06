@@ -33,6 +33,7 @@ import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
+import { withLabelsLock } from './label-lock.mjs';
 import {
   buildCompletionSignalInstructions,
   buildTerminalCompletionPayload,
@@ -331,18 +332,25 @@ function saveLabels(labels) {
 }
 
 function mutateLabels(mutator) {
-  const labels = loadLabels();
-  if (labelsCacheError) {
-    throw new Error(
-      `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
-      { cause: labelsCacheError },
-    );
-  }
-  const changed = mutator(labels);
-  if (changed !== false) {
-    saveLabels(labels);
-  }
-  return labels;
+  // Cross-process lock: labels.json is mutated by the enqueue CLI, per-tick
+  // watcher processes, and status/result/sync CLIs concurrently. The lock
+  // serializes the read-modify-write window so a stale reader can no longer
+  // clobber fields another process just wrote. The ledger is re-read inside
+  // the lock (loadLabels invalidates on file signature change).
+  return withLabelsLock(LABELS_PATH, () => {
+    const labels = loadLabels();
+    if (labelsCacheError) {
+      throw new Error(
+        `Refusing to mutate invalid labels ledger: ${labelsCacheError.message}`,
+        { cause: labelsCacheError },
+      );
+    }
+    const changed = mutator(labels);
+    if (changed !== false) {
+      saveLabels(labels);
+    }
+    return labels;
+  });
 }
 
 function assertValidLabelSessionMetadata(name, entry) {
@@ -1152,6 +1160,43 @@ function checkSessionDone(sessionKey, sessionsStore, thresholdMs, sessionEverFou
   }
 
   if (sessionStatus === 'done') {
+    // A session reaching store status=done means the *turn* ended — it does
+    // NOT by itself prove the *task* completed. Require the terminal reply
+    // wherever one is observable:
+    //   - transcript readable + terminal end_turn reply -> completed
+    //   - transcript readable + NO terminal reply       -> interrupted
+    //     (silently-ended session: context limit / silent stop / gateway
+    //      recycled; observed 2026-09-02: #728 finisher reported "done"
+    //      with 0 commits / no push)
+    //   - transcript unavailable (no sessionId, legacy/missing store) ->
+    //     completed (preserves the legacy contract the t8 watchdog test
+    //     pins: a clean canonical done must not be narrated as abnormal)
+    let entries = null;
+    if (entry.sessionId) {
+      try {
+        entries = readJsonlTailEntries(entry.sessionId, agent, 20);
+      } catch {
+        entries = null; // unreadable -> legacy branch below
+      }
+    }
+    if (entries) {
+      if (getJsonlTerminalReplyReason(entries)) {
+        return {
+          shouldResolve: true,
+          completed: true,
+          reason: 'OpenClaw session status=done with terminal end_turn reply',
+          lastActivity,
+          sessionStatus,
+        };
+      }
+      return {
+        shouldResolve: true,
+        completed: false,
+        reason: 'OpenClaw session status=done but no terminal reply observed (possible incomplete run)',
+        lastActivity,
+        sessionStatus,
+      };
+    }
     return {
       shouldResolve: true,
       completed: true,
