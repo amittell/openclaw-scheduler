@@ -28,9 +28,10 @@ function runSync(script, args = [], options = {}) {
   });
 }
 
-function startWorker(script, args) {
+function startWorker(script, args, options = {}) {
   const child = spawn(process.execPath, ['--input-type=module', '-e', script, ...args], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    ...options,
   });
   let stdout = '';
   let stderr = '';
@@ -156,7 +157,174 @@ test('an invalid mutex file fails closed without entering or replacing it', (t) 
   assert.equal(readFileSync(mutexPath, 'utf8'), original);
 });
 
-test('the actual npm archive contains and runs both dispatch entrypoints and their mutex', { timeout: 60_000 }, (t) => {
+test('a delayed legacy bootstrap cannot overwrite a new writer after its missing-file check', { timeout: 30_000 }, async (t) => {
+  const { root } = fixture(t);
+  const stateDir = join(root, 'bootstrap-state');
+  const labelsPath = join(stateDir, 'labels.json');
+  const legacyPath = join(root, 'legacy.json');
+  const observed = join(root, 'missing-observed');
+  const resume = join(root, 'resume-bootstrap');
+  writeFileSync(legacyPath, '{"value":0}\n');
+  const pathsUrl = pathToFileURL(join(REPO_DIR, 'dispatch/paths.mjs')).href;
+  const script = `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const [who, stateDir, legacyPath, observed, resume] = process.argv.slice(1);
+    const labelsPath = stateDir + '/labels.json';
+    if (who === 'A') {
+      const original = fs.existsSync;
+      let intercepted = false;
+      fs.existsSync = function (path) {
+        const exists = original(path);
+        if (path === labelsPath && !exists && !intercepted) {
+          intercepted = true;
+          fs.writeFileSync(observed, 'missing');
+          const deadline = Date.now() + 15_000;
+          while (!original(resume)) {
+            if (Date.now() > deadline) throw new Error('bootstrap barrier timeout');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        }
+        return exists;
+      };
+      syncBuiltinESMExports();
+    }
+    const { resolveLabelsPath } = await import(${JSON.stringify(pathsUrl)});
+    const { withLabelsLock } = await import(${JSON.stringify(LOCK_URL)});
+    resolveLabelsPath({ env: { DISPATCH_STATE_DIR: stateDir }, legacyCandidates: [legacyPath] });
+    if (who === 'B') {
+      withLabelsLock(labelsPath, () => {
+        const state = JSON.parse(fs.readFileSync(labelsPath, 'utf8'));
+        state.value++;
+        fs.writeFileSync(labelsPath, JSON.stringify(state));
+      });
+    }
+  `;
+  const args = [stateDir, legacyPath, observed, resume];
+  const first = startWorker(script, ['A', ...args]);
+  const workers = [first];
+  try {
+    await waitForFile(observed);
+    const second = startWorker(script, ['B', ...args]);
+    workers.push(second);
+    const created = await second.done;
+    assert.equal(created.status, 0, created.stderr);
+    assert.equal(JSON.parse(readFileSync(labelsPath, 'utf8')).value, 1);
+    writeFileSync(resume, 'continue');
+    const delayed = await first.done;
+    assert.equal(delayed.status, 0, delayed.stderr);
+    assert.equal(JSON.parse(readFileSync(labelsPath, 'utf8')).value, 1,
+      'late bootstrap must retain the update written after its initial missing check');
+  } finally {
+    for (const worker of workers) worker.child.kill('SIGKILL');
+    await Promise.all(workers.map((worker) => worker.done));
+  }
+});
+
+for (const mode of ['concurrent-claimers', 'completed-before-claim', 'completed-during-dispatch', 'edited-during-dispatch']) {
+  test(`recovery owns fresh ledger mutations and preserves concurrent state: ${mode}`, { timeout: 30_000 }, async (t) => {
+    const { root, labelsPath } = fixture(t);
+    const recoveryPath = join(REPO_DIR, 'dispatch/529-recovery.mjs');
+    const callsPath = join(root, 'fixture-calls.jsonl');
+    const stubPath = join(root, 'owned-cli.mjs');
+    const initial = {
+      retry: { status: 'error', error: 'synthetic 529 overload',
+        updatedAt: new Date(Date.now() - 6 * 60_000).toISOString(), retryCount: 0 },
+      unrelated: { marker: 0 },
+    };
+    writeFileSync(labelsPath, JSON.stringify(initial));
+    writeFileSync(stubPath, `
+      import { withLabelsLock } from ${JSON.stringify(LOCK_URL)};
+      import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+      const verb = process.argv[2];
+      // This separate child must acquire the actual mutex successfully. A
+      // recovery parent holding ownership across dispatch would fail here.
+      withLabelsLock(process.env.DISPATCH_LABELS_PATH, () => {
+        appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ verb }) + '\\n');
+        if (verb === 'send' && ${JSON.stringify(mode)}.endsWith('-during-dispatch')) {
+          const labels = JSON.parse(readFileSync(process.env.DISPATCH_LABELS_PATH, 'utf8'));
+          if (${JSON.stringify(mode)} === 'completed-during-dispatch') {
+            labels.retry.status = 'done';
+            labels.retry.error = null;
+          } else {
+            labels.retry.error = 'different failure after claim';
+          }
+          // Deliberately retain updatedAt: timestamp equality is insufficient
+          // to prove this is still the entry recovery claimed.
+          labels.retry.note = 'concurrent change';
+          writeFileSync(process.env.DISPATCH_LABELS_PATH, JSON.stringify(labels));
+        }
+      }, { timeoutMs: 150 });
+    `);
+    const databaseUrl = pathToFileURL(join(REPO_DIR, 'node_modules/better-sqlite3/lib/index.js')).href;
+    const script = `
+      import Database from ${JSON.stringify(databaseUrl)};
+      import { writeFileSync } from 'node:fs';
+      const original = Database.prototype.exec;
+      Database.prototype.exec = function (sql) {
+        if (sql === 'BEGIN IMMEDIATE') writeFileSync(process.argv[2], 'attempting actual mutex');
+        return original.call(this, sql);
+      };
+      await import(process.argv[1]);
+    `;
+    const env = {
+      ...process.env,
+      HOME: join(root, 'home'), OPENCLAW_SCHEDULER_HOME: join(root, 'scheduler'),
+      SCHEDULER_DB: ':memory:', DISPATCH_STATE_DIR: root, DISPATCH_LABELS_PATH: labelsPath,
+      DISPATCH_INDEX_PATH: stubPath, OPENCLAW_SCHEDULER_CLI: stubPath,
+    };
+    const workers = [];
+    try {
+      withLabelsLock(labelsPath, () => {
+        const markers = [];
+        for (let i = 0; i < (mode === 'concurrent-claimers' ? 2 : 1); i++) {
+          const marker = join(root, `attempt-${i}`);
+          markers.push(marker);
+          workers.push(startWorker(script, [pathToFileURL(recoveryPath).href, marker], { env }));
+        }
+        const deadline = Date.now() + 15_000;
+        while (markers.some((marker) => !existsSync(marker))) {
+          assert.ok(Date.now() < deadline, 'recovery did not attempt the actual mutex');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+        assert.deepEqual(JSON.parse(readFileSync(labelsPath, 'utf8')), initial,
+          'recovery must not mutate while another owner holds the mutex');
+        assert.equal(existsSync(callsPath), false, 'no subprocess before a successful retry claim');
+        initial.unrelated.marker = 1;
+        if (mode === 'completed-before-claim') initial.retry.status = 'done';
+        writeFileSync(labelsPath, JSON.stringify(initial));
+      });
+      for (const result of await Promise.all(workers.map((worker) => worker.done))) {
+        assert.equal(result.status, 0, result.stderr);
+      }
+      const final = JSON.parse(readFileSync(labelsPath, 'utf8'));
+      const calls = existsSync(callsPath)
+        ? readFileSync(callsPath, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      assert.equal(final.unrelated.marker, 1);
+      if (mode === 'completed-before-claim') {
+        assert.deepEqual(calls, []);
+        assert.equal(final.retry.status, 'done');
+        assert.equal(final.retry.retryCount, 0);
+      } else {
+        assert.deepEqual(calls, [{ verb: 'send' }, { verb: 'msg' }], 'one claimant dispatches once');
+        assert.equal(final.retry.retryCount, 1);
+        if (mode === 'concurrent-claimers') {
+          assert.equal(final.retry.status, 'running');
+          assert.equal(final.retry.error, null);
+        } else {
+          assert.equal(final.retry.note, 'concurrent change');
+          assert.equal(final.retry.status, mode === 'completed-during-dispatch' ? 'done' : 'error');
+          assert.equal(final.retry.error, mode === 'completed-during-dispatch' ? null : 'different failure after claim');
+        }
+      }
+    } finally {
+      for (const worker of workers) worker.child.kill('SIGKILL');
+      await Promise.all(workers.map((worker) => worker.done));
+    }
+  });
+}
+
+test('the actual npm archive contains and runs dispatch writers and their mutex', { timeout: 60_000 }, (t) => {
   const { root } = fixture(t);
   const home = join(root, 'home');
   mkdirSync(home);
@@ -181,7 +349,9 @@ test('the actual npm archive contains and runs both dispatch entrypoints and the
   assert.equal(pack.error, undefined);
   assert.equal(pack.status, 0, pack.stderr);
   const [packed] = JSON.parse(pack.stdout);
-  for (const path of ['dispatch/index.mjs', 'dispatch/watcher.mjs', 'dispatch/label-lock.mjs']) {
+  const runtimePaths = ['dispatch/index.mjs', 'dispatch/watcher.mjs', 'dispatch/label-lock.mjs',
+    'dispatch/paths.mjs', 'dispatch/529-recovery.mjs'];
+  for (const path of runtimePaths) {
     assert.ok(packed.files.some((entry) => entry.path === path), `archive missing ${path}`);
   }
   const unpack = spawnSync('tar', ['-xzf', join(root, packed.filename), '-C', root], {
@@ -189,19 +359,21 @@ test('the actual npm archive contains and runs both dispatch entrypoints and the
   });
   assert.equal(unpack.status, 0, unpack.stderr);
   const packageDir = join(root, 'package');
-  for (const path of ['dispatch/index.mjs', 'dispatch/watcher.mjs', 'dispatch/label-lock.mjs']) {
+  for (const path of runtimePaths) {
     assert.deepEqual(readFileSync(join(packageDir, path)), readFileSync(join(REPO_DIR, path)),
       `archive changed ${path}`);
   }
   symlinkSync(realpathSync(join(REPO_DIR, 'node_modules')), join(packageDir, 'node_modules'), 'dir');
-  for (const entrypoint of ['index.mjs', 'watcher.mjs']) {
+  for (const entrypoint of ['index.mjs', 'watcher.mjs', '529-recovery.mjs']) {
     const result = spawnSync(process.execPath, [join(packageDir, 'dispatch', entrypoint)], {
       cwd: packageDir, env, encoding: 'utf8', timeout: 15_000,
     });
     assert.equal(result.error, undefined);
-    assert.equal(result.status, 2, result.stderr);
+    assert.equal(result.status, entrypoint === '529-recovery.mjs' ? 0 : 2, result.stderr);
     assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND|Cannot find module/);
-    assert.match(result.stdout + result.stderr, entrypoint === 'watcher.mjs' ? /--label is required/ : /Usage:/i);
+    const expected = { 'watcher.mjs': /--label is required/, 'index.mjs': /Usage:/i,
+      '529-recovery.mjs': /no 529 errors found/ };
+    assert.match(result.stdout + result.stderr, expected[entrypoint]);
   }
   const packedLock = pathToFileURL(join(packageDir, 'dispatch/label-lock.mjs')).href;
   const result = runSync(`

@@ -63,9 +63,13 @@ persistent file is expected after release; do not delete it to unlock a live
 writer. The OS releases a crashed process's ownership, and waiting writers
 have a bounded timeout. This mutex is separate from the scheduler database.
 Keep the ledger and mutex on one host's local filesystem.
+Legacy-ledger initialization and the periodic 529 recovery writer use the
+same mutex. Recovery rechecks eligibility when claiming, releases ownership
+before child dispatch/notification, and retains concurrent label changes when
+reconciling a successful retry.
 
 When upgrading from the former JSON `labels.json.lock` protocol, stop all
-writers, including running watchers and CLI invocations, before replacing any
+writers, including running watchers, recovery scans and CLI invocations, before replacing any
 of these dispatch files. Restart them from the same upgraded package. Old and
 new writers must not overlap because their mutex protocols differ. Retain
 that quiescence when rolling back. An old JSON lock can be archived only after

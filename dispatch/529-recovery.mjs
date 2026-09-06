@@ -25,6 +25,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { resolveLabelsPath } from './paths.mjs';
+import { withLabelsLock } from './label-lock.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.HOME || homedir();
@@ -64,6 +65,56 @@ function saveLabels(labels) {
   const tmp = LABELS_PATH + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(labels, null, 2) + '\n');
   renameSync(tmp, LABELS_PATH);
+}
+
+function retryRejection(entry, now) {
+  if (!entry || entry.status !== 'error' || !is529Error(entry.error)) {
+    return 'label changed since scan';
+  }
+  const updatedAt = entry.updatedAt ? new Date(entry.updatedAt).getTime() : 0;
+  const errorAge = now - updatedAt;
+  if (!Number.isFinite(errorAge)) return 'invalid error timestamp';
+  if (errorAge > MAX_ERROR_AGE_MS) {
+    return `error too old (${Math.round(errorAge / 60000)}min)`;
+  }
+  if (errorAge < MIN_SINCE_LAST_UPDATE_MS) {
+    return `updated ${Math.round(errorAge / 1000)}s ago (watcher may be handling)`;
+  }
+  const retryCount = entry.retryCount || 0;
+  if (!Number.isInteger(retryCount) || retryCount < 0) return 'invalid retry count';
+  if (retryCount >= MAX_RETRIES) {
+    return `max retries exhausted (${retryCount}/${MAX_RETRIES})`;
+  }
+  return null;
+}
+
+function claimRetry(name) {
+  return withLabelsLock(LABELS_PATH, () => {
+    const labels = loadLabels();
+    const entry = labels[name];
+    const reason = retryRejection(entry, Date.now());
+    if (reason) return { reason };
+    entry.retryCount = (entry.retryCount || 0) + 1;
+    entry.updatedAt = new Date().toISOString();
+    saveLabels(labels);
+    return { entry, signature: JSON.stringify(entry) };
+  });
+}
+
+function reconcileRetry(name, claim) {
+  return withLabelsLock(LABELS_PATH, () => {
+    const labels = loadLabels();
+    const entry = labels[name];
+    // The child CLI or another watcher may have updated this label while we
+    // dispatched. Only reconcile the exact entry this process claimed; keep
+    // every concurrent change, including terminal state and same-time writes.
+    if (!entry || JSON.stringify(entry) !== claim.signature) return false;
+    entry.status = 'running';
+    entry.error = null;
+    entry.updatedAt = new Date().toISOString();
+    saveLabels(labels);
+    return true;
+  });
 }
 
 function resolveSchedulerCliPath() {
@@ -143,58 +194,30 @@ function respawnSession(label, entry) {
 // -- Main ----------------------------------------------------
 
 const labels = loadLabels();
-const now = Date.now();
 const results = [];
 for (const [name, entry] of Object.entries(labels)) {
   // Only look at error-state sessions
-  if (entry.status !== 'error') continue;
+  if (entry?.status !== 'error') continue;
 
   const errorMsg = entry.error || '';
   if (!is529Error(errorMsg)) continue;
 
-  // Check age -- don't retry very old errors
-  const updatedAt = entry.updatedAt ? new Date(entry.updatedAt).getTime() : 0;
-  const errorAge = now - updatedAt;
-  if (errorAge > MAX_ERROR_AGE_MS) {
-    results.push({ label: name, action: 'skip', reason: `error too old (${Math.round(errorAge / 60000)}min)` });
+  // Re-read and revalidate under ownership: a watcher or competing recovery
+  // process may have handled this error since the initial scan.
+  const claim = claimRetry(name);
+  if (claim.reason) {
+    results.push({ label: name, action: 'skip', reason: claim.reason });
     continue;
   }
 
-  // Check if watcher already handled it (updated recently)
-  if (errorAge < MIN_SINCE_LAST_UPDATE_MS) {
-    results.push({ label: name, action: 'skip', reason: `updated ${Math.round(errorAge / 1000)}s ago (watcher may be handling)` });
-    continue;
-  }
-
-  // Check retry count
-  const retryCount = entry.retryCount || 0;
-  if (retryCount >= MAX_RETRIES) {
-    results.push({ label: name, action: 'skip', reason: `max retries exhausted (${retryCount}/${MAX_RETRIES})` });
-    continue;
-  }
-
-  // Attempt retry
-  const newRetryCount = retryCount + 1;
+  const newRetryCount = claim.entry.retryCount;
   process.stderr.write(`[529-recovery] retrying [${name}] (attempt ${newRetryCount}/${MAX_RETRIES})\n`);
 
-  // Update labels.json first (claim the retry)
-  const freshLabels = loadLabels();
-  if (freshLabels[name]) {
-    freshLabels[name].retryCount = newRetryCount;
-    freshLabels[name].updatedAt = new Date().toISOString();
-    saveLabels(freshLabels);
-  }
-
-  const method = respawnSession(name, entry);
+  // Child dispatch and notifications can also write labels. Do not hold the
+  // synchronous mutex over subprocess work or wait on our own child owner.
+  const method = respawnSession(name, claim.entry);
   if (method) {
-    // Mark as running
-    const updated = loadLabels();
-    if (updated[name]) {
-      updated[name].status = 'running';
-      updated[name].error = null;
-      updated[name].updatedAt = new Date().toISOString();
-      saveLabels(updated);
-    }
+    reconcileRetry(name, claim);
     notify(`🌶️ Dispatch 529 recovery: [${name}] retried (${newRetryCount}/${MAX_RETRIES}) via ${method}`);
     results.push({ label: name, action: 'retried', method, retryCount: newRetryCount });
   } else {
