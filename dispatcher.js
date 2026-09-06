@@ -31,7 +31,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
   readFileSync(join(__dirname, 'package.json'), 'utf8')
 );
-import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount } from './jobs.js';
+import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount, canEnqueueDispatch } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes,
@@ -89,7 +89,7 @@ import {
   getBackoffMs,
   isDrainError,
 } from './dispatcher-utils.js';
-import { createDeliveryHelpers } from './dispatcher-delivery.js';
+import { createDeliveryHelpers, createTransientFailureAlertHandler } from './dispatcher-delivery.js';
 import { checkApprovals } from './dispatcher-approvals.js';
 import {
   checkRunHealth,
@@ -668,6 +668,13 @@ function buildDispatchDeps(dispatcherFence = null) {
     dequeueJob,
     // Drain-error retry
     isDrainError, enqueueDispatch, getJob,
+    // Transient-LLM-error retry (isolated agent-turn jobs): one retry after ~5min
+    canEnqueueDispatch,
+    // Failure alerts have no implicit recipient on a new installation.
+    alertTransitFailure: createTransientFailureAlertHandler({
+      target: process.env.SCHEDULER_ALERT_TARGET,
+      deliverMessageFn: deliverMessage,
+    }),
     // v0.2 runtime
     resolveIdentity, evaluateTrust, verifyAuthorizationProof,
     evaluateAuthorization, generateEvidence, summarizeCredentialHandoff,

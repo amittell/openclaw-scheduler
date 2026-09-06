@@ -1,0 +1,57 @@
+name: Publish to npm
+#
+# WritHub-side shadow of `.github/workflows/publish.yml`, whose only purpose is
+# to make that workflow STOP AUTO-DISPATCHING ON WRITHUB.
+#
+# THE TRIGGER IS THE DEFECT. The GitHub file declares:
+#
+#     on:
+#       push:
+#         tags: ['v*']
+#
+# On GitHub that fires for tags only. WritHub's push-trigger matcher parses just
+# the `on:` mapping, and when a `push:` block carries no `branches:` key it
+# treats the trigger as UNFILTERED -- so this release workflow was dispatched on
+# WritHub by every ordinary BRANCH push, and failed every time. Measured on
+# `main` and again on the head of Change #2.
+#
+# It cannot pass here even in principle: it wants an npm publish token, the
+# `gh` CLI against GitHub's API, and `actions/setup-node`, which the lane's
+# `--cap-drop=ALL` container cannot extract (writhub #2068). No credential is
+# added here and none should be -- publishing belongs on the forge that owns
+# the npm provenance chain.
+#
+# HOW THIS DISABLES IT: WritHub's dispatcher evaluates the `on: push:` trigger of
+# the SHADOW when one exists. This file declares only `workflow_dispatch`, so
+# there is no `push` key to match and the workflow is never auto-dispatched here.
+#
+# COVERAGE LOST: none. `.github/workflows/publish.yml` is untouched and still
+# runs on GitHub Actions for `v*` tags, which is where releases are actually
+# cut. What is lost is a job that could never have published anything from this
+# lane, on pushes it was never meant to observe.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this GitHub-only workflow is being run on WritHub'
+        required: false
+
+jobs:
+  explain:
+    name: GitHub-only workflow (no-op on WritHub)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Explain why there is nothing to do
+        run: |
+          echo "publish.yml releases this package to npm from a v* tag on"
+          echo "GitHub Actions, with npm provenance and a GitHub release."
+          echo
+          echo "It has no npm credential here, no GitHub API to talk to, and"
+          echo "the lane cannot run actions/setup-node. Nothing to do."
+          echo
+          echo "The real release runs on GitHub Actions from"
+          echo ".github/workflows/publish.yml, which this file shadows only on"
+          echo "WritHub."

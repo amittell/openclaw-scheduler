@@ -1,5 +1,23 @@
 import { enqueueDelivery, enqueueMultipartDelivery } from './delivery-outbox.js';
 
+/** Failure alerts require an operator-selected Telegram chat, never a default. */
+export function createTransientFailureAlertHandler({ target, deliverMessageFn }) {
+  const normalized = typeof target === 'string' ? target.trim() : '';
+  const valid = /^-?[1-9]\d*$/.test(normalized)
+    && Number.isSafeInteger(Number(normalized));
+  return async ({ jobName, runId, errorMessage, consecutiveErrors }) => {
+    if (!valid) return { sent: false, reason: normalized ? 'invalid_operator_target' : 'operator_target_unconfigured' };
+    const text = [
+      `\u26a0\ufe0f Scheduled job failing repeatedly: ${jobName}`,
+      `Consecutive failures: ${consecutiveErrors}`,
+      `Run: ${runId}`,
+      errorMessage ? `Last error: ${errorMessage}` : null,
+    ].filter(Boolean).join('\n');
+    await deliverMessageFn('telegram', normalized, text);
+    return { sent: true };
+  };
+}
+
 export function createDeliveryHelpers({
   log,
   resolveDeliveryAlias,
@@ -10,6 +28,21 @@ export function createDeliveryHelpers({
     if (!target) return null;
     return resolveDeliveryAlias(target);
   }
+
+  /**
+   * A target that is only digits or a leading-minus integer (optionally with
+   * spaces) is a bare chat id on Telegram: Telegram user and group ids are
+   * signed integers (groups/supergroups start with '-100' / '-5', DMs are
+   * plain numbers), and on this deployment Telegram is the only message
+   * channel the scheduler delivers to. When the channel column was left
+   * empty (NULL) at job-creation time, the target still identifies a unique
+   * route, so resolving the channel here is safe and preserves the
+   * operator-configured target. Non-numeric targets (aliases, usernames,
+   * prefixed strings that already carry their own channel) must not be
+   * touched: a prefix like 'discord:123' is resolved by the prefixed-target
+   * branch below, and a bare alias resolves through resolveAlias first.
+   */
+  const isBareNumericTarget = (value) => /^[+-]?\d[\d\s]*$/.test(String(value ?? '').trim());
 
   function normalizeRoute(channel, target) {
     let normalizedChannel = typeof channel === 'string' ? channel.trim() : '';
@@ -46,8 +79,19 @@ export function createDeliveryHelpers({
     }
 
     ({ channel, target } = normalizeRoute(channel, target));
+    if (!channel && target && isBareNumericTarget(target)) {
+      channel = 'telegram';
+      log('info', `Delivery channel auto-resolved to telegram for ${job.name || job.id || 'job'}`, { to: target });
+    }
+    if (!channel && !target) {
+      // Fully unrouted (no channel, no target): nothing to deliver. Announce
+      // jobs with no configured route are a no-op, matching the pre-existing
+      // behavior -- a hard failure is reserved for partially-routed jobs whose
+      // target cannot be resolved.
+      return null;
+    }
     if (!channel || !target) {
-      log('error', `Delivery route is incomplete: ${job.name}`, { channel: channel || null, to: target || null });
+      log('error', `Delivery route is incomplete: ${job.name || job.id || 'job'}`, { channel: channel || null, to: target || null });
       throw new Error(`Delivery route for '${job.name || job.id || 'job'}' requires both channel and target`);
     }
 

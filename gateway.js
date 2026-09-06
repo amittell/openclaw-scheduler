@@ -353,7 +353,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
  * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
  * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject
- * @param {string[]} [opts.sessionKinds]  - Optional session kinds to track for activity polling
+ * @param {string[]} [opts.sessionKinds]  - Ignored; activity is matched by exact session key across all kinds
  */
 export async function runAgentTurnWithActivityTimeout(opts) {
   const {
@@ -367,7 +367,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     idleTimeoutMs = 120000,       // per-check idle threshold (from payload_timeout_seconds)
     pollIntervalMs = 60000,       // check activity every 60s
     absoluteTimeoutMs = 300000,   // hard ceiling (run_timeout_ms)
-    sessionKinds,
     signal,
     cancelOnAbort = true,
   } = opts;
@@ -385,41 +384,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const controller = new AbortController();
   let abortReason = null;
   const unlinkExternalAbort = linkExternalAbort(controller, signal, () => { abortReason = 'external'; });
-  const normalizedAgentId = validatedAgentId.toLowerCase();
-  const normalizedSessionKey = String(validatedSessionKey || '').toLowerCase();
-
-  const inferSessionKinds = () => {
-    if (Array.isArray(sessionKinds) && sessionKinds.length > 0) {
-      return [...new Set(sessionKinds.map(k => String(k).toLowerCase()).filter(Boolean))];
-    }
-
-    // Explicitly isolated/subagent sessions should not be pinned to main session
-    // so they can report idleness based on their own active session records.
-    if (
-      normalizedSessionKey === 'isolated' ||
-      normalizedSessionKey.startsWith('isolated:') ||
-      normalizedSessionKey.endsWith(':isolated') ||
-      normalizedSessionKey.includes(':isolated:') ||
-      normalizedAgentId === 'subagent'
-    ) {
-      return ['subagent', 'isolated'];
-    }
-
-    // Default to including main unless we can clearly infer this is an isolated run.
-    if (
-      normalizedAgentId === 'main' ||
-      normalizedSessionKey === 'main' ||
-      normalizedSessionKey.startsWith('main:') ||
-      normalizedSessionKey.includes(':main:') ||
-      normalizedSessionKey.endsWith(':main')
-    ) {
-      return ['main', 'subagent', 'isolated'];
-    }
-
-    return ['main', 'subagent', 'isolated'];
-  };
-
-  const resolvedSessionKinds = inferSessionKinds();
 
   // Hard absolute ceiling -- always fires regardless of activity
   const absoluteTimer = setTimeout(() => {
@@ -433,7 +397,11 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 
   const checkActivity = async () => {
     try {
-      const result = await listSessions({ kinds: resolvedSessionKinds, activeMinutes: 60 });
+      // Scheduler sessions can be classified as "other". Filtering by
+      // main/subagent/isolated returns a successful list that omits the active
+      // session, leaving lastSeenActivity unchanged and causing a false idle
+      // timeout. Poll all kinds and match only the exact session key below.
+      const result = await listSessions({ activeMinutes: 60 });
       // Normalise: gateway wraps result in several layers
       const sessions =
         result?.result?.details?.sessions ||
