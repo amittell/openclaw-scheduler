@@ -33,10 +33,13 @@ import {
   buildSudoChmodPrivateArgs,
   buildSudoInstallArgs,
   buildSudoLaunchctlBootstrapArgs,
+  configuredOpenClawCliPath,
   createSetupCommandRunner,
   encodeLaunchdPlistValue,
   formatPosixCommand,
+  renderLaunchdCliEnvironment,
   renderSystemdUserService,
+  updateLaunchdCliPath,
 } from './setup-service-utils.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -101,6 +104,7 @@ if (setupOptions.help) {
 }
 
 const platform = process.platform;
+const openclawCliPath = platform === 'darwin' ? configuredOpenClawCliPath() : '';
 const isWSL = platform === 'linux' && Boolean(
   process.env.WSL_DISTRO_NAME
   || process.env.WSL_INTEROP
@@ -451,6 +455,25 @@ if (platform === 'darwin') {
       warn(`Run manually: ${chmodCommand}`);
     }
   };
+  const updateExistingServiceCliPath = async (service) => {
+    if (!openclawCliPath || !await confirm(`Update ${service.title} OPENCLAW_CLI_PATH from installation configuration?`)) {
+      return false;
+    }
+    try {
+      const changed = updateLaunchdCliPath({
+        plistPath: service.plistPath,
+        cliPath: openclawCliPath,
+        runCommand: runSetupCommand,
+        asRoot: service.mode === 'daemon',
+      });
+      if (changed) ok(`${service.title} OPENCLAW_CLI_PATH updated; service has not been reloaded`);
+      else skip(`${service.title} OPENCLAW_CLI_PATH already matches`);
+      return changed;
+    } catch (error) {
+      warn(`Could not configure ${service.title} OPENCLAW_CLI_PATH: ${error.message}`);
+      return false;
+    }
+  };
   let selectedServiceMode = setupOptions.serviceMode;
   if (!selectedServiceMode) {
     print('  Choose how the scheduler should start on macOS:');
@@ -495,6 +518,7 @@ if (platform === 'darwin') {
       hardenExistingServiceFile(macServiceSummary);
     } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
       hardenExistingServiceFile(service);
+      const cliPathChanged = await updateExistingServiceCliPath(service);
       skip(`${service.title} already installed`);
       print(`  Path: ${service.plistPath}`);
       if (service.domain) {
@@ -502,7 +526,15 @@ if (platform === 'darwin') {
         const restartCommand = service.mode === 'daemon'
           ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...restartArgs])
           : formatPosixCommand(MACOS_LAUNCHCTL_PATH, restartArgs);
-        print(`  To restart: ${restartCommand}`);
+        if (cliPathChanged) {
+          const prefix = service.mode === 'daemon' ? ['--', MACOS_LAUNCHCTL_PATH] : [];
+          const command = service.mode === 'daemon' ? MACOS_SUDO_PATH : MACOS_LAUNCHCTL_PATH;
+          print('  After holding callers and stopping active work, reload to read the new environment:');
+          print(`  ${formatPosixCommand(command, [...prefix, 'bootout', `${service.domain}/${service.label}`])}`);
+          print(`  ${formatPosixCommand(command, [...prefix, ...buildLaunchctlBootstrapArgs(service.domain, service.plistPath)])}`);
+        } else {
+          print(`  To restart: ${restartCommand}`);
+        }
       }
     } else if (macServiceSummary) {
       const install = await confirm(service.installPrompt);
@@ -510,6 +542,7 @@ if (platform === 'darwin') {
         const tokenXml = gatewayToken
           ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${encodeLaunchdPlistValue(gatewayToken, 'gateway token')}</string>\n`
           : '';
+        const cliXml = renderLaunchdCliEnvironment(openclawCliPath);
         const userXml = service.mode === 'daemon'
           ? `  <key>UserName</key>\n  <string>${encodeLaunchdPlistValue(serviceUser, 'service user')}</string>\n`
           : '';
@@ -539,7 +572,7 @@ ${userXml}  <key>WorkingDirectory</key>
     <string>${encodeLaunchdPlistValue(gatewayUrl, 'gateway URL')}</string>
     <key>SCHEDULER_DB</key>
     <string>${encodeLaunchdPlistValue(schedulerDbPath, 'scheduler database path')}</string>
-${tokenXml}  </dict>
+${tokenXml}${cliXml}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

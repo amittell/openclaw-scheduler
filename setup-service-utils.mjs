@@ -7,6 +7,7 @@ export const MACOS_INSTALL_PATH = '/usr/bin/install';
 export const MACOS_LAUNCHCTL_PATH = '/bin/launchctl';
 export const MACOS_SUDO_PATH = '/usr/bin/sudo';
 export const MACOS_CHMOD_PATH = '/bin/chmod';
+export const MACOS_PLUTIL_PATH = '/usr/bin/plutil';
 
 function describeCodePoint(character) {
   return `U+${character.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
@@ -52,6 +53,47 @@ export function encodeLaunchdPlistValue(value, label = 'launchd value') {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&apos;');
+}
+
+/** Use only the public CLI entry explicitly supplied by installation configuration. */
+export function configuredOpenClawCliPath(env = process.env) {
+  const value = env.OPENCLAW_CLI_PATH ?? '';
+  assertSafeServiceValue(value, 'OPENCLAW_CLI_PATH');
+  if (value && !isAbsolute(value)) throw new Error('OPENCLAW_CLI_PATH must be an absolute public CLI path');
+  return value;
+}
+
+export function renderLaunchdCliEnvironment(cliPath = '') {
+  const value = configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: cliPath });
+  return value
+    ? `    <key>OPENCLAW_CLI_PATH</key>\n    <string>${encodeLaunchdPlistValue(value, 'OPENCLAW_CLI_PATH')}</string>\n`
+    : '';
+}
+
+/** Update only the configured CLI key; plutil preserves all other plist values. */
+export function updateLaunchdCliPath({ plistPath, cliPath = '', runCommand, asRoot = false }) {
+  const value = configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: cliPath });
+  if (!value) return false;
+  assertSafeServiceValue(plistPath, 'launchd plist path');
+  if (!isAbsolute(plistPath)) throw new Error('launchd plist path must be absolute');
+  const plutil = args => runCommand(
+    asRoot ? MACOS_SUDO_PATH : MACOS_PLUTIL_PATH,
+    asRoot ? ['--', MACOS_PLUTIL_PATH, ...args] : args,
+    { encoding: 'utf8' },
+  );
+  // Read only this dictionary, so unrelated plist date/data values need no JSON conversion.
+  const environment = JSON.parse(plutil([
+    '-extract', 'EnvironmentVariables', 'json', '-expect', 'dictionary', '-o', '-', '--', plistPath,
+  ]));
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    throw new Error('launchd EnvironmentVariables must be a dictionary');
+  }
+  if (environment.OPENCLAW_CLI_PATH === value) return false;
+  plutil([
+    Object.hasOwn(environment, 'OPENCLAW_CLI_PATH') ? '-replace' : '-insert',
+    'EnvironmentVariables.OPENCLAW_CLI_PATH', '-string', value, '--', plistPath,
+  ]);
+  return true;
 }
 
 function encodeSystemdQuotedItem(value, label, { escapeDollar = false } = {}) {
