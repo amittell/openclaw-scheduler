@@ -44,6 +44,7 @@ test('name-filtered daily reliability tests leave the fallback database untouche
   const child = spawnSync(process.execPath, [
     '--import', denyNetwork,
     '--test',
+    '--test-reporter=tap',
     '--test-name-pattern', '^(transient 5xx failure|second consecutive transient failure)',
     fileURLToPath(new URL('./daily-job-reliability.test.mjs', import.meta.url)),
   ], {
