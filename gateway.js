@@ -565,7 +565,7 @@ export async function sendSystemEvent(text, mode = 'now') {
 //
 // The gateway's /v1/chat/completions endpoint only accepts routing model ids
 // in the request body ("openclaw", "openclaw/default", "openclaw/<agentId>",
-// "agent/<agentId>" -- see the gateway's isOpenClawAgentModelId). Concrete
+// "agent:<agentId>" -- see the gateway's isOpenClawAgentModelId). Concrete
 // provider/model refs (e.g. "example/gpt-4o") are rejected there and
 // belong in the x-openclaw-model header, which the gateway resolves via
 // parseModelRef with a visibility-policy check. splitModelOverride routes a

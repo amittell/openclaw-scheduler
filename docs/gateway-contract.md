@@ -100,7 +100,7 @@ how `job.payload_model` values are routed.
 
 The gateway's `/v1/chat/completions` endpoint accepts only **routing model ids** in
 the request body (`openclaw`, `openclaw/default`, `openclaw/<agentId>`,
-`agent/<agentId>`); concrete `provider/model` refs (e.g. `example/gpt-4o`)
+`agent:<agentId>`); concrete `provider/model` refs (e.g. `example/gpt-4o`)
 are rejected there. The scheduler therefore splits the requested model before
 dispatch (`splitModelOverride` in `gateway.js`):
 
