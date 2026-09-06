@@ -13143,6 +13143,65 @@ console.log('\n-- Gateway scope header --');
   }
 }
 
+
+// -- Activity monitor must not filter sessions_list by kind --
+// Regression: the former main/subagent/isolated filter omitted an active scheduler
+// session classified as "other" from a successful sessions_list result. Without
+// activity updates, the monitor could then report a false idle timeout. Keep the
+// poll unfiltered and match the exact run session key, independent of its kind.
+console.log('\n-- Activity monitor sessions_list args (no kinds filter) --');
+{
+  const originalFetch = globalThis.fetch;
+  const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  process.env.OPENCLAW_GATEWAY_TOKEN = 'test-gateway-token';
+  const captured = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    captured.push({ url: String(url), opts });
+    if (String(url).includes('tools/invoke')) {
+      // sessions_list poll: report the run session as active
+      return {
+        ok: true,
+        json: async () => ({ result: { sessions: [{ key: 'session-act', updatedAt: Date.now() }] } }),
+        headers: new Headers({}),
+      };
+    }
+    // chat completions: delay so the poll timer fires while the turn is in flight
+    await new Promise((r) => setTimeout(r, 50));
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 1 } }),
+      headers: new Headers({ 'x-openclaw-session-key': 'session-act' }),
+    };
+  };
+
+  try {
+    const result = await runAgentTurnWithActivityTimeout({
+      message: 'hello',
+      agentId: 'main',
+      sessionKey: 'session-act',
+      pollIntervalMs: 20,
+      idleTimeoutMs: 60_000,
+      absoluteTimeoutMs: 5_000,
+    });
+    assert(result?.ok === true, 'runAgentTurnWithActivityTimeout: completes when monitor sees activity');
+
+    const invokeCalls = captured.filter((c) => c.url.includes('tools/invoke'));
+    assert(invokeCalls.length > 0, 'activity monitor: polled sessions_list at least once');
+    for (const call of invokeCalls) {
+      const body = JSON.parse(call.opts.body);
+      assert(body.tool === 'sessions_list', 'activity monitor: polls the sessions_list tool');
+      assert(
+        !('kinds' in (body.args || {})),
+        'activity monitor: must NOT pass a kinds filter that can omit the active session',
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
+  }
+}
+
 // ===========================================================
 // SECTION: ORIGIN_CHAT_ID auto-inject in cmdEnqueue
 // ===========================================================
