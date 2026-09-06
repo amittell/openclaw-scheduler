@@ -91,6 +91,23 @@ test('bare positive numeric delivery_to with null channel resolves to telegram',
   assert.equal(delivered[0].target, '484946046');
 });
 
+test('bare numeric inference trims only surrounding whitespace', () => {
+  const { job, handleDelivery, delivered } = makeHandleDelivery({ delivery_to: '  -5268075089  ' });
+  handleDelivery(job, 'body');
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].channel, 'telegram');
+  assert.equal(delivered[0].target, '-5268075089');
+});
+
+for (const target of ['123 456', '123\t456', '123\n456', '+12345']) {
+  test(`bare numeric inference rejects malformed target ${JSON.stringify(target)}`, () => {
+    const { job, handleDelivery, delivered, infos } = makeHandleDelivery({ delivery_to: target });
+    assert.throws(() => handleDelivery(job, 'body'), /Delivery route for 'Daily Job' requires both channel and target/);
+    assert.equal(delivered.length, 0, 'invalid inferred route never reaches the outbox');
+    assert.equal(infos.some(entry => entry.msg.includes('auto-resolved')), false);
+  });
+}
+
 test('explicit channel is preserved (no override)', () => {
   const { job, handleDelivery, delivered } = makeHandleDelivery({
     delivery_channel: 'telegram',

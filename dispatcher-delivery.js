@@ -30,8 +30,8 @@ export function createDeliveryHelpers({
   }
 
   /**
-   * A target that is only digits or a leading-minus integer (optionally with
-   * spaces) is a bare chat id on Telegram: Telegram user and group ids are
+   * A target that is only digits with an optional leading minus (after trimming
+   * surrounding whitespace) is a bare chat id on Telegram: Telegram user and group ids are
    * signed integers (groups/supergroups start with '-100' / '-5', DMs are
    * plain numbers), and on this deployment Telegram is the only message
    * channel the scheduler delivers to. When the channel column was left
@@ -42,7 +42,7 @@ export function createDeliveryHelpers({
    * touched: a prefix like 'discord:123' is resolved by the prefixed-target
    * branch below, and a bare alias resolves through resolveAlias first.
    */
-  const isBareNumericTarget = (value) => /^[+-]?\d[\d\s]*$/.test(String(value ?? '').trim());
+  const isBareNumericTarget = (value) => /^-?\d+$/.test(String(value ?? '').trim());
 
   function normalizeRoute(channel, target) {
     let normalizedChannel = typeof channel === 'string' ? channel.trim() : '';

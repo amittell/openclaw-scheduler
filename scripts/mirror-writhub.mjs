@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -91,8 +90,7 @@ export function mirrorRefs({ cwd, source = 'origin', target = 'writhub', eventNa
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const event = process.env.GITHUB_EVENT_PATH ? JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')) : {};
-    const result = mirrorRefs({ cwd: process.cwd(), eventName: process.env.GITHUB_EVENT_NAME, eventRef: process.env.GITHUB_REF, deleted: event.deleted === true, fullSync: process.env.MIRROR_FULL_SYNC === 'true' });
+    const result = mirrorRefs({ cwd: process.cwd(), eventName: process.env.GITHUB_EVENT_NAME, eventRef: process.env.GITHUB_REF, deleted: process.env.MIRROR_DELETED === 'true', fullSync: process.env.MIRROR_FULL_SYNC === 'true' });
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 1;
   } catch (error) {

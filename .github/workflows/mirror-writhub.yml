@@ -41,6 +41,7 @@ jobs:
           WRITHUB_USERNAME: ${{ vars.WRITHUB_USERNAME }}
           WRITHUB_REPOSITORY: ${{ vars.WRITHUB_REPOSITORY }}
           WRITHUB_ASKPASS: ${{ github.workspace }}/scripts/writhub-askpass.sh
+          MIRROR_DELETED: ${{ github.event.deleted == true }}
           MIRROR_FULL_SYNC: ${{ inputs.full_sync || false }}
         shell: bash
         run: |

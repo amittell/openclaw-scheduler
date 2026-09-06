@@ -108,6 +108,34 @@ test('source deletions are preserved without attempting to fetch a missing event
   assert.deepEqual(f.refs(), before);
 });
 
+test('CLI deletion flag preserves a missing ref without reading an event path', t => {
+  const f = fixture(t);
+  const before = f.refs();
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/mirror-writhub.mjs', import.meta.url))], {
+    cwd: f.cwd,
+    env: { PATH: process.env.PATH, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/no-longer-present', GITHUB_EVENT_PATH: join(f.root, 'must-not-read.json'), MIRROR_DELETED: 'true', MIRROR_FULL_SYNC: 'false', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    encoding: 'utf8', timeout: 5_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { ok: true, mode: 'event-ref', refs: [{ ref: 'refs/heads/no-longer-present', status: 'preserved-deletion' }] });
+  assert.deepEqual(f.refs(), before);
+});
+
+test('CLI uses the scalar deletion flag instead of event file contents', t => {
+  const f = fixture(t);
+  const eventPath = join(f.root, 'ignored-event.json');
+  writeFileSync(eventPath, '{"deleted":true}');
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/mirror-writhub.mjs', import.meta.url))], {
+    cwd: f.cwd,
+    env: { PATH: process.env.PATH, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/candidate', GITHUB_EVENT_PATH: eventPath, MIRROR_DELETED: 'false', MIRROR_FULL_SYNC: 'false', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    encoding: 'utf8', timeout: 10_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout).refs, [{ ref: 'refs/heads/candidate', status: 'updated', oid: f.candidate }]);
+  assert.equal(f.refs().get('refs/heads/candidate'), f.candidate);
+  assert.equal(readFileSync(eventPath, 'utf8'), '{"deleted":true}');
+});
+
 test('queued events mirror the current source tip and manual defaults stay scoped', t => {
   const f = fixture(t);
   f.run();
@@ -162,7 +190,7 @@ process.exit(result.status ?? 1);
 `, { mode: 0o700 });
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/mirror-writhub.mjs', import.meta.url))], {
     cwd: f.cwd,
-    env: { ...process.env, PATH: `${f.root}${delimiter}${process.env.PATH}`, MIRROR_OBSERVATIONS: observations, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/candidate', GITHUB_EVENT_PATH: '', MIRROR_FULL_SYNC: 'false', WRITHUB_TOKEN: 'synthetic-only-token', WRITHUB_USERNAME: 'fixture', WRITHUB_REPOSITORY: 'fixture/scheduler', WRITHUB_ASKPASS: askpass, WRITHUB_EXTRA_TEST: 'synthetic-extra', GIT_ASKPASS: 'must-not-inherit', SSH_ASKPASS: 'must-not-inherit', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    env: { ...process.env, PATH: `${f.root}${delimiter}${process.env.PATH}`, MIRROR_OBSERVATIONS: observations, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/candidate', GITHUB_EVENT_PATH: '', MIRROR_DELETED: 'false', MIRROR_FULL_SYNC: 'false', WRITHUB_TOKEN: 'synthetic-only-token', WRITHUB_USERNAME: 'fixture', WRITHUB_REPOSITORY: 'fixture/scheduler', WRITHUB_ASKPASS: askpass, WRITHUB_EXTRA_TEST: 'synthetic-extra', GIT_ASKPASS: 'must-not-inherit', SSH_ASKPASS: 'must-not-inherit', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
