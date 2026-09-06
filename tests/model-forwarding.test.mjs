@@ -8,7 +8,7 @@ import test from 'node:test';
 // isOpenClawAgentModelId, src/gateway/http-utils.ts). Before this fix the
 // isolated-dispatch path sent `model: model || openclaw:<agentId>` in the
 // body and never forwarded payload_model, so a job payload_model of e.g.
-// "gpufarm/qwen3.8-27b" only took effect via the legacy sessions.json store.
+// "example/gpt-4o" only took effect via the legacy sessions.json store.
 //
 // splitModelOverride routes non-routing refs into the x-openclaw-model header
 // (the gateway's model-override channel, resolved via parseModelRef with the
@@ -75,15 +75,15 @@ test('provider/model ref is forwarded via x-openclaw-model, body keeps a routing
     message: 'use the configured model',
     agentId: 'main',
     sessionKey: 'agent:main:subagent:11111111-2222-3333-4444-555555555555',
-    model: 'gpufarm/qwen3.8-27b',
-    authProfile: 'gpufarm:all-models',
+    model: 'example/gpt-4o',
+    authProfile: 'example:all-models',
     timeoutMs: 3_000,
   }));
   assert.equal(result.ok, true, 'turn should succeed against the sink');
-  assert.equal(captured.modelHeader, 'gpufarm/qwen3.8-27b', 'model ref must travel in the x-openclaw-model header');
+  assert.equal(captured.modelHeader, 'example/gpt-4o', 'model ref must travel in the x-openclaw-model header');
   assert.equal(captured.body.model, 'openclaw:main', 'body must carry a valid routing id, not the provider ref');
   assert.equal(captured.agentIdHeader, 'main', 'agent id header is preserved');
-  assert.equal(captured.authProfileHeader, 'gpufarm:all-models', 'auth profile header is preserved');
+  assert.equal(captured.authProfileHeader, 'example:all-models', 'auth profile header is preserved');
 });
 
 test('routing model id stays in the body without an override header', async () => {
@@ -130,10 +130,10 @@ test('explicit routes identical to the default path stay in the body (P2)', asyn
   const { result, captured } = await captureChatCompletions(async (gateway) => gateway.runAgentTurn({
     message: 'provider ref still header-routed',
     agentId: 'main',
-    model: 'gpufarm/qwen3.8-27b',
+    model: 'example/gpt-4o',
     timeoutMs: 3_000,
   }));
   assert.equal(result.ok, true, 'provider ref turn should succeed');
-  assert.equal(captured.modelHeader, 'gpufarm/qwen3.8-27b', 'provider ref still travels in the header');
+  assert.equal(captured.modelHeader, 'example/gpt-4o', 'provider ref still travels in the header');
   assert.equal(captured.body.model, 'openclaw:main', 'provider ref body stays a valid routing id');
 });

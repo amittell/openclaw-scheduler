@@ -180,7 +180,7 @@ test('alias resolution still wins over bare-numeric inference', () => {
 test('applySessionOverridesToSessionStore: missing sessions.json is ok (no warn payload)', () => {
   const result = applySessionOverridesToSessionStore('scheduler:daily-job-reliability-never-created', {
     authProfile: 'openai:codex',
-    modelRef: 'gpufarm/qwen3.8-27b',
+    modelRef: 'example/gpt-4o',
   }, 'main');
   assert.equal(result.ok, true, 'missing sessions.json is a no-op, not a failure');
   assert.equal(result.error, undefined, 'no error string for callers to log');
