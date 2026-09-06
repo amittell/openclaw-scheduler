@@ -385,7 +385,7 @@ test('actual existing-service setup branch updates only after an explicit config
   assert.ok(branch, 'actual existing-service branch found');
   const directory = mkdtempSync(join(tmpdir(), 'setup-cli-existing-'));
   try {
-    for (const [cliPath, approve, expected] of [[METACHAR_VALUE, true, METACHAR_VALUE], [METACHAR_VALUE, false, '/fixture/old-cli'], ['', true, '/fixture/old-cli']]) {
+    for (const [cliPath, approve, expected, failRead = false] of [[METACHAR_VALUE, true, METACHAR_VALUE], [METACHAR_VALUE, false, '/fixture/old-cli'], ['', true, '/fixture/old-cli'], [METACHAR_VALUE, true, '/fixture/old-cli', true]]) {
       const file = join(directory, 'fixture.plist');
       writeFileSync(file, `<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
 <key>OPENCLAW_CLI_PATH</key><string>/fixture/old-cli</string><key>KEEP</key><string>fixture-secret-sentinel</string>
@@ -402,17 +402,33 @@ test('actual existing-service setup branch updates only after an explicit config
         runSetupCommand: createSetupCommandRunner((command, args, options) => {
           assert.equal(command, MACOS_PLUTIL_PATH, 'no service command is allowed in the existing-service branch');
           commands += 1;
+          if (failRead) throw new Error('inert plist read failure');
           return execFileSync(command, args, options);
         }),
       };
       await runInNewContext(`(async () => { ${helper}\n${branch}\n })()`, context);
       assert.equal(plistCommand(['-extract', 'EnvironmentVariables.OPENCLAW_CLI_PATH', 'raw', '-n', '--', file]), expected);
       assert.equal(withoutCliNode(canonicalPlist(file)), withoutCliNode(before));
-      assert.equal(commands, cliPath && approve ? 2 : 0);
+      assert.equal(commands, failRead ? 1 : (cliPath && approve ? 2 : 0));
       assert.ok(output.every(text => !text.includes('fixture-secret-sentinel')));
-      if (cliPath && approve) {
+      if (cliPath && approve && !failRead) {
         assert.ok(output.some(text => text.includes('bootstrap')));
         assert.ok(output.every(text => !text.includes('kickstart')));
+        // Confirm the same setting again before any service reload has occurred.
+        const matchingBytes = readFileSync(file);
+        commands = 0;
+        output.length = 0;
+        await runInNewContext(`(async () => { ${helper}\n${branch}\n })()`, context);
+        assert.equal(commands, 1, 'matching configuration only reads the plist');
+        assert.deepEqual(readFileSync(file), matchingBytes);
+        assert.ok(output.some(text => text.includes('already matches')));
+        assert.ok(output.some(text => text.includes('bootout')));
+        assert.ok(output.some(text => text.includes('bootstrap')));
+        assert.ok(output.every(text => !text.includes('kickstart')));
+      } else {
+        assert.ok(output.some(text => text.includes('kickstart')));
+        assert.ok(output.every(text => !text.includes('bootstrap')));
+        if (failRead) assert.ok(output.some(text => text.includes('inert plist read failure')));
       }
     }
   } finally {

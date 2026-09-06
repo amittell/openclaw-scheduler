@@ -468,7 +468,8 @@ if (platform === 'darwin') {
       });
       if (changed) ok(`${service.title} OPENCLAW_CLI_PATH updated; service has not been reloaded`);
       else skip(`${service.title} OPENCLAW_CLI_PATH already matches`);
-      return changed;
+      // Disk equality does not establish which environment launchd has loaded.
+      return true;
     } catch (error) {
       warn(`Could not configure ${service.title} OPENCLAW_CLI_PATH: ${error.message}`);
       return false;
@@ -518,7 +519,7 @@ if (platform === 'darwin') {
       hardenExistingServiceFile(macServiceSummary);
     } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
       hardenExistingServiceFile(service);
-      const cliPathChanged = await updateExistingServiceCliPath(service);
+      const cliPathConfigured = await updateExistingServiceCliPath(service);
       skip(`${service.title} already installed`);
       print(`  Path: ${service.plistPath}`);
       if (service.domain) {
@@ -526,7 +527,7 @@ if (platform === 'darwin') {
         const restartCommand = service.mode === 'daemon'
           ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...restartArgs])
           : formatPosixCommand(MACOS_LAUNCHCTL_PATH, restartArgs);
-        if (cliPathChanged) {
+        if (cliPathConfigured) {
           const prefix = service.mode === 'daemon' ? ['--', MACOS_LAUNCHCTL_PATH] : [];
           const command = service.mode === 'daemon' ? MACOS_SUDO_PATH : MACOS_LAUNCHCTL_PATH;
           print('  After holding callers and stopping active work, reload to read the new environment:');
