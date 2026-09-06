@@ -66,6 +66,7 @@
     "scripts/telegram-webhook-check.mjs",
     "scripts/test-all.mjs",
     "scripts/mirror-writhub.mjs",
+    "scripts/writhub-askpass.sh",
     "scripts/validate-doc-examples.mjs",
     "scripts/coverage.mjs",
     "scripts/verify-local.mjs",

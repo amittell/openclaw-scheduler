@@ -40,6 +40,7 @@ jobs:
           WRITHUB_TOKEN: ${{ secrets.WRITHUB_TOKEN }}
           WRITHUB_USERNAME: ${{ vars.WRITHUB_USERNAME }}
           WRITHUB_REPOSITORY: ${{ vars.WRITHUB_REPOSITORY }}
+          WRITHUB_ASKPASS: ${{ github.workspace }}/scripts/writhub-askpass.sh
           MIRROR_FULL_SYNC: ${{ inputs.full_sync || false }}
         shell: bash
         run: |
@@ -58,20 +59,8 @@ jobs:
             exit 1
           fi
 
-          askpass="$RUNNER_TEMP/writhub-askpass.sh"
-          trap 'rm -f "$askpass"' EXIT
-          cat > "$askpass" <<'ASKPASS'
-          #!/bin/sh
-          case "$1" in
-            *Username*) printf '%s\n' "$WRITHUB_USERNAME" ;;
-            *Password*) printf '%s\n' "$WRITHUB_TOKEN" ;;
-            *) exit 1 ;;
-          esac
-          ASKPASS
-          chmod 700 "$askpass"
-
           git remote add writhub \
             "https://writhub.io/${WRITHUB_REPOSITORY}.git"
 
-          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+          GIT_TERMINAL_PROMPT=0 \
             node scripts/mirror-writhub.mjs

@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mirrorRefs } from '../scripts/mirror-writhub.mjs';
 
 function fixture(t) {
@@ -139,4 +140,71 @@ test('a rejected push is reported as failure and is never retried', t => {
   assert.equal(result.refs[0].status, 'push-failed');
   assert.equal(readFileSync(join(target, 'mirror-attempts'), 'utf8'), 'attempt\n');
   assert.deepEqual(f.refs(), before);
+});
+
+test('Git subprocess credentials are available only to destination operations', t => {
+  const f = fixture(t);
+  // Exercise destination fetch as well as ls-remote and push.
+  f.git('push', 'writhub', `${f.base}:refs/heads/candidate`);
+  const realGit = process.env.PATH.split(delimiter).map(path => join(path, 'git')).find(path => existsSync(path));
+  assert.ok(realGit);
+  const gitWrapper = join(f.root, 'git');
+  const observations = join(f.root, 'git-environment.jsonl');
+  const askpass = fileURLToPath(new URL('../scripts/writhub-askpass.sh', import.meta.url));
+  writeFileSync(gitWrapper, `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const args = process.argv.slice(2);
+const keys = ['WRITHUB_TOKEN', 'WRITHUB_USERNAME', 'WRITHUB_REPOSITORY', 'WRITHUB_ASKPASS', 'WRITHUB_EXTRA_TEST', 'GIT_ASKPASS', 'SSH_ASKPASS'];
+appendFileSync(process.env.MIRROR_OBSERVATIONS, JSON.stringify({ args, present: Object.fromEntries(keys.map(key => [key, Object.hasOwn(process.env, key)])), intendedAskpass: process.env.GIT_ASKPASS === ${JSON.stringify(askpass)} }) + '\\n');
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`, { mode: 0o700 });
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/mirror-writhub.mjs', import.meta.url))], {
+    cwd: f.cwd,
+    env: { ...process.env, PATH: `${f.root}${delimiter}${process.env.PATH}`, MIRROR_OBSERVATIONS: observations, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/candidate', GITHUB_EVENT_PATH: '', MIRROR_FULL_SYNC: 'false', WRITHUB_TOKEN: 'synthetic-only-token', WRITHUB_USERNAME: 'fixture', WRITHUB_REPOSITORY: 'fixture/scheduler', WRITHUB_ASKPASS: askpass, WRITHUB_EXTRA_TEST: 'synthetic-extra', GIT_ASKPASS: 'must-not-inherit', SSH_ASKPASS: 'must-not-inherit', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(f.refs().get('refs/heads/candidate'), f.candidate);
+  const rows = readFileSync(observations, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const sourceAndLocal = rows.filter(row => !row.args.includes('writhub'));
+  const destination = rows.filter(row => row.args.includes('writhub'));
+  assert.ok(sourceAndLocal.some(row => row.args.includes('origin')));
+  assert.equal(destination.length, 3, 'destination ls-remote, fetch and push were exercised');
+  for (const row of sourceAndLocal) assert.ok(Object.values(row.present).every(present => !present), 'source/local Git must receive no WritHub credential variables or askpass');
+  for (const row of destination) {
+    assert.equal(row.present.WRITHUB_TOKEN, true);
+    assert.equal(row.present.WRITHUB_USERNAME, true);
+    assert.equal(row.present.WRITHUB_REPOSITORY, true);
+    assert.equal(row.intendedAskpass, true);
+    assert.equal(row.present.SSH_ASKPASS, false);
+    assert.deepEqual(row.args.slice(0, 2), ['-c', 'credential.useHttpPath=true']);
+  }
+});
+
+test('askpass serves only the intended HTTPS WritHub repository and configured username', t => {
+  const f = fixture(t);
+  const askpass = fileURLToPath(new URL('../scripts/writhub-askpass.sh', import.meta.url));
+  const env = { PATH: process.env.PATH, LC_ALL: 'C', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: '0', WRITHUB_USERNAME: 'fixture', WRITHUB_REPOSITORY: 'fixture/scheduler', WRITHUB_TOKEN: 'synthetic-only-token' };
+  // credential fill invokes the actual Git askpass protocol; empty helpers
+  // prevent access to any credential store. It performs no network operation.
+  for (const [protocol, host, path, username, allowed] of [
+    ['https', 'writhub.io', 'fixture/scheduler.git', null, true],
+    ['https', 'writhub.io', 'fixture/scheduler.git', 'fixture', true],
+    ['https', 'github.com', 'fixture/scheduler.git', null, false],
+    ['https', 'unrelated.invalid', 'fixture/scheduler.git', null, false],
+    ['https', 'writhub.io.unrelated.invalid', 'fixture/scheduler.git', null, false],
+    ['http', 'writhub.io', 'fixture/scheduler.git', null, false],
+    ['https', 'writhub.io', 'fixture/other.git', null, false],
+    ['https', 'writhub.io', '', null, false],
+    ['https', 'writhub.io', 'fixture/scheduler.git', 'other-user', false],
+  ]) {
+    const result = spawnSync('git', ['-c', 'credential.helper=', '-c', 'credential.useHttpPath=true', 'credential', 'fill'], {
+      cwd: f.cwd, env, input: `protocol=${protocol}\nhost=${host}\npath=${path}\n${username ? `username=${username}\n` : ''}\n`, encoding: 'utf8', timeout: 5_000,
+    });
+    assert.equal(result.status === 0, allowed, `${protocol}://${host}/${path} credential decision`);
+    assert.equal(result.stdout.includes('password=synthetic-only-token'), allowed);
+    if (!allowed) assert.equal(result.stdout, '', 'denied prompts return no credentials');
+  }
 });

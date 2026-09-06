@@ -4,8 +4,21 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-function git(cwd, args, allowFailure = false) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 60_000 });
+function git(cwd, args, allowFailure = false, destination = false) {
+  // Source fetches and local Git operations must never inherit destination
+  // secrets or a generic credential responder from the workflow environment.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !key.startsWith('WRITHUB_') && !['GIT_ASKPASS', 'SSH_ASKPASS'].includes(key)));
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.LC_ALL = 'C';
+  if (destination) {
+    for (const key of ['WRITHUB_TOKEN', 'WRITHUB_USERNAME', 'WRITHUB_REPOSITORY']) {
+      if (process.env[key] !== undefined) env[key] = process.env[key];
+    }
+    if (process.env.WRITHUB_ASKPASS) env.GIT_ASKPASS = process.env.WRITHUB_ASKPASS;
+  }
+  const gitArgs = destination ? ['-c', 'credential.useHttpPath=true', ...args] : args;
+  const result = spawnSync('git', gitArgs, { cwd, env, encoding: 'utf8', timeout: 60_000 });
   if (result.error) throw result.error;
   if (result.status !== 0 && !allowFailure) {
     throw new Error(`git ${args[0]} failed: ${result.stderr.trim()}`);
@@ -37,7 +50,7 @@ export function mirrorRefs({ cwd, source = 'origin', target = 'writhub', eventNa
     : [`+${eventRef}:${sourcePrefix}${eventRef.slice(5)}`];
   git(cwd, ['fetch', '--no-tags', '--prune', source, ...refspecs]);
   const sourceRefs = parseRefs(git(cwd, ['for-each-ref', '--format=%(objectname) %(refname)', sourcePrefix]).stdout);
-  const targetRefs = parseRefs(git(cwd, ['ls-remote', '--refs', target, 'refs/heads/*', 'refs/tags/*']).stdout);
+  const targetRefs = parseRefs(git(cwd, ['ls-remote', '--refs', target, 'refs/heads/*', 'refs/tags/*'], false, true).stdout);
   const results = [];
   for (const [localRef, oid] of sourceRefs) {
     const ref = `refs/${localRef.slice(sourcePrefix.length)}`;
@@ -54,7 +67,7 @@ export function mirrorRefs({ cwd, source = 'origin', target = 'writhub', eventNa
     }
     if (targetOid) {
       const localTarget = `refs/mirror-target/${ref.slice(5)}`;
-      git(cwd, ['fetch', '--no-tags', target, `+${ref}:${localTarget}`]);
+      git(cwd, ['fetch', '--no-tags', target, `+${ref}:${localTarget}`], false, true);
       targetOid = git(cwd, ['rev-parse', localTarget]).stdout.trim();
       const ancestry = git(cwd, ['merge-base', '--is-ancestor', targetOid, oid], true);
       if (ancestry.status !== 0) {
@@ -65,7 +78,7 @@ export function mirrorRefs({ cwd, source = 'origin', target = 'writhub', eventNa
     }
     // No force, deletion, mirror flag or wildcard push. A concurrent destination
     // change is still protected by Git's normal fast-forward/tag checks.
-    const push = git(cwd, ['push', '--porcelain', target, `${localRef}:${ref}`], true);
+    const push = git(cwd, ['push', '--porcelain', target, `${localRef}:${ref}`], true, true);
     if (push.status !== 0) {
       // Never retry an uncertain remote result (e.g. a WritHub HTTP 524).
       results.push({ ref, status: 'push-failed', sourceOid: oid, detail: push.stderr.trim() });
