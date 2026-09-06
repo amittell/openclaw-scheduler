@@ -915,16 +915,9 @@ function splitProfileSuffix(raw) {
   return model && profile ? { model, profile } : { model: trimmed };
 }
 
-/**
- * Apply Gateway session-pin metadata before a turn; never read/write a session file.
- * This is not a credential-use guarantee: Gateway auth resolution can clear invalid pins.
- * Model-only selections remain HTTP-only. The optional executor is for offline controls.
- */
-export async function prepareAgentSelection(sessionKey, overrides = {}, agentId = 'main', opts = {}) {
+/** Normalize the effective model/profile once for preparation and fallback identity. */
+export function normalizeAgentSelection(overrides = {}, agentId = 'main') {
   const owner = assertValidAgentId(agentId, 'agentId');
-  const validatedKey = assertSessionKeyForAgent(sessionKey, owner, 'sessionKey');
-  const key = validatedKey.startsWith('agent:') ? validatedKey : `agent:${owner}:${validatedKey}`;
-  if (opts.signal?.aborted) throw new GatewayPreparationError('Gateway preparation cancelled', { code: 'ABORT_ERR' });
   if (['modelRef', 'authProfile'].some(name => overrides[name] != null && typeof overrides[name] !== 'string')) {
     throw new GatewayPreparationError('Model and profile selections must be strings or null');
   }
@@ -936,7 +929,9 @@ export async function prepareAgentSelection(sessionKey, overrides = {}, agentId 
   }
   const profile = separateProfile || split.profile;
   const route = splitModelOverride(split.model, owner);
-  if (!profile) return { ok: true, applied: false, model: split.model || undefined };
+  const normalized = { model: split.model || undefined, authProfile: profile || undefined,
+    identity: JSON.stringify([route.overrideHeader || `openclaw:${owner.toLowerCase()}`, profile || null]) };
+  if (!profile) return normalized;
   if (profile === 'inherit' || /[\s/]/.test(profile)) {
     throw new GatewayPreparationError('Profile must be a resolved explicit ID without whitespace or slash');
   }
@@ -950,6 +945,23 @@ export async function prepareAgentSelection(sessionKey, overrides = {}, agentId 
   if (verified.model !== split.model || verified.profile !== profile) {
     throw new GatewayPreparationError('Ambiguous model/profile suffix combination');
   }
+  return normalized;
+}
+
+/**
+ * Apply Gateway session-pin metadata before a turn; never read/write a session file.
+ * This is not a credential-use guarantee: Gateway auth resolution can clear invalid pins.
+ * Model-only selections remain HTTP-only. The optional executor is for offline controls.
+ */
+export async function prepareAgentSelection(sessionKey, overrides = {}, agentId = 'main', opts = {}) {
+  const owner = assertValidAgentId(agentId, 'agentId');
+  const validatedKey = assertSessionKeyForAgent(sessionKey, owner, 'sessionKey');
+  const key = validatedKey.startsWith('agent:') ? validatedKey : `agent:${owner}:${validatedKey}`;
+  if (opts.signal?.aborted) throw new GatewayPreparationError('Gateway preparation cancelled', { code: 'ABORT_ERR' });
+  const { model: selectedModel, authProfile: profile } = normalizeAgentSelection(overrides, owner);
+  if (!profile) return { ok: true, applied: false, model: selectedModel };
+  const slash = selectedModel.indexOf('/');
+  const modelWithProfile = `${selectedModel}@${profile}`;
   const response = await callGatewayPreparation({ key, agentId: owner, model: modelWithProfile }, {
     ...opts,
     gatewayUrl: GATEWAY_URL,
@@ -961,12 +973,12 @@ export async function prepareAgentSelection(sessionKey, overrides = {}, agentId 
   const model = entry?.modelOverride ?? response?.resolved?.model;
   if (response?.ok !== true || response.key !== key || !entry || Array.isArray(entry)
       || entry.authProfileOverride !== profile || entry.authProfileOverrideSource !== 'user'
-      || provider !== split.model.slice(0, slash) || model !== split.model.slice(slash + 1)) {
+      || provider !== selectedModel.slice(0, slash) || model !== selectedModel.slice(slash + 1)) {
     throw new GatewayPreparationError('Gateway preparation receipt does not match the requested session/model/profile', {
       code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
     });
   }
-  return { ok: true, applied: true, model: split.model, authProfile: profile };
+  return { ok: true, applied: true, model: selectedModel, authProfile: profile };
 }
 
 /** Retired compatibility API: never silently mutate or report an applied local override. */

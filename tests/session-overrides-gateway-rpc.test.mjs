@@ -38,7 +38,8 @@ test('real preparation binds canonical key, owner, model/profile, endpoint, CLI 
   assert.deepEqual(JSON.parse(call.args[call.args.indexOf('--params') + 1]), { key, agentId: 'main', model: 'vendor/model@vendor:work' });
   const expectedUrl = new URL(process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789');
   expectedUrl.protocol = expectedUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-  assert.equal(call.args[call.args.indexOf('--url') + 1], expectedUrl.href);
+  assert(!call.args.includes('--url'));
+  assert.equal(call.options.env.OPENCLAW_GATEWAY_URL, expectedUrl.href);
   assert(!call.args.join(' ').includes('fixture-token'));
   assert.equal(call.options.env.OPENCLAW_GATEWAY_TOKEN, 'fixture-token');
 });
@@ -69,9 +70,10 @@ test('invalid, ambiguous, unowned and unresolved selections fail before any RPC'
 });
 
 test('definite RPC rejection differs from malformed, wrong-target, wrong-pin and wrong-model receipts', async () => {
-  await assert.rejects(prepareAgentSelection(key, selection, 'main', fixture({ ok: false, error: { code: 'INVALID_REQUEST', message: 'fixture rejection' } }).options),
+  await assert.rejects(prepareAgentSelection(key, selection, 'main', fixture({ ok: false, error: { type: 'gateway_request_error', code: 'INVALID_REQUEST', message: 'fixture rejection' } }, { code: 1, signal: null, killed: false }).options),
     error => error instanceof GatewayPreparationError && !error.uncertain);
   for (const response of ['not json', {}, { ok: false, error: 'unclassified error' },
+    { ok: false, error: { code: 'INVALID_REQUEST' } },
     { ok: false, error: { code: 'UNAVAILABLE' } }, receipt({ key: 'agent:other:scheduler:fixture' }),
     receipt({ entry: { ...receipt().entry, authProfileOverride: 'vendor:other' } }),
     receipt({ entry: { ...receipt().entry, modelOverride: 'other' } }),
@@ -91,7 +93,7 @@ test('transport refuses PATH lookup, different scope fields, bad URL and pre-can
   await assert.rejects(callGatewayPreparation(params, { ...options, signal: controller.signal }), error => error.code === 'ABORT_ERR');
   assert.equal(f.calls.length, 0);
   await callGatewayPreparation(params, options);
-  assert.equal(f.calls[0].args[f.calls[0].args.indexOf('--url') + 1], 'wss://gateway.example/prefix/');
+  assert.equal(f.calls[0].options.env.OPENCLAW_GATEWAY_URL, 'wss://gateway.example/prefix/');
 });
 
 test('actual owned subprocess timeout, cancellation and nonzero success-looking output are uncertain', async () => {
@@ -111,4 +113,36 @@ test('actual owned subprocess timeout, cancellation and nonzero success-looking 
       await assert.rejects(callGatewayPreparation(params, { ...options, timeout: 2000, signal: controller.signal }), error => error.code === 'ABORT_ERR' && error.uncertain === true);
     } finally { clearTimeout(timer); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('typed rejections require a completed exit zero or exact exit one process', async () => {
+  for (const code of ['INVALID_REQUEST', 'FORBIDDEN']) {
+    const rejection = { ok: false, error: { type: 'gateway_request_error', code, message: 'fixture' } };
+    for (const processError of [null, { code: 1, killed: false, signal: null }]) {
+      await assert.rejects(prepareAgentSelection(key, selection, 'main', fixture(rejection, processError).options),
+        error => error.code === 'GATEWAY_PREPARATION_REJECTED' && !error.uncertain);
+    }
+    for (const processError of [
+      { code: 2, killed: false, signal: null }, { code: 1, killed: true, signal: null },
+      { code: 1, killed: false, signal: 'SIGTERM' }, { code: 'ABORT_ERR' },
+      { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }, { code: 'ETIMEDOUT' }, { code: 1 },
+    ]) await assert.rejects(prepareAgentSelection(key, selection, 'main', fixture(rejection, processError).options),
+      error => error.uncertain === true);
+  }
+});
+
+test('paired child URL/token replace ambient values and exclude ambient password', async () => {
+  const f = fixture();
+  const env = { OPENCLAW_GATEWAY_URL: 'ws://other.invalid', OPENCLAW_GATEWAY_TOKEN: 'ambient-token',
+    OPENCLAW_GATEWAY_PASSWORD: 'ambient-password', PATH: '/owned/path' };
+  await callGatewayPreparation({ key, agentId: 'main', model: 'vendor/model@vendor:work' }, {
+    ...f.options, gatewayUrl: 'https://gateway.example/prefix/', env,
+  });
+  assert.equal(f.calls[0].options.env.OPENCLAW_GATEWAY_URL, 'wss://gateway.example/prefix/');
+  assert.equal(f.calls[0].options.env.OPENCLAW_GATEWAY_TOKEN, 'fixture-token');
+  assert.equal(f.calls[0].options.env.OPENCLAW_GATEWAY_PASSWORD, undefined);
+  assert.equal(f.calls[0].options.env.PATH, '/owned/path');
+  assert.equal(env.OPENCLAW_GATEWAY_PASSWORD, 'ambient-password');
+  assert(!f.calls[0].args.includes('--url'));
 });

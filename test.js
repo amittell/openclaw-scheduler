@@ -3697,8 +3697,8 @@ console.log('\n-- executeAgent fallback selection --');
     id: 'fallback-runtime-job',
     name: 'Fallback Runtime Job',
     agent_id: 'main',
-    payload_model: 'gpt-5-mini',
-    payload_model_fallback: 'gpt-4.1-mini',
+    payload_model: 'anthropic/gpt-5-mini',
+    payload_model_fallback: 'openai/gpt-4.1-mini',
     auth_profile: 'anthropic:primary',
     auth_profile_fallback: 'openai:backup',
     payload_timeout_seconds: 120,
@@ -3726,11 +3726,11 @@ console.log('\n-- executeAgent fallback selection --');
 
   assert(result.status === 'ok', 'executeAgent fallback: returns ok after fallback turn succeeds');
   assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
-  assert(turnAttempts[0].model === 'gpt-5-mini' && turnAttempts[0].authProfile === null, 'executeAgent fallback: primary dispatch retains the model after separate profile preparation');
-  assert(turnAttempts[1].model === 'gpt-4.1-mini' && turnAttempts[1].authProfile === null, 'executeAgent fallback: fallback dispatch retains the model after separate profile preparation');
+  assert(turnAttempts[0].model === 'anthropic/gpt-5-mini' && turnAttempts[0].authProfile === null, 'executeAgent fallback: primary dispatch retains the model after separate profile preparation');
+  assert(turnAttempts[1].model === 'openai/gpt-4.1-mini' && turnAttempts[1].authProfile === null, 'executeAgent fallback: fallback dispatch retains the model after separate profile preparation');
   assert(JSON.stringify(appliedSelections) === JSON.stringify([
-    { authProfile: 'anthropic:primary', modelRef: 'gpt-5-mini' },
-    { authProfile: 'openai:backup', modelRef: 'gpt-4.1-mini' },
+    { authProfile: 'anthropic:primary', modelRef: 'anthropic/gpt-5-mini' },
+    { authProfile: 'openai:backup', modelRef: 'openai/gpt-4.1-mini' },
   ]), 'executeAgent fallback: prepares primary then fallback model/auth selections through the Gateway boundary');
   assert(logs.some(entry => String(entry[1] || '').includes('retrying with configured fallback')), 'executeAgent fallback: logs fallback retry');
 }

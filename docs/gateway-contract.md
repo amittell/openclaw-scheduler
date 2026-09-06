@@ -747,7 +747,7 @@ isolated-turn primitive. It requires a concrete normalized `provider/model`
 reference. It calls the reviewed absolute `OPENCLAW_CLI_PATH` executable with:
 
 ```text
-openclaw gateway call sessions.patch --json --params <key/agentId/model JSON> --url <bound ws/wss URL> --timeout <remaining bounded milliseconds>
+openclaw gateway call sessions.patch --json --params <key/agentId/model JSON> --timeout <remaining bounded milliseconds>
 ```
 
 The patch contains exactly `key`, `agentId`, and `model: provider/model@profile`.
@@ -759,7 +759,10 @@ combinations are rejected before RPC. No model/default is guessed.
 `OPENCLAW_CLI_PATH` must identify the reviewed current CLI by an absolute path;
 there is no PATH lookup fallback. The explicit WebSocket URL derives from the
 same validated HTTP Gateway URL, and its token comes from the existing token
-mechanism through the subprocess environment, never argv or diagnostics.
+mechanism. Both are explicitly bound in the subprocess environment as
+`OPENCLAW_GATEWAY_URL` and `OPENCLAW_GATEWAY_TOKEN`, never secret argv or
+diagnostics; an ambient Gateway password is removed. The installed CLI pairs
+environment URL/auth, whereas `--url` requires explicit CLI credentials.
 Activation must bind that CLI version/path separately. The inspected current
 CLI requests only `operator.write` for this exact patch shape; an arbitrary
 admin RPC connection is not equivalent and can update persistent model defaults.
@@ -768,7 +771,10 @@ Preparation has a ten-second ceiling bounded further by the remaining run
 deadline, with cancellation and process termination. Only a successful process
 exit and matching canonical session key, model and user profile pin receipt
 permit HTTP dispatch. The selected concrete model stays in the existing HTTP
-header after preparation. Local session or provider-auth stores are never used for this step.
+header after preparation. Scheduler code never reads or writes legacy session
+or provider-auth stores for this step. The reviewed CLI still performs its
+normal configuration/authentication bootstrap; activation must validate that
+path and its permissions separately.
 
 A receipt proves accepted metadata only. Gateway auth resolution can clear a
 missing or wrong-provider profile and continue normal auth selection. The
@@ -780,11 +786,16 @@ Gateway execution contract.
 
 A job may configure `payload_model_fallback` and `auth_profile_fallback`.
 The primary and at most one distinct fallback share the same run deadline.
+Before another preparation or HTTP turn, both selections are compared after
+profile suffix parsing, whitespace normalization and same-agent inheritance.
+Routing aliases share the same effective owner route. Equivalent model/profile
+pairs do not retry, including after a definite preparation rejection. Catalog
+alias resolution remains the Gateway’s responsibility.
 
 | Primary outcome | Scheduler behavior |
 | --- | --- |
-| Definite local selection error or structured INVALID_REQUEST/FORBIDDEN Gateway rejection | May validate/prepare one different configured fallback; primary HTTP is not sent. |
-| Process timeout/nonzero exit, transport failure, unclassified Gateway error, malformed or mismatched receipt | Mutation outcome is uncertain; no primary HTTP or fallback is launched. |
+| Definite local selection error or typed gateway_request_error INVALID_REQUEST/FORBIDDEN rejection on completed exit 0 or 1 | May validate/prepare one different configured fallback; primary HTTP is not sent. |
+| Process timeout/signal/other nonzero exit, transport failure, unclassified Gateway error, malformed or mismatched receipt | Mutation outcome is uncertain; no primary HTTP or fallback is launched. |
 | Cancellation, expired deadline or Gateway capability failure | No extra attempt. |
 | Model-only HTTP failure | Existing distinct configured model fallback remains available without an added preparation RPC. |
 | Pin accepted, then HTTP failure | An explicitly prepared fallback pin can replace it. An omitted/clear profile fallback is refused because the interface cannot reliably clear the accepted pin. |

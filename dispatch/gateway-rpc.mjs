@@ -39,38 +39,35 @@ export async function callGatewayPreparation(params, opts = {}) {
     throw new GatewayPreparationError('Profile preparation requires a valid bound Gateway HTTP URL');
   }
   const args = ['gateway', 'call', 'sessions.patch', '--json', '--params', JSON.stringify(params),
-    '--url', url.href, '--timeout', String(Math.ceil(timeout))];
+    '--timeout', String(Math.ceil(timeout))];
+  const childEnv = { ...(opts.env || process.env),
+    OPENCLAW_GATEWAY_URL: url.href, OPENCLAW_GATEWAY_TOKEN: gatewayToken };
+  // The CLI pairs env URL/auth; --url requires argv credentials. Ignore ambient password.
+  delete childEnv.OPENCLAW_GATEWAY_PASSWORD;
   const execute = opts.execFile || execFile;
   return await new Promise((resolve, reject) => {
     execute(openclawCommand, args, {
       encoding: 'utf8', timeout: Math.ceil(timeout), killSignal: 'SIGKILL', signal,
       maxBuffer: 1024 * 1024,
-      env: { ...(opts.env || process.env), OPENCLAW_GATEWAY_TOKEN: gatewayToken },
+      env: childEnv,
     }, (error, stdout) => {
-      // A nonzero exit/timeout may follow a committed mutation. Do not parse it as success.
-      if (error) {
-        reject(new GatewayPreparationError('Gateway preparation process failed; mutation outcome is unknown', {
-          code: signal?.aborted ? 'ABORT_ERR' : 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
-        }));
-        return;
-      }
       let response;
-      try {
-        response = parseGatewayCliJson(stdout);
-      } catch {
-        reject(new GatewayPreparationError('Gateway preparation returned an unreadable receipt', {
-          code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
-        }));
+      try { response = parseGatewayCliJson(stdout); } catch { /* No authoritative receipt. */ }
+      // Current CLI formats a GatewayClientRequestError as typed JSON then exits 1.
+      // Only this completed process/typed pre-mutation refusal is safe to retry.
+      const completed = !error || (error.code === 1 && error.signal === null && error.killed === false);
+      const definite = completed && !signal?.aborted && response?.ok === false
+        && response.error?.type === 'gateway_request_error'
+        && ['INVALID_REQUEST', 'FORBIDDEN'].includes(response.error?.code);
+      if (definite) {
+        reject(new GatewayPreparationError('Gateway rejected session profile preparation'));
         return;
       }
-      if (response?.ok === false) {
-        // Do not copy untrusted CLI output or credential-bearing diagnostics into run logs.
-        const definite = ['INVALID_REQUEST', 'FORBIDDEN'].includes(response.error?.code);
-        reject(new GatewayPreparationError(definite
-          ? 'Gateway rejected session profile preparation'
-          : 'Gateway preparation failed without a definite pre-mutation rejection', {
-          code: definite ? 'GATEWAY_PREPARATION_REJECTED' : 'GATEWAY_PREPARATION_UNKNOWN',
-          uncertain: !definite,
+      // Nonzero success-looking output, interrupted processes and other errors are uncertain.
+      // Never copy raw CLI diagnostics into run logs.
+      if (error || signal?.aborted || !response || response.ok === false) {
+        reject(new GatewayPreparationError('Gateway preparation did not return a definite outcome', {
+          code: signal?.aborted ? 'ABORT_ERR' : 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
         }));
         return;
       }

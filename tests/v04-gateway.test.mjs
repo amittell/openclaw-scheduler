@@ -465,6 +465,7 @@ test('agent strategy forwards materialized env and does not selection-retry comp
   const forwarded = [];
   const job = {
     id: 'gateway-v04-strategy',
+    payload_model: 'provider/model',
     name: 'Gateway v0.4 Strategy',
     agent_id: 'main',
     auth_profile: 'provider:primary',
@@ -516,7 +517,7 @@ function selectionStrategyFixture({ job = {}, rejectPrimary = false, uncertainPr
       const params = JSON.parse(args[args.indexOf('--params') + 1]);
       preparations.push(params);
       if (uncertainPrimary && preparations.length === 1) return callback(new Error('fixture timeout'), '{}');
-      if (rejectPrimary && preparations.length === 1) return callback(null, JSON.stringify({ ok: false, error: { code: 'INVALID_REQUEST', message: 'fixture rejection' } }));
+      if (rejectPrimary && preparations.length === 1) return callback({ code: 1, signal: null, killed: false }, JSON.stringify({ ok: false, error: { type: 'gateway_request_error', code: 'INVALID_REQUEST', message: 'fixture rejection' } }));
       const delimiter = params.model.indexOf('@');
       const model = params.model.slice(0, delimiter);
       const slash = model.indexOf('/');
@@ -593,4 +594,38 @@ test('cancellation, expired deadlines and identical fallback never produce an ex
   const identical = selectionStrategyFixture({ rejectPrimary: true, job: { payload_model_fallback: 'vendor/primary', auth_profile_fallback: 'vendor:primary' } });
   await assert.rejects(identical.run(), /rejected/);
   assert.equal(identical.preparations.length, 1);
+});
+
+
+test('effective suffix and inherited equivalents cannot repeat preparation or HTTP', async () => {
+  for (const primary of [
+    { payload_model: 'vendor/model@work', auth_profile: null },
+    { payload_model: 'vendor/model', auth_profile: 'inherit' },
+  ]) {
+    for (const rejection of [false, true]) {
+      const f = selectionStrategyFixture({ failHttp: !rejection, rejectPrimary: rejection,
+        job: { ...primary, payload_model_fallback: 'vendor/model', auth_profile_fallback: 'work' },
+        sessions: [{ key: 'agent:other:main', authProfileOverride: 'wrong' },
+          { key: 'agent:main:main', authProfileOverride: 'work' }] });
+      await assert.rejects(f.run(), /already attempted/);
+      assert.equal(f.preparations.length, 1);
+      assert.equal(f.turns.length, rejection ? 0 : 1);
+    }
+  }
+});
+
+test('normalized routing aliases do not duplicate a model-only turn', async () => {
+  const f = selectionStrategyFixture({ failHttp: true, job: { payload_model: 'openclaw:main',
+    payload_model_fallback: 'agent:main', auth_profile: null, auth_profile_fallback: null } });
+  await assert.rejects(f.run(), /already attempted/);
+  assert.equal(f.preparations.length, 0);
+  assert.equal(f.turns.length, 1);
+});
+
+test('same model with a different resolved profile remains a valid fallback', async () => {
+  const f = selectionStrategyFixture({ failHttp: true, job: { payload_model: 'vendor/model@work',
+    auth_profile: null, payload_model_fallback: 'vendor/model', auth_profile_fallback: 'backup' } });
+  assert.equal((await f.run()).status, 'ok');
+  assert.deepEqual(f.preparations.map(row => row.model), ['vendor/model@work', 'vendor/model@backup']);
+  assert.equal(f.turns.length, 2);
 });

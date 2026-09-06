@@ -26,6 +26,7 @@ import {
 } from './evidence-runtime.js';
 import { detectTransientError } from './dispatcher-utils.js';
 import { GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
+import { normalizeAgentSelection } from './gateway.js';
 
 /**
  * DispatchResult shape (returned by every strategy):
@@ -3011,12 +3012,21 @@ async function runAgentTurnForSelection(
   const authProfile = await resolveConfiguredAuthProfile(selection.authProfile, deps, agentId,
     Math.min(10_000, attemptState.deadlineMs - Date.now()), signal);
   assertActive();
-  let prepared = { ok: true, applied: false, model: selection.model || undefined };
+  const effective = normalizeAgentSelection({ modelRef: selection.model, authProfile }, agentId);
+  if (attemptState.selectionIdentity === effective.identity) {
+    throw new GatewayPreparationError('Configured fallback resolves to the already attempted model/profile selection');
+  }
+  // Record the effective pair before any mutation, including a definite RPC refusal.
+  attemptState.selectionIdentity = effective.identity;
+  if (attemptState.pinApplied && !effective.authProfile) {
+    throw new GatewayPreparationError('Configured fallback cannot clear or implicitly inherit an applied profile pin');
+  }
+  let prepared = { ok: true, applied: false, model: effective.model };
   if (typeof prepareAgentSelection === 'function') {
     prepared = await prepareAgentSelection(validatedSessionKey,
-      { authProfile, modelRef: selection.model || null }, agentId,
+      { authProfile: effective.authProfile, modelRef: effective.model || null }, agentId,
       { signal, timeout: Math.min(10_000, attemptState.deadlineMs - Date.now()) });
-  } else if (authProfile) {
+  } else if (effective.authProfile) {
     throw new GatewayPreparationError('Profile preparation is unavailable');
   }
   if (prepared?.ok !== true) {
@@ -3033,7 +3043,7 @@ async function runAgentTurnForSelection(
 
   return dispatchAgentTurn({
     message: prompt, agentId, sessionKey: validatedSessionKey,
-    model: prepared.model ?? selection.model ?? undefined,
+    model: prepared.model ?? effective.model,
     materializedEnv: materializedEnv || undefined,
     capabilityBinding: capabilityBinding || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
