@@ -66,6 +66,7 @@
     "scripts/stuck-detector.sh",
     "scripts/telegram-webhook-check.mjs",
     "scripts/test-all.mjs",
+    "scripts/test-environment.mjs",
     "scripts/mirror-writhub.mjs",
     "scripts/writhub-askpass.sh",
     "scripts/validate-doc-examples.mjs",

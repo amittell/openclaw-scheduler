@@ -27,6 +27,8 @@ async function close(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
+let gatewayFixtureSequence = 0;
+
 async function captureChatCompletions(call) {
   let captured = null;
   const sink = await listen((request, response) => {
@@ -60,7 +62,8 @@ async function captureChatCompletions(call) {
   const savedUrl = process.env.OPENCLAW_GATEWAY_URL;
   try {
     process.env.OPENCLAW_GATEWAY_URL = sink.url;
-    const gateway = await import(`../gateway.js?model-forwarding-test-${Date.now()}`);
+    // Back-to-back fixtures can share a clock tick but must never share a URL.
+    const gateway = await import(`../gateway.js?model-forwarding-test-${++gatewayFixtureSequence}`);
     const result = await call(gateway);
     return { result, captured };
   } finally {
