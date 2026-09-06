@@ -1,0 +1,63 @@
+name: CI
+#
+# WritHub CI plane.
+#
+# `.writhub/workflows/<name>.yml` SHADOWS `.github/workflows/<name>.yml` at
+# execution ON WRITHUB ONLY. GitHub Actions never reads `.writhub/`, so the full
+# `.github/workflows/ci.yml` matrix -- 2 operating systems x 4 Node versions,
+# plus the agentcli-contract, published-package and packaging jobs -- is
+# UNCHANGED and still runs there. This file adds a gate for a lane that
+# previously had none; it removes nothing.
+#
+# Three properties of the WritHub checks lane make the GitHub matrix unrunnable
+# here, none of which is a repository defect:
+#
+#   1. `actions/setup-node` cannot work. The lane starts the job container with
+#      `--cap-drop=ALL --security-opt=no-new-privileges`, so the tool-cache
+#      `tar -x` cannot chown its extracted tree and dies with "Cannot change
+#      ownership to uid 1000 ... Operation not permitted" (writhub #2068, which
+#      holds ~20 repositories red fleet-wide). The image already carries node
+#      v24.18.0 and npm 11.16.0 on PATH -- inside this package's declared
+#      `engines.node` of `22.x || 24.x || 25.x || 26.x` -- so the action buys
+#      nothing here even when it works. `alexm/coord`'s
+#      `.writhub/workflows/ci.yml` documents the same workaround for
+#      `actions/setup-python`.
+#
+#   2. A `strategy.matrix` cannot pass. The runner's act guard refuses to report
+#      success when act starts the image more times than any declared `runs-on`
+#      allows -- nektos/act #5971, shared `*model.Job` with `runs-on` evaluated
+#      in place. Every matrix workflow in this lane exits 99. This file
+#      therefore declares ONE job with no matrix and no `needs`.
+#
+#   3. There is no dependency-installation contract. `npm ci` would have to
+#      fetch and build `better-sqlite3`, a native module, and the gate is
+#      designed to need zero network egress and zero node_modules.
+#
+# `on:` uses `branches: ['**']` because `[main]` suppresses Change heads, and
+# every key carries a non-null value because act mis-parses an all-null `on:`
+# block as "no stages".
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  gate:
+    name: repository gate (system node, no network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        # v7.0.1 is one of the six entries in the runner's action mirror
+        # (mapping digest a182926b..., identical on kebab-builder and the M1
+        # Pro), so it resolves under `--action-offline-mode` with no egress.
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Repository gate
+        # All the logic lives in the script so that running it by hand IS the
+        # gate. Nothing here is CI-only.
+        run: bash scripts/ci-gate.sh

@@ -3,7 +3,7 @@ const TRANSIENT_ERROR_PATTERNS = [
   /\bservice\s+(?:is\s+)?unavailable\b/i,
   /\brate\s*limit(?:ed|s?)?\b/i,
   /\btoo\s+many\s+requests\b/i,
-  /\b5[0-9]{2}\b\s+(?:internal\s+)?server\s+error\b/i,
+  /\b5[0-9]{2}\b[):]*\s*(?:internal\s+)?server\s+error\b/i,
   /\bgateway\s+timeout\b/i,
   /\bbad\s+gateway\b/i,
   /\bmodel\s+(?:is\s+)?(?:overloaded|unavailable)\b/i,
