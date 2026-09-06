@@ -4,7 +4,7 @@ import test from 'node:test';
 
 // Regression: the gateway's /v1/chat/completions endpoint rejects concrete
 // provider/model refs in the request body (only routing ids: openclaw,
-// openclaw/default, openclaw/<agentId>, agent/<agentId> — see the gateway's
+// openclaw/default, openclaw/<agentId>, agent:<agentId> — see the gateway's
 // isOpenClawAgentModelId, src/gateway/http-utils.ts). Before this fix the
 // isolated-dispatch path sent `model: model || openclaw:<agentId>` in the
 // body and never forwarded payload_model, so a job payload_model of e.g.
