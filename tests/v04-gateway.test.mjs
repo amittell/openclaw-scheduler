@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import {
-  mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -628,4 +628,65 @@ test('same model with a different resolved profile remains a valid fallback', as
   assert.equal((await f.run()).status, 'ok');
   assert.deepEqual(f.preparations.map(row => row.model), ['vendor/model@work', 'vendor/model@backup']);
   assert.equal(f.turns.length, 2);
+});
+
+
+test('real strategy subprocess accepts optional signals and preserves cancellation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scheduler-signal-control-'));
+  const executable = join(dir, 'fixture-cli.cjs');
+  const started = join(dir, 'started.jsonl');
+  writeFileSync(executable, `#!${process.execPath}
+const fs = require('node:fs');
+const patch = JSON.parse(process.argv[process.argv.indexOf('--params') + 1]);
+fs.appendFileSync(process.env.FIXTURE_CHILD_LOG, JSON.stringify({ pid: process.pid }) + String.fromCharCode(10));
+if (process.env.FIXTURE_WAIT === 'yes') {
+  setTimeout(() => {}, 30000);
+} else {
+  const [model, profile] = patch.model.split('@');
+  const slash = model.indexOf('/');
+  console.log(JSON.stringify({ ok: true, key: patch.key, entry: {
+    providerOverride: model.slice(0, slash), modelOverride: model.slice(slash + 1),
+    authProfileOverride: profile, authProfileOverrideSource: 'user',
+  } }));
+}
+`, { mode: 0o700 });
+  const fixture = ({ signal, omitSignal = false, wait = false } = {}) => {
+    writeFileSync(started, '');
+    const f = selectionStrategyFixture();
+    f.deps.prepareAgentSelection = (key, overrides, owner, options) => gateway.prepareAgentSelection(key, overrides, owner, {
+      ...options, openclawCommand: executable, gatewayToken: 'literal-fixture-token',
+      env: { TMPDIR: tmpdir(), PATH: '/usr/bin:/bin', FIXTURE_CHILD_LOG: started, FIXTURE_WAIT: wait ? 'yes' : 'no' },
+    });
+    const ctx = { run: { id: 'actual-signal-run' }, ...(omitSignal ? {} : { abortSignal: signal }) };
+    const job = { id: 'actual-signal-job', name: 'Actual signal control', agent_id: 'main', delivery_mode: 'none',
+      payload_model: 'vendor/model', auth_profile: 'work', run_timeout_ms: 2000 };
+    return { ...f, run: () => executeAgent(job, ctx, f.deps),
+      starts: () => readFileSync(started, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
+  };
+  try {
+    for (const options of [{ omitSignal: true }, { signal: null }, { signal: new AbortController().signal }]) {
+      const f = fixture(options);
+      assert.equal((await f.run()).status, 'ok');
+      assert.equal(f.starts().length, 1);
+      assert.notEqual(f.starts()[0].pid, process.pid);
+      assert.equal(f.turns.length, 1);
+    }
+    const preAbort = new AbortController(); preAbort.abort();
+    const cancelled = fixture({ signal: preAbort.signal });
+    await assert.rejects(cancelled.run(), error => error.code === 'ABORT_ERR');
+    assert.equal(cancelled.starts().length, 0);
+    assert.equal(cancelled.turns.length, 0);
+
+    const midAbort = new AbortController();
+    const running = fixture({ signal: midAbort.signal, wait: true });
+    const rejected = assert.rejects(running.run(), error => error.code === 'ABORT_ERR' && error.uncertain === true);
+    try {
+      const deadline = Date.now() + 1000;
+      while (running.starts().length === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(running.starts().length, 1, 'owned child must start before cancellation');
+      midAbort.abort();
+      await rejected;
+      assert.equal(running.turns.length, 0);
+    } finally { midAbort.abort(); await rejected.catch(() => {}); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

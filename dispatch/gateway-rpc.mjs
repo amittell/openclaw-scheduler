@@ -47,7 +47,8 @@ export async function callGatewayPreparation(params, opts = {}) {
   const execute = opts.execFile || execFile;
   return await new Promise((resolve, reject) => {
     execute(openclawCommand, args, {
-      encoding: 'utf8', timeout: Math.ceil(timeout), killSignal: 'SIGKILL', signal,
+      encoding: 'utf8', timeout: Math.ceil(timeout), killSignal: 'SIGKILL',
+      ...(signal == null ? {} : { signal }),
       maxBuffer: 1024 * 1024,
       env: childEnv,
     }, (error, stdout) => {
