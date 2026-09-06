@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 - Forward job `payload_model` selections to the gateway via the
   `x-openclaw-model` header on the chat-completions dispatch. The gateway
   rejects concrete `provider/model` refs in the request body (routing ids
-  only), so `payload_model` values (e.g. `gpufarm/qwen3.8-27b`) previously
+  only), so `payload_model` values (e.g. `example/gpt-4o`) previously
   never took effect on gateways without the legacy `sessions.json` store
   (SQLite-only). `splitModelOverride` routes provider/model refs into the
   header and keeps a valid routing id in the body; routing ids are sent
