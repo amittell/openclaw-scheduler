@@ -229,7 +229,7 @@ function makeAgentStrategyDeps(runIsolatedAgentTurn) {
     syncAuthStoreToSession: () => {
       throw new Error('agent strategy must not copy Gateway credential stores');
     },
-    applySessionOverridesToSessionStore: () => ({ ok: true }),
+    prepareAgentSelection: async (_key, overrides) => ({ ok: true, applied: Boolean(overrides.authProfile), model: overrides.modelRef || undefined }),
     runIsolatedAgentTurn,
   };
 }
@@ -268,7 +268,6 @@ test('capable Gateway receives validated credentials and revalidates before each
     message: 'use the scoped credential',
     agentId: 'main',
     sessionKey: 'agent:main:stub-one',
-    authProfile: 'provider:production',
     materializedEnv: { STRIPE_API_KEY: 'secret-one' },
     timeoutMs: 2_000,
   });
@@ -286,7 +285,6 @@ test('capable Gateway receives validated credentials and revalidates before each
     message: 'reuse discovery cache',
     agentId: 'main',
     sessionKey: 'agent:main:stub-two',
-    authProfile: 'provider:production',
     materializedEnv: { STRIPE_API_KEY: 'secret-two' },
     pollIntervalMs: 60_000,
     idleTimeoutMs: 60_000,
@@ -299,7 +297,7 @@ test('capable Gateway receives validated credentials and revalidates before each
   const chatCalls = callsFor('/v1/chat/completions');
   for (const [index, call] of chatCalls.entries()) {
     assert.equal(call.headers.authorization, 'Bearer stub-gateway-token');
-    assert.equal(call.headers['x-openclaw-auth-profile'], 'provider:production');
+    assert.equal(call.headers['x-openclaw-auth-profile'], undefined);
     assert.deepEqual(JSON.parse(call.headers['x-openclaw-env-inject']), {
       STRIPE_API_KEY: index === 0 ? 'secret-one' : 'secret-two',
     });
@@ -363,20 +361,10 @@ test('a Gateway restart or downgrade invalidates a previously positive capabilit
   assert.equal(callsFor('/v1/chat/completions').length, 1);
 });
 
-test('legacy Gateway keeps auth_profile compatibility when no env injection is requested', async () => {
+test('direct profiles are rejected even without environment injection', async () => {
   reset('legacy');
-  await gateway.runAgentTurn({
-    message: 'profile-only dispatch',
-    authProfile: 'provider:legacy-compatible',
-    timeoutMs: 2_000,
-  });
-
-  assert.equal(callsFor('/v1/info').length, 0);
-  assert.equal(callsFor('/health').length, 0);
-  const [chatCall] = callsFor('/v1/chat/completions');
-  assert.ok(chatCall);
-  assert.equal(chatCall.headers['x-openclaw-auth-profile'], 'provider:legacy-compatible');
-  assert.equal(chatCall.headers['x-openclaw-env-inject'], undefined);
+  await assert.rejects(gateway.runAgentTurn({ message: 'unprepared profile', authProfile: 'provider:legacy-compatible' }), /prepareAgentSelection/);
+  assert.equal(callsFor('/v1/chat/completions').length, 0);
 });
 
 test('legacy Gateway fails closed when materialized credentials require injection', async () => {
@@ -511,4 +499,98 @@ test('agent strategy forwards materialized env and does not selection-retry comp
     error => error === compatibilityError,
   );
   assert.equal(attempts, 1);
+});
+
+function selectionStrategyFixture({ job = {}, rejectPrimary = false, uncertainPrimary = false, failHttp = false, sessions = [], signal } = {}) {
+  const preparations = [];
+  const turns = [];
+  const deps = makeAgentStrategyDeps(async opts => {
+    turns.push(opts);
+    if (failHttp && turns.length === 1) throw new Error('fixture primary turn failed');
+    return { content: 'fixture completed', usage: { total_tokens: 1 } };
+  });
+  deps.listSessions = async () => ({ sessions });
+  deps.prepareAgentSelection = (key, overrides, agentId, options) => gateway.prepareAgentSelection(key, overrides, agentId, {
+    ...options, openclawCommand: '/owned/fixture/openclaw', gatewayToken: 'literal-fixture-token',
+    execFile(_command, args, _options, callback) {
+      const params = JSON.parse(args[args.indexOf('--params') + 1]);
+      preparations.push(params);
+      if (uncertainPrimary && preparations.length === 1) return callback(new Error('fixture timeout'), '{}');
+      if (rejectPrimary && preparations.length === 1) return callback(null, JSON.stringify({ ok: false, error: { code: 'INVALID_REQUEST', message: 'fixture rejection' } }));
+      const delimiter = params.model.indexOf('@');
+      const model = params.model.slice(0, delimiter);
+      const slash = model.indexOf('/');
+      callback(null, JSON.stringify({ ok: true, key: params.key, entry: {
+        providerOverride: model.slice(0, slash), modelOverride: model.slice(slash + 1),
+        authProfileOverride: params.model.slice(delimiter + 1), authProfileOverrideSource: 'user',
+      } }));
+    },
+  });
+  const input = { id: 'selection-fixture', name: 'selection fixture', agent_id: 'main',
+    payload_model: 'vendor/primary', auth_profile: 'vendor:primary',
+    payload_model_fallback: 'vendor/fallback', auth_profile_fallback: 'vendor:fallback',
+    payload_timeout_seconds: 120, run_timeout_ms: 2000, delivery_mode: 'none', ...job };
+  const run = () => executeAgent(input, { run: { id: 'selection-fixture-run' }, v02Outcomes: {}, abortSignal: signal }, deps);
+  return { run, preparations, turns, deps };
+}
+
+test('definite preparation rejection permits one separately prepared fallback and no primary HTTP', async () => {
+  const f = selectionStrategyFixture({ rejectPrimary: true });
+  assert.equal((await f.run()).status, 'ok');
+  assert.equal(f.preparations.length, 2);
+  assert.equal(f.turns.length, 1);
+  assert.equal(f.turns[0].model, 'vendor/fallback');
+  assert.equal(f.turns[0].authProfile, undefined);
+});
+
+test('uncertain preparation stops primary HTTP and configured fallback', async () => {
+  const f = selectionStrategyFixture({ uncertainPrimary: true });
+  await assert.rejects(f.run(), error => error.uncertain === true);
+  assert.equal(f.preparations.length, 1);
+  assert.equal(f.turns.length, 0);
+});
+
+test('accepted pin can be replaced explicitly, but omitted fallback auth cannot clear it', async () => {
+  const replaced = selectionStrategyFixture({ failHttp: true });
+  assert.equal((await replaced.run()).status, 'ok');
+  assert.equal(replaced.preparations.length, 2);
+  assert.equal(replaced.turns.length, 2);
+  const clear = selectionStrategyFixture({ failHttp: true, job: { auth_profile_fallback: '' } });
+  await assert.rejects(clear.run(), /cannot clear/);
+  assert.equal(clear.preparations.length, 1);
+  assert.equal(clear.turns.length, 1);
+});
+
+test('model-only attempts retain configured fallback without preparation RPC', async () => {
+  const f = selectionStrategyFixture({ failHttp: true, job: { auth_profile: null, auth_profile_fallback: null } });
+  assert.equal((await f.run()).status, 'ok');
+  assert.equal(f.preparations.length, 0);
+  assert.deepEqual(f.turns.map(turn => turn.model), ['vendor/primary', 'vendor/fallback']);
+});
+
+test('inherit chooses only the exact same-agent main key and resolution failure can use a valid fallback', async () => {
+  const f = selectionStrategyFixture({ job: { auth_profile: 'inherit' }, sessions: [
+    { key: 'agent:other:main', authProfileOverride: 'vendor:wrong' },
+    { key: 'agent:main:main', authProfileOverride: 'vendor:right' },
+  ] });
+  await f.run();
+  assert.equal(f.preparations[0].model, 'vendor/primary@vendor:right');
+  const missing = selectionStrategyFixture({ job: { auth_profile: 'inherit' }, sessions: [{ key: 'agent:other:main', authProfileOverride: 'vendor:wrong' }] });
+  await missing.run();
+  assert.equal(missing.preparations.length, 1);
+  assert.equal(missing.preparations[0].model, 'vendor/fallback@vendor:fallback');
+});
+
+test('cancellation, expired deadlines and identical fallback never produce an extra attempt', async () => {
+  const controller = new AbortController(); controller.abort();
+  const cancelled = selectionStrategyFixture({ signal: controller.signal });
+  await assert.rejects(cancelled.run(), /cancelled/);
+  assert.equal(cancelled.preparations.length, 0);
+  assert.equal(cancelled.turns.length, 0);
+  const expired = selectionStrategyFixture({ job: { run_timeout_ms: -1 } });
+  await assert.rejects(expired.run(), /deadline/);
+  assert.equal(expired.preparations.length, 0);
+  const identical = selectionStrategyFixture({ rejectPrimary: true, job: { payload_model_fallback: 'vendor/primary', auth_profile_fallback: 'vendor:primary' } });
+  await assert.rejects(identical.run(), /rejected/);
+  assert.equal(identical.preparations.length, 1);
 });

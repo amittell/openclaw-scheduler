@@ -78,7 +78,6 @@ single user message to an agent and receives the complete assistant response.
 | `x-openclaw-scopes` | Conditional | `operator.write` when a bearer token is sent. This scope header is specific to chat-completions dispatch. |
 | `x-openclaw-agent-id` | Conditional | Agent ID string (e.g. `main`). Omitted when falsy. |
 | `x-openclaw-session-key` | Conditional | Session key for continuity. Omitted when not provided. |
-| `x-openclaw-auth-profile` | Conditional | Auth profile override. Omitted when null. See "Auth-Profile Forwarding" below. |
 | `x-openclaw-model` | Conditional | Model ref override (e.g. `example/gpt-4o`) for non-routing model refs. Omitted when `payload_model` is empty or is itself a routing id. See "Model Forwarding" below. |
 
 **Request body**:
@@ -110,12 +109,14 @@ dispatch (`splitModelOverride` in `gateway.js`):
   `parseModelRef` with its model visibility-policy check. This requires
   owner-equivalent HTTP auth (the shared-secret gateway token qualifies).
 
-The legacy `sessions.json` override write still runs as a dual path so
-gateways with the legacy store keep working unchanged.
+The scheduler never writes local session overrides. Model-only dispatch adds no
+preparation RPC. Gateway routing IDs use `[a-z0-9][a-z0-9_-]{0,63}`,
+case-insensitively. Incompatible routing syntax, a routing owner different from
+`agentId`, or an incompatible default agent route is rejected locally. General
+scheduler identity validation remains separate.
 
-If `job.payload_model_fallback` and/or `job.auth_profile_fallback` are set, the
-scheduler retries once in the same run with the configured fallback selection
-after a primary selection error.
+An explicit profile requires separate preparation; see "Auth-Profile Forwarding"
+and "Fallback Model / Auth Selection" for failure and uncertainty handling.
 
 **Response body** (expected):
 
@@ -719,45 +720,81 @@ On abort, the error message distinguishes the cause:
 
 ## Auth-Profile Forwarding
 
-Jobs can specify an `auth_profile` field with three modes:
+Current Gateway supports **session-pin metadata**, not a strict execution
+credential guarantee. The scheduler does not send `x-openclaw-auth-profile`:
+that header has no handler in the inspected Gateway. Low-level HTTP runners
+reject an unprepared `authProfile` argument instead of silently ignoring it.
 
 ### null (default)
-No `x-openclaw-auth-profile` header is sent. The gateway uses its default
-authentication profile.
+
+No profile preparation RPC occurs. The Gateway retains its existing session and
+default auth behavior. Omission does not clear a warm session's previous pin.
+Concrete model forwarding remains through `x-openclaw-model`.
 
 ### "inherit"
-The scheduler resolves the main session's active auth profile at dispatch time.
-It calls `listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 })` via
-the `sessions_list` tool, finds the main session, and reads its
-`authProfileOverride`, `authProfile`, or `profile` field (in that priority
-order).
 
-If a profile is found, it replaces `'inherit'` with the resolved profile ID
-string. If no main session profile is found, `'inherit'` is passed through
-as-is to the gateway.
+Each attempt resolves exactly `agent:<job.agent_id>:main` through the existing
+`sessions_list` tool, reading only `authProfileOverride`. A missing, unavailable
+or unresolved same-agent profile is a definite selection failure. Neither a
+main session owned by another agent nor a bare ambiguous main key is used, and
+the literal `inherit` is never sent as a profile ID. The lookup is bounded by
+the remaining run deadline and cancellation.
 
-Reference: `dispatcher-strategies.js` `executeAgent()`.
+### Explicit profile with a concrete model
 
-### "provider:label" (explicit)
-A specific provider and label string (e.g. `anthropic:production`) is passed
-directly as the `x-openclaw-auth-profile` header value without resolution.
+`prepareAgentSelection` is a separate preparation helper, outside the HTTP-only
+isolated-turn primitive. It requires a concrete normalized `provider/model`
+reference. It calls the reviewed absolute `OPENCLAW_CLI_PATH` executable with:
 
----
+```text
+openclaw gateway call sessions.patch --json --params <key/agentId/model JSON> --url <bound ws/wss URL> --timeout <remaining bounded milliseconds>
+```
+
+The patch contains exactly `key`, `agentId`, and `model: provider/model@profile`.
+An inline profile suffix is also an explicit selection; a conflicting separate
+profile is rejected. Date and quantization suffixes remain part of the model.
+Profile-only, unresolved inherit, ambiguous suffixes and routing-ID/profile
+combinations are rejected before RPC. No model/default is guessed.
+
+`OPENCLAW_CLI_PATH` must identify the reviewed current CLI by an absolute path;
+there is no PATH lookup fallback. The explicit WebSocket URL derives from the
+same validated HTTP Gateway URL, and its token comes from the existing token
+mechanism through the subprocess environment, never argv or diagnostics.
+Activation must bind that CLI version/path separately. The inspected current
+CLI requests only `operator.write` for this exact patch shape; an arbitrary
+admin RPC connection is not equivalent and can update persistent model defaults.
+
+Preparation has a ten-second ceiling bounded further by the remaining run
+deadline, with cancellation and process termination. Only a successful process
+exit and matching canonical session key, model and user profile pin receipt
+permit HTTP dispatch. The selected concrete model stays in the existing HTTP
+header after preparation. Local session or provider-auth stores are never used for this step.
+
+A receipt proves accepted metadata only. Gateway auth resolution can clear a
+missing or wrong-provider profile and continue normal auth selection. The
+scheduler neither promises which credential was used nor reads auth stores to
+simulate such a guarantee. Strict credential identity requires a stronger
+Gateway execution contract.
 
 ## Fallback Model / Auth Selection
 
-Jobs can optionally persist `payload_model_fallback` and `auth_profile_fallback`
-alongside the primary `payload_model` / `auth_profile` fields.
+A job may configure `payload_model_fallback` and `auth_profile_fallback`.
+The primary and at most one distinct fallback share the same run deadline.
 
-Runtime behavior:
+| Primary outcome | Scheduler behavior |
+| --- | --- |
+| Definite local selection error or structured INVALID_REQUEST/FORBIDDEN Gateway rejection | May validate/prepare one different configured fallback; primary HTTP is not sent. |
+| Process timeout/nonzero exit, transport failure, unclassified Gateway error, malformed or mismatched receipt | Mutation outcome is uncertain; no primary HTTP or fallback is launched. |
+| Cancellation, expired deadline or Gateway capability failure | No extra attempt. |
+| Model-only HTTP failure | Existing distinct configured model fallback remains available without an added preparation RPC. |
+| Pin accepted, then HTTP failure | An explicitly prepared fallback pin can replace it. An omitted/clear profile fallback is refused because the interface cannot reliably clear the accepted pin. |
+| Missing, identical or failed fallback | Run fails; no further retry. |
 
-- The scheduler attempts the primary selection first.
-- If the primary chat-completions request errors before a usable assistant
-  reply is returned, `executeAgent()` retries once in the same run using the
-  configured fallback overrides.
-- Any fallback dimension left unset keeps the primary effective value.
-- Existing jobs remain backward-compatible because both fallback fields default
-  to `NULL` and no retry is attempted unless a fallback override is configured.
+An unset fallback dimension retains the primary selection. An explicit empty
+fallback profile does not mean a Gateway pin was cleared. Model-only or null
+model patches can preserve compatible pins, so the scheduler never sends a
+speculative null patch as a reset. Selection errors remain visible; no legacy
+file absence is treated as successful application.
 
 ---
 
@@ -776,19 +813,13 @@ Validation rules:
 - Serialization uses `Object.fromEntries` on validated entries so hidden
   `toJSON` hooks on the original object cannot alter the payload.
 
-### Precedence when both headers are present
+### Profile preparation and environment injection
 
-A request may include both `x-openclaw-auth-profile` and
-`x-openclaw-env-inject`. These are complementary, not competing:
-
-- `x-openclaw-auth-profile` selects which credential profile the gateway
-  uses for upstream API calls (model provider routing).
-- `x-openclaw-env-inject` injects task-scoped environment variables into
-  the child session's process environment (credential materialization).
-
-If the gateway receives both, it should apply both: select the auth profile
-for provider routing, and merge the env vars into the child environment.
-Neither header overrides the other.
+Session-profile preparation and `x-openclaw-env-inject` are separate operations.
+The former records Gateway session metadata; the latter retains its existing
+capability-gated task environment contract. No profile header is sent, and a
+profile receipt does not establish environment-injection support or credential
+identity. Capability failures still prevent fallback from bypassing that gate.
 
 ### Header size limits
 
@@ -979,9 +1010,9 @@ An HTTP discovery response may use this shape:
 }
 ```
 
-Capability discovery is lazy. Ordinary health checks and auth-profile-only
-agent turns retain their existing behavior and ordinary discovery uses the
-bounded cache. A non-empty materialized env map force-refreshes discovery and
+Capability discovery is lazy. Ordinary health checks and model-only agent
+turns retain the bounded discovery cache. Explicit profile selections first
+require the separate preparation contract above. A non-empty materialized env map force-refreshes discovery and
 requires `chat-completions-env-inject-v1`; absence produces
 `GATEWAY_ENV_INJECT_UNSUPPORTED` before `POST /v1/chat/completions`.
 
@@ -1047,7 +1078,7 @@ request headers.
 | `x-openclaw-agent-id` | Header | `gateway.js` | Route request to correct agent |
 | `x-openclaw-session-key` | Header (req) | `gateway.js` | Session continuity |
 | `x-openclaw-session-key` | Header (resp) | `gateway.js` | Session key propagation |
-| `x-openclaw-auth-profile` | Header | `gateway.js` | Auth profile override |
+| `sessions.patch` | Bounded CLI RPC | `gateway.js` / `dispatch/gateway-rpc.mjs` | Explicit session-profile metadata preparation |
 | `x-openclaw-env-inject` | Header | `gateway.js`, `gateway-capabilities.js` | Capability-gated task-scoped env materialization for isolated turns |
 | `~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite` | SQLite (read-only) | `dispatch/session-store.mjs` | Current session lifecycle and transcript state |
 | `~/.openclaw/agents/<agent>/sessions/` | Legacy file fallback | `dispatch/session-store.mjs` | Older `sessions.json` and JSONL session state |

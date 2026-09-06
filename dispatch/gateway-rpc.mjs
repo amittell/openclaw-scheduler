@@ -1,4 +1,83 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { isAbsolute } from 'node:path';
+
+/** A preparation failure is retryable via another selection only when no mutation is uncertain. */
+export class GatewayPreparationError extends Error {
+  constructor(message, { code = 'GATEWAY_PREPARATION_REJECTED', uncertain = false, cause } = {}) {
+    super(message, { cause });
+    this.name = 'GatewayPreparationError';
+    this.code = code;
+    this.uncertain = uncertain;
+  }
+}
+
+/**
+ * Separate, cancellable preparation transport. Never used by the HTTP turn primitive.
+ * Bind the reviewed CLI and the same Gateway explicitly; never select a CLI via PATH.
+ * The current CLI requests operator.write for {key, agentId, model} sessions.patch.
+ */
+export async function callGatewayPreparation(params, opts = {}) {
+  const { openclawCommand, gatewayUrl, gatewayToken, signal } = opts;
+  const timeout = opts.timeout ?? 10_000;
+  if (signal?.aborted) {
+    throw new GatewayPreparationError('Gateway preparation cancelled', { code: 'ABORT_ERR' });
+  }
+  if (!openclawCommand || !isAbsolute(openclawCommand) || !gatewayToken
+      || !Number.isFinite(timeout) || timeout <= 0) {
+    throw new GatewayPreparationError('Profile preparation requires an absolute OPENCLAW_CLI_PATH, Gateway authentication and a positive deadline');
+  }
+  if (!params || Object.keys(params).sort().join(',') !== 'agentId,key,model'
+      || !['agentId', 'key', 'model'].every(key => typeof params[key] === 'string' && params[key].trim())) {
+    throw new GatewayPreparationError('Preparation accepts only the write-scoped key, agentId and model fields');
+  }
+  let url;
+  try {
+    url = new URL(gatewayUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('invalid URL');
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  } catch {
+    throw new GatewayPreparationError('Profile preparation requires a valid bound Gateway HTTP URL');
+  }
+  const args = ['gateway', 'call', 'sessions.patch', '--json', '--params', JSON.stringify(params),
+    '--url', url.href, '--timeout', String(Math.ceil(timeout))];
+  const execute = opts.execFile || execFile;
+  return await new Promise((resolve, reject) => {
+    execute(openclawCommand, args, {
+      encoding: 'utf8', timeout: Math.ceil(timeout), killSignal: 'SIGKILL', signal,
+      maxBuffer: 1024 * 1024,
+      env: { ...(opts.env || process.env), OPENCLAW_GATEWAY_TOKEN: gatewayToken },
+    }, (error, stdout) => {
+      // A nonzero exit/timeout may follow a committed mutation. Do not parse it as success.
+      if (error) {
+        reject(new GatewayPreparationError('Gateway preparation process failed; mutation outcome is unknown', {
+          code: signal?.aborted ? 'ABORT_ERR' : 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
+        }));
+        return;
+      }
+      let response;
+      try {
+        response = parseGatewayCliJson(stdout);
+      } catch {
+        reject(new GatewayPreparationError('Gateway preparation returned an unreadable receipt', {
+          code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
+        }));
+        return;
+      }
+      if (response?.ok === false) {
+        // Do not copy untrusted CLI output or credential-bearing diagnostics into run logs.
+        const definite = ['INVALID_REQUEST', 'FORBIDDEN'].includes(response.error?.code);
+        reject(new GatewayPreparationError(definite
+          ? 'Gateway rejected session profile preparation'
+          : 'Gateway preparation failed without a definite pre-mutation rejection', {
+          code: definite ? 'GATEWAY_PREPARATION_REJECTED' : 'GATEWAY_PREPARATION_UNKNOWN',
+          uncertain: !definite,
+        }));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
 
 export class GatewayRpcError extends Error {
   constructor(method, error, options = {}) {

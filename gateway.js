@@ -1,21 +1,21 @@
 // Gateway API client -- independent dispatch via chat completions + system events
 import { execFile, execFileSync } from 'child_process';
 import {
-  readFileSync, writeFileSync, existsSync, realpathSync,
+  readFileSync, realpathSync,
 } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { getDb } from './db.js';
+import { callGatewayPreparation, GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
+export { GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
 import {
   agentIdFromSessionKey,
   assertValidAgentId,
   assertValidSessionKey,
-  assertValidSessionStore,
   assertSessionKeyForAgent,
   buildGatewayEndpointUrl,
   parseGatewayBaseUrl,
-  resolveAgentSessionsStorePath,
 } from './identifiers.js';
 
 export {
@@ -37,7 +37,6 @@ const GATEWAY_BASE_URL = parseGatewayBaseUrl(
 );
 const GATEWAY_URL = GATEWAY_BASE_URL.href;
 const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL, endpoint);
-const HOME_DIR = process.env.HOME || homedir();
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 // -- Isolated dispatch primitive contract --------------------
@@ -238,7 +237,7 @@ export function cancelAgentSession(sessionKey, opts = {}) {
  * @param {string} [opts.agentId='main'] - Agent ID.
  * @param {string} [opts.sessionKey] - Session key for continuity.
  * @param {string} [opts.model] - Model override.
- * @param {string|null} [opts.authProfile] - Auth profile header value.
+ * @param {string|null} [opts.authProfile] - Explicit profiles require separate prepareAgentSelection.
  * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject.
  * @param {number} [opts.timeoutMs=300000] - Request timeout in milliseconds.
  */
@@ -259,6 +258,9 @@ export async function runAgentTurn(opts) {
   const validatedSessionKey = sessionKey === undefined || sessionKey === null
     ? sessionKey
     : assertSessionKeyForAgent(sessionKey, validatedAgentId, 'sessionKey');
+
+  if (authProfile) throw new GatewayPreparationError('Explicit authProfile requires separate prepareAgentSelection before HTTP dispatch');
+  splitModelOverride(model, validatedAgentId);
 
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
@@ -285,7 +287,6 @@ export async function runAgentTurn(opts) {
         ...authHeaders('operator.write'),
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
-        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...(modelRoute.overrideHeader ? { 'x-openclaw-model': modelRoute.overrideHeader } : {}),
         ...envInjection.headers,
       },
@@ -351,7 +352,7 @@ export async function runAgentTurn(opts) {
  * @param {number} opts.idleTimeoutMs     - Per-check idle threshold; session aborts after 2x this value of continuous idle time
  * @param {number} opts.pollIntervalMs    - How often to poll session activity (default: 60000)
  * @param {number} opts.absoluteTimeoutMs - Hard ceiling regardless of activity (default: 300000)
- * @param {string} opts.authProfile       - Auth profile override (null, 'inherit', or 'provider:label')
+ * @param {string} opts.authProfile       - Explicit profiles require separate prepareAgentSelection.
  * @param {Record<string, string>|null} [opts.materializedEnv] - Required task-scoped environment to inject
  * @param {string[]} [opts.sessionKinds]  - Ignored; activity is matched by exact session key across all kinds
  */
@@ -374,6 +375,9 @@ export async function runAgentTurnWithActivityTimeout(opts) {
   const validatedSessionKey = sessionKey === undefined || sessionKey === null
     ? sessionKey
     : assertSessionKeyForAgent(sessionKey, validatedAgentId, 'sessionKey');
+
+  if (authProfile) throw new GatewayPreparationError('Explicit authProfile requires separate prepareAgentSelection before HTTP dispatch');
+  splitModelOverride(model, validatedAgentId);
 
   const envInjection = await negotiateGatewayEnvironmentInjection(materializedEnv, {
     gatewayUrl: GATEWAY_URL,
@@ -450,7 +454,6 @@ export async function runAgentTurnWithActivityTimeout(opts) {
         ...authHeaders('operator.write'),
         'x-openclaw-agent-id': validatedAgentId,
         ...(validatedSessionKey ? { 'x-openclaw-session-key': validatedSessionKey } : {}),
-        ...(authProfile ? { 'x-openclaw-auth-profile': authProfile } : {}),
         ...(modelRoute.overrideHeader ? { 'x-openclaw-model': modelRoute.overrideHeader } : {}),
         ...envInjection.headers,
       },
@@ -570,26 +573,33 @@ export async function sendSystemEvent(text, mode = 'now') {
 // belong in the x-openclaw-model header, which the gateway resolves via
 // parseModelRef with a visibility-policy check. splitModelOverride routes a
 // requested model into those two channels without ever mixing them.
-// Mirrors the gateway's routing-model acceptance exactly (isOpenClawAgentModelId,
-// src/gateway/http-utils.ts, using the assertValidAgentId charset/length):
-// the body accepts only these routing model ids; anything else is a provider/model
-// ref and belongs in the x-openclaw-model header. Agent ids may contain dots and
-// at-signs (e.g. openclaw:ops.team), so the charset must match assertValidAgentId
-// or the no-model default (openclaw:<agentId>) would be misrouted into the header.
-const ROUTING_AGENT_ID = '[a-z0-9][a-z0-9._@-]{0,127}';
+// Installed Gateway routing syntax; keep general scheduler identity validation separate.
+const ROUTING_AGENT_ID = '[a-z0-9][a-z0-9_-]{0,63}';
 const ROUTING_MODEL_ID_PATTERN = new RegExp(
   `^(?:openclaw|openclaw\\/default|openclaw[:/]${ROUTING_AGENT_ID}|agent:${ROUTING_AGENT_ID})$`, 'i',
 );
 
 function splitModelOverride(model, agentId) {
-  const trimmed = typeof model === 'string' ? model.trim() : '';
-  if (!trimmed) {
-    return { bodyModel: `openclaw:${agentId}`, overrideHeader: undefined };
+  const bodyModel = `openclaw:${agentId}`;
+  if (!ROUTING_MODEL_ID_PATTERN.test(bodyModel)) {
+    throw new GatewayPreparationError('Agent ID is incompatible with the Gateway routing model syntax');
   }
+  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!trimmed) return { bodyModel, overrideHeader: undefined };
   if (ROUTING_MODEL_ID_PATTERN.test(trimmed)) {
+    const routeAgent = /^(?:openclaw[:/]|agent:)(.+)$/i.exec(trimmed)?.[1];
+    if (routeAgent && trimmed.toLowerCase() !== 'openclaw/default' && routeAgent.toLowerCase() !== agentId.toLowerCase()) {
+      throw new GatewayPreparationError('Routing model owner does not match the requested agent');
+    }
     return { bodyModel: trimmed, overrideHeader: undefined };
   }
-  return { bodyModel: `openclaw:${agentId}`, overrideHeader: trimmed };
+  if (/^(?:openclaw[:/]|agent:)/i.test(trimmed)) {
+    throw new GatewayPreparationError('Routing model is incompatible with the Gateway routing syntax');
+  }
+  if (splitProfileSuffix(trimmed).profile) {
+    throw new GatewayPreparationError('Inline profile requires separate prepareAgentSelection before HTTP dispatch');
+  }
+  return { bodyModel, overrideHeader: trimmed };
 }
 
 /**
@@ -887,156 +897,86 @@ export async function waitForGateway(timeoutMs = 30000, intervalMs = 2000) {
   return false;
 }
 
-/**
- * Resolve the canonical and flat gateway aliases for a scheduler session key.
- *
- * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
- * @param {string} [agentId='main'] - Agent ID used to construct and validate the canonical key
- * @returns {string[]} Unique session-key aliases, canonical first
- */
-function resolveSessionKeyAliases(sessionKey, agentId = 'main') {
-  const validatedAgentId = assertValidAgentId(agentId, 'agentId');
-  const validatedSessionKey = assertValidSessionKey(sessionKey, 'sessionKey');
-  const canonicalMatch = validatedSessionKey.match(/^agent:[^:]+:(.+)$/);
-  if (canonicalMatch) assertSessionKeyForAgent(validatedSessionKey, validatedAgentId, 'sessionKey');
-  const canonicalKey = validatedSessionKey.startsWith('agent:')
-    ? validatedSessionKey
-    : `agent:${validatedAgentId}:${validatedSessionKey}`;
-  const flatSessionKey = canonicalMatch?.[1] || validatedSessionKey;
-  return Array.from(new Set([canonicalKey, flatSessionKey]));
-}
-
-function parseSessionModelRef(modelRef) {
-  const trimmed = typeof modelRef === 'string' ? modelRef.trim() : '';
-  if (!trimmed) {
-    return { providerOverride: undefined, modelOverride: undefined };
+/** Split the current Gateway's profile suffix grammar, preserving date/quant model versions. */
+function splitProfileSuffix(raw) {
+  const trimmed = raw.trim();
+  let delimiter = trimmed.indexOf('@', trimmed.lastIndexOf('/') + 1);
+  if (delimiter <= 0) return { model: trimmed };
+  if (/^\d{8}(?:@|$)/.test(trimmed.slice(delimiter + 1))) {
+    delimiter = trimmed.indexOf('@', delimiter + 9);
+    if (delimiter < 0) return { model: trimmed };
   }
-  const slashIndex = trimmed.indexOf('/');
-  if (slashIndex <= 0 || slashIndex >= trimmed.length - 1) {
-    return { providerOverride: undefined, modelOverride: trimmed };
+  if (/^(?:i?q\d+(?:_[a-z0-9]+)*|\d+bit)(?:@|$)/i.test(trimmed.slice(delimiter + 1))) {
+    delimiter = trimmed.indexOf('@', delimiter + 1);
+    if (delimiter < 0) return { model: trimmed };
   }
-  const providerOverride = trimmed.slice(0, slashIndex).trim();
-  const modelOverride = trimmed.slice(slashIndex + 1).trim();
-  return {
-    providerOverride: providerOverride || undefined,
-    modelOverride: modelOverride || undefined,
-  };
+  const model = trimmed.slice(0, delimiter).trim();
+  const profile = trimmed.slice(delimiter + 1).trim();
+  return model && profile ? { model, profile } : { model: trimmed };
 }
 
 /**
- * Write scheduler-managed session overrides directly to the gateway's sessions.json store.
- *
- * The gateway reads sessions.json on each agent turn (with mtime-based cache
- * invalidation), so writing here before dispatch ensures the embedded runner
- * picks up the correct auth profile and model selection.
- *
- * @param {string} sessionKey - Session key as used in the HTTP request (e.g. 'scheduler:<jobId>')
- * @param {{ authProfile?: string | null, modelRef?: string | null }} overrides - Desired session overrides
- * @param {string} [agentId='main'] - Agent ID for store path resolution
- * @returns {{ ok: boolean, error?: string }}
+ * Apply Gateway session-pin metadata before a turn; never read/write a session file.
+ * This is not a credential-use guarantee: Gateway auth resolution can clear invalid pins.
+ * Model-only selections remain HTTP-only. The optional executor is for offline controls.
  */
-export function applySessionOverridesToSessionStore(sessionKey, overrides = {}, agentId = 'main') {
-  try {
-    const validatedAgentId = assertValidAgentId(agentId, 'agentId');
-    const keyAliases = resolveSessionKeyAliases(sessionKey, validatedAgentId);
-    const sessionsPath = resolveAgentSessionsStorePath(HOME_DIR, validatedAgentId);
-    const authProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
-    const shouldSetAuthProfile = Boolean(authProfile) && authProfile !== 'inherit';
-    const { providerOverride, modelOverride } = parseSessionModelRef(overrides.modelRef);
-    const shouldSetModelOverride = Boolean(modelOverride);
-
-    if (!existsSync(sessionsPath)) {
-      // The gateway keeps its session store in per-agent SQLite (see
-      // dispatch/session-store.mjs); sessions.json is a legacy fallback that
-      // is absent on modern gateways. A missing file means the override has
-      // no legacy store to land in: the dispatch still runs with authProfile
-      // carried explicitly via the x-openclaw-auth-profile header and the
-      // model via the x-openclaw-model header (splitModelOverride), so the
-      // selected model takes effect without the legacy store. Callers only
-      // log the result and dispatch either way. Treat the legacy-store miss
-      // as a successful no-op so the dispatcher does not warn on every
-      // isolated dispatch.
-      return { ok: true };
-    }
-
-    const raw = readFileSync(sessionsPath, 'utf-8');
-    const store = assertValidSessionStore(JSON.parse(raw), 'gateway sessions store');
-
-    const now = Date.now();
-    let changed = false;
-
-    for (const key of keyAliases) {
-      const existingEntry = store[key];
-      if (!existingEntry && !shouldSetAuthProfile && !shouldSetModelOverride) {
-        continue;
-      }
-
-      const entry = existingEntry || { updatedAt: now };
-      let entryChanged = false;
-
-      if (shouldSetAuthProfile) {
-        if (entry.authProfileOverride !== authProfile || entry.authProfileOverrideSource !== 'user') {
-          entry.authProfileOverride = authProfile;
-          entry.authProfileOverrideSource = 'user';
-          delete entry.authProfileOverrideCompactionCount;
-          entryChanged = true;
-        }
-      } else if (
-        entry.authProfileOverride !== undefined ||
-        entry.authProfileOverrideSource !== undefined ||
-        entry.authProfileOverrideCompactionCount !== undefined
-      ) {
-        delete entry.authProfileOverride;
-        delete entry.authProfileOverrideSource;
-        delete entry.authProfileOverrideCompactionCount;
-        entryChanged = true;
-      }
-
-      if (shouldSetModelOverride) {
-        if (entry.modelOverride !== modelOverride) {
-          entry.modelOverride = modelOverride;
-          entryChanged = true;
-        }
-        if (providerOverride) {
-          if (entry.providerOverride !== providerOverride) {
-            entry.providerOverride = providerOverride;
-            entryChanged = true;
-          }
-        } else if (entry.providerOverride !== undefined) {
-          delete entry.providerOverride;
-          entryChanged = true;
-        }
-      } else if (entry.modelOverride !== undefined || entry.providerOverride !== undefined) {
-        delete entry.modelOverride;
-        delete entry.providerOverride;
-        entryChanged = true;
-      }
-
-      if (!entryChanged) {
-        continue;
-      }
-
-      entry.updatedAt = now;
-      store[key] = entry;
-      changed = true;
-    }
-
-    if (!changed) {
-      return { ok: true };
-    }
-
-    writeFileSync(sessionsPath, JSON.stringify(store), 'utf-8');
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: `Failed to update sessions.json: ${err.message}` };
+export async function prepareAgentSelection(sessionKey, overrides = {}, agentId = 'main', opts = {}) {
+  const owner = assertValidAgentId(agentId, 'agentId');
+  const validatedKey = assertSessionKeyForAgent(sessionKey, owner, 'sessionKey');
+  const key = validatedKey.startsWith('agent:') ? validatedKey : `agent:${owner}:${validatedKey}`;
+  if (opts.signal?.aborted) throw new GatewayPreparationError('Gateway preparation cancelled', { code: 'ABORT_ERR' });
+  if (['modelRef', 'authProfile'].some(name => overrides[name] != null && typeof overrides[name] !== 'string')) {
+    throw new GatewayPreparationError('Model and profile selections must be strings or null');
   }
+  const rawModel = typeof overrides.modelRef === 'string' ? overrides.modelRef.trim() : '';
+  const separateProfile = typeof overrides.authProfile === 'string' ? overrides.authProfile.trim() : '';
+  const split = splitProfileSuffix(rawModel);
+  if (separateProfile && split.profile && separateProfile !== split.profile) {
+    throw new GatewayPreparationError('Conflicting model suffix and authProfile selections');
+  }
+  const profile = separateProfile || split.profile;
+  const route = splitModelOverride(split.model, owner);
+  if (!profile) return { ok: true, applied: false, model: split.model || undefined };
+  if (profile === 'inherit' || /[\s/]/.test(profile)) {
+    throw new GatewayPreparationError('Profile must be a resolved explicit ID without whitespace or slash');
+  }
+  const slash = split.model.indexOf('/');
+  if (!route.overrideHeader || slash <= 0 || slash === split.model.length - 1) {
+    throw new GatewayPreparationError('Explicit profile preparation requires a concrete provider/model reference');
+  }
+  // Reject suffixes that would be parsed into a different pair after concatenation.
+  const modelWithProfile = `${split.model}@${profile}`;
+  const verified = splitProfileSuffix(modelWithProfile);
+  if (verified.model !== split.model || verified.profile !== profile) {
+    throw new GatewayPreparationError('Ambiguous model/profile suffix combination');
+  }
+  const response = await callGatewayPreparation({ key, agentId: owner, model: modelWithProfile }, {
+    ...opts,
+    gatewayUrl: GATEWAY_URL,
+    gatewayToken: opts.gatewayToken ?? getGatewayToken(),
+    openclawCommand: opts.openclawCommand ?? process.env.OPENCLAW_CLI_PATH,
+  });
+  const entry = response?.entry;
+  const provider = entry?.providerOverride ?? response?.resolved?.modelProvider;
+  const model = entry?.modelOverride ?? response?.resolved?.model;
+  if (response?.ok !== true || response.key !== key || !entry || Array.isArray(entry)
+      || entry.authProfileOverride !== profile || entry.authProfileOverrideSource !== 'user'
+      || provider !== split.model.slice(0, slash) || model !== split.model.slice(slash + 1)) {
+    throw new GatewayPreparationError('Gateway preparation receipt does not match the requested session/model/profile', {
+      code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
+    });
+  }
+  return { ok: true, applied: true, model: split.model, authProfile: profile };
 }
 
-export function applyAuthProfileToSessionStore(sessionKey, authProfile, agentId = 'main') {
-  if (!sessionKey || !authProfile) {
-    return { ok: false, error: 'sessionKey and authProfile are required' };
-  }
-  return applySessionOverridesToSessionStore(sessionKey, { authProfile }, agentId);
+/** Retired compatibility API: never silently mutate or report an applied local override. */
+export function applySessionOverridesToSessionStore() {
+  return { ok: false, error: 'Local session overrides are retired; use prepareAgentSelection' };
+}
+
+/** Retired compatibility API. */
+export function applyAuthProfileToSessionStore() {
+  return applySessionOverridesToSessionStore();
 }
 
 /**

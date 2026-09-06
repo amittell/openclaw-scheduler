@@ -25,6 +25,7 @@ import {
   persistPreparedArtifactBoundEvidence,
 } from './evidence-runtime.js';
 import { detectTransientError } from './dispatcher-utils.js';
+import { GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
 
 /**
  * DispatchResult shape (returned by every strategy):
@@ -2959,87 +2960,86 @@ function isGatewayCompatibilityFailure(error) {
     || error?.name === 'GatewayCompatibilityError';
 }
 
-async function resolveConfiguredAuthProfile(authProfile, deps, jobId, fieldName = 'auth_profile') {
-  const { listSessions, log } = deps;
-  let resolvedAuthProfile = authProfile || undefined;
-  if (resolvedAuthProfile !== 'inherit') return resolvedAuthProfile;
-
+async function resolveConfiguredAuthProfile(authProfile, deps, agentId, timeoutMs, signal) {
+  if (authProfile !== 'inherit') return authProfile || undefined;
+  let timer;
+  let abort;
   try {
-    const sessions = await listSessions({ kinds: ['main'], activeMinutes: 120, limit: 10 });
-    const sessionList = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions || [];
-    const mainSession = Array.isArray(sessionList)
-      ? sessionList.find(s => {
-          const key = s.key || s.sessionKey || '';
-          return key.includes(':main:') || key.endsWith(':main') || key === 'main';
-        })
-      : null;
-    const profileId = mainSession?.authProfileOverride || mainSession?.authProfile || mainSession?.profile;
-    if (profileId) {
-      resolvedAuthProfile = profileId;
-      log('debug', `Resolved ${fieldName} 'inherit' -> '${profileId}'`, { jobId });
-    } else {
-      log('debug', `${fieldName} 'inherit' -- no main session profile found, passing 'inherit' as-is`, { jobId });
-    }
-  } catch (err) {
-    log('warn', `Failed to resolve ${fieldName} 'inherit': ${err.message}`, { jobId });
-    // Fall through with 'inherit' -- gateway may handle it.
+    const unavailable = () => new GatewayPreparationError('Cannot resolve inherit from the same agent main session');
+    const sessions = await Promise.race([
+      Promise.resolve().then(() => {
+        if (signal?.aborted) throw new GatewayPreparationError('Selection cancelled', { code: 'ABORT_ERR' });
+        return deps.listSessions({ kinds: ['main'], activeMinutes: 120, limit: 100 });
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(unavailable()), timeoutMs);
+        abort = () => reject(new GatewayPreparationError('Selection cancelled', { code: 'ABORT_ERR' }));
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+      }),
+    ]);
+    const rows = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions;
+    const main = Array.isArray(rows) ? rows.find(row => (row.key || row.sessionKey) === `agent:${agentId}:main`) : null;
+    const profile = main?.authProfileOverride;
+    if (typeof profile !== 'string' || !profile.trim() || profile === 'inherit') throw unavailable();
+    return profile.trim();
+  } catch (error) {
+    if (error instanceof GatewayPreparationError) throw error;
+    throw new GatewayPreparationError('Cannot resolve inherit from the same agent main session');
+  } finally {
+    clearTimeout(timer);
+    if (abort) signal?.removeEventListener('abort', abort);
   }
-
-  return resolvedAuthProfile;
 }
 
 async function runAgentTurnForSelection(
-  job,
-  deps,
-  prompt,
-  sessionKey,
-  selection,
-  dispatchAgentTurn,
-  materializedEnv = null,
-  capabilityBinding = null,
-  signal = null,
+  job, deps, prompt, sessionKey, selection, dispatchAgentTurn,
+  materializedEnv = null, capabilityBinding = null, signal = null, attemptState = {},
 ) {
-  const { log } = deps;
-  const { applySessionOverridesToSessionStore: applySessionOverrides } = deps;
+  const { log, prepareAgentSelection } = deps;
   const agentId = assertValidAgentId(job.agent_id ?? 'main', 'job agent_id');
   const validatedSessionKey = assertSessionKeyForAgent(sessionKey, agentId, 'job session_key');
-
-  if (typeof applySessionOverrides === 'function') {
-    const applyResult = applySessionOverrides(
-      validatedSessionKey,
-      {
-        authProfile: selection.authProfile,
-        modelRef: selection.model || null,
-      },
-      agentId,
-    );
-    if (applyResult.ok) {
-      log('debug', `Applied session overrides for ${validatedSessionKey}`, {
-        jobId: job.id,
-        authProfile: selection.authProfile || null,
-        modelRef: selection.model || null,
-      });
-    } else {
-      log('warn', `Failed to apply session overrides: ${applyResult.error}`, {
-        jobId: job.id,
-        sessionKey: validatedSessionKey,
-      });
+  const assertActive = () => {
+    if (signal?.aborted || deps.isRunCancellationRequested?.(attemptState.runId)) {
+      throw new GatewayPreparationError('Run cancelled before agent dispatch', { code: 'ABORT_ERR' });
     }
+    if (Date.now() >= attemptState.deadlineMs) {
+      throw new GatewayPreparationError('Agent run deadline expired', { code: 'GATEWAY_RUN_DEADLINE' });
+    }
+  };
+  assertActive();
+  const authProfile = await resolveConfiguredAuthProfile(selection.authProfile, deps, agentId,
+    Math.min(10_000, attemptState.deadlineMs - Date.now()), signal);
+  assertActive();
+  let prepared = { ok: true, applied: false, model: selection.model || undefined };
+  if (typeof prepareAgentSelection === 'function') {
+    prepared = await prepareAgentSelection(validatedSessionKey,
+      { authProfile, modelRef: selection.model || null }, agentId,
+      { signal, timeout: Math.min(10_000, attemptState.deadlineMs - Date.now()) });
+  } else if (authProfile) {
+    throw new GatewayPreparationError('Profile preparation is unavailable');
   }
+  if (prepared?.ok !== true) {
+    throw new GatewayPreparationError('Profile preparation returned no accepted receipt', {
+      code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
+    });
+  }
+  if (attemptState.pinApplied && !prepared.applied) {
+    throw new GatewayPreparationError('Configured fallback cannot clear or implicitly inherit an applied profile pin');
+  }
+  if (prepared.applied) attemptState.pinApplied = true;
+  assertActive();
+  if (prepared.applied) log('debug', 'Gateway accepted session profile metadata', { jobId: job.id, sessionKey: validatedSessionKey });
 
   return dispatchAgentTurn({
-    message: prompt,
-    agentId,
-    sessionKey: validatedSessionKey,
-    model: selection.model || undefined,
-    authProfile: selection.authProfile,
+    message: prompt, agentId, sessionKey: validatedSessionKey,
+    model: prepared.model ?? selection.model ?? undefined,
     materializedEnv: materializedEnv || undefined,
     capabilityBinding: capabilityBinding || undefined,
     idleTimeoutMs: (job.payload_timeout_seconds || 120) * 1000,
     pollIntervalMs: 60000,
-    absoluteTimeoutMs: job.run_timeout_ms || 300000,
-    signal,
-    cancelOnAbort: false,
+    absoluteTimeoutMs: Math.max(1, attemptState.deadlineMs - Date.now()),
+    signal, cancelOnAbort: false,
   });
 }
 
@@ -3059,6 +3059,7 @@ export async function executeAgent(job, ctx, deps) {
   } = deps;
   const dispatchAgentTurn = runIsolatedAgentTurn || runAgentTurnWithActivityTimeout;
   const result = makeDefaultResult();
+  const agentDeadlineMs = Date.now() + (job.run_timeout_ms || 300000);
 
   if (isRunCancellationRequested?.(ctx.run.id)) {
     throw new Error('Run cancelled before agent dispatch');
@@ -3106,20 +3107,14 @@ export async function executeAgent(job, ctx, deps) {
 
   const primarySelection = {
     model: job.payload_model || undefined,
-    authProfile: await resolveConfiguredAuthProfile(
-      ctx.v02Outcomes?.effective_auth_profile || job.auth_profile || undefined,
-      deps,
-      job.id,
-      ctx.v02Outcomes?.effective_auth_profile ? 'effective_auth_profile' : 'auth_profile'
-    ),
+    authProfile: ctx.v02Outcomes?.effective_auth_profile || job.auth_profile || undefined,
   };
   const hasConfiguredFallback = job.payload_model_fallback != null || job.auth_profile_fallback != null;
   const fallbackSelection = hasConfiguredFallback ? {
     model: job.payload_model_fallback || primarySelection.model || undefined,
-    authProfile: job.auth_profile_fallback != null
-      ? await resolveConfiguredAuthProfile(job.auth_profile_fallback, deps, job.id, 'auth_profile_fallback')
-      : primarySelection.authProfile,
+    authProfile: job.auth_profile_fallback != null ? job.auth_profile_fallback || undefined : primarySelection.authProfile,
   } : null;
+  const attemptState = { runId: ctx.run.id, deadlineMs: agentDeadlineMs, pinApplied: false };
 
   let turnResult;
   try {
@@ -3136,11 +3131,17 @@ export async function executeAgent(job, ctx, deps) {
       ctx.materializedEnv || null,
       ctx.gatewayCapabilityBinding || null,
       ctx.abortSignal || null,
+      attemptState,
     );
   } catch (primaryError) {
     const canTryConfiguredFallback = fallbackSelection
       && !sameAgentSelection(primarySelection, fallbackSelection)
-      && !isGatewayCompatibilityFailure(primaryError);
+      && !isGatewayCompatibilityFailure(primaryError)
+      && primaryError?.uncertain !== true
+      && primaryError?.code !== 'ABORT_ERR'
+      && !ctx.abortSignal?.aborted
+      && !isRunCancellationRequested?.(ctx.run.id)
+      && Date.now() < agentDeadlineMs;
     if (!canTryConfiguredFallback) throw primaryError;
 
     log('warn', 'Primary agent selection failed; retrying with configured fallback', {
@@ -3161,6 +3162,7 @@ export async function executeAgent(job, ctx, deps) {
         ctx.materializedEnv || null,
         ctx.gatewayCapabilityBinding || null,
         ctx.abortSignal || null,
+        attemptState,
       );
       log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });
     } catch (fallbackError) {
