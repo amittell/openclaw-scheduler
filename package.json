@@ -51,6 +51,7 @@
     "dispatch/gateway-rpc.mjs",
     "dispatch/hooks.mjs",
     "dispatch/index.mjs",
+    "dispatch/label-lock.mjs",
     "dispatch/liveness.mjs",
     "dispatch/message-input.mjs",
     "dispatch/paths.mjs",

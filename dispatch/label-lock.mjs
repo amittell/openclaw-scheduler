@@ -49,8 +49,11 @@ let lockedAs = null;
 function tryAcquire(lockPath) {
   if (existsSync(lockPath)) {
     let age;
+    let inoAtStaleCheck = null;
     try {
-      age = Date.now() - statSync(lockPath).mtimeMs;
+      const st = statSync(lockPath);
+      age = Date.now() - st.mtimeMs;
+      inoAtStaleCheck = st.ino;
     } catch {
       age = Infinity; // file vanished between existsSync and stat — O_EXCL re-checks
     }
@@ -67,7 +70,28 @@ function tryAcquire(lockPath) {
       stale = age > LABELS_LOCK_STALE_MS;
     }
     if (stale) {
-      try { unlinkSync(lockPath); } catch {}
+      // Stale recovery must not unlink a replacement that another breaker
+      // acquired after our earlier stat/read. Re-check the same inode and,
+      // for readable locks, the owner pid before unlinking; if the file is
+      // gone (EACCES), moved, or now held by a live process, leave it alone.
+      let stillStale = false;
+      try {
+        const fresh = statSync(lockPath);
+        if (fresh.ino === inoAtStaleCheck) {
+          stillStale = true;
+          try {
+            const info = JSON.parse(readFileSync(lockPath, 'utf8'));
+            stillStale = !ownerAlive(info.pid);
+          } catch {
+            // empty/corrupt and old enough: still a crash orphan
+          }
+        }
+      } catch {
+        stillStale = false; // vanished; let the O_EXCL create path own it
+      }
+      if (stillStale) {
+        try { unlinkSync(lockPath); } catch {}
+      }
     }
   }
   let fd = null;
