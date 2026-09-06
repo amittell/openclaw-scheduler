@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] -- 2026-09-06
+
+### Fixed
+
+- **Stop false activity-timeout aborts of isolated agent-turn jobs.** The
+  activity monitor polled `sessions_list` with a `kinds` filter
+  (`main`/`subagent`/`isolated`) that the gateway does not recognise and
+  silently returns an empty list for, so a run's own session was omitted
+  from every poll and each isolated `agentTurn` job was aborted after 2x the
+  idle window ("Session idle for 240s -- aborted (activity-based timeout)")
+  regardless of real activity or run length. The monitor now polls an
+  unfiltered active list and matches the exact session key. Regression test
+  asserts the poll never sends a `kinds` argument. (#38)
+
+- **Preserve one transient retry and commit failure alerts atomically.**
+  Isolated agent-turn jobs get one conservative retry for transient LLM
+  failures (5xx / gateway timeout / aborted-class), booked in the same
+  completion-transaction as delivery validation so a later validation error
+  rolls the retry and its counters back together. `retry_count` propagates
+  from the failed run to the retry run so the at-most-one-retry guard holds.
+  Failure alerts require an explicit operator destination (a well-formed
+  Telegram chat id), are enqueued only after completion bookkeeping commits,
+  and are suppressed (never sent) while an outer transaction is open. (#39)
+
+- **Stop false terminal states in dispatch label watching.** A cross-process
+  lock (`dispatch/label-lock.mjs`) serializes labels-ledger read-modify-write
+  so concurrent enqueue / watcher / status / result processes no longer
+  clobber fields another just wrote (observed: a label lost its
+  sessionKey/delivery fields mid-enqueue, cascading into a false "terminal
+  failure (unknown)" alarm on the next tick). Stale-lock recovery now
+  re-checks the inode and owner pid immediately before unlinking, so it never
+  removes a replacement live owner's lock. The done-gate requires an
+  observable terminal reply in the transcript: a session whose turn ended
+  without one is reported interrupted, not completed. The lock module is
+  included in the published package `files`. Genuinely-concurrent regression
+  test (4 real OS processes x 200 locked increments). (#36)
+
+- Treat missing `sessions.json` as a no-op override write instead of an
+  error, for gateways on the SQLite-only session store. (#34)
+
+
 ### Fixed
 
 - Forward job `payload_model` selections to the gateway via the
@@ -27,6 +68,37 @@ All notable changes to this project will be documented in this file.
   contract. Regression test added (`tests/durable-delivery-agentid.test.mjs`).
   Note: dispatched agents keep their embedded CHECK_IN template until
   re-dispatched; already-running prompts carry the pre-fix template.
+
+### Changed
+
+- Delivery route inference: a bare numeric target with a NULL channel resolves
+  to telegram only for well-formed chat ids (digits with an optional single
+  leading minus, surrounding whitespace trimmed). Malformed values (embedded
+  whitespace, leading `+`) are rejected with an incomplete-route error
+  instead of being enqueued to the delivery outbox. (#39)
+
+- Bump dev dependency `@humanfs/node` 0.16.7 -> 0.16.8. (#37)
+
+### Added
+
+- Completion-lifecycle tests import the same bookkeeping factory the
+  dispatcher uses (no execution of extracted source text); the
+  database-isolation child pins TAP output so its strict two-test assertion
+  holds across Node 22-26. (#39)
+
+- WritHub mirror hardening: destination credentials are confined to the exact
+  host/repository via a validating askpass; source/local git receives no
+  destination credentials or askpass variables; the CLI reads deletion state
+  from a scalar env flag instead of the GitHub event file; full
+  reconciliation only through an explicit manual input. (#39)
+
+### Docs
+
+- Note the agentId owner-pinning contract on `invokeGatewayTool`. (#33)
+
+- Correct routing-model-id examples to the accepted `agent:<agentId>` colon
+  form (the slash form is only valid for `openclaw/<agentId>`) and remove
+  internal host names from public comments, docs, and test fixtures. (#40)
 
 ## [0.5.2] -- 2026-08-19
 
