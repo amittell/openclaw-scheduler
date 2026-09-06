@@ -7,6 +7,11 @@ on:
     tags:
       - '**'
   workflow_dispatch:
+    inputs:
+      full_sync:
+        description: 'Sync all current refs independently; preserve/report conflicts, never force or delete'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,7 +22,9 @@ concurrency:
 
 jobs:
   mirror:
-    name: Mirror Git refs
+    name: Mirror selected Git refs
+    # Preserve destination history when a source branch or tag is deleted.
+    if: ${{ github.event_name != 'push' || !github.event.deleted }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -28,11 +35,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Mirror branches and tags to WritHub
+      - name: Mirror event ref or explicit full sync to WritHub
         env:
           WRITHUB_TOKEN: ${{ secrets.WRITHUB_TOKEN }}
           WRITHUB_USERNAME: ${{ vars.WRITHUB_USERNAME }}
           WRITHUB_REPOSITORY: ${{ vars.WRITHUB_REPOSITORY }}
+          MIRROR_FULL_SYNC: ${{ inputs.full_sync || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -51,22 +59,19 @@ jobs:
           fi
 
           askpass="$RUNNER_TEMP/writhub-askpass.sh"
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'case "$1" in' \
-            '  *Username*) printf "%s\\n" "$WRITHUB_USERNAME" ;;' \
-            '  *Password*) printf "%s\\n" "$WRITHUB_TOKEN" ;;' \
-            '  *) exit 1 ;;' \
-            'esac' > "$askpass"
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$WRITHUB_USERNAME" ;;
+            *Password*) printf '%s\n' "$WRITHUB_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
           chmod 700 "$askpass"
 
-          git fetch --prune origin \
-            '+refs/heads/*:refs/remotes/github/*' \
-            '+refs/tags/*:refs/remotes/github-tags/*'
           git remote add writhub \
             "https://writhub.io/${WRITHUB_REPOSITORY}.git"
 
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git push --atomic writhub \
-              'refs/remotes/github/*:refs/heads/*' \
-              'refs/remotes/github-tags/*:refs/tags/*'
+            node scripts/mirror-writhub.mjs

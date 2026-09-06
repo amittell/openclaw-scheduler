@@ -13,7 +13,6 @@
 //   6. Prune old runs (hourly)
 
 import { readFileSync } from 'fs';
-import { createHash } from 'node:crypto';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
@@ -98,6 +97,7 @@ import {
   ensureAgentInboxJobs,
   pruneDeliveryHistory,
   reconcileCompletedDueSchedules,
+  createScheduleBookkeeping,
 } from './dispatcher-maintenance.js';
 import {
   prepareDispatch,
@@ -1023,70 +1023,9 @@ function advanceNextRun(job) {
 }
 
 // -- Update job state after run ------------------------------
-function updateJobAfterRun(job, status) {
-  // Re-read from DB to get current state (avoids stale consecutive_errors during retries)
-  const freshJob = getJob(job.id);
-  if (!freshJob) return; // Job was already deleted (e.g. delete_after_run race)
-  const currentErrors = freshJob?.consecutive_errors || 0;
-  const patch = { last_run_at: sqliteNow(), last_status: status };
-  const hasChildren = Boolean(getDb().prepare(
-    'SELECT 1 FROM jobs WHERE parent_id = ? LIMIT 1',
-  ).get(freshJob.id));
-
-  if (status === 'error' || status === 'timeout') {
-    patch.consecutive_errors = currentErrors + 1;
-  } else if (status === 'ok') {
-    patch.consecutive_errors = 0;
-  }
-
-  // At-jobs (one-shot): don't advance cron schedule -- delete or disable
-  if (freshJob.schedule_kind === 'at') {
-    if (freshJob.delete_after_run && !hasChildren) {
-      getDb().transaction(() => {
-        updateJob(job.id, patch);
-        deleteJob(job.id);
-      })();
-      log('info', `Deleting one-shot at-job: ${job.name}`, { jobId: job.id });
-    } else {
-      patch.enabled = 0; // Disable so it won't fire again via getDueAtJobs
-      updateJob(job.id, patch);
-      log('info', hasChildren
-        ? `Disabling completed at-job until its workflow children are retired: ${job.name}`
-        : `Disabling completed at-job: ${job.name}`, { jobId: job.id });
-    }
-    return;
-  }
-
-  // Cron job: advance schedule
-  const nextRun = nextRunFromCron(freshJob.schedule_cron, freshJob.schedule_tz);
-  patch.next_run_at = nextRun;
-
-  // Backoff for errors
-  if (patch.consecutive_errors > 0 && nextRun) {
-    const backoffMs = getBackoffMs(patch.consecutive_errors);
-    const backoffDate = new Date(Date.now() + backoffMs);
-    const nextDate = new Date(nextRun);
-    if (backoffDate > nextDate) patch.next_run_at = backoffDate.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-  }
-
-  if (status === 'ok' && freshJob.delete_after_run && !hasChildren) {
-    getDb().transaction(() => {
-      updateJob(job.id, patch);
-      deleteJob(freshJob.id);
-    })();
-    log('info', `Deleting one-shot: ${freshJob.name}`);
-  } else {
-    if (status === 'ok' && freshJob.delete_after_run && hasChildren) patch.enabled = 0;
-    updateJob(job.id, patch);
-  }
-}
-
-function scheduledDispatchId(jobId, kind, scheduledFor) {
-  const digest = createHash('sha256')
-    .update(`${jobId}\0${kind}\0${scheduledFor}`)
-    .digest('hex');
-  return `scheduled-${digest}`;
-}
+const { updateJobAfterRun, scheduledDispatchId } = createScheduleBookkeeping({
+  getDb, getJob, updateJob, deleteJob, sqliteNow, nextRunFromCron, getBackoffMs, log,
+});
 
 function materializeDueSchedules() {
   const materialize = (job, kind, scheduledFor) => {

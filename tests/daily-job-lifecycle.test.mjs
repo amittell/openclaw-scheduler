@@ -1,8 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import vm from 'node:vm';
 import { setDbPath, initDb, closeDb, getDb } from '../db.js';
 import { createJob, getJob, updateJob, deleteJob, getDueJobs, getDueAtJobs, nextRunFromCron, shouldRetry, scheduleRetry, canEnqueueDispatch, getDispatchBacklogCount } from '../jobs.js';
 import { createRun, getRun, finishRun } from '../runs.js';
@@ -11,21 +8,12 @@ import { completeRunFenced, commitCompletionBookkeeping, shouldRunPostCompletion
 import { transitionRunTerminal } from '../run-state.js';
 import { createDeliveryHelpers, createTransientFailureAlertHandler } from '../dispatcher-delivery.js';
 import { finalizeDispatch } from '../dispatcher-strategies.js';
-import { reconcileCompletedDueSchedules } from '../dispatcher-maintenance.js';
+import { reconcileCompletedDueSchedules, createScheduleBookkeeping } from '../dispatcher-maintenance.js';
 import { sqliteNow, getBackoffMs } from '../dispatcher-utils.js';
 
-const dispatcherSource = readFileSync(new URL('../dispatcher.js', import.meta.url), 'utf8');
-function between(source, start, end) {
-  const first = source.indexOf(start);
-  const last = source.indexOf(end, first);
-  assert.ok(first >= 0 && last > first);
-  return source.slice(first, last).trim();
-}
-// The executable dispatcher starts its service when imported. Extract only its
-// unchanged production updater and ID helper, binding them to the real test DB.
-const context = vm.createContext({ getDb, getJob, updateJob, deleteJob, sqliteNow, nextRunFromCron, getBackoffMs, createHash, log: () => {} });
-vm.runInContext(between(dispatcherSource, 'function updateJobAfterRun', 'function materializeDueSchedules'), context);
-const { updateJobAfterRun, scheduledDispatchId } = context;
+const { updateJobAfterRun, scheduledDispatchId } = createScheduleBookkeeping({
+  getDb, getJob, updateJob, deleteJob, sqliteNow, nextRunFromCron, getBackoffMs, log: () => {},
+});
 
 function createAlert(target, deliverMessageFn) {
   return createTransientFailureAlertHandler({ target, deliverMessageFn });
