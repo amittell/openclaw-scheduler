@@ -381,6 +381,12 @@ function rejectUnsafeWatcherMetadata(labels) {
 }
 
 function loadLabels() {
+  // Reading may sanitize unsafe persisted routing metadata and save it.
+  // That repair must serialize with every other labels writer too.
+  return withLabelsLock(LABELS_PATH, loadLabelsWithinLock);
+}
+
+function loadLabelsWithinLock() {
   const signature = getLabelsSignature();
   if (labelsCache && labelsCacheSignature === signature) {
     return labelsCache;
@@ -431,6 +437,9 @@ function mutateLabels(mutator) {
   // lastPing) — the cascade that turned a benign read race into a false
   // "terminal failure (unknown)" alarm.
   return withLabelsLock(LABELS_PATH, () => {
+    // A same-size write can retain the filesystem timestamp: do not reuse a
+    // pre-acquisition cache during a read-modify-write transaction.
+    labelsCache = null;
     const labels = loadLabels();
     if (labelsCacheError) {
       throw new Error(
