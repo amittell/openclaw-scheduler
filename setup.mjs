@@ -33,9 +33,13 @@ import {
   buildSudoChmodPrivateArgs,
   buildSudoInstallArgs,
   buildSudoLaunchctlBootstrapArgs,
+  configuredOpenClawCliPath,
+  configureExistingLaunchdService,
   createSetupCommandRunner,
   encodeLaunchdPlistValue,
   formatPosixCommand,
+  renderLaunchdCliEnvironment,
+  renderLaunchdServicePlist,
   renderSystemdUserService,
 } from './setup-service-utils.mjs';
 
@@ -101,6 +105,7 @@ if (setupOptions.help) {
 }
 
 const platform = process.platform;
+const openclawCliPath = platform === 'darwin' ? configuredOpenClawCliPath() : '';
 const isWSL = platform === 'linux' && Boolean(
   process.env.WSL_DISTRO_NAME
   || process.env.WSL_INTEROP
@@ -494,64 +499,25 @@ if (platform === 'darwin') {
       // User declined new service and kept existing one -- skip install block
       hardenExistingServiceFile(macServiceSummary);
     } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
-      hardenExistingServiceFile(service);
-      skip(`${service.title} already installed`);
-      print(`  Path: ${service.plistPath}`);
-      if (service.domain) {
-        const restartArgs = ['kickstart', '-k', `${service.domain}/${service.label}`];
-        const restartCommand = service.mode === 'daemon'
-          ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...restartArgs])
-          : formatPosixCommand(MACOS_LAUNCHCTL_PATH, restartArgs);
-        print(`  To restart: ${restartCommand}`);
-      }
+      await configureExistingLaunchdService({
+        service, openclawCliPath, confirm, hardenExistingServiceFile,
+        runSetupCommand, ok, skip, warn, print,
+      });
     } else if (macServiceSummary) {
       const install = await confirm(service.installPrompt);
       if (install) {
         const tokenXml = gatewayToken
           ? `    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>${encodeLaunchdPlistValue(gatewayToken, 'gateway token')}</string>\n`
           : '';
+        const cliXml = renderLaunchdCliEnvironment(openclawCliPath);
         const userXml = service.mode === 'daemon'
           ? `  <key>UserName</key>\n  <string>${encodeLaunchdPlistValue(serviceUser, 'service user')}</string>\n`
           : '';
-        const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Comment</key>
-  <string>${encodeLaunchdPlistValue(service.comment, 'service comment')}</string>
-  <key>Label</key>
-  <string>${service.label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${encodeLaunchdPlistValue(nodePath, 'Node executable path')}</string>
-    <string>--no-warnings</string>
-    <string>${encodeLaunchdPlistValue(indexPath, 'dispatcher path')}</string>
-  </array>
-${userXml}  <key>WorkingDirectory</key>
-  <string>${encodeLaunchdPlistValue(serviceWorkingDirectory, 'service working directory')}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key>
-    <string>${encodeLaunchdPlistValue(os.homedir(), 'home directory')}</string>
-    <key>PATH</key>
-    <string>${encodeLaunchdPlistValue(envPath, 'service PATH')}</string>
-    <key>OPENCLAW_GATEWAY_URL</key>
-    <string>${encodeLaunchdPlistValue(gatewayUrl, 'gateway URL')}</string>
-    <key>SCHEDULER_DB</key>
-    <string>${encodeLaunchdPlistValue(schedulerDbPath, 'scheduler database path')}</string>
-${tokenXml}  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>30</integer>
-  <key>StandardOutPath</key>
-  <string>${encodeLaunchdPlistValue(logPath, 'stdout log path')}</string>
-  <key>StandardErrorPath</key>
-  <string>${encodeLaunchdPlistValue(logPath, 'stderr log path')}</string>
-</dict>
-</plist>`;
+        const plist = renderLaunchdServicePlist({
+          service, serviceWorkingDirectory, nodePath, indexPath,
+          homeDirectory: os.homedir(), envPath, gatewayUrl, schedulerDbPath,
+          logPath, tokenXml, cliXml, userXml,
+        });
         if (service.mode === 'daemon') {
           const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-'));
           const tmpPlistPath = path.join(tmpDir, 'ai.openclaw.scheduler.plist');

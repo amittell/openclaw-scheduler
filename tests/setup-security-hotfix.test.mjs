@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
   MACOS_CHMOD_PATH,
   MACOS_INSTALL_PATH,
   MACOS_LAUNCHCTL_PATH,
+  MACOS_PLUTIL_PATH,
   MACOS_SUDO_PATH,
   assertSafeServiceValue,
   buildLaunchctlBootstrapArgs,
@@ -15,13 +18,18 @@ import {
   buildSudoChmodPrivateArgs,
   buildSudoInstallArgs,
   buildSudoLaunchctlBootstrapArgs,
+  configuredOpenClawCliPath,
+  configureExistingLaunchdService,
   createSetupCommandRunner,
   encodeLaunchdPlistValue,
   encodeSystemdEnvironmentAssignment,
   encodeSystemdExecArgument,
   encodeSystemdValue,
   formatPosixCommand,
+  renderLaunchdCliEnvironment,
+  renderLaunchdServicePlist,
   renderSystemdUserService,
+  updateLaunchdCliPath,
 } from '../setup-service-utils.mjs';
 
 const METACHAR_VALUE = String.raw`/tmp/Open Claw;$(printf injected)&"'\\release/%n/$HOME/[x]`;
@@ -250,4 +258,174 @@ test('setup source contains no shell-based child process execution', () => {
   );
   assert.match(source, /chmodSync\(service\.plistPath, 0o600\)/u);
   assert.match(source, /buildSudoChmodPrivateArgs\(service\.plistPath\)/u);
+  assert.match(source, /const plist = renderLaunchdServicePlist\(\{/u);
+  assert.match(source, /await configureExistingLaunchdService\(\{/u);
+});
+
+
+test('CLI installation configuration is explicit, absolute, and preserves literal path characters', () => {
+  assert.equal(configuredOpenClawCliPath({}), '');
+  assert.equal(configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: '' }), '');
+  assert.equal(configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: METACHAR_VALUE }), METACHAR_VALUE);
+  for (const value of ['openclaw', './openclaw', '~/openclaw', '/public/cli\nother', 42]) {
+    assert.throws(() => configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: value }), /absolute|control character|string/);
+  }
+  assert.equal(renderLaunchdCliEnvironment(''), '');
+  let called = false;
+  assert.equal(updateLaunchdCliPath({ runCommand: () => { called = true; } }), false);
+  assert.throws(() => updateLaunchdCliPath({ cliPath: 'relative', runCommand: () => { called = true; } }), /absolute/);
+  assert.equal(called, false);
+});
+
+function plistCommand(args, options = {}) {
+  return execFileSync(MACOS_PLUTIL_PATH, args, { encoding: 'utf8', ...options });
+}
+
+function canonicalPlist(file) {
+  return plistCommand(['-convert', 'xml1', '-o', '-', '--', file]);
+}
+
+function withoutCliNode(xml) {
+  return xml.replace(/\t+<key>OPENCLAW_CLI_PATH<\/key>\n\t+<string>[^<]*<\/string>\n/u, '');
+}
+
+test('actual setup LaunchAgent and LaunchDaemon templates persist only the explicitly configured CLI entry', {
+  skip: process.platform !== 'darwin',
+}, () => {
+  // Import the same inert renderer used by setup; never run the setup entrypoint.
+  for (const mode of ['agent', 'daemon']) {
+    const context = {
+      service: { comment: 'fixture', label: 'fixture.scheduler' },
+      serviceWorkingDirectory: '/fixture/work', nodePath: '/fixture/node', indexPath: '/fixture/dispatcher.js',
+      homeDirectory: '/fixture/home', envPath: '/fixture/bin', gatewayUrl: 'http://fixture.invalid',
+      schedulerDbPath: '/fixture/scheduler.db', logPath: '/fixture/log',
+      tokenXml: '    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>fixture-secret-sentinel</string>\n',
+      userXml: mode === 'daemon' ? '  <key>UserName</key>\n  <string>fixture-user</string>\n' : '',
+    };
+    const render = cliPath => JSON.parse(plistCommand(['-convert', 'json', '-o', '-', '--', '-'], {
+      input: renderLaunchdServicePlist({ ...context, cliXml: renderLaunchdCliEnvironment(cliPath) }),
+    }));
+    const original = render('');
+    const configured = render(METACHAR_VALUE);
+    assert.equal(configured.EnvironmentVariables.OPENCLAW_CLI_PATH, METACHAR_VALUE);
+    delete configured.EnvironmentVariables.OPENCLAW_CLI_PATH;
+    assert.deepEqual(configured, original);
+  }
+});
+
+test('native CLI plist updates preserve every unrelated XML/binary value, mode, and idempotent bytes', {
+  skip: process.platform !== 'darwin',
+}, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'setup-cli-'));
+  try {
+    for (const format of ['xml1', 'binary1']) {
+      for (const prior of ['', '/fixture/old-cli']) {
+        const file = join(directory, `${format}-${prior ? 'existing' : 'missing'}.plist`);
+        writeFileSync(file, `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>fixture.scheduler</string>
+<key>ProgramArguments</key><array><string>/fixture/caffeinate</string><string>/fixture/node</string><string>/fixture/dispatcher.js</string></array>
+<key>WorkingDirectory</key><string>/fixture/unchanged</string><key>KeepAlive</key><true/>
+<key>CustomDate</key><date>2026-01-01T00:00:00Z</date><key>CustomData</key><data>AQID</data>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>/fixture/home</string>
+<key>PATH</key><string>/fixture/bin</string><key>OPENCLAW_GATEWAY_TOKEN</key><string>fixture-secret-sentinel</string>
+${renderLaunchdCliEnvironment(prior)}</dict></dict></plist>`, { mode: 0o640 });
+        plistCommand(['-convert', format, '--', file]);
+        const before = canonicalPlist(file);
+        const beforeStat = statSync(file);
+        const calls = [];
+        const runner = createSetupCommandRunner((command, args, options) => {
+          calls.push({ command, args });
+          assert.equal(command, MACOS_PLUTIL_PATH);
+          return execFileSync(command, args, options);
+        });
+        assert.equal(updateLaunchdCliPath({ plistPath: file, cliPath: METACHAR_VALUE, runCommand: runner }), true);
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].args[0], prior ? '-replace' : '-insert');
+        assert.equal(withoutCliNode(canonicalPlist(file)), withoutCliNode(before));
+        const afterStat = statSync(file);
+        assert.deepEqual([afterStat.mode, afterStat.uid, afterStat.gid], [beforeStat.mode, beforeStat.uid, beforeStat.gid]);
+        assert.equal(plistCommand(['-extract', 'EnvironmentVariables.OPENCLAW_CLI_PATH', 'raw', '-n', '--', file]), METACHAR_VALUE);
+        const bytes = readFileSync(file);
+        assert.equal(updateLaunchdCliPath({ plistPath: file, cliPath: METACHAR_VALUE, runCommand: runner }), false);
+        assert.equal(calls.length, 3);
+        assert.deepEqual(readFileSync(file), bytes);
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('daemon CLI updates use sudo argv and refuse invalid plist environments without writing', () => {
+  const calls = [];
+  const runner = createSetupCommandRunner((command, args) => {
+    calls.push({ command, args });
+    return args.includes('-extract') ? '{"KEEP":"fixture-secret-sentinel"}' : '';
+  });
+  const plistPath = '/fixture/daemon file.plist';
+  assert.equal(updateLaunchdCliPath({ plistPath, cliPath: METACHAR_VALUE, runCommand: runner, asRoot: true }), true);
+  assert.deepEqual(calls[1], { command: MACOS_SUDO_PATH, args: [
+    '--', MACOS_PLUTIL_PATH, '-insert', 'EnvironmentVariables.OPENCLAW_CLI_PATH', '-string', METACHAR_VALUE, '--', plistPath,
+  ] });
+  for (const response of ['[]', 'null', '"wrong-type"']) {
+    let count = 0;
+    assert.throws(() => updateLaunchdCliPath({ plistPath, cliPath: METACHAR_VALUE, runCommand: () => { count += 1; return response; } }), /dictionary/);
+    assert.equal(count, 1);
+  }
+});
+
+test('actual existing-service setup branch updates only after an explicit configured-path confirmation', {
+  skip: process.platform !== 'darwin',
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'setup-cli-existing-'));
+  try {
+    for (const [cliPath, approve, expected, failRead = false] of [[METACHAR_VALUE, true, METACHAR_VALUE], [METACHAR_VALUE, false, '/fixture/old-cli'], ['', true, '/fixture/old-cli'], [METACHAR_VALUE, true, '/fixture/old-cli', true]]) {
+      const file = join(directory, 'fixture.plist');
+      writeFileSync(file, `<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>OPENCLAW_CLI_PATH</key><string>/fixture/old-cli</string><key>KEEP</key><string>fixture-secret-sentinel</string>
+</dict><key>KeepAlive</key><true/></dict></plist>`, { mode: 0o600 });
+      const before = canonicalPlist(file);
+      const output = [];
+      let commands = 0;
+      const context = {
+        service: { title: 'LaunchAgent', mode: 'agent', plistPath: file, domain: 'gui/501', label: 'fixture.scheduler' },
+        openclawCliPath: cliPath, confirm: async () => approve,
+        hardenExistingServiceFile: () => {},
+        ok: text => output.push(text), skip: text => output.push(text), warn: text => output.push(text), print: text => output.push(text),
+        runSetupCommand: createSetupCommandRunner((command, args, options) => {
+          assert.equal(command, MACOS_PLUTIL_PATH, 'no service command is allowed in the existing-service branch');
+          commands += 1;
+          if (failRead) throw new Error('inert plist read failure');
+          return execFileSync(command, args, options);
+        }),
+      };
+      await configureExistingLaunchdService(context);
+      assert.equal(plistCommand(['-extract', 'EnvironmentVariables.OPENCLAW_CLI_PATH', 'raw', '-n', '--', file]), expected);
+      assert.equal(withoutCliNode(canonicalPlist(file)), withoutCliNode(before));
+      assert.equal(commands, failRead ? 1 : (cliPath && approve ? 2 : 0));
+      assert.ok(output.every(text => !text.includes('fixture-secret-sentinel')));
+      if (cliPath && approve && !failRead) {
+        assert.ok(output.some(text => text.includes('bootstrap')));
+        assert.ok(output.every(text => !text.includes('kickstart')));
+        // Confirm the same setting again before any service reload has occurred.
+        const matchingBytes = readFileSync(file);
+        commands = 0;
+        output.length = 0;
+        await configureExistingLaunchdService(context);
+        assert.equal(commands, 1, 'matching configuration only reads the plist');
+        assert.deepEqual(readFileSync(file), matchingBytes);
+        assert.ok(output.some(text => text.includes('already matches')));
+        assert.ok(output.some(text => text.includes('bootout')));
+        assert.ok(output.some(text => text.includes('bootstrap')));
+        assert.ok(output.every(text => !text.includes('kickstart')));
+      } else {
+        assert.ok(output.some(text => text.includes('kickstart')));
+        assert.ok(output.every(text => !text.includes('bootstrap')));
+        if (failRead) assert.ok(output.some(text => text.includes('inert plist read failure')));
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

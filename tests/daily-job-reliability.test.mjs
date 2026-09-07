@@ -14,7 +14,7 @@ import { updateJob } from '../jobs.js';
 import { commitCompletionBookkeeping } from '../run-completion.js';
 import { createDeliveryHelpers } from '../dispatcher-delivery.js';
 import { finalizeDispatch } from '../dispatcher-strategies.js';
-import { applySessionOverridesToSessionStore } from '../gateway.js';
+import { applySessionOverridesToSessionStore, prepareAgentSelection } from '../gateway.js';
 
 const tempDir = mkdtempSync(join(tmpdir(), 'sched-daily-reliability-'));
 
@@ -174,16 +174,18 @@ test('alias resolution still wins over bare-numeric inference', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bug A: sessions.json missing is a no-op, not a failure
+// Bug A: model-only preparation needs no retired session store
 // ---------------------------------------------------------------------------
 
-test('applySessionOverridesToSessionStore: missing sessions.json is ok (no warn payload)', () => {
-  const result = applySessionOverridesToSessionStore('scheduler:daily-job-reliability-never-created', {
-    authProfile: 'openai:codex',
-    modelRef: 'example/gpt-4o',
+test('retired local override reports failure; model-only preparation needs no legacy store', async () => {
+  const retired = applySessionOverridesToSessionStore('scheduler:daily-job-reliability-never-created', {
+    authProfile: 'vendor:work', modelRef: 'vendor/model',
   }, 'main');
-  assert.equal(result.ok, true, 'missing sessions.json is a no-op, not a failure');
-  assert.equal(result.error, undefined, 'no error string for callers to log');
+  assert.equal(retired.ok, false);
+  assert.match(retired.error, /retired/);
+  const prepared = await prepareAgentSelection('scheduler:daily-job-reliability-never-created', { modelRef: 'vendor/model' });
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.applied, false);
 });
 
 // ---------------------------------------------------------------------------

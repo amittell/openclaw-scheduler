@@ -1598,6 +1598,25 @@ openclaw-scheduler setup --service-mode agent
 openclaw-scheduler setup --service-mode daemon
 ```
 
+For agent jobs that use profile/session preparation, supply the installed public OpenClaw
+CLI entry through installation configuration (the executable `openclaw` entry or its
+absolute `openclaw.mjs` target, not the Node binary):
+
+```bash
+OPENCLAW_CLI_PATH=/absolute/path/to/openclaw openclaw-scheduler setup --service-mode agent
+```
+
+Setup persists this explicit path in new LaunchAgent or LaunchDaemon environments.
+For an existing service, it offers to update only `OPENCLAW_CLI_PATH`, preserving
+all other plist and environment values. It does not reload the service; follow the
+printed stop/bootstrap instructions in a maintenance window after active work and
+callers are held. A `kickstart` alone does not reload the on-disk environment.
+Without the setting, setup keeps its existing behavior and retains any already
+configured CLI path. Relative paths and control characters are rejected. The CLI
+must already exist and be executable under the service's preserved `PATH`/`HOME`;
+setup does not install, launch, or authenticate it. The wizard still performs its
+normal database/job/memory setup steps, so it is not a service-only activation tool.
+
 ### macOS LaunchAgent
 
 ```bash

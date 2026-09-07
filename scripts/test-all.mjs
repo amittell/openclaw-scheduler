@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { createTestEnvironment } from './test-environment.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = new Set(process.argv.slice(2));
@@ -35,14 +36,20 @@ if (agentcliOnly && skipAgentcli) {
   process.exit(2);
 }
 
-function runStep(name, command, args, { cwd = root, env = process.env } = {}) {
+function runStep(name, command, args, { cwd = root, envOverrides = {}, dbPath } = {}) {
+  const isolatedHome = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-test-'));
   process.stdout.write(`\n==> ${name}\n`);
-  const result = spawnSync(command, args, {
-    cwd,
-    env,
-    stdio: 'inherit',
-    windowsHide: true,
-  });
+  let result;
+  try {
+    result = spawnSync(command, args, {
+      cwd,
+      env: { ...createTestEnvironment(isolatedHome, { dbPath }), ...envOverrides },
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+  } finally {
+    rmSync(isolatedHome, { recursive: true, force: true });
+  }
   executed++;
   if (result.error) {
     failures.push(`${name}: ${result.error.message}`);
@@ -56,7 +63,7 @@ function runStep(name, command, args, { cwd = root, env = process.env } = {}) {
 
 if (!focusedOnly && !agentcliOnly) {
   runStep('legacy integration suite', process.execPath, ['test.js'], {
-    env: { ...process.env, SCHEDULER_DB: ':memory:' },
+    dbPath: ':memory:',
   });
 }
 
@@ -74,18 +81,7 @@ const focusedTests = agentcliOnly
     );
 
 for (const testFile of focusedTests) {
-  const isolatedHome = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-test-'));
-  try {
-    runStep(`focused ${testFile}`, process.execPath, ['--test', join('tests', testFile)], {
-      env: {
-        ...process.env,
-        SCHEDULER_DB: join(isolatedHome, 'scheduler.db'),
-        OPENCLAW_SCHEDULER_HOME: isolatedHome,
-      },
-    });
-  } finally {
-    rmSync(isolatedHome, { recursive: true, force: true });
-  }
+  runStep(`focused ${testFile}`, process.execPath, ['--test', join('tests', testFile)]);
 }
 
 if (!skipDocs && !agentcliOnly) {
@@ -103,29 +99,21 @@ const missingAgentcliFiles = [agentcliPackage, agentcliBin, agentcliIntegration]
   .filter(file => !existsSync(file));
 
 if (!skipAgentcli && missingAgentcliFiles.length === 0) {
-  const isolatedHome = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-agentcli-'));
-  try {
-    const integrationEnv = {
-      ...process.env,
-      AGENTCLI_PATH: agentcliRoot,
-      REQUIRE_AGENTCLI_INTEGRATION: '1',
-      SCHEDULER_PATH: root,
-      SCHEDULER_DB: join(isolatedHome, 'scheduler.db'),
-      OPENCLAW_SCHEDULER_HOME: isolatedHome,
-    };
-    runStep('scheduler agentcli contract integration', process.execPath, ['test-integration-agentcli.js'], {
-      env: integrationEnv,
+  const integrationEnv = {
+    AGENTCLI_PATH: agentcliRoot,
+    REQUIRE_AGENTCLI_INTEGRATION: '1',
+    SCHEDULER_PATH: root,
+  };
+  runStep('scheduler agentcli contract integration', process.execPath, ['test-integration-agentcli.js'], {
+    envOverrides: integrationEnv,
+  });
+  if (skipAgentcliOwned) {
+    process.stdout.write('\n==> agentcli-owned integration explicitly skipped by --skip-agentcli-owned or SKIP_AGENTCLI_OWNED_INTEGRATION=1\n');
+  } else {
+    runStep('agentcli scheduler integration', process.execPath, ['--test', agentcliIntegration], {
+      cwd: agentcliRoot,
+      envOverrides: integrationEnv,
     });
-    if (skipAgentcliOwned) {
-      process.stdout.write('\n==> agentcli-owned integration explicitly skipped by --skip-agentcli-owned or SKIP_AGENTCLI_OWNED_INTEGRATION=1\n');
-    } else {
-      runStep('agentcli scheduler integration', process.execPath, ['--test', agentcliIntegration], {
-        cwd: agentcliRoot,
-        env: integrationEnv,
-      });
-    }
-  } finally {
-    rmSync(isolatedHome, { recursive: true, force: true });
   }
 } else if (!skipAgentcli && requireAgentcli) {
   executed++;

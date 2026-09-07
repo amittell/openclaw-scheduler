@@ -2,6 +2,7 @@ import { copyFileSync, existsSync, mkdirSync } from 'fs';
 import { dirname, join, resolve as pathResolve, sep } from 'path';
 import { homedir } from 'os';
 import { assertContainedPath } from '../identifiers.js';
+import { withLabelsLock } from './label-lock.mjs';
 
 function schedulerHome(env) {
   return env.OPENCLAW_SCHEDULER_HOME ||
@@ -36,14 +37,19 @@ export function resolveLabelsPath({ legacyCandidates = [], env = process.env } =
   assertContainedPath(stateDir, labelsPath, 'DISPATCH_LABELS_PATH');
 
   if (!env.DISPATCH_LABELS_PATH && !existsSync(labelsPath)) {
-    const normalizedTarget = pathResolve(labelsPath);
-    const legacyPath = legacyCandidates
-      .filter(Boolean)
-      .map((candidate) => pathResolve(candidate))
-      .find((candidate) => candidate !== normalizedTarget && existsSync(candidate));
-    if (legacyPath) {
-      copyFileSync(legacyPath, labelsPath);
-    }
+    withLabelsLock(labelsPath, () => {
+      // Another starter may create and update the ledger while this process
+      // waits. Bootstrap participates in the same ownership as later writers.
+      if (existsSync(labelsPath)) return;
+      const normalizedTarget = pathResolve(labelsPath);
+      const legacyPath = legacyCandidates
+        .filter(Boolean)
+        .map((candidate) => pathResolve(candidate))
+        .find((candidate) => candidate !== normalizedTarget && existsSync(candidate));
+      if (legacyPath) {
+        copyFileSync(legacyPath, labelsPath);
+      }
+    });
   }
 
   return labelsPath;
