@@ -181,7 +181,8 @@
   "dependencies": {
     "better-sqlite3": "^12.11.1",
     "croner": "^10.0.1",
-    "re2js": "2.8.6"
+    "re2js": "2.8.6",
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

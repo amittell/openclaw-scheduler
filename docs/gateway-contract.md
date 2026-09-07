@@ -147,6 +147,12 @@ The scheduler reads `data.choices[0].message.content` and `data.usage`.
   descriptive timeout message (see "Activity Timeout" below).
 
 **Timeout behavior**:
+- Chat completions retain the complete JSON response. Both callers override
+  Undici's default 300-second headers and body-idle limits per request; their
+  existing abort signals own the lifetime of the request and response body.
+  A quiet agent turn may exceed five minutes when its configured deadline
+  permits it. The current global dispatcher's connection/proxy policy is
+  preserved, and other Gateway requests retain their transport limits.
 - `runAgentTurn`: Hard wall-clock abort via `AbortController` at `timeoutMs`
   (default 300000ms / 5 min).
 - `runAgentTurnWithActivityTimeout`: Two-tier timeout -- see "Activity Timeout
