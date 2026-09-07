@@ -505,16 +505,20 @@ test('agent strategy forwards materialized env and does not selection-retry comp
 function selectionStrategyFixture({ job = {}, rejectPrimary = false, uncertainPrimary = false, failHttp = false, sessions = [], signal } = {}) {
   const preparations = [];
   const turns = [];
+  const profileLookups = [];
   const deps = makeAgentStrategyDeps(async opts => {
     turns.push(opts);
     if (failHttp && turns.length === 1) throw new Error('fixture primary turn failed');
     return { content: 'fixture completed', usage: { total_tokens: 1 } };
   });
-  deps.listSessions = async () => ({ sessions });
-  deps.prepareAgentSelection = (key, overrides, agentId, options) => gateway.prepareAgentSelection(key, overrides, agentId, {
+  const rpcOptions = options => ({
     ...options, openclawCommand: '/owned/fixture/openclaw', gatewayToken: 'literal-fixture-token',
     execFile(_command, args, _options, callback) {
       const params = JSON.parse(args[args.indexOf('--params') + 1]);
+      if (args[2] === 'sessions.describe') {
+        profileLookups.push(params);
+        return callback(null, JSON.stringify({ session: sessions.find(row => row.key === params.key) || null }));
+      }
       preparations.push(params);
       if (uncertainPrimary && preparations.length === 1) return callback(new Error('fixture timeout'), '{}');
       if (rejectPrimary && preparations.length === 1) return callback({ code: 1, signal: null, killed: false }, JSON.stringify({ ok: false, error: { type: 'gateway_request_error', code: 'INVALID_REQUEST', message: 'fixture rejection' } }));
@@ -527,12 +531,14 @@ function selectionStrategyFixture({ job = {}, rejectPrimary = false, uncertainPr
       } }));
     },
   });
+  deps.prepareAgentSelection = (key, overrides, agentId, options) => gateway.prepareAgentSelection(key, overrides, agentId, rpcOptions(options));
+  deps.resolveMainSessionAuthProfile = (agentId, options) => gateway.resolveMainSessionAuthProfile(agentId, rpcOptions(options));
   const input = { id: 'selection-fixture', name: 'selection fixture', agent_id: 'main',
     payload_model: 'vendor/primary', auth_profile: 'vendor:primary',
     payload_model_fallback: 'vendor/fallback', auth_profile_fallback: 'vendor:fallback',
     payload_timeout_seconds: 120, run_timeout_ms: 2000, delivery_mode: 'none', ...job };
   const run = () => executeAgent(input, { run: { id: 'selection-fixture-run' }, v02Outcomes: {}, abortSignal: signal }, deps);
-  return { run, preparations, turns, deps };
+  return { run, preparations, turns, profileLookups, deps };
 }
 
 test('definite preparation rejection permits one separately prepared fallback and no primary HTTP', async () => {
@@ -580,6 +586,71 @@ test('inherit chooses only the exact same-agent main key and resolution failure 
   await missing.run();
   assert.equal(missing.preparations.length, 1);
   assert.equal(missing.preparations[0].model, 'vendor/fallback@vendor:fallback');
+});
+
+test('inherit retains an idle same-agent main profile for primary and fallback selections', async () => {
+  const now = Date.now();
+  const sessions = [
+    { key: 'agent:main:main', authProfileOverride: 'vendor:other-agent', updatedAt: now },
+    { key: 'agent:ops:scheduler:neighbor', authProfileOverride: 'vendor:neighbor', updatedAt: now },
+    ...Array.from({ length: 101 }, (_, index) => ({
+      key: `agent:ops:thread:${index}`, authProfileOverride: 'vendor:neighbor', updatedAt: now,
+    })),
+    { key: 'agent:ops:main', authProfileOverride: 'vendor:overnight', updatedAt: now - 12 * 60 * 60_000 },
+  ];
+  const primary = selectionStrategyFixture({ sessions, job: {
+    agent_id: 'ops', auth_profile: 'inherit', payload_model_fallback: null, auth_profile_fallback: null,
+  } });
+  assert.equal((await primary.run()).status, 'ok');
+  assert.deepEqual(primary.profileLookups, [{ key: 'agent:ops:main' }]);
+  assert.equal(primary.preparations.length, 1);
+  assert.equal(primary.preparations[0].agentId, 'ops');
+  assert.equal(primary.preparations[0].model, 'vendor/primary@vendor:overnight');
+  assert.equal(primary.turns.length, 1);
+  assert.equal(primary.turns[0].model, 'vendor/primary');
+
+  const fallback = selectionStrategyFixture({ sessions, failHttp: true, job: {
+    agent_id: 'ops', auth_profile_fallback: 'inherit',
+  } });
+  assert.equal((await fallback.run()).status, 'ok');
+  assert.deepEqual(fallback.profileLookups, [{ key: 'agent:ops:main' }]);
+  assert.deepEqual(fallback.preparations.map(row => row.model), [
+    'vendor/primary@vendor:primary', 'vendor/fallback@vendor:overnight',
+  ]);
+  assert.equal(fallback.turns.length, 2);
+});
+
+test('inherit fails closed when session metadata omits the persisted profile', async () => {
+  // Older Gateways omit this field; never substitute another session's pin.
+  const f = selectionStrategyFixture({ job: {
+    auth_profile: 'inherit', payload_model_fallback: null, auth_profile_fallback: null,
+  }, sessions: [{ key: 'agent:main:main', updatedAt: Date.now() - 12 * 60 * 60_000 }] });
+  await assert.rejects(f.run(), /Cannot resolve inherit from the same agent main session/);
+  assert.equal(f.preparations.length, 0);
+  assert.equal(f.turns.length, 0);
+});
+
+test('failed inherited metadata can use explicit fallback, but cancelled lookup stops dispatch', async () => {
+  const failed = selectionStrategyFixture({ job: { auth_profile: 'inherit' } });
+  failed.deps.resolveMainSessionAuthProfile = async () => {
+    throw new gateway.GatewayPreparationError('fixture lookup failed', { code: 'GATEWAY_PROFILE_LOOKUP_FAILED' });
+  };
+  assert.equal((await failed.run()).status, 'ok');
+  assert.equal(failed.preparations.length, 1);
+  assert.equal(failed.preparations[0].model, 'vendor/fallback@vendor:fallback');
+  assert.equal(failed.turns.length, 1);
+
+  const controller = new AbortController();
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const cancelled = selectionStrategyFixture({ job: { auth_profile: 'inherit' }, signal: controller.signal });
+  cancelled.deps.resolveMainSessionAuthProfile = () => { started(); return new Promise(() => {}); };
+  const running = cancelled.run();
+  await ready;
+  controller.abort();
+  await assert.rejects(running, error => error.code === 'ABORT_ERR');
+  assert.equal(cancelled.preparations.length, 0);
+  assert.equal(cancelled.turns.length, 0);
 });
 
 test('cancellation, expired deadlines and identical fallback never produce an extra attempt', async () => {

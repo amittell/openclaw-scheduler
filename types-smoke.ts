@@ -260,6 +260,74 @@ async function _gatewaySmoke() {
 }
 void _gatewaySmoke;
 
+// A consumer prepares the selection before passing only the model to a turn.
+async function _gatewayPreparationSmoke() {
+  const selection = gateway.normalizeAgentSelection({
+    modelRef: 'vendor/model', authProfile: 'vendor:work',
+  }, 'main');
+  const identity: string = selection.identity;
+  const selectedModel: string | undefined = selection.model;
+  const selectedProfile: string | undefined = selection.authProfile;
+  void identity; void selectedModel; void selectedProfile;
+
+  const prepared = await gateway.prepareAgentSelection('scheduler:fixture', {
+    modelRef: 'vendor/model', authProfile: 'vendor:work',
+  }, 'main', {
+    signal: new AbortController().signal,
+    timeout: 5000,
+    openclawCommand: '/fixture/bin/openclaw',
+    gatewayToken: 'fixture-token',
+    env: { HOME: '/fixture/home' },
+    execFile(_command, _args, options, callback) {
+      const encoding: 'utf8' = options.encoding;
+      void encoding;
+      callback(null, '{}');
+    },
+  });
+  if (prepared.applied) {
+    const model: string = prepared.model;
+    const authProfile: string = prepared.authProfile;
+    void model; void authProfile;
+  } else {
+    const model: string | undefined = prepared.model;
+    void model;
+    // @ts-expect-error A no-op does not claim to have applied a profile.
+    void prepared.authProfile;
+  }
+  await gateway.runAgentTurn({ message: 'hi', model: prepared.model });
+  await gateway.runAgentTurnWithActivityTimeout({ message: 'hi', model: prepared.model });
+  await gateway.runIsolatedAgentTurn({ message: 'hi', model: prepared.model });
+  await gateway.prepareAgentSelection('scheduler:fixture');
+  const inheritedProfile: string = await gateway.resolveMainSessionAuthProfile('main', { timeout: 5000, signal: null });
+  void inheritedProfile;
+  // @ts-expect-error The read boundary accepts an agent owner, not arbitrary query options.
+  await gateway.resolveMainSessionAuthProfile({ activeMinutes: 120 });
+  gateway.normalizeAgentSelection({ modelRef: null, authProfile: null });
+
+  const failure = new gateway.GatewayPreparationError('outcome unknown', {
+    code: 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true, cause: new Error('timeout'),
+  });
+  const caught: unknown = failure;
+  if (caught instanceof gateway.GatewayPreparationError) {
+    const code: string = caught.code;
+    const uncertain: boolean = caught.uncertain;
+    const cause: unknown = caught.cause;
+    void code; void uncertain; void cause;
+  }
+
+  // @ts-expect-error Profile selection belongs to preparation, not the low-level runner.
+  await gateway.runAgentTurn({ message: 'hi', authProfile: 'vendor:work' });
+  // @ts-expect-error The activity-timeout runner also rejects direct profile selection.
+  await gateway.runAgentTurnWithActivityTimeout({ message: 'hi', authProfile: 'vendor:work' });
+  // @ts-expect-error The isolated alias has the same profile-free turn contract.
+  await gateway.runIsolatedAgentTurn({ message: 'hi', authProfile: 'vendor:work' });
+  // @ts-expect-error Override values must be strings or null, never booleans.
+  gateway.normalizeAgentSelection({ authProfile: true });
+  // @ts-expect-error Uncertainty is a boolean, not a status string.
+  new gateway.GatewayPreparationError('failed', { uncertain: 'unknown' });
+}
+void _gatewayPreparationSmoke;
+
 // ---- paths ----
 const home: string = paths.resolveSchedulerHome();
 const dbPath: string = paths.resolveSchedulerDbPath({ explicitPath: ':memory:' });

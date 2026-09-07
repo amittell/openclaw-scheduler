@@ -17,6 +17,16 @@ export class GatewayPreparationError extends Error {
  * The current CLI requests operator.write for {key, agentId, model} sessions.patch.
  */
 export async function callGatewayPreparation(params, opts = {}) {
+  return callBoundSessionRpc('sessions.patch', params, opts);
+}
+
+/** Read one session's metadata without listing, activity filters or session mutation. */
+export async function callGatewaySessionMetadata(params, opts = {}) {
+  return callBoundSessionRpc('sessions.describe', params, opts);
+}
+
+async function callBoundSessionRpc(method, params, opts) {
+  const preparing = method === 'sessions.patch';
   const { openclawCommand, gatewayUrl, gatewayToken, signal } = opts;
   const timeout = opts.timeout ?? 10_000;
   if (signal?.aborted) {
@@ -26,9 +36,12 @@ export async function callGatewayPreparation(params, opts = {}) {
       || !Number.isFinite(timeout) || timeout <= 0) {
     throw new GatewayPreparationError('Profile preparation requires an absolute OPENCLAW_CLI_PATH, Gateway authentication and a positive deadline');
   }
-  if (!params || Object.keys(params).sort().join(',') !== 'agentId,key,model'
-      || !['agentId', 'key', 'model'].every(key => typeof params[key] === 'string' && params[key].trim())) {
-    throw new GatewayPreparationError('Preparation accepts only the write-scoped key, agentId and model fields');
+  const fields = preparing ? ['agentId', 'key', 'model'] : ['key'];
+  if (!params || Object.keys(params).sort().join(',') !== fields.join(',')
+      || !fields.every(key => typeof params[key] === 'string' && params[key].trim())) {
+    throw new GatewayPreparationError(preparing
+      ? 'Preparation accepts only the write-scoped key, agentId and model fields'
+      : 'Session metadata lookup accepts only an exact key');
   }
   let url;
   try {
@@ -38,7 +51,7 @@ export async function callGatewayPreparation(params, opts = {}) {
   } catch {
     throw new GatewayPreparationError('Profile preparation requires a valid bound Gateway HTTP URL');
   }
-  const args = ['gateway', 'call', 'sessions.patch', '--json', '--params', JSON.stringify(params),
+  const args = ['gateway', 'call', method, '--json', '--params', JSON.stringify(params),
     '--timeout', String(Math.ceil(timeout))];
   const childEnv = { ...(opts.env || process.env),
     OPENCLAW_GATEWAY_URL: url.href, OPENCLAW_GATEWAY_TOKEN: gatewayToken };
@@ -64,11 +77,12 @@ export async function callGatewayPreparation(params, opts = {}) {
         reject(new GatewayPreparationError('Gateway rejected session profile preparation'));
         return;
       }
-      // Nonzero success-looking output, interrupted processes and other errors are uncertain.
+      // Only patch can leave an uncertain mutation; a failed describe is safe to fall back from.
       // Never copy raw CLI diagnostics into run logs.
       if (error || signal?.aborted || !response || response.ok === false) {
         reject(new GatewayPreparationError('Gateway preparation did not return a definite outcome', {
-          code: signal?.aborted ? 'ABORT_ERR' : 'GATEWAY_PREPARATION_UNKNOWN', uncertain: true,
+          code: signal?.aborted ? 'ABORT_ERR' : preparing ? 'GATEWAY_PREPARATION_UNKNOWN' : 'GATEWAY_PROFILE_LOOKUP_FAILED',
+          uncertain: preparing,
         }));
         return;
       }

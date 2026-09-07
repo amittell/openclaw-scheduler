@@ -105,7 +105,7 @@ if (setupOptions.help) {
 }
 
 const platform = process.platform;
-const openclawCliPath = platform === 'darwin' ? configuredOpenClawCliPath() : '';
+const openclawCliPath = ['darwin', 'linux'].includes(platform) ? configuredOpenClawCliPath() : '';
 const isWSL = platform === 'linux' && Boolean(
   process.env.WSL_DISTRO_NAME
   || process.env.WSL_INTEROP
@@ -497,7 +497,10 @@ if (platform === 'darwin') {
 
     if (macServiceSummary && macServiceSummary !== service) {
       // User declined new service and kept existing one -- skip install block
-      hardenExistingServiceFile(macServiceSummary);
+      await configureExistingLaunchdService({
+        service: macServiceSummary, openclawCliPath, confirm, hardenExistingServiceFile,
+        runSetupCommand, ok, skip, warn, print,
+      });
     } else if (macServiceSummary && fs.existsSync(service.plistPath)) {
       await configureExistingLaunchdService({
         service, openclawCliPath, confirm, hardenExistingServiceFile,
@@ -616,6 +619,7 @@ if (platform === 'darwin') {
           indexPath,
           gatewayUrl,
           gatewayToken,
+          openclawCliPath,
           schedulerDbPath,
           logPath,
         });

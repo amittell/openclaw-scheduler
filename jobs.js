@@ -9,6 +9,7 @@ import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
 import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
+import { normalizeAgentSelection } from './agent-selection.js';
 import {
   assertValidHandoffArtifact,
   getHandoffArtifact,
@@ -338,6 +339,32 @@ function validateTriggerConditionSyntax(condition) {
   }
   // Unknown prefix -- reject early rather than silently falling back to substring match
   throw new Error('trigger_condition must start with "contains:" or "regex:"');
+}
+
+function validateAgentJobSelections(job) {
+  if ((job.session_target || 'isolated') !== 'isolated' || job.job_type === 'watchdog') return;
+  const primary = { modelRef: job.payload_model || undefined, authProfile: job.auth_profile || undefined };
+  const selections = [['primary', primary]];
+  if (job.payload_model_fallback != null || job.auth_profile_fallback != null) {
+    selections.push(['fallback', {
+      modelRef: job.payload_model_fallback || primary.modelRef,
+      authProfile: job.auth_profile_fallback != null ? job.auth_profile_fallback || undefined : primary.authProfile,
+    }]);
+  }
+  for (const [name, selection] of selections) {
+    try {
+      if (selection.authProfile === 'inherit') {
+        // The actual profile is resolved at dispatch. Check its required model
+        // shape now, preserving any explicit suffix and never looking up state.
+        const effective = normalizeAgentSelection({ modelRef: selection.modelRef }, job.agent_id ?? 'main');
+        normalizeAgentSelection({ modelRef: effective.model, authProfile: effective.authProfile || 'inherited-profile' }, job.agent_id ?? 'main');
+      } else {
+        normalizeAgentSelection(selection, job.agent_id ?? 'main');
+      }
+    } catch (error) {
+      throw new Error(`${name} model/profile selection is invalid: ${error.message}`, { cause: error });
+    }
+  }
 }
 
 export function validateJobSpec(opts, currentJob = null, mode = 'create') {
@@ -714,6 +741,12 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
       }
       assertSafeString('auth_profile_fallback', merged.auth_profile_fallback, { allowEmpty: false, maxLength: 256 });
     }
+  }
+
+  if (mode === 'create' || normalized.enabled || [
+    'session_target', 'job_type', 'agent_id', 'payload_model', 'payload_model_fallback', 'auth_profile', 'auth_profile_fallback',
+  ].some(key => key in normalized)) {
+    validateAgentJobSelections(merged);
   }
 
   // Origin tracking (v20): required on creation for root (non-child) jobs.

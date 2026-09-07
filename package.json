@@ -83,6 +83,7 @@
     "eslint.config.js",
     "tsconfig.json",
     "types-smoke.ts",
+    "agent-selection.js",
     "agents.js",
     "approval.js",
     "approval-binding.js",

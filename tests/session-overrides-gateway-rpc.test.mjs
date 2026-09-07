@@ -3,8 +3,8 @@ import test from 'node:test';
 import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { prepareAgentSelection, GatewayPreparationError } from '../gateway.js';
-import { callGatewayPreparation } from '../dispatch/gateway-rpc.mjs';
+import { prepareAgentSelection, resolveMainSessionAuthProfile, GatewayPreparationError } from '../gateway.js';
+import { callGatewayPreparation, callGatewaySessionMetadata } from '../dispatch/gateway-rpc.mjs';
 
 const key = 'agent:main:scheduler:fixture';
 const selection = { modelRef: 'vendor/model', authProfile: 'vendor:work' };
@@ -19,6 +19,58 @@ function fixture(response = receipt(), processError = null) {
       callback(processError, typeof response === 'string' ? response : JSON.stringify(response));
     } } };
 }
+
+test('main profile read binds exact owner key and rejects missing or wrong-target metadata', async () => {
+  const main = 'agent:ops:main';
+  const f = fixture({ session: { key: main, authProfileOverride: 'vendor:overnight', updatedAt: 1 } });
+  assert.equal(await resolveMainSessionAuthProfile('ops', { ...f.options, signal: null }), 'vendor:overnight');
+  assert.deepEqual(f.calls[0].args.slice(0, 3), ['gateway', 'call', 'sessions.describe']);
+  assert.deepEqual(JSON.parse(f.calls[0].args[5]), { key: main });
+  assert.equal(f.calls[0].options.env.OPENCLAW_GATEWAY_TOKEN, 'fixture-token');
+  assert(!f.calls[0].args.join(' ').includes('fixture-token'));
+  for (const session of [null, { key: main }, { key: main, authProfileOverride: 'inherit' },
+    { key: main, authProfileOverride: ' ' }, { key: main, authProfileOverride: 42 },
+    { key: 'agent:other:main', authProfileOverride: 'vendor:other' }]) {
+    await assert.rejects(resolveMainSessionAuthProfile('ops', fixture({ session }).options), error => !error.uncertain);
+  }
+  await assert.rejects(resolveMainSessionAuthProfile('../other', f.options));
+  assert.equal(f.calls.length, 1);
+});
+
+test('metadata read failures never claim uncertain mutation and cannot carry write fields', async () => {
+  const params = { key: 'agent:ops:main' };
+  for (const response of ['not json', { ok: false, error: { code: 'UNAVAILABLE' } }]) {
+    await assert.rejects(resolveMainSessionAuthProfile('ops', fixture(response).options),
+      error => error.code === 'GATEWAY_PROFILE_LOOKUP_FAILED' && !error.uncertain);
+  }
+  const f = fixture({ session: null });
+  await assert.rejects(callGatewaySessionMetadata({ ...params, model: 'vendor/model' }, {
+    ...f.options, gatewayUrl: 'http://127.0.0.1:1',
+  }), error => !error.uncertain);
+  assert.equal(f.calls.length, 0);
+});
+
+test('actual owned metadata subprocess reads one key and cancels without mutation uncertainty', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scheduler-metadata-control-'));
+  const executable = join(dir, 'literal CLI;fixture.cjs');
+  const options = { openclawCommand: executable, gatewayToken: 'literal-fixture-token', timeout: 2000,
+    env: { PATH: '/usr/bin:/bin', TMPDIR: tmpdir() } };
+  const program = body => { writeFileSync(executable, `#!${process.execPath}\n${body}\n`); chmodSync(executable, 0o700); };
+  try {
+    program(`const params = JSON.parse(process.argv[process.argv.indexOf('--params') + 1]);
+if (process.argv[4] !== 'sessions.describe' || Object.keys(params).join() !== 'key' || params.key !== 'agent:ops:main') process.exit(2);
+console.log(JSON.stringify({ session: { key: params.key, authProfileOverride: 'vendor:overnight' } }));`);
+    assert.equal(await resolveMainSessionAuthProfile('ops', options), 'vendor:overnight');
+    program('setTimeout(() => {}, 30000);');
+    await assert.rejects(resolveMainSessionAuthProfile('ops', { ...options, timeout: 50 }), error => !error.uncertain);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 100);
+    try {
+      await assert.rejects(resolveMainSessionAuthProfile('ops', { ...options, signal: controller.signal }),
+        error => error.code === 'ABORT_ERR' && !error.uncertain);
+    } finally { clearTimeout(timer); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('model-only/default preparation performs no RPC; explicit route remains a route', async () => {
   const f = fixture();

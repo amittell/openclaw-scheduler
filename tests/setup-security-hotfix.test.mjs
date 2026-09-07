@@ -429,3 +429,84 @@ test('actual existing-service setup branch updates only after an explicit config
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('systemd persists only the validated explicit CLI path and preserves every other unit byte', () => {
+  const values = {
+    workingDirectory: '/fixture/work', nodePath: '/fixture/node', indexPath: '/fixture/dispatcher.js',
+    gatewayUrl: 'http://fixture.invalid', gatewayToken: 'fixture-secret-sentinel',
+    schedulerDbPath: '/fixture/scheduler.db', logPath: '/fixture/log',
+  };
+  const original = renderSystemdUserService(values);
+  assert.equal(renderSystemdUserService({ ...values, openclawCliPath: '' }), original);
+  const configured = renderSystemdUserService({ ...values, openclawCliPath: METACHAR_VALUE });
+  const cliLines = configured.split('\n').filter(line => line.startsWith('Environment="OPENCLAW_CLI_PATH='));
+  assert.equal(cliLines.length, 1);
+  assert.equal(decodeSystemdQuotedItem(cliLines[0].slice('Environment='.length)), `OPENCLAW_CLI_PATH=${METACHAR_VALUE}`);
+  assert.equal(configured.replace(`${cliLines[0]}\n`, ''), original);
+  for (const value of ['openclaw', './openclaw', '~/openclaw', '/fixture/cli\nother', '/fixture/cli\0other', 42]) {
+    assert.throws(() => renderSystemdUserService({ ...values, openclawCliPath: value }), /absolute|control character|string/);
+  }
+  const source = readFileSync(new URL('../setup.mjs', import.meta.url), 'utf8');
+  assert.match(source, /const openclawCliPath = \['darwin', 'linux'\]\.includes\(platform\) \? configuredOpenClawCliPath\(\) : '';/u);
+  const systemdCall = source.match(/const unit = renderSystemdUserService\(\{([\s\S]*?)\n\s*\}\);/u)?.[1];
+  assert.ok(systemdCall, 'the actual Linux installer uses the tested renderer');
+  assert.match(systemdCall, /^\s+openclawCliPath,$/mu);
+});
+
+test('retained macOS services receive their own confirmed CLI update without touching the selected service', {
+  skip: process.platform !== 'darwin',
+}, async () => {
+  // Inspect wiring without evaluating setup source, then call its actual inert updater.
+  const source = readFileSync(new URL('../setup.mjs', import.meta.url), 'utf8');
+  const branch = source.match(/if \(macServiceSummary && macServiceSummary !== service\) \{([\s\S]*?)\n {4}\} else if/u)?.[1];
+  assert.ok(branch, 'the user can retain a different service after declining a duplicate');
+  assert.match(branch, /await configureExistingLaunchdService\(\{\s*service: macServiceSummary,/u);
+  const directory = mkdtempSync(join(tmpdir(), 'setup-cli-retained-'));
+  try {
+    for (const mode of ['agent', 'daemon']) for (const approve of [true, false]) {
+      const file = join(directory, `${mode}.plist`);
+      const selectedPath = join(directory, `uninstalled-${mode === 'agent' ? 'daemon' : 'agent'}.plist`);
+      const retained = { mode, title: mode === 'agent' ? 'LaunchAgent' : 'LaunchDaemon',
+        plistPath: file, domain: mode === 'agent' ? 'gui/501' : 'system', label: `fixture.retained-${mode}` };
+      writeFileSync(file, `<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>OPENCLAW_CLI_PATH</key><string>/fixture/old-cli</string><key>KEEP</key><string>fixture-secret-sentinel</string>
+</dict><key>KeepAlive</key><true/></dict></plist>`, { mode: 0o600 });
+      const before = canonicalPlist(file), beforeBytes = readFileSync(file);
+      const output = [], events = [];
+      await configureExistingLaunchdService({
+        service: retained, openclawCliPath: METACHAR_VALUE,
+        confirm: async prompt => { assert.ok(prompt.includes(retained.title)); events.push('confirm'); return approve; },
+        hardenExistingServiceFile: service => { assert.equal(service, retained); events.push('harden'); },
+        ok: text => output.push(text), skip: text => output.push(text), warn: text => output.push(text), print: text => output.push(text),
+        runSetupCommand: createSetupCommandRunner((command, args, options) => {
+          if (mode === 'daemon') {
+            assert.equal(command, MACOS_SUDO_PATH);
+            assert.deepEqual(args.slice(0, 2), ['--', MACOS_PLUTIL_PATH]);
+            args = args.slice(2); // Execute only plutil on the owned fixture, never sudo.
+          } else assert.equal(command, MACOS_PLUTIL_PATH);
+          assert.equal(args.at(-1), file);
+          assert.equal(options.shell, false);
+          events.push('plutil');
+          return execFileSync(MACOS_PLUTIL_PATH, args, options);
+        }),
+      });
+      assert.deepEqual(events, approve ? ['harden', 'confirm', 'plutil', 'plutil'] : ['harden', 'confirm']);
+      assert.equal(plistCommand(['-extract', 'EnvironmentVariables.OPENCLAW_CLI_PATH', 'raw', '-n', '--', file]), approve ? METACHAR_VALUE : '/fixture/old-cli');
+      assert.equal(withoutCliNode(canonicalPlist(file)), withoutCliNode(before));
+      assert.equal(statSync(file).mode & 0o777, 0o600);
+      assert.throws(() => statSync(selectedPath), { code: 'ENOENT' });
+      assert.ok(output.every(text => !text.includes('fixture-secret-sentinel') && !text.includes(selectedPath)));
+      if (approve) {
+        assert.ok(output.some(text => text.includes('bootout') && text.includes(`${retained.domain}/${retained.label}`)));
+        assert.ok(output.some(text => text.includes('bootstrap') && text.includes(file)));
+        assert.ok(output.every(text => !text.includes('kickstart')));
+      } else {
+        assert.deepEqual(readFileSync(file), beforeBytes);
+        assert.ok(output.some(text => text.includes('kickstart') && text.includes(`${retained.domain}/${retained.label}`)));
+        assert.ok(output.every(text => !text.includes('bootstrap')));
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -3510,6 +3510,7 @@ console.log('\n-- Auth Profile --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test inherit profile',
     session_target: 'isolated',
+    payload_model: 'anthropic/primary',
     auth_profile: 'inherit',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms:   300_000, origin: 'system',
@@ -3522,6 +3523,7 @@ console.log('\n-- Auth Profile --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test specific profile',
     session_target: 'isolated',
+    payload_model: 'anthropic/primary',
     auth_profile: 'anthropic:gmail',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms:   300_000, origin: 'system',
@@ -3552,7 +3554,7 @@ console.log('\n-- Auth Profile --');
   assert(explicitNullJob.auth_profile === null, 'auth_profile explicit null stored as null');
 
   // Update job to set auth_profile
-  const updated = updateJob(nullJob.id, { auth_profile: 'openai:work' });
+  const updated = updateJob(nullJob.id, { payload_model: 'openai/primary', auth_profile: 'openai:work' });
   assert(updated.auth_profile === 'openai:work', 'auth_profile updated to openai:work');
 
   // Update job to clear auth_profile
@@ -3599,25 +3601,25 @@ console.log('\n-- Fallback Model/Auth Fields --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test fallback fields',
     session_target: 'isolated',
-    payload_model: 'gpt-5-mini',
-    payload_model_fallback: 'openclaw:main',
+    payload_model: 'anthropic/primary',
+    payload_model_fallback: 'openai/fallback',
     auth_profile: 'anthropic:gmail',
     auth_profile_fallback: 'openai:work',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000, origin: 'system',
   });
-  assert(fallbackJob.payload_model_fallback === 'openclaw:main', 'payload_model_fallback stored correctly');
+  assert(fallbackJob.payload_model_fallback === 'openai/fallback', 'payload_model_fallback stored correctly');
   assert(fallbackJob.auth_profile_fallback === 'openai:work', 'auth_profile_fallback stored correctly');
 
   const fetchedFallback = getJob(fallbackJob.id);
-  assert(fetchedFallback.payload_model_fallback === 'openclaw:main', 'getJob returns payload_model_fallback');
+  assert(fetchedFallback.payload_model_fallback === 'openai/fallback', 'getJob returns payload_model_fallback');
   assert(fetchedFallback.auth_profile_fallback === 'openai:work', 'getJob returns auth_profile_fallback');
 
   const updatedFallback = updateJob(fallbackJob.id, {
-    payload_model_fallback: 'gpt-4.1-mini',
+    payload_model_fallback: 'anthropic/backup',
     auth_profile_fallback: 'anthropic:backup',
   });
-  assert(updatedFallback.payload_model_fallback === 'gpt-4.1-mini', 'payload_model_fallback updates correctly');
+  assert(updatedFallback.payload_model_fallback === 'anthropic/backup', 'payload_model_fallback updates correctly');
   assert(updatedFallback.auth_profile_fallback === 'anthropic:backup', 'auth_profile_fallback updates correctly');
 
   const clearedFallback = updateJob(fallbackJob.id, {

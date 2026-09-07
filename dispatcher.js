@@ -58,7 +58,7 @@ import {
   runAgentTurnWithActivityTimeout, runIsolatedAgentTurn,
   sendSystemEvent, getAllSubAgentSessions, listSessions,
   deliverMessage, checkGatewayHealth, waitForGateway, resolveDeliveryAlias,
-  prepareAgentSelection,
+  prepareAgentSelection, resolveMainSessionAuthProfile,
   cancelAgentSession,
   isAgentCancellationConfirmed,
 } from './gateway.js';
@@ -659,7 +659,7 @@ function buildDispatchDeps(dispatcherFence = null) {
     updateContextSummary, releaseIdempotencyKey,
     matchesSentinel, detectTransientError,
     listSessions,
-    prepareAgentSelection,
+    prepareAgentSelection, resolveMainSessionAuthProfile,
     // Finalize
     storeRunArtifact,
     updateIdempotencyResultHash,

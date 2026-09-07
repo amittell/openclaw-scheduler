@@ -136,6 +136,7 @@ export function renderSystemdUserService({
   indexPath,
   gatewayUrl,
   gatewayToken = '',
+  openclawCliPath = '',
   schedulerDbPath,
   logPath,
 }) {
@@ -152,11 +153,15 @@ export function renderSystemdUserService({
     assertSafeServiceValue(value, name);
   }
   assertSafeServiceValue(gatewayToken, 'gatewayToken');
+  const cliPath = configuredOpenClawCliPath({ OPENCLAW_CLI_PATH: openclawCliPath });
 
   const environmentLines = [
     `Environment=${encodeSystemdEnvironmentAssignment('OPENCLAW_GATEWAY_URL', gatewayUrl)}`,
     ...(gatewayToken
       ? [`Environment=${encodeSystemdEnvironmentAssignment('OPENCLAW_GATEWAY_TOKEN', gatewayToken)}`]
+      : []),
+    ...(cliPath
+      ? [`Environment=${encodeSystemdEnvironmentAssignment('OPENCLAW_CLI_PATH', cliPath)}`]
       : []),
     `Environment=${encodeSystemdEnvironmentAssignment('SCHEDULER_DB', schedulerDbPath)}`,
   ];

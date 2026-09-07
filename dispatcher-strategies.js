@@ -2967,10 +2967,10 @@ async function resolveConfiguredAuthProfile(authProfile, deps, agentId, timeoutM
   let abort;
   try {
     const unavailable = () => new GatewayPreparationError('Cannot resolve inherit from the same agent main session');
-    const sessions = await Promise.race([
+    const profile = await Promise.race([
       Promise.resolve().then(() => {
         if (signal?.aborted) throw new GatewayPreparationError('Selection cancelled', { code: 'ABORT_ERR' });
-        return deps.listSessions({ kinds: ['main'], activeMinutes: 120, limit: 100 });
+        return deps.resolveMainSessionAuthProfile(agentId, { timeout: timeoutMs, signal });
       }),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(unavailable()), timeoutMs);
@@ -2979,9 +2979,6 @@ async function resolveConfiguredAuthProfile(authProfile, deps, agentId, timeoutM
         if (signal?.aborted) abort();
       }),
     ]);
-    const rows = sessions?.result?.details?.sessions || sessions?.result?.sessions || sessions?.sessions || sessions;
-    const main = Array.isArray(rows) ? rows.find(row => (row.key || row.sessionKey) === `agent:${agentId}:main`) : null;
-    const profile = main?.authProfileOverride;
     if (typeof profile !== 'string' || !profile.trim() || profile === 'inherit') throw unavailable();
     return profile.trim();
   } catch (error) {
