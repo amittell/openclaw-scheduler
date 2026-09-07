@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
@@ -41,7 +41,9 @@ test('fixture HOME remains authoritative after clearing inherited runtime paths'
 });
 
 test('every test-all phase isolates hook Git selectors and leaves the invoking repository untouched', t => {
-  const root = mkdtempSync(join(tmpdir(), 'scheduler-test-runner-'));
+  // Node resolves the copied runner's module URL, so its explicit sibling paths
+  // must refer to the same canonical root even when TMPDIR has a symlink alias.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'scheduler-test-runner-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const scheduler = join(root, 'scheduler');
   const agentcli = join(root, 'agentcli');
@@ -97,12 +99,12 @@ test('every test-all phase isolates hook Git selectors and leaves the invoking r
   // Model a Git hook, not this test worker: node:test suppresses nested --test.
   delete poisoned.NODE_TEST_CONTEXT;
   // This valid hook environment really selects the publisher, irrespective of cwd.
-  assert.equal(git(['rev-parse', '--absolute-git-dir'], poisoned), sentinelGit);
+  assert.equal(resolve(git(['rev-parse', '--absolute-git-dir'], poisoned)), realpathSync(sentinelGit));
   const probe = `
     import assert from 'node:assert/strict';
     import { spawnSync } from 'node:child_process';
-    import { mkdirSync, writeFileSync } from 'node:fs';
-    import { join } from 'node:path';
+    import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+    import { join, resolve } from 'node:path';
     const env = process.env;
     for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'SCHEDULER_HOME', 'OPENCLAW_STATE_DIR', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_SCHEDULER_HOME', 'DISPATCH_STATE_DIR']) {
       assert.equal(env[key], undefined, key);
@@ -129,7 +131,7 @@ test('every test-all phase isolates hook Git selectors and leaves the invoking r
     git('config', 'user.email', 'mirror@example.invalid');
     git('commit', '--allow-empty', '-m', 'base');
     git('remote', 'add', 'origin', join(env.HOME, 'local.git'));
-    assert.equal(git('rev-parse', '--show-toplevel'), cwd);
+    assert.equal(resolve(git('rev-parse', '--show-toplevel')), realpathSync(cwd));
     writeFileSync(join(env.FIXTURE_TEST_EVIDENCE, phase + '.json'), JSON.stringify({ home: env.HOME }));
   `;
   const phases = [

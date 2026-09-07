@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
@@ -151,9 +151,13 @@ hookTest('failed atomic replacement preserves original and cleans same-directory
   assert.deepEqual(readFileSync(f.hook), before);
   assert.deepEqual(readFileSync(`${f.hook}.before-openclaw-scheduler`), before);
   const staging = readFileSync(join(f.base, 'staging-path'), 'utf8').trim();
-  assert.equal(dirname(staging), dirname(f.hook));
-  assert.equal(existsSync(staging), false);
-  assert.equal(readdirSync(dirname(f.hook)).some(p => p.startsWith('.pre-push.')), false);
+  const hooksDir = realpathSync(dirname(f.hook));
+  assert.equal(dirname(staging), hooksDir);
+  assert.match(basename(staging), /^\.pre-push\.[^/\\]+$/);
+  // Inspect only the owned directory; command output is comparison data, not a path to access.
+  const remaining = readdirSync(hooksDir);
+  assert.equal(remaining.includes(basename(staging)), false);
+  assert.equal(remaining.some(p => p.startsWith('.pre-push.')), false);
 });
 
 hookTest('clear coordination invokes both existing gate commands in order', t => {
