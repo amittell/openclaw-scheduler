@@ -262,3 +262,96 @@ export function formatPosixCommand(command, args = []) {
   const quote = (value, label) => `'${assertArgvString(value, label).replaceAll("'", `'"'"'`)}'`;
   return [quote(command, 'command'), ...args.map((arg, index) => quote(arg, `command arg ${index}`))].join(' ');
 }
+
+/** Render the setup plist without filesystem access or service execution. */
+export function renderLaunchdServicePlist({
+  service, serviceWorkingDirectory, nodePath, indexPath, homeDirectory,
+  envPath, gatewayUrl, schedulerDbPath, logPath, tokenXml, cliXml, userXml,
+}) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Comment</key>
+  <string>${encodeLaunchdPlistValue(service.comment, 'service comment')}</string>
+  <key>Label</key>
+  <string>${service.label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${encodeLaunchdPlistValue(nodePath, 'Node executable path')}</string>
+    <string>--no-warnings</string>
+    <string>${encodeLaunchdPlistValue(indexPath, 'dispatcher path')}</string>
+  </array>
+${userXml}  <key>WorkingDirectory</key>
+  <string>${encodeLaunchdPlistValue(serviceWorkingDirectory, 'service working directory')}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${encodeLaunchdPlistValue(homeDirectory, 'home directory')}</string>
+    <key>PATH</key>
+    <string>${encodeLaunchdPlistValue(envPath, 'service PATH')}</string>
+    <key>OPENCLAW_GATEWAY_URL</key>
+    <string>${encodeLaunchdPlistValue(gatewayUrl, 'gateway URL')}</string>
+    <key>SCHEDULER_DB</key>
+    <string>${encodeLaunchdPlistValue(schedulerDbPath, 'scheduler database path')}</string>
+${tokenXml}${cliXml}  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>${encodeLaunchdPlistValue(logPath, 'stdout log path')}</string>
+  <key>StandardErrorPath</key>
+  <string>${encodeLaunchdPlistValue(logPath, 'stderr log path')}</string>
+</dict>
+</plist>`;
+}
+
+/** Configure an existing plist and print reload guidance; never reload the service. */
+export async function configureExistingLaunchdService({
+  service, openclawCliPath, confirm, hardenExistingServiceFile,
+  runSetupCommand, ok, skip, warn, print,
+}) {
+  const updateExistingServiceCliPath = async (service) => {
+    if (!openclawCliPath || !await confirm(`Update ${service.title} OPENCLAW_CLI_PATH from installation configuration?`)) {
+      return false;
+    }
+    try {
+      const changed = updateLaunchdCliPath({
+        plistPath: service.plistPath,
+        cliPath: openclawCliPath,
+        runCommand: runSetupCommand,
+        asRoot: service.mode === 'daemon',
+      });
+      if (changed) ok(`${service.title} OPENCLAW_CLI_PATH updated; service has not been reloaded`);
+      else skip(`${service.title} OPENCLAW_CLI_PATH already matches`);
+      // Disk equality does not establish which environment launchd has loaded.
+      return true;
+    } catch (error) {
+      warn(`Could not configure ${service.title} OPENCLAW_CLI_PATH: ${error.message}`);
+      return false;
+    }
+  };
+
+  hardenExistingServiceFile(service);
+  const cliPathConfigured = await updateExistingServiceCliPath(service);
+  skip(`${service.title} already installed`);
+  print(`  Path: ${service.plistPath}`);
+  if (service.domain) {
+    const restartArgs = ['kickstart', '-k', `${service.domain}/${service.label}`];
+    const restartCommand = service.mode === 'daemon'
+      ? formatPosixCommand(MACOS_SUDO_PATH, ['--', MACOS_LAUNCHCTL_PATH, ...restartArgs])
+      : formatPosixCommand(MACOS_LAUNCHCTL_PATH, restartArgs);
+    if (cliPathConfigured) {
+      const prefix = service.mode === 'daemon' ? ['--', MACOS_LAUNCHCTL_PATH] : [];
+      const command = service.mode === 'daemon' ? MACOS_SUDO_PATH : MACOS_LAUNCHCTL_PATH;
+      print('  After holding callers and stopping active work, reload to read the new environment:');
+      print(`  ${formatPosixCommand(command, [...prefix, 'bootout', `${service.domain}/${service.label}`])}`);
+      print(`  ${formatPosixCommand(command, [...prefix, ...buildLaunchctlBootstrapArgs(service.domain, service.plistPath)])}`);
+    } else {
+      print(`  To restart: ${restartCommand}`);
+    }
+  }
+}
