@@ -311,7 +311,8 @@ export async function runAgentTurn(opts) {
       body: JSON.stringify({
         model: modelRoute.bodyModel,
         messages: [{ role: 'user', content: message }],
-        stream: false,
+        stream: true,
+        stream_options: { include_usage: true },
       }),
       signal: controller.signal,
     });
@@ -321,11 +322,50 @@ export async function runAgentTurn(opts) {
       throw new Error(`Chat completions failed (${resp.status}): ${text.slice(0, 500)}`);
     }
 
-    const data = await resp.json();
+    // SSE: stream:true so the gateway sends headers + deltas immediately
+    // instead of buffering the whole turn behind undici's 300s headersTimeout.
+    // Accumulate delta.content until stream end. Same result shape as before.
+    let content = '';
+    let usage = null;
+    let finishReason = null;
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = sseBuf.indexOf('\n')) !== -1) {
+        const line = sseBuf.slice(0, nl).replace(/\r$/, '');
+        sseBuf = sseBuf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        if (payload === '[DONE]') continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        if (obj.error) {
+          const emsg = typeof obj.error === 'string' ? obj.error : (obj.error.message || 'stream error');
+          throw new Error(`Chat completions stream error: ${String(emsg).slice(0, 500)}`);
+        }
+        if (obj.usage) usage = obj.usage;
+        const choice = obj.choices && obj.choices[0];
+        if (choice) {
+          if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+        }
+      }
+    }
+    const data = {
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }],
+      usage,
+    };
     return {
       ok: true,
-      content: data.choices?.[0]?.message?.content || '',
-      usage: data.usage,
+      content,
+      usage,
       sessionKey: resolveGatewayResponseSessionKey(resp, validatedSessionKey, validatedAgentId),
       raw: data,
     };
@@ -479,7 +519,8 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       body: JSON.stringify({
         model: modelRoute.bodyModel,
         messages: [{ role: 'user', content: message }],
-        stream: false,
+        stream: true,
+        stream_options: { include_usage: true },
       }),
       signal: controller.signal,
     });
@@ -489,11 +530,50 @@ export async function runAgentTurnWithActivityTimeout(opts) {
       throw new Error(`Chat completions failed (${resp.status}): ${text.slice(0, 500)}`);
     }
 
-    const data = await resp.json();
+    // SSE: stream:true so the gateway sends headers + deltas immediately
+    // instead of buffering the whole turn behind undici's 300s headersTimeout.
+    // Accumulate delta.content until stream end. Same result shape as before.
+    let content = '';
+    let usage = null;
+    let finishReason = null;
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = sseBuf.indexOf('\n')) !== -1) {
+        const line = sseBuf.slice(0, nl).replace(/\r$/, '');
+        sseBuf = sseBuf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        if (payload === '[DONE]') continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        if (obj.error) {
+          const emsg = typeof obj.error === 'string' ? obj.error : (obj.error.message || 'stream error');
+          throw new Error(`Chat completions stream error: ${String(emsg).slice(0, 500)}`);
+        }
+        if (obj.usage) usage = obj.usage;
+        const choice = obj.choices && obj.choices[0];
+        if (choice) {
+          if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+        }
+      }
+    }
+    const data = {
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }],
+      usage,
+    };
     return {
       ok: true,
-      content: data.choices?.[0]?.message?.content || '',
-      usage: data.usage,
+      content,
+      usage,
       sessionKey: resolveGatewayResponseSessionKey(resp, validatedSessionKey, validatedAgentId),
       raw: data,
     };

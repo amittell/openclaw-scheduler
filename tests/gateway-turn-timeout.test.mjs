@@ -79,10 +79,24 @@ const callers = [
 for (const [name, call] of callers) {
   for (const phase of ['headers', 'body']) {
     test(`${name}: job deadline owns a long wait for ${phase}`, async () => {
-      await withGateway((_req, res, later) => {
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('x-openclaw-session-key', sessionKey);
-        const payload = JSON.stringify(completion);
+      await withGateway((req, res, later) => {
+        // The /control probe keeps the original JSON shape so the short 50ms
+        // transport timers still fire exactly as before. The chat completions
+        // request streams SSE (stream: true contract): the same delayed
+        // delivery, but as data: frames instead of one buffered JSON body.
+        const isChat = req.url === '/v1/chat/completions';
+        res.setHeader('Content-Type', isChat ? 'text/event-stream' : 'application/json');
+        if (isChat) res.setHeader('x-openclaw-session-key', sessionKey);
+        const payload = isChat
+          ? 'data: ' + JSON.stringify({
+              choices: [{ index: 0, delta: { content: 'complete ' } }],
+            }) + '\n\n' +
+            'data: ' + JSON.stringify({
+              choices: [{ index: 0, delta: { content: 'response' }, finish_reason: 'stop' }],
+              usage: completion.usage,
+            }) + '\n\n' +
+            'data: [DONE]\n\n'
+          : JSON.stringify(completion);
         if (phase === 'body') res.write(payload.slice(0, 10));
         later(() => res.end(phase === 'body' ? payload.slice(10) : payload));
       }, async ({ gateway, url, requests }) => {
@@ -97,9 +111,13 @@ for (const [name, call] of callers) {
         assert.equal(result.content, 'complete response');
         assert.equal(result.sessionKey, sessionKey);
         assert.deepEqual(result.usage, completion.usage);
-        assert.deepEqual(result.raw, completion, 'all JSON completion metadata survives');
+        assert.equal(result.raw.object, 'chat.completion');
+        assert.equal(result.raw.choices[0].message.content, 'complete response');
+        assert.equal(result.raw.choices[0].finish_reason, 'stop');
+        assert.deepEqual(result.raw.usage, completion.usage, 'SSE usage frame survives');
         const request = requests.find(item => item.url === '/v1/chat/completions');
-        assert.equal(request.body.stream, false);
+        assert.equal(request.body.stream, true);
+        assert.deepEqual(request.body.stream_options, { include_usage: true });
         assert.equal(request.headers['x-openclaw-scopes'], 'operator.write');
         assert.equal(request.headers['x-openclaw-session-key'], sessionKey);
       });

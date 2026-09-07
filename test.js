@@ -3801,18 +3801,29 @@ console.log('\n-- Isolated dispatch primitive: no subprocess spawn --');
   }
   const fetchCalls = [];
   const originalFetch = globalThis.fetch;
+  // Chat completions now stream SSE (stream: true); the stub body must be a
+  // ReadableStream of data: events, not a .json() payload.
+  const sseBody = text => new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: text }, finish_reason: 'stop' }],
+        usage: { total_tokens: 7 },
+      })}\n\ndata: [DONE]\n\n`));
+      controller.close();
+    },
+  });
   globalThis.fetch = async (url, init) => {
     fetchCalls.push({ url: String(url), method: init?.method || 'GET' });
-    return {
-      ok: true,
+    if (String(url).includes('/v1/chat/completions')) {
+      return new Response(sseBody('isolated-ok'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }
+    return new Response(JSON.stringify({ result: { sessions: [] } }), {
       status: 200,
-      headers: { get: () => null },
-      json: async () => ({
-        choices: [{ message: { role: 'assistant', content: 'isolated-ok' } }],
-        usage: { total_tokens: 7 },
-      }),
-      text: async () => '',
-    };
+      headers: { 'content-type': 'application/json' },
+    });
   };
 
   let executionError = null;
@@ -13026,14 +13037,23 @@ console.log('\n-- Gateway scope header --');
   const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
   process.env.OPENCLAW_GATEWAY_TOKEN = 'test-gateway-token';
   const captured = [];
+  const sseCompletions = content => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }],
+        usage: { total_tokens: 1 },
+      })}\n\ndata: [DONE]\n\n`));
+      controller.close();
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   globalThis.fetch = async (url, opts = {}) => {
     captured.push({ url, opts });
+    if (String(url).includes('/v1/chat/completions')) {
+      return sseCompletions('ok');
+    }
     return {
       ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ok' } }],
-        usage: { total_tokens: 1 },
-      }),
+      json: async () => ({ result: { sessions: [] } }),
       headers: new Headers({ 'x-openclaw-session-key': 'session-from-gateway' }),
     };
   };
@@ -13104,13 +13124,17 @@ console.log('\n-- Activity monitor sessions_list args (no kinds filter) --');
         headers: new Headers({}),
       };
     }
-    // chat completions: delay so the poll timer fires while the turn is in flight
+    // chat completions: stream SSE and delay so the poll timer fires while the turn is in flight
     await new Promise((r) => setTimeout(r, 50));
-    return {
-      ok: true,
-      json: async () => ({ choices: [{ message: { content: 'ok' } }], usage: { total_tokens: 1 } }),
-      headers: new Headers({ 'x-openclaw-session-key': 'session-act' }),
-    };
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
+          usage: { total_tokens: 1 },
+        })}\n\ndata: [DONE]\n\n`));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream', 'x-openclaw-session-key': 'session-act' } });
   };
 
   try {
