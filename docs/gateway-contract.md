@@ -733,12 +733,18 @@ Concrete model forwarding remains through `x-openclaw-model`.
 
 ### "inherit"
 
-Each attempt resolves exactly `agent:<job.agent_id>:main` through the existing
-`sessions_list` tool, reading only `authProfileOverride`. A missing, unavailable
-or unresolved same-agent profile is a definite selection failure. Neither a
-main session owned by another agent nor a bare ambiguous main key is used, and
-the literal `inherit` is never sent as a profile ID. The lookup is bounded by
-the remaining run deadline and cancellation.
+Each attempt calls authenticated `sessions.describe` with only the exact
+`agent:<job.agent_id>:main` key and reads `session.authProfileOverride`.
+There is no session list, activity cutoff or result limit. The same reviewed
+absolute CLI path, bound Gateway URL/token, remaining run deadline and
+cancellation apply to this read. The Gateway must expose the persisted profile
+in its canonical session metadata; older responses that omit it fail closed.
+Neither another agent's main session nor a bare ambiguous main key is used, and
+the literal `inherit` is never sent as a profile ID. A missing, unavailable or
+unresolved profile is a definite selection failure and may use a valid
+configured fallback; cancellation or an expired run deadline stops dispatch.
+The paired Gateway projection must be published and installed before live
+inheritance validation; the scheduler source alone does not supply that support.
 
 ### Explicit profile with a concrete model
 
@@ -795,7 +801,8 @@ alias resolution remains the Gateway’s responsibility.
 | Primary outcome | Scheduler behavior |
 | --- | --- |
 | Definite local selection error or typed gateway_request_error INVALID_REQUEST/FORBIDDEN rejection on completed exit 0 or 1 | May validate/prepare one different configured fallback; primary HTTP is not sent. |
-| Process timeout/signal/other nonzero exit, transport failure, unclassified Gateway error, malformed or mismatched receipt | Mutation outcome is uncertain; no primary HTTP or fallback is launched. |
+| Read-only `sessions.describe` transport or metadata failure | Definite selection failure; may validate one different configured fallback unless cancelled or out of time. |
+| Mutating `sessions.patch` process timeout/signal/other nonzero exit, transport failure, unclassified Gateway error, malformed or mismatched receipt | Mutation outcome is uncertain; no primary HTTP or fallback is launched. |
 | Cancellation, expired deadline or Gateway capability failure | No extra attempt. |
 | Model-only HTTP failure | Existing distinct configured model fallback remains available without an added preparation RPC. |
 | Pin accepted, then HTTP failure | An explicitly prepared fallback pin can replace it. An omitted/clear profile fallback is refused because the interface cannot reliably clear the accepted pin. |
@@ -1090,6 +1097,7 @@ request headers.
 | `x-openclaw-session-key` | Header (req) | `gateway.js` | Session continuity |
 | `x-openclaw-session-key` | Header (resp) | `gateway.js` | Session key propagation |
 | `sessions.patch` | Bounded CLI RPC | `gateway.js` / `dispatch/gateway-rpc.mjs` | Explicit session-profile metadata preparation |
+| `sessions.describe` | Bounded authenticated CLI RPC | `gateway.js` / `dispatch/gateway-rpc.mjs` | Inherited profile metadata from the exact same-agent canonical main session |
 | `x-openclaw-env-inject` | Header | `gateway.js`, `gateway-capabilities.js` | Capability-gated task-scoped env materialization for isolated turns |
 | `~/.openclaw/agents/<agent>/agent/openclaw-agent.sqlite` | SQLite (read-only) | `dispatch/session-store.mjs` | Current session lifecycle and transcript state |
 | `~/.openclaw/agents/<agent>/sessions/` | Legacy file fallback | `dispatch/session-store.mjs` | Older `sessions.json` and JSONL session state |
