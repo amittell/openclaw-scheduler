@@ -5,6 +5,7 @@ import {
 } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
+import { getGlobalDispatcher } from 'undici';
 import { getDb } from './db.js';
 import { normalizeAgentSelection, splitModelOverride } from './agent-selection.js';
 export { normalizeAgentSelection } from './agent-selection.js';
@@ -40,6 +41,20 @@ const GATEWAY_BASE_URL = parseGatewayBaseUrl(
 const GATEWAY_URL = GATEWAY_BASE_URL.href;
 const gatewayEndpointUrl = endpoint => buildGatewayEndpointUrl(GATEWAY_BASE_URL, endpoint);
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+// Agent turns can be silent longer than Undici's five-minute headers/body
+// limits. Their existing absolute/activity/caller AbortControllers own the
+// deadline instead. Forward to the current dispatcher to preserve connection
+// and proxy policy; only chat-completion requests receive these overrides.
+const agentTurnDispatcher = {
+  dispatch(options, handler) {
+    return getGlobalDispatcher().dispatch({
+      ...options,
+      headersTimeout: 0,
+      bodyTimeout: 0,
+    }, handler);
+  },
+};
 
 // -- Isolated dispatch primitive contract --------------------
 //
@@ -284,6 +299,7 @@ export async function runAgentTurn(opts) {
     const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
       redirect: 'error',
+      dispatcher: agentTurnDispatcher,
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders('operator.write'),
@@ -451,6 +467,7 @@ export async function runAgentTurnWithActivityTimeout(opts) {
     const resp = await fetch(gatewayEndpointUrl('v1/chat/completions'), {
       method: 'POST',
       redirect: 'error',
+      dispatcher: agentTurnDispatcher,
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders('operator.write'),
