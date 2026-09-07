@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Stream agent turns over SSE instead of buffering one JSON completion.**
+  Isolated agent turns POSTed to `/v1/chat/completions` with `stream: false`;
+  the gateway buffered the entire multi-step turn behind the HTTP headers, so
+  any turn longer than undici's default 300s `headersTimeout` died with a
+  bare `fetch failed` and no detail (observed: a 302.9s run with 12+ model
+  calls, all HTTP 200). Both fetch sites (`runAgentTurn`,
+  `runAgentTurnWithActivityTimeout`) now send `stream: true` +
+  `stream_options.include_usage` and accumulate `delta.content` frames, with
+  in-band stream errors surfacing the upstream message instead of a transport
+  kill. The result shape (`ok`, `content`, `usage`, `sessionKey`, `raw`) is
+  unchanged; a gateway that answers with a buffered JSON body still parses
+  with the legacy mapping and the original completion object preserved in
+  `raw`. `docs/gateway-contract.md` is updated to the streaming contract.
+
+### Fixed
 ## [0.6.0] -- 2026-09-06
 
 ### Fixed

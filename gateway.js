@@ -56,6 +56,132 @@ const agentTurnDispatcher = {
   },
 };
 
+// A single SSE `data:` line that stays undrained above this means the body
+// is not an event stream (or a line is pathologically long); refuse to buffer
+// it indefinitely instead of growing without bound.
+const MAX_UNDRAINED_SSE_BUFFER = 8 * 1024 * 1024;
+
+/**
+ * Accumulate a streaming (SSE) chat completion body into the same logical
+ * completion object the non-streaming endpoint returns.
+ *
+ * Handles: frames split across network chunks (line buffering), a trailing
+ * `data:` frame with no final newline (decoder flush + residual line at
+ * stream end), CRLF/LF endings, `: keep-alive` comments and empty `data:`
+ * frames, `data: [DONE]`, in-band `{ error }` frames, tool-call deltas that
+ * carry no content, and multi-byte UTF-8 split across chunks (TextDecoder
+ * with stream: true).
+ *
+ * Returns `{ content, usage, data }` where `data` is the reconstructed
+ * completion object used as the result's `raw`.
+ */
+async function collectSseChatCompletion(resp) {
+  let content = '';
+  let usage = null;
+  let finishReason = null;
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuf = '';
+  const processLine = line => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return; }
+    if (obj.error) {
+      const emsg = typeof obj.error === 'string'
+        ? obj.error
+        : (obj.error.message || 'stream error');
+      throw new Error(`Chat completions stream error: ${String(emsg).slice(0, 500)}`);
+    }
+    if (obj.usage) usage = obj.usage;
+    const choice = obj.choices && obj.choices[0];
+    if (choice) {
+      if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = sseBuf.indexOf('\n')) !== -1) {
+        const line = sseBuf.slice(0, nl).replace(/\r$/, '');
+        sseBuf = sseBuf.slice(nl + 1);
+        processLine(line);
+      }
+      if (sseBuf.length > MAX_UNDRAINED_SSE_BUFFER) {
+        throw new Error(
+          'Chat completions SSE body exceeded an undrained single line; gateway returned a non-streaming payload',
+        );
+      }
+    }
+    // Stream ended: flush any trailing multi-byte character and parse a final
+    // `data:` frame the sender did not terminate with a newline.
+    sseBuf += decoder.decode();
+    if (sseBuf.trim()) processLine(sseBuf.replace(/\r$/, ''));
+  } finally {
+    // Return the socket to the pool cleanly: on in-band errors or deadline
+    // aborts the body may still be open, and an abandoned body holds the
+    // connection (and any gateway-side streaming state) until the socket dies.
+    try { await reader.cancel(); } catch { /* already closed/aborted */ }
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return {
+    content,
+    usage,
+    data: {
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }],
+      usage,
+    },
+  };
+}
+
+/**
+ * Parse a legacy buffered JSON chat completion (content-type is not
+ * text/event-stream). Keeps the original field mapping so a gateway that
+ * still answers stream requests with the complete JSON body behaves exactly
+ * as before: `raw` carries the original completion object (id, created,
+ * model, ...), and a missing content field still yields ''.
+ */
+async function parseJsonChatCompletion(resp) {
+  let data;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    throw new Error(
+      `Chat completions response was neither SSE nor JSON: ${String(err.message).slice(0, 200)}`,
+      { cause: err },
+    );
+  }
+  if (data && data.error) {
+    const emsg = typeof data.error === 'string'
+      ? data.error
+      : (data.error.message || 'gateway error');
+    throw new Error(`Chat completions failed: ${String(emsg).slice(0, 500)}`);
+  }
+  return {
+    content: data?.choices?.[0]?.message?.content || '',
+    usage: data?.usage ?? null,
+    data: data ?? null,
+  };
+}
+
+/**
+ * Read an OK chat completions response regardless of whether the gateway
+ * answered with an SSE stream or a buffered JSON completion. Same result
+ * shape for both: `{ content, usage, data }`.
+ */
+async function readChatCompletionResponse(resp) {
+  const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+  return contentType.includes('text/event-stream')
+    ? collectSseChatCompletion(resp)
+    : parseJsonChatCompletion(resp);
+}
+
 // -- Isolated dispatch primitive contract --------------------
 //
 // Cron jobs with session_target=isolated must reach the gateway via the
@@ -324,44 +450,9 @@ export async function runAgentTurn(opts) {
 
     // SSE: stream:true so the gateway sends headers + deltas immediately
     // instead of buffering the whole turn behind undici's 300s headersTimeout.
-    // Accumulate delta.content until stream end. Same result shape as before.
-    let content = '';
-    let usage = null;
-    let finishReason = null;
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let sseBuf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      sseBuf += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = sseBuf.indexOf('\n')) !== -1) {
-        const line = sseBuf.slice(0, nl).replace(/\r$/, '');
-        sseBuf = sseBuf.slice(nl + 1);
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        if (payload === '[DONE]') continue;
-        let obj;
-        try { obj = JSON.parse(payload); } catch { continue; }
-        if (obj.error) {
-          const emsg = typeof obj.error === 'string' ? obj.error : (obj.error.message || 'stream error');
-          throw new Error(`Chat completions stream error: ${String(emsg).slice(0, 500)}`);
-        }
-        if (obj.usage) usage = obj.usage;
-        const choice = obj.choices && obj.choices[0];
-        if (choice) {
-          if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
-          if (choice.finish_reason) finishReason = choice.finish_reason;
-        }
-      }
-    }
-    const data = {
-      object: 'chat.completion',
-      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }],
-      usage,
-    };
+    // readChatCompletionResponse falls back to legacy JSON parsing when the
+    // gateway answers with a buffered JSON body instead of an event stream.
+    const { content, usage, data } = await readChatCompletionResponse(resp);
     return {
       ok: true,
       content,
@@ -532,44 +623,9 @@ export async function runAgentTurnWithActivityTimeout(opts) {
 
     // SSE: stream:true so the gateway sends headers + deltas immediately
     // instead of buffering the whole turn behind undici's 300s headersTimeout.
-    // Accumulate delta.content until stream end. Same result shape as before.
-    let content = '';
-    let usage = null;
-    let finishReason = null;
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let sseBuf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      sseBuf += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = sseBuf.indexOf('\n')) !== -1) {
-        const line = sseBuf.slice(0, nl).replace(/\r$/, '');
-        sseBuf = sseBuf.slice(nl + 1);
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        if (payload === '[DONE]') continue;
-        let obj;
-        try { obj = JSON.parse(payload); } catch { continue; }
-        if (obj.error) {
-          const emsg = typeof obj.error === 'string' ? obj.error : (obj.error.message || 'stream error');
-          throw new Error(`Chat completions stream error: ${String(emsg).slice(0, 500)}`);
-        }
-        if (obj.usage) usage = obj.usage;
-        const choice = obj.choices && obj.choices[0];
-        if (choice) {
-          if (choice.delta && typeof choice.delta.content === 'string') content += choice.delta.content;
-          if (choice.finish_reason) finishReason = choice.finish_reason;
-        }
-      }
-    }
-    const data = {
-      object: 'chat.completion',
-      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }],
-      usage,
-    };
+    // readChatCompletionResponse falls back to legacy JSON parsing when the
+    // gateway answers with a buffered JSON body instead of an event stream.
+    const { content, usage, data } = await readChatCompletionResponse(resp);
     return {
       ok: true,
       content,

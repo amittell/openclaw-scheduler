@@ -257,3 +257,210 @@ test('activity-timeout runner also requests stream: true and assembles SSE conte
   assert.equal(result.usage.total_tokens, 3);
   assert.equal(result.raw.object, 'chat.completion');
 });
+
+// ---------------------------------------------------------------------------
+// Robustness regressions (adversarial review of #44):
+//
+// * trailing `data:` frame with no terminating newline must not be dropped
+// * multi-byte UTF-8 split across chunk boundaries must decode intact
+// * keep-alive comments and empty data: frames must be ignored
+// * a body whose content type is not text/event-stream falls back to the
+//   legacy JSON parsing (raw preserves the original completion object)
+// * an in-band JSON error object on a non-SSE body surfaces the upstream msg
+// * an SSE buffer that never drains (huge non-SSE body) must be refused,
+//   not buffered without bound
+// ---------------------------------------------------------------------------
+
+function replaceFetch(handlers) {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  process.env.OPENCLAW_GATEWAY_TOKEN = 'fixture-streaming-token';
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    for (const [match, handle] of Object.entries(handlers)) {
+      if (u.includes(match)) return handle(u, init);
+    }
+    if (u.includes('/tools/invoke')) {
+      return Response.json({ result: { sessions: [] } });
+    }
+    throw new Error(`mock fetch saw an unexpected URL: ${u}`);
+  };
+  return () => {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = previousToken;
+  };
+}
+
+test('trailing data frame without a final newline is not dropped', async () => {
+  // The final frame carries content AND finish_reason and ends with no
+  // terminating newline at stream end.
+  const frames = [
+    deltaFrame('final '),
+    sseFrame({ choices: [{ index: 0, delta: { content: 'line' }, finish_reason: 'stop' }], usage: { total_tokens: 3 } }).replace(/\n+$/, ''),
+  ];
+  const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
+    message: 'fixture no trailing newline',
+    agentId: 'main',
+    sessionKey: SESSION_KEY,
+    timeoutMs: 5_000,
+    cancelOnAbort: false,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.content, 'final line');
+  assert.equal(result.raw.choices[0].finish_reason, 'stop');
+  assert.equal(result.raw.usage.total_tokens, 3);
+});
+
+test('multi-byte UTF-8 split across chunk boundaries decodes intact', async () => {
+  const text = 'héllo → 世界 🌍';
+  const bytes = new TextEncoder().encode(deltaFrame(text));
+  // Split mid-codepoint: first half lands in chunk one, second in chunk two.
+  const cut = Math.floor(bytes.length / 2);
+  const restore = replaceFetch({
+    '/v1/chat/completions': () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, cut));
+        controller.enqueue(bytes.slice(cut));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+  });
+  try {
+    const result = await gateway.runAgentTurn({
+      message: 'fixture utf8 split',
+      agentId: 'main',
+      sessionKey: SESSION_KEY,
+      timeoutMs: 5_000,
+      cancelOnAbort: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.content, text);
+    assert.equal(result.raw.choices[0].message.content, text);
+  } finally {
+    restore();
+  }
+});
+
+test('keep-alive comments and empty data frames are ignored', async () => {
+  const frames = [
+    ': keep-alive\n\n',
+    'data:\n\n',
+    deltaFrame('alive '),
+    ': ping\n',
+    '\n',
+    deltaFrame('comment ignored'),
+    'data: [DONE]\n\n',
+  ];
+  const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
+    message: 'fixture keepalive',
+    agentId: 'main',
+    sessionKey: SESSION_KEY,
+    timeoutMs: 5_000,
+    cancelOnAbort: false,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.content, 'alive comment ignored');
+});
+
+test('non-SSE content type falls back to legacy JSON parsing and preserves raw', async () => {
+  const completion = {
+    id: 'chatcmpl-json-fallback',
+    object: 'chat.completion',
+    created: 1725740000,
+    model: 'openclaw:main',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: 'buffered reply' },
+      finish_reason: 'stop',
+    }],
+    usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+  };
+  const captured = [];
+  const restore = replaceFetch({
+    '/v1/chat/completions': (_u, init) => {
+      captured.push(JSON.parse(init.body));
+      return new Response(JSON.stringify(completion), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-openclaw-session-key': SESSION_KEY,
+        },
+      });
+    },
+  });
+  try {
+    const result = await gateway.runAgentTurn({
+      message: 'fixture json fallback',
+      agentId: 'main',
+      sessionKey: SESSION_KEY,
+      timeoutMs: 5_000,
+      cancelOnAbort: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.content, 'buffered reply');
+    assert.deepEqual(result.usage, completion.usage);
+    // Legacy path: raw is the ORIGINAL object (id/created/model survive).
+    assert.deepEqual(result.raw, completion);
+    assert.equal(result.raw.id, 'chatcmpl-json-fallback');
+    assert.equal(result.raw.model, 'openclaw:main');
+    assert.equal(result.sessionKey, SESSION_KEY);
+    assert.equal(captured[0].stream, true, 'request still asks for streaming');
+    assert.deepEqual(captured[0].stream_options, { include_usage: true });
+  } finally {
+    restore();
+  }
+});
+
+test('in-band JSON error object on a non-SSE body throws with the upstream message', async () => {
+  const restore = replaceFetch({
+    '/v1/chat/completions': () => new Response(JSON.stringify({
+      error: { message: 'rate limited upstream', type: 'api_error' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  });
+  try {
+    await assert.rejects(
+      gateway.runAgentTurn({
+        message: 'fixture json error',
+        agentId: 'main',
+        sessionKey: SESSION_KEY,
+        timeoutMs: 5_000,
+        cancelOnAbort: false,
+      }),
+      err => err instanceof Error && err.message.includes('rate limited upstream'),
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('an undrained non-SSE body in an SSE stream is refused, not buffered without bound', async () => {
+  // A single line far above the buffer cap with no newline: the gateway must
+  // have sent something that is not an event stream. Reject with a clear error
+  // instead of accumulating memory until the stream ends.
+  const restore = replaceFetch({
+    '/v1/chat/completions': () => {
+      const huge = 'data: ' + 'x'.repeat(16 * 1024 * 1024); // no trailing newline
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(huge));
+          controller.close();
+        },
+      }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  try {
+    await assert.rejects(
+      gateway.runAgentTurn({
+        message: 'fixture undrained',
+        agentId: 'main',
+        sessionKey: SESSION_KEY,
+        timeoutMs: 5_000,
+        cancelOnAbort: false,
+      }),
+      err => err instanceof Error && /exceeded an undrained single line/i.test(err.message),
+    );
+  } finally {
+    restore();
+  }
+});

@@ -88,7 +88,8 @@ single user message to an agent and receives the complete assistant response.
   "messages": [
     { "role": "user", "content": "<prompt text>" }
   ],
-  "stream": false
+  "stream": true,
+  "stream_options": { "include_usage": true }
 }
 ```
 
@@ -118,22 +119,23 @@ scheduler identity validation remains separate.
 An explicit profile requires separate preparation; see "Auth-Profile Forwarding"
 and "Fallback Model / Auth Selection" for failure and uncertainty handling.
 
-**Response body** (expected):
+**Response** (expected): the gateway answers `stream: true` with an SSE body
+(`Content-Type: text/event-stream`). The scheduler accumulates
+`data:` frames and assembles `choices[0].delta.content` until stream end;
+`finish_reason` and `usage` (sent in a final frame when
+`stream_options.include_usage` is set) are captured the same way.
 
-```json
-{
-  "choices": [
-    {
-      "message": {
-        "content": "<assistant reply>"
-      }
-    }
-  ],
-  "usage": { ... }
-}
-```
+If a gateway answers with a buffered JSON completion instead (content type
+is not `text/event-stream`), the scheduler falls back to the legacy JSON
+mapping. In both cases the scheduler reads the assembled
+`choices[0].message.content` and `usage` from the result.
 
-The scheduler reads `data.choices[0].message.content` and `data.usage`.
+**Why streaming**: a non-streaming request buffers the entire multi-step
+turn (model calls plus tool executions) behind the HTTP headers, so a quiet
+turn longer than undici's default 300s `headersTimeout` dies with a bare
+`fetch failed` and no detail. Streaming sends headers and deltas
+immediately, so the turn's existing deadline aborts own its lifetime instead
+of the transport timers (see "Timeout behavior" below).
 
 **Response headers read**:
 
@@ -143,14 +145,20 @@ The scheduler reads `data.choices[0].message.content` and `data.usage`.
 
 **Error semantics**:
 - Any non-2xx status throws: `Chat completions failed (<status>): <body first 500 chars>`
+- An in-band SSE `data: {"error": ...}` frame (the gateway reports a failed
+  stream run this way, followed by `data: [DONE]`) throws
+  `Chat completions stream error: <upstream message, first 500 chars>`.
+- A non-SSE body that is not JSON throws
+  `Chat completions response was neither SSE nor JSON: <detail>`.
 - `AbortError` / `TimeoutError` from the fetch signal is translated into a
   descriptive timeout message (see "Activity Timeout" below).
 
 **Timeout behavior**:
-- Chat completions retain the complete JSON response. Both callers override
-  Undici's default 300-second headers and body-idle limits per request; their
-  existing abort signals own the lifetime of the request and response body.
-  A quiet agent turn may exceed five minutes when its configured deadline
+- Chat completions stream SSE. Both callers override Undici's default
+  300-second headers and body-idle limits per request (`headersTimeout: 0`,
+  `bodyTimeout: 0` on the chat-completions dispatcher only); their existing
+  abort signals own the lifetime of the request and the response body. A
+  quiet agent turn may exceed five minutes when its configured deadline
   permits it. The current global dispatcher's connection/proxy policy is
   preserved, and other Gateway requests retain their transport limits.
 - `runAgentTurn`: Hard wall-clock abort via `AbortController` at `timeoutMs`
