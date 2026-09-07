@@ -3,7 +3,6 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 
 import {
@@ -20,6 +19,7 @@ import {
   buildSudoInstallArgs,
   buildSudoLaunchctlBootstrapArgs,
   configuredOpenClawCliPath,
+  configureExistingLaunchdService,
   createSetupCommandRunner,
   encodeLaunchdPlistValue,
   encodeSystemdEnvironmentAssignment,
@@ -27,6 +27,7 @@ import {
   encodeSystemdValue,
   formatPosixCommand,
   renderLaunchdCliEnvironment,
+  renderLaunchdServicePlist,
   renderSystemdUserService,
   updateLaunchdCliPath,
 } from '../setup-service-utils.mjs';
@@ -257,6 +258,8 @@ test('setup source contains no shell-based child process execution', () => {
   );
   assert.match(source, /chmodSync\(service\.plistPath, 0o600\)/u);
   assert.match(source, /buildSudoChmodPrivateArgs\(service\.plistPath\)/u);
+  assert.match(source, /const plist = renderLaunchdServicePlist\(\{/u);
+  assert.match(source, /await configureExistingLaunchdService\(\{/u);
 });
 
 
@@ -289,22 +292,18 @@ function withoutCliNode(xml) {
 test('actual setup LaunchAgent and LaunchDaemon templates persist only the explicitly configured CLI entry', {
   skip: process.platform !== 'darwin',
 }, () => {
-  // Evaluate only the checked-in template expressions, never the setup entrypoint/imports.
-  const source = readFileSync(new URL('../setup.mjs', import.meta.url), 'utf8');
-  const template = source.match(/const plist = (`[\s\S]*?<\/plist>`);/u)?.[1];
-  assert.ok(template, 'actual setup plist template found');
+  // Import the same inert renderer used by setup; never run the setup entrypoint.
   for (const mode of ['agent', 'daemon']) {
     const context = {
-      encodeLaunchdPlistValue,
       service: { comment: 'fixture', label: 'fixture.scheduler' },
       serviceWorkingDirectory: '/fixture/work', nodePath: '/fixture/node', indexPath: '/fixture/dispatcher.js',
-      os: { homedir: () => '/fixture/home' }, envPath: '/fixture/bin', gatewayUrl: 'http://fixture.invalid',
+      homeDirectory: '/fixture/home', envPath: '/fixture/bin', gatewayUrl: 'http://fixture.invalid',
       schedulerDbPath: '/fixture/scheduler.db', logPath: '/fixture/log',
       tokenXml: '    <key>OPENCLAW_GATEWAY_TOKEN</key>\n    <string>fixture-secret-sentinel</string>\n',
       userXml: mode === 'daemon' ? '  <key>UserName</key>\n  <string>fixture-user</string>\n' : '',
     };
     const render = cliPath => JSON.parse(plistCommand(['-convert', 'json', '-o', '-', '--', '-'], {
-      input: runInNewContext(template, { ...context, cliXml: renderLaunchdCliEnvironment(cliPath) }),
+      input: renderLaunchdServicePlist({ ...context, cliXml: renderLaunchdCliEnvironment(cliPath) }),
     }));
     const original = render('');
     const configured = render(METACHAR_VALUE);
@@ -379,10 +378,6 @@ test('daemon CLI updates use sudo argv and refuse invalid plist environments wit
 test('actual existing-service setup branch updates only after an explicit configured-path confirmation', {
   skip: process.platform !== 'darwin',
 }, async () => {
-  const source = readFileSync(new URL('../setup.mjs', import.meta.url), 'utf8');
-  const branch = source.match(/else if \(macServiceSummary && fs.existsSync\(service.plistPath\)\) \{([\s\S]*?)\n {4}\} else if \(macServiceSummary\) \{/u)?.[1];
-  const helper = source.match(/(const updateExistingServiceCliPath = async[\s\S]*?\n {2}\};)\n {2}let selectedServiceMode/u)?.[1] || '';
-  assert.ok(branch, 'actual existing-service branch found');
   const directory = mkdtempSync(join(tmpdir(), 'setup-cli-existing-'));
   try {
     for (const [cliPath, approve, expected, failRead = false] of [[METACHAR_VALUE, true, METACHAR_VALUE], [METACHAR_VALUE, false, '/fixture/old-cli'], ['', true, '/fixture/old-cli'], [METACHAR_VALUE, true, '/fixture/old-cli', true]]) {
@@ -396,7 +391,6 @@ test('actual existing-service setup branch updates only after an explicit config
       const context = {
         service: { title: 'LaunchAgent', mode: 'agent', plistPath: file, domain: 'gui/501', label: 'fixture.scheduler' },
         openclawCliPath: cliPath, confirm: async () => approve,
-        updateLaunchdCliPath, formatPosixCommand, buildLaunchctlBootstrapArgs, MACOS_SUDO_PATH, MACOS_LAUNCHCTL_PATH,
         hardenExistingServiceFile: () => {},
         ok: text => output.push(text), skip: text => output.push(text), warn: text => output.push(text), print: text => output.push(text),
         runSetupCommand: createSetupCommandRunner((command, args, options) => {
@@ -406,7 +400,7 @@ test('actual existing-service setup branch updates only after an explicit config
           return execFileSync(command, args, options);
         }),
       };
-      await runInNewContext(`(async () => { ${helper}\n${branch}\n })()`, context);
+      await configureExistingLaunchdService(context);
       assert.equal(plistCommand(['-extract', 'EnvironmentVariables.OPENCLAW_CLI_PATH', 'raw', '-n', '--', file]), expected);
       assert.equal(withoutCliNode(canonicalPlist(file)), withoutCliNode(before));
       assert.equal(commands, failRead ? 1 : (cliPath && approve ? 2 : 0));
@@ -418,7 +412,7 @@ test('actual existing-service setup branch updates only after an explicit config
         const matchingBytes = readFileSync(file);
         commands = 0;
         output.length = 0;
-        await runInNewContext(`(async () => { ${helper}\n${branch}\n })()`, context);
+        await configureExistingLaunchdService(context);
         assert.equal(commands, 1, 'matching configuration only reads the plist');
         assert.deepEqual(readFileSync(file), matchingBytes);
         assert.ok(output.some(text => text.includes('already matches')));
