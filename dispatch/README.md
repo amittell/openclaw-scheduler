@@ -18,6 +18,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 | `index.mjs` | CLI entry point — 12 subcommands |
 | `hooks.mjs` | Lifecycle event emitter (Loki + optional HTTP webhook) |
 | `watcher.mjs` | Delivery monitoring process |
+| `label-lock.mjs` | Process-safe mutex for ledger read-modify-write operations |
 | `529-recovery.mjs` | Transient error recovery |
 | `deliver-watcher.sh` | Shell wrapper for result retrieval |
 | `chilisaus.mjs` | Branded chilisaus wrapper over this dispatch engine |
@@ -52,6 +53,27 @@ Orchestrator calls:
   → Agent auto-announces results on completion
   → hooks.mjs fires dispatch.started to Loki
 ```
+
+### Labels mutex and upgrades
+
+Labels writers use the existing `better-sqlite3` dependency to hold a
+`BEGIN IMMEDIATE` transaction in a dedicated `labels.json.lock.sqlite3` file
+beside the configured ledger. It stores no labels or transcript data. The
+persistent file is expected after release; do not delete it to unlock a live
+writer. The OS releases a crashed process's ownership, and waiting writers
+have a bounded timeout. This mutex is separate from the scheduler database.
+Keep the ledger and mutex on one host's local filesystem.
+Legacy-ledger initialization and the periodic 529 recovery writer use the
+same mutex. Recovery rechecks eligibility when claiming, releases ownership
+before child dispatch/notification, and retains concurrent label changes when
+reconciling a successful retry.
+
+When upgrading from the former JSON `labels.json.lock` protocol, stop all
+writers, including running watchers, recovery scans and CLI invocations, before replacing any
+of these dispatch files. Restart them from the same upgraded package. Old and
+new writers must not overlap because their mutex protocols differ. Retain
+that quiescence when rolling back. An old JSON lock can be archived only after
+all old writers stop; the new implementation never deletes it automatically.
 
 ### Chilisaus branding
 

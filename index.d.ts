@@ -704,7 +704,6 @@ export interface AgentTurnOpts {
   agentId?: string;
   sessionKey?: string;
   model?: string;
-  authProfile?: string | null;
   materializedEnv?: Record<string, string> | null;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -716,7 +715,6 @@ export interface AgentTurnWithTimeoutOpts {
   agentId?: string;
   sessionKey?: string;
   model?: string;
-  authProfile?: string | null;
   materializedEnv?: Record<string, string> | null;
   sessionKinds?: string[];
   idleTimeoutMs?: number;
@@ -732,6 +730,53 @@ export interface AgentTurnResult {
   usage?: Record<string, unknown>;
   sessionKey?: string;
   raw: Record<string, unknown>;
+}
+
+export interface AgentSelectionOverrides {
+  modelRef?: string | null;
+  authProfile?: string | null;
+}
+
+export interface NormalizedAgentSelection {
+  model: string | undefined;
+  authProfile: string | undefined;
+  identity: string;
+}
+
+export type AgentSelectionPreparationResult =
+  | { ok: true; applied: false; model: string | undefined }
+  | { ok: true; applied: true; model: string; authProfile: string };
+
+export interface AgentSelectionPreparationOpts {
+  /** Positive CLI deadline in milliseconds; defaults to 10000. */
+  timeout?: number;
+  signal?: AbortSignal | null;
+  /** Absolute CLI path; defaults to OPENCLAW_CLI_PATH. */
+  openclawCommand?: string;
+  gatewayToken?: string;
+  env?: Record<string, string | undefined>;
+  /** Optional callback-style executor for offline preparation controls. */
+  execFile?: (
+    command: string,
+    args: string[],
+    options: {
+      encoding: 'utf8';
+      timeout: number;
+      killSignal: 'SIGKILL';
+      signal?: AbortSignal;
+      maxBuffer: number;
+      env: Record<string, string | undefined>;
+    },
+    callback: (
+      error: (Error & { code?: string | number; signal?: string | null; killed?: boolean }) | null,
+      stdout: string,
+    ) => void,
+  ) => unknown;
+}
+
+export interface GatewayPreparationError extends Error {
+  readonly code: string;
+  readonly uncertain: boolean;
 }
 
 export interface GatewayCapabilities {
@@ -1118,6 +1163,18 @@ export const gateway: {
     details?: Record<string, unknown>,
     options?: ErrorOptions & { retryable?: boolean },
   ) => GatewayCompatibilityError;
+  GatewayPreparationError: new (
+    message: string,
+    options?: ErrorOptions & { code?: string; uncertain?: boolean },
+  ) => GatewayPreparationError;
+  normalizeAgentSelection(overrides?: AgentSelectionOverrides, agentId?: string): NormalizedAgentSelection;
+  resolveMainSessionAuthProfile(agentId?: string, opts?: AgentSelectionPreparationOpts): Promise<string>;
+  prepareAgentSelection(
+    sessionKey: string,
+    overrides?: AgentSelectionOverrides,
+    agentId?: string,
+    opts?: AgentSelectionPreparationOpts,
+  ): Promise<AgentSelectionPreparationResult>;
   buildGatewayEnvInjectHeader(materializedEnv?: Record<string, string> | null): Record<string, string>;
   discoverGatewayCapabilities(opts?: GatewayCapabilityDiscoveryOpts): Promise<GatewayCapabilities>;
   clearGatewayCapabilityCache(gatewayUrl?: string): void;

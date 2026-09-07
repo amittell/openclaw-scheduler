@@ -314,7 +314,7 @@ test('Gateway response session keys require exact agent binding', async () => {
   }
 });
 
-test('Gateway session-store writes reject symlink escapes without touching a sentinel', async () => {
+test('Retired Gateway session-store API never follows symlinks or touches a sentinel', async () => {
   const home = makeTempDir('scheduler-store-write-home-');
   const outside = makeTempDir('scheduler-store-write-outside-');
   const outsideSessions = join(outside, 'sessions');
@@ -335,7 +335,7 @@ test('Gateway session-store writes reject symlink escapes without touching a sen
         'main',
       );
       assert.equal(result.ok, false);
-      assert.match(result.error, /symbolic link/);
+      assert.match(result.error, /retired/);
     });
     assert.equal(readFileSync(sentinel, 'utf8'), '{}');
   } finally {

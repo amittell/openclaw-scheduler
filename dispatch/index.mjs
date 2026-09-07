@@ -335,9 +335,12 @@ function mutateLabels(mutator) {
   // Cross-process lock: labels.json is mutated by the enqueue CLI, per-tick
   // watcher processes, and status/result/sync CLIs concurrently. The lock
   // serializes the read-modify-write window so a stale reader can no longer
-  // clobber fields another process just wrote. The ledger is re-read inside
-  // the lock (loadLabels invalidates on file signature change).
+  // clobber fields another process just wrote. Always re-read the ledger
+  // after acquiring the lock.
   return withLabelsLock(LABELS_PATH, () => {
+    // A same-size write can retain the filesystem timestamp: do not reuse a
+    // pre-acquisition cache during a read-modify-write transaction.
+    labelsCache = null;
     const labels = loadLabels();
     if (labelsCacheError) {
       throw new Error(

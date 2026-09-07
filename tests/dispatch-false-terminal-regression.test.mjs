@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { withLabelsLock } from '../dispatch/label-lock.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
@@ -147,7 +148,7 @@ test('(B) labels lock: genuinely concurrent workers never lose increments', asyn
     // so final v < 800 or the file tears. The lock must keep v exact.
     const WORKER_SCRIPT = `
       import { withLabelsLock } from ${JSON.stringify(join(REPO_DIR, 'dispatch', 'label-lock.mjs'))};
-      import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+      import { readFileSync, writeFileSync, renameSync } from 'node:fs';
       const labelsPath = process.argv[2];
       const iterations = Number(process.argv[3]);
       for (let i = 0; i < iterations; i++) {
@@ -159,7 +160,7 @@ test('(B) labels lock: genuinely concurrent workers never lose increments', asyn
           renameSync(tmp, labelsPath);
         });
       }
-      process.stdout.write('done ' + iterations + (existsSync(labelsPath + '.lock') ? ' LOCKLEAK' : '') + '\\n');
+      process.stdout.write('done ' + iterations + '\\n');
     `;
     const scriptPath = join(root, 'worker.mjs');
     writeFileSync(scriptPath, WORKER_SCRIPT);
@@ -185,7 +186,9 @@ test('(B) labels lock: genuinely concurrent workers never lose increments', asyn
     const final = JSON.parse(readFileSync(labelsPath, 'utf8')).a;
     assert.equal(final.v, 800, `lock must serialize all concurrent increments; got ${JSON.stringify(final)}`);
     assert.equal(final.field, 'writer');
-    assert.equal(existsSync(labelsPath + '.lock'), false, 'lock must be released after all workers finish');
+    assert.equal(existsSync(labelsPath + '.lock.sqlite3'), true, 'mutex file remains after release');
+    assert.equal(withLabelsLock(labelsPath, () => 'reacquired', { timeoutMs: 200 }), 'reacquired',
+      'ownership must be released after all workers finish');
   } finally {
     for (const child of workers) { try { child.kill('SIGKILL'); } catch {} }
     rmSync(root, { recursive: true, force: true });

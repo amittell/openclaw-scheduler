@@ -27,6 +27,8 @@ async function close(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
+let gatewayFixtureSequence = 0;
+
 async function captureChatCompletions(call) {
   let captured = null;
   const sink = await listen((request, response) => {
@@ -60,7 +62,8 @@ async function captureChatCompletions(call) {
   const savedUrl = process.env.OPENCLAW_GATEWAY_URL;
   try {
     process.env.OPENCLAW_GATEWAY_URL = sink.url;
-    const gateway = await import(`../gateway.js?model-forwarding-test-${Date.now()}`);
+    // Back-to-back fixtures can share a clock tick but must never share a URL.
+    const gateway = await import(`../gateway.js?model-forwarding-test-${++gatewayFixtureSequence}`);
     const result = await call(gateway);
     return { result, captured };
   } finally {
@@ -76,14 +79,13 @@ test('provider/model ref is forwarded via x-openclaw-model, body keeps a routing
     agentId: 'main',
     sessionKey: 'agent:main:subagent:11111111-2222-3333-4444-555555555555',
     model: 'example/gpt-4o',
-    authProfile: 'example:all-models',
     timeoutMs: 3_000,
   }));
   assert.equal(result.ok, true, 'turn should succeed against the sink');
   assert.equal(captured.modelHeader, 'example/gpt-4o', 'model ref must travel in the x-openclaw-model header');
   assert.equal(captured.body.model, 'openclaw:main', 'body must carry a valid routing id, not the provider ref');
   assert.equal(captured.agentIdHeader, 'main', 'agent id header is preserved');
-  assert.equal(captured.authProfileHeader, 'example:all-models', 'auth profile header is preserved');
+  assert.equal(captured.authProfileHeader, null, 'unsupported profile header is absent');
 });
 
 test('routing model id stays in the body without an override header', async () => {
@@ -110,30 +112,31 @@ test('no model: body defaults to the per-agent routing id, no override header', 
   assert.equal(captured.body.model, 'openclaw:main', 'body defaults to openclaw:<agentId>');
 });
 
-test('explicit routes identical to the default path stay in the body (P2)', async () => {
-  // Agent ids may contain dots and at-signs (assertValidAgentId, up to 128
-  // chars), and the no-model default path emits openclaw:<agentId> into the
-  // body for them. Supplying that identical route explicitly must behave
-  // exactly like the default: body only, NO x-openclaw-model header.
-  for (const route of ['openclaw:ops.team', 'agent:user@example']) {
-    const { result, captured } = await captureChatCompletions(async (gateway) => gateway.runAgentTurn({
-      message: 'explicit route identical to default',
-      agentId: 'main',
-      model: route,
-      timeoutMs: 3_000,
-    }));
-    assert.equal(result.ok, true, `${route} turn should succeed`);
-    assert.equal(captured.modelHeader, null, `${route} must NOT add x-openclaw-model`);
-    assert.equal(captured.body.model, route, `${route} stays in the body as a routing id`);
+test('Gateway-incompatible routing IDs are rejected locally, not forwarded as model overrides', async () => {
+  for (const route of ['openclaw:ops.team', 'agent:user@example', `openclaw:${'a'.repeat(65)}`]) {
+    const { captured } = await captureChatCompletions(async gateway => {
+      await assert.rejects(gateway.runAgentTurn({ message: 'invalid route', agentId: 'main', model: route }), /routing/i);
+    });
+    assert.equal(captured, null);
   }
-  // A true provider/model ref still routes to the header.
-  const { result, captured } = await captureChatCompletions(async (gateway) => gateway.runAgentTurn({
-    message: 'provider ref still header-routed',
-    agentId: 'main',
-    model: 'example/gpt-4o',
-    timeoutMs: 3_000,
+});
+
+test('direct explicit profile options are rejected by both HTTP runners before a request', async () => {
+  const { captured } = await captureChatCompletions(async gateway => {
+    for (const run of [gateway.runAgentTurn, gateway.runAgentTurnWithActivityTimeout]) {
+      await assert.rejects(run({ message: 'unprepared profile', agentId: 'main', authProfile: 'vendor:work' }), /prepareAgentSelection/);
+    }
+  });
+  assert.equal(captured, null);
+});
+
+test('activity-aware runner retains concrete model forwarding without profile header', async () => {
+  const { result, captured } = await captureChatCompletions(async gateway => gateway.runAgentTurnWithActivityTimeout({
+    message: 'model selection', agentId: 'main', sessionKey: 'agent:main:scheduler:fixture',
+    model: 'vendor/model', absoluteTimeoutMs: 3000, pollIntervalMs: 60000,
   }));
-  assert.equal(result.ok, true, 'provider ref turn should succeed');
-  assert.equal(captured.modelHeader, 'example/gpt-4o', 'provider ref still travels in the header');
-  assert.equal(captured.body.model, 'openclaw:main', 'provider ref body stays a valid routing id');
+  assert.equal(result.ok, true);
+  assert.equal(captured.body.model, 'openclaw:main');
+  assert.equal(captured.modelHeader, 'vendor/model');
+  assert.equal(captured.authProfileHeader, null);
 });

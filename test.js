@@ -3510,6 +3510,7 @@ console.log('\n-- Auth Profile --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test inherit profile',
     session_target: 'isolated',
+    payload_model: 'anthropic/primary',
     auth_profile: 'inherit',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms:   300_000, origin: 'system',
@@ -3522,6 +3523,7 @@ console.log('\n-- Auth Profile --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test specific profile',
     session_target: 'isolated',
+    payload_model: 'anthropic/primary',
     auth_profile: 'anthropic:gmail',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms:   300_000, origin: 'system',
@@ -3552,7 +3554,7 @@ console.log('\n-- Auth Profile --');
   assert(explicitNullJob.auth_profile === null, 'auth_profile explicit null stored as null');
 
   // Update job to set auth_profile
-  const updated = updateJob(nullJob.id, { auth_profile: 'openai:work' });
+  const updated = updateJob(nullJob.id, { payload_model: 'openai/primary', auth_profile: 'openai:work' });
   assert(updated.auth_profile === 'openai:work', 'auth_profile updated to openai:work');
 
   // Update job to clear auth_profile
@@ -3599,25 +3601,25 @@ console.log('\n-- Fallback Model/Auth Fields --');
     schedule_cron: '0 0 * * *',
     payload_message: 'test fallback fields',
     session_target: 'isolated',
-    payload_model: 'gpt-5-mini',
-    payload_model_fallback: 'openclaw:main',
+    payload_model: 'anthropic/primary',
+    payload_model_fallback: 'openai/fallback',
     auth_profile: 'anthropic:gmail',
     auth_profile_fallback: 'openai:work',
     delivery_mode: 'none', delivery_opt_out_reason: 'test',
     run_timeout_ms: 300_000, origin: 'system',
   });
-  assert(fallbackJob.payload_model_fallback === 'openclaw:main', 'payload_model_fallback stored correctly');
+  assert(fallbackJob.payload_model_fallback === 'openai/fallback', 'payload_model_fallback stored correctly');
   assert(fallbackJob.auth_profile_fallback === 'openai:work', 'auth_profile_fallback stored correctly');
 
   const fetchedFallback = getJob(fallbackJob.id);
-  assert(fetchedFallback.payload_model_fallback === 'openclaw:main', 'getJob returns payload_model_fallback');
+  assert(fetchedFallback.payload_model_fallback === 'openai/fallback', 'getJob returns payload_model_fallback');
   assert(fetchedFallback.auth_profile_fallback === 'openai:work', 'getJob returns auth_profile_fallback');
 
   const updatedFallback = updateJob(fallbackJob.id, {
-    payload_model_fallback: 'gpt-4.1-mini',
+    payload_model_fallback: 'anthropic/backup',
     auth_profile_fallback: 'anthropic:backup',
   });
-  assert(updatedFallback.payload_model_fallback === 'gpt-4.1-mini', 'payload_model_fallback updates correctly');
+  assert(updatedFallback.payload_model_fallback === 'anthropic/backup', 'payload_model_fallback updates correctly');
   assert(updatedFallback.auth_profile_fallback === 'anthropic:backup', 'auth_profile_fallback updates correctly');
 
   const clearedFallback = updateJob(fallbackJob.id, {
@@ -3661,75 +3663,12 @@ console.log('\n-- Fallback Model/Auth Fields --');
   deleteJob(fallbackJob.id);
 }
 
-console.log('\n-- Auth Profile Session Store Propagation --');
+console.log('\n-- Gateway Session Preparation --');
 {
-  // Test applyAuthProfileToSessionStore writes authProfileOverride to sessions.json
-  const { applyAuthProfileToSessionStore } = await import('./gateway.js');
-
-  // Create a temp sessions dir
-  const tmpSessions = mkdtempSync(join(tmpdir(), 'scheduler-auth-profile-'));
-  const agentDir = join(tmpSessions, '.openclaw', 'agents', 'main', 'sessions');
-  mkdirSync(agentDir, { recursive: true });
-  const sessionsPath = join(agentDir, 'sessions.json');
-
-  // Create an initial sessions.json with an existing session entry
-  const initialStore = {
-    'agent:main:scheduler:test-job-123': {
-      sessionId: 'test-session-abc',
-      updatedAt: Date.now() - 10000,
-      modelProvider: 'anthropic',
-      model: 'claude-sonnet-4-5',
-    },
-  };
-  writeFileSync(sessionsPath, JSON.stringify(initialStore), 'utf-8');
-
-  // Monkey-patch HOME_DIR by calling the function directly with the right path
-  // Since we can't override HOME_DIR in gateway.js easily, test the function logic manually:
-  // 1. Read, modify, write -- the core logic
-  const storeRaw = readFileSync(sessionsPath, 'utf-8');
-  const store = JSON.parse(storeRaw);
-  const canonicalKey = 'agent:main:scheduler:test-job-123';
-  const authProfile = 'anthropic:gmail';
-
-  // Simulate the function logic
-  const entry = store[canonicalKey];
-  assert(entry, 'session entry exists before apply');
-  assert(!entry.authProfileOverride, 'no authProfileOverride before apply');
-
-  entry.authProfileOverride = authProfile;
-  entry.authProfileOverrideSource = 'user';
-  entry.updatedAt = Date.now();
-  writeFileSync(sessionsPath, JSON.stringify(store), 'utf-8');
-
-  // Verify the write
-  const updated = JSON.parse(readFileSync(sessionsPath, 'utf-8'));
-  assert(updated[canonicalKey].authProfileOverride === 'anthropic:gmail',
-    'authProfileOverride written to sessions.json');
-  assert(updated[canonicalKey].authProfileOverrideSource === 'user',
-    'authProfileOverrideSource is user');
-
-  // Test creating a new entry for a non-existing session
-  const newKey = 'agent:main:scheduler:new-job-456';
-  assert(!updated[newKey], 'new session key does not exist yet');
-  updated[newKey] = {
-    updatedAt: Date.now(),
-    authProfileOverride: 'openai:work',
-    authProfileOverrideSource: 'user',
-  };
-  writeFileSync(sessionsPath, JSON.stringify(updated), 'utf-8');
-  const final = JSON.parse(readFileSync(sessionsPath, 'utf-8'));
-  assert(final[newKey].authProfileOverride === 'openai:work',
-    'authProfileOverride set on new session entry');
-
-  // Test the actual function exists and validates inputs
-  const badResult1 = applyAuthProfileToSessionStore(null, 'anthropic:gmail');
-  assert(!badResult1.ok, 'rejects null sessionKey');
-  const badResult2 = applyAuthProfileToSessionStore('scheduler:test', null);
-  assert(!badResult2.ok, 'rejects null authProfile');
-
-  // Cleanup
-  rmSync(tmpSessions, { recursive: true, force: true });
-  console.log('  auth profile session store propagation: pass');
+  const { prepareAgentSelection, applyAuthProfileToSessionStore } = await import('./gateway.js');
+  const result = await prepareAgentSelection('scheduler:legacy-suite', { modelRef: 'vendor/model' });
+  assert(result.ok && !result.applied, 'model-only selection needs no local store or RPC');
+  assert(!applyAuthProfileToSessionStore('scheduler:legacy-suite', 'vendor:work').ok, 'retired API never claims a profile was applied');
 }
 
 console.log('\n-- Gateway-managed Auth Store Compatibility --');
@@ -3760,8 +3699,8 @@ console.log('\n-- executeAgent fallback selection --');
     id: 'fallback-runtime-job',
     name: 'Fallback Runtime Job',
     agent_id: 'main',
-    payload_model: 'gpt-5-mini',
-    payload_model_fallback: 'gpt-4.1-mini',
+    payload_model: 'anthropic/gpt-5-mini',
+    payload_model_fallback: 'openai/gpt-4.1-mini',
     auth_profile: 'anthropic:primary',
     auth_profile_fallback: 'openai:backup',
     payload_timeout_seconds: 120,
@@ -3779,7 +3718,7 @@ console.log('\n-- executeAgent fallback selection --');
     detectTransientError: () => false,
     sqliteNow,
     log: (...args) => logs.push(args),
-    applySessionOverridesToSessionStore: (_sessionKey, overrides) => { appliedSelections.push(overrides); return { ok: true }; },
+    prepareAgentSelection: async (_sessionKey, overrides) => { appliedSelections.push(overrides); return { ok: true, applied: Boolean(overrides.authProfile), model: overrides.modelRef }; },
     runIsolatedAgentTurn: async ({ model, authProfile }) => {
       turnAttempts.push({ model: model || null, authProfile: authProfile || null });
       if (turnAttempts.length === 1) throw new Error('primary selection failed');
@@ -3789,12 +3728,12 @@ console.log('\n-- executeAgent fallback selection --');
 
   assert(result.status === 'ok', 'executeAgent fallback: returns ok after fallback turn succeeds');
   assert(turnAttempts.length === 2, 'executeAgent fallback: retries exactly once inside the same run');
-  assert(turnAttempts[0].model === 'gpt-5-mini' && turnAttempts[0].authProfile === 'anthropic:primary', 'executeAgent fallback: primary dispatch forwards the selected model and auth profile explicitly');
-  assert(turnAttempts[1].model === 'gpt-4.1-mini' && turnAttempts[1].authProfile === 'openai:backup', 'executeAgent fallback: retry dispatch forwards the fallback model and auth profile explicitly');
+  assert(turnAttempts[0].model === 'anthropic/gpt-5-mini' && turnAttempts[0].authProfile === null, 'executeAgent fallback: primary dispatch retains the model after separate profile preparation');
+  assert(turnAttempts[1].model === 'openai/gpt-4.1-mini' && turnAttempts[1].authProfile === null, 'executeAgent fallback: fallback dispatch retains the model after separate profile preparation');
   assert(JSON.stringify(appliedSelections) === JSON.stringify([
-    { authProfile: 'anthropic:primary', modelRef: 'gpt-5-mini' },
-    { authProfile: 'openai:backup', modelRef: 'gpt-4.1-mini' },
-  ]), 'executeAgent fallback: applies primary then fallback model/auth selections to session store');
+    { authProfile: 'anthropic:primary', modelRef: 'anthropic/gpt-5-mini' },
+    { authProfile: 'openai:backup', modelRef: 'openai/gpt-4.1-mini' },
+  ]), 'executeAgent fallback: prepares primary then fallback model/auth selections through the Gateway boundary');
   assert(logs.some(entry => String(entry[1] || '').includes('retrying with configured fallback')), 'executeAgent fallback: logs fallback retry');
 }
 
