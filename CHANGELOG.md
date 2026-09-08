@@ -4,7 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] -- 2026-09-08
+
 ### Changed
+
+- **Prepare explicit model/profile selections through a bounded receipt-checked RPC.**
+  Scheduler agent and model/profile selections are now validated and prepared
+  through authenticated `sessions.patch` / `sessions.describe` calls (a
+  matching receipt is required before dispatch) instead of being forwarded to
+  the gateway unvalidated. Inherited profiles resolve through the exact
+  same-agent main session key; uncertain writes, cancellations and expired
+  deadlines prevent a retry. The replacement preparation APIs are exposed in
+  the public TypeScript declarations. (#42)
 
 - **Stream agent turns over SSE instead of buffering one JSON completion.**
   Isolated agent turns POSTed to `/v1/chat/completions` with `stream: false`;
@@ -21,6 +32,19 @@ All notable changes to this project will be documented in this file.
   `raw`. `docs/gateway-contract.md` is updated to the streaming contract.
 
 ### Fixed
+
+- **Stop transport-deadline kills of long agent turns at the fetch layer.**
+  Undici's default 300s `headersTimeout` / `bodyTimeout` aborted the
+  `/v1/chat/completions` fetch for any agent turn that went quiet for five
+  minutes between headers or streamed body chunks (observed: a `terminated`
+  run at 301,784ms during legitimate tool work, and a `fetch failed` run at
+  302,938ms while the gateway buffered the whole turn). Both fetch sites now
+  send requests through a per-request dispatcher that sets
+  `headersTimeout: 0` / `bodyTimeout: 0` and forwards to the current global
+  dispatcher, so the job's own absolute / activity / caller
+  `AbortController`s own the deadline instead of an opaque transport timer.
+  Regression tests use a real loopback server to prove the override protects
+  both the streaming and buffered-JSON paths. (#43)
 
 - **Do not abort a streaming agent turn on a non-object `data:` frame.** The
   SSE reader read `obj.error` on every parsed frame; a valid-JSON but
