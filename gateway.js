@@ -72,6 +72,12 @@ const MAX_UNDRAINED_SSE_BUFFER = 8 * 1024 * 1024;
  * payloads (skipped), tool-call deltas that carry no content, and multi-byte
  * UTF-8 split across chunks (TextDecoder with stream: true).
  *
+ * The gateway terminates every stream with `data: [DONE]` (both the success
+ * finalize and the error path in the gateway's OpenAI-compat handler).
+ * A clean stream end without the sentinel means the body was truncated
+ * (gateway crash, connection drop, server-side run abort): rejecting it
+ * keeps a dead gateway from returning a partial turn as a successful one.
+ *
  * Returns `{ content, usage, data }` where `data` is the reconstructed
  * completion object used as the result's `raw`.
  */
@@ -79,6 +85,7 @@ async function collectSseChatCompletion(resp) {
   let content = '';
   let usage = null;
   let finishReason = null;
+  let sawDone = false;
   if (!resp.body || typeof resp.body.getReader !== 'function') {
     throw new Error('Chat completions SSE response has no readable body');
   }
@@ -88,7 +95,11 @@ async function collectSseChatCompletion(resp) {
   const processLine = line => {
     if (!line.startsWith('data:')) return;
     const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]') return;
+    if (!payload) return;
+    if (payload === '[DONE]') {
+      sawDone = true;
+      return;
+    }
     let obj;
     try { obj = JSON.parse(payload); } catch { return; }
     // Non-object frames (data: null, data: 1, data: "x") are not completion
@@ -129,6 +140,11 @@ async function collectSseChatCompletion(resp) {
     // `data:` frame the sender did not terminate with a newline.
     sseBuf += decoder.decode();
     if (sseBuf.trim()) processLine(sseBuf.replace(/\r$/, ''));
+    if (!sawDone) {
+      throw new Error(
+        'Chat completions SSE stream ended without [DONE]; response truncated (gateway crash or connection drop)',
+      );
+    }
   } finally {
     // Return the socket to the pool cleanly: on in-band errors or deadline
     // aborts the body may still be open, and an abandoned body holds the

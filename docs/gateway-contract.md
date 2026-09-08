@@ -130,6 +130,14 @@ is not `text/event-stream`), the scheduler falls back to the legacy JSON
 mapping. In both cases the scheduler reads the assembled
 `choices[0].message.content` and `usage` from the result.
 
+Malformed SSE frames do not abort the turn: unparseable `data:` payloads and
+valid-JSON non-object frames (`data: null`, `data: 42`, ...) are skipped,
+as are `: comment` lines, empty `data:` frames, and the trailing
+`data: [DONE]` sentinel. Every well-formed stream ends with that sentinel;
+a stream that closes without it is treated as truncated and rejected
+(`Chat completions SSE stream ended without [DONE]; response truncated...`)
+instead of returning partial content as a successful turn.
+
 **Why streaming**: a non-streaming request buffers the entire multi-step
 turn (model calls plus tool executions) behind the HTTP headers, so a quiet
 turn longer than undici's default 300s `headersTimeout` dies with a bare

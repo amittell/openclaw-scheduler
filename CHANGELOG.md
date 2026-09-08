@@ -28,6 +28,14 @@ All notable changes to this project will be documented in this file.
   `TypeError: Cannot read properties of null` and failed the whole turn over
   one malformed frame. Non-object frames are now skipped, matching the
   parser's handling of unparseable frames. Regression test added.
+- **Reject a streaming completion that ends without `data: [DONE]`.** The
+  gateway terminates every chat-completion stream with the `[DONE]` sentinel
+  (success and error paths). A clean stream close without it means the body
+  was truncated (gateway crash, connection drop); the reader now fails with a
+  descriptive error instead of returning partial content as `ok: true`
+  (the legacy `stream: false` path failed closed on partial bodies). The
+  sentinel requirement is documented in `docs/gateway-contract.md`. Regression
+  test added.
 
 ## [0.6.0] -- 2026-09-06
 

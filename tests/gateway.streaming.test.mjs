@@ -106,6 +106,7 @@ test('happy path: multi-chunk SSE deltas assemble into the same result shape', a
       choices: [{ index: 0, delta: { content: '!' }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 20, completion_tokens: 22, total_tokens: 42 },
     }),
+    'data: [DONE]\n\n',
   ];
   const { result, completions } = await withSseStream(frames, async mock => {
     assert.equal(mock.completions.length, 0, 'no completion request yet mid-flight');
@@ -175,6 +176,7 @@ test('CRLF line endings are parsed the same as LF', async () => {
   const frames = [
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'streamed' } }] })}\r\n\r\n`,
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: ' via crlf' }, finish_reason: 'stop' }], usage: { total_tokens: 9 } })}\r\n\r\n`,
+    'data: [DONE]\r\n\r\n',
   ];
   const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
     message: 'fixture crlf',
@@ -193,6 +195,7 @@ test('tool-call deltas without content leave content empty', async () => {
     toolCallFrame(),
     toolCallFrame(),
     sseFrame({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+    'data: [DONE]\n\n',
   ];
   const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
     message: 'fixture tool calls',
@@ -217,6 +220,7 @@ test('usage appearing only in the final chunk is still captured', async () => {
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
       usage: { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 },
     }),
+    'data: [DONE]\n\n',
   ];
   const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
     message: 'fixture late usage',
@@ -294,9 +298,10 @@ function replaceFetch(handlers) {
 
 test('trailing data frame without a final newline is not dropped', async () => {
   // The final frame carries content AND finish_reason and ends with no
-  // terminating newline at stream end.
+  // terminating newline at stream end; the [DONE] sentinel lands before it.
   const frames = [
     deltaFrame('final '),
+    'data: [DONE]\n\n',
     sseFrame({ choices: [{ index: 0, delta: { content: 'line' }, finish_reason: 'stop' }], usage: { total_tokens: 3 } }).replace(/\n+$/, ''),
   ];
   const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
@@ -330,7 +335,10 @@ test('multi-byte UTF-8 split across chunk boundaries decodes intact', async () =
     '/v1/chat/completions': () => new Response(new ReadableStream({
       start(controller) {
         controller.enqueue(bytes.slice(0, cut));
+        // Second chunk: the remainder of the split frame plus the [DONE]
+        // sentinel the gateway always appends.
         controller.enqueue(bytes.slice(cut));
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
         controller.close();
       },
     }), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
@@ -348,6 +356,32 @@ test('multi-byte UTF-8 split across chunk boundaries decodes intact', async () =
     assert.equal(result.raw.choices[0].message.content, text);
   } finally {
     restore();
+  }
+});
+
+test('a stream that closes without [DONE] rejects instead of returning partial content', async () => {
+  // The gateway terminates every chat-completion stream with data: [DONE]
+  // (success and error paths). A clean close without the sentinel means the
+  // body was truncated (gateway crash, connection drop): fail closed with an
+  // error instead of returning a partial turn as ok:true.
+  const frames = [
+    deltaFrame('partial '),
+    sseFrame({ choices: [{ index: 0, delta: { content: 'content' }, finish_reason: 'stop' }], usage: { total_tokens: 3 } }),
+  ];
+  const mock = installMockFetch(frames);
+  try {
+    await assert.rejects(
+      gateway.runAgentTurn({
+        message: 'fixture truncated',
+        agentId: 'main',
+        sessionKey: SESSION_KEY,
+        timeoutMs: 5_000,
+        cancelOnAbort: false,
+      }),
+      err => err instanceof Error && /truncated/i.test(err.message),
+    );
+  } finally {
+    mock.restore();
   }
 });
 
