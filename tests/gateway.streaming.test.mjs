@@ -315,8 +315,17 @@ test('trailing data frame without a final newline is not dropped', async () => {
 test('multi-byte UTF-8 split across chunk boundaries decodes intact', async () => {
   const text = 'héllo → 世界 🌍';
   const bytes = new TextEncoder().encode(deltaFrame(text));
-  // Split mid-codepoint: first half lands in chunk one, second in chunk two.
-  const cut = Math.floor(bytes.length / 2);
+  // Deterministic split mid-codepoint: 世 is E4 B8 96; cut between B8 and 96.
+  // (The original 50/50 cut landed on an ASCII boundary and would not have
+  // exercised the stream-decode path at all.)
+  const cut = bytes.indexOf(0x96);
+  // Guard: a fatal decode of the first chunk only throws when the cut lands
+  // inside a multi-byte codepoint. If this guard ever fails, the cut is on a
+  // codepoint boundary and the test no longer proves the stream-decode fix.
+  assert.throws(
+    () => new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(0, cut)),
+    'cut must land inside a multi-byte codepoint',
+  );
   const restore = replaceFetch({
     '/v1/chat/completions': () => new Response(new ReadableStream({
       start(controller) {
