@@ -102,14 +102,17 @@ before(async () => {
       return;
     }
     if (request.method === 'POST' && request.url === '/v1/chat/completions') {
-      sendJson(
-        response,
-        200,
-        {
-          choices: [{ message: { content: 'stub gateway response' } }],
+      // Chat completions now stream SSE (stream: true). Emit the same
+      // content/usage/session key the old JSON stub carried.
+      response.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'x-openclaw-session-key': 'agent:main:stub-session',
+      });
+      response.end(
+        'data: ' + JSON.stringify({
+          choices: [{ index: 0, delta: { content: 'stub gateway response' }, finish_reason: 'stop' }],
           usage: { total_tokens: 2 },
-        },
-        { 'x-openclaw-session-key': 'agent:main:stub-session' },
+        }) + '\n\n' + 'data: [DONE]\n\n',
       );
       return;
     }

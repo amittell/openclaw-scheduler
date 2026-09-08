@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Stream agent turns over SSE instead of buffering one JSON completion.**
+  Isolated agent turns POSTed to `/v1/chat/completions` with `stream: false`;
+  the gateway buffered the entire multi-step turn behind the HTTP headers, so
+  any turn longer than undici's default 300s `headersTimeout` died with a
+  bare `fetch failed` and no detail (observed: a 302.9s run with 12+ model
+  calls, all HTTP 200). Both fetch sites (`runAgentTurn`,
+  `runAgentTurnWithActivityTimeout`) now send `stream: true` +
+  `stream_options.include_usage` and accumulate `delta.content` frames, with
+  in-band stream errors surfacing the upstream message instead of a transport
+  kill. The result shape (`ok`, `content`, `usage`, `sessionKey`, `raw`) is
+  unchanged; a gateway that answers with a buffered JSON body still parses
+  with the legacy mapping and the original completion object preserved in
+  `raw`. `docs/gateway-contract.md` is updated to the streaming contract.
+
+### Fixed
+
+- **Do not abort a streaming agent turn on a non-object `data:` frame.** The
+  SSE reader read `obj.error` on every parsed frame; a valid-JSON but
+  non-object frame (`data: null`, `data: 42`, `data: "x"`) threw
+  `TypeError: Cannot read properties of null` and failed the whole turn over
+  one malformed frame. Non-object frames are now skipped, matching the
+  parser's handling of unparseable frames. Regression test added.
+- **Reject a streaming completion that ends without `data: [DONE]`.** The
+  gateway terminates every chat-completion stream with the `[DONE]` sentinel
+  (success and error paths). A clean stream close without it means the body
+  was truncated (gateway crash, connection drop); the reader now fails with a
+  descriptive error instead of returning partial content as `ok: true`
+  (the legacy `stream: false` path failed closed on partial bodies). The
+  sentinel requirement is documented in `docs/gateway-contract.md`. Regression
+  test added.
+
 ## [0.6.0] -- 2026-09-06
 
 ### Fixed
