@@ -372,6 +372,29 @@ test('keep-alive comments and empty data frames are ignored', async () => {
   assert.equal(result.content, 'alive comment ignored');
 });
 
+test('non-object and null data frames do not poison the turn', async () => {
+  // A proxy or upstream can emit valid JSON that is not an object (data: null,
+  // data: 1, data: "x"). The parser must skip such frames instead of throwing
+  // a TypeError (obj.error on null) that would abort the whole turn.
+  const frames = [
+    deltaFrame('before '),
+    'data: null\n\n',
+    'data: 42\n\n',
+    'data: "stray"\n\n',
+    deltaFrame('after'),
+    'data: [DONE]\n\n',
+  ];
+  const { result } = await withSseStream(frames, () => gateway.runAgentTurn({
+    message: 'fixture non-object frames',
+    agentId: 'main',
+    sessionKey: SESSION_KEY,
+    timeoutMs: 5_000,
+    cancelOnAbort: false,
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.content, 'before after');
+});
+
 test('non-SSE content type falls back to legacy JSON parsing and preserves raw', async () => {
   const completion = {
     id: 'chatcmpl-json-fallback',

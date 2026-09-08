@@ -68,9 +68,9 @@ const MAX_UNDRAINED_SSE_BUFFER = 8 * 1024 * 1024;
  * Handles: frames split across network chunks (line buffering), a trailing
  * `data:` frame with no final newline (decoder flush + residual line at
  * stream end), CRLF/LF endings, `: keep-alive` comments and empty `data:`
- * frames, `data: [DONE]`, in-band `{ error }` frames, tool-call deltas that
- * carry no content, and multi-byte UTF-8 split across chunks (TextDecoder
- * with stream: true).
+ * frames, `data: [DONE]`, in-band `{ error }` frames, non-object `data:`
+ * payloads (skipped), tool-call deltas that carry no content, and multi-byte
+ * UTF-8 split across chunks (TextDecoder with stream: true).
  *
  * Returns `{ content, usage, data }` where `data` is the reconstructed
  * completion object used as the result's `raw`.
@@ -91,6 +91,10 @@ async function collectSseChatCompletion(resp) {
     if (!payload || payload === '[DONE]') return;
     let obj;
     try { obj = JSON.parse(payload); } catch { return; }
+    // Non-object frames (data: null, data: 1, data: "x") are not completion
+    // chunks; skip them instead of throwing a TypeError on obj.error that
+    // would abort the whole turn over one malformed frame.
+    if (!obj || typeof obj !== 'object') return;
     if (obj.error) {
       const emsg = typeof obj.error === 'string'
         ? obj.error

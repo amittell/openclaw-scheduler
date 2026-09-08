@@ -21,6 +21,14 @@ All notable changes to this project will be documented in this file.
   `raw`. `docs/gateway-contract.md` is updated to the streaming contract.
 
 ### Fixed
+
+- **Do not abort a streaming agent turn on a non-object `data:` frame.** The
+  SSE reader read `obj.error` on every parsed frame; a valid-JSON but
+  non-object frame (`data: null`, `data: 42`, `data: "x"`) threw
+  `TypeError: Cannot read properties of null` and failed the whole turn over
+  one malformed frame. Non-object frames are now skipped, matching the
+  parser's handling of unparseable frames. Regression test added.
+
 ## [0.6.0] -- 2026-09-06
 
 ### Fixed
