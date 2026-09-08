@@ -79,6 +79,9 @@ async function collectSseChatCompletion(resp) {
   let content = '';
   let usage = null;
   let finishReason = null;
+  if (!resp.body || typeof resp.body.getReader !== 'function') {
+    throw new Error('Chat completions SSE response has no readable body');
+  }
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let sseBuf = '';

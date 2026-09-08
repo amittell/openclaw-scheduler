@@ -158,3 +158,94 @@ test('activity monitor still aborts a quiet session before its absolute deadline
     assert.ok(requests.some(request => request.url === '/tools/invoke'));
   });
 });
+
+// The streaming contract means production completions are SSE, so the
+// 50ms-timer tests above can no longer reproduce the ORIGINAL failure
+// (buffered body held past the transport timer). These two tests keep
+// direct coverage of #43's mechanism: per-request headersTimeout:0 /
+// bodyTimeout:0 overrides forwarded through the ambient dispatcher,
+// for BOTH the SSE path and the legacy buffered-JSON fallback path.
+test('chat completion requests carry the per-request transport overrides (both callers)', async () => {
+  await withGateway((req, res) => {
+    if (req.url !== '/v1/chat/completions') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ result: { sessions: [] } }));
+      return;
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('x-openclaw-session-key', sessionKey);
+    res.end('data: ' + JSON.stringify({
+      choices: [{ index: 0, delta: { content: 'complete response' }, finish_reason: 'stop' }],
+      usage: completion.usage,
+    }) + '\n\ndata: [DONE]\n\n');
+  }, async ({ gateway }) => {
+    const { Agent, getGlobalDispatcher, setGlobalDispatcher } = await import('undici');
+    const previous = getGlobalDispatcher();
+    const seen = [];
+    const spy = new Agent({ headersTimeout: 50, bodyTimeout: 50 });
+    const realDispatch = spy.dispatch.bind(spy);
+    spy.dispatch = (options, handler) => {
+      if (options.path === '/v1/chat/completions') seen.push(options);
+      return realDispatch(options, handler);
+    };
+    setGlobalDispatcher(spy);
+    try {
+      for (const [, invoke] of callers) {
+        const result = await invoke(gateway);
+        assert.equal(result.ok, true);
+        assert.equal(result.content, 'complete response');
+      }
+    } finally {
+      setGlobalDispatcher(previous);
+      await spy.destroy();
+    }
+    assert.equal(seen.length, 2, 'both caller turns must pass through the ambient dispatcher');
+    for (const options of seen) {
+      assert.equal(options.path, '/v1/chat/completions');
+      // 0 disables the timer (undici semantics); any finite value would
+      // reintroduce the five-minute kill on slow turns.
+      assert.equal(options.headersTimeout, 0, 'headersTimeout override must be 0');
+      assert.equal(options.bodyTimeout, 0, 'bodyTimeout override must be 0');
+    }
+  });
+});
+
+test('legacy buffered-JSON completion survives the transport override (fallback path)', async () => {
+  await withGateway((req, res, later) => {
+    // Both the chat completion and the plain-fetch control are held 1.5s, far
+    // past the 50ms ambient timers. The chat path survives ONLY via #43's
+    // per-request headersTimeout:0 / bodyTimeout:0 override; the control dies
+    // at the timer, proving the timers are real (the original failure mode).
+    if (req.url !== '/v1/chat/completions') {
+      later(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      return;
+    }
+    // A gateway that answers the stream request with one buffered JSON body
+    // (legacy behavior): the reader must take parseJsonChatCompletion.
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('x-openclaw-session-key', sessionKey);
+    later(() => res.end(JSON.stringify(completion)));
+  }, async ({ gateway, url, requests }) => {
+    const control = assert.rejects(
+      fetch(`${url}/control`).then(r => r.json()),
+      error => error.cause?.code === 'UND_ERR_HEADERS_TIMEOUT',
+      'plain fetch must hit the real 50ms headersTimeout',
+    );
+    const result = await gateway.runAgentTurn({
+      message: 'fixture', sessionKey, timeoutMs: 5_000, cancelOnAbort: false,
+    });
+    await control;
+    assert.equal(result.ok, true);
+    assert.equal(result.content, 'complete response');
+    assert.deepEqual(result.usage, completion.usage);
+    // The fallback preserves the original completion object in raw.
+    assert.equal(result.raw.id, 'chatcmpl-fixture');
+    assert.equal(result.raw.model, 'openclaw:main');
+    const request = requests.find(item => item.url === '/v1/chat/completions');
+    assert.equal(request.body.stream, true, 'request still asks for SSE');
+    assert.equal(request.headers['x-openclaw-session-key'], sessionKey);
+  });
+});
