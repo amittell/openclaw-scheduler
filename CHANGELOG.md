@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Classify OpenClaw core's `upstream provider timeout/error/overloaded` strings as transient.**
+  The gateway's provider-failover layer emits exactly these three strings
+  (e.g. `Chat completions stream error: upstream provider timeout`), but no
+  `TRANSIENT_ERROR_PATTERNS` entry covered the provider-prefix form — so an
+  isolated agent-turn job that hit a genuine upstream blip soft-failed with
+  no retry (observed: rh-bot, Morning Daily Brief, 2026-09-09, 2 occurrences).
+  The new pattern anchors the full `upstream provider (timeout|error|overloaded)
+  phrase, which keeps prose such as "the upstream provider was down" unflagged;
+  verified 0 false-positives across all 1,740 historical ok-run summaries in the
+  prod scheduler DB, and it matches all three distinct prod error strings
+  recorded today. Regression tests use the exact observed strings plus prose
+  negatives.
+
 - **Stop the transient-error scanner from false-positiving on report prose.**
   `detectTransientError` scanned the first 500 chars of an agent reply for
   transport-notice phrases; the pattern

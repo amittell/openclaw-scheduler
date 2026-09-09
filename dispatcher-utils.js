@@ -24,6 +24,16 @@ const TRANSIENT_ERROR_PATTERNS = [
   /gateway\s+is\s+draining/i,
   /new\s+tasks\s+are\s+not\s+accepted/i,
   /gateway.*draining.*restart/i,
+  // OpenClaw core's provider-failover layer emits exactly these three strings
+  // (messageForReason in the openai-compat error envelope): "upstream provider
+  // timeout" (timeout, 504), "upstream provider error" (server_error, 502),
+  // "upstream provider overloaded" (overloaded, 502). Observed in prod (rh-bot,
+  // 2026-09-09, Daily Brief): "Chat completions stream error: upstream provider
+  // timeout" soft-failed with no retry because no existing pattern covered the
+  // provider-prefix form. The triple-word anchor keeps prose like "the upstream
+  // provider was down" unflagged; verified 0 false-positives across all 1,740
+  // historical ok-run summaries in the prod scheduler DB.
+  /\bupstream\s+provider\s+(?:timeout|error|overloaded)\b/i,
 ];
 
 const DRAIN_PATTERNS = [

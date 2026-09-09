@@ -2499,6 +2499,18 @@ console.log('\n-- Transient Error Detection --');
   assert(detectTransientError('Retry later'), 'detects: retry later');
   assert(detectTransientError('retry in 5 seconds'), 'detects: retry in N');
 
+  // OpenClaw core's provider-failover layer emits exactly these three strings
+  // (messageForReason in the openai-compat error envelope). Observed in prod
+  // (rh-bot, 2026-09-09, Daily Brief): the stream error soft-failed with no
+  // retry because no existing pattern covered the provider-prefix form.
+  assert(detectTransientError('Chat completions stream error: upstream provider timeout'), 'detects: upstream provider timeout (prod string)');
+  assert(detectTransientError('Chat completions failed (504): {"error":{"message":"upstream provider timeout","type":"api_error"}}'), 'detects: upstream provider timeout (408/504 envelope)');
+  assert(detectTransientError('Chat completions stream error: upstream provider error'), 'detects: upstream provider error');
+  assert(detectTransientError('Chat completions stream error: upstream provider overloaded'), 'detects: upstream provider overloaded');
+  // Triple-word anchor: prose mentioning the provider stays unflagged.
+  assert(!detectTransientError('The upstream provider was down for a few minutes this morning'), 'ignores: prose "upstream provider" without a failure token');
+  assert(!detectTransientError('upstream provider latency is trending down'), 'ignores: "upstream provider latency" (non-matching token)');
+
   // "retry after" without a number is prose, not a transport notice.
   // Observed false positive (2026-09-08, Morning Daily Brief run 60c3cebf):
   // a successful report containing "the retry after this morning's
