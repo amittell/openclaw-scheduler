@@ -9,7 +9,16 @@ const TRANSIENT_ERROR_PATTERNS = [
   /\bmodel\s+(?:is\s+)?(?:overloaded|unavailable)\b/i,
   /\bAPI\s+(?:error|unavailable|timeout)\b/i,
   /\bcapacity\s+(?:exceeded|limit)\b/i,
-  /\bretry\s+(?:after|later|in\s+\d)\b/i,
+  // "retry after" / "retry in" require a number with a word boundary after it:
+  // gateway rate-limit/overload notices say "retry after 30 seconds" (or
+  // surface a Retry-After value), while agent reports can contain the prose
+  // "the retry after this morning's attempt" (observed false positive:
+  // Morning Daily Brief 2026-09-08, run 60c3cebf). The trailing \b (on \d+) is
+  // preserved from the original combined pattern so e.g. "retry in 2FA" does
+  // not match.
+  /\bretry\s+after\s+\d+\b/i,
+  /\bretry\s+in\s+\d+\b/i,
+  /\bretry\s+later\b/i,
   /\bcontext\s+(?:length|window)\s+exceeded\b/i,
   /\btoken\s+limit\s+exceeded\b/i,
   /gateway\s+is\s+draining/i,
