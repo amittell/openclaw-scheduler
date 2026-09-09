@@ -2498,6 +2498,15 @@ console.log('\n-- Transient Error Detection --');
   assert(detectTransientError('Please retry after 30 seconds'), 'detects: retry after');
   assert(detectTransientError('Retry later'), 'detects: retry later');
   assert(detectTransientError('retry in 5 seconds'), 'detects: retry in N');
+
+  // "retry after" without a number is prose, not a transport notice.
+  // Observed false positive (2026-09-08, Morning Daily Brief run 60c3cebf):
+  // a successful report containing "the retry after this morning's
+  // interrupted attempt" was classified as a transient error, flipping the
+  // run to status=error, firing a spurious failure alert, and arming a
+  // redundant 300s transient retry of an already-delivered report.
+  assert(!detectTransientError("the retry after this morning's interrupted attempt"), 'ignores: prose "retry after" without a number');
+  assert(!detectTransientError('Both reports are out. All healthy — k8s green everywhere, backups 6/6 fresh. I flagged the lateness since this was the retry after this morning\'s interrupted attempt.'), 'ignores: successful report mentioning a retry');
   assert(detectTransientError('context length exceeded'), 'detects: context length exceeded');
   assert(detectTransientError('context window exceeded'), 'detects: context window exceeded');
   assert(detectTransientError('token limit exceeded'), 'detects: token limit exceeded');

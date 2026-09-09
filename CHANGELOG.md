@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop the transient-error scanner from false-positiving on report prose.**
+  `detectTransientError` scanned the first 500 chars of an agent reply for
+  transport-notice phrases; the pattern `retry\s+(?:after|later|in\s+\d)`
+  matched the prose "the retry after this morning's interrupted attempt"
+  inside a successful Daily Brief (run `60c3cebf`, 2026-09-08), flipping the
+  completed run to `status=error`, firing a spurious failure alert, and
+  arming a redundant 300s transient retry of an already-delivered report.
+  "retry after" now requires a following number (gateway notices say
+  "retry after 30 seconds" / surface a Retry-After value; prose does not),
+  while "retry later" and "retry in <n>" keep their current matching.
+  Regression tests added using the exact observed strings.
+
 ## [0.6.1] -- 2026-09-08
 
 ### Changed
