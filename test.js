@@ -2507,6 +2507,11 @@ console.log('\n-- Transient Error Detection --');
   // redundant 300s transient retry of an already-delivered report.
   assert(!detectTransientError("the retry after this morning's interrupted attempt"), 'ignores: prose "retry after" without a number');
   assert(!detectTransientError('Both reports are out. All healthy — k8s green everywhere, backups 6/6 fresh. I flagged the lateness since this was the retry after this morning\'s interrupted attempt.'), 'ignores: successful report mentioning a retry');
+  // Boundary preservation (regression guard for the split patterns): a digit
+  // immediately followed by a letter is not a delay value.
+  assert(!detectTransientError('The retry in 2FA login succeeded'), 'ignores: "retry in 2FA" (letter after digit)');
+  assert(!detectTransientError('retry after the storm'), 'ignores: "retry after" + non-numeric');
+  assert(detectTransientError('retry after 30 seconds'), 'detects: multi-digit "retry after 30"');
   assert(detectTransientError('context length exceeded'), 'detects: context length exceeded');
   assert(detectTransientError('context window exceeded'), 'detects: context window exceeded');
   assert(detectTransientError('token limit exceeded'), 'detects: token limit exceeded');
