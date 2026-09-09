@@ -2504,12 +2504,18 @@ console.log('\n-- Transient Error Detection --');
   // (rh-bot, 2026-09-09, Daily Brief): the stream error soft-failed with no
   // retry because no existing pattern covered the provider-prefix form.
   assert(detectTransientError('Chat completions stream error: upstream provider timeout'), 'detects: upstream provider timeout (prod string)');
-  assert(detectTransientError('Chat completions failed (504): {"error":{"message":"upstream provider timeout","type":"api_error"}}'), 'detects: upstream provider timeout (408/504 envelope)');
-  assert(detectTransientError('Chat completions stream error: upstream provider error'), 'detects: upstream provider error');
-  assert(detectTransientError('Chat completions stream error: upstream provider overloaded'), 'detects: upstream provider overloaded');
-  // Triple-word anchor: prose mentioning the provider stays unflagged.
-  assert(!detectTransientError('The upstream provider was down for a few minutes this morning'), 'ignores: prose "upstream provider" without a failure token');
+  assert(detectTransientError('Chat completions failed (408): {"error":{"message":"upstream provider timeout","type":"api_error"}}'), 'detects: upstream provider timeout (408 envelope)');
+  assert(detectTransientError('Chat completions failed (504): {"error":{"message":"upstream provider timeout","type":"api_error"}}'), 'detects: upstream provider timeout (504 envelope)');
+  assert(detectTransientError('Chat completions failed: upstream provider error'), 'detects: upstream provider error (bare failed prefix)');
+  assert(detectTransientError('Chat completions stream error: upstream provider error'), 'detects: upstream provider error (stream)');
+  assert(detectTransientError('Chat completions stream error: upstream provider overloaded'), 'detects: upstream provider overloaded (stream)');
+  // Envelope anchoring (review fix for the P2 finding): the phrase only
+  // counts inside the gateway's "Chat completions …" error prefix, so report
+  // prose containing the same words stays unflagged.
+  assert(!detectTransientError('Upstream provider error rate fell to 0.1%; all services are healthy'), 'ignores: prose "Upstream provider error rate fell to..." (Codex P2 case)');
+  assert(!detectTransientError('The upstream provider was down for a few minutes this morning'), 'ignores: prose "upstream provider" without envelope prefix');
   assert(!detectTransientError('upstream provider latency is trending down'), 'ignores: "upstream provider latency" (non-matching token)');
+  assert(!detectTransientError('upstream provider timeout'), 'ignores: bare phrase with no envelope prefix');
 
   // "retry after" without a number is prose, not a transport notice.
   // Observed false positive (2026-09-08, Morning Daily Brief run 60c3cebf):

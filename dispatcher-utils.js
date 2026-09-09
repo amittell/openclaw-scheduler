@@ -27,13 +27,18 @@ const TRANSIENT_ERROR_PATTERNS = [
   // OpenClaw core's provider-failover layer emits exactly these three strings
   // (messageForReason in the openai-compat error envelope): "upstream provider
   // timeout" (timeout, 504), "upstream provider error" (server_error, 502),
-  // "upstream provider overloaded" (overloaded, 502). Observed in prod (rh-bot,
-  // 2026-09-09, Daily Brief): "Chat completions stream error: upstream provider
-  // timeout" soft-failed with no retry because no existing pattern covered the
-  // provider-prefix form. The triple-word anchor keeps prose like "the upstream
-  // provider was down" unflagged; verified 0 false-positives across all 1,740
-  // historical ok-run summaries in the prod scheduler DB.
-  /\bupstream\s+provider\s+(?:timeout|error|overloaded)\b/i,
+  // "upstream provider overloaded" (overloaded, 502). The scheduler's gateway
+  // client always wraps them in its error prefix (gateway.js): "Chat completions
+  // stream error: ...", "Chat completions failed: ...", and "Chat completions
+  // failed (NNN): ...". Observed in prod (rh-bot, 2026-09-09, Daily Brief):
+  // "Chat completions stream error: upstream provider timeout" soft-failed with
+  // no retry because no existing pattern covered this form. The pattern is
+  // anchored to that envelope prefix (review fix: the bare token matched report
+  // prose such as "Upstream provider error rate fell to 0.1%"), so prose stays
+  // unflagged; verified 0 false-positives across all 1,740 historical ok-run
+  // summaries in the prod scheduler DB, and it matches all three distinct prod
+  // error strings recorded on 2026-09-09 (stream + 408 + 504 envelopes).
+  /\bchat\s+completions\s+(?:stream\s+error|failed(?:\s*\(\d{3}\))?)[\s:]*.*\bupstream\s+provider\s+(?:timeout|error|overloaded)\b/i,
 ];
 
 const DRAIN_PATTERNS = [
