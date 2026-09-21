@@ -1462,6 +1462,22 @@ function respawnInterrupted(label) {
       '--message', continuationMsg,
       '--mode', 'reuse',
     ];
+    // Carry the original label's agent forward: cmdEnqueue defaults --agent to
+    // 'main' and validates the reused sessionKey against that agent, so a label
+    // created for a non-main agent would fail redispatch without this.
+    if (entry?.agent) {
+      try {
+        enqueueArgs.push('--agent', assertValidAgentId(entry.agent, `redispatch agent for label ${JSON.stringify(label)}`));
+      } catch (agentErr) {
+        process.stderr.write(`[watcher] [${label}] invalid persisted agent ${JSON.stringify(entry.agent)} -- redispatching with default agent: ${agentErr.message}\n`);
+      }
+    }
+    // Carry the original verify-cmd forward: cmdEnqueue writes verifyCmd: null
+    // when --verify-cmd is omitted, so an interrupted retry would otherwise
+    // clear the post-completion verification.
+    if (typeof entry?.verifyCmd === 'string' && entry.verifyCmd) {
+      enqueueArgs.push('--verify-cmd', entry.verifyCmd);
+    }
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
     if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
@@ -1530,15 +1546,15 @@ function emitInterruptedOutcome(label, summary, result = null) {
     process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
-  markLabelError(label, summary || 'interrupted: session went idle without calling done');
-
   // -- Interrupted auto-redispatch ----------------------------------------
   // Reached only when verify-cmd did not pass and no artifact evidence was
   // found: the session lost its work (transcript readable, no terminal reply).
   // Re-dispatch up to MAX_INTERRUPT_RETRIES times with a continuation prompt.
   // The counter is per-label and independent of the 529 / gateway-restart
-  // budgets; it resets on a clean done. At max retries the terminal state above
-  // stands so the 5-min check-in announcements stay accurate.
+  // budgets; it resets on a clean done. The label is only marked terminal
+  // when no further redispatch will be scheduled; while a backoff or a
+  // respawn failure is pending it stays non-terminal so the 5-min check-in
+  // announcements stay accurate.
   const interruptDecision = getInterruptRedispatchDecision(label);
   if (interruptDecision) {
     const retryAfterMs = parseTimestampMs(entry?.watcherRetryAfter);
@@ -1560,7 +1576,7 @@ function emitInterruptedOutcome(label, summary, result = null) {
       markWatcherPending(label, `interrupted redispatch scheduled for future tick (${interruptDecision.delayMs / 1000}s)`);
     }
 
-    if (Date.now() < retryAfterMs) {
+    if (retryAfterMs && Date.now() < retryAfterMs) {
       markWatcherPending(label, 'interrupted redispatch backoff active');
     }
 
@@ -1568,14 +1584,34 @@ function emitInterruptedOutcome(label, summary, result = null) {
       clearWatcherRetryAfter(label);
       markWatcherPending(label, 'interrupted redispatch dispatched');
     }
+
+    // Respawn failed. If the retry budget is not exhausted, advance the
+    // counter and schedule a fresh backoff window so the next tick retries
+    // cleanly instead of looping on the stale window. Only mark the label
+    // terminal interrupted when the budget is actually exhausted.
+    const failedRetryCount = getInterruptRetryCount(label);
+    if (failedRetryCount < MAX_INTERRUPT_RETRIES) {
+      const nextRetryCount = failedRetryCount + 1;
+      const nextDelayMs = INTERRUPT_RETRY_BASE_DELAY_MS * nextRetryCount;
+      setInterruptRetryCount(label, nextRetryCount);
+      updateExistingLabel(label, (current) => {
+        current.watcherRetryAfter = new Date(Date.now() + nextDelayMs).toISOString();
+      });
+      process.stderr.write(
+        `[watcher] [${label}] interrupted redispatch failed -- retry ${nextRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
+        `scheduled in ${nextDelayMs / 1000}s\n`
+      );
+      markWatcherPending(label, `interrupted redispatch failed; retry ${nextRetryCount}/${MAX_INTERRUPT_RETRIES} scheduled in ${nextDelayMs / 1000}s`);
+    }
     markLabelInterrupted(label, summary || 'interrupted: session went idle without calling done');
     process.stdout.write(
-      `⚠️ dispatch [${label}] interrupted -- re-dispatch failed\n` +
+      `⚠️ dispatch [${label}] interrupted -- re-dispatch failed and retry budget exhausted\n` +
       `Summary: ${summary || 'interrupted: session went idle without calling done'}\n`
     );
     process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
+  markLabelError(label, summary || 'interrupted: session went idle without calling done');
   process.stdout.write(
     `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
     `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
