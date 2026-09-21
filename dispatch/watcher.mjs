@@ -18,6 +18,16 @@
  *   (30s * retryCount). It respawns via `dispatch enqueue --mode reuse` to continue
  *   the same session, and tracks retryCount in labels.json.
  *
+ * Interrupted auto-redispatch:
+ *   When a session auto-resolves as 'interrupted' (transcript readable but no
+ *   terminal reply, e.g. a reasoning-only turn the harness did not retry), the
+ *   watcher re-dispatches via `dispatch enqueue --mode reuse` with a continuation
+ *   prompt, up to DISPATCH_INTERRUPT_RETRIES times (default 2). It tracks a
+ *   separate interruptRetryCount in labels.json (independent of the 529 and
+ *   gateway-restart counters) and backs off 60s * retryCount before the next
+ *   attempt. At max retries the label keeps its 'interrupted' terminal status.
+ *   The counter resets on a clean done.
+ *
  * Usage: node watcher.mjs --label <label> [--timeout <seconds>] [--poll-interval <seconds>]
  *
  * Exit codes:
@@ -75,6 +85,19 @@ const MAX_529_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 30000; // 30 seconds
 
 const MAX_GW_RESTART_RETRIES = 2; // Max retries for gateway-restart-kill recovery
+
+// Interrupted auto-redispatch: separate budget from the 529 and gateway-restart
+// counters. DISPATCH_INTERRUPT_RETRIES=0 disables the redispatch entirely.
+const MAX_INTERRUPT_RETRIES = (() => {
+  const raw = process.env.DISPATCH_INTERRUPT_RETRIES;
+  const n = raw === undefined ? 2 : parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 ? n : 2;
+})();
+const INTERRUPT_RETRY_BASE_DELAY_MS = (() => {
+  const raw = process.env.DISPATCH_INTERRUPT_RETRY_BASE_DELAY_MS;
+  const n = raw === undefined ? 60000 : parseInt(raw, 10);
+  return Number.isInteger(n) && n > 0 ? n : 60000;
+})();
 
 const FLAT_WINDOW_MS = 3 * 60 * 1000; // 3 min flat = genuinely stuck
 const ACTIVITY_POLL_MS = 30_000;
@@ -497,6 +520,37 @@ function setGwRestartRetryCount(label, count) {
   updateExistingLabel(label, (entry) => {
     entry.gwRestartRetryCount = count;
   });
+}
+
+/**
+ * Get the current interrupted-redispatch count for a label (default 0).
+ * Separate from retryCount (529) and gwRestartRetryCount (gateway restart).
+ */
+function getInterruptRetryCount(label) {
+  const labels = loadLabels();
+  return labels[label]?.interruptRetryCount || 0;
+}
+
+/**
+ * Update the interrupted-redispatch count for a label.
+ */
+function setInterruptRetryCount(label, count) {
+  updateExistingLabel(label, (entry) => {
+    entry.interruptRetryCount = count;
+  });
+}
+
+/**
+ * Decide whether an interrupted terminal resolution should be re-dispatched.
+ * Pure: reads the per-label counter and returns the next count and backoff
+ * delay, or null when the budget is exhausted (or redispatch is disabled).
+ */
+function getInterruptRedispatchDecision(label, maxRetries = MAX_INTERRUPT_RETRIES) {
+  const retryCount = getInterruptRetryCount(label);
+  if (retryCount >= maxRetries) return null;
+  const newRetryCount = retryCount + 1;
+  const delayMs = INTERRUPT_RETRY_BASE_DELAY_MS * newRetryCount;
+  return { retryCount, newRetryCount, delayMs };
 }
 
 /**
@@ -1291,6 +1345,8 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   if (retryCount > 0) setRetryCount(label, 0);
   const gatewayRetryCount = getGwRestartRetryCount(label);
   if (gatewayRetryCount > 0) setGwRestartRetryCount(label, 0);
+  const interruptRetryCount = getInterruptRetryCount(label);
+  if (interruptRetryCount > 0) setInterruptRetryCount(label, 0);
 
   // Update labels.json before exiting -- prevents stuck detector false positives
   const completion = resolveCompletionDelivery({
@@ -1390,6 +1446,47 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   process.exit(exitZeroOnTerminal ? 0 : 1);
 }
 
+function respawnInterrupted(label) {
+  try {
+    const labels = loadLabels();
+    const entry = labels[label];
+    if (!entry) throw new Error(`label "${label}" not found`);
+
+    const continuationMsg =
+      `[Auto-redispatch after interrupted session] Your previous run on this session was interrupted before completion. ` +
+      `Continue from where the transcript left off; do not redo completed steps.`;
+
+    const enqueueArgs = [
+      INDEX_PATH, 'enqueue',
+      '--label', label,
+      '--message', continuationMsg,
+      '--mode', 'reuse',
+    ];
+    if (entry?.model) enqueueArgs.push('--model', entry.model);
+    if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
+    if (entry?.origin) enqueueArgs.push('--origin', entry.origin);
+    if (entry?.sourceContext) enqueueArgs.push('--source-context', JSON.stringify(entry.sourceContext));
+    if (entry?.timeoutSeconds) enqueueArgs.push('--timeout', String(entry.timeoutSeconds));
+    if (entry?.deliverTo) {
+      enqueueArgs.push('--deliver-to', entry.deliverTo);
+      if (entry?.deliveryMode) enqueueArgs.push('--delivery-mode', entry.deliveryMode);
+      if (entry?.deliverChannel) enqueueArgs.push('--deliver-channel', entry.deliverChannel);
+    }
+
+    execFileSync(process.execPath, enqueueArgs, {
+      encoding: 'utf-8',
+      timeout: 60000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    process.stderr.write(`[watcher] [${label}] re-dispatched via enqueue --mode reuse after interrupted session\n`);
+    return true;
+  } catch (err) {
+    process.stderr.write(`[watcher] [${label}] interrupted re-dispatch failed: ${err.message}\n`);
+    return false;
+  }
+}
+
 function emitInterruptedOutcome(label, summary, result = null) {
   process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
   const entry = getLabelEntry(label);
@@ -1434,6 +1531,51 @@ function emitInterruptedOutcome(label, summary, result = null) {
   }
 
   markLabelError(label, summary || 'interrupted: session went idle without calling done');
+
+  // -- Interrupted auto-redispatch ----------------------------------------
+  // Reached only when verify-cmd did not pass and no artifact evidence was
+  // found: the session lost its work (transcript readable, no terminal reply).
+  // Re-dispatch up to MAX_INTERRUPT_RETRIES times with a continuation prompt.
+  // The counter is per-label and independent of the 529 / gateway-restart
+  // budgets; it resets on a clean done. At max retries the terminal state above
+  // stands so the 5-min check-in announcements stay accurate.
+  const interruptDecision = getInterruptRedispatchDecision(label);
+  if (interruptDecision) {
+    const retryAfterMs = parseTimestampMs(entry?.watcherRetryAfter);
+    if (!retryAfterMs) {
+      // First tick: persist the intent (counter + backoff window) and defer the
+      // respawn to the tick after the delay, mirroring the 529 once-mode path.
+      setInterruptRetryCount(label, interruptDecision.newRetryCount);
+      updateExistingLabel(label, (current) => {
+        current.watcherRetryAfter = new Date(Date.now() + interruptDecision.delayMs).toISOString();
+      });
+      process.stderr.write(
+        `[watcher] [${label}] interrupted redispatch ${interruptDecision.newRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
+        `scheduled in ${interruptDecision.delayMs / 1000}s\n`
+      );
+      notify(
+        `🌶️ Dispatch: [${label}] interrupted before completion -- ` +
+        `re-dispatching (${interruptDecision.newRetryCount}/${MAX_INTERRUPT_RETRIES}) in ${interruptDecision.delayMs / 1000}s`
+      );
+      markWatcherPending(label, `interrupted redispatch scheduled for future tick (${interruptDecision.delayMs / 1000}s)`);
+    }
+
+    if (Date.now() < retryAfterMs) {
+      markWatcherPending(label, 'interrupted redispatch backoff active');
+    }
+
+    if (respawnInterrupted(label)) {
+      clearWatcherRetryAfter(label);
+      markWatcherPending(label, 'interrupted redispatch dispatched');
+    }
+    markLabelInterrupted(label, summary || 'interrupted: session went idle without calling done');
+    process.stdout.write(
+      `⚠️ dispatch [${label}] interrupted -- re-dispatch failed\n` +
+      `Summary: ${summary || 'interrupted: session went idle without calling done'}\n`
+    );
+    process.exit(exitZeroOnTerminal ? 0 : 1);
+  }
+
   process.stdout.write(
     `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
     `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
@@ -1625,6 +1767,8 @@ function runOnceAndExit() {
       if (currentRetryCount > 0) setRetryCount(label, 0);
       const gwRetryCount = getGwRestartRetryCount(label);
       if (gwRetryCount > 0) setGwRestartRetryCount(label, 0);
+      const interruptRetryCount = getInterruptRetryCount(label);
+      if (interruptRetryCount > 0) setInterruptRetryCount(label, 0);
       deliverResult(label, terminalResult?.lastReply, status.summary, terminalCompletion);
     }
 
@@ -2026,6 +2170,11 @@ while (Date.now() < deadline) {
         setRetryCount(label, 0);
         process.stderr.write(`[watcher] [${label}] completed after ${currentRetryCount} retry(ies), reset retryCount\n`);
       }
+      const interruptRetryCount = getInterruptRetryCount(label);
+      if (interruptRetryCount > 0) {
+        setInterruptRetryCount(label, 0);
+        process.stderr.write(`[watcher] [${label}] completed after ${interruptRetryCount} interrupted redispatch(es), reset interruptRetryCount\n`);
+      }
     }
     deliverResult(label, terminalResult?.lastReply, status.summary, terminalCompletion);
   }
@@ -2172,6 +2321,8 @@ if (statusAtDeadline?.status === 'done' || baselineTokens === null) {
     if (retryCount > 0) setRetryCount(label, 0);
     const gatewayRetryCount = getGwRestartRetryCount(label);
     if (gatewayRetryCount > 0) setGwRestartRetryCount(label, 0);
+    const interruptRetryCount = getInterruptRetryCount(label);
+    if (interruptRetryCount > 0) setInterruptRetryCount(label, 0);
     // Route the authoritative deadline completion through the same durable
     // outbox path as every other watcher completion, even without a structured
     // payload. deliverResult exits after enqueueing or explicit fallback.
