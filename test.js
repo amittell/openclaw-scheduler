@@ -5917,6 +5917,9 @@ if (sub === 'status') {
   //     Mock always returns status=interrupted with the auto-resolve summary.
   //     Watcher must: exit non-zero (exit 1), write warning emoji to stdout,
   //     and NOT deliver as a successful result.
+  //     DISPATCH_INTERRUPT_RETRIES=0 pins the legacy terminal path; the new
+  //     default-mode redispatch behavior is covered by 3b2 and by
+  //     tests/dispatch-interrupted-redispatch.test.mjs.
   {
     const intTempDir = mkdtempSync(join(tmpdir(), 'watcher-intr-'));
     const mockIntrPath = join(intTempDir, 'mock-interrupted.mjs');
@@ -5961,7 +5964,8 @@ if (sub === 'status') {
           SCHEDULER_DB: watcherDbPath,
           DISPATCH_INDEX_PATH: mockIntrPath,
           ...dispatchLabelsEnv(mockLabelsIntr),
-        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+          OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+          DISPATCH_INTERRUPT_RETRIES: '0',
         },
         encoding: 'utf8',
         timeout: 40000,
@@ -5982,6 +5986,72 @@ if (sub === 'status') {
     assert(finalLabels['test-intr'].status === 'error', 'interrupted: watcher marks label as error in labels.json');
 
     rmSync(intTempDir, { recursive: true, force: true });
+  }
+
+  // 3b2. Interrupted, default mode: the watcher attempts the auto-redispatch
+  //      (2026-09-21: a long dispatch died mid-task as 'interrupted' and the work
+  //      was lost until a human re-dispatched it 45 min later). First tick: the
+  //      counter + backoff window are persisted, the watcher stays pending
+  //      (exit 0), and no terminal error state is written.
+  {
+    const int2TempDir = mkdtempSync(join(tmpdir(), 'watcher-intr2-'));
+    const mockIntr2Path = join(int2TempDir, 'mock-interrupted2.mjs');
+    const mockLabelsIntr2 = join(int2TempDir, 'labels-intr2.json');
+
+    writeFileSync(mockIntr2Path, `
+import { appendFileSync } from 'node:fs';
+const [,,sub] = process.argv;
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'test-intr2',
+    status: 'interrupted',
+    summary: 'Auto-resolved: session went idle without calling done. Work may be incomplete. (session idle 15 min)',
+    sessionKey: 'agent:main:subagent:intr2-uuid',
+    liveness: { ageMs: 900000, updatedAt: Date.now() - 900000 },
+  }) + '\\n');
+} else if (sub === 'result') {
+  process.stdout.write(JSON.stringify({ ok: true, lastReply: null, status: 'interrupted' }) + '\\n');
+} else if (sub === 'enqueue') {
+  appendFileSync(${JSON.stringify(join(int2TempDir, 'enqueue.log'))}, JSON.stringify(process.argv.slice(2)) + '\\n');
+  process.stdout.write(JSON.stringify({ ok: true, label: 'test-intr2', status: 'accepted', mode: 'reuse' }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+}
+`);
+
+    writeFileSync(mockLabelsIntr2, JSON.stringify({
+      'test-intr2': {
+        sessionKey: 'agent:main:subagent:intr2-uuid',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date(Date.now() - 200_000).toISOString(),
+        timeoutSeconds: 300,
+      },
+    }) + '\n');
+
+    const intr2Run = spawnSync(process.execPath, [watcherPath, '--label', 'test-intr2', '--timeout', '30', '--poll-interval', '1'], {
+      env: {
+        ...process.env,
+        SCHEDULER_DB: watcherDbPath,
+        DISPATCH_INDEX_PATH: mockIntr2Path,
+        ...dispatchLabelsEnv(mockLabelsIntr2),
+        OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+      },
+      encoding: 'utf8',
+      timeout: 40000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    assert((intr2Run.status ?? 1) === 0, 'interrupted default mode: watcher stays pending (exit 0) on the first tick');
+    assert((intr2Run.stderr || '').includes('interrupted redispatch scheduled'), 'interrupted default mode: redispatch scheduled');
+    const intr2Labels = JSON.parse(readFileSync(mockLabelsIntr2, 'utf-8'));
+    assert(intr2Labels['test-intr2'].interruptRetryCount === 1, 'interrupted default mode: interruptRetryCount persisted to 1');
+    assert(Boolean(intr2Labels['test-intr2'].watcherRetryAfter), 'interrupted default mode: backoff window persisted');
+    assert(!existsSync(join(int2TempDir, 'enqueue.log')), 'interrupted default mode: no respawn before the backoff window');
+
+    rmSync(int2TempDir, { recursive: true, force: true });
   }
 
   // 3c. Missed-done recovery: if the run wrote a real terminal final report but never
@@ -6053,6 +6123,7 @@ if (sub === 'status') {
         DISPATCH_INDEX_PATH: mockMissedPath,
         ...dispatchLabelsEnv(mockLabelsMissed),
         OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1',
+        DISPATCH_INTERRUPT_RETRIES: '0',
       },
       encoding: 'utf8',
       timeout: 15000,
