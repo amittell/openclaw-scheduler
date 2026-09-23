@@ -1454,6 +1454,7 @@ function respawnInterrupted(label) {
 
     const continuationMsg =
       `[Auto-redispatch after interrupted session] Your previous run on this session was interrupted before completion. ` +
+      `It may have left partial artifacts on disk -- verify the existing state before redoing any work. ` +
       `Continue from where the transcript left off; do not redo completed steps.`;
 
     const enqueueArgs = [
@@ -1534,22 +1535,40 @@ function emitInterruptedOutcome(label, summary, result = null) {
     );
   }
 
-  if (artifactEvidence?.found) {
-    const artifactSummary = `interrupted after producing artifacts: ${artifactEvidence.reason}`;
-    markLabelInterrupted(label, artifactSummary);
-    process.stdout.write(
-      `⚠️ dispatch [${label}] interrupted after producing artifacts -- work may be incomplete\n` +
+  // -- Artifact evidence: the session died but produced real output. -------
+  // NOT automatically "complete": a mid-work death (e.g. an xhigh thinking
+  // loop) leaves partial artifacts and the work is unfinished. Do NOT mark
+  // terminal here -- fall through to the interrupt auto-redispatch below so
+  // the agent continues from the transcript (reuse mode). The label only goes
+  // terminal when the redispatch budget is exhausted, and it carries the
+  // artifact summary in that case. (Regression: sm-round8-fix, 2026-09-23 --
+  // an artifact-interrupt went terminal and nothing re-dispatched the work.)
+  const artifactFound = artifactEvidence?.found;
+  const artifactSummary = artifactFound
+    ? `interrupted after producing artifacts: ${artifactEvidence.reason}`
+    : null;
+  if (artifactFound) {
+    // Pending-path diagnostic: keep it OFF stdout so the completion-watcher
+    // pending protocol (stdout empty + WATCHER_PENDING on stderr) is preserved.
+    // Non-empty stdout makes the quick-poll job finalize as a terminal result
+    // before the backoff tick reaches `enqueue --mode reuse`, so the auto-
+    // redispatch would never fire. The user-facing notification is the notify()
+    // call below; stdout is reserved for the terminal deliverable (budget
+    // exhausted). (Copilot r4084521857, sm-round8-fix, 2026-09-23.)
+    process.stderr.write(
+      `[watcher] [${label}] interrupted after producing artifacts -- work may be incomplete\n` +
       `Summary: ${artifactEvidence.reason}` +
       `${summary ? `\nContext: ${summary}` : ''}` +
       `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
     );
-    process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
   // -- Interrupted auto-redispatch ----------------------------------------
-  // Reached only when verify-cmd did not pass and no artifact evidence was
+  // Reached when verify-cmd did not pass, whether or not artifact evidence was
   // found: the session lost its work (transcript readable, no terminal reply).
-  // Re-dispatch up to MAX_INTERRUPT_RETRIES times with a continuation prompt.
+  // Artifact-producing deaths (mid-work stalls) also continue from the
+  // transcript -- the work is incomplete either way. Re-dispatch up to
+  // MAX_INTERRUPT_RETRIES times with a continuation prompt.
   // The counter is per-label and independent of the 529 / gateway-restart
   // budgets; it resets on a clean done. The label is only marked terminal
   // when no further redispatch will be scheduled; while a backoff or a
@@ -1564,6 +1583,13 @@ function emitInterruptedOutcome(label, summary, result = null) {
       setInterruptRetryCount(label, interruptDecision.newRetryCount);
       updateExistingLabel(label, (current) => {
         current.watcherRetryAfter = new Date(Date.now() + interruptDecision.delayMs).toISOString();
+        // Reset the label to non-terminal while the redispatch is pending. The
+        // production auto-resolve path (dispatch/index.mjs) persists status
+        // 'interrupted' BEFORE this watcher runs, so without this the label
+        // stays terminal and check-ins report an interrupted run even though a
+        // redispatch is scheduled. (Copilot r4084521899.)
+        current.status = 'running';
+        delete current.error;
       });
       process.stderr.write(
         `[watcher] [${label}] interrupted redispatch ${interruptDecision.newRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
@@ -1596,6 +1622,11 @@ function emitInterruptedOutcome(label, summary, result = null) {
       setInterruptRetryCount(label, nextRetryCount);
       updateExistingLabel(label, (current) => {
         current.watcherRetryAfter = new Date(Date.now() + nextDelayMs).toISOString();
+        // Keep the label non-terminal while a retry is pending (same reset as
+        // the first-tick branch; production auto-resolve persists 'interrupted'
+        // before this watcher runs). (Copilot r4084521899.)
+        current.status = 'running';
+        delete current.error;
       });
       process.stderr.write(
         `[watcher] [${label}] interrupted redispatch failed -- retry ${nextRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
@@ -1603,15 +1634,23 @@ function emitInterruptedOutcome(label, summary, result = null) {
       );
       markWatcherPending(label, `interrupted redispatch failed; retry ${nextRetryCount}/${MAX_INTERRUPT_RETRIES} scheduled in ${nextDelayMs / 1000}s`);
     }
-    markLabelInterrupted(label, summary || 'interrupted: session went idle without calling done');
+    const exhaustedSummary = artifactSummary || summary || 'interrupted: session went idle without calling done';
+    markLabelInterrupted(label, exhaustedSummary);
     process.stdout.write(
       `⚠️ dispatch [${label}] interrupted -- re-dispatch failed and retry budget exhausted\n` +
-      `Summary: ${summary || 'interrupted: session went idle without calling done'}\n`
+      `Summary: ${exhaustedSummary}\n`
     );
     process.exit(exitZeroOnTerminal ? 0 : 1);
   }
 
-  markLabelError(label, summary || 'interrupted: session went idle without calling done');
+  // Budget exhausted (or redispatch disabled). An artifact-interrupt is an
+  // "interrupted" state (the work is on disk, the transcript is readable), so
+  // preserve the artifact summary; a plain idle is an "error".
+  if (artifactSummary) {
+    markLabelInterrupted(label, artifactSummary);
+  } else {
+    markLabelError(label, summary || 'interrupted: session went idle without calling done');
+  }
   process.stdout.write(
     `⚠️ dispatch [${label}] session went idle before completing -- work may be incomplete` +
     `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
