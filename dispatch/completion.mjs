@@ -1396,9 +1396,12 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   // The worker's final reply is the authoritative completion report. The
   // auto-generated summary_human is a lossy derivative and must only be a
-  // fallback: when lastReply is deliverable, deliver it (humanized, which
-  // pass-through preserves for real final reports).
-  if (isDeliverableText(rawReply, reply)) {
+  // fallback: when lastReply is a real human final report (multi-section,
+  // heading or bold-label), deliver it (humanized, which pass-through
+  // preserves). A thin lastReply fragment does NOT beat the structured
+  // summary - that would invert the legacy contract (raw transcript text
+  // should not beat structured completion).
+  if (isLikelyHumanFinalReport(rawReply) && isDeliverableText(rawReply, reply)) {
     const technicalDetailsText = buildTechnicalDetailsText({
       rawText: rawReply,
       summaryText: reply,
@@ -1424,6 +1427,25 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
       summary: candidate.summary || candidate.text,
       source: candidate.source,
+    };
+  }
+
+  // Deliverable lastReply that is NOT a human final report (e.g. overlong prose
+  // or a thin fragment). It lost the top gate (isLikelyHumanFinalReport) and the
+  // structured candidates above, so it is only delivered when no structured
+  // completion exists - preserving the legacy contract that a raw transcript
+  // fragment does not beat a structured summary.
+  if (isDeliverableText(rawReply, reply)) {
+    const technicalDetailsText = buildTechnicalDetailsText({
+      rawText: rawReply,
+      summaryText: reply,
+      completion,
+      includeRawSummaryDetails: false,
+    });
+    return {
+      deliveryText: composeDeliveryText(reply, technicalDetailsText),
+      summary: authoritativeStructuredSummary || reply,
+      source: 'lastReply',
     };
   }
 
