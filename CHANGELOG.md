@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.3] -- 2026-09-23
+
+### Fixed
+
+- **Auto-redispatch interrupted sessions with a per-label budget (#49, #50).**
+  A long dispatch can die mid-task with terminal status `interrupted`
+  (transcript readable, no terminal reply); the watcher classified it
+  interrupted and stopped, so nothing retried the work until a human noticed.
+  The watcher now re-dispatches interrupted terminal resolutions via
+  `dispatch enqueue --mode reuse` with a continuation prompt, up to
+  `DISPATCH_INTERRUPT_RETRIES` times (default 2; 0 disables), tracking a
+  separate `interruptRetryCount` in labels.json and backing off
+  `60s * retryCount` between attempts. The label stays non-terminal while a
+  retry is pending so check-in announcements remain accurate, and the counter
+  resets on a clean done. The artifact branch no longer marks terminal and
+  exits before reaching the redispatch decision (observed: sm-round8-fix died
+  that way 2026-09-23 and sat unmonitored); it now surfaces the artifact
+  summary to stderr, falls through to the same redispatch decision, and
+  preserves the artifact summary when the budget is exhausted. Redispatch
+  carries the label's persisted `--agent` and `--verify-cmd` so non-main-agent
+  labels and post-completion verification survive the retry.
+
+- **Prefer lastReply over summary_human in completion delivery (#51).**
+  Two bugs mangled real agent completion reports into a 1-line fragment plus
+  boilerplate filler: `resolveCompletionDelivery` tried structured candidates
+  (`summary_human` first) before `lastReply`, and `isLikelyHumanFinalReport`
+  required standalone heading lines that real reports (bold-label sections
+  like `**Root cause:** ...`) never match. A deliverable `lastReply` that
+  passes the human-final-report gate now wins with source `lastReply`, with
+  structured candidates as fallback; the gate accepts bold-label sections as
+  an alternate signal; and the technical-details section no longer duplicates
+  the report body when it is the same (compacted) text.
+
 ## [0.6.2] -- 2026-09-21
 
 ### Fixed
