@@ -36,7 +36,9 @@ test('sm-round8-fix: summary field keeps the authoritative structured summary', 
     completion: payload.completion,
     fallbackSummary: payload.completion?.summary,
   });
-  assert.equal(result.summary, humanizeCompletionText(payload.completion?.summary_human) || payload.completion?.summary_human || result.summary);
+  const expected = humanizeCompletionText(payload.completion?.summary_human) || payload.completion?.summary;
+  assert.ok(expected, 'fixture must carry a structured summary to assert against');
+  assert.equal(result.summary, expected, 'summary keeps the authoritative structured summary, not the report body');
   assert.ok(result.summary, 'summary must not be empty');
 });
 
