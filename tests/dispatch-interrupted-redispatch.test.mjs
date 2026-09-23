@@ -531,3 +531,119 @@ test('(5) DISPATCH_INTERRUPT_RETRIES=0 disables the redispatch', () => {
     rmSync(fix.root, { recursive: true, force: true });
   }
 });
+
+/**
+ * (8) REGRESSION -- sm-round8-fix (2026-09-23): an interrupted session that
+ * produced artifacts ("successful tool result observed in JSONL") used to be
+ * marked terminal by emitInterruptedOutcome() BEFORE reaching the interrupt
+ * auto-redispatch block, so nothing re-dispatched the work until a human
+ * noticed hours later. Artifact-producing deaths must fall through to the same
+ * redispatch decision (continue-from-transcript, reuse mode, per-label budget)
+ * instead of going terminal.
+ */
+test('(8) artifact-interrupt falls through to auto-redispatch (not terminal)', () => {
+  const fix = makeFixture('artifact');
+  try {
+    const stubPath = join(fix.root, 'index-stub.mjs');
+    const enqueueLog = join(fix.root, 'enqueue.log');
+    writeFileSync(stubPath, `
+import { appendFileSync } from 'node:fs';
+const sub = process.argv[2];
+if (sub === 'status') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'int-x',
+    status: 'interrupted',
+    summary: 'Auto-resolved as interrupted: session done but no terminal reply observed',
+    sessionKey: 'agent:main:subagent:11111111-2222-4333-8444-555555555555',
+  }) + '\\n');
+  process.exit(0);
+}
+if (sub === 'result') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    label: 'int-x',
+    status: 'interrupted',
+    lastReply: null,
+    diagnosticReply: null,
+    completion: null,
+    artifactEvidence: { found: true, reason: 'successful tool result observed in JSONL' },
+  }) + '\\n');
+  process.exit(0);
+}
+if (sub === 'enqueue') {
+  appendFileSync(${JSON.stringify(enqueueLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+  process.stdout.write(JSON.stringify({ ok: true, label: 'int-x', status: 'accepted', mode: 'reuse' }) + '\\n');
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ ok: true, changes: 0, details: [] }) + '\\n');
+process.exit(0);
+`);
+
+    // First artifact-interrupt tick: must schedule a redispatch, NOT go terminal.
+    writeFileSync(fix.labelsPath, JSON.stringify({
+      'int-x': {
+        sessionKey: 'agent:main:subagent:11111111-2222-4333-8444-555555555555',
+        status: 'running',
+        agent: 'main',
+        mode: 'fresh',
+        spawnedAt: new Date().toISOString(),
+        timeoutSeconds: 7200,
+        deliverTo: '484946046',
+        deliveryMode: 'announce',
+        deliverChannel: 'telegram',
+      },
+    }, null, 2));
+
+    const first = runWatcher(
+      ['--label', 'int-x', '--timeout', '3600', '--poll-interval', '20', '--once'],
+      watcherEnv(fix, {
+        stubPath,
+        DISPATCH_INTERRUPT_RETRIES: '2',
+        DISPATCH_INTERRUPT_RETRY_BASE_DELAY_MS: '120000',
+      }),
+    );
+
+    assert.equal(first.status, 0, `watcher must stay pending; stderr=${first.stderr}`);
+    assert.match(first.stderr, /WATCHER_PENDING.*interrupted redispatch scheduled/,
+      'artifact-interrupt must schedule a redispatch, not go terminal');
+    assert.match(first.stdout, /interrupted after producing artifacts/,
+      'artifact summary still surfaced to the delivery target');
+    const afterFirst = readLabels(fix)['int-x'];
+    assert.equal(afterFirst.interruptRetryCount, 1, 'counter incremented to 1');
+    assert.ok(afterFirst.watcherRetryAfter, 'backoff window persisted');
+    assert.equal(afterFirst.status, 'running',
+      'label stays non-terminal while an artifact-redispatch is pending');
+    assert.equal(existsSync(enqueueLog), false, 'no respawn before the backoff window');
+
+    // Tick after the backoff: respawn dispatched via enqueue --mode reuse.
+    const labels = readLabels(fix);
+    labels['int-x'].watcherRetryAfter = new Date(Date.now() - 1000).toISOString();
+    writeFileSync(fix.labelsPath, JSON.stringify(labels, null, 2));
+
+    const second = runWatcher(
+      ['--label', 'int-x', '--timeout', '3600', '--poll-interval', '20', '--once'],
+      watcherEnv(fix, {
+        stubPath,
+        DISPATCH_INTERRUPT_RETRIES: '2',
+        DISPATCH_INTERRUPT_RETRY_BASE_DELAY_MS: '120000',
+      }),
+    );
+
+    assert.equal(second.status, 0, `watcher must stay pending after dispatch; stderr=${second.stderr}`);
+    assert.match(second.stderr, /interrupted redispatch dispatched/,
+      'watcher should report the dispatched artifact-redispatch');
+    assert.ok(existsSync(enqueueLog), 'enqueue must have been invoked');
+    const args = JSON.parse(readFileSync(enqueueLog, 'utf8'));
+    const flag = (name) => args[args.indexOf(name) + 1];
+    assert.equal(flag('--label'), 'int-x');
+    assert.equal(flag('--mode'), 'reuse', 'continues the same session');
+    assert.match(flag('--message'), /interrupted before completion/i, 'continuation prompt present');
+    assert.equal(flag('--deliver-to'), '484946046', 'delivery target preserved');
+    const afterSecond = readLabels(fix)['int-x'];
+    assert.equal(afterSecond.watcherRetryAfter, undefined, 'backoff window cleared after dispatch');
+    assert.equal(afterSecond.interruptRetryCount, 1, 'counter not double-incremented on the dispatch tick');
+  } finally {
+    rmSync(fix.root, { recursive: true, force: true });
+  }
+});
