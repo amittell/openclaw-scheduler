@@ -1136,7 +1136,9 @@ test('watcher --once schedules a redispatch after producing artifacts (label sta
     writeFileSync(labelsPath, JSON.stringify({
       [label]: {
         sessionKey,
-        status: 'running',
+        // production state: auto-resolve persists 'interrupted' before the
+        // watcher runs; first-tick branch resets to 'running' while pending.
+        status: 'interrupted',
         agent: 'main',
         spawnedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
         timeoutSeconds: 600,
@@ -1233,7 +1235,9 @@ test('watcher --once schedules a redispatch for stalled sessions with tool outpu
     writeFileSync(labelsPath, JSON.stringify({
       [label]: {
         sessionKey,
-        status: 'running',
+        // production state: auto-resolve persists 'interrupted' before the
+        // watcher runs; first-tick branch resets to 'running' while pending.
+        status: 'interrupted',
         agent: 'main',
         spawnedAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
         timeoutSeconds: 600,

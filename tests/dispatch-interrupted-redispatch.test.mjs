@@ -581,10 +581,15 @@ process.exit(0);
 `);
 
     // First artifact-interrupt tick: must schedule a redispatch, NOT go terminal.
+    // The label starts from the PRODUCTION state: dispatch/index.mjs auto-resolve
+    // persists status 'interrupted' before this watcher runs, so the first-tick
+    // branch must reset it to 'running' while the redispatch is pending.
+    // (Copilot r4084521899.)
     writeFileSync(fix.labelsPath, JSON.stringify({
       'int-x': {
         sessionKey: 'agent:main:subagent:11111111-2222-4333-8444-555555555555',
-        status: 'running',
+        status: 'interrupted',
+        summary: 'Auto-resolved as interrupted: session done but no terminal reply observed',
         agent: 'main',
         mode: 'fresh',
         spawnedAt: new Date().toISOString(),
