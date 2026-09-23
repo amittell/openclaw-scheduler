@@ -107,6 +107,7 @@ function isLikelyHumanFinalReport(text) {
 
   const cleanedLines = rawLines.map(line => cleanMarkdown(line).replace(/\s+/g, ' ').trim());
   const headingCount = cleanedLines.filter(line => FINAL_REPORT_HEADING_RE.test(line)).length;
+  const boldLabelCount = rawLines.filter(line => /^\*\*[^*]{2,60}\*\*:?/.test(line)).length;
   const itemCount = rawLines.filter(isItemLine).length;
   const hasCue = FINAL_REPORT_CUE_RE.test(normalized);
   const hasSectionLabel = /^#{1,6}\s+\S|^[A-Za-z][A-Za-z0-9 /_-]{2,60}:$/m.test(normalized);
@@ -114,7 +115,10 @@ function isLikelyHumanFinalReport(text) {
   // This is the key path for real completion reports from agents: multiple
   // human-readable sections plus bullets. Those reports are already the final
   // answer and must not be collapsed into "Files changed: Validation: ...".
-  if (hasCue && headingCount >= 2 && (itemCount >= 1 || rawLines.length >= 5)) return true;
+  // Bold-label sections ("**Root cause:** ...") count the same as headings:
+  // agents frequently use bold labels instead of markdown headings, and the
+  // text after the colon prevents FINAL_REPORT_HEADING_RE from matching.
+  if (hasCue && (headingCount >= 2 || boldLabelCount >= 2) && (itemCount >= 1 || rawLines.length >= 5)) return true;
 
   // Allow slightly shorter reports with an explicit root cause / validation shape.
   if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
@@ -881,9 +885,14 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
   const splitRaw = extractExplicitTechnicalTail(raw);
   const rawTechnicalSource = normalizeTechnicalDetailLine(rawSections?.technical || splitRaw?.technicalTail || raw);
   const rawHasExplicitTechnical = Boolean(rawSections?.technical || splitRaw?.technicalTail);
+  // When the summary is the same report as the raw text (pass-through final
+  // report), the "technical detail" derived from raw is the report itself
+  // compacted: including it just duplicates the body under "Technical details:".
+  const rawIsSameReportAsSummary = Boolean(rawTechnicalSource && rawTechnicalSource === normalizeTechnicalDetailLine(summary));
 
   const rawTechnical = Boolean(
     rawTechnicalSource
+      && !rawIsSameReportAsSummary
       && ((rawHasExplicitTechnical && rawTechnicalSource !== summary)
         || (looksTechnicalCompletionSummary(rawTechnicalSource, summary) && rawTechnicalSource !== summary)),
   );
@@ -1385,6 +1394,24 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     },
   ];
 
+  // The worker's final reply is the authoritative completion report. The
+  // auto-generated summary_human is a lossy derivative and must only be a
+  // fallback: when lastReply is deliverable, deliver it (humanized, which
+  // pass-through preserves for real final reports).
+  if (isDeliverableText(rawReply, reply)) {
+    const technicalDetailsText = buildTechnicalDetailsText({
+      rawText: rawReply,
+      summaryText: reply,
+      completion,
+      includeRawSummaryDetails: false,
+    });
+    return {
+      deliveryText: composeDeliveryText(reply, technicalDetailsText),
+      summary: authoritativeStructuredSummary || reply,
+      source: 'lastReply',
+    };
+  }
+
   for (const candidate of structuredCandidates.filter(candidate => candidate.source !== 'technical-synthesis')) {
     if (!isDeliverableText(candidate.rawText, candidate.text)) continue;
     const technicalDetailsText = buildTechnicalDetailsText({
@@ -1397,20 +1424,6 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
       summary: candidate.summary || candidate.text,
       source: candidate.source,
-    };
-  }
-
-  if (isDeliverableText(rawReply, reply)) {
-    const technicalDetailsText = buildTechnicalDetailsText({
-      rawText: rawReply,
-      summaryText: reply,
-      completion,
-      includeRawSummaryDetails: false,
-    });
-    return {
-      deliveryText: composeDeliveryText(reply, technicalDetailsText),
-      summary: authoritativeStructuredSummary || reply,
-      source: 'lastReply',
     };
   }
 
