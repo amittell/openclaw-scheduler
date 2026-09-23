@@ -607,8 +607,11 @@ process.exit(0);
     assert.equal(first.status, 0, `watcher must stay pending; stderr=${first.stderr}`);
     assert.match(first.stderr, /WATCHER_PENDING.*interrupted redispatch scheduled/,
       'artifact-interrupt must schedule a redispatch, not go terminal');
-    assert.match(first.stdout, /interrupted after producing artifacts/,
-      'artifact summary still surfaced to the delivery target');
+    // Pending protocol: stdout stays empty (deliverable-only); the artifact
+    // diagnostic surfaces on stderr. (Copilot r4084521857.)
+    assert.equal((first.stdout || '').trim(), '', 'stdout must stay empty on a pending tick');
+    assert.match(first.stderr, /interrupted after producing artifacts/,
+      'artifact summary surfaced on stderr (pending path)');
     const afterFirst = readLabels(fix)['int-x'];
     assert.equal(afterFirst.interruptRetryCount, 1, 'counter incremented to 1');
     assert.ok(afterFirst.watcherRetryAfter, 'backoff window persisted');

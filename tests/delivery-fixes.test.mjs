@@ -1124,7 +1124,7 @@ test('dispatch status treats turn_aborted JSONL as interrupted despite fresh wat
   }
 });
 
-test('watcher --once reports interrupted after producing artifacts for interrupted status evidence', () => {
+test('watcher --once schedules a redispatch after producing artifacts (label stays non-terminal)', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-interrupted-artifacts-'));
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
@@ -1183,16 +1183,24 @@ if (sub === 'status') {
     const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
 
     assert.equal(run.status, 0, run.stderr || run.stdout);
-    assert.match(run.stdout || '', /interrupted after producing artifacts/);
-    assert.match(run.stdout || '', /Downloaded four rendered images/);
-    assert.equal(labels[label].status, 'interrupted');
+    // Pending protocol: stdout stays empty (deliverable-only); the artifact
+    // diagnostic + WATCHER_PENDING go to stderr. (Copilot r4084521857.)
+    assert.equal((run.stdout || '').trim(), '', 'stdout must stay empty on a pending tick');
+    assert.match(run.stderr || '', /WATCHER_PENDING.*interrupted redispatch scheduled/);
+    assert.match(run.stderr || '', /interrupted after producing artifacts/);
+    assert.match(run.stderr || '', /Downloaded four rendered images/);
+    // The label is reset to non-terminal while the redispatch is pending.
+    // (Copilot r4084521899.)
+    assert.equal(labels[label].status, 'running');
     assert.equal(labels[label].error, undefined);
+    assert.equal(labels[label].interruptRetryCount, 1);
+    assert.ok(labels[label].watcherRetryAfter);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test('watcher --once reports stalled sessions with tool output as interrupted after artifacts', () => {
+test('watcher --once schedules a redispatch for stalled sessions with tool output (label stays non-terminal)', () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'watcher-stalled-artifacts-'));
   const labelsPath = join(tempDir, 'labels.json');
   const mockDispatch = join(tempDir, 'mock-dispatch.mjs');
@@ -1267,10 +1275,15 @@ if (sub === 'status') {
     const labels = JSON.parse(readFileSync(labelsPath, 'utf8'));
 
     assert.equal(run.status, 0, run.stderr || run.stdout);
-    assert.match(run.stdout || '', /interrupted after producing artifacts/);
-    assert.doesNotMatch(run.stdout || '', /^❌ \*dispatch\* \[stalled-artifacts\] failed/m);
-    assert.equal(labels[label].status, 'interrupted');
+    // Pending protocol: stdout stays empty; artifact diagnostic goes to stderr.
+    assert.equal((run.stdout || '').trim(), '', 'stdout must stay empty on a pending tick');
+    assert.match(run.stderr || '', /WATCHER_PENDING.*interrupted redispatch scheduled/);
+    assert.match(run.stderr || '', /interrupted after producing artifacts/);
+    assert.doesNotMatch(run.stderr || '', /^❌ \*dispatch\* \[stalled-artifacts\] failed/m);
+    assert.equal(labels[label].status, 'running');
     assert.equal(labels[label].error, undefined);
+    assert.equal(labels[label].interruptRetryCount, 1);
+    assert.ok(labels[label].watcherRetryAfter);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }

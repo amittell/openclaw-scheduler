@@ -1548,8 +1548,15 @@ function emitInterruptedOutcome(label, summary, result = null) {
     ? `interrupted after producing artifacts: ${artifactEvidence.reason}`
     : null;
   if (artifactFound) {
-    process.stdout.write(
-      `⚠️ dispatch [${label}] interrupted after producing artifacts -- work may be incomplete\n` +
+    // Pending-path diagnostic: keep it OFF stdout so the completion-watcher
+    // pending protocol (stdout empty + WATCHER_PENDING on stderr) is preserved.
+    // Non-empty stdout makes the quick-poll job finalize as a terminal result
+    // before the backoff tick reaches `enqueue --mode reuse`, so the auto-
+    // redispatch would never fire. The user-facing notification is the notify()
+    // call below; stdout is reserved for the terminal deliverable (budget
+    // exhausted). (Copilot r4084521857, sm-round8-fix, 2026-09-23.)
+    process.stderr.write(
+      `[watcher] [${label}] interrupted after producing artifacts -- work may be incomplete\n` +
       `Summary: ${artifactEvidence.reason}` +
       `${summary ? `\nContext: ${summary}` : ''}` +
       `${formatDiagnosticSnippet(result?.diagnosticReply || result?.lastReply || null)}\n`
@@ -1576,6 +1583,13 @@ function emitInterruptedOutcome(label, summary, result = null) {
       setInterruptRetryCount(label, interruptDecision.newRetryCount);
       updateExistingLabel(label, (current) => {
         current.watcherRetryAfter = new Date(Date.now() + interruptDecision.delayMs).toISOString();
+        // Reset the label to non-terminal while the redispatch is pending. The
+        // production auto-resolve path (dispatch/index.mjs) persists status
+        // 'interrupted' BEFORE this watcher runs, so without this the label
+        // stays terminal and check-ins report an interrupted run even though a
+        // redispatch is scheduled. (Copilot r4084521899.)
+        current.status = 'running';
+        delete current.error;
       });
       process.stderr.write(
         `[watcher] [${label}] interrupted redispatch ${interruptDecision.newRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
@@ -1608,6 +1622,11 @@ function emitInterruptedOutcome(label, summary, result = null) {
       setInterruptRetryCount(label, nextRetryCount);
       updateExistingLabel(label, (current) => {
         current.watcherRetryAfter = new Date(Date.now() + nextDelayMs).toISOString();
+        // Keep the label non-terminal while a retry is pending (same reset as
+        // the first-tick branch; production auto-resolve persists 'interrupted'
+        // before this watcher runs). (Copilot r4084521899.)
+        current.status = 'running';
+        delete current.error;
       });
       process.stderr.write(
         `[watcher] [${label}] interrupted redispatch failed -- retry ${nextRetryCount}/${MAX_INTERRUPT_RETRIES} ` +
