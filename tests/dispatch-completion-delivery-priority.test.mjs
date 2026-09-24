@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
+import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
@@ -132,6 +132,22 @@ test('done path: thin completion.summary does not trigger the full-summary path'
   });
   assert.notEqual(result.source, 'completion-summary-full');
   assert.ok(result.deliveryText, 'still delivers something');
+});
+
+test('raw JSON-ish summary without marker keys is not promoted (integration)', () => {
+  // P2 from the adversarial review: looksLikeRawPayloadText is a marker-key
+  // heuristic, so a truncated single-line JSON without marker keys slipped
+  // through and got promoted verbatim. Run it through the REAL producer
+  // (buildTerminalCompletionPayload) to pin the end-to-end shape.
+  const item = (i) => `{"id":${i},"name":"maintenance-task-${i}","state":"done","note":"ok"}`;
+  const truncatedJson = '{"results":[' + Array.from({ length: 30 }, (_, i) => item(i + 1)).join(',') + ']';
+  const payload = buildTerminalCompletionPayload({ summary: truncatedJson, checklist: { work_complete: true } });
+  const result = resolveCompletionDelivery({ completion: payload, fallbackSummary: truncatedJson });
+  // The P2 fix: a JSON-shaped summary (no marker keys) must NOT be promoted
+  // verbatim via the completion-summary-full path. (The summary_human fallback
+  // may still carry a JSON fragment - that is pre-existing behavior outside
+  // this PR's scope, guarded separately by looksLikeRawPayloadText.)
+  assert.notEqual(result.source, 'completion-summary-full', 'JSON-shaped summary must never be promoted verbatim');
 });
 
 test('no-cue multi-section report passes isLikelyHumanFinalReport (regression)', () => {
