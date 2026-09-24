@@ -95,3 +95,29 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
   assert.equal(result.source, 'lastReply');
   assert.ok(result.deliveryText.includes('Root cause of the aac/wav mismatch'));
 });
+
+// DONE-path regression (sm-round8-align-fix, 2026-09-24): the done path does
+// not recover lastReply, so resolveCompletionDelivery was falling back to
+// completion.summary_human -- a lossy humanized derivative that mangled
+// numbers ("0.00s" -> "0. 00s", "344.25" -> "344. 25") and collapsed a 1900-char
+// report to ~200 chars. The full completion.summary must win instead.
+test('done path (no lastReply): full completion.summary wins over lossy summary_human', () => {
+  const result = resolveCompletionDelivery({
+    completion: payload.completion,
+    fallbackSummary: payload.completion.summary,
+  });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.ok(result.deliveryText.length > 500, 'must deliver the full report, not the stub');
+  assert.ok(result.deliveryText.length > payload.completion.summary_human.length,
+    'full summary must beat the truncated summary_human derivative');
+});
+
+test('done path: thin completion.summary still falls back to summary_human', () => {
+  const result = resolveCompletionDelivery({
+    completion: { summary_human: 'Work complete. Files changed.', summary: 'done', checklist: { work_complete: true } },
+    fallbackSummary: 'done',
+  });
+  assert.notEqual(result.source, 'completion-summary-full',
+    'thin summary must not trigger the full-summary path');
+  assert.ok(result.deliveryText, 'still delivers something');
+});

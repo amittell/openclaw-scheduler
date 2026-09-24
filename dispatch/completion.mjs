@@ -123,6 +123,12 @@ function isLikelyHumanFinalReport(text) {
   // Allow slightly shorter reports with an explicit root cause / validation shape.
   if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
 
+  // A multi-section report with several bold-label/heading sections is a real
+  // final report even without a specific cue word. Domain reports (dubbing
+  // alignment fixes, etc.) use labels like "**Item 1**", "**Re-verify**",
+  // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword.
+  if ((headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5) return true;
+
   return false;
 }
 
@@ -1412,6 +1418,22 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: composeDeliveryText(reply, technicalDetailsText),
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
+    };
+  }
+
+  // completion.summary is the authoritative full report the agent submitted via
+  // --summary. summary_human is a lossy humanized derivative that can mangle
+  // numbers (0.00s -> 0. 00s) and collapse a 1900-char report to ~200 chars.
+  // When the full summary is substantial and not transport noise, deliver it
+  // verbatim (normalized only) instead of the derivative. This is the done
+  // path, where lastReply is not recovered, so completion.summary is the best
+  // full text available.
+  const fullSummary = normalizeCompletionText(completion?.summary);
+  if (fullSummary && fullSummary.length > 200 && !isInternalTransportNoiseText(fullSummary)) {
+    return {
+      deliveryText: fullSummary,
+      summary: fullSummary,
+      source: 'completion-summary-full',
     };
   }
 
