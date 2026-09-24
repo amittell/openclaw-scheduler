@@ -123,6 +123,12 @@ function isLikelyHumanFinalReport(text) {
   // Allow slightly shorter reports with an explicit root cause / validation shape.
   if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
 
+  // A multi-section report with several bold-label/heading sections is a real
+  // final report even without a specific cue word. Domain reports (dubbing
+  // alignment fixes, etc.) use labels like "**Item 1**", "**Re-verify**",
+  // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword.
+  if ((headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5) return true;
+
   return false;
 }
 
@@ -1336,6 +1342,21 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
+// True when summaryHuman is a truncation of summary (shape (a) above): a
+// prefix (after stripping punctuation/spaces) that is substantially shorter.
+// This holds for both clean truncations and mangled truncations (number-
+// mangling only inserts spaces, which strip removes). A clean rewrite (not a
+// prefix) returns false, so the structured-candidate loop still delivers the
+// better humanized lead. summaryHuman equal to summary also returns false via
+// the length check.
+function isLossyHumanizedTruncation(summary, summaryHuman) {
+  if (!summary || !summaryHuman) return false;
+  if (summary.length <= 200) return false;
+  if (summaryHuman.length >= summary.length * 0.6) return false; // not a truncation
+  const strip = (t) => String(t).replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return strip(summary).startsWith(strip(summaryHuman));
+}
+
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
@@ -1412,6 +1433,47 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       deliveryText: composeDeliveryText(reply, technicalDetailsText),
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
+    };
+  }
+
+  // completion.summary is the authoritative full report the agent submitted via
+  // --summary. summary_human is a humanized derivative that comes in two shapes:
+  //   (a) lossy truncation: the report failed the isLikelyHumanFinalReport gate
+  //       and summarizeProse collapsed it, mangling numbers (0.00s -> 0. 00s)
+  //       and cutting 1909 chars to ~200. summary_human is then a mangled
+  //       prefix of summary.
+  //   (b) clean humanized lead: a distinct plain-English rewrite of summary
+  //       (the fitness / Apple-Health / sports-backtest shapes). summary_human
+  //       is the better text and must win.
+  // Promote summary verbatim ONLY in shape (a): summary is substantial, not a
+  // raw payload, and summary_human is a substantially-shorter prefix of it (a
+  // truncation, clean or mangled). Shape (b) - a clean rewrite - is not a
+  // prefix, so it falls through to the structured-candidate loop below, which
+  // delivers summary_human. This is the done path, where lastReply is not
+  // recovered, so completion.summary is the best full text.
+  const fullSummary = normalizeCompletionText(completion?.summary);
+  // looksLikeRawPayloadText is a marker-key heuristic; a truncated single-line
+  // JSON without marker keys still slips through it. Reject any JSON-shaped
+  // summary (starts with {/[ and has a quoted key) from verbatim promotion.
+  const fullHead = fullSummary.slice(0, 200);
+  const isJsonishShape = (fullHead[0] === '{' || fullHead[0] === '[') && /"\s*:/.test(fullHead);
+  // A mixed-technical summary (prose lead + "Technically:"/"Technical details:"
+  // tail) is the shape the humanizer already knows how to split into a lead +
+  // technical-details block. Promoting it verbatim would leak the raw marker,
+  // so exclude it and let the structured-candidate loop deliver the humanized form.
+  const hasExplicitTechnicalMarker = EXPLICIT_TECHNICAL_MARKER_RE.test(fullSummary);
+  if (
+    fullSummary
+    && fullSummary.length > 200
+    && !looksLikeRawPayloadText(fullSummary)
+    && !isJsonishShape
+    && !hasExplicitTechnicalMarker
+    && isLossyHumanizedTruncation(fullSummary, normalizeCompletionText(completion?.summary_human))
+  ) {
+    return {
+      deliveryText: fullSummary,
+      summary: fullSummary,
+      source: 'completion-summary-full',
     };
   }
 
