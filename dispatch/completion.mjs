@@ -1452,10 +1452,16 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // delivers summary_human. This is the done path, where lastReply is not
   // recovered, so completion.summary is the best full text.
   const fullSummary = normalizeCompletionText(completion?.summary);
+  // looksLikeRawPayloadText is a marker-key heuristic; a truncated single-line
+  // JSON without marker keys still slips through it. Reject any JSON-shaped
+  // summary (starts with {/[ and has a quoted key) from verbatim promotion.
+  const fullHead = fullSummary.slice(0, 200);
+  const isJsonishShape = (fullHead[0] === '{' || fullHead[0] === '[') && /"\s*:/.test(fullHead);
   if (
     fullSummary
     && fullSummary.length > 200
     && !looksLikeRawPayloadText(fullSummary)
+    && !isJsonishShape
     && isLossyHumanizedTruncation(fullSummary, normalizeCompletionText(completion?.summary_human))
   ) {
     return {
