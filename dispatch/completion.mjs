@@ -1342,6 +1342,21 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
+// True when summaryHuman is a truncation of summary (shape (a) above): a
+// prefix (after stripping punctuation/spaces) that is substantially shorter.
+// This holds for both clean truncations and mangled truncations (number-
+// mangling only inserts spaces, which strip removes). A clean rewrite (not a
+// prefix) returns false, so the structured-candidate loop still delivers the
+// better humanized lead. summaryHuman equal to summary also returns false via
+// the length check.
+function isLossyHumanizedTruncation(summary, summaryHuman) {
+  if (!summary || !summaryHuman) return false;
+  if (summary.length <= 200) return false;
+  if (summaryHuman.length >= summary.length * 0.6) return false; // not a truncation
+  const strip = (t) => String(t).replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return strip(summary).startsWith(strip(summaryHuman));
+}
+
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
@@ -1422,14 +1437,27 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   }
 
   // completion.summary is the authoritative full report the agent submitted via
-  // --summary. summary_human is a lossy humanized derivative that can mangle
-  // numbers (0.00s -> 0. 00s) and collapse a 1900-char report to ~200 chars.
-  // When the full summary is substantial and not transport noise, deliver it
-  // verbatim (normalized only) instead of the derivative. This is the done
-  // path, where lastReply is not recovered, so completion.summary is the best
-  // full text available.
+  // --summary. summary_human is a humanized derivative that comes in two shapes:
+  //   (a) lossy truncation: the report failed the isLikelyHumanFinalReport gate
+  //       and summarizeProse collapsed it, mangling numbers (0.00s -> 0. 00s)
+  //       and cutting 1909 chars to ~200. summary_human is then a mangled
+  //       prefix of summary.
+  //   (b) clean humanized lead: a distinct plain-English rewrite of summary
+  //       (the fitness / Apple-Health / sports-backtest shapes). summary_human
+  //       is the better text and must win.
+  // Promote summary verbatim ONLY in shape (a): summary is substantial, not a
+  // raw payload, and summary_human is a substantially-shorter prefix of it (a
+  // truncation, clean or mangled). Shape (b) - a clean rewrite - is not a
+  // prefix, so it falls through to the structured-candidate loop below, which
+  // delivers summary_human. This is the done path, where lastReply is not
+  // recovered, so completion.summary is the best full text.
   const fullSummary = normalizeCompletionText(completion?.summary);
-  if (fullSummary && fullSummary.length > 200 && !isInternalTransportNoiseText(fullSummary)) {
+  if (
+    fullSummary
+    && fullSummary.length > 200
+    && !looksLikeRawPayloadText(fullSummary)
+    && isLossyHumanizedTruncation(fullSummary, normalizeCompletionText(completion?.summary_human))
+  ) {
     return {
       deliveryText: fullSummary,
       summary: fullSummary,

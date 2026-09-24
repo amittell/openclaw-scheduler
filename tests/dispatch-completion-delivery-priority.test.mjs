@@ -98,26 +98,58 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
 
 // DONE-path regression (sm-round8-align-fix, 2026-09-24): the done path does
 // not recover lastReply, so resolveCompletionDelivery was falling back to
-// completion.summary_human -- a lossy humanized derivative that mangled
-// numbers ("0.00s" -> "0. 00s", "344.25" -> "344. 25") and collapsed a 1900-char
-// report to ~200 chars. The full completion.summary must win instead.
-test('done path (no lastReply): full completion.summary wins over lossy summary_human', () => {
+// completion.summary_human -- a lossy derivative that mangled numbers
+// ("0.00s" -> "0. 00s") and collapsed a 1909-char report to 198 chars. The
+// full completion.summary must win when summary_human is a truncation of it
+// (clean or mangled prefix), and must NOT win when summary_human is a clean
+// rewrite (the fitness / Apple-Health / sports-backtest shapes).
+test('done path: mangled-prefix summary_human promotes full completion.summary', () => {
+  const full = 'Round-8 alignment fix complete (all 3 items, re-verified, staged). ITEM 1 (7 SRT-offset lines): 3 were real EN sub offsets, fixed to 0.00s drift - i=37 Bunny. #32 344.25 to 347.50, i=83 Um show me. #75 738.11 to 739.00. ITEM 2 (32 missing-cue lines): 16 real EN lines got new 1:1 cues, 16 are jp_fallback. SRT 224 to 241 cues, sequential, chronological, 0 new overlaps. ITEM 3 (1251.9 gap): CONFIRMED real dropped JP line, regenerated No! via IndexTTS2 best-of-6, surgical mix and re-encode to dub_eng_v10.aac. RE-VERIFY: gate_03s.py OK, P1 max drift 4.54s to 0.36s. STAGED: srt md5 772f57d1 (241 cues), aac md5 04f634ff, lines_index md5 9f1cc522 (266 entries).';
+  const mangled = full.slice(0, 160).replace('0.00s', '0. 00s').replace('344.25', '344. 25');
+  const result = resolveCompletionDelivery({
+    completion: { summary: full, summary_human: mangled, checklist: { work_complete: true } },
+    fallbackSummary: full,
+  });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, full);
+  assert.ok(result.deliveryText.includes('0.00s') && result.deliveryText.includes('344.25'), 'numbers must be intact in the promoted summary');
+});
+
+test('done path: clean-rewrite summary_human is not overridden by raw summary', () => {
   const result = resolveCompletionDelivery({
     completion: payload.completion,
     fallbackSummary: payload.completion.summary,
   });
-  assert.equal(result.source, 'completion-summary-full');
-  assert.ok(result.deliveryText.length > 500, 'must deliver the full report, not the stub');
-  assert.ok(result.deliveryText.length > payload.completion.summary_human.length,
-    'full summary must beat the truncated summary_human derivative');
+  assert.notEqual(result.source, 'completion-summary-full',
+    'fixture summary_human is a clean rewrite, not a truncation - must not be promoted away');
+  assert.equal(result.source, 'summary_human');
 });
 
-test('done path: thin completion.summary still falls back to summary_human', () => {
+test('done path: thin completion.summary does not trigger the full-summary path', () => {
   const result = resolveCompletionDelivery({
     completion: { summary_human: 'Work complete. Files changed.', summary: 'done', checklist: { work_complete: true } },
     fallbackSummary: 'done',
   });
-  assert.notEqual(result.source, 'completion-summary-full',
-    'thin summary must not trigger the full-summary path');
+  assert.notEqual(result.source, 'completion-summary-full');
   assert.ok(result.deliveryText, 'still delivers something');
+});
+
+test('no-cue multi-section report passes isLikelyHumanFinalReport (regression)', () => {
+  // Copilot comment on PR #53: the existing bold-label fixture contains cue
+  // words (Root cause / Files changed / Validation) so it is accepted by the
+  // earlier hasCue branch. This fixture uses 3+ neutral bold labels with no
+  // cue word and must pass through the new no-cue branch unchanged.
+  const report = [
+    'The work is complete.',
+    '',
+    '**Item 1 (7 SRT-offset lines):** 3 real offsets fixed to 0.00s drift.',
+    '',
+    '**Item 2 (32 missing-cue lines):** 16 got new 1:1 cues.',
+    '',
+    '**Re-verify:** gate_03s.py OK, P1 max drift 0.36s.',
+    '',
+    '**Staged** in the workdir: srt 241 cues, aac v10.',
+  ].join('\n');
+  const humanized = humanizeCompletionText(report);
+  assert.equal(humanized, report, 'no-cue report with 3+ bold-label sections must pass through unmodified');
 });
