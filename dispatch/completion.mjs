@@ -1457,11 +1457,17 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // summary (starts with {/[ and has a quoted key) from verbatim promotion.
   const fullHead = fullSummary.slice(0, 200);
   const isJsonishShape = (fullHead[0] === '{' || fullHead[0] === '[') && /"\s*:/.test(fullHead);
+  // A mixed-technical summary (prose lead + "Technically:"/"Technical details:"
+  // tail) is the shape the humanizer already knows how to split into a lead +
+  // technical-details block. Promoting it verbatim would leak the raw marker,
+  // so exclude it and let the structured-candidate loop deliver the humanized form.
+  const hasExplicitTechnicalMarker = EXPLICIT_TECHNICAL_MARKER_RE.test(fullSummary);
   if (
     fullSummary
     && fullSummary.length > 200
     && !looksLikeRawPayloadText(fullSummary)
     && !isJsonishShape
+    && !hasExplicitTechnicalMarker
     && isLossyHumanizedTruncation(fullSummary, normalizeCompletionText(completion?.summary_human))
   ) {
     return {
