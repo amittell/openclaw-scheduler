@@ -231,12 +231,17 @@ exits 1 with `{"ok":false,"error":{"code":"ADOPT_ARMING_INCOMPLETE","missing":[.
 and the partial record. Running the same `adopt` again registers only the
 missing steps (`rearmed: true`); once armed, a repeat is a no-op that returns
 the existing record (`alreadyAdopted: true`). A different key for a label that
-already has a session is refused. `--run-id` is optional.
+already has a session is refused. `--run-id` is optional: without it the run
+keeps the id `enqueue` minted for it (`preparedRunId`), as a Gateway spawn
+falls back to its own idempotency key, so each run of a label has its own
+completion claim and outbox key.
 
 A fast child can call `done` before the parent runs `adopt`. `done` then marks
 the awaiting-spawn label `done`, measures its minimum-runtime guard from
-`preparedAt`, and delivers the completion as usual, recording the delivery
-scope it used. A later `adopt` binds the session key, registers no jobs, and
+`preparedAt`, and delivers the completion as usual under the run's
+`preparedRunId`, recording that delivery scope. For an adopted tool-route run
+the guard also measures from `preparedAt`, the earlier bound on the spawn,
+since `adopt` records `spawnedAt` when it runs. A later `adopt` binds the session key, registers no jobs, and
 reports `completedBeforeAdopt: true`; if `done` could not deliver, `adopt`
 retries under the same scope, so the completion is delivered once. Until
 `adopt`, `status` shows the pending view, `sync` and `stuck` skip the label,

@@ -29,7 +29,10 @@ All notable changes to this project will be documented in this file.
   earlier run no longer delivers that run's reply while a continuation awaits
   `adopt`. Every new run of a label drops the previous run's handoff state, and
   a tool-route `--mode reuse` applies an explicit `--model` or `--thinking`
-  with `sessions.patch` before printing the `sessions_send` call.
+  with `sessions.patch` before printing the `sessions_send` call. Each prepared
+  run gets its own id, which scopes a completion that arrives before `adopt`
+  and stands in for an omitted `--run-id`, so repeated runs of a label are each
+  delivered once.
 
 ## [0.6.3] -- 2026-09-23
 
