@@ -27,7 +27,9 @@ All notable changes to this project will be documented in this file.
   after a partial failure registers only the missing jobs. A child that calls
   `done` before `adopt` is delivered once, and a delivery watcher left from an
   earlier run no longer delivers that run's reply while a continuation awaits
-  `adopt`.
+  `adopt`. Every new run of a label drops the previous run's handoff state, and
+  a tool-route `--mode reuse` applies an explicit `--model` or `--thinking`
+  with `sessions.patch` before printing the `sessions_send` call.
 
 ## [0.6.3] -- 2026-09-23
 

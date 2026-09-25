@@ -246,7 +246,11 @@ delivering that run's reply.
 For `--mode reuse` from a marked shell, `enqueue` prints a `sessions_send` call
 (`mode: "followup"`, `timeoutSeconds: 0`) to the label's existing session
 instead, and `adopt.command` already contains that session key; pass the
-`runId` that `sessions_send` returned.
+`runId` that `sessions_send` returned. `sessions_send` carries no model or
+thinking, so an explicit `--model` or `--thinking` is applied to that session
+first with `sessions.patch`, which OpenClaw does not refuse from an agent
+shell. A rejected override aborts before anything is recorded, as on the
+Gateway route.
 
 `timeoutSeconds: 0` keeps every `sessions_send` plan fire-and-forget. Omitted,
 OpenClaw 2026.9.6 defaults it to 30 for `followup`, and the requesting agent
@@ -452,7 +456,9 @@ A label prepared from an agent shell holds `status: "awaiting-spawn"`,
 `sessionKey`, `runId`, `spawnedAt`, `adoptedAt`, and the `arming` record. A
 label whose child called `done` first also holds `completedBeforeAdopt` and
 `completionScope`. Labels spawned through the Gateway record
-`spawnVia: "gateway"`.
+`spawnVia: "gateway"`. Every new run of a label, through either route, drops
+these handoff fields from the previous run, so `adopt` only acts on the
+current run.
 
 ---
 
