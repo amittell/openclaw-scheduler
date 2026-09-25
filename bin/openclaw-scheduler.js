@@ -13,6 +13,7 @@ const root = join(__dirname, '..');
 const DISPATCH_SUBCOMMANDS = new Set([
   'dispatch',
   'enqueue',
+  'adopt',
   'stuck',
   'result',
   'route',
@@ -42,6 +43,7 @@ Commands:
 Dispatch subcommands (routed to dispatch/index.mjs):
   dispatch <sub>   Explicit dispatch namespace
   enqueue          Spawn a sub-agent session (alias: dispatch enqueue)
+  adopt            Record a session an agent started with sessions_spawn
   dispatch status  Query session status by label
   stuck            Find sessions running past threshold
   result           Get last assistant reply from a session

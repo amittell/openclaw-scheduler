@@ -7,6 +7,8 @@
  *
  * Subcommands:
  *   enqueue    Spawn a session via gateway, store label->sessionKey, return immediately
+ *              (from an OpenClaw agent shell: prepare a sessions_spawn call instead)
+ *   adopt      Record the session an agent started with sessions_spawn for a prepared label
  *   status     Query session status by label
  *   stuck      Find sessions running past threshold with no activity
  *   result     Get last assistant message from a session
@@ -22,14 +24,15 @@
  *   0  -- success / nothing stuck
  *   1  -- stuck runs found, or hard error
  *   2  -- argument error
+ *   3  -- OpenClaw refused a Gateway turn from an agent shell (ATTRIBUTED_SPAWN_REQUIRED)
  *
  * Usage: openclaw-scheduler <subcommand> [options]
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync, renameSync, mkdirSync } from 'fs';
 import { dirname, join, resolve as pathResolve } from 'path';
 import { fileURLToPath } from 'url';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
@@ -504,6 +507,61 @@ function gatewayCall(method, params = {}, opts = {}) {
     ...opts,
     gatewayToken: GATEWAY_TOKEN,
   });
+}
+
+// -- OpenClaw agent exec shells -------------------------------
+//
+// OpenClaw marks every agent exec shell with OPENCLAW_SHELL=exec, and subagent
+// exec shells with OPENCLAW_SUBAGENT_EXEC=1. From 2026.9.6 its CLI refuses a
+// Gateway `agent` turn from such a shell because the turn would lose
+// inter-session attribution; the supported route is the agent's own attributed
+// tool (sessions_spawn, sessions_send). From a marked shell dispatch therefore
+// prepares that tool call and records the label instead of starting a turn.
+// The markers only deny: dispatch never removes them, never retries through
+// another Gateway surface, and never treats them as authority.
+
+const GATEWAY_ROUTES = new Set(['auto', 'gateway', 'tool']);
+// Stable text of OpenClaw's refusal (src/gateway/operator-cli-message-input.ts).
+const ATTRIBUTION_REFUSAL_TEXT = 'would lose inter-session attribution';
+const EXIT_ATTRIBUTED_SPAWN_REQUIRED = 3;
+const AWAITING_SPAWN = 'awaiting-spawn';
+// The requesting agent calls its tool and adopt within seconds of enqueue.
+const AWAITING_SPAWN_STALE_MS = 15 * 60 * 1000;
+
+function isOpenClawAgentExecShell(env = process.env) {
+  return env.OPENCLAW_SHELL === 'exec' || env.OPENCLAW_SUBAGENT_EXEC === '1';
+}
+
+/** Resolve --spawn-via / --send-via: `auto` selects the tool handoff only in a marked shell. */
+function resolveGatewayRoute(value, flagName) {
+  const requested = value === undefined ? 'auto' : value;
+  if (!GATEWAY_ROUTES.has(requested)) die(`${flagName} must be auto, gateway, or tool`, 2);
+  if (requested !== 'auto') return requested;
+  return isOpenClawAgentExecShell() ? 'tool' : 'gateway';
+}
+
+function isAttributionRefusal(error) {
+  return String(error?.message ?? '').includes(ATTRIBUTION_REFUSAL_TEXT);
+}
+
+/** Report OpenClaw's refusal of an explicit Gateway route; the caller has written nothing. */
+function failAttributedSpawnRequired({ method, routeFlag, error }) {
+  const message =
+    `OpenClaw refused Gateway ${method} from this agent shell because the turn would lose ` +
+    `inter-session attribution. Re-run with ${routeFlag} tool (or omit ${routeFlag}) so ${BRAND} ` +
+    `prepares the call for this agent's attributed session tool. ${BRAND} does not retry ` +
+    'through another route.';
+  out({
+    ok: false,
+    error: {
+      code: 'ATTRIBUTED_SPAWN_REQUIRED',
+      message,
+      method,
+      gatewayError: error.message,
+    },
+  });
+  process.stderr.write(`[${BRAND}] ATTRIBUTED_SPAWN_REQUIRED: ${message}\n`);
+  process.exit(EXIT_ATTRIBUTED_SPAWN_REQUIRED);
 }
 
 // -- Gateway Error Log Check ----------------------------------
@@ -1428,6 +1486,496 @@ function makeSessionKey(agentId) {
   return `agent:${agentId}:subagent:${randomUUID()}`;
 }
 
+function resolveAgentBrand(agent) {
+  return config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
+}
+
+/** A shell command that runs this dispatch CLI against the same config and ledger. */
+function buildDispatchCommand(args) {
+  const sq = quoteForSingleQuotedShell;
+  return [
+    `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}'`,
+    `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}'`,
+    `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}'`,
+    `'${sq(resolvePersistentNodePath())}'`,
+    `'${sq(resolveDispatchScriptPath('index.mjs'))}'`,
+    ...args,
+  ].join(' ');
+}
+
+/**
+ * Build the task text sent to the worker. A `handoff` task goes to a child
+ * started by the agent's sessions_spawn tool: OpenClaw supplies its subagent
+ * context, and the child's message tool is disabled, so the hand-written depth
+ * header and the CHECK_IN curl are omitted. Checkpoints stay: they are a local
+ * scheduler message write, not a Gateway call.
+ */
+function buildDispatchTaskMessage({ label, message, deliverTo, deliverChannel, origin, handoff = false }) {
+  const parts = handoff ? [] : [
+    `[Subagent Context] You are running as a subagent (depth 1/3). Results auto-announce to your requester; do not busy-poll for status.`,
+    ``,
+  ];
+
+  // -- Checkpoint notify command (mid-run status messages) -----
+  // Agents can call this command at logical checkpoints to send status updates
+  // that will be delivered to the inbox consumer (and ultimately Telegram).
+  const schedulerCliPath = resolveSchedulerCliPath();
+  const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
+
+  // Prepend CHECK_IN template when delivery target is set
+  if (deliverTo && !handoff) {
+    parts.push(`---`);
+    parts.push(`CHECK_IN: To report progress, use curl:`);
+    parts.push(`GW_TOKEN=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.openclaw/openclaw.json','utf8')).gateway.auth.token)")`);
+    // Sanitize values for safe embedding in JSON inside a shell single-quoted string
+    const safeJson = (v) => String(v || '').replace(/[\\'"\n\r]/g, '');
+    const safeChannel = safeJson(deliverChannel || 'telegram');
+    const safeTarget = safeJson(deliverTo);
+    const safeLabel = safeJson(label);
+    parts.push(`curl -s -X POST '${GATEWAY_TOOLS_INVOKE_URL}' -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main","agentId":"main"}'`);
+    parts.push(`Call this every ~5 minutes with a brief progress update.`);
+    parts.push(`---`);
+    parts.push(``);
+  }
+
+  parts.push(`[Subagent Task]: ${message}`);
+
+  // -- Checkpoint notify instructions ---------------------------
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(`CHECKPOINT MESSAGING: You can send mid-run status updates using this command:`);
+  parts.push(`  ${checkpointNotifyCmd} "<message>"`);
+  parts.push(`Call this at logical checkpoints: start of a major step, on conflict/error, before completing.`);
+  parts.push(`Example: ${checkpointNotifyCmd} "Starting step 2: running tests"`);
+  parts.push(`---`);
+  parts.push(``);
+
+  // Append agent-side done signal instructions (Fix 2 -- push-based completion)
+  // Always point to dispatch/index.mjs (__dirname) -- the canonical done handler.
+  const doneScriptPath = join(__dirname, 'index.mjs');
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(buildCompletionSignalInstructions({
+    label,
+    taskPrompt: message,
+    doneScriptPath,
+  }));
+  parts.push(`---`);
+  parts.push(``);
+  parts.push(`---`);
+  parts.push(`DELIVERY RULE: Do NOT use the message tool, sessions_send, or any direct messaging to send updates or results to Telegram or any chat. Do NOT reference chat IDs, user IDs, or delivery targets in your work.`);
+  parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically.`);
+  if (origin) {
+    parts.push(`Note: This job will be delivered to origin channel: ${origin}`);
+  }
+  parts.push(`---`);
+
+  return parts.join('\n');
+}
+
+function describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }) {
+  const lead = `Session ${verb}.`;
+  if (delivery.status === 'disabled') {
+    return `${lead} Delivery intentionally disabled${delivery.reason ? ` (${delivery.reason}).` : '.'}`;
+  }
+  if (schedulerWatcherOk) {
+    return gatewaySecondary
+      ? `${lead} Delivery via scheduler (primary) + gateway (secondary).`
+      : `${lead} Delivery via scheduler watcher.`;
+  }
+  if (deliverTo) {
+    return gatewaySecondary
+      ? `${lead} Delivery via gateway only (scheduler watcher failed).`
+      : `${lead} Scheduler watcher not registered; poll status and result for completion.`;
+  }
+  return `${lead} Delivery target missing or not recorded.`;
+}
+
+/**
+ * Arm delivery and monitoring for a run whose session exists and whose ledger
+ * row is already `running`, then report it. Shared by the Gateway spawn in
+ * enqueue and by adopt, so both register the same watcher and watchdog jobs.
+ */
+async function activateDispatchRun({
+  label,
+  sessionKey,
+  runId,
+  jobId,
+  agent,
+  mode,
+  hookMode,
+  agentBrand,
+  sourceContext,
+  origin,
+  deliverTo,
+  deliverChannel,
+  deliverMode,
+  deliveryDisabled,
+  deliveryDisabledReason,
+  timeoutSeconds,
+  idleThresholdSeconds,
+  monitor,
+  announceStart,
+  gatewaySecondary,
+  verb,
+  extraOutput = {},
+}) {
+  // Reserve this run's delivery scope before a stale watcher from an earlier
+  // use of the same label can claim the fresh completion.
+  if (!deliveryDisabled) {
+    resetCompletionDeliveryClaim({
+      label,
+      sessionKey,
+      runId,
+    });
+  }
+
+  // Fire dispatch.started hook (best-effort)
+  await onStarted({
+    label, job_id: jobId, run_id: runId,
+    agent, mode: hookMode, session_key: sessionKey,
+  }).catch(() => {});
+
+  // -- Send "Starting" notification via gateway HTTP API -----
+  // Only for a session dispatch started itself. An adopted session was started
+  // by the requesting agent, which reports that in its own attributed reply.
+  if (announceStart && deliverTo && GATEWAY_TOKEN) {
+    try {
+      await fetch(GATEWAY_TOOLS_INVOKE_URL, {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${GATEWAY_TOKEN}`,
+        },
+        body: JSON.stringify({
+          tool: 'message',
+          args: {
+            action: 'send',
+            channel: deliverChannel,
+            target: deliverTo,
+            message: `🌶️ *${agentBrand}* [${label}] starting...`,
+          },
+          sessionKey: 'main',
+          agentId: 'main',
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch (err) {
+      process.stderr.write(`[${agentBrand}] starting notification failed: ${err.message}\n`);
+    }
+  }
+
+  // -- Register scheduler watcher for delivery ---------------
+  // Creates a quick-poll shell job that runs watcher.mjs once per tick. Empty
+  // stdout means "still running" and advances the next tick without delivery.
+  // The watcher enqueues terminal output directly into the durable outbox;
+  // stdout remains only as a route-less compatibility fallback.
+  const sq = s => String(s).replace(/'/g, "'\\''");
+  let schedulerWatcherOk = false;
+  if (deliverTo && deliverMode !== 'none') {
+    try {
+      const watcherJob = scheduleDeliveryWatcherJob({
+        label,
+        deliverTo,
+        deliverChannel,
+        sourceContext,
+        timeoutSeconds,
+        idleThresholdSeconds,
+        origin: origin || 'system',
+        agentBrand,
+      });
+      schedulerWatcherOk = true;
+      if (watcherJob?.id) {
+        setLabel(label, { deliveryWatcherJobId: watcherJob.id });
+      }
+      process.stderr.write(
+        `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
+        `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
+      );
+    } catch (err) {
+      process.stderr.write(`[${agentBrand}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
+    }
+  }
+
+  // -- Register watchdog monitoring job ---------------------
+  let watchdogJobOk = false;
+  let watchdogJobId = null;
+  if (monitor.enabled && deliverTo) {
+    try {
+      const checkCmd =
+        `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
+        `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}' ` +
+        `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
+        `'${sq(resolvePersistentNodePath())}' '${sq(resolveDispatchScriptPath('index.mjs'))}' result --label '${sq(label)}'`;
+      const alertChannel = deliverChannel || 'telegram';
+      const alertTarget  = deliverTo;
+      const watchdogSpec = JSON.stringify({
+        name:                     `watchdog:${label}`,
+        job_type:                 'watchdog',
+        schedule_cron:            monitor.interval,
+        session_target:           'shell',
+        payload_kind:             'shellCommand',
+        payload_message:          checkCmd,
+        delivery_mode:            'none',
+        run_timeout_ms:           120_000,  // 2 min: watchdog shell check should be fast
+        watchdog_target_label:    label,
+        watchdog_check_cmd:       checkCmd,
+        watchdog_timeout_min:     monitor.timeoutMin,
+        watchdog_alert_channel:   alertChannel,
+        watchdog_alert_target:    alertTarget,
+        watchdog_self_destruct:   1,
+        watchdog_started_at:      new Date().toISOString(),
+        delete_after_run:         1,             // auto-delete after watchdog fires
+        origin:                   origin || 'system',
+        ...sourceContextToSchedulerFields(sourceContext),
+      });
+      const schedulerCli = resolveSchedulerCliPath();
+      const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
+        encoding: 'utf-8',
+        timeout:  10000,
+        stdio:    ['pipe', 'pipe', 'pipe'],
+      });
+      try {
+        const parsed = JSON.parse(addResult.trim());
+        watchdogJobId = parsed?.job?.id || null;
+      } catch {}
+      watchdogJobOk = true;
+
+      // Store watchdog job ID in labels ledger for later cleanup
+      if (watchdogJobId) {
+        setLabel(label, { watchdogJobId });
+      }
+
+      process.stderr.write(`[${agentBrand}] watchdog registered: ${monitor.interval}, timeout: ${monitor.timeoutMin}min\n`);
+    } catch (err) {
+      process.stderr.write(`[${agentBrand}] watchdog registration FAILED: ${err.message}\n`);
+    }
+  }
+
+  const delivery = buildDispatchDeliverySurface({
+    deliverTo,
+    deliverChannel,
+    deliveryMode: deliverMode,
+    deliveryDisabled,
+    deliveryDisabledReason,
+    ...(deliverTo ? {
+      scheduler: schedulerWatcherOk,
+      gateway: gatewaySecondary,
+    } : {}),
+  });
+
+  out({
+    ok:         true,
+    label,
+    sessionKey,
+    runId,
+    mode,
+    agent,
+    status:     'accepted',
+    ...extraOutput,
+    sourceContext: sourceContext || null,
+    delivery,
+    watchdog:   monitor.enabled ? {
+      enabled:  watchdogJobOk,
+      jobId:    watchdogJobId,
+      interval: monitor.interval,
+      timeout:  monitor.timeoutMin,
+      ...(monitor.enabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
+    } : null,
+    message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }),
+  });
+
+  // -- Post-spawn verification (Fix 3) --------------------------------
+  // Canary: inspect the SQLite-first compatibility store immediately, then
+  // wait up to 3 intervals to
+  // confirm the session appeared in the store. A session store entry with
+  // sessionId or startedAt/sessionStartedAt is enough: long first turns may not
+  // flush JSONL, token counts, or chat.history until the model call completes.
+  // The delivery watcher owns later completion/failure handling.
+  const configuredSpawnPollMax = Number(config.spawnPollMax);
+  const configuredSpawnPollDelayMs = Number(config.spawnPollDelayMs);
+  const SPAWN_POLL_MAX = Number.isInteger(configuredSpawnPollMax)
+    ? Math.min(12, Math.max(0, configuredSpawnPollMax))
+    : 3;
+  const SPAWN_POLL_DELAY_MS = Number.isFinite(configuredSpawnPollDelayMs)
+    ? Math.min(60_000, Math.max(1, configuredSpawnPollDelayMs))
+    : 10_000;
+  let spawnConfirmed = false;
+  for (let spawnPoll = 0; spawnPoll <= SPAWN_POLL_MAX; spawnPoll++) {
+    const spawnStore = readSessionsStore(agent);
+    const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
+    if (signal.hasStartedSignal || signal.hasActivitySignal) {
+      spawnConfirmed = true;
+      break;
+    }
+    if (spawnPoll < SPAWN_POLL_MAX) {
+      await sleep(SPAWN_POLL_DELAY_MS);
+    }
+  }
+  if (!spawnConfirmed) {
+    const laneError = getGatewayLaneTaskError(sessionKey);
+    if (laneError.found && laneError.error) {
+      const spawnError = `spawn-failure: ${laneError.error}`;
+      process.stderr.write(`[${agentBrand}] WARNING: ${spawnError}\n`);
+      setLabel(label, {
+        status: 'error',
+        error: spawnError,
+        summary: spawnError,
+      });
+      disarmWatchdog(label);
+    } else {
+      // The session was accepted. Visibility policies and delayed database
+      // persistence can hide a healthy child from both local and gateway
+      // reads, so the watcher/job timeout owns eventual failure.
+      process.stderr.write(
+        `[${agentBrand}] session ${sessionKey} is not observable yet after ` +
+        `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s; leaving accepted run active\n`,
+      );
+    }
+  }
+}
+
+/** Keep the full handoff task beside the ledger, private to this user, with its digest. */
+function writeSpawnTaskFile(taskMessage) {
+  const dir = join(LABELS_STATE_DIR, 'spawn-tasks');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${randomUUID()}.txt`);
+  writeFileSync(path, taskMessage, { mode: 0o600, flag: 'wx' });
+  return { path, sha256: createHash('sha256').update(taskMessage).digest('hex') };
+}
+
+/**
+ * Tool route of enqueue: record the label as awaiting-spawn and print the
+ * sessions_spawn (or, to continue a session, sessions_send) call for the
+ * requesting agent to make. Nothing here calls the Gateway. OpenClaw's tool
+ * records the parent-child attribution; `adopt` arms delivery and monitoring
+ * once the agent has the session key.
+ */
+function prepareAttributedSpawn({
+  label,
+  message,
+  agent,
+  agentBrand,
+  isFresh,
+  sessionKey,
+  model,
+  thinking,
+  origin,
+  sourceContext,
+  deliverTo,
+  deliverChannel,
+  deliverMode,
+  deliveryDisabled,
+  deliveryDisabledReason,
+  verifyCmd,
+  timeoutS,
+  gatewayTimeoutS,
+  idleThresholdSeconds,
+  monitor,
+}) {
+  const taskMessage = buildDispatchTaskMessage({
+    label, message, deliverTo, deliverChannel, origin, handoff: true,
+  });
+  const tool = isFresh ? 'sessions_spawn' : 'sessions_send';
+  const params = isFresh
+    ? {
+        task: taskMessage,
+        label,
+        agentId: agent,
+        ...(model ? { model } : {}),
+        ...(thinking ? { thinking } : {}),
+        runTimeoutSeconds: gatewayTimeoutS,
+        mode: 'run',
+        cleanup: 'keep',
+        // The done signal and the scheduler watcher deliver the completion to
+        // --deliver-to, as they do for a Gateway spawn (deliver: false). An
+        // OpenClaw completion handoff to the requester would announce the same
+        // result a second time, and with delivery disabled the caller polls
+        // status/result as before.
+        expectsCompletionMessage: false,
+      }
+    : { sessionKey, message: taskMessage, mode: 'followup' };
+
+  let taskFile;
+  try {
+    taskFile = writeSpawnTaskFile(taskMessage);
+    // Clear per-run facts a previous use of this label left behind: a stale
+    // completion or delivery receipt would satisfy the new run's watcher.
+    setLabel(label, {
+      sessionKey: isFresh ? null : sessionKey,
+      ...(isFresh ? { sessionId: null } : {}),
+      runId:          null,
+      agent,
+      mode:           isFresh ? 'fresh' : 'reuse',
+      model:          model || null,
+      thinking,
+      origin:         origin || null,
+      sourceContext:  sourceContext || null,
+      deliverTo:      deliverTo || null,
+      deliverChannel: deliverChannel || null,
+      deliveryMode:   deliverMode || null,
+      deliveryDisabled,
+      deliveryDisabledReason,
+      verifyCmd:      verifyCmd || null,
+      spawnVia:       tool,
+      preparedAt:     new Date().toISOString(),
+      spawnedAt:      null,
+      timeoutSeconds: timeoutS,
+      gatewayTimeoutSeconds: gatewayTimeoutS,
+      idleThresholdSeconds,
+      timeout:        timeoutS,
+      monitor,
+      status:         AWAITING_SPAWN,
+      summary:        null,
+      error:          null,
+      completion:     null,
+      completionDeliveredAt: null,
+      lastPing:       null,
+      taskPrompt:     message.slice(0, 2000),
+      taskFile:       taskFile.path,
+      taskSha256:     taskFile.sha256,
+    });
+  } catch (err) {
+    die(`could not record ${AWAITING_SPAWN} label: ${err.message}`);
+  }
+
+  const sq = quoteForSingleQuotedShell;
+  const adoptCommand = buildDispatchCommand([
+    'adopt',
+    '--label', `'${sq(label)}'`,
+    '--session-key', isFresh ? '<childSessionKey>' : `'${sq(sessionKey)}'`,
+    '--run-id', '<runId>',
+  ]);
+  const instruction = isFresh
+    ? 'Call sessions_spawn with spawn.params, then run adopt.command with the childSessionKey and runId it returns.'
+    : 'Call sessions_send with spawn.params, then run adopt.command with the runId it returns. ' +
+      `${agentBrand} still delivers the completion, so do not repost the reply.`;
+
+  out({
+    ok:        true,
+    status:    AWAITING_SPAWN,
+    label,
+    agent,
+    mode:      isFresh ? 'fresh' : 'reuse',
+    spawn:     { tool, params },
+    taskFile:  taskFile.path,
+    taskSha256: taskFile.sha256,
+    adopt:     { command: adoptCommand },
+    sourceContext: sourceContext || null,
+    delivery:  buildDispatchDeliverySurface({
+      deliverTo,
+      deliverChannel,
+      deliveryMode: deliverMode,
+      deliveryDisabled,
+      deliveryDisabledReason,
+    }),
+    message:   `OpenClaw agent shell: ${agentBrand} did not start a session. ${instruction} ` +
+      'Delivery and monitoring start at adopt.',
+  });
+  process.stderr.write(`[${agentBrand}] OpenClaw agent shell: no session started for [${label}]. ${instruction}\n`);
+}
+
 // -- Subcommands ----------------------------------------------
 
 /**
@@ -1458,10 +2006,16 @@ function makeSessionKey(agentId) {
  *       reuse  -- look up prior session_key for this label, send into it
  *   --session-key <key>      Explicit session key override
  *   --model <string>         Model override (e.g. anthropic/claude-sonnet-4-6)
+ *   --spawn-via <route>      auto|gateway|tool (default: auto). auto uses tool in an
+ *                            OpenClaw agent exec shell and gateway everywhere else.
+ *                            tool prepares a sessions_spawn (or, to continue, sessions_send)
+ *                            call for the requesting agent and records the label as
+ *                            awaiting-spawn; `adopt` then arms delivery and monitoring.
  */
 async function cmdEnqueue(flags) {
   const label = flags.label;
   if (!label) die('--label is required', 2);
+  const spawnVia = resolveGatewayRoute(flags['spawn-via'], '--spawn-via');
 
   let message = null;
   try {
@@ -1582,7 +2136,7 @@ async function cmdEnqueue(flags) {
   }
 
   // Dynamic branding: resolve per-agent brand name
-  const agentBrand = config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
+  const agentBrand = resolveAgentBrand(agent);
   const model       = flags.model            || DEFAULT_DISPATCH_MODEL;
 
   // -- Session key resolution ----------------------------------
@@ -1606,13 +2160,48 @@ async function cmdEnqueue(flags) {
   }
 
   const isFresh = !sessionKey;
-  if (isFresh) {
+  if (isFresh && spawnVia !== 'tool') {
     sessionKey = makeSessionKey(agent);
   }
-  try {
-    sessionKey = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
-  } catch (error) {
-    die(error.message, 2);
+  // A tool-route fresh spawn has no key yet: OpenClaw mints the child key.
+  if (sessionKey !== null) {
+    try {
+      sessionKey = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
+    } catch (error) {
+      die(error.message, 2);
+    }
+  }
+
+  const deliveryDisabled = !deliverTo && noMonitor;
+  const deliveryDisabledReason = deliveryDisabled
+    ? (noMonitorReason || 'explicit opt-out via --no-monitor')
+    : null;
+  const monitor = { enabled: monitorEnabled, interval: monitorInterval, timeoutMin: monitorTimeout };
+
+  if (spawnVia === 'tool') {
+    prepareAttributedSpawn({
+      label,
+      message,
+      agent,
+      agentBrand,
+      isFresh,
+      sessionKey,
+      model,
+      thinking,
+      origin,
+      sourceContext,
+      deliverTo,
+      deliverChannel,
+      deliverMode,
+      deliveryDisabled,
+      deliveryDisabledReason,
+      verifyCmd,
+      timeoutS,
+      gatewayTimeoutS,
+      idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
+      monitor,
+    });
+    return;
   }
 
   const idem = randomUUID();
@@ -1641,75 +2230,16 @@ async function cmdEnqueue(flags) {
     }
   }
 
-  // -- Build the task message ----------------------------------
-  const parts = [
-    `[Subagent Context] You are running as a subagent (depth 1/3). Results auto-announce to your requester; do not busy-poll for status.`,
-    ``,
-  ];
-
-  // -- Checkpoint notify command (mid-run status messages) -----
-  // Agents can call this command at logical checkpoints to send status updates
-  // that will be delivered to the inbox consumer (and ultimately Telegram).
-  const schedulerCliPath = resolveSchedulerCliPath();
-  const checkpointNotifyCmd = `node '${schedulerCliPath}' messages send --from '${label.replace(/'/g, "'\\''")}' --to main --kind status --body`;
-
-  // Prepend CHECK_IN template when delivery target is set
-  if (deliverTo) {
-    parts.push(`---`);
-    parts.push(`CHECK_IN: To report progress, use curl:`);
-    parts.push(`GW_TOKEN=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.openclaw/openclaw.json','utf8')).gateway.auth.token)")`);
-    // Sanitize values for safe embedding in JSON inside a shell single-quoted string
-    const safeJson = (v) => String(v || '').replace(/[\\'"\n\r]/g, '');
-    const safeChannel = safeJson(deliverChannel || 'telegram');
-    const safeTarget = safeJson(deliverTo);
-    const safeLabel = safeJson(label);
-    parts.push(`curl -s -X POST '${GATEWAY_TOOLS_INVOKE_URL}' -H 'Content-Type: application/json' -H "Authorization: Bearer $GW_TOKEN" -d '{"tool":"message","args":{"action":"send","channel":"${safeChannel}","target":"${safeTarget}","message":"[${safeLabel}] <your status here>"},"sessionKey":"main","agentId":"main"}'`);
-    parts.push(`Call this every ~5 minutes with a brief progress update.`);
-    parts.push(`---`);
-    parts.push(``);
-  }
-
-  parts.push(`[Subagent Task]: ${message}`);
-
-  // -- Checkpoint notify instructions ---------------------------
-  parts.push(``);
-  parts.push(`---`);
-  parts.push(`CHECKPOINT MESSAGING: You can send mid-run status updates using this command:`);
-  parts.push(`  ${checkpointNotifyCmd} "<message>"`);
-  parts.push(`Call this at logical checkpoints: start of a major step, on conflict/error, before completing.`);
-  parts.push(`Example: ${checkpointNotifyCmd} "Starting step 2: running tests"`);
-  parts.push(`---`);
-  parts.push(``);
-
-  // Append agent-side done signal instructions (Fix 2 -- push-based completion)
-  // Always point to dispatch/index.mjs (__dirname) -- the canonical done handler.
-  const doneScriptPath = join(__dirname, 'index.mjs');
-  parts.push(``);
-  parts.push(`---`);
-  parts.push(buildCompletionSignalInstructions({
-    label,
-    taskPrompt: message,
-    doneScriptPath,
-  }));
-  parts.push(`---`);
-  parts.push(``);
-  parts.push(`---`);
-  parts.push(`DELIVERY RULE: Do NOT use the message tool, sessions_send, or any direct messaging to send updates or results to Telegram or any chat. Do NOT reference chat IDs, user IDs, or delivery targets in your work.`);
-  parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically.`);
-  if (origin) {
-    parts.push(`Note: This job will be delivered to origin channel: ${origin}`);
-  }
-  parts.push(`---`);
-
-  const taskMessage = parts.join('\n');
+  const taskMessage = buildDispatchTaskMessage({ label, message, deliverTo, deliverChannel, origin });
 
   // -- Call gateway agent method -------------------------------
   // Final user delivery belongs to the scheduler watcher below.
   // Keep the gateway spawn fire-and-forget so raw tool output or internal
   // done payloads cannot leak directly to the chat ahead of the durable
   // post-office delivery path.
+  let response;
   try {
-    const response = gatewayCall('agent', {
+    response = gatewayCall('agent', {
       message:        taskMessage,
       sessionKey,
       idempotencyKey: idem,
@@ -1724,16 +2254,22 @@ async function cmdEnqueue(flags) {
         replyChannel: deliverChannel,
       } : {}),
     }, { timeout: 15000 });
+  } catch (err) {
+    // An explicit --spawn-via gateway from an agent shell lands here on
+    // OpenClaw 2026.9.6+. Nothing has been recorded for this label yet.
+    if (isAttributionRefusal(err)) {
+      failAttributedSpawnRequired({ method: 'agent', routeFlag: '--spawn-via', error: err });
+    }
+    die(`gateway agent call failed: ${err.message}`);
+  }
 
-    const deliveryDisabled = !deliverTo && noMonitor;
-    const deliveryDisabledReason = deliveryDisabled
-      ? (noMonitorReason || 'explicit opt-out via --no-monitor')
-      : null;
+  try {
+    const runId = response?.runId || idem;
 
     // Update ledger
     setLabel(label, {
       sessionKey,
-      runId:     response?.runId || idem,
+      runId,
       agent,
       mode:      isFresh ? 'fresh' : 'reuse',
       model:     model || null,
@@ -1746,6 +2282,7 @@ async function cmdEnqueue(flags) {
       deliveryDisabled,
       deliveryDisabledReason,
       verifyCmd:      verifyCmd || null,
+      spawnVia:       'gateway',
       spawnedAt:      new Date().toISOString(),
       timeoutSeconds: timeoutS,
       gatewayTimeoutSeconds: gatewayTimeoutS,
@@ -1759,226 +2296,224 @@ async function cmdEnqueue(flags) {
       taskPrompt:     message.slice(0, 2000),
     });
 
-    // Reserve this run's delivery scope before a stale watcher from an earlier
-    // use of the same label can claim the fresh completion.
-    if (!deliveryDisabled) {
-      resetCompletionDeliveryClaim({
-        label,
-        sessionKey,
-        runId: response?.runId || idem,
-      });
-    }
-
-    // Fire dispatch.started hook (best-effort)
-    await onStarted({
-      label, job_id: idem, run_id: response?.runId || idem,
-      agent, mode, session_key: sessionKey,
-    }).catch(() => {});
-
-    // -- Send "Starting" notification via gateway HTTP API -----
-    if (deliverTo && GATEWAY_TOKEN) {
-      try {
-        await fetch(GATEWAY_TOOLS_INVOKE_URL, {
-          method: 'POST',
-          redirect: 'error',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${GATEWAY_TOKEN}`,
-          },
-          body: JSON.stringify({
-            tool: 'message',
-            args: {
-              action: 'send',
-              channel: deliverChannel,
-              target: deliverTo,
-              message: `🌶️ *${agentBrand}* [${label}] starting...`,
-            },
-            sessionKey: 'main',
-            agentId: 'main',
-          }),
-          signal: AbortSignal.timeout(5000),
-        });
-      } catch (err) {
-        process.stderr.write(`[${agentBrand}] starting notification failed: ${err.message}\n`);
-      }
-    }
-
-    // -- Register scheduler watcher for delivery ---------------
-    // Creates a quick-poll shell job that runs watcher.mjs once per tick. Empty
-    // stdout means "still running" and advances the next tick without delivery.
-    // The watcher enqueues terminal output directly into the durable outbox;
-    // stdout remains only as a route-less compatibility fallback.
-    const sq = s => String(s).replace(/'/g, "'\\''");
-    let schedulerWatcherOk = false;
-    if (deliverTo && deliverMode !== 'none') {
-      try {
-        const watcherJob = scheduleDeliveryWatcherJob({
-          label,
-          deliverTo,
-          deliverChannel,
-          sourceContext,
-          timeoutSeconds: timeoutS,
-          idleThresholdSeconds: flags['idle-threshold'] || '300',
-          origin: origin || 'system',
-          agentBrand,
-        });
-        schedulerWatcherOk = true;
-        if (watcherJob?.id) {
-          setLabel(label, { deliveryWatcherJobId: watcherJob.id });
-        }
-        process.stderr.write(
-          `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
-          `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
-        );
-      } catch (err) {
-        process.stderr.write(`[${agentBrand}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
-      }
-    }
-
-    // -- Register watchdog monitoring job ---------------------
-    let watchdogJobOk = false;
-    let watchdogJobId = null;
-    if (monitorEnabled && deliverTo) {
-      try {
-        const checkCmd =
-          `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
-          `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}' ` +
-          `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
-          `'${sq(resolvePersistentNodePath())}' '${sq(resolveDispatchScriptPath('index.mjs'))}' result --label '${sq(label)}'`;
-        const alertChannel = deliverChannel || 'telegram';
-        const alertTarget  = deliverTo;
-        const watchdogSpec = JSON.stringify({
-          name:                     `watchdog:${label}`,
-          job_type:                 'watchdog',
-          schedule_cron:            monitorInterval,
-          session_target:           'shell',
-          payload_kind:             'shellCommand',
-          payload_message:          checkCmd,
-          delivery_mode:            'none',
-          run_timeout_ms:           120_000,  // 2 min: watchdog shell check should be fast
-          watchdog_target_label:    label,
-          watchdog_check_cmd:       checkCmd,
-          watchdog_timeout_min:     monitorTimeout,
-          watchdog_alert_channel:   alertChannel,
-          watchdog_alert_target:    alertTarget,
-          watchdog_self_destruct:   1,
-          watchdog_started_at:      new Date().toISOString(),
-          delete_after_run:         1,             // auto-delete after watchdog fires
-          origin:                   origin || 'system',
-          ...sourceContextToSchedulerFields(sourceContext),
-        });
-        const schedulerCli = resolveSchedulerCliPath();
-        const addResult = execFileSync(process.execPath, [schedulerCli, 'jobs', 'add', watchdogSpec, '--watchdog', '--json'], {
-          encoding: 'utf-8',
-          timeout:  10000,
-          stdio:    ['pipe', 'pipe', 'pipe'],
-        });
-        try {
-          const parsed = JSON.parse(addResult.trim());
-          watchdogJobId = parsed?.job?.id || null;
-        } catch {}
-        watchdogJobOk = true;
-
-        // Store watchdog job ID in labels ledger for later cleanup
-        if (watchdogJobId) {
-          setLabel(label, { watchdogJobId });
-        }
-
-        process.stderr.write(`[${agentBrand}] watchdog registered: ${monitorInterval}, timeout: ${monitorTimeout}min\n`);
-      } catch (err) {
-        process.stderr.write(`[${agentBrand}] watchdog registration FAILED: ${err.message}\n`);
-      }
-    }
-
-    const delivery = buildDispatchDeliverySurface({
-      deliverTo,
-      deliverChannel,
-      deliveryMode: deliverMode,
-      deliveryDisabled,
-      deliveryDisabledReason,
-      ...(deliverTo ? {
-        scheduler: schedulerWatcherOk,
-        gateway: true,
-      } : {}),
-    });
-
-    out({
-      ok:         true,
+    await activateDispatchRun({
       label,
       sessionKey,
-      runId:      response?.runId || idem,
-      mode:       isFresh ? 'fresh' : 'reuse',
+      runId,
+      jobId: idem,
       agent,
-      status:     'accepted',
-      sourceContext: sourceContext || null,
-      delivery,
-      watchdog:   monitorEnabled ? {
-        enabled:  watchdogJobOk,
-        jobId:    watchdogJobId,
-        interval: monitorInterval,
-        timeout:  monitorTimeout,
-        ...(monitorEnabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
-      } : null,
-      message:    delivery.status === 'disabled'
-        ? `Session spawned. Delivery intentionally disabled${delivery.reason ? ` (${delivery.reason}).` : '.'}`
-        : schedulerWatcherOk
-          ? 'Session spawned. Delivery via scheduler (primary) + gateway (secondary).'
-          : deliverTo
-            ? 'Session spawned. Delivery via gateway only (scheduler watcher failed).'
-            : 'Session spawned. Delivery target missing or not recorded.',
+      mode: isFresh ? 'fresh' : 'reuse',
+      hookMode: mode,
+      agentBrand,
+      sourceContext,
+      origin,
+      deliverTo,
+      deliverChannel,
+      deliverMode,
+      deliveryDisabled,
+      deliveryDisabledReason,
+      timeoutSeconds: timeoutS,
+      idleThresholdSeconds: flags['idle-threshold'] || '300',
+      monitor,
+      announceStart: true,
+      gatewaySecondary: true,
+      verb: 'spawned',
     });
-
-    // -- Post-spawn verification (Fix 3) --------------------------------
-    // Canary: inspect the SQLite-first compatibility store immediately, then
-    // wait up to 3 intervals to
-    // confirm the session appeared in the store. A session store entry with
-    // sessionId or startedAt/sessionStartedAt is enough: long first turns may not
-    // flush JSONL, token counts, or chat.history until the model call completes.
-    // The delivery watcher owns later completion/failure handling.
-    const configuredSpawnPollMax = Number(config.spawnPollMax);
-    const configuredSpawnPollDelayMs = Number(config.spawnPollDelayMs);
-    const SPAWN_POLL_MAX = Number.isInteger(configuredSpawnPollMax)
-      ? Math.min(12, Math.max(0, configuredSpawnPollMax))
-      : 3;
-    const SPAWN_POLL_DELAY_MS = Number.isFinite(configuredSpawnPollDelayMs)
-      ? Math.min(60_000, Math.max(1, configuredSpawnPollDelayMs))
-      : 10_000;
-    let spawnConfirmed = false;
-    for (let spawnPoll = 0; spawnPoll <= SPAWN_POLL_MAX; spawnPoll++) {
-      const spawnStore = readSessionsStore(agent);
-      const signal = inspectSessionActivitySignal(sessionKey, spawnStore);
-      if (signal.hasStartedSignal || signal.hasActivitySignal) {
-        spawnConfirmed = true;
-        break;
-      }
-      if (spawnPoll < SPAWN_POLL_MAX) {
-        await sleep(SPAWN_POLL_DELAY_MS);
-      }
-    }
-    if (!spawnConfirmed) {
-      const laneError = getGatewayLaneTaskError(sessionKey);
-      if (laneError.found && laneError.error) {
-        const spawnError = `spawn-failure: ${laneError.error}`;
-        process.stderr.write(`[${agentBrand}] WARNING: ${spawnError}\n`);
-        setLabel(label, {
-          status: 'error',
-          error: spawnError,
-          summary: spawnError,
-        });
-        disarmWatchdog(label);
-      } else {
-        // The agent RPC was accepted. Visibility policies and delayed database
-        // persistence can hide a healthy child from both local and gateway
-        // reads, so the watcher/job timeout owns eventual failure.
-        process.stderr.write(
-          `[${agentBrand}] session ${sessionKey} is not observable yet after ` +
-          `${(SPAWN_POLL_MAX * SPAWN_POLL_DELAY_MS) / 1000}s; leaving accepted run active\n`,
-        );
-      }
-    }
   } catch (err) {
     die(`gateway agent call failed: ${err.message}`);
   }
+}
+
+const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+
+/** A sessions_spawn child key for this agent: agent:<agent>:subagent:<id>. */
+function assertSpawnedChildKey(sessionKey, agent) {
+  const key = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
+  const [scope, , kind, ...rest] = key.split(':');
+  if (scope !== 'agent' || kind !== 'subagent' || rest.length === 0) {
+    throw new Error(
+      `--session-key must be the childSessionKey sessions_spawn returned (agent:${agent}:subagent:<id>)`,
+    );
+  }
+  return key;
+}
+
+/**
+ * adopt -- record the session a requesting agent started for a prepared label.
+ *
+ * Moves an awaiting-spawn label to running and arms the same delivery watcher
+ * and watchdog as a Gateway spawn. Repeating the same label and key is a no-op;
+ * a different key for a label that already has a session is refused. The
+ * session need not be observable yet: the post-spawn canary records a lane
+ * error if one appears and otherwise leaves the watcher in charge.
+ *
+ * Flags:
+ *   --label <string>        Required. Label printed by enqueue
+ *   --session-key <key>     Required. childSessionKey from sessions_spawn
+ *                           (or the label's existing key for a sessions_send continuation)
+ *   --run-id <id>           Optional. runId the tool returned
+ */
+async function cmdAdopt(flags) {
+  const label = flags.label;
+  if (!label || typeof label !== 'string') die('--label is required', 2);
+  const requestedKey = flags['session-key'];
+  if (typeof requestedKey !== 'string') {
+    die('--session-key is required (the childSessionKey returned by sessions_spawn)', 2);
+  }
+  const runIdFlag = flags['run-id'];
+  if (runIdFlag !== undefined && (typeof runIdFlag !== 'string' || !RUN_ID_PATTERN.test(runIdFlag))) {
+    die('--run-id must be the runId the tool returned (letters, digits, ".", "_", ":", "-")', 2);
+  }
+  const runId = runIdFlag ?? null;
+
+  let outcome = null;
+  const now = new Date().toISOString();
+  try {
+    mutateLabels((labels) => {
+      const entry = labels[label];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        outcome = { kind: 'missing' };
+        return false;
+      }
+      if (entry.status !== AWAITING_SPAWN) {
+        outcome = { kind: entry.sessionKey === requestedKey ? 'already' : 'conflict', entry };
+        return false;
+      }
+      let sessionKey;
+      try {
+        if (entry.sessionKey) {
+          // A sessions_send continuation keeps the label's session.
+          sessionKey = assertValidSessionKey(requestedKey, '--session-key');
+          if (sessionKey !== entry.sessionKey) {
+            throw new Error(`--session-key must be the label's session ${entry.sessionKey}, which sessions_send continued`);
+          }
+        } else {
+          sessionKey = assertSpawnedChildKey(requestedKey, entry.agent || 'main');
+        }
+      } catch (error) {
+        outcome = { kind: 'invalid', message: error.message };
+        return false;
+      }
+      const updated = {
+        ...entry,
+        sessionKey,
+        runId,
+        status:    'running',
+        spawnedAt: now,
+        adoptedAt: now,
+        summary:   null,
+        error:     null,
+        updatedAt: now,
+      };
+      assertValidLabelSessionMetadata(label, updated);
+      labels[label] = updated;
+      outcome = { kind: 'adopted', entry: updated };
+    });
+  } catch (err) {
+    die(`adopt failed: ${err.message}`);
+  }
+
+  if (outcome.kind === 'missing') {
+    die(`No ${AWAITING_SPAWN} dispatch for label "${label}". Run enqueue first; adopt records a session for a label enqueue prepared.`);
+  }
+  if (outcome.kind === 'invalid') die(outcome.message, 2);
+  if (outcome.kind === 'conflict') {
+    const { entry } = outcome;
+    die(
+      `Label "${label}" is ${entry.status || 'unknown'}` +
+      `${entry.sessionKey ? ` with session ${entry.sessionKey}` : ''}; refusing to adopt ${requestedKey}. ` +
+      'Enqueue the label again to prepare a new spawn.',
+    );
+  }
+  if (outcome.kind === 'already') {
+    const { entry } = outcome;
+    out({
+      ok:         true,
+      label,
+      sessionKey: entry.sessionKey,
+      runId:      entry.runId ?? null,
+      mode:       entry.mode ?? null,
+      agent:      entry.agent ?? null,
+      status:     entry.status,
+      adopted:    true,
+      alreadyAdopted: true,
+      spawnVia:   entry.spawnVia ?? null,
+      sourceContext: entry.sourceContext || null,
+      delivery:   buildDispatchDeliverySurface(entry),
+      message:    'Label already has this session; no jobs were registered.',
+    });
+    return;
+  }
+
+  const { entry } = outcome;
+  const agent = entry.agent || 'main';
+  try {
+    await activateDispatchRun({
+      label,
+      sessionKey: entry.sessionKey,
+      runId,
+      jobId: runId,
+      agent,
+      mode: entry.mode,
+      hookMode: entry.mode,
+      agentBrand: resolveAgentBrand(agent),
+      sourceContext: entry.sourceContext || null,
+      origin: entry.origin || null,
+      deliverTo: entry.deliverTo || null,
+      deliverChannel: entry.deliverChannel || null,
+      deliverMode: entry.deliveryMode || 'announce',
+      deliveryDisabled: entry.deliveryDisabled === true,
+      deliveryDisabledReason: entry.deliveryDisabledReason || null,
+      timeoutSeconds: Number(entry.timeoutSeconds ?? entry.timeout) || 300,
+      idleThresholdSeconds: Number(entry.idleThresholdSeconds) || 300,
+      monitor: {
+        enabled: entry.monitor?.enabled === true,
+        interval: entry.monitor?.interval || config.watchdogIntervalCron || '*/15 * * * *',
+        timeoutMin: Number(entry.monitor?.timeoutMin) || Number(config.watchdogTimeoutMin ?? 60),
+      },
+      announceStart: false,
+      gatewaySecondary: false,
+      verb: 'adopted',
+      extraOutput: { adopted: true, spawnVia: entry.spawnVia ?? null },
+    });
+  } catch (err) {
+    die(`adopt recorded session ${entry.sessionKey} but could not arm delivery: ${err.message}`);
+  }
+}
+
+function describeAwaitingSpawn(label, entry) {
+  const preparedAtMs = toTimestampMs(entry.preparedAt);
+  const ageMs = preparedAtMs === null ? null : Math.max(0, Date.now() - preparedAtMs);
+  const stale = ageMs !== null && ageMs >= AWAITING_SPAWN_STALE_MS;
+  const tool = entry.spawnVia === 'sessions_send' ? 'sessions_send' : 'sessions_spawn';
+  return {
+    ok:         true,
+    label,
+    sessionKey: entry.sessionKey || null,
+    runId:      null,
+    agent:      entry.agent,
+    mode:       entry.mode,
+    status:     AWAITING_SPAWN,
+    spawnVia:   tool,
+    preparedAt: entry.preparedAt || null,
+    spawnedAt:  null,
+    updatedAt:  entry.updatedAt,
+    ageSeconds: ageMs === null ? null : Math.round(ageMs / 1000),
+    stale,
+    staleAfterSeconds: AWAITING_SPAWN_STALE_MS / 1000,
+    summary:    null,
+    completion: null,
+    sourceContext: entry.sourceContext || null,
+    gatewayTimeoutSeconds: Number(entry.gatewayTimeoutSeconds ?? entry.timeoutSeconds) || null,
+    delivery:   buildDispatchDeliverySurface(entry),
+    error:      null,
+    liveness:   null,
+    taskFile:   entry.taskFile || null,
+    message:    stale
+      ? `Prepared ${Math.round(ageMs / 60000)} min ago and never adopted. If ${tool} started a session, ` +
+        'run adopt with its session key; otherwise enqueue again. This row is not deleted automatically.'
+      : `Waiting for the requesting agent to call ${tool} and run adopt; nothing is monitored yet.`,
+  };
 }
 
 /**
@@ -1995,6 +2530,12 @@ function cmdStatus(flags) {
   let entry = getLabel(label);
   if (!entry) {
     out({ ok: true, label, found: false, message: 'No session found for this label' });
+    return;
+  }
+
+  // No session is tracked until adopt, so liveness and auto-resolution do not apply.
+  if (entry.status === AWAITING_SPAWN) {
+    out(describeAwaitingSpawn(label, entry));
     return;
   }
 
@@ -2995,10 +3536,14 @@ async function cmdDone(flags) {
  *   --message-stdin       Read message text from stdin explicitly
  *                         (stdin is also auto-read when piped and no other message source is set)
  *   --session-key <key>   Optional. Direct session key (bypasses label lookup)
+ *   --send-via <route>    auto|gateway|tool (default: auto). From an OpenClaw agent
+ *                         exec shell, auto prints the sessions_send call for the agent
+ *                         to make instead of calling Gateway `agent`.
  */
-async function cmdSend(flags) {
+async function cmdSend(flags, subcommand = 'send') {
   const label = flags.label;
   const directKey = flags['session-key'];
+  const sendVia = resolveGatewayRoute(flags['send-via'], '--send-via');
   let message = null;
 
   try {
@@ -3027,6 +3572,22 @@ async function cmdSend(flags) {
     die(error.message, 2);
   }
 
+  if (sendVia === 'tool') {
+    const mode = subcommand === 'steer' ? 'steer' : 'followup';
+    const instruction = `Call sessions_send with params to ${mode === 'steer' ? 'steer' : 'message'} the session.`;
+    out({
+      ok:         true,
+      label:      label || null,
+      sessionKey,
+      status:     'handoff',
+      tool:       'sessions_send',
+      params:     { sessionKey, message, mode },
+      message:    `OpenClaw agent shell: ${BRAND} did not send the message. ${instruction}`,
+    });
+    process.stderr.write(`[${BRAND}] OpenClaw agent shell: message not sent. ${instruction}\n`);
+    return;
+  }
+
   const idem = randomUUID();
 
   try {
@@ -3047,6 +3608,9 @@ async function cmdSend(flags) {
       message:    'Message sent to session.',
     });
   } catch (err) {
+    if (isAttributionRefusal(err)) {
+      failAttributedSpawnRequired({ method: 'agent', routeFlag: '--send-via', error: err });
+    }
     die(`Failed to send message: ${err.message}`);
   }
 }
@@ -3171,7 +3735,13 @@ Subcommands:
            (active-session auto-detect is preserved only as a manual/local fallback)
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
            [--verify-cmd <shell_cmd>]
+           [--spawn-via auto|gateway|tool]
            (stdin is auto-read when piped and no explicit message source is set)
+           (from an OpenClaw agent exec shell, auto prints a sessions_spawn call for the
+            agent to make and records the label as awaiting-spawn; see adopt)
+
+  adopt    --label <l> --session-key <childSessionKey> [--run-id <runId>]
+           (record the session sessions_spawn started; registers delivery and monitoring)
 
   status   --label <l>
 
@@ -3184,10 +3754,11 @@ Subcommands:
   watcher-handoff --label <l> [--reason <text>]
 
   send     --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
-           [--session-key <k>]
+           [--session-key <k>] [--send-via auto|gateway|tool]
+           (from an OpenClaw agent exec shell, auto prints a sessions_send call instead)
 
   steer    --label <l> [--message <m>|--message-file <f>|--message-env <VAR>|--message-stdin]
-           (alias for send)
+           (alias for send; the sessions_send handoff uses mode steer)
 
   heartbeat --label <l>  OR  --session-key <k>
 
@@ -3206,13 +3777,14 @@ const flags = parseFlags(rest);
 
 switch (subcommand) {
   case 'enqueue':   await cmdEnqueue(flags);   break;
+  case 'adopt':     await cmdAdopt(flags);     break;
   case 'status':    cmdStatus(flags);          break;
   case 'stuck':     await cmdStuck(flags);     break;
   case 'result':    cmdResult(flags);          break;
   case 'route':     cmdRoute(flags);           break;
   case 'watcher-handoff': cmdWatcherHandoff(flags); break;
-  case 'send':      await cmdSend(flags);      break;
-  case 'steer':     await cmdSend(flags);      break;
+  case 'send':      await cmdSend(flags, 'send');  break;
+  case 'steer':     await cmdSend(flags, 'steer'); break;
   case 'heartbeat': cmdHeartbeat(flags);       break;
   case 'list':      cmdList(flags);            break;
   case 'sync':      cmdSync(flags);            break;

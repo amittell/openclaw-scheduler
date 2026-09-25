@@ -620,10 +620,15 @@ function respawnSession(label) {
     // is preserved and we send a continuation message.
     const continuationMsg = `[Auto-retry after 529 overload] Please continue your previous task. Pick up where you left off.`;
 
+    // Scheduler-originated retries keep the Gateway route explicitly. If this
+    // process ever inherits an OpenClaw agent-shell marker, the CLI refusal
+    // fails the retry here instead of leaving an awaiting-spawn row no agent
+    // will act on.
     execFileSync(process.execPath, [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,
+      '--send-via', 'gateway',
     ], {
       encoding: 'utf-8',
       timeout: 30000,
@@ -653,6 +658,7 @@ function respawnSession(label) {
         '--label', label,
         '--message', continuationMsg,
         '--mode', 'fresh',
+        '--spawn-via', 'gateway',
       ];
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -700,6 +706,7 @@ function respawnAfterGwRestart(label) {
       '--label', label,
       '--message', continuationMsg,
       '--mode', 'fresh',
+      '--spawn-via', 'gateway',
     ];
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -1462,6 +1469,7 @@ function respawnInterrupted(label) {
       '--label', label,
       '--message', continuationMsg,
       '--mode', 'reuse',
+      '--spawn-via', 'gateway',
     ];
     // Carry the original label's agent forward: cmdEnqueue defaults --agent to
     // 'main' and validates the reused sessionKey against that agent, so a label
