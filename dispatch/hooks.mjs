@@ -72,6 +72,30 @@ export function buildCompletionDeliveryScope({
   return `v1:${createHash('sha256').update(identity).digest('hex')}`;
 }
 
+/**
+ * The completion identity of a dispatch label row, for every claimant (the
+ * done signal, adopt, the claim reservation, the watcher). A run prepared for
+ * an agent's sessions_spawn or sessions_send call records its scope once, as
+ * `completionScope`, because adopt later changes the row's session key and run
+ * id; claimants reuse that scope before and after adopt. Other rows derive
+ * the scope from their session key and run id.
+ */
+export function labelCompletionIdentity(label, entry) {
+  const sessionKey = entry?.sessionKey || null;
+  const runId = entry?.runId || null;
+  const recorded = entry?.completionScope;
+  if (!recorded || typeof recorded !== 'object') return { sessionKey, runId, deliveryScope: null };
+  return {
+    sessionKey,
+    runId,
+    deliveryScope: buildCompletionDeliveryScope({
+      label,
+      sessionKey: recorded.sessionKey ?? null,
+      runId: recorded.runId ?? null,
+    }),
+  };
+}
+
 function metadataWithCompletionScope(metadata, { scope, runId }) {
   return {
     ...(metadata && typeof metadata === 'object' ? metadata : {}),

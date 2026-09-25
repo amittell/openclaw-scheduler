@@ -17,6 +17,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { getDispatchGatewayTimeoutSeconds } from '../dispatch/liveness.mjs';
+import { buildCompletionDeliveryScope } from '../dispatch/hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
@@ -217,8 +218,39 @@ function outboxBodiesContaining(fixture, text) {
 }
 
 const HANDOFF_RUN_FIELDS = [
-  'completedBeforeAdopt', 'completionScope', 'adoptedAt', 'arming', 'preparedAt', 'taskFile', 'taskSha256', 'monitor',
+  'completedBeforeAdopt', 'completionScope', 'adoptedAt', 'arming', 'preparedAt', 'preparedRunId', 'taskFile',
+  'taskSha256', 'monitor',
 ];
+
+function completionDebtScopes(fixture, label) {
+  const db = new Database(fixture.dbPath, { readonly: true });
+  try {
+    return db.prepare('SELECT delivery_scope FROM completion_debts WHERE task_label = ?').all(label)
+      .map(row => row.delivery_scope);
+  } finally {
+    db.close();
+  }
+}
+
+function runWatcherOnce(fixture, label) {
+  return spawnSync(process.execPath, [
+    join(REPO_DIR, 'dispatch', 'watcher.mjs'), '--label', label, '--timeout', '60', '--once',
+  ], {
+    encoding: 'utf8',
+    timeout: 45_000,
+    env: {
+      ...process.env,
+      HOME: fixture.root,
+      PATH: `${fixture.binDir}:${process.env.PATH || ''}`,
+      DISPATCH_CONFIG_DIR: fixture.configDir,
+      DISPATCH_STATE_DIR: fixture.stateDir,
+      DISPATCH_LABELS_PATH: fixture.labelsPath,
+      SCHEDULER_DB: fixture.dbPath,
+      OPENCLAW_GATEWAY_TOKEN: '',
+      OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
+    },
+  });
+}
 
 function outboxCount(fixture) {
   const db = new Database(fixture.dbPath, { readonly: true });
@@ -699,9 +731,15 @@ test('a failed completion-claim reservation is reported, and a repeat adopt rese
     assert.match(first.stderr, /completion debt reservation failed/);
     assert.deepEqual(jobNames(fixture), [`spawn-test-deliver:${label}`, `watchdog:${label}`]);
 
-    const second = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    const preparedRunId = readLabels(fixture)[label].preparedRunId;
+    assert.equal(readLabels(fixture)[label].runId, preparedRunId, 'without --run-id the prepared id is the run id');
+    const second = runDispatch(fixture, [
+      'adopt', '--label', label, '--session-key', CHILD_KEY, '--run-id', 'late-run-id',
+    ], AGENT_SHELL);
     assert.equal(second.status, 0, second.stderr || second.stdout);
     assert.deepEqual(parseJson(second).arming, { complete: true, missing: [] });
+    assert.match(second.stderr, /keeping recorded run id .*a later --run-id does not replace it/);
+    assert.equal(readLabels(fixture)[label].runId, preparedRunId, 'the reservation keeps its run id');
     assert.deepEqual(jobNames(fixture), [`spawn-test-deliver:${label}`, `watchdog:${label}`], 'no job registered twice');
     const db = new Database(fixture.dbPath, { readonly: true });
     try {
@@ -884,13 +922,16 @@ test('label reuse: a run that finished before adopt does not leak into the next 
     const first = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
     assert.equal(parseJson(first).completedBeforeAdopt, true);
     const delivered = outboxCount(fixture);
+    const firstScope = readLabels(fixture)[label].completionScope;
 
     assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
     const pending = readLabels(fixture)[label];
     assert.equal(pending.status, 'awaiting-spawn');
-    for (const field of ['completedBeforeAdopt', 'completionScope', 'adoptedAt', 'arming']) {
+    for (const field of ['completedBeforeAdopt', 'adoptedAt', 'arming']) {
       assert.equal(Object.hasOwn(pending, field), false, `${field} from the previous run is cleared`);
     }
+    assert.deepEqual(pending.completionScope, { sessionKey: null, runId: pending.preparedRunId }, 'the new run records its own scope');
+    assert.notDeepEqual(pending.completionScope, firstScope);
 
     seedSession(fixture, CHILD_KEY_2);
     const failing = watchdogFailingCli(fixture);
@@ -1090,8 +1131,10 @@ test('label reuse: two runs that finish before adopt are each delivered exactly 
       { key: CHILD_KEY, summary: 'Run one: switched the default theme.' },
       { key: CHILD_KEY_2, summary: 'Run two: added the dark variant.' },
     ];
+    const preparedRunIds = [];
     for (const run of runs) {
       assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+      preparedRunIds.push(readLabels(fixture)[label].preparedRunId);
       const done = finishBeforeAdopt(fixture, label, run.summary);
       assert.equal(done.delivery.delivered, true, `${run.summary} enqueued by done`);
       const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', run.key], AGENT_SHELL);
@@ -1104,9 +1147,10 @@ test('label reuse: two runs that finish before adopt are each delivered exactly 
     for (const run of runs) {
       assert.equal(outboxBodiesContaining(fixture, run.summary), 1, `${run.summary} delivered exactly once`);
     }
-    const scopes = new Set(Object.values(readLabels(fixture)).map(row => JSON.stringify(row.completionScope)));
-    assert.equal(scopes.size, 1, 'one label row');
-    assert.notEqual(readLabels(fixture)[label].completionScope.runId, null, 'the prepared run id scopes the claim');
+    assert.ok(preparedRunIds.every(Boolean) && preparedRunIds[0] !== preparedRunIds[1], 'each run minted its own id');
+    assert.deepEqual(completionDebtScopes(fixture, label).sort(), preparedRunIds
+      .map(runId => buildCompletionDeliveryScope({ label, sessionKey: null, runId }))
+      .sort(), 'one claim per run, each under that run\'s prepared id');
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -1159,6 +1203,101 @@ test('done after adopt measures its runtime guard from preparation, not from ado
     ], SUBAGENT_SHELL);
     assert.equal(done.status, 0, done.stderr || done.stdout);
     assert.equal(readLabels(fixture)[label].status, 'done');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a repeated done before adopt is delivered once', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'done-retried';
+    const summary = 'Retried done: theme switched.';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label, summary);
+    // The child's first done returned slowly and it called done again.
+    const again = runDispatch(fixture, [
+      'done', '--label', label, '--summary', summary, '--checklist', '{"work_complete":true}',
+    ], SUBAGENT_SHELL);
+    assert.equal(again.status, 0, again.stderr || again.stdout);
+    const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+    assert.equal(outboxBodiesContaining(fixture, summary), 1, 'the summary reaches the outbox once');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('done, adopt, then done again is delivered once', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'done-adopt-done';
+    const summary = 'Done again after adopt: tests pass.';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label, summary);
+    const adopted = runDispatch(fixture, [
+      'adopt', '--label', label, '--session-key', CHILD_KEY, '--run-id', 'run-from-tool',
+    ], AGENT_SHELL);
+    assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+    const again = runDispatch(fixture, [
+      'done', '--label', label, '--summary', summary, '--checklist', '{"work_complete":true}',
+    ], SUBAGENT_SHELL);
+    assert.equal(again.status, 0, again.stderr || again.stdout);
+    assert.equal(outboxBodiesContaining(fixture, summary), 1, 'the summary reaches the outbox once');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('the watcher delivers a completion done already enqueued before adopt only once', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'done-races-adopt';
+    const summary = 'Raced adopt: dark variant added.';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label, summary);
+    assert.equal(outboxBodiesContaining(fixture, summary), 1);
+    // done read the label before adopt moved it to running, then enqueued its
+    // completion; adopt armed the watcher, which ticks before done records
+    // completionDeliveredAt.
+    const labels = readLabels(fixture);
+    delete labels[label].completionDeliveredAt;
+    Object.assign(labels[label], {
+      sessionKey: CHILD_KEY, runId: 'run-from-tool', adoptedAt: new Date().toISOString(),
+      arming: { sessionKey: CHILD_KEY },
+    });
+    writeFileSync(fixture.labelsPath, JSON.stringify(labels, null, 2) + '\n');
+
+    const watcher = runWatcherOnce(fixture, label);
+    assert.equal(watcher.status, 0, watcher.stderr);
+    assert.match(watcher.stderr, /WATCHER_ALREADY_DELIVERED/);
+    assert.equal(outboxBodiesContaining(fixture, summary), 1, 'the watcher does not enqueue it again');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('adopt --run-id replays an undelivered completion under the prepared scope', () => {
+  const fixture = buildFixture({ initDb: false });
+  try {
+    const label = 'replay-with-run-id';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    const preparedRunId = readLabels(fixture)[label].preparedRunId;
+    const done = finishBeforeAdopt(fixture, label, 'Replayed completion.');
+    assert.equal(done.delivery.delivered, false, 'no completion tables yet');
+
+    initSchedulerDb(fixture);
+    const adopted = runDispatch(fixture, [
+      'adopt', '--label', label, '--session-key', CHILD_KEY, '--run-id', 'run-from-tool',
+    ], AGENT_SHELL);
+    assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+    assert.equal(parseJson(adopted).delivery.delivered, true);
+    const row = readLabels(fixture)[label];
+    assert.equal(row.runId, 'run-from-tool');
+    assert.deepEqual(completionDebtScopes(fixture, label), [
+      buildCompletionDeliveryScope({ label, sessionKey: null, runId: preparedRunId }),
+    ], 'claimed under the prepared scope, not the adopted key and run id');
+    assert.equal(outboxBodiesContaining(fixture, 'Replayed completion.'), 1);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

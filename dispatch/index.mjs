@@ -59,6 +59,7 @@ import {
   onStuck,
   enqueueCompletionNotification,
   resetCompletionDeliveryClaim,
+  labelCompletionIdentity,
 } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
 import { resolveDefaultDispatchModel } from './default-model.mjs';
@@ -1671,6 +1672,7 @@ async function activateDispatchRun({
   verb,
   extraOutput = {},
   arming = null,
+  deliveryScope = null,
 }) {
   const progress = arming ? { ...arming } : null;
   const recordStep = (patch) => {
@@ -1691,6 +1693,7 @@ async function activateDispatchRun({
         label,
         sessionKey,
         runId,
+        ...(deliveryScope ? { deliveryScope } : {}),
       }) !== false;
     } catch (err) {
       process.stderr.write(`[${agentBrand}] completion claim reservation FAILED: ${err.message}\n`);
@@ -2010,6 +2013,13 @@ function prepareAttributedSpawn({
       }
     : buildSessionsSendParams({ sessionKey, message: taskMessage, mode: 'followup' });
 
+  // This run's identity until adopt records the tool's runId, and its
+  // completion scope for good: every claimant (done before or after adopt,
+  // adopt's replay, the claim reservation, the watcher) reuses the recorded
+  // scope, so one run's completion has one claim and one outbox key.
+  const preparedRunId = randomUUID();
+  const completionScope = { sessionKey: isFresh ? null : sessionKey, runId: preparedRunId };
+
   let taskFile;
   try {
     taskFile = writeSpawnTaskFile(taskMessage);
@@ -2034,10 +2044,8 @@ function prepareAttributedSpawn({
       verifyCmd:      verifyCmd || null,
       spawnVia:       tool,
       preparedAt:     new Date().toISOString(),
-      // This run's identity until adopt records the tool's runId. A child that
-      // finishes before adopt claims its completion under it, so each run of a
-      // label gets its own claim scope and outbox key.
-      preparedRunId:  randomUUID(),
+      preparedRunId,
+      completionScope,
       spawnedAt:      null,
       timeoutSeconds: timeoutS,
       gatewayTimeoutSeconds: gatewayTimeoutS,
@@ -2496,9 +2504,9 @@ async function cmdAdopt(flags) {
           return false;
         }
         // Without --run-id the run keeps the id minted at prepare, as a Gateway
-        // spawn falls back to its own idempotency key, so claim scopes and
-        // outbox keys stay distinct between runs of one label and session.
-        const runIdentity = runId ?? entry.runId ?? entry.preparedRunId ?? null;
+        // spawn falls back to its own idempotency key. Once recorded, a run id
+        // is not replaced by a later --run-id.
+        const runIdentity = entry.runId ?? runId ?? entry.preparedRunId ?? null;
         const updated = pending
           ? {
               ...entry,
@@ -2510,7 +2518,6 @@ async function cmdAdopt(flags) {
               summary:   null,
               error:     null,
               completedBeforeAdopt: undefined,
-              completionScope: undefined,
               arming:    { sessionKey },
               updatedAt: now,
             }
@@ -2524,14 +2531,11 @@ async function cmdAdopt(flags) {
         outcome = { kind: 'conflict', entry };
         return false;
       }
+      // A repeat keeps the recorded run id: the claim reservation and any
+      // completion already use this run's recorded scope.
       const rearm = entry.status === 'running'
         && entry.arming?.sessionKey === requestedKey
         && !entry.arming.armedAt;
-      if (rearm && runId && !entry.runId) {
-        labels[label] = { ...entry, runId, updatedAt: now };
-        outcome = { kind: 'rearm', entry: labels[label] };
-        return undefined;
-      }
       outcome = { kind: rearm ? 'rearm' : 'already', entry };
       return false;
     });
@@ -2552,6 +2556,11 @@ async function cmdAdopt(flags) {
     );
   }
   const { entry } = outcome;
+  if (runId && entry.runId && runId !== entry.runId) {
+    process.stderr.write(
+      `[${BRAND}] keeping recorded run id ${entry.runId} for ${label}; a later --run-id does not replace it\n`,
+    );
+  }
   if (outcome.kind === 'already') {
     out({
       ok:         true,
@@ -2611,6 +2620,7 @@ async function cmdAdopt(flags) {
         ...(outcome.kind === 'rearm' ? { rearmed: true } : {}),
       },
       arming: entry.arming || { sessionKey: entry.sessionKey },
+      deliveryScope: labelCompletionIdentity(label, entry).deliveryScope,
     });
   } catch (err) {
     die(`adopt recorded session ${entry.sessionKey} but could not arm delivery: ${err.message}. ` +
@@ -2637,7 +2647,7 @@ function assertAdoptableKey(entry, requestedKey) {
 
 /**
  * The child called `done` before adopt. done delivered (or tried to deliver)
- * the completion under the scope recorded in completionScope; retry only a
+ * the completion under the run's recorded completionScope; retry only a
  * delivery that did not succeed, under that same scope, so the claim keeps it
  * to one delivery. No watcher or watchdog is armed for a finished run.
  */
@@ -2645,7 +2655,7 @@ async function reportCompletedBeforeAdopt(label, entry) {
   let delivered = Boolean(entry.completionDeliveredAt);
   let deliveryError = null;
   if (completionDeliveryWanted(entry) && !delivered) {
-    const scope = entry.completionScope || { sessionKey: null, runId: null };
+    const identity = labelCompletionIdentity(label, entry);
     try {
       const retry = await enqueueCompletionNotification({
         label,
@@ -2653,8 +2663,9 @@ async function reportCompletedBeforeAdopt(label, entry) {
         completion: entry.completion || null,
         deliverTo: entry.deliverTo,
         deliveryChannel: entry.deliverChannel || 'telegram',
-        sessionKey: scope.sessionKey ?? null,
-        runId: scope.runId ?? null,
+        sessionKey: identity.sessionKey,
+        runId: identity.runId,
+        deliveryScope: identity.deliveryScope,
         origin: entry.origin || null,
         sourceContext: entry.sourceContext || null,
         metadata: {
@@ -3538,10 +3549,9 @@ async function cmdDone(flags) {
 
   const existing = getLabel(label);
   // A child started by sessions_spawn can finish before its parent runs adopt.
-  // Its label is still awaiting-spawn: no session key or run id yet, so the
-  // completion is claimed under the run id minted when the label was prepared.
+  // Its label is still awaiting-spawn, with no session key or run id yet; the
+  // completion is claimed under the scope recorded when the label was prepared.
   const beforeAdopt = existing?.status === AWAITING_SPAWN;
-  const completionRunId = existing?.runId || (beforeAdopt ? existing.preparedRunId : null) || null;
 
   // -- Fix 1: Minimum runtime guard ----------------------------------------
   // Prevent agents from calling done immediately after spawning before doing
@@ -3695,11 +3705,8 @@ async function cmdDone(flags) {
     completion,
     ...(sha ? { sha } : {}),
     // adopt later binds the session key and retries this delivery, if it
-    // fails below, under the same claim scope, so it is delivered once.
-    ...(beforeAdopt ? {
-      completedBeforeAdopt: true,
-      completionScope: { sessionKey: existing.sessionKey || null, runId: completionRunId },
-    } : {}),
+    // fails below, under the run's recorded completion scope.
+    ...(beforeAdopt ? { completedBeforeAdopt: true } : {}),
   });
 
   // Disarm watchdog when agent signals done
@@ -3707,14 +3714,16 @@ async function cmdDone(flags) {
 
   let completionDelivery = null;
   if (existing.deliverTo && existing.deliveryMode !== 'none') {
+    const identity = labelCompletionIdentity(label, existing);
     completionDelivery = await enqueueCompletionNotification({
       label,
       summary,
       completion,
       deliverTo: existing.deliverTo,
       deliveryChannel: existing.deliverChannel || 'telegram',
-      sessionKey: existing.sessionKey || null,
-      runId: completionRunId,
+      sessionKey: identity.sessionKey,
+      runId: identity.runId,
+      deliveryScope: identity.deliveryScope,
       origin: existing.origin || null,
       sourceContext: existing.sourceContext || null,
       metadata: {
