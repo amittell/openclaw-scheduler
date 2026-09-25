@@ -2457,8 +2457,9 @@ function assertSpawnedChildKey(sessionKey, agent) {
  * interrupted part way, registering only the missing jobs; once armed it is a
  * no-op. A different key for a label that already has a session is refused.
  * If the child called `done` before adopt, done has already delivered the
- * completion: adopt binds the session key, retries that delivery under done's
- * scope only if it did not succeed, and registers no jobs. The session need
+ * completion: adopt binds the session key, retries that delivery under the
+ * run's recorded completion scope only if it did not succeed, and registers no
+ * jobs. The session need
  * not be observable yet: the post-spawn canary records a lane error if one
  * appears and otherwise leaves the watcher in charge.
  *

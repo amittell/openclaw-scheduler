@@ -246,9 +246,9 @@ keys. Each run of a label records a fresh scope.
 A fast child can call `done` before the parent runs `adopt`. `done` then marks
 the awaiting-spawn label `done`, measures its minimum-runtime guard from
 `preparedAt`, and delivers the completion as usual under the run's recorded
-completion scope. For an adopted tool-route run
-the guard also measures from `preparedAt`, the earlier bound on the spawn,
-since `adopt` records `spawnedAt` when it runs. A later `adopt` binds the session key, registers no jobs, and
+completion scope. For an adopted tool-route run the guard also measures from
+`preparedAt`, the earlier bound on the spawn, since `adopt` records `spawnedAt`
+when it runs. A later `adopt` binds the session key, registers no jobs, and
 reports `completedBeforeAdopt: true`; if `done` could not deliver, `adopt`
 retries under the same scope, so the completion is delivered once. Until
 `adopt`, `status` shows the pending view, `sync` and `stuck` skip the label,

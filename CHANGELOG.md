@@ -33,7 +33,8 @@ All notable changes to this project will be documented in this file.
   run gets its own id and records one completion scope, which `done` (before
   or after `adopt`, and on a retry), `adopt`, and the watcher all claim under,
   so each run of a label is delivered once. The id also stands in for an
-  omitted `--run-id`. `done` for an adopted run measures its minimum-runtime
+  omitted `--run-id`, and a later `--run-id` does not replace a recorded run
+  id. `done` for an adopted run measures its minimum-runtime
   guard from preparation, so a `done` after a late `adopt` is no longer
   rejected as too short.
 

@@ -747,6 +747,9 @@ test('a failed completion-claim reservation is reported, and a repeat adopt rese
     } finally {
       db.close();
     }
+    assert.deepEqual(completionDebtScopes(fixture, label), [
+      buildCompletionDeliveryScope({ label, sessionKey: null, runId: preparedRunId }),
+    ], 'the claim reservation is keyed on the run\'s recorded scope, not the adopted key');
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
