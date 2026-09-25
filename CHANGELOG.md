@@ -30,9 +30,12 @@ All notable changes to this project will be documented in this file.
   `adopt`. Every new run of a label drops the previous run's handoff state, and
   a tool-route `--mode reuse` applies an explicit `--model` or `--thinking`
   with `sessions.patch` before printing the `sessions_send` call. Each prepared
-  run gets its own id, which scopes a completion that arrives before `adopt`
-  and stands in for an omitted `--run-id`, so repeated runs of a label are each
-  delivered once.
+  run gets its own id and records one completion scope, which `done` (before
+  or after `adopt`, and on a retry), `adopt`, and the watcher all claim under,
+  so each run of a label is delivered once. The id also stands in for an
+  omitted `--run-id`. `done` for an adopted run measures its minimum-runtime
+  guard from preparation, so a `done` after a late `adopt` is no longer
+  rejected as too short.
 
 ## [0.6.3] -- 2026-09-23
 

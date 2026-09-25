@@ -233,13 +233,20 @@ missing steps (`rearmed: true`); once armed, a repeat is a no-op that returns
 the existing record (`alreadyAdopted: true`). A different key for a label that
 already has a session is refused. `--run-id` is optional: without it the run
 keeps the id `enqueue` minted for it (`preparedRunId`), as a Gateway spawn
-falls back to its own idempotency key, so each run of a label has its own
-completion claim and outbox key.
+falls back to its own idempotency key. Once a run id is recorded, a later
+`--run-id` does not replace it; `adopt` says so on stderr.
+
+`enqueue` also records the run's completion scope (`completionScope`, from
+`preparedRunId`) once. Every path that claims the completion uses it: `done`
+before or after `adopt` and on a retry, `adopt`'s claim reservation and replay,
+and the delivery watcher. `adopt` changes the label's session key and run id,
+so deriving the scope from them would give one run two claims and two outbox
+keys. Each run of a label records a fresh scope.
 
 A fast child can call `done` before the parent runs `adopt`. `done` then marks
 the awaiting-spawn label `done`, measures its minimum-runtime guard from
-`preparedAt`, and delivers the completion as usual under the run's
-`preparedRunId`, recording that delivery scope. For an adopted tool-route run
+`preparedAt`, and delivers the completion as usual under the run's recorded
+completion scope. For an adopted tool-route run
 the guard also measures from `preparedAt`, the earlier bound on the spawn,
 since `adopt` records `spawnedAt` when it runs. A later `adopt` binds the session key, registers no jobs, and
 reports `completedBeforeAdopt: true`; if `done` could not deliver, `adopt`
