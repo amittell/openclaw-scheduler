@@ -2009,7 +2009,11 @@ openclaw-scheduler enqueue --label fix-deploy-script --message-file task.md \
 openclaw-scheduler adopt --label fix-deploy-script --session-key agent:main:subagent:CHILD_ID --run-id RUN_ID
 ```
 
-`send` and `steer` print a `sessions_send` call in a marked shell. Terminals,
+If `adopt` exits 1 with `ADOPT_ARMING_INCOMPLETE`, run it again with the same
+key: it registers only the missing jobs. A worker that finishes before `adopt`
+is delivered once by `done`, and `adopt` then only records its session.
+`send` and `steer` print a fire-and-forget `sessions_send` call
+(`timeoutSeconds: 0`) in a marked shell. Terminals,
 the scheduler daemon, and watcher or 529 redispatch keep the Gateway path.
 `--spawn-via gateway` (or `--send-via gateway`) forces the Gateway call for
 older OpenClaw releases; a refusal exits 3 with `ATTRIBUTED_SPAWN_REQUIRED` and

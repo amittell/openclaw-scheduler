@@ -65,7 +65,9 @@ to you:
 2. Call your `sessions_spawn` tool with `spawn.params` exactly as printed.
 3. Run `adopt.command`, replacing `<childSessionKey>` and `<runId>` with the
    values `sessions_spawn` returned. Delivery to the chat and the watchdog start
-   here.
+   here. If it exits 1 with `ADOPT_ARMING_INCOMPLETE`, run the same command
+   again; it finishes only the missing steps. If the worker already finished,
+   `adopt` still records it and reports `completedBeforeAdopt`.
 
 `--mode reuse` prints a `sessions_send` call instead; `send` and `steer` print a
 `sessions_send` call for you to make. The worker still finishes with `done`, and

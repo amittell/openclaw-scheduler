@@ -224,15 +224,39 @@ no "starting" chat notice: the requesting agent reports the start in its own
 reply. The session does not have to be observable yet; the post-spawn check
 records a lane error if one appears.
 
-Running `adopt` again with the same label and key is a no-op that returns the
-existing record (`alreadyAdopted: true`). A different key for a label that
+`adopt` records each arming step in the label's `arming` record (claim,
+watcher, watchdog) and sets `arming.armedAt` once all of them are done. If a
+step fails, or the process dies after the label moved to `running`, `adopt`
+exits 1 with `{"ok":false,"error":{"code":"ADOPT_ARMING_INCOMPLETE","missing":[...]}}`
+and the partial record. Running the same `adopt` again registers only the
+missing steps (`rearmed: true`); once armed, a repeat is a no-op that returns
+the existing record (`alreadyAdopted: true`). A different key for a label that
 already has a session is refused. `--run-id` is optional.
 
+A fast child can call `done` before the parent runs `adopt`. `done` then marks
+the awaiting-spawn label `done`, measures its minimum-runtime guard from
+`preparedAt`, and delivers the completion as usual, recording the delivery
+scope it used. A later `adopt` binds the session key, registers no jobs, and
+reports `completedBeforeAdopt: true`; if `done` could not deliver, `adopt`
+retries under the same scope, so the completion is delivered once. Until
+`adopt`, `status` shows the pending view, `sync` and `stuck` skip the label,
+and a delivery watcher left from an earlier run stays pending instead of
+delivering that run's reply.
+
 For `--mode reuse` from a marked shell, `enqueue` prints a `sessions_send` call
-(`mode: "followup"`) to the label's existing session instead, and
-`adopt.command` already contains that session key; pass the `runId` that
-`sessions_send` returned. OpenClaw may hand the child's reply back to the
-requesting agent; dispatch still delivers the completion, so do not repost it.
+(`mode: "followup"`, `timeoutSeconds: 0`) to the label's existing session
+instead, and `adopt.command` already contains that session key; pass the
+`runId` that `sessions_send` returned.
+
+`timeoutSeconds: 0` keeps every `sessions_send` plan fire-and-forget. Omitted,
+OpenClaw 2026.9.6 defaults it to 30 for `followup`, and the requesting agent
+waits for the child's reply and receives it inline. With 0 the call returns
+once the turn is accepted. OpenClaw still hands a `followup` reply to a
+requesting agent that is not itself a subagent, once, if the child's turn ends
+within its 30 second announce window; a dispatch task normally runs longer, and
+the handoff message tells the agent not to repost it. `steer` always runs with
+0, injects into the active run without an announcement, and fails when the
+child has no active run (use `send` then).
 
 ### `status` — session status for a label
 
@@ -325,8 +349,9 @@ Sends a message directly into the running session. The agent sees it as a new
 user turn and continues working. This is the **mid-session steering superpower**.
 
 From an OpenClaw agent exec shell, `send` does not call the Gateway. It prints
-`{"status":"handoff","tool":"sessions_send","params":{"sessionKey":...,"message":...,"mode":"followup"}}`
-for the agent to pass to its `sessions_send` tool (`steer` uses `mode: "steer"`).
+`{"status":"handoff","tool":"sessions_send","params":{"sessionKey":...,"message":...,"mode":"followup","timeoutSeconds":0}}`
+for the agent to pass to its `sessions_send` tool (`steer` uses `mode: "steer"`;
+see `adopt` above for what `timeoutSeconds: 0` does).
 `--send-via auto|gateway|tool` selects the route the same way `--spawn-via`
 does for `enqueue`.
 
@@ -424,8 +449,10 @@ Gitignored by default. Session-local, not shared.
 A label prepared from an agent shell holds `status: "awaiting-spawn"`,
 `spawnVia: "sessions_spawn"` (or `"sessions_send"`), `preparedAt`, the stored
 `monitor` settings, and `taskFile` with `taskSha256` until `adopt` records its
-`sessionKey`, `runId`, and `spawnedAt`. Labels spawned through the Gateway
-record `spawnVia: "gateway"`.
+`sessionKey`, `runId`, `spawnedAt`, `adoptedAt`, and the `arming` record. A
+label whose child called `done` first also holds `completedBeforeAdopt` and
+`completionScope`. Labels spawned through the Gateway record
+`spawnVia: "gateway"`.
 
 ---
 

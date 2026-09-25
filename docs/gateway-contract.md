@@ -483,8 +483,11 @@ because those turns would lose inter-session attribution. Dispatch does not
 call `agent` from such a shell. `cmdEnqueue` records the label as
 `awaiting-spawn` and prints the `sessions_spawn` (or, for `--mode reuse`,
 `sessions_send`) call for the agent's attributed tool; `cmdAdopt` then records
-the child session and registers delivery and monitoring. `cmdSend` prints a
-`sessions_send` call. An explicit `--spawn-via gateway` or `--send-via gateway`
+the child session and registers delivery and monitoring, resuming a partial
+arming when repeated. `cmdSend` prints a `sessions_send` call. Every
+`sessions_send` plan sets `timeoutSeconds: 0`: OpenClaw defaults a `followup` to
+a 30 second inline wait for the child's reply, which would hand the reply to
+the requesting agent instead of leaving delivery to dispatch. An explicit `--spawn-via gateway` or `--send-via gateway`
 still calls `agent`; a refusal, recognized by its stable text
 `would lose inter-session attribution`, exits 3 as `ATTRIBUTED_SPAWN_REQUIRED`
 before any ledger write or job registration. Scheduler-originated redispatch

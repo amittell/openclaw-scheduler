@@ -21,7 +21,13 @@ All notable changes to this project will be documented in this file.
   records nothing. Terminals, the scheduler daemon, and watcher, 529, and
   stuck-detector redispatch keep the Gateway path, which scheduler-originated
   redispatch now requests explicitly. `status` shows `awaiting-spawn` labels
-  with their age and marks them stale after 15 minutes.
+  with their age and marks them stale after 15 minutes. `sessions_send` plans
+  set `timeoutSeconds: 0` so the requesting agent does not wait for, and
+  receive, the child's reply. `adopt` records its arming steps, so a repeat
+  after a partial failure registers only the missing jobs. A child that calls
+  `done` before `adopt` is delivered once, and a delivery watcher left from an
+  earlier run no longer delivers that run's reply while a continuation awaits
+  `adopt`.
 
 ## [0.6.3] -- 2026-09-23
 
