@@ -48,9 +48,32 @@ openclaw-scheduler runs list <job-id> --json
 openclaw-scheduler runs running --json
 ```
 
-The `status` output gives authoritative `status` (`accepted` / `running` / `done` / `error`), `updatedAt` timestamp, and final `summary`. Use that.
+The `status` output gives authoritative `status` (`accepted` / `running` / `done` / `error`, or `awaiting-spawn` for a label prepared but not yet adopted), `updatedAt` timestamp, and final `summary`. Use that.
 
 **Rule: if you haven't polled status, you don't know the status.**
+
+## Dispatching Sub-Agents from an OpenClaw Agent (2026.9.6+)
+
+On OpenClaw 2026.9.6 and later, an agent's exec shell cannot start another
+session through the Gateway CLI. `chilisaus.mjs enqueue` (and
+`dispatch/index.mjs enqueue`) detects the agent shell and hands the spawn back
+to you:
+
+1. Run `enqueue` with the usual flags. It starts nothing and prints JSON with
+   `status: "awaiting-spawn"`, `spawn.tool: "sessions_spawn"`, `spawn.params`,
+   and `adopt.command`.
+2. Call your `sessions_spawn` tool with `spawn.params` exactly as printed.
+3. Run `adopt.command`, replacing `<childSessionKey>` and `<runId>` with the
+   values `sessions_spawn` returned. Delivery to the chat and the watchdog start
+   here.
+
+`--mode reuse` prints a `sessions_send` call instead; `send` and `steer` print a
+`sessions_send` call for you to make. The worker still finishes with `done`, and
+the scheduler delivers its result, so do not repost it. Do not work around a
+refusal: do not unset `OPENCLAW_SHELL`, call `/v1/chat/completions`, `/hooks`,
+or `/tools/invoke` yourself, or ask the scheduler to start the session. Exit
+code 3 with `ATTRIBUTED_SPAWN_REQUIRED` means `--spawn-via gateway` was forced
+from an agent shell; drop the flag.
 
 ---
 

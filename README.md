@@ -1950,6 +1950,7 @@ fallback.
 | `--timeout` | `300` | Session timeout in seconds. |
 | `--monitor` | on | Auto-register a watchdog job that alerts if the session goes silent past the configured threshold. |
 | `--no-monitor` | -- | Disable watchdog registration for this dispatch. |
+| `--spawn-via` | `auto` | `auto`, `gateway`, or `tool`. In an OpenClaw agent exec shell `auto` prepares a `sessions_spawn` call instead of calling the Gateway; see [From an OpenClaw agent shell](#from-an-openclaw-agent-shell-openclaw-202696-and-later). |
 
 *One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
 
@@ -1957,14 +1958,15 @@ fallback.
 
 | Subcommand | Description |
 |------------|-------------|
-| `enqueue` | Spawn a new agent session (or resume one with `--mode reuse`) and optionally register a scheduler watcher for delivery. |
-| `status` | Show current status for a label: session key, spawn time, running/done/error, and liveness data from the sessions store. |
+| `enqueue` | Spawn a new agent session (or resume one with `--mode reuse`) and optionally register a scheduler watcher for delivery. From an OpenClaw agent exec shell, prepare the `sessions_spawn` call instead. |
+| `adopt` | Record the session an agent started with `sessions_spawn` for an `awaiting-spawn` label, then register the delivery watcher and watchdog. |
+| `status` | Show current status for a label: session key, spawn time, running/done/error, and liveness data from the sessions store. An `awaiting-spawn` label reports its age and whether it is stale. |
 | `stuck` | Check all running sessions against the stuck threshold. Exits 1 if genuinely stuck sessions remain after auto-resolving completed ones. |
 | `result` | Retrieve the last assistant reply from a session transcript via `chat.history`. |
 | `route` | Return the stored authoritative source envelope and durable delivery route for safe follow-up. |
 | `sync` | Reconcile `labels.json` with sessions store state. Auto-marks sessions as done or error based on idle time. Supports `--dry-run`. |
 | `done` | Agent-side completion signal. The agent calls this as its final action from the originating local dispatch shell to mark itself done immediately (push-based; no idle timeout wait). Do not call it from inside a remote or nested shell, because the label lookup is local to the dispatch host. The stored completion payload is normalized for channel-safe delivery, with checklist/sha metadata used as a fallback when the raw summary is generic or noisy. |
-| `send` | Inject a message into a running session for mid-run steering. The agent sees it as a new user turn. |
+| `send` | Inject a message into a running session for mid-run steering. The agent sees it as a new user turn. From an OpenClaw agent exec shell, print the `sessions_send` call instead. |
 | `steer` | Alias for `send`. The name makes steering intent explicit. |
 | `heartbeat` | Check whether a session has been active within the last 10 minutes. Accepts `--label` or `--session-key`. |
 | `list` | List all tracked labels in `labels.json`, sorted by most recent. Accepts `--status running|done|error` and `--limit`. |
@@ -1983,9 +1985,40 @@ source_thread=$(printf '%s' "$route_json" | jq -r '.sourceContext.threadId // em
 Pass those stored identifiers to the messaging API used by the caller. The
 scheduler never stores inbound message text or credentials in this envelope.
 
+### From an OpenClaw agent shell (OpenClaw 2026.9.6 and later)
+
+OpenClaw 2026.9.6 and later refuse a Gateway `agent` turn from an agent exec
+shell (`OPENCLAW_SHELL=exec`, and subagent shells with
+`OPENCLAW_SUBAGENT_EXEC=1`), because such a turn would lose inter-session
+attribution. Scripts in those shells must use the agent's attributed session
+tool or normal child completion instead. In a marked shell, dispatch therefore
+prepares the spawn for the agent rather than starting it:
+
+1. `enqueue` validates the request as before, records the label as
+   `awaiting-spawn`, and prints `spawn.params` and `adopt.command`. It makes no
+   Gateway call.
+2. The agent calls its `sessions_spawn` tool with `spawn.params` as printed.
+3. The agent runs `adopt.command` with the `childSessionKey` and `runId` that
+   `sessions_spawn` returned. `adopt` moves the label to `running` and
+   registers the same delivery watcher and watchdog as an unmarked enqueue.
+
+```bash
+openclaw-scheduler enqueue --label fix-deploy-script --message-file task.md \
+  --thinking high --timeout 3600 --source-context "$SOURCE_CONTEXT" --deliver-to YOUR_CHAT_ID
+# call sessions_spawn with .spawn.params, then:
+openclaw-scheduler adopt --label fix-deploy-script --session-key agent:main:subagent:CHILD_ID --run-id RUN_ID
+```
+
+`send` and `steer` print a `sessions_send` call in a marked shell. Terminals,
+the scheduler daemon, and watcher or 529 redispatch keep the Gateway path.
+`--spawn-via gateway` (or `--send-via gateway`) forces the Gateway call for
+older OpenClaw releases; a refusal exits 3 with `ATTRIBUTED_SPAWN_REQUIRED` and
+records nothing. See [`dispatch/README.md`](dispatch/README.md) for the full
+contract.
+
 ### Multi-agent Orchestration
 
-The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. Results are enqueued for durable outbox delivery to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
+The main agent acts as the orchestrator and delegates parallel units of work to sub-agents via `enqueue`. Each sub-agent runs in an isolated session, completes its assigned task, and calls `done` as its last action. When the orchestrator runs these commands from its own OpenClaw 2026.9.6+ exec shell, each `enqueue` returns a `sessions_spawn` call and an `adopt` command instead of starting the worker (see above). Results are enqueued for durable outbox delivery to the requesting chat (Telegram, Discord, WhatsApp, Signal, iMessage, or Slack) without the orchestrator polling.
 
 **Spawn depth constraint:** The gateway enforces `maxSpawnDepth: 2`. The main agent (depth 0) spawns sub-agents (depth 1), which can spawn nested sub-agents (depth 2). Depth 3 is blocked. Current OpenClaw derives and enforces depth in its native session/runtime policy; dispatch does not send the obsolete `sessions.patch spawnDepth` field.
 

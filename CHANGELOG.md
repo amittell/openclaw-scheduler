@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hand dispatch spawns to `sessions_spawn` from OpenClaw 2026.9.6+ agent shells.**
+  OpenClaw 2026.9.6 refuses Gateway `agent` turns from agent exec shells
+  (`OPENCLAW_SHELL=exec`) because they would lose inter-session attribution, so
+  `enqueue`, `send`, and `steer` failed whenever an agent ran them (observed
+  2026-09-25). In a marked shell `enqueue` now validates as before, records the
+  label as `awaiting-spawn`, and prints the `sessions_spawn` call (or
+  `sessions_send` for `--mode reuse`) for the agent to make, with the full task
+  in a private file. The new `adopt` subcommand records the returned child
+  session key and registers the same delivery watcher and watchdog, and is a
+  no-op when repeated. `send` and `steer` print a `sessions_send` call. The new
+  `--spawn-via` and `--send-via` flags (`auto|gateway|tool`) select the route;
+  a refused explicit Gateway route exits 3 with `ATTRIBUTED_SPAWN_REQUIRED` and
+  records nothing. Terminals, the scheduler daemon, and watcher, 529, and
+  stuck-detector redispatch keep the Gateway path, which scheduler-originated
+  redispatch now requests explicitly. `status` shows `awaiting-spawn` labels
+  with their age and marks them stale after 15 minutes.
+
 ## [0.6.3] -- 2026-09-23
 
 ### Fixed
