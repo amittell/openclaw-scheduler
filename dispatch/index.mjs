@@ -540,6 +540,7 @@ function clearedHandoffRunState() {
     adoptedAt: undefined,
     arming: undefined,
     preparedAt: undefined,
+    preparedRunId: undefined,
     taskFile: undefined,
     taskSha256: undefined,
     monitor: undefined,
@@ -2033,6 +2034,10 @@ function prepareAttributedSpawn({
       verifyCmd:      verifyCmd || null,
       spawnVia:       tool,
       preparedAt:     new Date().toISOString(),
+      // This run's identity until adopt records the tool's runId. A child that
+      // finishes before adopt claims its completion under it, so each run of a
+      // label gets its own claim scope and outbox key.
+      preparedRunId:  randomUUID(),
       spawnedAt:      null,
       timeoutSeconds: timeoutS,
       gatewayTimeoutSeconds: gatewayTimeoutS,
@@ -2453,7 +2458,8 @@ function assertSpawnedChildKey(sessionKey, agent) {
  *   --label <string>        Required. Label printed by enqueue
  *   --session-key <key>     Required. childSessionKey from sessions_spawn
  *                           (or the label's existing key for a sessions_send continuation)
- *   --run-id <id>           Optional. runId the tool returned
+ *   --run-id <id>           Optional. runId the tool returned (default: the id
+ *                           minted when enqueue prepared the label)
  */
 async function cmdAdopt(flags) {
   const label = flags.label;
@@ -2489,11 +2495,15 @@ async function cmdAdopt(flags) {
           outcome = { kind: 'invalid', message: error.message };
           return false;
         }
+        // Without --run-id the run keeps the id minted at prepare, as a Gateway
+        // spawn falls back to its own idempotency key, so claim scopes and
+        // outbox keys stay distinct between runs of one label and session.
+        const runIdentity = runId ?? entry.runId ?? entry.preparedRunId ?? null;
         const updated = pending
           ? {
               ...entry,
               sessionKey,
-              runId,
+              runId: runIdentity,
               status:    'running',
               spawnedAt: now,
               adoptedAt: now,
@@ -2504,7 +2514,7 @@ async function cmdAdopt(flags) {
               arming:    { sessionKey },
               updatedAt: now,
             }
-          : { ...entry, sessionKey, runId: entry.runId ?? runId, adoptedAt: entry.adoptedAt ?? now, updatedAt: now };
+          : { ...entry, sessionKey, runId: runIdentity, adoptedAt: entry.adoptedAt ?? now, updatedAt: now };
         assertValidLabelSessionMetadata(label, updated);
         labels[label] = updated;
         outcome = { kind: pending ? 'adopted' : 'finished-first', entry: updated };
@@ -3528,15 +3538,20 @@ async function cmdDone(flags) {
 
   const existing = getLabel(label);
   // A child started by sessions_spawn can finish before its parent runs adopt.
-  // Its label is still awaiting-spawn: no session key or spawn time yet.
+  // Its label is still awaiting-spawn: no session key or run id yet, so the
+  // completion is claimed under the run id minted when the label was prepared.
   const beforeAdopt = existing?.status === AWAITING_SPAWN;
+  const completionRunId = existing?.runId || (beforeAdopt ? existing.preparedRunId : null) || null;
 
   // -- Fix 1: Minimum runtime guard ----------------------------------------
   // Prevent agents from calling done immediately after spawning before doing
   // any real work. Threshold scales with the task's configured timeout.
   if (existing) {
-    // Before adopt, measure from preparation: the spawn cannot precede it.
-    const startedAt     = existing.spawnedAt || (beforeAdopt ? existing.preparedAt : null);
+    // A tool-route child starts between prepare and adopt, and adopt records
+    // spawnedAt when it runs; measure from preparation, the earlier bound.
+    const startedAt     = [existing.spawnedAt, existing.preparedAt]
+      .filter(Boolean)
+      .sort((a, b) => (toTimestampMs(a) ?? Infinity) - (toTimestampMs(b) ?? Infinity))[0] || null;
     const spawnedAtMs   = startedAt ? new Date(startedAt).getTime() : null;
     if (spawnedAtMs !== null) {
       const elapsedMs   = Date.now() - spawnedAtMs;
@@ -3683,7 +3698,7 @@ async function cmdDone(flags) {
     // fails below, under the same claim scope, so it is delivered once.
     ...(beforeAdopt ? {
       completedBeforeAdopt: true,
-      completionScope: { sessionKey: existing.sessionKey || null, runId: existing.runId || null },
+      completionScope: { sessionKey: existing.sessionKey || null, runId: completionRunId },
     } : {}),
   });
 
@@ -3699,7 +3714,7 @@ async function cmdDone(flags) {
       deliverTo: existing.deliverTo,
       deliveryChannel: existing.deliverChannel || 'telegram',
       sessionKey: existing.sessionKey || null,
-      runId: existing.runId || null,
+      runId: completionRunId,
       origin: existing.origin || null,
       sourceContext: existing.sourceContext || null,
       metadata: {

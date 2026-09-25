@@ -153,6 +153,8 @@ function runDispatch(fixture, args, env = {}) {
       DISPATCH_LABELS_PATH: fixture.labelsPath,
       SCHEDULER_DB: fixture.dbPath,
       OPENCLAW_GATEWAY_TOKEN: '',
+      // Never reach a live Gateway from the done activity check.
+      OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
       ...env,
     },
   });
@@ -196,13 +198,22 @@ function parseJson(result) {
 }
 
 // A child that finished while its label was still awaiting adopt.
-function finishBeforeAdopt(fixture, label) {
+function finishBeforeAdopt(fixture, label, summary = 'Finished the requested change; checks pass.') {
   patchLabel(fixture, label, { preparedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() });
   const done = runDispatch(fixture, [
-    'done', '--label', label, '--summary', 'Finished the requested change; checks pass.',
-    '--checklist', '{"work_complete":true}',
+    'done', '--label', label, '--summary', summary, '--checklist', '{"work_complete":true}',
   ], SUBAGENT_SHELL);
   assert.equal(done.status, 0, done.stderr || done.stdout);
+  return parseJson(done);
+}
+
+function outboxBodiesContaining(fixture, text) {
+  const db = new Database(fixture.dbPath, { readonly: true });
+  try {
+    return db.prepare('SELECT COUNT(*) AS n FROM delivery_outbox WHERE instr(body, ?) > 0').get(text).n;
+  } finally {
+    db.close();
+  }
 }
 
 const HANDOFF_RUN_FIELDS = [
@@ -752,7 +763,8 @@ test('before adopt, status, sync, stuck, and the watcher leave the label alone, 
     let row = readLabels(fixture)[label];
     assert.equal(row.status, 'done');
     assert.equal(row.completedBeforeAdopt, true);
-    assert.deepEqual(row.completionScope, { sessionKey: null, runId: null });
+    assert.ok(pendingRow.preparedRunId, 'prepare mints a run id');
+    assert.deepEqual(row.completionScope, { sessionKey: null, runId: pendingRow.preparedRunId });
     assert.ok(row.completionDeliveredAt);
     const delivered = outboxCount(fixture);
     assert.ok(delivered > 0, 'done enqueued the completion');
@@ -1065,6 +1077,88 @@ test('a rejected override aborts a tool-route continuation before anything is re
     assert.deepEqual(readLabels(fixture), before, 'no pending row');
     assert.equal(existsSync(join(fixture.stateDir, 'spawn-tasks')), false, 'no task file');
     assert.deepEqual(readCalls(fixture).map(call => call.method), ['sessions.patch']);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: two runs that finish before adopt are each delivered exactly once', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'twice-done-first';
+    const runs = [
+      { key: CHILD_KEY, summary: 'Run one: switched the default theme.' },
+      { key: CHILD_KEY_2, summary: 'Run two: added the dark variant.' },
+    ];
+    for (const run of runs) {
+      assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+      const done = finishBeforeAdopt(fixture, label, run.summary);
+      assert.equal(done.delivery.delivered, true, `${run.summary} enqueued by done`);
+      const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', run.key], AGENT_SHELL);
+      assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+      const report = parseJson(adopted);
+      assert.equal(report.ok, true);
+      assert.equal(report.completedBeforeAdopt, true);
+      assert.equal(report.delivery.delivered, true);
+    }
+    for (const run of runs) {
+      assert.equal(outboxBodiesContaining(fixture, run.summary), 1, `${run.summary} delivered exactly once`);
+    }
+    const scopes = new Set(Object.values(readLabels(fixture)).map(row => JSON.stringify(row.completionScope)));
+    assert.equal(scopes.size, 1, 'one label row');
+    assert.notEqual(readLabels(fixture)[label].completionScope.runId, null, 'the prepared run id scopes the claim');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: two adopted continuations of one session without --run-id are each delivered once', () => {
+  const fixture = buildFixture();
+  try {
+    writeFileSync(fixture.labelsPath, JSON.stringify({
+      cont: { sessionKey: CHILD_KEY, agent: 'main', status: 'done' },
+    }));
+    seedSession(fixture, CHILD_KEY);
+    const summaries = ['Continuation one: added tests.', 'Continuation two: fixed the flaky case.'];
+    const runIds = [];
+    for (const summary of summaries) {
+      const prepared = runDispatch(fixture, [
+        'enqueue', '--label', 'cont', '--message', 'Continue.', '--mode', 'reuse', '--timeout', '600', '--deliver-to', CHAT,
+      ], AGENT_SHELL);
+      assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout);
+      const adopted = runDispatch(fixture, ['adopt', '--label', 'cont', '--session-key', CHILD_KEY], AGENT_SHELL);
+      assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+      runIds.push(parseJson(adopted).runId);
+      patchLabel(fixture, 'cont', { preparedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() });
+      const done = runDispatch(fixture, [
+        'done', '--label', 'cont', '--summary', summary, '--checklist', '{"work_complete":true}',
+      ], SUBAGENT_SHELL);
+      assert.equal(done.status, 0, done.stderr || done.stdout);
+      assert.equal(parseJson(done).delivery.delivered, true);
+    }
+    assert.ok(runIds.every(Boolean) && runIds[0] !== runIds[1], 'each run has its own id without --run-id');
+    for (const summary of summaries) {
+      assert.equal(outboxBodiesContaining(fixture, summary), 1, `${summary} delivered exactly once`);
+    }
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('done after adopt measures its runtime guard from preparation, not from adopt', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'guard-from-prepare';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    seedSession(fixture, CHILD_KEY);
+    // The parent took five minutes to run adopt; the child had been working since.
+    patchLabel(fixture, label, { preparedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() });
+    assert.equal(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL).status, 0);
+    const done = runDispatch(fixture, [
+      'done', '--label', label, '--summary', 'Theme switched; tests pass.', '--checklist', '{"work_complete":true}',
+    ], SUBAGENT_SHELL);
+    assert.equal(done.status, 0, done.stderr || done.stdout);
+    assert.equal(readLabels(fixture)[label].status, 'done');
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
