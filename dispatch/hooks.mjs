@@ -72,6 +72,30 @@ export function buildCompletionDeliveryScope({
   return `v1:${createHash('sha256').update(identity).digest('hex')}`;
 }
 
+/**
+ * The completion identity of a dispatch label row, for every claimant (the
+ * done signal, adopt, the claim reservation, the watcher). A run prepared for
+ * an agent's sessions_spawn or sessions_send call records its scope once, as
+ * `completionScope`, because adopt later changes the row's session key and run
+ * id; claimants reuse that scope before and after adopt. Other rows derive
+ * the scope from their session key and run id.
+ */
+export function labelCompletionIdentity(label, entry) {
+  const sessionKey = entry?.sessionKey || null;
+  const runId = entry?.runId || null;
+  const recorded = entry?.completionScope;
+  if (!recorded || typeof recorded !== 'object') return { sessionKey, runId, deliveryScope: null };
+  return {
+    sessionKey,
+    runId,
+    deliveryScope: buildCompletionDeliveryScope({
+      label,
+      sessionKey: recorded.sessionKey ?? null,
+      runId: recorded.runId ?? null,
+    }),
+  };
+}
+
 function metadataWithCompletionScope(metadata, { scope, runId }) {
   return {
     ...(metadata && typeof metadata === 'object' ? metadata : {}),
@@ -270,19 +294,20 @@ export function recordCompletionEnqueued({
 // Reserve the new run's scope before its watcher can race a stale watcher from
 // an older use of the same label. Legacy schemas can retain only one scope per
 // label; the reservation still makes stale-run claims fail closed atomically.
+/** Returns false when the reservation could not be written (the failure is logged). */
 export function resetCompletionDeliveryClaim({
   label,
   sessionKey = null,
   runId = null,
   deliveryScope = null,
 } = {}) {
-  if (!label) return;
+  if (!label) return false;
   try {
     const db = getDb();
     const hasIdentity = Boolean(sessionKey || runId || deliveryScope);
     if (!hasIdentity) {
       db.prepare('DELETE FROM completion_debts WHERE task_label = ?').run(label);
-      return;
+      return true;
     }
 
     const context = completionDebtContext({ label, sessionKey, runId, deliveryScope });
@@ -314,7 +339,7 @@ export function resetCompletionDeliveryClaim({
           metadata = excluded.metadata,
           updated_at = excluded.updated_at
       `).run(randomUUID(), context.label, context.scope, context.sessionKey, metadataJson, now, now);
-      return;
+      return true;
     }
 
     db.prepare(`
@@ -336,8 +361,10 @@ export function resetCompletionDeliveryClaim({
         metadata = excluded.metadata,
         updated_at = excluded.updated_at
     `).run(context.label, context.sessionKey, metadataJson, now, now);
+    return true;
   } catch (err) {
     process.stderr.write(`[dispatch-hooks] completion debt reservation failed for ${label}: ${err.message}\n`);
+    return false;
   }
 }
 

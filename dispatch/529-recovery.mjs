@@ -148,12 +148,15 @@ function notify(message) {
 function respawnSession(label, entry) {
   const continuationMsg = `[Auto-retry after 529 overload -- scheduler safety net] This is an automatic retry. Please continue your previous task from where you left off.`;
 
-  // Try send (reuse session) first
+  // Try send (reuse session) first. Scheduler-originated retries keep the
+  // Gateway route explicitly; an OpenClaw agent-shell handoff has no agent to
+  // act on it here.
   try {
     execFileSync(process.execPath, [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,
+      '--send-via', 'gateway',
     ], {
       encoding: 'utf-8',
       timeout: 30000,
@@ -169,6 +172,7 @@ function respawnSession(label, entry) {
       '--label', label,
       '--message', continuationMsg,
       '--mode', 'fresh',
+      '--spawn-via', 'gateway',
     ];
     if (entry?.model) args.push('--model', entry.model);
     if (entry?.thinking) args.push('--thinking', entry.thinking);

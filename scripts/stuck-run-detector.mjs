@@ -133,8 +133,8 @@ function steerSession(label, staleMins) {
   ].join(' ');
   try {
     const execArgs = DISPATCH_IS_BIN
-      ? [DISPATCH_CLI, ['send', '--label', label, '--message', msg]]
-      : [process.execPath, [DISPATCH_CLI, 'send', '--label', label, '--message', msg]];
+      ? [DISPATCH_CLI, ['send', '--label', label, '--message', msg, '--send-via', 'gateway']]
+      : [process.execPath, [DISPATCH_CLI, 'send', '--label', label, '--message', msg, '--send-via', 'gateway']];
     execFileSync(execArgs[0], execArgs[1], {
       encoding: 'utf-8',
       timeout: 15_000,

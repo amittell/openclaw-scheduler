@@ -50,6 +50,7 @@ import {
 import {
   claimCompletionDelivery,
   enqueueCompletionNotification,
+  labelCompletionIdentity,
   recordCompletionDelivered,
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
@@ -620,10 +621,15 @@ function respawnSession(label) {
     // is preserved and we send a continuation message.
     const continuationMsg = `[Auto-retry after 529 overload] Please continue your previous task. Pick up where you left off.`;
 
+    // Scheduler-originated retries keep the Gateway route explicitly. If this
+    // process ever inherits an OpenClaw agent-shell marker, the CLI refusal
+    // fails the retry here instead of leaving an awaiting-spawn row no agent
+    // will act on.
     execFileSync(process.execPath, [
       INDEX_PATH, 'send',
       '--label', label,
       '--message', continuationMsg,
+      '--send-via', 'gateway',
     ], {
       encoding: 'utf-8',
       timeout: 30000,
@@ -653,6 +659,7 @@ function respawnSession(label) {
         '--label', label,
         '--message', continuationMsg,
         '--mode', 'fresh',
+        '--spawn-via', 'gateway',
       ];
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -700,6 +707,7 @@ function respawnAfterGwRestart(label) {
       '--label', label,
       '--message', continuationMsg,
       '--mode', 'fresh',
+      '--spawn-via', 'gateway',
     ];
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -1358,6 +1366,9 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
 
   if (completion.deliveryText) {
     const claimEntry = getLabelEntry(label);
+    // A run adopted from an agent's sessions_spawn call keeps the completion
+    // scope recorded at prepare, which the done signal also claims under.
+    const identity = labelCompletionIdentity(label, claimEntry);
     if (claimEntry?.deliverTo && claimEntry?.deliveryMode !== 'none') {
       const deliveryResult = enqueueCompletionNotification({
         label,
@@ -1366,8 +1377,9 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
         resolvedDelivery: completion,
         deliverTo: claimEntry.deliverTo,
         deliveryChannel: claimEntry.deliverChannel || 'telegram',
-        sessionKey: claimEntry.sessionKey || null,
-        runId: claimEntry.runId || null,
+        sessionKey: identity.sessionKey,
+        runId: identity.runId,
+        deliveryScope: identity.deliveryScope,
         origin: claimEntry.origin || null,
         sourceContext: claimEntry.sourceContext || null,
         metadata: {
@@ -1402,8 +1414,9 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     // this claim closes it -- if the done-path already owns delivery, stand down.
     if (!claimCompletionDelivery({
       label,
-      sessionKey: claimEntry?.sessionKey || null,
-      runId: claimEntry?.runId || null,
+      sessionKey: identity.sessionKey,
+      runId: identity.runId,
+      deliveryScope: identity.deliveryScope,
     })) {
       markWatcherAlreadyDelivered(label);
     }
@@ -1412,10 +1425,12 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
       entry.completionDeliverySource = completion.source || 'watcher';
     });
     const deliveredEntry = getLabelEntry(label);
+    const deliveredIdentity = labelCompletionIdentity(label, deliveredEntry);
     recordCompletionDelivered({
       label,
-      sessionKey: deliveredEntry?.sessionKey || null,
-      runId: deliveredEntry?.runId || null,
+      sessionKey: deliveredIdentity.sessionKey,
+      runId: deliveredIdentity.runId,
+      deliveryScope: deliveredIdentity.deliveryScope,
       metadata: {
         delivery_source: completion.source || 'watcher',
         last_label_status: deliveredEntry?.status || 'done',
@@ -1429,10 +1444,12 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   process.stderr.write(`[watcher] [${label}] completion delivery suppressed (no meaningful reply or summary)\n`);
   markLabelError(label, failureSummary);
   const failedEntry = getLabelEntry(label);
+  const failedIdentity = labelCompletionIdentity(label, failedEntry);
   recordCompletionDeliveryDebt({
     label,
-    sessionKey: failedEntry?.sessionKey || null,
-    runId: failedEntry?.runId || null,
+    sessionKey: failedIdentity.sessionKey,
+    runId: failedIdentity.runId,
+    deliveryScope: failedIdentity.deliveryScope,
     openReason: 'no-clean-user-facing-completion',
     noReply: true,
     metadata: {
@@ -1462,6 +1479,7 @@ function respawnInterrupted(label) {
       '--label', label,
       '--message', continuationMsg,
       '--mode', 'reuse',
+      '--spawn-via', 'gateway',
     ];
     // Carry the original label's agent forward: cmdEnqueue defaults --agent to
     // 'main' and validates the reused sessionKey against that agent, so a label
@@ -1821,6 +1839,12 @@ function runOnceAndExit() {
       : 'status field missing (transient read/write race); retrying next tick');
   }
 
+  // A label prepared from an OpenClaw agent shell has no session of its own
+  // until adopt; a stored key there still belongs to the previous run.
+  if (status.status === 'awaiting-spawn') {
+    markWatcherPending(label, 'label awaiting adopt; no session to watch yet');
+  }
+
   if (status.status === 'error') {
     const errorMsg = status.error || status.summary || '';
     if (is529Error(errorMsg)) {
@@ -1977,7 +2001,7 @@ process.on('SIGTERM', () => {
     process.exit(1);
   }
 
-  if (latestStatus?.status && latestStatus.status !== 'running') {
+  if (latestStatus?.status && latestStatus.status !== 'running' && latestStatus.status !== 'awaiting-spawn') {
     const summary = latestStatus.error || latestStatus.summary || `terminal failure (${latestStatus.status})`;
     markLabelError(label, summary);
     process.stdout.write(`🌶️ *dispatch* [${label}] failed\nSummary: ${summary}\n`);

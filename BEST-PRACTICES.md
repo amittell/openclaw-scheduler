@@ -407,6 +407,8 @@ node ~/.openclaw/worktrees/openclaw-scheduler/dispatch/chilisaus.mjs status --la
 
 The `status` output gives you the authoritative `status` field (`accepted` / `running` / `done` / `error`), the last `updatedAt` timestamp, and the final `summary`. Use that — not the most recent check-in message.
 
+`awaiting-spawn` means the label was prepared from an OpenClaw 2026.9.6+ agent shell and nothing is running yet: the requesting agent still has to call `sessions_spawn` with the printed `spawn.params` and run the printed `adopt` command. `status` flags such a label as `stale` after 15 minutes.
+
 **Rule: if you haven't polled `status`, you don't know the status.**
 
 ---
