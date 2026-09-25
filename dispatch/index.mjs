@@ -1595,6 +1595,12 @@ function describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gat
  * Arm delivery and monitoring for a run whose session exists and whose ledger
  * row is already `running`, then report it. Shared by the Gateway spawn in
  * enqueue and by adopt, so both register the same watcher and watchdog jobs.
+ *
+ * `arming` is adopt's per-run record (`{ sessionKey, ... }`). Each step that
+ * succeeds is written to it, steps it already records are skipped, and
+ * `armedAt` is set once every wanted step is done, so a repeated adopt
+ * finishes a partial arming without registering a job twice. The Gateway path
+ * passes no record and keeps its historical single pass.
  */
 async function activateDispatchRun({
   label,
@@ -1619,22 +1625,43 @@ async function activateDispatchRun({
   gatewaySecondary,
   verb,
   extraOutput = {},
+  arming = null,
 }) {
+  const progress = arming ? { ...arming } : null;
+  const recordStep = (patch) => {
+    if (!progress) return;
+    Object.assign(progress, patch);
+    setLabel(label, { arming: progress });
+  };
+  const watcherWanted = Boolean(deliverTo) && deliverMode !== 'none';
+  const watchdogWanted = monitor.enabled && Boolean(deliverTo);
+  const missing = [];
+
   // Reserve this run's delivery scope before a stale watcher from an earlier
   // use of the same label can claim the fresh completion.
-  if (!deliveryDisabled) {
-    resetCompletionDeliveryClaim({
-      label,
-      sessionKey,
-      runId,
-    });
+  if (!deliveryDisabled && !progress?.claimReservedAt) {
+    let reserved = false;
+    try {
+      reserved = resetCompletionDeliveryClaim({
+        label,
+        sessionKey,
+        runId,
+      }) !== false;
+    } catch (err) {
+      process.stderr.write(`[${agentBrand}] completion claim reservation FAILED: ${err.message}\n`);
+    }
+    if (reserved) recordStep({ claimReservedAt: new Date().toISOString() });
+    else if (progress) missing.push('claim');
   }
 
   // Fire dispatch.started hook (best-effort)
-  await onStarted({
-    label, job_id: jobId, run_id: runId,
-    agent, mode: hookMode, session_key: sessionKey,
-  }).catch(() => {});
+  if (!progress?.startedEventAt) {
+    await onStarted({
+      label, job_id: jobId, run_id: runId,
+      agent, mode: hookMode, session_key: sessionKey,
+    }).catch(() => {});
+    recordStep({ startedEventAt: new Date().toISOString() });
+  }
 
   // -- Send "Starting" notification via gateway HTTP API -----
   // Only for a session dispatch started itself. An adopted session was started
@@ -1672,8 +1699,8 @@ async function activateDispatchRun({
   // The watcher enqueues terminal output directly into the durable outbox;
   // stdout remains only as a route-less compatibility fallback.
   const sq = s => String(s).replace(/'/g, "'\\''");
-  let schedulerWatcherOk = false;
-  if (deliverTo && deliverMode !== 'none') {
+  let schedulerWatcherOk = Boolean(progress?.watcherArmedAt);
+  if (watcherWanted && !schedulerWatcherOk) {
     try {
       const watcherJob = scheduleDeliveryWatcherJob({
         label,
@@ -1689,6 +1716,7 @@ async function activateDispatchRun({
       if (watcherJob?.id) {
         setLabel(label, { deliveryWatcherJobId: watcherJob.id });
       }
+      recordStep({ watcherArmedAt: new Date().toISOString(), watcherJobId: watcherJob?.id || null });
       process.stderr.write(
         `[${agentBrand}] scheduler watcher registered: ${agentBrand}-deliver:${label}` +
         `${watcherJob?.id ? ` (${watcherJob.id})` : ''}\n`
@@ -1697,11 +1725,12 @@ async function activateDispatchRun({
       process.stderr.write(`[${agentBrand}] scheduler watcher FAILED (gateway fallback active): ${err.message}\n`);
     }
   }
+  if (watcherWanted && !schedulerWatcherOk && progress) missing.push('watcher');
 
   // -- Register watchdog monitoring job ---------------------
-  let watchdogJobOk = false;
-  let watchdogJobId = null;
-  if (monitor.enabled && deliverTo) {
+  let watchdogJobOk = Boolean(progress?.watchdogArmedAt);
+  let watchdogJobId = progress?.watchdogJobId ?? null;
+  if (watchdogWanted && !watchdogJobOk) {
     try {
       const checkCmd =
         `DISPATCH_CONFIG_DIR='${sq(dispatchConfigDirForChild())}' ` +
@@ -1746,11 +1775,17 @@ async function activateDispatchRun({
       if (watchdogJobId) {
         setLabel(label, { watchdogJobId });
       }
+      recordStep({ watchdogArmedAt: new Date().toISOString(), watchdogJobId });
 
       process.stderr.write(`[${agentBrand}] watchdog registered: ${monitor.interval}, timeout: ${monitor.timeoutMin}min\n`);
     } catch (err) {
       process.stderr.write(`[${agentBrand}] watchdog registration FAILED: ${err.message}\n`);
     }
+  }
+  if (watchdogWanted && !watchdogJobOk && progress) missing.push('watchdog');
+
+  if (progress && missing.length === 0 && !progress.armedAt) {
+    recordStep({ armedAt: new Date().toISOString() });
   }
 
   const delivery = buildDispatchDeliverySurface({
@@ -1765,8 +1800,11 @@ async function activateDispatchRun({
     } : {}),
   });
 
+  const incomplete = missing.length > 0;
+  const incompleteNote = `Arming incomplete (missing: ${missing.join(', ')}); run adopt again ` +
+    'with the same session key to finish. Steps already done are not repeated.';
   out({
-    ok:         true,
+    ok:         !incomplete,
     label,
     sessionKey,
     runId,
@@ -1774,6 +1812,8 @@ async function activateDispatchRun({
     agent,
     status:     'accepted',
     ...extraOutput,
+    ...(progress ? { arming: { complete: !incomplete, missing } } : {}),
+    ...(incomplete ? { error: { code: 'ADOPT_ARMING_INCOMPLETE', missing, message: incompleteNote } } : {}),
     sourceContext: sourceContext || null,
     delivery,
     watchdog:   monitor.enabled ? {
@@ -1783,8 +1823,10 @@ async function activateDispatchRun({
       timeout:  monitor.timeoutMin,
       ...(monitor.enabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
     } : null,
-    message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }),
+    message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }) +
+      (incomplete ? ` ${incompleteNote}` : ''),
   });
+  if (incomplete) process.stderr.write(`[${agentBrand}] ${incompleteNote}\n`);
 
   // -- Post-spawn verification (Fix 3) --------------------------------
   // Canary: inspect the SQLite-first compatibility store immediately, then
@@ -1834,7 +1876,27 @@ async function activateDispatchRun({
       );
     }
   }
+  return { complete: !incomplete, missing };
 }
+
+/**
+ * sessions_send parameters for a dispatch continuation (OpenClaw 2026.9.6
+ * src/agents/tools/sessions-send-tool.ts). Omitted, timeoutSeconds defaults to
+ * 30 for followup, so the requesting agent would wait for the child's reply
+ * and receive it inline. 0 returns as soon as the turn is accepted (steer
+ * always runs with 0), leaving the done signal and the scheduler watcher as the
+ * delivery path. With 0, OpenClaw still hands a followup reply to a top-level
+ * requester once if the child's turn ends within its 30 second announce
+ * window; a dispatch task normally runs longer. steer only reaches an active
+ * run.
+ */
+function buildSessionsSendParams({ sessionKey, message, mode }) {
+  return { sessionKey, message, mode, timeoutSeconds: 0 };
+}
+
+const SESSIONS_SEND_REPLY_NOTE =
+  'The call returns once accepted; if OpenClaw still hands you the reply, do not repost it, ' +
+  'because dispatch delivers the completion.';
 
 /** Keep the full handoff task beside the ledger, private to this user, with its digest. */
 function writeSpawnTaskFile(taskMessage) {
@@ -1895,7 +1957,7 @@ function prepareAttributedSpawn({
         // status/result as before.
         expectsCompletionMessage: false,
       }
-    : { sessionKey, message: taskMessage, mode: 'followup' };
+    : buildSessionsSendParams({ sessionKey, message: taskMessage, mode: 'followup' });
 
   let taskFile;
   try {
@@ -1949,8 +2011,7 @@ function prepareAttributedSpawn({
   ]);
   const instruction = isFresh
     ? 'Call sessions_spawn with spawn.params, then run adopt.command with the childSessionKey and runId it returns.'
-    : 'Call sessions_send with spawn.params, then run adopt.command with the runId it returns. ' +
-      `${agentBrand} still delivers the completion, so do not repost the reply.`;
+    : `Call sessions_send with spawn.params, then run adopt.command with the runId it returns. ${SESSIONS_SEND_REPLY_NOTE}`;
 
   out({
     ok:        true,
@@ -2342,10 +2403,15 @@ function assertSpawnedChildKey(sessionKey, agent) {
  * adopt -- record the session a requesting agent started for a prepared label.
  *
  * Moves an awaiting-spawn label to running and arms the same delivery watcher
- * and watchdog as a Gateway spawn. Repeating the same label and key is a no-op;
- * a different key for a label that already has a session is refused. The
- * session need not be observable yet: the post-spawn canary records a lane
- * error if one appears and otherwise leaves the watcher in charge.
+ * and watchdog as a Gateway spawn. Arming progress is recorded per run, so
+ * repeating adopt with the same key finishes an arming that failed or was
+ * interrupted part way, registering only the missing jobs; once armed it is a
+ * no-op. A different key for a label that already has a session is refused.
+ * If the child called `done` before adopt, done has already delivered the
+ * completion: adopt binds the session key, retries that delivery under done's
+ * scope only if it did not succeed, and registers no jobs. The session need
+ * not be observable yet: the post-spawn canary records a lane error if one
+ * appears and otherwise leaves the watcher in charge.
  *
  * Flags:
  *   --label <string>        Required. Label printed by enqueue
@@ -2375,39 +2441,50 @@ async function cmdAdopt(flags) {
         outcome = { kind: 'missing' };
         return false;
       }
-      if (entry.status !== AWAITING_SPAWN) {
-        outcome = { kind: entry.sessionKey === requestedKey ? 'already' : 'conflict', entry };
-        return false;
-      }
-      let sessionKey;
-      try {
-        if (entry.sessionKey) {
-          // A sessions_send continuation keeps the label's session.
-          sessionKey = assertValidSessionKey(requestedKey, '--session-key');
-          if (sessionKey !== entry.sessionKey) {
-            throw new Error(`--session-key must be the label's session ${entry.sessionKey}, which sessions_send continued`);
-          }
-        } else {
-          sessionKey = assertSpawnedChildKey(requestedKey, entry.agent || 'main');
+      const pending = entry.status === AWAITING_SPAWN;
+      const finishedFirst = entry.completedBeforeAdopt === true
+        && (!entry.adoptedAt || (completionDeliveryWanted(entry) && !entry.completionDeliveredAt));
+      if (pending || finishedFirst) {
+        let sessionKey;
+        try {
+          sessionKey = assertAdoptableKey(entry, requestedKey);
+        } catch (error) {
+          outcome = { kind: 'invalid', message: error.message };
+          return false;
         }
-      } catch (error) {
-        outcome = { kind: 'invalid', message: error.message };
+        const updated = pending
+          ? {
+              ...entry,
+              sessionKey,
+              runId,
+              status:    'running',
+              spawnedAt: now,
+              adoptedAt: now,
+              summary:   null,
+              error:     null,
+              arming:    { sessionKey },
+              updatedAt: now,
+            }
+          : { ...entry, sessionKey, runId: entry.runId ?? runId, adoptedAt: entry.adoptedAt ?? now, updatedAt: now };
+        assertValidLabelSessionMetadata(label, updated);
+        labels[label] = updated;
+        outcome = { kind: pending ? 'adopted' : 'finished-first', entry: updated };
+        return undefined;
+      }
+      if (entry.sessionKey !== requestedKey) {
+        outcome = { kind: 'conflict', entry };
         return false;
       }
-      const updated = {
-        ...entry,
-        sessionKey,
-        runId,
-        status:    'running',
-        spawnedAt: now,
-        adoptedAt: now,
-        summary:   null,
-        error:     null,
-        updatedAt: now,
-      };
-      assertValidLabelSessionMetadata(label, updated);
-      labels[label] = updated;
-      outcome = { kind: 'adopted', entry: updated };
+      const rearm = entry.status === 'running'
+        && entry.arming?.sessionKey === requestedKey
+        && !entry.arming.armedAt;
+      if (rearm && runId && !entry.runId) {
+        labels[label] = { ...entry, runId, updatedAt: now };
+        outcome = { kind: 'rearm', entry: labels[label] };
+        return undefined;
+      }
+      outcome = { kind: rearm ? 'rearm' : 'already', entry };
+      return false;
     });
   } catch (err) {
     die(`adopt failed: ${err.message}`);
@@ -2425,8 +2502,8 @@ async function cmdAdopt(flags) {
       'Enqueue the label again to prepare a new spawn.',
     );
   }
+  const { entry } = outcome;
   if (outcome.kind === 'already') {
-    const { entry } = outcome;
     out({
       ok:         true,
       label,
@@ -2438,21 +2515,26 @@ async function cmdAdopt(flags) {
       adopted:    true,
       alreadyAdopted: true,
       spawnVia:   entry.spawnVia ?? null,
+      ...(entry.arming ? { arming: { complete: Boolean(entry.arming.armedAt), missing: [] } } : {}),
       sourceContext: entry.sourceContext || null,
       delivery:   buildDispatchDeliverySurface(entry),
-      message:    'Label already has this session; no jobs were registered.',
+      message:    'Label already has this session and nothing is left to arm; no jobs were registered.',
     });
     return;
   }
+  if (outcome.kind === 'finished-first') {
+    await reportCompletedBeforeAdopt(label, entry);
+    return;
+  }
 
-  const { entry } = outcome;
   const agent = entry.agent || 'main';
+  let result;
   try {
-    await activateDispatchRun({
+    result = await activateDispatchRun({
       label,
       sessionKey: entry.sessionKey,
-      runId,
-      jobId: runId,
+      runId: entry.runId ?? null,
+      jobId: entry.runId ?? null,
       agent,
       mode: entry.mode,
       hookMode: entry.mode,
@@ -2474,11 +2556,98 @@ async function cmdAdopt(flags) {
       announceStart: false,
       gatewaySecondary: false,
       verb: 'adopted',
-      extraOutput: { adopted: true, spawnVia: entry.spawnVia ?? null },
+      extraOutput: {
+        adopted: true,
+        spawnVia: entry.spawnVia ?? null,
+        ...(outcome.kind === 'rearm' ? { rearmed: true } : {}),
+      },
+      arming: entry.arming || { sessionKey: entry.sessionKey },
     });
   } catch (err) {
-    die(`adopt recorded session ${entry.sessionKey} but could not arm delivery: ${err.message}`);
+    die(`adopt recorded session ${entry.sessionKey} but could not arm delivery: ${err.message}. ` +
+      'Run adopt again with the same session key to finish.');
   }
+  if (!result.complete) process.exitCode = 1;
+}
+
+function completionDeliveryWanted(entry) {
+  return Boolean(entry.deliverTo) && entry.deliveryMode !== 'none';
+}
+
+/** The key sessions_spawn returned for this label, or the continued session's own key. */
+function assertAdoptableKey(entry, requestedKey) {
+  if (entry.sessionKey) {
+    const key = assertValidSessionKey(requestedKey, '--session-key');
+    if (key !== entry.sessionKey) {
+      throw new Error(`--session-key must be the label's session ${entry.sessionKey}, which sessions_send continued`);
+    }
+    return key;
+  }
+  return assertSpawnedChildKey(requestedKey, entry.agent || 'main');
+}
+
+/**
+ * The child called `done` before adopt. done delivered (or tried to deliver)
+ * the completion under the scope recorded in completionScope; retry only a
+ * delivery that did not succeed, under that same scope, so the claim keeps it
+ * to one delivery. No watcher or watchdog is armed for a finished run.
+ */
+async function reportCompletedBeforeAdopt(label, entry) {
+  let delivered = Boolean(entry.completionDeliveredAt);
+  let deliveryError = null;
+  if (completionDeliveryWanted(entry) && !delivered) {
+    const scope = entry.completionScope || { sessionKey: null, runId: null };
+    try {
+      const retry = await enqueueCompletionNotification({
+        label,
+        summary: entry.summary || null,
+        completion: entry.completion || null,
+        deliverTo: entry.deliverTo,
+        deliveryChannel: entry.deliverChannel || 'telegram',
+        sessionKey: scope.sessionKey ?? null,
+        runId: scope.runId ?? null,
+        origin: entry.origin || null,
+        sourceContext: entry.sourceContext || null,
+        metadata: {
+          last_label_status: 'done',
+          timeout_seconds: Number(entry.timeoutSeconds ?? entry.timeout) || null,
+        },
+      });
+      delivered = Boolean(retry?.ok);
+      deliveryError = delivered ? null : (retry?.reason || 'completion delivery failed');
+    } catch (err) {
+      deliveryError = err.message;
+    }
+    if (delivered) setLabel(label, { completionDeliveredAt: new Date().toISOString() });
+  }
+  const wanted = completionDeliveryWanted(entry);
+  const pendingDelivery = wanted && !delivered;
+  out({
+    ok:         !pendingDelivery,
+    label,
+    sessionKey: entry.sessionKey,
+    runId:      entry.runId ?? null,
+    mode:       entry.mode ?? null,
+    agent:      entry.agent ?? null,
+    status:     entry.status,
+    adopted:    true,
+    completedBeforeAdopt: true,
+    spawnVia:   entry.spawnVia ?? null,
+    summary:    effectiveCompletionSummary(entry),
+    sourceContext: entry.sourceContext || null,
+    delivery:   { ...buildDispatchDeliverySurface(entry), delivered },
+    ...(pendingDelivery ? {
+      error: {
+        code: 'COMPLETION_DELIVERY_PENDING',
+        message: `Completion not delivered yet (${deliveryError}); run adopt again with the same session key to retry.`,
+      },
+    } : {}),
+    message: pendingDelivery
+      ? `The child finished before adopt, but its completion is not delivered yet (${deliveryError}). ` +
+        'Run adopt again with the same session key to retry. No jobs were registered.'
+      : 'The child finished before adopt; done already handled its completion. Session recorded; no jobs were registered.',
+  });
+  if (pendingDelivery) process.exitCode = 1;
 }
 
 function describeAwaitingSpawn(label, entry) {
@@ -3319,12 +3488,17 @@ async function cmdDone(flags) {
   const summary = completion.summary || null;
 
   const existing = getLabel(label);
+  // A child started by sessions_spawn can finish before its parent runs adopt.
+  // Its label is still awaiting-spawn: no session key or spawn time yet.
+  const beforeAdopt = existing?.status === AWAITING_SPAWN;
 
   // -- Fix 1: Minimum runtime guard ----------------------------------------
   // Prevent agents from calling done immediately after spawning before doing
   // any real work. Threshold scales with the task's configured timeout.
   if (existing) {
-    const spawnedAtMs   = existing.spawnedAt ? new Date(existing.spawnedAt).getTime() : null;
+    // Before adopt, measure from preparation: the spawn cannot precede it.
+    const startedAt     = existing.spawnedAt || (beforeAdopt ? existing.preparedAt : null);
+    const spawnedAtMs   = startedAt ? new Date(startedAt).getTime() : null;
     if (spawnedAtMs !== null) {
       const elapsedMs   = Date.now() - spawnedAtMs;
       // Fix 4: Use stored timeout from label entry; fall back to timeoutSeconds, then 300.
@@ -3466,6 +3640,12 @@ async function cmdDone(flags) {
     summary,
     completion,
     ...(sha ? { sha } : {}),
+    // adopt later binds the session key and retries this delivery, if it
+    // fails below, under the same claim scope, so it is delivered once.
+    ...(beforeAdopt ? {
+      completedBeforeAdopt: true,
+      completionScope: { sessionKey: existing.sessionKey || null, runId: existing.runId || null },
+    } : {}),
   });
 
   // Disarm watchdog when agent signals done
@@ -3574,14 +3754,16 @@ async function cmdSend(flags, subcommand = 'send') {
 
   if (sendVia === 'tool') {
     const mode = subcommand === 'steer' ? 'steer' : 'followup';
-    const instruction = `Call sessions_send with params to ${mode === 'steer' ? 'steer' : 'message'} the session.`;
+    const instruction = mode === 'steer'
+      ? 'Call sessions_send with params to steer the active run; if the child is idle, use send (mode followup) instead.'
+      : `Call sessions_send with params to start a follow-up turn. ${SESSIONS_SEND_REPLY_NOTE}`;
     out({
       ok:         true,
       label:      label || null,
       sessionKey,
       status:     'handoff',
       tool:       'sessions_send',
-      params:     { sessionKey, message, mode },
+      params:     buildSessionsSendParams({ sessionKey, message, mode }),
       message:    `OpenClaw agent shell: ${BRAND} did not send the message. ${instruction}`,
     });
     process.stderr.write(`[${BRAND}] OpenClaw agent shell: message not sent. ${instruction}\n`);

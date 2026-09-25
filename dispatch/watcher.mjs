@@ -1829,6 +1829,12 @@ function runOnceAndExit() {
       : 'status field missing (transient read/write race); retrying next tick');
   }
 
+  // A label prepared from an OpenClaw agent shell has no session of its own
+  // until adopt; a stored key there still belongs to the previous run.
+  if (status.status === 'awaiting-spawn') {
+    markWatcherPending(label, 'label awaiting adopt; no session to watch yet');
+  }
+
   if (status.status === 'error') {
     const errorMsg = status.error || status.summary || '';
     if (is529Error(errorMsg)) {
@@ -1985,7 +1991,7 @@ process.on('SIGTERM', () => {
     process.exit(1);
   }
 
-  if (latestStatus?.status && latestStatus.status !== 'running') {
+  if (latestStatus?.status && latestStatus.status !== 'running' && latestStatus.status !== 'awaiting-spawn') {
     const summary = latestStatus.error || latestStatus.summary || `terminal failure (${latestStatus.status})`;
     markLabelError(label, summary);
     process.stdout.write(`🌶️ *dispatch* [${label}] failed\nSummary: ${summary}\n`);
