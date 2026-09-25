@@ -528,6 +528,24 @@ const AWAITING_SPAWN = 'awaiting-spawn';
 // The requesting agent calls its tool and adopt within seconds of enqueue.
 const AWAITING_SPAWN_STALE_MS = 15 * 60 * 1000;
 
+/**
+ * Per-run facts of the agent-shell handoff. Every new run of a label, through
+ * either route, starts without them, so adopt only ever sees the current run.
+ * Undefined removes the key when the ledger is written.
+ */
+function clearedHandoffRunState() {
+  return {
+    completedBeforeAdopt: undefined,
+    completionScope: undefined,
+    adoptedAt: undefined,
+    arming: undefined,
+    preparedAt: undefined,
+    taskFile: undefined,
+    taskSha256: undefined,
+    monitor: undefined,
+  };
+}
+
 function isOpenClawAgentExecShell(env = process.env) {
   return env.OPENCLAW_SHELL === 'exec' || env.OPENCLAW_SUBAGENT_EXEC === '1';
 }
@@ -1486,6 +1504,32 @@ function makeSessionKey(agentId) {
   return `agent:${agentId}:subagent:${randomUUID()}`;
 }
 
+/**
+ * Apply supported session overrides before a turn. sessions.patch is not one
+ * of the methods OpenClaw 2026.9.6 refuses from an agent shell. A rejected
+ * explicit override aborts instead of silently running on another setting.
+ */
+function patchSessionOverrides(sessionKey, { model = null, thinking = null } = {}) {
+  if (model) {
+    try {
+      gatewayCall('sessions.patch', { key: sessionKey, model }, { timeout: 10000 });
+    } catch (err) {
+      die(`sessions.patch (model) failed: ${err.message}`);
+    }
+  }
+
+  if (thinking) {
+    try {
+      gatewayCall('sessions.patch', {
+        key: sessionKey,
+        thinkingLevel: thinking === 'off' ? null : thinking,
+      }, { timeout: 10000 });
+    } catch (err) {
+      die(`sessions.patch (thinking) failed: ${err.message}`);
+    }
+  }
+}
+
 function resolveAgentBrand(agent) {
   return config.agents?.[agent]?.name || (agent !== 'main' ? agent : null) || config.name || 'dispatch';
 }
@@ -1935,7 +1979,13 @@ function prepareAttributedSpawn({
   gatewayTimeoutS,
   idleThresholdSeconds,
   monitor,
+  requestedModel,
 }) {
+  // sessions_spawn carries model and thinking for a new child; sessions_send
+  // has neither, so a continuation applies explicitly requested overrides to
+  // the existing session first, exactly as a Gateway spawn patches its session.
+  if (!isFresh) patchSessionOverrides(sessionKey, { model: requestedModel, thinking });
+
   const taskMessage = buildDispatchTaskMessage({
     label, message, deliverTo, deliverChannel, origin, handoff: true,
   });
@@ -1965,6 +2015,7 @@ function prepareAttributedSpawn({
     // Clear per-run facts a previous use of this label left behind: a stale
     // completion or delivery receipt would satisfy the new run's watcher.
     setLabel(label, {
+      ...clearedHandoffRunState(),
       sessionKey: isFresh ? null : sessionKey,
       ...(isFresh ? { sessionId: null } : {}),
       runId:          null,
@@ -2261,6 +2312,7 @@ async function cmdEnqueue(flags) {
       gatewayTimeoutS,
       idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
       monitor,
+      requestedModel: flags.model || null,
     });
     return;
   }
@@ -2271,24 +2323,7 @@ async function cmdEnqueue(flags) {
   // Spawn lineage is owned by OpenClaw's sessions.create/sessions_spawn
   // runtime. Current sessions.patch intentionally rejects spawnDepth.
   if (isFresh) {
-    if (model) {
-      try {
-        gatewayCall('sessions.patch', { key: sessionKey, model }, { timeout: 10000 });
-      } catch (err) {
-        die(`sessions.patch (model) failed: ${err.message}`);
-      }
-    }
-
-    if (thinking) {
-      try {
-        gatewayCall('sessions.patch', {
-          key: sessionKey,
-          thinkingLevel: thinking === 'off' ? null : thinking,
-        }, { timeout: 10000 });
-      } catch (err) {
-        die(`sessions.patch (thinking) failed: ${err.message}`);
-      }
-    }
+    patchSessionOverrides(sessionKey, { model, thinking });
   }
 
   const taskMessage = buildDispatchTaskMessage({ label, message, deliverTo, deliverChannel, origin });
@@ -2329,6 +2364,7 @@ async function cmdEnqueue(flags) {
 
     // Update ledger
     setLabel(label, {
+      ...clearedHandoffRunState(),
       sessionKey,
       runId,
       agent,
@@ -2442,7 +2478,8 @@ async function cmdAdopt(flags) {
         return false;
       }
       const pending = entry.status === AWAITING_SPAWN;
-      const finishedFirst = entry.completedBeforeAdopt === true
+      const finishedFirst = entry.status === 'done'
+        && entry.completedBeforeAdopt === true
         && (!entry.adoptedAt || (completionDeliveryWanted(entry) && !entry.completionDeliveredAt));
       if (pending || finishedFirst) {
         let sessionKey;
@@ -2462,6 +2499,8 @@ async function cmdAdopt(flags) {
               adoptedAt: now,
               summary:   null,
               error:     null,
+              completedBeforeAdopt: undefined,
+              completionScope: undefined,
               arming:    { sessionKey },
               updatedAt: now,
             }

@@ -74,6 +74,10 @@ function buildFixture({ initDb = true } = {}) {
     "  process.stdout.write(JSON.stringify({ ok: false, error: { type: 'cli_error', message: refusal } }));",
     '  process.exit(1);',
     '}',
+    "if (method === 'sessions.patch' && params?.model === 'rejected/model') {",
+    "  process.stdout.write(JSON.stringify({ ok: false, error: { type: 'gateway_request_error', code: 'INVALID_REQUEST', message: 'model not allowed' } }));",
+    '  process.exit(1);',
+    '}',
     "if (method === 'sessions.patch' && params?.key) {",
     "  const sessionsDir = path.join(process.env.HOME, '.openclaw', 'agents', 'main', 'sessions');",
     "  const sessionsPath = path.join(sessionsDir, 'sessions.json');",
@@ -190,6 +194,20 @@ function parseJson(result) {
   assert.ok(result.stdout.trim(), `expected JSON on stdout; stderr=${result.stderr}`);
   return JSON.parse(result.stdout);
 }
+
+// A child that finished while its label was still awaiting adopt.
+function finishBeforeAdopt(fixture, label) {
+  patchLabel(fixture, label, { preparedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() });
+  const done = runDispatch(fixture, [
+    'done', '--label', label, '--summary', 'Finished the requested change; checks pass.',
+    '--checklist', '{"work_complete":true}',
+  ], SUBAGENT_SHELL);
+  assert.equal(done.status, 0, done.stderr || done.stdout);
+}
+
+const HANDOFF_RUN_FIELDS = [
+  'completedBeforeAdopt', 'completionScope', 'adoptedAt', 'arming', 'preparedAt', 'taskFile', 'taskSha256', 'monitor',
+];
 
 function outboxCount(fixture) {
   const db = new Database(fixture.dbPath, { readonly: true });
@@ -838,6 +856,215 @@ test('adopt retries a completion that done could not deliver, under done\'s scop
     assert.equal(parseJson(again).alreadyAdopted, true);
     assert.equal(outboxCount(fixture), delivered, 'delivered once');
     assert.deepEqual(jobNames(fixture), []);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+const CHILD_KEY_2 = 'agent:main:subagent:1c8d3f5a-4e2b-4d66-8f10-2b3c4d5e6f70';
+
+test('label reuse: a run that finished before adopt does not leak into the next run\'s arming retry', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'reused-after-done-first';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label);
+    const first = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    assert.equal(parseJson(first).completedBeforeAdopt, true);
+    const delivered = outboxCount(fixture);
+
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    const pending = readLabels(fixture)[label];
+    assert.equal(pending.status, 'awaiting-spawn');
+    for (const field of ['completedBeforeAdopt', 'completionScope', 'adoptedAt', 'arming']) {
+      assert.equal(Object.hasOwn(pending, field), false, `${field} from the previous run is cleared`);
+    }
+
+    seedSession(fixture, CHILD_KEY_2);
+    const failing = watchdogFailingCli(fixture);
+    const partial = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], {
+      ...AGENT_SHELL, ...failing.env,
+    });
+    assert.equal(partial.status, 1, partial.stderr || partial.stdout);
+    assert.deepEqual(parseJson(partial).arming, { complete: false, missing: ['watchdog'] });
+
+    rmSync(failing.flagPath);
+    const retry = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], {
+      ...AGENT_SHELL, ...failing.env,
+    });
+    assert.equal(retry.status, 0, retry.stderr || retry.stdout);
+    const armed = parseJson(retry);
+    assert.equal(armed.status, 'accepted', 'the running run is armed, not reported as finished');
+    assert.equal(armed.rearmed, true);
+    assert.equal(armed.completedBeforeAdopt, undefined);
+    assert.deepEqual(armed.arming, { complete: true, missing: [] });
+    assert.deepEqual(jobNames(fixture), [`spawn-test-deliver:${label}`, `watchdog:${label}`]);
+
+    assert.equal(parseJson(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], AGENT_SHELL)).alreadyAdopted, true);
+    assert.equal(outboxCount(fixture), delivered, 'nothing delivered for the running run');
+    assert.equal(readLabels(fixture)[label].status, 'running');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: after an adopted run, a run that finishes before adopt still binds its key', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'reused-after-adopt';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    seedSession(fixture, CHILD_KEY);
+    assert.equal(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL).status, 0);
+
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label);
+    const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], AGENT_SHELL);
+    assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+    const report = parseJson(adopted);
+    assert.equal(report.completedBeforeAdopt, true);
+    assert.equal(report.sessionKey, CHILD_KEY_2);
+    assert.equal(readLabels(fixture)[label].sessionKey, CHILD_KEY_2);
+    assert.equal(parseJson(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], AGENT_SHELL)).alreadyAdopted, true);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: a Gateway run after a tool-route run starts without handoff state', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'tool-then-gateway';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    finishBeforeAdopt(fixture, label);
+    assert.equal(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL).status, 0);
+
+    const gateway = runDispatch(fixture, enqueueArgs(label));
+    assert.equal(gateway.status, 0, gateway.stderr || gateway.stdout);
+    const row = readLabels(fixture)[label];
+    assert.equal(row.status, 'running');
+    assert.equal(row.spawnVia, 'gateway');
+    for (const field of HANDOFF_RUN_FIELDS) {
+      assert.equal(Object.hasOwn(row, field), false, `${field} from the tool-route run is cleared`);
+    }
+    const jobsBefore = jobNames(fixture);
+
+    const same = runDispatch(fixture, ['adopt', '--label', label, '--session-key', row.sessionKey], AGENT_SHELL);
+    assert.equal(same.status, 0, same.stderr || same.stdout);
+    assert.equal(parseJson(same).alreadyAdopted, true, 'a Gateway run is never re-armed or reported as finished');
+    const stale = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    assert.equal(stale.status, 1);
+    assert.match(stale.stderr, /refusing to adopt/);
+    assert.deepEqual(jobNames(fixture), jobsBefore);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: a tool-route run after a Gateway run arms its own session', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'gateway-then-tool';
+    assert.equal(runDispatch(fixture, enqueueArgs(label)).status, 0);
+    const gatewayKey = readLabels(fixture)[label].sessionKey;
+
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    const pending = readLabels(fixture)[label];
+    assert.equal(pending.status, 'awaiting-spawn');
+    assert.equal(pending.sessionKey, null);
+    assert.equal(Object.hasOwn(pending, 'arming'), false);
+
+    seedSession(fixture, CHILD_KEY);
+    const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
+    assert.deepEqual(parseJson(adopted).arming, { complete: true, missing: [] });
+    const row = readLabels(fixture)[label];
+    assert.equal(row.arming.sessionKey, CHILD_KEY);
+    assert.equal(row.spawnVia, 'sessions_spawn');
+    assert.notEqual(row.sessionKey, gatewayKey);
+    // The Gateway run's jobs stay registered, as when a Gateway run is replaced.
+    assert.deepEqual(jobNames(fixture), [
+      `spawn-test-deliver:${label}`, `spawn-test-deliver:${label}`, `watchdog:${label}`, `watchdog:${label}`,
+    ]);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('label reuse: a Gateway continuation of a partially armed run is not re-armed by a stale adopt', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'partial-then-gateway-reuse';
+    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    seedSession(fixture, CHILD_KEY);
+    const failing = watchdogFailingCli(fixture);
+    const partial = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], {
+      ...AGENT_SHELL, ...failing.env,
+    });
+    assert.equal(partial.status, 1, partial.stderr || partial.stdout);
+    rmSync(failing.flagPath);
+
+    // The scheduler's own redispatch continues the same session through the Gateway.
+    const continued = runDispatch(fixture, [
+      'enqueue', '--label', label, '--message', 'Continue.', '--mode', 'reuse', '--timeout', '1200',
+      '--deliver-to', CHAT, '--spawn-via', 'gateway',
+    ]);
+    assert.equal(continued.status, 0, continued.stderr || continued.stdout);
+    const row = readLabels(fixture)[label];
+    assert.equal(row.sessionKey, CHILD_KEY);
+    assert.equal(row.spawnVia, 'gateway');
+    assert.equal(Object.hasOwn(row, 'arming'), false);
+    const jobsBefore = jobNames(fixture);
+    assert.deepEqual(jobsBefore, [`spawn-test-deliver:${label}`, `spawn-test-deliver:${label}`, `watchdog:${label}`]);
+
+    const stale = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL);
+    assert.equal(stale.status, 0, stale.stderr || stale.stdout);
+    assert.equal(parseJson(stale).alreadyAdopted, true);
+    assert.deepEqual(jobNames(fixture), jobsBefore, 'no second watchdog for the Gateway run');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a tool-route continuation applies requested model and thinking with sessions.patch first', () => {
+  const fixture = buildFixture();
+  try {
+    writeFileSync(fixture.labelsPath, JSON.stringify({
+      cont: { sessionKey: CHILD_KEY, agent: 'main', status: 'done' },
+    }));
+    const result = runDispatch(fixture, [
+      'enqueue', '--label', 'cont', '--message', 'Add the dark variant.', '--mode', 'reuse',
+      '--model', 'test/model-b', '--thinking', 'high', '--timeout', '600', '--deliver-to', CHAT,
+    ], AGENT_SHELL);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.deepEqual(readCalls(fixture), [
+      { method: 'sessions.patch', params: { key: CHILD_KEY, model: 'test/model-b' } },
+      { method: 'sessions.patch', params: { key: CHILD_KEY, thinkingLevel: 'high' } },
+    ], 'overrides applied to the continued session; no agent call');
+    const plan = parseJson(result);
+    assertSessionsSendContract(plan.spawn.params, 'followup');
+    const row = readLabels(fixture).cont;
+    assert.equal(row.model, 'test/model-b');
+    assert.equal(row.thinking, 'high');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a rejected override aborts a tool-route continuation before anything is recorded', () => {
+  const fixture = buildFixture();
+  try {
+    const before = { cont: { sessionKey: CHILD_KEY, agent: 'main', status: 'done' } };
+    writeFileSync(fixture.labelsPath, JSON.stringify(before));
+    const result = runDispatch(fixture, [
+      'enqueue', '--label', 'cont', '--message', 'Add the dark variant.', '--mode', 'reuse',
+      '--model', 'rejected/model', '--timeout', '600', '--deliver-to', CHAT,
+    ], AGENT_SHELL);
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /sessions\.patch \(model\) failed: .*model not allowed/);
+    assert.equal(result.stdout, '', 'no plan printed');
+    assert.deepEqual(readLabels(fixture), before, 'no pending row');
+    assert.equal(existsSync(join(fixture.stateDir, 'spawn-tasks')), false, 'no task file');
+    assert.deepEqual(readCalls(fixture).map(call => call.method), ['sessions.patch']);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
