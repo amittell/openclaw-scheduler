@@ -38,7 +38,7 @@ const knownTopLevel = new Set([
   'setup', 'start', 'dispatcher', 'migrate', 'status', 'doctor', 'webhook-check',
   'help', 'version', 'jobs', 'runs', 'queue', 'messages', 'msg', 'team', 'agents',
   'tasks', 'approvals', 'idem', 'alias', 'schema', 'capabilities', 'dispatch',
-  'enqueue', 'stuck', 'result', 'sync', 'done', 'send', 'steer', 'heartbeat', 'list',
+  'enqueue', 'adopt', 'stuck', 'result', 'sync', 'done', 'send', 'steer', 'heartbeat', 'list',
 ]);
 
 const knownSubcommands = new Map([

@@ -13289,12 +13289,16 @@ console.log('\n-- ORIGIN_CHAT_ID auto-inject (source check) --');
     indexSrcOCID.includes('ORIGIN_CHAT_ID: ${deliverTo}'),
     'ORIGIN_CHAT_ID: inject uses deliverTo value in template literal',
   );
-  // The injection must appear AFTER deliverTo is resolved and BEFORE parts = [
+  // The injection must appear AFTER deliverTo is resolved and BEFORE either
+  // enqueue route (Gateway or sessions_spawn handoff) assembles the task text.
   const deliverToIdx  = indexSrcOCID.indexOf("const deliverTo      = flags['deliver-to']");
   const injectIdx     = indexSrcOCID.indexOf("!message.includes('ORIGIN_CHAT_ID:')");
-  const partsIdx      = indexSrcOCID.indexOf('const parts = [');
+  const enqueueIdx    = indexSrcOCID.indexOf('async function cmdEnqueue(');
+  const assemblyIdxs  = ['buildDispatchTaskMessage({', 'prepareAttributedSpawn({']
+    .map(call => indexSrcOCID.indexOf(call, enqueueIdx));
   assert(deliverToIdx < injectIdx, 'ORIGIN_CHAT_ID: inject is after deliverTo resolution');
-  assert(injectIdx    < partsIdx,  'ORIGIN_CHAT_ID: inject is before prompt parts assembly');
+  assert(enqueueIdx < injectIdx && assemblyIdxs.every(idx => idx > injectIdx),
+    'ORIGIN_CHAT_ID: inject is before prompt parts assembly');
 }
 
 console.log('\n-- ORIGIN_CHAT_ID auto-inject (runtime behavior) --');

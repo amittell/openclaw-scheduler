@@ -475,6 +475,27 @@ requested model or thinking override aborts enqueue before the agent call.
 For `cmdSend` (mid-session steering), the call uses `lane: 'nested'` and
 `deliver: false`.
 
+**Agent exec shells (OpenClaw 2026.9.6+).** The OpenClaw CLI refuses `agent`,
+`sessions.send`, `sessions.steer`, `chat.send`, and `sessions.create` with an
+initial turn when it runs in an agent exec shell (`OPENCLAW_SHELL=exec`), and
+refuses session messages in a subagent exec shell (`OPENCLAW_SUBAGENT_EXEC=1`),
+because those turns would lose inter-session attribution. Dispatch does not
+call `agent` from such a shell. `cmdEnqueue` records the label as
+`awaiting-spawn` and prints the `sessions_spawn` (or, for `--mode reuse`,
+`sessions_send`) call for the agent's attributed tool; `cmdAdopt` then records
+the child session and registers delivery and monitoring, resuming a partial
+arming when repeated. `cmdSend` prints a `sessions_send` call. Every
+`sessions_send` plan sets `timeoutSeconds: 0`: OpenClaw defaults a `followup` to
+a 30 second inline wait for the child's reply, which would hand the reply to
+the requesting agent instead of leaving delivery to dispatch. A tool-route
+`--mode reuse` applies an explicit `--model` or `--thinking` with
+`sessions.patch` before printing the plan, since `sessions_send` carries
+neither and `sessions.patch` is not refused from an agent shell. An explicit `--spawn-via gateway` or `--send-via gateway`
+still calls `agent`; a refusal, recognized by its stable text
+`would lose inter-session attribution`, exits 3 as `ATTRIBUTED_SPAWN_REQUIRED`
+before any ledger write or job registration. Scheduler-originated redispatch
+(watcher, 529 recovery, stuck detector) passes the Gateway route explicitly.
+
 **`chat.history`** -- Retrieve session transcript.
 
 Called in `cmdResult()`:
@@ -519,6 +540,9 @@ Sessions are created implicitly. Scheduled isolated jobs use the stable key
 `agent:<agentId>:scheduler:<jobId>` so later runs reuse the same warm per-job
 session. The dispatch CLI uses `agent:<agentId>:subagent:<uuid>`
 (`dispatch/index.mjs` `makeSessionKey()`) for each newly enqueued sub-agent.
+A label prepared from an OpenClaw agent shell gets its key from the agent's
+`sessions_spawn` call instead (OpenClaw mints `agent:<agentId>:subagent:<uuid>`),
+and dispatch records it at `adopt`.
 Main-session jobs use `agent:<agentId>:main`. No explicit "create session" API
 exists; the Gateway creates a session when it first receives a request with
 that key.
@@ -1111,7 +1135,7 @@ request headers.
 | `GET /sessions/:key` | HTTP | `dispatch/index.mjs` | Session activity validation (done guard) |
 | `openclaw system event` | CLI | `gateway.js` | Fire-and-forget main-session event injection |
 | `openclaw gateway call sessions.patch` | CLI | `dispatch/index.mjs` | Supported session overrides (model, thinking) |
-| `openclaw gateway call agent` | CLI | `dispatch/index.mjs` | Subagent session dispatch |
+| `openclaw gateway call agent` | CLI | `dispatch/index.mjs` | Subagent session dispatch outside OpenClaw agent exec shells |
 | `openclaw gateway call chat.history` | CLI | `dispatch/index.mjs` | Session transcript retrieval |
 | `openclaw gateway call sessions.list` | CLI | `dispatch/index.mjs` | Session existence verification (fallback) |
 | `openclaw gateway call chat.abort` | CLI | `gateway.js` | Best-effort active agent-session cancellation |

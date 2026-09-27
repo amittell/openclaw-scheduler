@@ -15,7 +15,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 
 | File | Purpose |
 |---|---|
-| `index.mjs` | CLI entry point — 12 subcommands |
+| `index.mjs` | CLI entry point, 13 subcommands |
 | `hooks.mjs` | Lifecycle event emitter (Loki + optional HTTP webhook) |
 | `watcher.mjs` | Delivery monitoring process |
 | `label-lock.mjs` | Process-safe mutex for ledger read-modify-write operations |
@@ -53,6 +53,59 @@ Orchestrator calls:
   → Agent auto-announces results on completion
   → hooks.mjs fires dispatch.started to Loki
 ```
+
+### From an OpenClaw agent shell (OpenClaw 2026.9.6 and later)
+
+OpenClaw marks every agent exec shell with `OPENCLAW_SHELL=exec`, and subagent
+exec shells also with `OPENCLAW_SUBAGENT_EXEC=1`. Since 2026.9.6 the `openclaw`
+CLI refuses a Gateway `agent` turn from such a shell: a turn started there
+reaches the child without the parent and child attribution that OpenClaw
+records for its own session tools. OpenClaw's rule is that scripts in a marked
+shell use the agent's attributed session tool or normal child completion
+instead. The marker only denies, and an unavailable tool is not permission to
+use another route.
+
+So in a marked shell dispatch does not start the session. `enqueue` validates
+the request exactly as before, records the label as `awaiting-spawn`, and
+prints the `sessions_spawn` call for the agent to make:
+
+```
+Agent (exec shell) runs:
+  dispatch enqueue --label ticket-42 --message "Fix the deploy script" ...
+
+  → Validates flags, source context, delivery target, model and thinking defaults
+  → Writes the full task to a private file under the dispatch state directory
+  → Records ticket-42 as awaiting-spawn (no session key yet, no watcher, no watchdog)
+  → Prints {"status":"awaiting-spawn","spawn":{"tool":"sessions_spawn","params":{...}},
+            "adopt":{"command":"... adopt --label 'ticket-42' --session-key <childSessionKey> --run-id <runId>"}}
+  → No Gateway call
+
+Agent then:
+  1. Calls its sessions_spawn tool with spawn.params exactly as printed
+  2. Runs adopt.command with the childSessionKey and runId that sessions_spawn returned
+
+  → adopt moves ticket-42 to running and registers the delivery watcher and watchdog
+```
+
+`spawn.params` carries `task`, `label`, `agentId`, `model` and `thinking` (when
+set), `runTimeoutSeconds`, `mode: "run"`, `cleanup: "keep"`, and
+`expectsCompletionMessage: false`. The child still reports through `done`, and
+the scheduler watcher still delivers the completion to `--deliver-to`, exactly
+as for a Gateway spawn; an OpenClaw completion handoff to the requesting agent
+would announce the same result a second time. The task omits the depth header
+(OpenClaw supplies the subagent context) and the `CHECK_IN` curl (the child's
+message tool is disabled and chat messaging through curl is not allowed). The
+local `CHECKPOINT MESSAGING` command stays.
+
+`--spawn-via auto|gateway|tool` selects the route. `auto` (the default) means
+`tool` in a marked shell and `gateway` everywhere else: a terminal, the
+scheduler daemon, the delivery watcher, and 529 recovery keep the Gateway spawn
+unchanged. Scheduler-originated redispatch passes `--spawn-via gateway`
+explicitly. `--spawn-via gateway` from a marked shell still calls `agent` (for
+OpenClaw releases before 2026.9.6); when the CLI refuses it, dispatch exits 3
+with `{"ok":false,"error":{"code":"ATTRIBUTED_SPAWN_REQUIRED",...}}` and records
+no label and no jobs. Dispatch never removes the shell marker and never retries
+through `/v1/chat/completions`, `/hooks`, `/tools/invoke`, or the scheduler.
 
 ### Labels mutex and upgrades
 
@@ -147,8 +200,79 @@ is genuinely unavailable.
 | `--monitor-interval` | -- | Watcher cron expression |
 | `--monitor-timeout` | -- | Watcher timeout in minutes |
 | `--verify-cmd` | -- | Post-completion verification command |
+| `--spawn-via` | `auto` | `auto`, `gateway`, or `tool`. `auto` prepares a `sessions_spawn` call (see above) in an OpenClaw agent exec shell and uses the Gateway everywhere else. |
 
 *One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
+
+### `adopt` -- record a session the agent spawned
+
+```bash
+node dispatch/index.mjs adopt \
+  --label       "ticket-42" \
+  --session-key "agent:main:subagent:CHILD_ID" \
+  --run-id      "RUN_ID"
+```
+
+Run the `adopt.command` that `enqueue` printed, with the `childSessionKey` and
+`runId` from `sessions_spawn`. `adopt` requires an `awaiting-spawn` label and a
+key of the form `agent:<agent>:subagent:<id>` for the agent the label was
+prepared for. It moves the label to `running`, reserves the run's completion
+delivery claim, fires `dispatch.started`, and registers the same delivery
+watcher and watchdog jobs as an unmarked `enqueue`, then prints the same
+accepted JSON with `adopted: true`. It makes no guarded Gateway call and sends
+no "starting" chat notice: the requesting agent reports the start in its own
+reply. The session does not have to be observable yet; the post-spawn check
+records a lane error if one appears.
+
+`adopt` records each arming step in the label's `arming` record (claim,
+watcher, watchdog) and sets `arming.armedAt` once all of them are done. If a
+step fails, or the process dies after the label moved to `running`, `adopt`
+exits 1 with `{"ok":false,"error":{"code":"ADOPT_ARMING_INCOMPLETE","missing":[...]}}`
+and the partial record. Running the same `adopt` again registers only the
+missing steps (`rearmed: true`); once armed, a repeat is a no-op that returns
+the existing record (`alreadyAdopted: true`). A different key for a label that
+already has a session is refused. `--run-id` is optional: without it the run
+keeps the id `enqueue` minted for it (`preparedRunId`), as a Gateway spawn
+falls back to its own idempotency key. Once a run id is recorded, a later
+`--run-id` does not replace it; `adopt` says so on stderr.
+
+`enqueue` also records the run's completion scope (`completionScope`, from
+`preparedRunId`) once. Every path that claims the completion uses it: `done`
+before or after `adopt` and on a retry, `adopt`'s claim reservation and replay,
+and the delivery watcher. `adopt` changes the label's session key and run id,
+so deriving the scope from them would give one run two claims and two outbox
+keys. Each run of a label records a fresh scope.
+
+A fast child can call `done` before the parent runs `adopt`. `done` then marks
+the awaiting-spawn label `done`, measures its minimum-runtime guard from
+`preparedAt`, and delivers the completion as usual under the run's recorded
+completion scope. For an adopted tool-route run the guard also measures from
+`preparedAt`, the earlier bound on the spawn, since `adopt` records `spawnedAt`
+when it runs. A later `adopt` binds the session key, registers no jobs, and
+reports `completedBeforeAdopt: true`; if `done` could not deliver, `adopt`
+retries under the same scope, so the completion is delivered once. Until
+`adopt`, `status` shows the pending view, `sync` and `stuck` skip the label,
+and a delivery watcher left from an earlier run stays pending instead of
+delivering that run's reply.
+
+For `--mode reuse` from a marked shell, `enqueue` prints a `sessions_send` call
+(`mode: "followup"`, `timeoutSeconds: 0`) to the label's existing session
+instead, and `adopt.command` already contains that session key; pass the
+`runId` that `sessions_send` returned. `sessions_send` carries no model or
+thinking, so an explicit `--model` or `--thinking` is applied to that session
+first with `sessions.patch`, which OpenClaw does not refuse from an agent
+shell. A rejected override aborts before anything is recorded, as on the
+Gateway route.
+
+`timeoutSeconds: 0` keeps every `sessions_send` plan fire-and-forget. Omitted,
+OpenClaw 2026.9.6 defaults it to 30 for `followup`, and the requesting agent
+waits for the child's reply and receives it inline. With 0 the call returns
+once the turn is accepted. OpenClaw still hands a `followup` reply to a
+requesting agent that is not itself a subagent, once, if the child's turn ends
+within its 30 second announce window; a dispatch task normally runs longer, and
+the handoff message tells the agent not to repost it. `steer` always runs with
+0, injects into the active run without an announcement, and fails when the
+child has no active run (use `send` then).
 
 ### `status` — session status for a label
 
@@ -158,7 +282,9 @@ node dispatch/index.mjs status --label "ticket-42"
 
 Returns ledger info + live session data from gateway (model, age, token usage).
 The JSON includes `sourceContext` when the dispatch had authoritative inbound
-metadata.
+metadata. An `awaiting-spawn` label reports `preparedAt`, `ageSeconds`, and
+`stale: true` once it is 15 minutes old without an `adopt`; no liveness check
+or auto-resolution runs for it, and it is never deleted automatically.
 
 ### `stuck` — find stuck running sessions
 
@@ -237,6 +363,13 @@ EOF
 
 Sends a message directly into the running session. The agent sees it as a new
 user turn and continues working. This is the **mid-session steering superpower**.
+
+From an OpenClaw agent exec shell, `send` does not call the Gateway. It prints
+`{"status":"handoff","tool":"sessions_send","params":{"sessionKey":...,"message":...,"mode":"followup","timeoutSeconds":0}}`
+for the agent to pass to its `sessions_send` tool (`steer` uses `mode: "steer"`;
+see `adopt` above for what `timeoutSeconds: 0` does).
+`--send-via auto|gateway|tool` selects the route the same way `--spawn-via`
+does for `enqueue`.
 
 ### `steer` — alias for send
 
@@ -328,6 +461,16 @@ Local JSON file mapping labels to session keys:
 ```
 
 Gitignored by default. Session-local, not shared.
+
+A label prepared from an agent shell holds `status: "awaiting-spawn"`,
+`spawnVia: "sessions_spawn"` (or `"sessions_send"`), `preparedAt`, the stored
+`monitor` settings, and `taskFile` with `taskSha256` until `adopt` records its
+`sessionKey`, `runId`, `spawnedAt`, `adoptedAt`, and the `arming` record. A
+label whose child called `done` first also holds `completedBeforeAdopt` and
+`completionScope`. Labels spawned through the Gateway record
+`spawnVia: "gateway"`. Every new run of a label, through either route, drops
+these handoff fields from the previous run, so `adopt` only acts on the
+current run.
 
 ---
 
