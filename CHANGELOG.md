@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.4] -- 2026-09-27
+
 ### Fixed
 
 - **Hand dispatch spawns to `sessions_spawn` from OpenClaw 2026.9.6+ agent shells.**
