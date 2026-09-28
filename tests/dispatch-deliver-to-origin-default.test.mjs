@@ -13,12 +13,12 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 import { effectiveDeliveryTarget } from '../dispatch/source-context.mjs';
+import { setDbPath, getDb, applyBundledSchema } from '../db.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
 const INDEX_PATH = join(REPO_DIR, 'dispatch', 'index.mjs');
 const WATCHER_PATH = join(REPO_DIR, 'dispatch', 'watcher.mjs');
-const SCHEMA_PATH = join(REPO_DIR, 'schema.sql');
 
 /**
  * Regression coverage for the deliver-to-origin-default fix:
@@ -46,8 +46,9 @@ function makeFixture(name) {
   const labelsPath = join(root, 'labels.json');
   writeFileSync(labelsPath, '{}\n');
   const dbPath = join(root, 'scheduler.db');
-  const db = new Database(dbPath);
-  db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+  setDbPath(dbPath);
+  const db = getDb();
+  applyBundledSchema('test fixture schema');
   db.close();
   return { root, labelsPath, dbPath };
 }
