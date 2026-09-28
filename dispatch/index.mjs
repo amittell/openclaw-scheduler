@@ -70,6 +70,7 @@ import {
   parseSourceContext,
   sourceContextToOrigin,
   sourceContextToSchedulerFields,
+  effectiveDeliveryTarget,
 } from './source-context.mjs';
 import { callGatewayRpc } from './gateway-rpc.mjs';
 import {
@@ -1680,8 +1681,14 @@ async function activateDispatchRun({
     Object.assign(progress, patch);
     setLabel(label, { arming: progress });
   };
-  const watcherWanted = Boolean(deliverTo) && deliverMode !== 'none';
-  const watchdogWanted = monitor.enabled && Boolean(deliverTo);
+  // The origin (request source) is the programmatic default delivery target
+  // for both the completion and failure paths. An explicit deliverTo wins; when
+  // none was resolved, the recorded origin's target is used so failure
+  // announcements (watcher job delivery_to, watchdog alerts) reach the requester
+  // instead of being dropped or defaulting to an unrelated chat.
+  const effectiveTarget = effectiveDeliveryTarget({ deliverTo, deliverChannel, origin });
+  const watcherWanted = Boolean(effectiveTarget) && deliverMode !== 'none';
+  const watchdogWanted = monitor.enabled && Boolean(effectiveTarget);
   const missing = [];
 
   // Reserve this run's delivery scope before a stale watcher from an earlier
@@ -1752,8 +1759,8 @@ async function activateDispatchRun({
     try {
       const watcherJob = scheduleDeliveryWatcherJob({
         label,
-        deliverTo,
-        deliverChannel,
+        deliverTo: effectiveTarget.target,
+        deliverChannel: effectiveTarget.channel,
         sourceContext,
         timeoutSeconds,
         idleThresholdSeconds,
@@ -1785,8 +1792,8 @@ async function activateDispatchRun({
         `DISPATCH_STATE_DIR='${sq(LABELS_STATE_DIR)}' ` +
         `DISPATCH_LABELS_PATH='${sq(LABELS_PATH)}' ` +
         `'${sq(resolvePersistentNodePath())}' '${sq(resolveDispatchScriptPath('index.mjs'))}' result --label '${sq(label)}'`;
-      const alertChannel = deliverChannel || 'telegram';
-      const alertTarget  = deliverTo;
+      const alertChannel = effectiveTarget.channel;
+      const alertTarget  = effectiveTarget.target;
       const watchdogSpec = JSON.stringify({
         name:                     `watchdog:${label}`,
         job_type:                 'watchdog',
@@ -1869,7 +1876,7 @@ async function activateDispatchRun({
       jobId:    watchdogJobId,
       interval: monitor.interval,
       timeout:  monitor.timeoutMin,
-      ...(monitor.enabled && !deliverTo ? { skipped: true, reason: 'no --deliver-to target' } : {}),
+      ...(monitor.enabled && !effectiveTarget ? { skipped: true, reason: 'no delivery target (explicit --deliver-to or origin)' } : {}),
     } : null,
     message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }) +
       (incomplete ? ` ${incompleteNote}` : ''),
@@ -2220,6 +2227,23 @@ async function cmdEnqueue(flags) {
       } catch (error) {
         die(`REJECTED: invalid auto-detected origin: ${error.message}`, 2);
       }
+    }
+  }
+
+  // -- Origin default delivery target -------------------------------------
+  // The origin (request source) is the programmatic default delivery target
+  // for both the completion and failure paths. When no explicit --deliver-to
+  // was given but an origin route ("channel:target") is known, resolve the
+  // delivery target from the origin so the run is announced back to the
+  // requester. An explicit --deliver-to always wins (it is preserved above).
+  if (!deliverTo && !sourceContext) {
+    const effective = effectiveDeliveryTarget({ deliverTo: null, origin });
+    if (effective) {
+      deliverTo = effective.target;
+      deliverChannel = effective.channel;
+      process.stderr.write(
+        `[${BRAND}] no --deliver-to given: defaulting delivery target to origin ${origin}\n`,
+      );
     }
   }
 
@@ -3438,7 +3462,8 @@ function cmdWatcherHandoff(flags) {
     return;
   }
 
-  if (!entry.deliverTo || entry.deliveryMode === 'none') {
+  const handoffTarget = effectiveDeliveryTarget(entry);
+  if (!handoffTarget || entry.deliveryMode === 'none') {
     out({ ok: true, scheduled: false, label, reason: 'delivery disabled for this label' });
     return;
   }
@@ -3450,8 +3475,8 @@ function cmdWatcherHandoff(flags) {
 
   const watcherJob = scheduleDeliveryWatcherJob({
     label,
-    deliverTo: entry.deliverTo,
-    deliverChannel: entry.deliverChannel || 'telegram',
+    deliverTo: handoffTarget.target,
+    deliverChannel: handoffTarget.channel,
     sourceContext: entry.sourceContext || null,
     timeoutSeconds: Number(entry.timeoutSeconds ?? entry.timeout) || 300,
     idleThresholdSeconds: Number(entry.idleThresholdSeconds) || 300,
@@ -3714,14 +3739,19 @@ async function cmdDone(flags) {
   disarmWatchdog(label);
 
   let completionDelivery = null;
-  if (existing.deliverTo && existing.deliveryMode !== 'none') {
+  // The origin (request source) is the programmatic default delivery target:
+  // an explicit deliverTo wins, otherwise the recorded origin is used. This
+  // guarantees a recorded completion payload is announced to the requester
+  // even when the label has no explicit deliverTo (no silent drop / not_required).
+  const completionTarget = effectiveDeliveryTarget(existing);
+  if (completionTarget && existing.deliveryMode !== 'none') {
     const identity = labelCompletionIdentity(label, existing);
     completionDelivery = await enqueueCompletionNotification({
       label,
       summary,
       completion,
-      deliverTo: existing.deliverTo,
-      deliveryChannel: existing.deliverChannel || 'telegram',
+      deliverTo: completionTarget.target,
+      deliveryChannel: completionTarget.channel,
       sessionKey: identity.sessionKey,
       runId: identity.runId,
       deliveryScope: identity.deliveryScope,
