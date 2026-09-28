@@ -1,4 +1,7 @@
 // Job CRUD operations
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { RE2JS } from 're2js';
@@ -1916,6 +1919,100 @@ export function pruneExpiredJobs() {
       )
   `).run();
   return aged.changes + orphans.changes + ttlExpired.changes;
+}
+
+// Delivery watcher orphan reaper.
+//
+// Dispatch delivery watchers are enabled cron jobs named "<brand>-deliver:<label>"
+// (optionally with a ":handoff:<ts>" suffix) that poll a dispatch label until its
+// parent work finishes. They are created with ttl_hours (default 48) and
+// delete_after_run=1, but delete_after_run only fires on a terminal 'ok' run and
+// the TTL pruning above only deletes disabled jobs -- a watcher that keeps ticking
+// (skipped/ok every minute) stays enabled forever and never expires. Evidence:
+// dispatch-deliver:830-acceptance-run(-v4) created 2026-09-13 with ttl_hours=48
+// were still enabled and ticking 14 days later. This reaper deletes an ENABLED
+// dispatch-deliver job once its ttl_hours window has passed AND the watched
+// dispatch label is terminal (or no longer present in the labels ledger).
+const TERMINAL_DISPATCH_LABEL_STATUSES = new Set(['done', 'error', 'interrupted']);
+
+function resolveLabelsFileForPrune() {
+  const stateDir = process.env.DISPATCH_STATE_DIR
+    || join(process.env.OPENCLAW_SCHEDULER_HOME || join(process.env.HOME || homedir(), '.openclaw', 'scheduler'), 'dispatch');
+  return process.env.DISPATCH_LABELS_PATH || join(stateDir, 'labels.json');
+}
+
+function readDispatchLabelsForPrune() {
+  try {
+    const labelsPath = resolveLabelsFileForPrune();
+    if (!existsSync(labelsPath)) return null;
+    const parsed = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the dispatch label watched by a delivery watcher job is terminal
+ * (or the ledger/label is missing, i.e. the watched work is gone). Null --
+ * not terminal -- when the label still has a non-terminal status.
+ */
+function dispatchLabelTerminalForPrune(jobName) {
+  const labels = readDispatchLabelsForPrune();
+  if (!labels) return null;
+  const marker = '-deliver:';
+  const markerIndex = jobName.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const label = jobName.slice(markerIndex + marker.length).replace(/:handoff:\d+$/, '');
+  const entry = labels[label];
+  if (!entry || typeof entry !== 'object') return true;
+  return TERMINAL_DISPATCH_LABEL_STATUSES.has(entry.status) ? true : null;
+}
+
+/**
+ * Delete enabled dispatch-deliver watcher jobs that are past their ttl_hours
+ * window and whose watched label is terminal. Same safety guards as the TTL
+ * pruning above: no in-flight run, no recovery_blocked run, no pending/claimed
+ * queue row, no live children. Returns the number of deleted jobs.
+ */
+export function pruneOrphanedDeliveryWatchers() {
+  const db = getDb();
+  const candidates = db.prepare(`
+    SELECT id, name
+    FROM jobs
+    WHERE enabled = 1
+      AND ttl_hours IS NOT NULL
+      AND ttl_hours > 0
+      AND last_run_at IS NOT NULL
+      AND last_run_at < datetime('now', '-' || ttl_hours || ' hours')
+      AND name LIKE '%-deliver:%'
+  `).all();
+  let deleted = 0;
+  for (const candidate of candidates) {
+    if (dispatchLabelTerminalForPrune(candidate.name) !== true) continue;
+    if (db.prepare(`
+      SELECT 1 FROM runs
+      WHERE job_id = ?
+        AND status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+      LIMIT 1
+    `).get(candidate.id)) continue;
+    if (db.prepare(`
+      SELECT 1 FROM runs WHERE job_id = ? AND status = 'recovery_blocked' LIMIT 1
+    `).get(candidate.id)) continue;
+    if (db.prepare(`
+      SELECT 1 FROM job_dispatch_queue
+      WHERE job_id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+      LIMIT 1
+    `).get(candidate.id)) continue;
+    if (db.prepare(`SELECT 1 FROM jobs WHERE parent_id = ? LIMIT 1`).get(candidate.id)) continue;
+    try {
+      if (deleteJob(candidate.id)) deleted += 1;
+    } catch {
+      // deleteJob throws JOB_ACTIVE_RUNS if a run raced into flight; skip and
+      // retry on the next prune pass.
+    }
+  }
+  return deleted;
 }
 
 /**
