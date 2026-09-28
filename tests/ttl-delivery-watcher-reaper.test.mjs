@@ -1,16 +1,21 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
 import { createJob, getJob, pruneOrphanedDeliveryWatchers } from '../jobs.js';
 import { enqueueDispatch } from '../dispatch-queue.js';
 import { createRun, finishRun } from '../runs.js';
 
-const stateDir = mkdtempSync(join(tmpdir(), 'scheduler-ttl-watcher-reaper-'));
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const tmpRoot = mkdtempSync(join(tmpdir(), 'scheduler-ttl-watcher-reaper-'));
+const stateDir = join(tmpRoot, 'dispatch');
 const labelsPath = join(stateDir, 'labels.json');
+const dbPath = join(tmpRoot, 'test.db');
 
 function setLabels(labels) {
   writeFileSync(labelsPath, JSON.stringify(labels) + '\n', 'utf8');
@@ -36,18 +41,21 @@ function makeWatcherJob(name, overrides = {}) {
   });
 }
 
+// Age the job past its ttl_hours window. The reaper ages on the immutable
+// created_at (not last_run_at), so this sets created_at.
 function ageWatcherJob(jobId, hoursAgo = 49) {
   getDb().prepare(`
     UPDATE jobs
-    SET last_run_at = datetime('now', '-' || ? || ' hours'), last_status = 'ok'
+    SET created_at = datetime('now', '-' || ? || ' hours')
     WHERE id = ?
   `).run(hoursAgo, jobId);
 }
 
 before(async () => {
+  mkdirSync(stateDir, { recursive: true });
   process.env.DISPATCH_STATE_DIR = stateDir;
   process.env.DISPATCH_LABELS_PATH = labelsPath;
-  setDbPath(':memory:');
+  setDbPath(dbPath);
   await initDb();
 });
 
@@ -55,7 +63,7 @@ after(() => {
   closeDb();
   delete process.env.DISPATCH_STATE_DIR;
   delete process.env.DISPATCH_LABELS_PATH;
-  rmSync(stateDir, { recursive: true, force: true });
+  rmSync(tmpRoot, { recursive: true, force: true });
 });
 
 test('enabled dispatch-deliver watcher past TTL with terminal parent label is reaped', () => {
@@ -117,7 +125,7 @@ test('non-dispatch-deliver jobs are unaffected by the watcher reaper', () => {
   ageWatcherJob(otherWatcher.id);
   assert.equal(pruneOrphanedDeliveryWatchers(), 1);
   assert.equal(getJob(otherWatcher.id), undefined, 'watcher whose label is absent from the ledger is terminal');
-  deleteJobCleanup(plain.id);
+  getDb().prepare('DELETE FROM jobs WHERE id = ?').run(plain.id);
 });
 
 test('watcher with a handoff suffix resolves to its base label', () => {
@@ -143,6 +151,93 @@ test('watcher with a pending queue row is NOT reaped', () => {
   assert.equal(getJob(job.id), undefined);
 });
 
-function deleteJobCleanup(jobId) {
-  getDb().prepare('DELETE FROM jobs WHERE id = ?').run(jobId);
-}
+test('full :handoff:<digits> suffix is preferred when it exists as a ledger key', () => {
+  // A user label that literally ends in ":handoff:123" produces the job name
+  // dispatch-deliver:foo:handoff:123. The full key is still running, so the
+  // watcher must survive even though the stripped base "foo" is absent from
+  // the ledger (the old suffix-stripping bug would have watched "foo").
+  setLabels({ 'foo:handoff:123': { status: 'running', updatedAt: new Date().toISOString() } });
+  const job = makeWatcherJob('dispatch-deliver:foo:handoff:123');
+  ageWatcherJob(job.id);
+
+  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(getJob(job.id).id, job.id, 'watcher must survive while the full-suffix label is running');
+
+  setLabels({ 'foo:handoff:123': { status: 'done', updatedAt: new Date().toISOString() } });
+  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(getJob(job.id), undefined, 'watcher is reaped once the full-suffix label is terminal');
+});
+
+test('aging is based on created_at, not last_run_at', () => {
+  // A watcher that keeps ticking every minute has a fresh last_run_at. The
+  // reaper must age on the immutable created_at so such a watcher is reaped
+  // once created_at is past TTL, even though last_run_at is recent.
+  setLabels({ 'tick-label': { status: 'done', updatedAt: new Date().toISOString() } });
+  const job = makeWatcherJob('dispatch-deliver:tick-label');
+  getDb().prepare(`
+    UPDATE jobs
+    SET created_at = datetime('now', '-49 hours'),
+        last_run_at = datetime('now', '-1 minute'),
+        last_status = 'ok'
+    WHERE id = ?
+  `).run(job.id);
+
+  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(getJob(job.id), undefined, 'ticking watcher is reaped once created_at is past TTL');
+});
+
+test('enqueue race: a queue row committed by another dispatcher is re-checked inside the delete transaction', () => {
+  setLabels({ 'race-label': { status: 'done', updatedAt: new Date().toISOString() } });
+  const job = makeWatcherJob('dispatch-deliver:race-label');
+  ageWatcherJob(job.id);
+
+  // Simulate a concurrent dispatcher committing a durable pending queue row
+  // on a separate connection (its own write transaction) before the reaper's
+  // delete transaction. The guard re-check inside the reaper's immediate
+  // transaction must see it, defer the delete, and leave the queue row intact.
+  const racer = new Database(dbPath);
+  const queueId = `race-dispatch-${job.id}`;
+  try {
+    racer.prepare(`
+      INSERT INTO job_dispatch_queue
+        (id, job_id, dispatch_kind, status, scheduled_for, binding_scheduled_for, created_at)
+      VALUES (?, ?, 'manual', 'pending', datetime('now'), datetime('now'), datetime('now'))
+    `).run(queueId, job.id);
+    assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+    assert.equal(getJob(job.id).id, job.id, 'job must survive a racing enqueue');
+    const row = racer.prepare('SELECT status FROM job_dispatch_queue WHERE id = ?').get(queueId);
+    assert.equal(row.status, 'pending', 'racing queue row must not be cascade-deleted');
+  } finally {
+    racer.close();
+  }
+});
+
+test('relative DISPATCH_LABELS_PATH is resolved beneath DISPATCH_STATE_DIR', () => {
+  // A relative override must resolve under stateDir (via the dispatch path
+  // resolver), not against the process cwd. The ledger at the resolved
+  // location holds a terminal label, so correct resolution reaps the watcher;
+  // a wrong cwd-relative resolution would miss the file and fail safe (no reap).
+  const relDir = join(stateDir, 'rel');
+  mkdirSync(relDir, { recursive: true });
+  writeFileSync(
+    join(relDir, 'labels.json'),
+    JSON.stringify({ 'rel-label': { status: 'done', updatedAt: new Date().toISOString() } }) + '\n',
+    'utf8',
+  );
+
+  const savedLabels = process.env.DISPATCH_LABELS_PATH;
+  process.env.DISPATCH_LABELS_PATH = 'rel/labels.json';
+  try {
+    const job = makeWatcherJob('dispatch-deliver:rel-label');
+    ageWatcherJob(job.id);
+    assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+    assert.equal(getJob(job.id), undefined, 'relative override must resolve beneath stateDir');
+  } finally {
+    process.env.DISPATCH_LABELS_PATH = savedLabels;
+  }
+});
+
+test('index.d.ts declares pruneOrphanedDeliveryWatchers on the jobs namespace', () => {
+  const dts = readFileSync(join(__dirname, '..', 'index.d.ts'), 'utf8');
+  assert.match(dts, /pruneOrphanedDeliveryWatchers\(\): number;/, 'jobs namespace must declare the new export');
+});

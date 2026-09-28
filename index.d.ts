@@ -1011,6 +1011,7 @@ export const jobs: {
   // Lifecycle
   cancelJob(jobId: string, opts?: { cascade?: boolean }): string[];
   pruneExpiredJobs(): number;
+  pruneOrphanedDeliveryWatchers(): number;
 };
 
 export const runs: {
