@@ -1005,6 +1005,55 @@ function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
 }
 
 /**
+ * Best-effort transcript-derived token estimate for sessions whose canonical
+ * totalTokens field is not yet populated. The gateway only persists a real
+ * totalTokens at turn completion, and bootstrap writes 0; long dispatch runs
+ * are one long turn (many model calls ending in toolUse), so mid-run the store
+ * entry has no totalTokens even though per-call usage already exists in the
+ * transcript. Scan the newest bounded tail for the most recent assistant
+ * message carrying positive usage and report its totalTokens
+ * (fallback: input + cacheRead + cacheWrite + output).
+ *
+ * Display-only: this backs liveness.tokensEstimate. liveness.tokens stays
+ * authoritative for control decisions (watcher deadline extension / steer),
+ * so callers must not mix the estimate into that path.
+ *
+ * @param {Object|null} sessionEntry - Session store entry for the tracked session
+ * @param {string} agent - Agent id owning the transcript store
+ * @returns {number|null} - Estimated live token count, or null when not derivable
+ */
+function readTranscriptTokenEstimate(sessionEntry, agent) {
+  if (!sessionEntry || !sessionEntry.sessionId) return null;
+  try {
+    const transcript = readOpenClawTranscriptTail(agent, sessionEntry.sessionId, {
+      env: process.env,
+      homeDir: HOME_DIR,
+      limit: 100,
+    });
+    const entries = projectOpenClawTranscriptEntries(transcript?.events || []);
+    if (!Array.isArray(entries)) return null;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (!entry || entry.role !== 'assistant') continue;
+      const usage = entry.usage;
+      if (!usage || typeof usage !== 'object') continue;
+      if (typeof usage.totalTokens === 'number' && usage.totalTokens > 0) {
+        return Math.round(usage.totalTokens);
+      }
+      const partSum = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
+        .filter((n) => typeof n === 'number' && n > 0)
+        .reduce((a, b) => a + b, 0);
+      if (partSum > 0) return Math.round(partSum);
+    }
+    return null;
+  } catch {
+    // readOpenClawTranscriptTail validates inputs and can throw; a store entry
+    // can also lack a sessionId. No estimate is better than a crashed status.
+    return null;
+  }
+}
+
+/**
  * Auto-detect the originating channel from the most recently active main session.
  * Reads the SQLite-first compatibility store, finds sessions active within the last 10 minutes,
  * excludes subagent sessions, returns deliveryContext.to of the most recent one.
@@ -3297,6 +3346,10 @@ function cmdStatus(flags) {
           typeof sessionEntry.abortedLastRun === 'boolean' ? sessionEntry.abortedLastRun : undefined,
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
+        tokensEstimate:
+          sessionEntry.totalTokens
+            ? null
+            : readTranscriptTokenEstimate(sessionEntry, statusAgent),
       };
     } else {
       liveness = { error: 'session not found in sessions store' };
