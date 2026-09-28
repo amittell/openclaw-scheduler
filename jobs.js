@@ -1,6 +1,6 @@
 // Job CRUD operations
 import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve as pathResolve } from 'node:path';
+import { resolve as pathResolve } from 'node:path';
 import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { RE2JS } from 're2js';
