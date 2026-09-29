@@ -117,3 +117,53 @@ export function sameSourceContext(left, right) {
     && a.messageId === b.messageId
     && a.threadId === b.threadId;
 }
+
+/**
+ * Target of an origin string ("channel:target"), or null when the origin is
+ * absent or is not a route (e.g. "system"). Never throws.
+ */
+export function originTarget(origin) {
+  if (!origin) return null;
+  try {
+    const route = parseOriginRoute(origin);
+    return route ? route.target : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Channel of an origin string ("channel:target"), or null when the origin is
+ * absent or is not a route. Never throws.
+ */
+export function originChannel(origin) {
+  if (!origin) return null;
+  try {
+    const route = parseOriginRoute(origin);
+    return route ? route.channel : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Effective delivery target for a label entry or route descriptor. The origin
+ * (request source) is the programmatic default delivery target for the
+ * completion and failure paths: an explicit deliverTo wins, but when none was
+ * resolved the origin's target is used. Returns { target, channel } or null
+ * when no delivery target is known (no explicit deliverTo and the origin is
+ * absent or not a route).
+ *
+ * @param {{deliverTo?: string|null, deliverChannel?: string|null, origin?: string|null}} entry
+ */
+export function effectiveDeliveryTarget(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  if (entry.deliverTo) {
+    return { target: entry.deliverTo, channel: entry.deliverChannel || 'telegram' };
+  }
+  const target = originTarget(entry.origin);
+  if (target) {
+    return { target, channel: originChannel(entry.origin) || 'telegram' };
+  }
+  return null;
+}
