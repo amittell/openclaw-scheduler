@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.5] -- 2026-09-29
+
+### Added
+
+- **TTL reaper for orphaned enabled dispatch-deliver watcher jobs (#58).**
+  A delivery watcher that keeps ticking (skipped/ok every minute) stays
+  enabled forever and never expires, so it is invisible to the TTL pruning
+  that only deletes disabled jobs. The new
+  `jobs.pruneOrphanedDeliveryWatchers()` deletes an ENABLED dispatch-deliver
+  job once its `ttl_hours` window has passed AND the watched dispatch label
+  is terminal (`done`/`error`/`interrupted`) or no longer present in the
+  labels ledger. The reaper runs on the scheduler's maintenance tick. It
+  reuses the dispatch path resolver's state-dir logic and containment
+  checks, so a relative `DISPATCH_LABELS_PATH` resolves beneath
+  `DISPATCH_STATE_DIR` and an escaping override fails closed (no reaping).
+  The job/label safety checks run inside the same immediate transaction as
+  the delete, so a concurrent enqueue or child creation cannot be cascade-
+  removed, and a full `:handoff:<digits>` suffix is preferred when it exists
+  as a ledger key so a user label like `foo:handoff:123` is watched under
+  its own key.
+
+### Fixed
+
+- **Origin-default delivery for completion + failure paths (#60).** A
+  dispatch run whose request source (origin) was recorded but which had no
+  explicit `--deliver-to` resolved to `deliverTo=null`, so the completion
+  payload was recorded (status done) but the durable outbox enqueue was
+  skipped and the requester was never announced the result. The origin is
+  now the programmatic default delivery target for BOTH the completion and
+  failure paths; an explicit `--deliver-to` always wins. Applied at enqueue
+  (origin-default target resolution + `ORIGIN_CHAT_ID`), arming (watcher
+  job `delivery_to` + watchdog alert target), watcher-handoff, and the done
+  signal / watcher deliver paths.
+- **Delivery response-surface consistency (#60).** `activateDispatchRun`
+  armed the watcher/watchdog with the effective target but the activation
+  response still built `delivery` and the message from the raw nullable
+  `deliverTo`, so an origin-only label scheduled delivery successfully yet
+  reported `delivery.status:"missing"` / "Delivery target missing". The
+  response surface and activation message now report the effective target
+  (explicit `--deliver-to`, else the recorded origin); an explicit opt-out
+  (`deliveryDisabled`) keeps its disabled surface. The done path was checked
+  and already resolves its effective target.
+
 ## [0.6.4] -- 2026-09-27
 
 ### Fixed
