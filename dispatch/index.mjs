@@ -1843,13 +1843,20 @@ async function activateDispatchRun({
     recordStep({ armedAt: new Date().toISOString() });
   }
 
+  // The response surface must report what was actually armed: the effective
+  // target (explicit --deliver-to, else the recorded origin). Without this, an
+  // origin-only label arms a watcher but comes back as
+  // delivery.status:"missing" / "Delivery target missing". An explicit opt-out
+  // (deliveryDisabled) keeps its disabled surface: nothing is armed for it and
+  // the effective target would falsely report enabled.
+  const surfaceTarget = deliveryDisabled ? null : effectiveTarget;
   const delivery = buildDispatchDeliverySurface({
-    deliverTo,
-    deliverChannel,
+    deliverTo: surfaceTarget?.target ?? deliverTo,
+    deliverChannel: surfaceTarget?.channel ?? deliverChannel,
     deliveryMode: deliverMode,
     deliveryDisabled,
     deliveryDisabledReason,
-    ...(deliverTo ? {
+    ...(surfaceTarget ? {
       scheduler: schedulerWatcherOk,
       gateway: gatewaySecondary,
     } : {}),
@@ -1878,7 +1885,7 @@ async function activateDispatchRun({
       timeout:  monitor.timeoutMin,
       ...(monitor.enabled && !effectiveTarget ? { skipped: true, reason: 'no delivery target (explicit --deliver-to or origin)' } : {}),
     } : null,
-    message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo, gatewaySecondary }) +
+    message:    describeActivation({ verb, delivery, schedulerWatcherOk, deliverTo: surfaceTarget?.target ?? deliverTo, gatewaySecondary }) +
       (incomplete ? ` ${incompleteNote}` : ''),
   });
   if (incomplete) process.stderr.write(`[${agentBrand}] ${incompleteNote}\n`);

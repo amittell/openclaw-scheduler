@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -301,4 +302,94 @@ test('(d) effectiveDeliveryTarget: null for undefined input', () => {
 test('(d) effectiveDeliveryTarget: origin channel is used for the target channel', () => {
   const t = effectiveDeliveryTarget({ deliverTo: null, deliverChannel: null, origin: 'slack:12345' });
   assert.deepEqual(t, { target: '12345', channel: 'slack' });
+});
+
+// -- (e) activation response surface for an origin-only label ---------------
+
+/**
+ * The gap Copilot flagged on #60's own code: activateDispatchRun arms the
+ * watcher/watchdog with the EFFECTIVE target (explicit --deliver-to, else the
+ * recorded origin), but the activation response built `delivery` and the
+ * message from the raw nullable deliverTo. An origin-only label (no explicit
+ * --deliver-to) therefore scheduled delivery successfully yet reported
+ * delivery.status:"missing" / "Delivery target missing or not recorded" --
+ * contradictory state for the caller.
+ *
+ * This test adopts a prepared origin-only label (production schema loader,
+ * stub scheduler CLI, hermetic HOME) and asserts the activation response
+ * reports the enabled surface with the origin target, matching what was
+ * actually armed.
+ */
+test('(e) activation response reports enabled delivery to origin for an origin-only label', () => {
+  const fix = makeFixture('e-activation-surface');
+  const label = 'origin-activation-e';
+  const originTarget = '666555444';
+  const sessionKey = 'agent:main:subagent:33333333-4444-5555-6666-777777777777';
+  try {
+    const capturePath = join(fix.root, 'captured-job.json');
+    const cliPath = stubSchedulerCli(fix, capturePath);
+    // Prepared (awaiting-spawn) label with an ORIGIN but NO deliverTo -- the
+    // exact incident shape Copilot flagged.
+    writeFileSync(fix.labelsPath, JSON.stringify({
+      [label]: {
+        sessionKey: null,
+        runId: null,
+        preparedRunId: 'prep-run-e',
+        agent: 'main',
+        mode: 'fresh',
+        spawnVia: 'tool',
+        origin: `telegram:${originTarget}`,
+        deliverTo: null,
+        deliverChannel: null,
+        deliveryMode: 'announce',
+        monitor: { enabled: false, interval: '*/15 * * * *', timeoutMin: 60 },
+        timeoutSeconds: 3600,
+        idleThresholdSeconds: 300,
+        status: 'awaiting-spawn',
+        spawnedAt: null,
+      },
+    }, null, 2));
+    // Hermetic config: fast canary (no spawn-poll sleep), no external hooks.
+    const configDir = join(fix.root, 'config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+      name: 'dispatch-test',
+      spawnPollMax: 0,
+      spawnPollDelayMs: 1,
+    }));
+
+    const result = spawnSync(process.execPath, [
+      INDEX_PATH, 'adopt', '--label', label, '--session-key', sessionKey,
+    ], {
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: baseEnv(fix, {
+        HOME: fix.root,
+        DISPATCH_CONFIG_DIR: configDir,
+        OPENCLAW_SCHEDULER_CLI: cliPath,
+      }),
+    });
+    if (result.error) throw result.error;
+
+    assert.equal(result.status, 0, `adopt exited 0; stderr=${result.stderr}`);
+    let parsed = null;
+    try { parsed = JSON.parse(result.stdout); } catch {}
+    assert.ok(parsed, `adopt returned JSON; stderr=${result.stderr}`);
+    assert.equal(parsed.status, 'accepted', 'activation accepted');
+
+    // The response surface must report what was actually armed: enabled,
+    // origin target -- not "missing".
+    assert.equal(parsed.delivery.status, 'enabled', 'activation response reports enabled delivery');
+    assert.equal(parsed.delivery.target, originTarget, 'activation response target is the ORIGIN target');
+    assert.equal(parsed.delivery.channel, 'telegram', 'activation response channel is the origin channel');
+    assert.equal(parsed.delivery.scheduler, true, 'scheduler watcher reported armed in the surface');
+    assert.match(parsed.message, /Delivery via scheduler watcher/, 'message reflects the armed watcher');
+    assert.doesNotMatch(parsed.message, /missing/i, 'no "missing target" language in the activation message');
+
+    // And the armed watcher job really targets the origin.
+    const spec = JSON.parse(readFileSync(capturePath, 'utf8'));
+    assert.equal(spec.delivery_to, originTarget, 'armed watcher job targets the origin');
+  } finally {
+    rmSync(fix.root, { recursive: true, force: true });
+  }
 });
