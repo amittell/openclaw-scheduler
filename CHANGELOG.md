@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop polling Gateway sessions when no task-tracker agent can use them.**
+  The dispatcher's message-delivery pass (about every 20s by default) posted
+  `sessions_list` to the Gateway's `/tools/invoke` on every pass to refresh
+  task-tracker heartbeats, even with no trackers at all, and discarded every
+  result. On a bot host with an empty `task_tracker` table that was about
+  4,300 calls a day and 42% of Gateway log lines. The pass now polls only
+  while an active tracker has a pending or running agent with a registered
+  session key. Dead-agent detection, group completion and summary delivery
+  are unchanged.
+
 ## [0.6.5] -- 2026-09-29
 
 ### Added

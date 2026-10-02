@@ -246,7 +246,8 @@ Each session object is expected to have at minimum: `key` (or `sessionKey`),
 - `dispatcher-strategies.js` `executeAgent()` -- resolves `auth_profile: 'inherit'` by finding
   the main session's auth profile
 - `dispatcher-maintenance.js` via `checkTaskTrackers` -- correlates subagent
-  sessions with task group agents
+  sessions with task group agents; it calls only while an active tracker has a
+  pending or running agent with a registered `session_key`
 
 #### Tool: `message`
 
