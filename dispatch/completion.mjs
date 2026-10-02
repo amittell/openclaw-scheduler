@@ -41,6 +41,13 @@ const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*
 const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
 const FINAL_REPORT_HEADING_RE = /^(?:#{1,6}\s*)?(?:root cause|files? changed|changes|validation|tests?(?: run| passed)?|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|result|results|summary|highlights?|notes?|follow[- ]ups?|next steps?|blockers?|implementation|what changed|verification)\s*:?$/i;
 const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validation|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|final report|human-readable report|files changed|tests passed)\b/i;
+// Upper bound for text delivered verbatim instead of humanized: about one
+// Telegram part (3,600 bytes in delivery-outbox.js) after the completion
+// header, for mostly-ASCII text. Longer text is a dump, not a chat report.
+const MAX_VERBATIM_REPORT_CHARS = 3500;
+const JSON_OBJECT_KEY_RE = /[{,]\s*"[^"\n]{1,80}"\s*:/;
+const STACK_FRAME_RE = /^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$/m;
+const TIMESTAMPED_LINE_RE = /^\s*\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/gm;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -90,7 +97,7 @@ function normalizeReportLineEndings(text) {
     .trim();
 }
 
-function isLikelyHumanFinalReport(text) {
+function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
   const normalized = normalizeReportLineEndings(text);
   if (!normalized) return false;
   if (isGenericOrTrivial(normalized)) return false;
@@ -123,13 +130,24 @@ function isLikelyHumanFinalReport(text) {
   // Allow slightly shorter reports with an explicit root cause / validation shape.
   if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
 
+  if (requireCue) return false;
+
   // A multi-section report with several bold-label/heading sections is a real
   // final report even without a specific cue word. Domain reports (dubbing
   // alignment fixes, etc.) use labels like "**Item 1**", "**Re-verify**",
-  // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword.
-  if ((headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5) return true;
+  // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword. Labels alone also
+  // match dumps, stack traces and status updates, so this shape must also be
+  // verbatim-deliverable.
+  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5 && isVerbatimDeliverable(normalized);
+}
 
-  return false;
+// Whether text may be delivered verbatim instead of humanized: it fits one
+// chat message and is not machine output (a payload, JSON, stack frames or
+// log lines), whatever labels or prose lead it carries.
+function isVerbatimDeliverable(text) {
+  if (text.length > MAX_VERBATIM_REPORT_CHARS) return false;
+  if (looksLikeRawPayloadText(text) || JSON_OBJECT_KEY_RE.test(text) || STACK_FRAME_RE.test(text)) return false;
+  return (text.match(TIMESTAMPED_LINE_RE) || []).length < 3;
 }
 
 function getPassThroughHumanFinalReport(text) {
@@ -1342,18 +1360,14 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
-// True when summaryHuman is a truncation of summary (shape (a) above): a
-// prefix (after stripping punctuation/spaces) that is substantially shorter.
-// This holds for both clean truncations and mangled truncations (number-
-// mangling only inserts spaces, which strip removes). A clean rewrite (not a
-// prefix) returns false, so the structured-candidate loop still delivers the
-// better humanized lead. summaryHuman equal to summary also returns false via
-// the length check.
+// True when summaryHuman is a truncation of a substantial summary: a prefix,
+// once punctuation and spaces are stripped, that is substantially shorter.
+// This covers clean truncations and the "0.00s" -> "0. 00s" mangling. Equal or
+// similar-length texts are not truncations.
 function isLossyHumanizedTruncation(summary, summaryHuman) {
   if (!summary || !summaryHuman) return false;
-  if (summary.length <= 200) return false;
-  if (summaryHuman.length >= summary.length * 0.6) return false; // not a truncation
-  const strip = (t) => String(t).replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
+  const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
   return strip(summary).startsWith(strip(summaryHuman));
 }
 
@@ -1421,8 +1435,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // heading or bold-label), deliver it (humanized, which pass-through
   // preserves). A thin lastReply fragment does NOT beat the structured
   // summary - that would invert the legacy contract (raw transcript text
-  // should not beat structured completion).
-  if (isLikelyHumanFinalReport(rawReply) && isDeliverableText(rawReply, reply)) {
+  // should not beat structured completion). Neither does a reply with section
+  // labels but no final-report cue: a status update ("**Status:**",
+  // "**Next:**", "**ETA:**") has that shape too. It is delivered below only
+  // when there is no structured completion.
+  if (isLikelyHumanFinalReport(rawReply, { requireCue: true }) && isDeliverableText(rawReply, reply)) {
     const technicalDetailsText = buildTechnicalDetailsText({
       rawText: rawReply,
       summaryText: reply,
@@ -1436,43 +1453,23 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     };
   }
 
-  // completion.summary is the authoritative full report the agent submitted via
-  // --summary. summary_human is a humanized derivative that comes in two shapes:
-  //   (a) lossy truncation: the report failed the isLikelyHumanFinalReport gate
-  //       and summarizeProse collapsed it, mangling numbers (0.00s -> 0. 00s)
-  //       and cutting 1909 chars to ~200. summary_human is then a mangled
-  //       prefix of summary.
-  //   (b) clean humanized lead: a distinct plain-English rewrite of summary
-  //       (the fitness / Apple-Health / sports-backtest shapes). summary_human
-  //       is the better text and must win.
-  // Promote summary verbatim ONLY in shape (a): summary is substantial, not a
-  // raw payload, and summary_human is a substantially-shorter prefix of it (a
-  // truncation, clean or mangled). Shape (b) - a clean rewrite - is not a
-  // prefix, so it falls through to the structured-candidate loop below, which
-  // delivers summary_human. This is the done path, where lastReply is not
-  // recovered, so completion.summary is the best full text.
-  const fullSummary = normalizeCompletionText(completion?.summary);
-  // looksLikeRawPayloadText is a marker-key heuristic; a truncated single-line
-  // JSON without marker keys still slips through it. Reject any JSON-shaped
-  // summary (starts with {/[ and has a quoted key) from verbatim promotion.
-  const fullHead = fullSummary ? fullSummary.slice(0, 200) : '';
-  const isJsonishShape = (fullHead[0] === '{' || fullHead[0] === '[') && /"\s*:/.test(fullHead);
-  // A mixed-technical summary (prose lead + "Technically:"/"Technical details:"
-  // tail) is the shape the humanizer already knows how to split into a lead +
-  // technical-details block. Promoting it verbatim would leak the raw marker,
-  // so exclude it and let the structured-candidate loop deliver the humanized form.
-  const hasExplicitTechnicalMarker = Boolean(fullSummary) && EXPLICIT_TECHNICAL_MARKER_RE.test(fullSummary);
+  // completion.summary is the full report the agent submitted with --summary.
+  // On the done path lastReply is not recovered, so when summary_human is a
+  // truncation of that report, deliver the report itself: summarizeProse cut a
+  // 1,909-char report to ~200 chars and split "0.00s" into "0. 00s". A clean
+  // rewrite is not a prefix and still delivers summary_human. It also wins when
+  // the agent wrote its own lead ("Technically:" / "Technical details:" tail,
+  // which the humanizer splits into lead and details block) or when summary is
+  // not verbatim-deliverable (too long, payload, JSON, stack frames, logs).
   if (
-    fullSummary
-    && fullSummary.length > 200
-    && !looksLikeRawPayloadText(fullSummary)
-    && !isJsonishShape
-    && !hasExplicitTechnicalMarker
-    && isLossyHumanizedTruncation(fullSummary, normalizeCompletionText(completion?.summary_human))
+    rawCompletionSummary
+    && !EXPLICIT_TECHNICAL_MARKER_RE.test(rawCompletionSummary)
+    && isLossyHumanizedTruncation(rawCompletionSummary, rawCompletionSummaryHuman)
+    && isVerbatimDeliverable(rawCompletionSummary)
   ) {
     return {
-      deliveryText: fullSummary,
-      summary: fullSummary,
+      deliveryText: rawCompletionSummary,
+      summary: rawCompletionSummary,
       source: 'completion-summary-full',
     };
   }
