@@ -4,9 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.6] -- 2026-10-02
+
 ### Fixed
 
-- **Stop polling Gateway sessions when no task-tracker agent can use them.**
+- **Stop polling Gateway sessions when no task-tracker agent can use them (#62).**
   The dispatcher's message-delivery pass (about every 20s by default) posted
   `sessions_list` to the Gateway's `/tools/invoke` on every pass to refresh
   task-tracker heartbeats, even with no trackers at all, and discarded every
