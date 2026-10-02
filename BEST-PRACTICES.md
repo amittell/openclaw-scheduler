@@ -463,7 +463,7 @@ node ~/.openclaw/scheduler/cli.js tasks register-session $TRACKER_ID writer "age
 node ~/.openclaw/scheduler/cli.js tasks register-session $TRACKER_ID reviewer "agent:main:subagent:def-456"
 ```
 
-Once session keys are registered, the **dispatcher auto-detects heartbeats** by calling `sessions_list` every 30s. As long as the sub-agent's session is active, it's counted as alive — no CLI calls required from inside the sub-agent.
+Once session keys are registered, the **dispatcher auto-detects heartbeats** by calling `sessions_list` on its message-delivery pass (about every 20s with the default 10s tick and 15s `SCHEDULER_MESSAGE_DELIVERY_MS`). It makes that call only while some active tracker has a pending or running agent with a registered session key; with no such agent the pass sends no `sessions_list` call. As long as the sub-agent's session is active, it's counted as alive — no CLI calls required from inside the sub-agent.
 
 **Step 3: Sub-agents report completion (optional but recommended)**
 
@@ -485,7 +485,7 @@ If something goes wrong:
 ```
 
 **What happens automatically:**
-- Dispatcher checks active sessions every 30s — agents with active sessions stay "alive"
+- Dispatcher checks active sessions on each message-delivery pass (about every 20s by default) while a registered agent is pending or running — agents with active sessions stay "alive"
 - Agents that go silent for > 5 minutes AND whose tracker has timed out → marked dead
 - When all agents reach terminal state → delivery summary sent to your configured channel
 - Check anytime: `openclaw-scheduler tasks status <TRACKER_ID>`

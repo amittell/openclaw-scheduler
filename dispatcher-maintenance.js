@@ -368,7 +368,19 @@ export async function checkTaskTrackers({
   try {
     try {
       const db = getDb();
-      const activeSessions = await getAllSubAgentSessions(10);
+      // The session list is used only to match an active agent's registered
+      // session_key below; NULL or '' never matches a listed session. Without
+      // such an agent every result is discarded, so skip the gateway round
+      // trip (sessions_list via /tools/invoke).
+      const correlatable = db.prepare(`
+        SELECT 1
+        FROM task_tracker_agents a
+        JOIN task_tracker t ON a.tracker_id = t.id
+        WHERE a.status IN ('pending', 'running') AND t.status = 'active'
+          AND a.session_key <> ''
+        LIMIT 1
+      `).get();
+      const activeSessions = correlatable ? await getAllSubAgentSessions(10) : [];
       if (activeSessions.length > 0) {
         for (const session of activeSessions) {
           const sessionKey = session.key || session.sessionKey;
