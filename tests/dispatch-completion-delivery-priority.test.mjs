@@ -101,8 +101,9 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
 // completion.summary_human -- a lossy derivative that mangled numbers
 // ("0.00s" -> "0. 00s") and collapsed a 1909-char report to 198 chars. The
 // full completion.summary must win when summary_human is a truncation of it
-// (clean or mangled prefix), and must NOT win when the agent wrote its own lead
-// (the fitness "Technically:" shape) or when summary is not a chat-sized report.
+// (clean or mangled prefix) or a synthetic technical rewrite, and must NOT win
+// when the agent wrote its own lead (the fitness "Technically:" shape) or when
+// summary is not a chat-sized report.
 const CHECKLIST = { work_complete: true };
 const MAX_VERBATIM_CHARS = 3500;
 const alignFull = 'Round-8 alignment fix complete (all 3 items, re-verified, staged). ITEM 1 (7 SRT-offset lines): 3 were real EN sub offsets, fixed to 0.00s drift - i=37 Bunny. #32 344.25 to 347.50, i=83 Um show me. #75 738.11 to 739.00. ITEM 2 (32 missing-cue lines): 16 real EN lines got new 1:1 cues, 16 are jp_fallback. SRT 224 to 241 cues, sequential, chronological, 0 new overlaps. ITEM 3 (1251.9 gap): CONFIRMED real dropped JP line, regenerated No! via IndexTTS2 best-of-6, surgical mix and re-encode to dub_eng_v10.aac. RE-VERIFY: gate_03s.py OK, P1 max drift 4.54s to 0.36s. STAGED: srt md5 772f57d1 (241 cues), aac md5 04f634ff, lines_index md5 9f1cc522 (266 entries).';
@@ -147,14 +148,17 @@ test('sm-round8-align-fix: the full report reaches chat on the done and watcher 
   assert.equal(watcher.deliveryText, alignReport.summary);
 });
 
-test('done path: clean-rewrite summary_human is not overridden by raw summary', () => {
+test('done path: a synthetic technical rewrite in summary_human gives way to the full report', () => {
+  // sm-round8-fix stored the humanizer's technical rewrite: one fragment plus
+  // its stock follow-up sentences, 133 chars standing in for a 1,619-char report.
+  assert.ok(payload.completion.summary_human.endsWith('Future runs should be less likely to hit the same problem.'));
+  assert.ok(payload.completion.summary.length > 1500);
   const result = resolveCompletionDelivery({
     completion: payload.completion,
     fallbackSummary: payload.completion.summary,
   });
-  assert.notEqual(result.source, 'completion-summary-full',
-    'fixture summary_human is a clean rewrite, not a truncation - must not be promoted away');
-  assert.equal(result.source, 'summary_human');
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, payload.completion.summary);
 });
 
 test('done path: thin completion.summary does not trigger the full-summary path', () => {

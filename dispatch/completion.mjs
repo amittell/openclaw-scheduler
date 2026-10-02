@@ -48,6 +48,17 @@ const MAX_VERBATIM_REPORT_CHARS = 3500;
 const JSON_OBJECT_KEY_RE = /[{,]\s*"[^"\n]{1,80}"\s*:/;
 const STACK_FRAME_RE = /^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$/m;
 const TIMESTAMPED_LINE_RE = /^\s*\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/gm;
+// Closing sentences buildHumanizedTechnicalSummary and
+// buildCompletionLeadFromThemes append to a synthetic rewrite, which is how
+// resolveCompletionDelivery recognizes one in a stored summary_human.
+const TECHNICAL_REWRITE_FOLLOW_UPS = {
+  testOnly: 'That makes the behavior easier to trust. Future regressions should get caught quickly.',
+  reliability: 'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
+  addedBehavior: 'That makes the new behavior available without extra follow-up. Future runs should use it automatically.',
+  other: 'That should make the result easier to work with. Future runs should reflect the change automatically.',
+};
+const THEMED_LEAD_FOLLOW_UP = 'Future runs should show the clean summary first, with technical details underneath when needed.';
+const SYNTHETIC_FOLLOW_UPS = [...Object.values(TECHNICAL_REWRITE_FOLLOW_UPS), THEMED_LEAD_FOLLOW_UP];
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -778,7 +789,7 @@ function buildCompletionLeadFromThemes(themes) {
       sentences.push('That makes the result easier to scan without hiding the useful detail.');
     }
   }
-  sentences.push('Future runs should show the clean summary first, with technical details underneath when needed.');
+  sentences.push(THEMED_LEAD_FOLLOW_UP);
   return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
 }
 
@@ -836,22 +847,8 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
     actionSummary = 'The update is in place.';
   }
 
-  const extras = [];
-  if (themes.testOnly) {
-    extras.push('That makes the behavior easier to trust.');
-    extras.push('Future regressions should get caught quickly.');
-  } else if (themes.reliability) {
-    extras.push('That should make the workflow more reliable.');
-    extras.push('Future runs should be less likely to hit the same problem.');
-  } else if (themes.addedBehavior) {
-    extras.push('That makes the new behavior available without extra follow-up.');
-    extras.push('Future runs should use it automatically.');
-  } else {
-    extras.push('That should make the result easier to work with.');
-    extras.push('Future runs should reflect the change automatically.');
-  }
-
-  return truncateText([actionSummary, ...extras].filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
+  const theme = ['testOnly', 'reliability', 'addedBehavior'].find(name => themes[name]) || 'other';
+  return truncateText(`${actionSummary} ${TECHNICAL_REWRITE_FOLLOW_UPS[theme]}`, MAX_DELIVERY_CHARS);
 }
 
 export function humanizeCompletionText(value) {
@@ -1360,15 +1357,17 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
-// True when summaryHuman is a truncation of a substantial summary: a prefix,
-// once punctuation and spaces are stripped, that is substantially shorter.
-// This covers clean truncations and the "0.00s" -> "0. 00s" mangling. Equal or
-// similar-length texts are not truncations.
-function isLossyHumanizedTruncation(summary, summaryHuman) {
+// True when summaryHuman is a machine derivative that dropped most of a
+// substantial summary: either a truncation (a prefix once punctuation and
+// spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling) or
+// a synthetic technical rewrite (it ends with a follow-up sentence the
+// humanizer wrote, not the agent). Equal or similar-length texts are not lossy.
+function isLossyHumanizedLead(summary, summaryHuman) {
   if (!summary || !summaryHuman) return false;
   if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
   const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  return strip(summary).startsWith(strip(summaryHuman));
+  if (strip(summary).startsWith(strip(summaryHuman))) return true;
+  return SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
@@ -1455,16 +1454,17 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
 
   // completion.summary is the full report the agent submitted with --summary.
   // On the done path lastReply is not recovered, so when summary_human is a
-  // truncation of that report, deliver the report itself: summarizeProse cut a
-  // 1,909-char report to ~200 chars and split "0.00s" into "0. 00s". A clean
-  // rewrite is not a prefix and still delivers summary_human. It also wins when
+  // lossy machine derivative of that report, deliver the report itself: a
+  // truncation (summarizeProse cut a 1,909-char report to ~200 chars and split
+  // "0.00s" into "0. 00s") or a synthetic technical rewrite (one fragment plus
+  // the humanizer's own follow-up sentences). summary_human still wins when
   // the agent wrote its own lead ("Technically:" / "Technical details:" tail,
   // which the humanizer splits into lead and details block) or when summary is
   // not verbatim-deliverable (too long, payload, JSON, stack frames, logs).
   if (
     rawCompletionSummary
     && !EXPLICIT_TECHNICAL_MARKER_RE.test(rawCompletionSummary)
-    && isLossyHumanizedTruncation(rawCompletionSummary, rawCompletionSummaryHuman)
+    && isLossyHumanizedLead(rawCompletionSummary, rawCompletionSummaryHuman)
     && isVerbatimDeliverable(rawCompletionSummary)
   ) {
     return {
