@@ -48,6 +48,10 @@ import { resolveArtifactBoundIdentity } from '../identity-runtime.js';
 import { normalizeShellResult } from '../shell-result.js';
 import { createApproval } from '../approval.js';
 import { createJob, deleteJob, getJob, updateJob } from '../jobs.js';
+import {
+  _resetForTesting as resetProviderRegistry,
+  registerProvider,
+} from '../provider-registry.js';
 import { claimProofReplay, revokeProof, verifyArtifactBoundProof } from '../proof-runtime.js';
 import { requestRunCancellation, transitionRunTerminal } from '../run-state.js';
 import {
@@ -3433,6 +3437,124 @@ test('verified evidence envelopes without payload digests use one consistent has
   const verified = await verifyPersistedArtifactBoundEvidence(run.id, { agentcli });
   assert.equal(verified.integrity.valid, true, verified.integrity.error);
   assert.equal(verified.integrity.cryptographically_verified, true);
+});
+
+test('evidence verify receives the declared provider_config, only verify() names the signer, and unknown providers fail closed', async () => {
+  const [evidenceApi, payloadApi] = await Promise.all([
+    import('@amittell/agentcli/evidence'),
+    import('@amittell/agentcli/evidence/payload'),
+  ]);
+  const verifyCalls = [];
+  const evidenceProvider = name => ({
+    name,
+    type: 'evidence',
+    resolve() { return { signer: name }; },
+    // The envelope names a signer that this verify() never vouches for.
+    attest(serialized) {
+      return {
+        attested: true,
+        envelope: {
+          method: name,
+          signed_payload: serialized,
+          principal: 'envelope-claims-mallory',
+          key_fingerprint: 'SHA256:envelope-claims-this-key',
+        },
+      };
+    },
+    verify(envelope, options) {
+      verifyCalls.push({ name, providerConfig: options.providerConfig });
+      return { verified: true, payload: JSON.parse(envelope.signed_payload) };
+    },
+    describe() { return {}; },
+  });
+  // agentcli-compiled v4 jobs persist only provider_config_hash, so the
+  // declared config reaches the runtime only through a run snapshot like this.
+  const declaredConfig = { key_ref: 'kms://scheduler/evidence', expected_issuer: 'https://issuer.test' };
+  const signRun = async (providerName, opts = {}) => {
+    const job = createV4Job(`Provider config ${providerName}`);
+    const run = createRun(job.id);
+    const profile = {
+      ref: `${providerName}-evidence`,
+      provider: providerName,
+      provider_config: declaredConfig,
+      payload: { format: 'canonical-json' },
+      verify: { required: true },
+    };
+    getDb().prepare(
+      'UPDATE runs SET evidence_ref_snapshot = ?, evidence_declaration_snapshot = ? WHERE id = ?',
+    ).run(profile.ref, JSON.stringify(profile), run.id);
+    finishRun(run.id, 'ok', {
+      summary: 'provider config evidence complete',
+      shell_exit_code: 0,
+      shell_stdout: 'provider-config-output',
+      shell_stderr: '',
+      shell_stdout_sha256: sha256('provider-config-output'),
+      shell_stderr_sha256: sha256(''),
+    });
+    await persistArtifactBoundEvidence(
+      { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
+      assertArtifactMatchesJob(job),
+      run.id,
+      { principal: 'provider-config-principal', ...opts },
+    );
+    return { job, run };
+  };
+  const lastVerify = name => verifyCalls.filter(call => call.name === name).at(-1);
+
+  try {
+    registerProvider(evidenceProvider('config-plugin'));
+    const signed = await signRun('config-plugin');
+    assert.deepEqual(lastVerify('config-plugin').providerConfig, declaredConfig);
+    const withRun = await verifyPersistedArtifactBoundEvidence(signed.run.id);
+    assert.equal(withRun.integrity.valid, true, withRun.integrity.error);
+    assert.deepEqual(lastVerify('config-plugin').providerConfig, declaredConfig);
+    assert.equal(withRun.integrity.principal, null);
+    assert.equal(withRun.integrity.key_fingerprint, null);
+    assert.equal(deleteJob(signed.job.id), true);
+    const pruned = await verifyPersistedArtifactBoundEvidence(signed.run.id);
+    assert.equal(pruned.integrity.valid, true, pruned.integrity.error);
+    assert.deepEqual(lastVerify('config-plugin').providerConfig, {});
+
+    const builtin = evidenceProvider('agentcli-builtin');
+    const agentcli = {
+      ...evidenceApi,
+      ...payloadApi,
+      resolveEvidenceProvider() { return builtin; },
+      async verifyEvidenceEnvelope(envelope, options) {
+        verifyCalls.push({ name: 'agentcli-builtin', providerConfig: options.providerConfig });
+        return { verified: true, payload: JSON.parse(envelope.signed_payload) };
+      },
+    };
+    const viaAgentcli = await signRun('agentcli-builtin', { agentcli });
+    assert.deepEqual(lastVerify('agentcli-builtin').providerConfig, declaredConfig);
+    const agentcliVerified = await verifyPersistedArtifactBoundEvidence(viaAgentcli.run.id, { agentcli });
+    assert.equal(agentcliVerified.integrity.valid, true, agentcliVerified.integrity.error);
+    assert.deepEqual(lastVerify('agentcli-builtin').providerConfig, declaredConfig);
+
+    const throwingAgentcli = error => ({
+      ...agentcli,
+      resolveEvidenceProvider() { throw error; },
+    });
+    await assert.rejects(
+      () => signRun('unregistered-plugin', {
+        agentcli: throwingAgentcli(Object.assign(new Error('Unknown evidence provider'), {
+          code: 'invalid_argument',
+        })),
+      }),
+      error => error.code === 'EVIDENCE_PROVIDER_NOT_LOADED'
+        && /SCHEDULER_PROVIDER_PATH/.test(error.message),
+    );
+    await assert.rejects(
+      () => signRun('broken-agentcli', {
+        agentcli: throwingAgentcli(Object.assign(new Error('registry unavailable'), {
+          code: 'AGENTCLI_REGISTRY_BROKEN',
+        })),
+      }),
+      error => error.code === 'AGENTCLI_REGISTRY_BROKEN',
+    );
+  } finally {
+    resetProviderRegistry();
+  }
 });
 
 test('credential capability negotiation fails before release and binds fresh runtime nonces', async () => {

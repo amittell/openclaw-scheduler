@@ -10,6 +10,7 @@ import {
   validatePersistedArtifactBoundEvidenceRecord,
   verifyPersistedArtifactBoundEvidence,
 } from './evidence-runtime.js';
+import { loadProviders } from './provider-registry.js';
 import {
   sendMessage, getInbox, getOutbox, getThread, markRead, markAllRead, getUnreadCount, pruneMessages,
   ackMessage, getMessage, listMessageReceipts, getTeamMessages,
@@ -292,6 +293,19 @@ function readJsonPayload(argv, {
   }
 }
 
+// A v4 evidence row signed by a SCHEDULER_PROVIDER_PATH plugin re-verifies only
+// with that plugin registered. Load the directory once, and only on the paths
+// that verify v4 evidence, with the dispatcher's world-writable refusal. A
+// directory that cannot be read must not stop built-in providers from
+// verifying; a plugin row then fails closed with EVIDENCE_PROVIDER_NOT_LOADED.
+let evidenceProviderPlugins = null;
+function loadEvidenceProviderPlugins() {
+  evidenceProviderPlugins ??= loadProviders(process.env.SCHEDULER_PROVIDER_PATH).catch(error => {
+    console.error(`[provider-registry] Cannot load providers: ${error.message}`);
+  });
+  return evidenceProviderPlugins;
+}
+
 function tableExists(db, name) {
   return Boolean(db.prepare(`
     SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1
@@ -382,6 +396,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
         checked += 1;
         let record;
         if (row.handoff_artifact_digest && verifyV4Evidence) {
+          await loadEvidenceProviderPlugins();
           record = await verifyPersistedArtifactBoundEvidence(row.run_id, { db });
         } else if (row.handoff_artifact_digest) {
           try {
@@ -790,7 +805,9 @@ switch (command) {
         const evidenceRow = getDb().prepare(
           'SELECT handoff_artifact_digest, evidence_verified FROM evidence_records WHERE run_id = ?',
         ).get(args[0]);
-        const evidence = evidenceRow?.handoff_artifact_digest && evidenceRow.evidence_verified === 1
+        const verifyV4 = evidenceRow?.handoff_artifact_digest && evidenceRow.evidence_verified === 1;
+        if (verifyV4) await loadEvidenceProviderPlugins();
+        const evidence = verifyV4
           ? await verifyPersistedArtifactBoundEvidence(args[0])
           : getEvidenceRecord(args[0]);
         if (!evidence) fail(`Evidence not found for run: ${args[0]}`, 1, 'NOT_FOUND');
@@ -1675,7 +1692,14 @@ switch (command) {
 }
 }
 
-main().catch(err => {
+main().then(() => {
+  // A plugin imported for evidence verification can leave a timer or socket
+  // open and keep the CLI alive after it has answered. Exit once stdout and
+  // stderr have flushed; a bare process.exit() can cut piped output short.
+  if (evidenceProviderPlugins) {
+    process.stdout.write('', () => process.stderr.write('', () => process.exit(process.exitCode ?? 0)));
+  }
+}, err => {
   const errorCode = typeof err?.code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(err.code)
     ? err.code
     : 'COMMAND_FAILED';

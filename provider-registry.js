@@ -6,10 +6,14 @@ const identityProviders = new Map();
 const authorizationProviders = new Map();
 const proofVerifiers = new Map();
 const evidenceProviders = new Map();
+// Why the last loadProviders() call loaded nothing, for errors that name a
+// provider which should have come from SCHEDULER_PROVIDER_PATH.
+let loadProblem = null;
 
 /**
  * Load provider plugins from a directory. Every *.js file is imported and
- * its default export registered by type (identity / authorization / proof-verifier).
+ * its default export registered by type (identity / authorization /
+ * proof-verifier / evidence).
  *
  * TRUST BOUNDARY: This directory is dynamically imported at startup. Only
  * point SCHEDULER_PROVIDER_PATH at operator-controlled directories. The loader
@@ -17,6 +21,7 @@ const evidenceProviders = new Map();
  * primary defense is correct deployment configuration.
  */
 export async function loadProviders(dirPath) {
+  loadProblem = null;
   if (!dirPath) return;
   const absPath = resolve(dirPath);
 
@@ -25,15 +30,23 @@ export async function loadProviders(dirPath) {
   try {
     const dirStat = await fsStat(absPath);
     if ((dirStat.mode & 0o002) !== 0) {
+      loadProblem = `${absPath} is world-writable`;
       console.error(`[provider-registry] REFUSING to load providers: ${absPath} is world-writable (mode 0${(dirStat.mode & 0o777).toString(8)}). Fix permissions or use a trusted directory.`);
       return;
     }
   } catch (err) {
+    loadProblem = `cannot stat ${absPath}: ${err.message}`;
     console.error(`[provider-registry] Cannot stat provider directory ${absPath}: ${err.message}`);
     return;
   }
 
-  const files = await readdir(absPath);
+  let files;
+  try {
+    files = await readdir(absPath);
+  } catch (err) {
+    loadProblem = `cannot read ${absPath}: ${err.message}`;
+    throw err;
+  }
   const jsFiles = files.filter(f => f.endsWith('.js'));
 
   for (const file of jsFiles) {
@@ -65,7 +78,9 @@ export async function loadProviders(dirPath) {
     + authorizationProviders.size
     + proofVerifiers.size
     + evidenceProviders.size;
-  console.log(`[provider-registry] Loaded ${total} provider(s) from ${absPath}`);
+  // Diagnostics go to stderr: the CLI also loads plugins, and its --json
+  // stdout must stay a single JSON document.
+  console.error(`[provider-registry] Loaded ${total} provider(s) from ${absPath}`);
 }
 
 export function getIdentityProvider(name) {
@@ -82,6 +97,10 @@ export function getProofVerifier(name) {
 
 export function getEvidenceProvider(name) {
   return evidenceProviders.get(name) || null;
+}
+
+export function getProviderLoadProblem() {
+  return loadProblem;
 }
 
 export function registerProvider(provider) {
@@ -218,4 +237,5 @@ export function _resetForTesting() {
   authorizationProviders.clear();
   proofVerifiers.clear();
   evidenceProviders.clear();
+  loadProblem = null;
 }
