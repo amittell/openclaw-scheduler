@@ -45,6 +45,7 @@ import {
   getCompletionAuthoritativeSummary,
   hasCompletionSignal,
   resolveCompletionDelivery,
+  resolveVerbatimBoundBytes,
   taskRequiresGitSha,
 } from './completion.mjs';
 import {
@@ -3572,15 +3573,18 @@ async function cmdDone(flags) {
 
   // Persist a first-class completion payload with deterministic delivery text
   // so the watcher/post-office path never depends solely on transcript recovery
-  // or on whatever raw blob the model chose to print at the end.
+  // or on whatever raw blob the model chose to print at the end. The label's
+  // recorded delivery channel (if any) drives the verbatim-promotion byte bound
+  // (telegram 3400 — the outbox chunks; discord/other/unknown a conservative
+  // 2000); an unregistered label falls back to the conservative default.
+  const existing = getLabel(label);
   const completion = buildTerminalCompletionPayload({
     summary: rawSummary,
     checklist,
     sha,
+    boundBytes: resolveVerbatimBoundBytes(existing),
   });
   const summary = completion.summary || null;
-
-  const existing = getLabel(label);
   // A child started by sessions_spawn can finish before its parent runs adopt.
   // Its label is still awaiting-spawn, with no session key or run id yet; the
   // completion is claimed under the scope recorded when the label was prepared.

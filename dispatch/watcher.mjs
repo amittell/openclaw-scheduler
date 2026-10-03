@@ -46,6 +46,7 @@ import {
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
   resolveCompletionDelivery,
+  resolveVerbatimBoundBytes,
 } from './completion.mjs';
 import {
   claimCompletionDelivery,
@@ -1357,10 +1358,16 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
   if (interruptRetryCount > 0) setInterruptRetryCount(label, 0);
 
   // Update labels.json before exiting -- prevents stuck detector false positives
+  // The delivery channel is known here (entry.deliverChannel / origin), so the
+  // verbatim-promotion byte bound matches it (telegram 3400 — the outbox
+  // chunks; discord/other/unknown a conservative 2000). Reports over the bound
+  // fall back to the summary_human path.
+  const completionTarget = effectiveDeliveryTarget(getLabelEntry(label));
   const completion = resolveCompletionDelivery({
     lastReply,
     completion: completionPayload,
     fallbackSummary,
+    boundBytes: resolveVerbatimBoundBytes(completionTarget || entry),
   });
   markLabelDone(label, completion.summary);
 
@@ -1373,7 +1380,6 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     // an explicit deliverTo wins, otherwise the recorded origin is used. This
     // guarantees a recorded completion payload is announced to the requester
     // even when the label has no explicit deliverTo (no silent drop).
-    const completionTarget = effectiveDeliveryTarget(claimEntry);
     if (completionTarget && claimEntry?.deliveryMode !== 'none') {
       const deliveryResult = enqueueCompletionNotification({
         label,

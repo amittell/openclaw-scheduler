@@ -18,7 +18,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { hostname } from 'os';
-import { resolveCompletionDelivery } from './completion.mjs';
+import { resolveCompletionDelivery, resolveVerbatimBoundBytes } from './completion.mjs';
 import { assertRouteMatchesSource, parseSourceContext } from './source-context.mjs';
 import { getDb } from '../db.js';
 import { enqueueMultipartDelivery } from '../delivery-outbox.js';
@@ -545,9 +545,16 @@ export function enqueueCompletionNotification({
       'completion delivery route',
     );
   }
+  // The delivery channel is known here, so the verbatim-promotion byte bound
+  // matches it (telegram 3400 — the outbox chunks; discord/other/unknown a
+  // conservative 2000). Reports over the bound fall back to summary_human.
   const delivery = resolvedDelivery && typeof resolvedDelivery === 'object'
     ? resolvedDelivery
-    : resolveCompletionDelivery({ completion, fallbackSummary: summary });
+    : resolveCompletionDelivery({
+      completion,
+      fallbackSummary: summary,
+      boundBytes: resolveVerbatimBoundBytes(deliveryChannel),
+    });
   const bodyText = delivery.deliveryText || null;
   const scope = buildCompletionDeliveryScope({ label, sessionKey, runId, deliveryScope });
   const baseMetadata = {

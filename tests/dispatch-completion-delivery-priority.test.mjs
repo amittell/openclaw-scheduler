@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
+import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery, resolveVerbatimBoundBytes, summarizeCompletionText, TELEGRAM_VERBATIM_BOUND_BYTES, DEFAULT_VERBATIM_BOUND_BYTES } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
@@ -378,4 +378,113 @@ test('watcher path: a cue-less status reply does not replace the agent\'s own --
   const replyOnly = resolveCompletionDelivery({ lastReply: statusReply, completion: null });
   assert.equal(replyOnly.source, 'lastReply');
   assert.equal(replyOnly.deliveryText, statusReply);
+});
+
+// --- Carry-forward from closed PR #66 --------------------------------------
+//
+// Three items from PR #66 (fix/completion-prose-delivery) were closed in favor
+// of #53; these land the surviving pieces on current main:
+//   1. splitSentences hardening — a period followed by a closing quote/bracket
+//      then whitespace is a sentence boundary (the old rule missed 'Done." Next').
+//   2. nhl-ml-full-summary.txt fixture + done-path regression test through the
+//      real producer (buildTerminalCompletionPayload).
+//   3. Per-channel verbatim-promotion bound — telegram 3400 (the outbox chunks),
+//      discord/other/unknown a conservative 2000, threaded from the watcher.
+
+// Same boundary logic as splitSentences() in dispatch/completion.mjs: split at
+// sentence-ending punctuation followed by whitespace, optionally after closing
+// quote/bracket characters. Decimals/formulas ("2.5", "1.0 + edge*(4/0.15)")
+// never split because nothing whitespace follows the dot.
+const SENTENCE_BOUNDARY_RE = /(?<=[.!?])["'”’)\]}]*(?=\s)/;
+
+test('splitSentences boundary: a period followed by a closing quote still splits', () => {
+  const quoted = 'Done." Next sentence.';
+  const quotedParts = quoted.split(SENTENCE_BOUNDARY_RE).map(part => part.trim()).filter(Boolean);
+  assert.deepEqual(quotedParts, ['Done.', 'Next sentence.'], 'period + closing quote must be a sentence boundary');
+
+  // Behavioral check through summarizeCompletionText: force the oversized path
+  // so splitSentences() actually runs. The output must be a join of whole
+  // sentences — which only happens if the period followed by a closing quote is
+  // treated as a boundary (before the fix the whole input was one "sentence"
+  // and truncation cut it mid-token).
+  const quotedInput = Array.from({ length: 200 }, () => quoted).join(' ');
+  assert.ok(quotedInput.length > MAX_VERBATIM_BYTES, 'quoted input must exceed the budget');
+  const summarized = summarizeCompletionText(quotedInput);
+  assert.ok(summarized, 'must produce a delivery text');
+  assert.ok(summarized.length < quotedInput.length, 'quoted prose must be truncated');
+  const inputSentences = quotedInput.split(SENTENCE_BOUNDARY_RE).map(part => part.trim()).filter(Boolean);
+  assert.ok(inputSentences.length > 1, 'quoted boundary must produce multiple sentences');
+  assert.ok(summarized.startsWith('Done.'), 'first kept sentence is the quoted one');
+  const wholeSentenceJoin = inputSentences.findIndex((_, k) => k > 0 && inputSentences.slice(0, k).join(' ') === summarized);
+  assert.ok(wholeSentenceJoin > 0, 'output must be a join of whole input sentences (quoted boundary respected)');
+});
+
+test('splitSentences boundary: curly quotes and brackets are separators too', () => {
+  assert.deepEqual('Done.” Next.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['Done.', 'Next.'], 'closing curly double quote must be a boundary');
+  assert.deepEqual('He said (ok.) Next.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['He said (ok.', 'Next.'], 'closing bracket after the terminator must be a boundary');
+});
+
+test('splitSentences boundary: decimals, versions, filenames, formulas and ranges never split', () => {
+  assert.deepEqual('Drift 2.5 ms. Then 0.00s.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['Drift 2.5 ms.', 'Then 0.00s.'], 'decimals must not split');
+  assert.deepEqual('v0.6.5 shipped. Tests passed.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['v0.6.5 shipped.', 'Tests passed.'], 'version strings must not split');
+  assert.deepEqual('Staged dub_eng_v9.aac. Done.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['Staged dub_eng_v9.aac.', 'Done.'], 'filenames must not split');
+  assert.deepEqual('conf = 1.0 + edge*(4/0.15) over the band. Capped at 5.0.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['conf = 1.0 + edge*(4/0.15) over the band.', 'Capped at 5.0.'], 'formulas must not split');
+  assert.deepEqual('The move 4.4 -> 3.6 held. Re-verified.'.split(SENTENCE_BOUNDARY_RE).map(p => p.trim()).filter(Boolean),
+    ['The move 4.4 -> 3.6 held.', 'Re-verified.'], 'ranges must not split');
+});
+
+test('done path: the nhl-ml full summary is delivered verbatim with decimals and formulas intact (regression)', () => {
+  const fixture = readFileSync(join(__dirname, 'fixtures', 'nhl-ml-full-summary.txt'), 'utf8').trim();
+  assert.equal(fixture.length, 1216, 'fixture must be the 1,216-char report');
+  const completion = buildTerminalCompletionPayload({ summary: fixture, checklist: { work_complete: true } });
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'completion-summary-full', 'the full report must be promoted');
+  assert.equal(result.deliveryText.length, fixture.length, '1,216 chars in must come out 1,216 chars');
+  assert.ok(result.deliveryText.includes('conf = 2.5'), 'decimal conf = 2.5 must be intact');
+  assert.ok(result.deliveryText.includes('conf = 1.0 + edge*(4/0.15)'), 'formula must be intact');
+  assert.ok(!/2\. 5|5\. 0|12\. 5pp/.test(result.deliveryText), 'no space-inserted decimals');
+});
+
+test('resolveVerbatimBoundBytes maps channels to the correct bounds', () => {
+  assert.equal(resolveVerbatimBoundBytes('telegram'), TELEGRAM_VERBATIM_BOUND_BYTES, 'telegram -> 3400');
+  assert.equal(resolveVerbatimBoundBytes('Telegram'), TELEGRAM_VERBATIM_BOUND_BYTES, 'case-insensitive');
+  assert.equal(resolveVerbatimBoundBytes('discord'), DEFAULT_VERBATIM_BOUND_BYTES, 'discord -> 2000');
+  assert.equal(resolveVerbatimBoundBytes('slack'), DEFAULT_VERBATIM_BOUND_BYTES, 'unknown channel -> conservative default');
+  assert.equal(resolveVerbatimBoundBytes(null), DEFAULT_VERBATIM_BOUND_BYTES, 'no channel -> conservative default');
+  assert.equal(resolveVerbatimBoundBytes(undefined), DEFAULT_VERBATIM_BOUND_BYTES, 'undefined -> conservative default');
+  assert.equal(resolveVerbatimBoundBytes({ channel: 'discord' }), DEFAULT_VERBATIM_BOUND_BYTES);
+  assert.equal(resolveVerbatimBoundBytes({ channel: 'telegram' }), TELEGRAM_VERBATIM_BOUND_BYTES);
+  assert.equal(resolveVerbatimBoundBytes({ deliverChannel: 'discord' }), DEFAULT_VERBATIM_BOUND_BYTES);
+  assert.equal(resolveVerbatimBoundBytes(3400), 3400, 'already-resolved numbers are idempotent');
+});
+
+test('a report between the discord and telegram bounds promotes on telegram only', () => {
+  // A plain-prose report in the 2001-3400 band: the telegram outbox chunks it,
+  // so it is promoted verbatim; discord/unknown channels must not receive one
+  // oversized message, so it falls back to the summary_human path.
+  const sentence = 'Phase 1 of the migration finished and its row counts matched production.';
+  let report = sentence;
+  while (report.length < 2100) report = `${report} ${sentence}`;
+  report = report.slice(0, report.lastIndexOf('.') + 1);
+  assert.ok(report.length > DEFAULT_VERBATIM_BOUND_BYTES && report.length < TELEGRAM_VERBATIM_BOUND_BYTES,
+    `report must sit between the bounds, got ${report.length} chars`);
+
+  const completion = buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST });
+  const telegram = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary, boundBytes: resolveVerbatimBoundBytes('telegram') });
+  assert.equal(telegram.source, 'completion-summary-full', 'telegram must promote the report');
+  assert.equal(telegram.deliveryText.length, report.length, 'telegram delivers it in full');
+
+  const discord = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary, boundBytes: resolveVerbatimBoundBytes('discord') });
+  assert.notEqual(discord.source, 'completion-summary-full', 'discord must not promote an oversized report');
+  assert.ok(Buffer.byteLength(discord.deliveryText) <= DEFAULT_VERBATIM_BOUND_BYTES,
+    `discord delivery must fit the bound, got ${Buffer.byteLength(discord.deliveryText)} bytes`);
+
+  const unknown = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.notEqual(unknown.source, 'completion-summary-full', 'the conservative default must not promote either');
 });
