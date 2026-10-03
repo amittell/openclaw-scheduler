@@ -274,9 +274,14 @@ The SSH provider uses `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the
 declared key, principal, namespace, and allowed-signers file. Provider methods,
 verification metadata, payload hash, artifact digest, and verification outcome
 are immutable. `runs evidence RUN_ID --json` reconstructs the persisted
-execution input and cryptographically re-verifies the envelope. Tampering,
-transplantation, a stale artifact, or unavailable required verification exits
-nonzero.
+execution input and cryptographically re-verifies the envelope. Tampering that
+leaves the row inconsistent, any change the signature covers, transplantation,
+a stale artifact, or unavailable required verification exits nonzero. A
+self-consistent row written by someone with write access to the scheduler
+database is not detected when it names `ssh`, because the row also supplies the
+principal and allowed-signers path, or when it names a provider whose
+`verify()` does not pin trust outside the database (see
+`docs/trust-architecture.md`).
 
 ## Gateway Compatibility
 
