@@ -2,14 +2,46 @@ const MAX_DELIVERY_SENTENCES = 5;
 const MAX_DELIVERY_CHARS = 700;
 const MAX_LIST_ITEMS = 3;
 
-// Channel budget for a full human-readable completion summary. Summaries up to
-// one Telegram message (4096 chars) are delivered intact. Prose beyond this
-// budget is truncated at a clean sentence boundary to <= MAX_PROSE_DELIVERY_CHARS
-// BEFORE it reaches the delivery outbox (and never alters the characters of kept
-// text — no space-inserted decimals), so this path never emits more than the
-// budget; the outbox's [n/N] chunking is a safety net for other paths, not what
-// this relies on.
+// Per-channel budgets for a full human-readable completion summary. Summaries up
+// to the channel's budget are delivered intact; prose beyond it is truncated at a
+// clean sentence boundary BEFORE it reaches the delivery outbox (and never alters
+// the characters of kept text — no space-inserted decimals), so this path never
+// emits more than the budget; the outbox's [n/N] chunking is a safety net for
+// other paths, not what this relies on.
+//
+// The budget MUST match the delivery channel: only the Telegram path chunks in
+// the outbox, so an over-limit payload for a non-chunking channel (e.g. Discord,
+// whose working cap here is 2000) would be sent as one message and fail. The
+// per-channel max is resolved at the call site (watcher) where the delivery
+// channel is known and threaded down. MAX_PROSE_DELIVERY_CHARS stays the
+// Telegram value for backward compatibility; the channel-neutral default for
+// unknown/other channels is deliberately conservative (2000), never 4096.
 export const MAX_PROSE_DELIVERY_CHARS = 4096;
+export const TELEGRAM_PROSE_BUDGET = 4096;
+export const DISCORD_PROSE_BUDGET = 2000;
+export const DEFAULT_PROSE_BUDGET = 2000;
+
+/**
+ * Resolve the prose pass-through budget for a delivery channel.
+ *   telegram -> 4096 (Telegram's per-message cap)
+ *   discord  -> 2000 (Discord's working cap in this deployment)
+ *   other    -> 2000 (conservative channel-neutral default; never 4096)
+ * Accepts a channel string or an object with a `channel`/`deliverChannel` field.
+ * Already-resolved positive numbers pass through unchanged (idempotent), so a
+ * budget resolved at the call site can be re-resolved safely downstream.
+ */
+export function resolveProseBudget(channelOrTarget) {
+  if (typeof channelOrTarget === 'number' && Number.isFinite(channelOrTarget) && channelOrTarget > 0) {
+    return Math.floor(channelOrTarget);
+  }
+  const raw = typeof channelOrTarget === 'string'
+    ? channelOrTarget
+    : (channelOrTarget?.channel ?? channelOrTarget?.deliverChannel ?? null);
+  const channel = String(raw || '').trim().toLowerCase();
+  if (channel === 'telegram') return TELEGRAM_PROSE_BUDGET;
+  if (channel === 'discord') return DISCORD_PROSE_BUDGET;
+  return DEFAULT_PROSE_BUDGET;
+}
 
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)[.!?]*$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
@@ -438,20 +470,31 @@ function summarizeStructuredText(text) {
   return compact ? asSentence(compact) : null;
 }
 
-function summarizeProse(text) {
-  const normalized = prepareLines(text).join(' ').replace(/\s+/g, ' ').trim();
-  if (!normalized || isGenericOrTrivial(normalized)) return null;
+export function summarizeProse(text, proseBudget = DEFAULT_PROSE_BUDGET) {
+  const maxChars = resolveProseBudget(proseBudget);
+  // The budget check runs against the trimmed RAW text (normalizeCompletionText
+  // only — no prepareLines). prepareLines strips Markdown/code markers and
+  // flattens line breaks, which would corrupt formulas/code (e.g. `score =
+  // x ** 2 + y ** 3` -> `score = x 2 + y 3`) on the path that is supposed to be
+  // "intact". The in-budget path therefore returns the raw text verbatim so
+  // Markdown/code/formulas survive; prepareLines is reserved for the oversized
+  // path below, where clean sentence-boundary truncation is required.
+  const raw = normalizeCompletionText(text);
+  if (!raw || isGenericOrTrivial(raw)) return null;
 
   // Deliver the full human-readable summary intact when it fits the channel
   // budget. Only genuinely oversized prose is truncated below — always to
-  // <= MAX_PROSE_DELIVERY_CHARS at a clean sentence boundary, so nothing longer
-  // ever reaches the delivery outbox from this path.
-  if (normalized.length <= MAX_PROSE_DELIVERY_CHARS) {
-    return normalized;
+  // <= the budget at a clean sentence boundary, so nothing longer ever reaches
+  // the delivery outbox from this path.
+  if (raw.length <= maxChars) {
+    return raw;
   }
 
+  const normalized = prepareLines(raw).join(' ').replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+
   const sentences = splitSentences(normalized);
-  if (!sentences.length) return truncateText(normalized, MAX_PROSE_DELIVERY_CHARS);
+  if (!sentences.length) return truncateText(normalized, maxChars);
 
   // Truncate only at a clean sentence boundary so the characters of kept text
   // are never altered (no space-inserted decimals); the teaser length is also
@@ -460,12 +503,12 @@ function summarizeProse(text) {
   let chars = 0;
   for (const sentence of sentences) {
     const next = kept.length ? chars + 1 + sentence.length : chars + sentence.length;
-    if (kept.length >= MAX_DELIVERY_SENTENCES || next > MAX_PROSE_DELIVERY_CHARS) break;
+    if (kept.length >= MAX_DELIVERY_SENTENCES || next > maxChars) break;
     kept.push(sentence);
     chars = next;
   }
 
-  if (!kept.length) return truncateText(normalized, MAX_PROSE_DELIVERY_CHARS);
+  if (!kept.length) return truncateText(normalized, maxChars);
   return kept.join(' ');
 }
 
@@ -857,7 +900,7 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   return truncateText([actionSummary, ...extras].filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
 }
 
-export function humanizeCompletionText(value) {
+export function humanizeCompletionText(value, proseBudget = DEFAULT_PROSE_BUDGET) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
@@ -871,7 +914,7 @@ export function humanizeCompletionText(value) {
   const mixedSummary = buildHumanSummaryFromMixedTechnicalText(summarySource);
   if (mixedSummary) return mixedSummary;
 
-  const summarized = summarizeCompletionText(summarySource);
+  const summarized = summarizeCompletionText(summarySource, { proseBudget });
   if (!summarized) return null;
   if (!looksTechnicalCompletionSummary(summarySource, summarized)) return stripHumanSummaryLabel(summarized) || summarized;
 
@@ -1001,7 +1044,7 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
   return summary;
 }
 
-export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {
+export function summarizeCompletionText(value, { skipEmbeddedObject = false, proseBudget = DEFAULT_PROSE_BUDGET } = {}) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
@@ -1013,7 +1056,7 @@ export function summarizeCompletionText(value, { skipEmbeddedObject = false } = 
     if (parsed !== null) {
       const candidates = gatherObjectTextCandidates(parsed);
       for (const candidate of candidates) {
-        const summarized = summarizeCompletionText(candidate, { skipEmbeddedObject: true });
+        const summarized = summarizeCompletionText(candidate, { skipEmbeddedObject: true, proseBudget });
         if (summarized) return summarized;
       }
       if (looksLikeRawPayloadText(raw)) return null;
@@ -1030,7 +1073,7 @@ export function summarizeCompletionText(value, { skipEmbeddedObject = false } = 
     if (summary && !isGenericOrTrivial(summary)) return summary;
   }
 
-  return summarizeProse(raw);
+  return summarizeProse(raw, proseBudget);
 }
 
 export function isMeaningfulCompletionText(value) {
@@ -1305,11 +1348,11 @@ export function synthesizeCompletionReply({ checklist, sha } = {}) {
   return `Work complete. ${sentences.join(' ')}`.trim();
 }
 
-export function buildTerminalCompletionPayload({ summary, checklist, sha } = {}) {
+export function buildTerminalCompletionPayload({ summary, checklist, sha, proseBudget = DEFAULT_PROSE_BUDGET } = {}) {
   const rawSummary = normalizeCompletionText(summary);
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
-  const normalizedSummary = humanizeCompletionText(rawSummary);
+  const normalizedSummary = humanizeCompletionText(rawSummary, proseBudget);
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
@@ -1363,7 +1406,7 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
-export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
+export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary, proseBudget = DEFAULT_PROSE_BUDGET } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
   const rawCompletionSummary = normalizeCompletionText(completion?.summary);
@@ -1371,12 +1414,12 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const rawCompletionRawSummary = getCompletionRawSummary(completion);
   const rawFallback = normalizeCompletionText(fallbackSummary);
 
-  const reply = humanizeCompletionText(lastReply);
-  const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman);
-  const completionSummary = humanizeCompletionText(completion?.summary);
-  const completionDelivery = humanizeCompletionText(completion?.deliveryText);
-  const completionRawSummary = humanizeCompletionText(rawCompletionRawSummary);
-  const fallback = humanizeCompletionText(fallbackSummary);
+  const reply = humanizeCompletionText(lastReply, proseBudget);
+  const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman, proseBudget);
+  const completionSummary = humanizeCompletionText(completion?.summary, proseBudget);
+  const completionDelivery = humanizeCompletionText(completion?.deliveryText, proseBudget);
+  const completionRawSummary = humanizeCompletionText(rawCompletionRawSummary, proseBudget);
+  const fallback = humanizeCompletionText(fallbackSummary, proseBudget);
   const synthesizedFromTechnical = synthesizeCompletionReply({
     checklist: completion?.checklist,
     sha: completion?.sha,

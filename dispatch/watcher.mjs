@@ -46,6 +46,7 @@ import {
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
   resolveCompletionDelivery,
+  resolveProseBudget,
 } from './completion.mjs';
 import {
   claimCompletionDelivery,
@@ -1361,6 +1362,10 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     lastReply,
     completion: completionPayload,
     fallbackSummary,
+    // The delivery channel is known here (entry.deliverChannel / origin), so
+    // the prose pass-through budget matches the actual channel (telegram 4096,
+    // discord 2000, conservative 2000 default) instead of a hardcoded 4096.
+    proseBudget: resolveProseBudget(effectiveDeliveryTarget(entry) || entry),
   });
   markLabelDone(label, completion.summary);
 
