@@ -72,7 +72,8 @@ export function normalizeCompletionText(value) {
   return trimmed ? trimmed : null;
 }
 
-const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+const ESC = String.fromCharCode(27);
+const ANSI_ESCAPE_RE = new RegExp(`${ESC}\\[[0-9;]*m`, 'g');
 
 function stripAnsi(text) {
   return text.replace(ANSI_ESCAPE_RE, '');
@@ -163,6 +164,8 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
 // test output, env or config dumps), whatever labels or prose lead it carries.
 function isVerbatimDeliverable(text) {
   if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+  // Color codes are stripped before this check; any other escape is terminal output.
+  if (text.includes(ESC)) return false;
   if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
   return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
 }
@@ -1477,17 +1480,19 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // ("Technically:" / "Technical details:" tail, which the humanizer splits
   // into lead and details block), or when the report is not
   // verbatim-deliverable (over one message, or machine output).
+  // The report gets the humanizer's text cleanup: no color codes or CRs.
+  const report = normalizeReportLineEndings(rawCompletionSummary);
   if (
-    rawCompletionSummary
-    && !EXPLICIT_TECHNICAL_MARKER_RE.test(rawCompletionSummary)
-    && isLossyHumanizedLead(rawCompletionSummary, rawCompletionSummaryHuman)
+    report
+    && !EXPLICIT_TECHNICAL_MARKER_RE.test(report)
+    && isLossyHumanizedLead(report, rawCompletionSummaryHuman)
   ) {
     // The checks line (tests passed, pushed sha) that the technical-details
     // block would have carried stays with the report.
     const checks = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
-    const deliveryText = checks ? `${rawCompletionSummary}\n\n${checks}` : rawCompletionSummary;
+    const deliveryText = checks ? `${report}\n\n${checks}` : report;
     if (isVerbatimDeliverable(deliveryText)) {
-      return { deliveryText, summary: rawCompletionSummary, source: 'completion-summary-full' };
+      return { deliveryText, summary: report, source: 'completion-summary-full' };
     }
   }
 

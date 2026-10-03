@@ -235,6 +235,21 @@ test('the verbatim bound counts bytes, so a non-ASCII report cannot outgrow one 
   assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `delivered ${Buffer.byteLength(result.deliveryText)} bytes`);
 });
 
+test('done path: a promoted report goes out without color codes or carriage returns', () => {
+  const prose = Array.from({ length: 14 }, (_, i) => `Step ${i + 1} finished and the output was checked against the expected values.`).join(' ');
+  const colored = deliverDone(`${prose} Final check: \u001b[32mPASS\u001b[0m on all 14 steps.`).result;
+  assert.equal(colored.source, 'completion-summary-full');
+  assert.equal(colored.deliveryText, `${prose} Final check: PASS on all 14 steps.`);
+
+  const crlf = deliverDone(prose.replace(/\. /g, '.\r\n')).result;
+  assert.equal(crlf.source, 'completion-summary-full');
+  assert.equal(crlf.deliveryText, prose.replace(/\. /g, '.\n'));
+
+  // Escapes other than color codes are terminal output, not a report.
+  const cursor = deliverDone(`${prose} \u001b[2KProgress: all steps done.`).result;
+  assert.notEqual(cursor.source, 'completion-summary-full');
+});
+
 test('done path: an agent-written "Technically:" split keeps its lead even when summary_human is a prefix', () => {
   const lead = 'Fixed the planner so the next session is recommended after the last completed one.';
   const { completion, result } = deliverDone(`${lead} Technically: mapped imported workout ids back to the program schedule, updated the focused progression tests, and verified on the live database snapshot that the last completed W2D4 now plans W2D5.`);
