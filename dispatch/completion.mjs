@@ -44,8 +44,32 @@ const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validatio
 // Upper bound, in UTF-8 bytes, for text delivered verbatim instead of
 // humanized. delivery-outbox.js splits Telegram bodies at 3,600 bytes; this
 // leaves 200 for the "✅ [label] done" header. Longer text is a dump, not a
-// chat report.
-const MAX_VERBATIM_REPORT_BYTES = 3400;
+// chat report. The bound is per-channel: only the Telegram outbox path chunks
+// oversized messages, so a non-chunking channel (Discord, or anything
+// unknown) must fit one message on its own and uses the conservative bound.
+export const TELEGRAM_VERBATIM_BOUND_BYTES = 3400;
+export const DEFAULT_VERBATIM_BOUND_BYTES = 2000;
+
+/**
+ * Resolve the verbatim-delivery byte bound for a delivery channel.
+ *   telegram -> 3400 (the outbox chunks Telegram bodies at 3,600 bytes)
+ *   other/unknown -> 2000 (conservative channel-neutral default; never 3400)
+ * Accepts a channel string or an object with a `channel`/`deliverChannel`
+ * field (e.g. the watcher's effectiveDeliveryTarget entry). Already-resolved
+ * positive numbers pass through unchanged (idempotent), so a bound resolved
+ * at the call site can be re-resolved safely downstream.
+ */
+export function resolveVerbatimBoundBytes(channelOrTarget) {
+  if (typeof channelOrTarget === 'number' && Number.isFinite(channelOrTarget) && channelOrTarget > 0) {
+    return Math.floor(channelOrTarget);
+  }
+  const raw = typeof channelOrTarget === 'string'
+    ? channelOrTarget
+    : (channelOrTarget?.channel ?? channelOrTarget?.deliverChannel ?? null);
+  const channel = String(raw || '').trim().toLowerCase();
+  if (channel === 'telegram') return TELEGRAM_VERBATIM_BOUND_BYTES;
+  return DEFAULT_VERBATIM_BOUND_BYTES;
+}
 // Any one of these marks machine output: a JSON or Python dict key, a JS stack
 // frame, a Python traceback header or a Go goroutine dump.
 const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$|^Traceback \(most recent call last\):|^goroutine \d+ \[/m;
@@ -115,7 +139,7 @@ function normalizeReportLineEndings(text) {
     .trim();
 }
 
-function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
+function isLikelyHumanFinalReport(text, { requireCue = false, boundBytes = TELEGRAM_VERBATIM_BOUND_BYTES } = {}) {
   const normalized = normalizeReportLineEndings(text);
   if (!normalized) return false;
   if (isGenericOrTrivial(normalized)) return false;
@@ -156,24 +180,26 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
   // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword. Labels alone also
   // match dumps, stack traces and status updates, so this shape must also be
   // verbatim-deliverable.
-  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5 && isVerbatimDeliverable(normalized);
+  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5 && isVerbatimDeliverable(normalized, boundBytes);
 }
 
-// Whether text may be delivered verbatim instead of humanized: it fits one
-// chat message and is not machine output (a payload, JSON, tracebacks, logs,
-// test output, env or config dumps), whatever labels or prose lead it carries.
-function isVerbatimDeliverable(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+// Whether text may be delivered verbatim instead of humanized: it fits the
+// channel's verbatim bound and is not machine output (a payload, JSON,
+// tracebacks, logs, test output, env or config dumps), whatever labels or
+// prose lead it carries. Reports over the bound fall back to the summary_human
+// path rather than going out as one oversized message.
+function isVerbatimDeliverable(text, boundBytes = TELEGRAM_VERBATIM_BOUND_BYTES) {
+  if (Buffer.byteLength(text, 'utf8') > boundBytes) return false;
   // Color codes are stripped before this check; any other escape is terminal output.
   if (text.includes(ESC)) return false;
   if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
   return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
 }
 
-function getPassThroughHumanFinalReport(text) {
+function getPassThroughHumanFinalReport(text, boundBytes = TELEGRAM_VERBATIM_BOUND_BYTES) {
   const normalized = normalizeReportLineEndings(text);
   if (!normalized) return null;
-  return isLikelyHumanFinalReport(normalized) ? normalized : null;
+  return isLikelyHumanFinalReport(normalized, { boundBytes }) ? normalized : null;
 }
 
 function isGenericOrTrivial(text) {
@@ -280,8 +306,17 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
 function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
-  // A period followed by a digit is a decimal ("0.00s", "v0.6"), not a sentence end.
-  return normalized.match(/(?:[^.!?]|\.(?=\d))+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
+  // Split only at sentence-ending punctuation (. ! ?) that is followed by
+  // whitespace, optionally with closing quote/bracket characters in between
+  // (e.g. 'Done."' splits into 'Done.' and the next sentence — the quote is
+  // consumed as part of the separator). Decimals, version strings, formulas,
+  // and ranges (e.g. "2.5", "v0.6.5", "dub_eng_v9.aac", "4.4 -> 3.6") have a
+  // non-whitespace character after the dot, so they are never split. The
+  // terminator stays attached to its fragment.
+  return normalized
+    .split(/(?<=[.!?])["'”’)\]}]*(?=\s)/)
+    .map(part => part.trim())
+    .filter(Boolean);
 }
 
 function asSentence(text) {
@@ -861,11 +896,11 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   return truncateText(`${actionSummary} ${TECHNICAL_REWRITE_FOLLOW_UPS[theme]}`, MAX_DELIVERY_CHARS);
 }
 
-export function humanizeCompletionText(value) {
+export function humanizeCompletionText(value, { boundBytes = DEFAULT_VERBATIM_BOUND_BYTES } = {}) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
-  const passThroughReport = getPassThroughHumanFinalReport(raw);
+  const passThroughReport = getPassThroughHumanFinalReport(raw, boundBytes);
   if (passThroughReport) return passThroughReport;
 
   const structuredSections = extractStructuredSummarySections(raw);
@@ -1309,11 +1344,11 @@ export function synthesizeCompletionReply({ checklist, sha } = {}) {
   return `Work complete. ${sentences.join(' ')}`.trim();
 }
 
-export function buildTerminalCompletionPayload({ summary, checklist, sha } = {}) {
+export function buildTerminalCompletionPayload({ summary, checklist, sha, boundBytes = DEFAULT_VERBATIM_BOUND_BYTES } = {}) {
   const rawSummary = normalizeCompletionText(summary);
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
-  const normalizedSummary = humanizeCompletionText(rawSummary);
+  const normalizedSummary = humanizeCompletionText(rawSummary, { boundBytes });
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
@@ -1389,7 +1424,7 @@ function isProseReport(text) {
   return (text.match(SENTENCE_BREAK_RE) || []).length > (text.match(/;/g) || []).length;
 }
 
-export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
+export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary, boundBytes = DEFAULT_VERBATIM_BOUND_BYTES } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
   const rawCompletionSummary = normalizeCompletionText(completion?.summary);
@@ -1397,12 +1432,12 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const rawCompletionRawSummary = getCompletionRawSummary(completion);
   const rawFallback = normalizeCompletionText(fallbackSummary);
 
-  const reply = humanizeCompletionText(lastReply);
-  const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman);
-  const completionSummary = humanizeCompletionText(completion?.summary);
-  const completionDelivery = humanizeCompletionText(completion?.deliveryText);
-  const completionRawSummary = humanizeCompletionText(rawCompletionRawSummary);
-  const fallback = humanizeCompletionText(fallbackSummary);
+  const reply = humanizeCompletionText(lastReply, { boundBytes });
+  const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman, { boundBytes });
+  const completionSummary = humanizeCompletionText(completion?.summary, { boundBytes });
+  const completionDelivery = humanizeCompletionText(completion?.deliveryText, { boundBytes });
+  const completionRawSummary = humanizeCompletionText(rawCompletionRawSummary, { boundBytes });
+  const fallback = humanizeCompletionText(fallbackSummary, { boundBytes });
   const synthesizedFromTechnical = synthesizeCompletionReply({
     checklist: completion?.checklist,
     sha: completion?.sha,
@@ -1457,7 +1492,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // labels but no final-report cue: a status update ("**Status:**",
   // "**Next:**", "**ETA:**") has that shape too. It is delivered below only
   // when there is no structured completion.
-  if (isLikelyHumanFinalReport(rawReply, { requireCue: true }) && isDeliverableText(rawReply, reply)) {
+  if (isLikelyHumanFinalReport(rawReply, { requireCue: true, boundBytes }) && isDeliverableText(rawReply, reply)) {
     const technicalDetailsText = buildTechnicalDetailsText({
       rawText: rawReply,
       summaryText: reply,
@@ -1492,7 +1527,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     // block would have carried stays with the report.
     const checks = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
     const deliveryText = checks ? `${report}\n\n${checks}` : report;
-    if (isVerbatimDeliverable(deliveryText)) {
+    if (isVerbatimDeliverable(deliveryText, boundBytes)) {
       return { deliveryText, summary: report, source: 'completion-summary-full' };
     }
   }
