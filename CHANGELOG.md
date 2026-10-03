@@ -4,9 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.6.6] -- 2026-10-02
+## [0.6.6] -- 2026-10-03
 
 ### Fixed
+
+- **Deliver the agent's own completion report, not a lossy summary stub (#53).**
+  On the done path the completion notification used `summary_human`, which
+  cut a 1,909-char report to a 198-char stub and split decimals ("0. 00s").
+  When `summary_human` is a cut-down copy or a synthetic rewrite of a prose
+  report, the report itself is now delivered, with its checks line (tests,
+  pushed sha), if it fits one Telegram part (3,400 UTF-8 bytes) and is not
+  logs, JSON, a traceback or other machine output. Otherwise delivery is
+  unchanged. Sentences no longer split at a decimal point. Reports carrying
+  a cue word are still unbounded (#65).
 
 - **Stop polling Gateway sessions when no task-tracker agent can use them (#62).**
   The dispatcher's message-delivery pass (about every 20s by default) posted
