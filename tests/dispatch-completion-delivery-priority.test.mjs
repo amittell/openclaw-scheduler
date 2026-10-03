@@ -105,6 +105,8 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
 // when the agent wrote its own lead (the fitness "Technically:" shape) or when
 // summary is not a chat-sized report.
 const CHECKLIST = { work_complete: true };
+const PUSHED_CHECKLIST = { work_complete: true, tests_passed: true, pushed: true };
+const SHA = 'deadbeef'.repeat(5);
 const MAX_VERBATIM_CHARS = 3500;
 const alignFull = 'Round-8 alignment fix complete (all 3 items, re-verified, staged). ITEM 1 (7 SRT-offset lines): 3 were real EN sub offsets, fixed to 0.00s drift - i=37 Bunny. #32 344.25 to 347.50, i=83 Um show me. #75 738.11 to 739.00. ITEM 2 (32 missing-cue lines): 16 real EN lines got new 1:1 cues, 16 are jp_fallback. SRT 224 to 241 cues, sequential, chronological, 0 new overlaps. ITEM 3 (1251.9 gap): CONFIRMED real dropped JP line, regenerated No! via IndexTTS2 best-of-6, surgical mix and re-encode to dub_eng_v10.aac. RE-VERIFY: gate_03s.py OK, P1 max drift 4.54s to 0.36s. STAGED: srt md5 772f57d1 (241 cues), aac md5 04f634ff, lines_index md5 9f1cc522 (266 entries).';
 const alignMangled = alignFull.slice(0, 160).replace('0.00s', '0. 00s').replace('344.25', '344. 25');
@@ -159,6 +161,37 @@ test('done path: a synthetic technical rewrite in summary_human gives way to the
   });
   assert.equal(result.source, 'completion-summary-full');
   assert.equal(result.deliveryText, payload.completion.summary);
+});
+
+test('done path: commit-style summaries keep their lead and the pushed sha at any length', () => {
+  // 12cb8d5 promoted these raw from about 309 chars up, and the
+  // "Checks: tests passed; pushed deadbee." line went with the lead.
+  const clauses = [
+    'fix(sync): retry the Health Auto Export import on 429 with backoff and jitter capped at 30s',
+    'guard the workouts.json parse against empty arrays and null dates',
+    'keep the last good fitness.db snapshot when an import fails mid-way',
+    'add focused tests for the retry, the empty-array guard and the snapshot fallback',
+  ];
+  const cases = {
+    'commit prefix, four clauses': clauses.join('; '),
+    'commit prefix, written as sentences': 'fix(sync): Retry the Health Auto Export import on 429 with backoff and jitter capped at 30s. Guard the workouts.json parse against empty arrays and null dates. Keep the last good fitness.db snapshot when an import fails mid-way. Add focused tests for the retry, the empty-array guard and the snapshot fallback. Verified on the live fitness.db snapshot.',
+    'clause list without a prefix': 'make summary_human win over deliveryText for every completion; move details_technical into a separate block below the lead; add focused tests for the payload-precedence regressions; pass lastReply into resolveCompletionDelivery on the watcher path; reuse resolvedDelivery in hooks.mjs instead of resolving twice; keep the claimCompletionDelivery dedupe between the two paths; update the focused tests for the watcher and done paths',
+  };
+  assert.equal(cases['commit prefix, four clauses'].length, 309);
+  for (const [name, summary] of Object.entries(cases)) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.notEqual(result.source, 'completion-summary-full', `${name}: promoted raw`);
+    assert.ok(result.deliveryText.startsWith(completion.summary_human), `${name}: lost the lead`);
+    assert.ok(result.deliveryText.includes('Checks: tests passed; pushed deadbee.'), `${name}: lost the sha`);
+  }
+});
+
+test('done path: a promoted report keeps the checks line', () => {
+  const completion = { ...payload.completion, checklist: PUSHED_CHECKLIST, sha: SHA };
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, `${payload.completion.summary}\n\nChecks: tests passed; pushed deadbee.`);
 });
 
 test('done path: thin completion.summary does not trigger the full-summary path', () => {

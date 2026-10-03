@@ -59,6 +59,7 @@ const TECHNICAL_REWRITE_FOLLOW_UPS = {
 };
 const THEMED_LEAD_FOLLOW_UP = 'Future runs should show the clean summary first, with technical details underneath when needed.';
 const SYNTHETIC_FOLLOW_UPS = [...Object.values(TECHNICAL_REWRITE_FOLLOW_UPS), THEMED_LEAD_FOLLOW_UP];
+const SENTENCE_BREAK_RE = /[.!?]\s+[A-Z]/g;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -1360,14 +1361,23 @@ export function getCompletionAuthoritativeSummary(completion) {
 // True when summaryHuman is a machine derivative that dropped most of a
 // substantial summary: either a truncation (a prefix once punctuation and
 // spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling) or
-// a synthetic technical rewrite (it ends with a follow-up sentence the
-// humanizer wrote, not the agent). Equal or similar-length texts are not lossy.
+// a synthetic technical rewrite of a prose report (it ends with a follow-up
+// sentence the humanizer wrote, not the agent). Equal or similar-length texts
+// are not lossy.
 function isLossyHumanizedLead(summary, summaryHuman) {
   if (!summary || !summaryHuman) return false;
   if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
   const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
   if (strip(summary).startsWith(strip(summaryHuman))) return true;
-  return SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
+  return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
+}
+
+// A report written as sentences. A commit-style summary ("fix(sync): a; b; c"
+// or "path/file.mjs: a; b") is a clause list instead, and its rewritten lead
+// plus technical-details block is the intended rendering.
+function isProseReport(text) {
+  if (TECHNICAL_COMMIT_PREFIX_RE.test(text) || FILE_CONTEXT_PREFIX_RE.test(text)) return false;
+  return (text.match(SENTENCE_BREAK_RE) || []).length > (text.match(/;/g) || []).length;
 }
 
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
@@ -1456,22 +1466,24 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // On the done path lastReply is not recovered, so when summary_human is a
   // lossy machine derivative of that report, deliver the report itself: a
   // truncation (summarizeProse cut a 1,909-char report to ~200 chars and split
-  // "0.00s" into "0. 00s") or a synthetic technical rewrite (one fragment plus
-  // the humanizer's own follow-up sentences). summary_human still wins when
-  // the agent wrote its own lead ("Technically:" / "Technical details:" tail,
-  // which the humanizer splits into lead and details block) or when summary is
-  // not verbatim-deliverable (too long, payload, JSON, stack frames, logs).
+  // "0.00s" into "0. 00s") or a synthetic technical rewrite of a prose report
+  // (one fragment plus the humanizer's own follow-up sentences). summary_human
+  // still wins for a commit-style summary, when the agent wrote its own lead
+  // ("Technically:" / "Technical details:" tail, which the humanizer splits
+  // into lead and details block), or when the report is not
+  // verbatim-deliverable (too long, payload, JSON, stack frames, logs).
   if (
     rawCompletionSummary
     && !EXPLICIT_TECHNICAL_MARKER_RE.test(rawCompletionSummary)
     && isLossyHumanizedLead(rawCompletionSummary, rawCompletionSummaryHuman)
-    && isVerbatimDeliverable(rawCompletionSummary)
   ) {
-    return {
-      deliveryText: rawCompletionSummary,
-      summary: rawCompletionSummary,
-      source: 'completion-summary-full',
-    };
+    // The checks line (tests passed, pushed sha) that the technical-details
+    // block would have carried stays with the report.
+    const checks = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
+    const deliveryText = checks ? `${rawCompletionSummary}\n\n${checks}` : rawCompletionSummary;
+    if (isVerbatimDeliverable(deliveryText)) {
+      return { deliveryText, summary: rawCompletionSummary, source: 'completion-summary-full' };
+    }
   }
 
   for (const candidate of structuredCandidates.filter(candidate => candidate.source !== 'technical-synthesis')) {
