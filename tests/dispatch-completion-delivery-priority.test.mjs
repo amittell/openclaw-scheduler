@@ -6,6 +6,12 @@ import test from 'node:test';
 
 import { humanizeCompletionText, resolveCompletionDelivery, summarizeCompletionText, MAX_PROSE_DELIVERY_CHARS } from '../dispatch/completion.mjs';
 
+// Same boundary logic as splitSentences() in dispatch/completion.mjs: split at
+// sentence-ending punctuation followed by whitespace, optionally after closing
+// quote/bracket characters. Decimals/formulas ("2.5", "1.0 + edge*(4/0.15)")
+// never split because nothing whitespace follows the dot.
+const SENTENCE_BOUNDARY_RE = /(?<=[.!?])["'”’)\]}]*(?=\s)/;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
 
@@ -107,6 +113,61 @@ test('completion summary keeps decimals/formulas intact and delivers the full te
   // The full summary is delivered (not a 155-char teaser) because it fits the channel budget.
   assert.equal(summarized, fixture, 'in-budget summary must pass through intact');
   assert.ok(summarized.length > 400, 'must not be truncated to the old teaser length');
+});
+
+test('oversized prose is truncated at a sentence boundary without mangling decimals/formulas', () => {
+  const fixture = readFileSync(join(__dirname, 'fixtures', 'nhl-ml-full-summary.txt'), 'utf8').trim();
+  // Repeat the fixture until the input exceeds the channel budget, so the
+  // in-budget pass-through branch is skipped and splitSentences() actually runs.
+  const input = Array.from({ length: 4 }, () => fixture).join(' ');
+  assert.ok(input.length > MAX_PROSE_DELIVERY_CHARS, `input must exceed the budget, got ${input.length} chars`);
+
+  const summarized = summarizeCompletionText(input);
+  assert.ok(summarized, 'must produce a delivery text');
+
+  // (a) Truncated to the channel budget.
+  assert.ok(summarized.length < input.length, 'oversized prose must be truncated');
+  assert.ok(summarized.length <= MAX_PROSE_DELIVERY_CHARS, 'truncated prose must respect the channel budget');
+
+  // (b) Decimals/formulas survive intact, with no space-inserted fragments.
+  assert.ok(summarized.includes('conf = 2.5'), 'decimal conf = 2.5 must be intact after truncation');
+  assert.ok(summarized.includes('conf = 1.0 + edge*(4/0.15)'), 'formula must be intact after truncation');
+  assert.ok(!/2\. 5|1\. 0|5\. 0/.test(summarized), 'no space-mangled fragments anywhere in the output');
+
+  // (c) Truncation landed at a sentence boundary: the output must be exactly
+  // the first k whole sentences of the input (joined with single spaces),
+  // for some k — never a mid-sentence cut.
+  const inputSentences = input.split(SENTENCE_BOUNDARY_RE).map(part => part.trim()).filter(Boolean);
+  assert.ok(inputSentences.length > 1, 'input must contain multiple sentences');
+  const match = inputSentences.findIndex((_, k) => k > 0 && inputSentences.slice(0, k).join(' ') === summarized);
+  assert.ok(match > 0, 'output must be a join of whole input sentences (clean boundary)');
+  assert.ok(summarized.endsWith('.') || summarized.endsWith('!') || summarized.endsWith('?'), 'output must end at a sentence terminator');
+});
+
+test('quoted sentence boundary: a period followed by a closing quote still splits', () => {
+  // Direct unit-style assertion for the splitSentences() boundary: the period
+  // in 'Done."' is followed by a closing quote, then whitespace — it must split
+  // (the quote is consumed as part of the separator, so the kept fragment is
+  // 'Done.').
+  const quoted = 'Done." Next sentence.';
+  const quotedParts = quoted.split(SENTENCE_BOUNDARY_RE).map(part => part.trim()).filter(Boolean);
+  assert.deepEqual(quotedParts, ['Done.', 'Next sentence.'], 'period + closing quote must be a sentence boundary');
+
+  // Behavioral check through summarizeCompletionText: force the oversized path
+  // so splitSentences() actually runs. The output must be a join of whole
+  // sentences — which only happens if the period followed by a closing quote
+  // is treated as a boundary (before the fix, the whole input was one
+  // "sentence" and truncation cut it mid-token).
+  const quotedInput = Array.from({ length: 200 }, () => quoted).join(' ');
+  assert.ok(quotedInput.length > MAX_PROSE_DELIVERY_CHARS, 'quoted input must exceed the budget');
+  const summarized = summarizeCompletionText(quotedInput);
+  assert.ok(summarized, 'must produce a delivery text');
+  assert.ok(summarized.length < quotedInput.length, 'quoted prose must be truncated');
+  const inputSentences = quotedInput.split(SENTENCE_BOUNDARY_RE).map(part => part.trim()).filter(Boolean);
+  assert.ok(inputSentences.length > 1, 'quoted boundary must produce multiple sentences');
+  assert.ok(summarized.startsWith('Done.'), 'first kept sentence is the quoted one');
+  const wholeSentenceJoin = inputSentences.findIndex((_, k) => k > 0 && inputSentences.slice(0, k).join(' ') === summarized);
+  assert.ok(wholeSentenceJoin > 0, 'output must be a join of whole input sentences (quoted boundary respected)');
 });
 
 test('lastReply is used when summary_human is noise and lastReply is a real report', () => {

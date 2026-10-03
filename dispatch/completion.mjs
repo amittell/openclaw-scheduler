@@ -3,11 +3,12 @@ const MAX_DELIVERY_CHARS = 700;
 const MAX_LIST_ITEMS = 3;
 
 // Channel budget for a full human-readable completion summary. Summaries up to
-// one Telegram message (4096 chars) are delivered intact; the downstream
-// delivery outbox transparently chunks anything longer into [n/N] parts.
-// Truncation (only for prose beyond this budget) cuts at a clean sentence
-// boundary and never alters the characters of kept text (no space-inserted
-// decimals).
+// one Telegram message (4096 chars) are delivered intact. Prose beyond this
+// budget is truncated at a clean sentence boundary to <= MAX_PROSE_DELIVERY_CHARS
+// BEFORE it reaches the delivery outbox (and never alters the characters of kept
+// text — no space-inserted decimals), so this path never emits more than the
+// budget; the outbox's [n/N] chunking is a safety net for other paths, not what
+// this relies on.
 export const MAX_PROSE_DELIVERY_CHARS = 4096;
 
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)[.!?]*$/i;
@@ -245,11 +246,14 @@ function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
   // Split only at sentence-ending punctuation (. ! ?) that is followed by
-  // whitespace. Decimals, version strings, formulas, and ranges (e.g. "2.5",
-  // "v0.6.5", "4.4 -> 3.6") have a non-whitespace character after the dot, so
-  // they are never split. The terminator stays attached to its fragment.
+  // whitespace, optionally with closing quote/bracket characters in between
+  // (e.g. 'Done."' splits into 'Done.' and the next sentence — the quote is
+  // consumed as part of the separator). Decimals, version strings, formulas,
+  // and ranges (e.g. "2.5", "v0.6.5", "4.4 -> 3.6") have a non-whitespace
+  // character after the dot, so they are never split. The terminator stays
+  // attached to its fragment.
   return normalized
-    .split(/(?<=[.!?])(?=\s)/)
+    .split(/(?<=[.!?])["'”’)\]}]*(?=\s)/)
     .map(part => part.trim())
     .filter(Boolean);
 }
@@ -439,8 +443,9 @@ function summarizeProse(text) {
   if (!normalized || isGenericOrTrivial(normalized)) return null;
 
   // Deliver the full human-readable summary intact when it fits the channel
-  // budget. The downstream outbox chunks anything longer into [n/N] parts, so
-  // only genuinely oversized prose is truncated here.
+  // budget. Only genuinely oversized prose is truncated below — always to
+  // <= MAX_PROSE_DELIVERY_CHARS at a clean sentence boundary, so nothing longer
+  // ever reaches the delivery outbox from this path.
   if (normalized.length <= MAX_PROSE_DELIVERY_CHARS) {
     return normalized;
   }
