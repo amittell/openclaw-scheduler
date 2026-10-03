@@ -41,6 +41,30 @@ const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*
 const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
 const FINAL_REPORT_HEADING_RE = /^(?:#{1,6}\s*)?(?:root cause|files? changed|changes|validation|tests?(?: run| passed)?|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|result|results|summary|highlights?|notes?|follow[- ]ups?|next steps?|blockers?|implementation|what changed|verification)\s*:?$/i;
 const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validation|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|final report|human-readable report|files changed|tests passed)\b/i;
+// Upper bound, in UTF-8 bytes, for text delivered verbatim instead of
+// humanized. delivery-outbox.js splits Telegram bodies at 3,600 bytes; this
+// leaves 200 for the "✅ [label] done" header. Longer text is a dump, not a
+// chat report.
+const MAX_VERBATIM_REPORT_BYTES = 3400;
+// Any one of these marks machine output: a JSON or Python dict key, a JS stack
+// frame, a Python traceback header or a Go goroutine dump.
+const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$|^Traceback \(most recent call last\):|^goroutine \d+ \[/m;
+// Lines of logs (ISO, syslog or time-only stamps), test runners (check marks,
+// TAP), KEY=value env dumps and indented YAML keys. Three or more mark machine
+// output.
+const MACHINE_OUTPUT_LINE_RE = /^(?:\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{1,2}:\d{2}:\d{2}\b|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|[✔✓✗✖] |(?:not )?ok \d+ |[A-Z][A-Z0-9_]+=\S)|\s{2,}[\w-]+:(?: |$))/gm;
+// Closing sentences buildHumanizedTechnicalSummary and
+// buildCompletionLeadFromThemes append to a synthetic rewrite, which is how
+// resolveCompletionDelivery recognizes one in a stored summary_human.
+const TECHNICAL_REWRITE_FOLLOW_UPS = {
+  testOnly: 'That makes the behavior easier to trust. Future regressions should get caught quickly.',
+  reliability: 'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
+  addedBehavior: 'That makes the new behavior available without extra follow-up. Future runs should use it automatically.',
+  other: 'That should make the result easier to work with. Future runs should reflect the change automatically.',
+};
+const THEMED_LEAD_FOLLOW_UP = 'Future runs should show the clean summary first, with technical details underneath when needed.';
+const SYNTHETIC_FOLLOW_UPS = [...Object.values(TECHNICAL_REWRITE_FOLLOW_UPS), THEMED_LEAD_FOLLOW_UP];
+const SENTENCE_BREAK_RE = /[.!?]\s+[A-Z]/g;
 
 export function normalizeCompletionText(value) {
   if (typeof value !== 'string') return null;
@@ -48,7 +72,8 @@ export function normalizeCompletionText(value) {
   return trimmed ? trimmed : null;
 }
 
-const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+const ESC = String.fromCharCode(27);
+const ANSI_ESCAPE_RE = new RegExp(`${ESC}\\[[0-9;]*m`, 'g');
 
 function stripAnsi(text) {
   return text.replace(ANSI_ESCAPE_RE, '');
@@ -90,7 +115,7 @@ function normalizeReportLineEndings(text) {
     .trim();
 }
 
-function isLikelyHumanFinalReport(text) {
+function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
   const normalized = normalizeReportLineEndings(text);
   if (!normalized) return false;
   if (isGenericOrTrivial(normalized)) return false;
@@ -123,7 +148,26 @@ function isLikelyHumanFinalReport(text) {
   // Allow slightly shorter reports with an explicit root cause / validation shape.
   if (hasCue && headingCount >= 1 && itemCount >= 2 && hasSectionLabel) return true;
 
-  return false;
+  if (requireCue) return false;
+
+  // A multi-section report with several bold-label/heading sections is a real
+  // final report even without a specific cue word. Domain reports (dubbing
+  // alignment fixes, etc.) use labels like "**Item 1**", "**Re-verify**",
+  // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword. Labels alone also
+  // match dumps, stack traces and status updates, so this shape must also be
+  // verbatim-deliverable.
+  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5 && isVerbatimDeliverable(normalized);
+}
+
+// Whether text may be delivered verbatim instead of humanized: it fits one
+// chat message and is not machine output (a payload, JSON, tracebacks, logs,
+// test output, env or config dumps), whatever labels or prose lead it carries.
+function isVerbatimDeliverable(text) {
+  if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+  // Color codes are stripped before this check; any other escape is terminal output.
+  if (text.includes(ESC)) return false;
+  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
+  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
 }
 
 function getPassThroughHumanFinalReport(text) {
@@ -236,7 +280,8 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
 function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
-  return normalized.match(/[^.!?]+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
+  // A period followed by a digit is a decimal ("0.00s", "v0.6"), not a sentence end.
+  return normalized.match(/(?:[^.!?]|\.(?=\d))+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
 }
 
 function asSentence(text) {
@@ -754,7 +799,7 @@ function buildCompletionLeadFromThemes(themes) {
       sentences.push('That makes the result easier to scan without hiding the useful detail.');
     }
   }
-  sentences.push('Future runs should show the clean summary first, with technical details underneath when needed.');
+  sentences.push(THEMED_LEAD_FOLLOW_UP);
   return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
 }
 
@@ -812,22 +857,8 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
     actionSummary = 'The update is in place.';
   }
 
-  const extras = [];
-  if (themes.testOnly) {
-    extras.push('That makes the behavior easier to trust.');
-    extras.push('Future regressions should get caught quickly.');
-  } else if (themes.reliability) {
-    extras.push('That should make the workflow more reliable.');
-    extras.push('Future runs should be less likely to hit the same problem.');
-  } else if (themes.addedBehavior) {
-    extras.push('That makes the new behavior available without extra follow-up.');
-    extras.push('Future runs should use it automatically.');
-  } else {
-    extras.push('That should make the result easier to work with.');
-    extras.push('Future runs should reflect the change automatically.');
-  }
-
-  return truncateText([actionSummary, ...extras].filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
+  const theme = ['testOnly', 'reliability', 'addedBehavior'].find(name => themes[name]) || 'other';
+  return truncateText(`${actionSummary} ${TECHNICAL_REWRITE_FOLLOW_UPS[theme]}`, MAX_DELIVERY_CHARS);
 }
 
 export function humanizeCompletionText(value) {
@@ -1336,6 +1367,28 @@ export function getCompletionAuthoritativeSummary(completion) {
   return storedSummary || summaryHuman || rawSummary || null;
 }
 
+// True when summaryHuman is a machine derivative that dropped most of a
+// substantial summary: either a truncation (a prefix once punctuation and
+// spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling) or
+// a synthetic technical rewrite of a prose report (it ends with a follow-up
+// sentence the humanizer wrote, not the agent). Equal or similar-length texts
+// are not lossy.
+function isLossyHumanizedLead(summary, summaryHuman) {
+  if (!summary || !summaryHuman) return false;
+  if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
+  const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (strip(summary).startsWith(strip(summaryHuman))) return true;
+  return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
+}
+
+// A report written as sentences. A commit-style summary ("fix(sync): a; b; c"
+// or "path/file.mjs: a; b") is a clause list instead, and its rewritten lead
+// plus technical-details block is the intended rendering.
+function isProseReport(text) {
+  if (TECHNICAL_COMMIT_PREFIX_RE.test(text) || FILE_CONTEXT_PREFIX_RE.test(text)) return false;
+  return (text.match(SENTENCE_BREAK_RE) || []).length > (text.match(/;/g) || []).length;
+}
+
 export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
@@ -1400,8 +1453,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // heading or bold-label), deliver it (humanized, which pass-through
   // preserves). A thin lastReply fragment does NOT beat the structured
   // summary - that would invert the legacy contract (raw transcript text
-  // should not beat structured completion).
-  if (isLikelyHumanFinalReport(rawReply) && isDeliverableText(rawReply, reply)) {
+  // should not beat structured completion). Neither does a reply with section
+  // labels but no final-report cue: a status update ("**Status:**",
+  // "**Next:**", "**ETA:**") has that shape too. It is delivered below only
+  // when there is no structured completion.
+  if (isLikelyHumanFinalReport(rawReply, { requireCue: true }) && isDeliverableText(rawReply, reply)) {
     const technicalDetailsText = buildTechnicalDetailsText({
       rawText: rawReply,
       summaryText: reply,
@@ -1413,6 +1469,32 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
     };
+  }
+
+  // completion.summary is the full report the agent submitted with --summary.
+  // On the done path lastReply is not recovered, so when summary_human is a
+  // lossy machine derivative of that report, deliver the report itself: a
+  // truncation (summarizeProse cut a 1,909-char report to ~200 chars and split
+  // "0.00s" into "0. 00s") or a synthetic technical rewrite of a prose report
+  // (one fragment plus the humanizer's own follow-up sentences). summary_human
+  // still wins for a commit-style summary, when the agent wrote its own lead
+  // ("Technically:" / "Technical details:" tail, which the humanizer splits
+  // into lead and details block), or when the report is not
+  // verbatim-deliverable (over one message, or machine output).
+  // The report gets the humanizer's text cleanup: no color codes or CRs.
+  const report = normalizeReportLineEndings(rawCompletionSummary);
+  if (
+    report
+    && !EXPLICIT_TECHNICAL_MARKER_RE.test(report)
+    && isLossyHumanizedLead(report, rawCompletionSummaryHuman)
+  ) {
+    // The checks line (tests passed, pushed sha) that the technical-details
+    // block would have carried stays with the report.
+    const checks = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
+    const deliveryText = checks ? `${report}\n\n${checks}` : report;
+    if (isVerbatimDeliverable(deliveryText)) {
+      return { deliveryText, summary: report, source: 'completion-summary-full' };
+    }
   }
 
   for (const candidate of structuredCandidates.filter(candidate => candidate.source !== 'technical-synthesis')) {
