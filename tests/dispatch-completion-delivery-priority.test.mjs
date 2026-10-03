@@ -107,7 +107,7 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
 const CHECKLIST = { work_complete: true };
 const PUSHED_CHECKLIST = { work_complete: true, tests_passed: true, pushed: true };
 const SHA = 'deadbeef'.repeat(5);
-const MAX_VERBATIM_CHARS = 3500;
+const MAX_VERBATIM_BYTES = 3400;
 const alignFull = 'Round-8 alignment fix complete (all 3 items, re-verified, staged). ITEM 1 (7 SRT-offset lines): 3 were real EN sub offsets, fixed to 0.00s drift - i=37 Bunny. #32 344.25 to 347.50, i=83 Um show me. #75 738.11 to 739.00. ITEM 2 (32 missing-cue lines): 16 real EN lines got new 1:1 cues, 16 are jp_fallback. SRT 224 to 241 cues, sequential, chronological, 0 new overlaps. ITEM 3 (1251.9 gap): CONFIRMED real dropped JP line, regenerated No! via IndexTTS2 best-of-6, surgical mix and re-encode to dub_eng_v10.aac. RE-VERIFY: gate_03s.py OK, P1 max drift 4.54s to 0.36s. STAGED: srt md5 772f57d1 (241 cues), aac md5 04f634ff, lines_index md5 9f1cc522 (266 entries).';
 const alignMangled = alignFull.slice(0, 160).replace('0.00s', '0. 00s').replace('344.25', '344. 25');
 // lastReply is the worker's real final reply (1,599 chars). The stored
@@ -209,13 +209,30 @@ test('done path: machine output and over-long summaries are never delivered verb
     'prose lead then a JSON blob': 'Finished the maintenance sweep. Output follows:\n{"results":[' + Array.from({ length: 30 }, (_, i) => item(i + 1)).join(','),
     'JSON in an untagged code fence': '```\n{\n' + Array.from({ length: 40 }, (_, i) => `  "key${i}": "value number ${i}",`).join('\n') + '\n}\n```',
     'raw log lines': Array.from({ length: 30 }, (_, i) => `2026-09-24T10:00:${String(i).padStart(2, '0')}Z INFO worker=${i} processed batch ${i} ok`).join('\n'),
+    'syslog lines': Array.from({ length: 30 }, (_, i) => `Oct  2 10:00:${String(i).padStart(2, '0')} kebab worker[4${i}]: processed batch ${i} ok in ${i * 3}ms`).join('\n'),
+    'time-only log lines': Array.from({ length: 30 }, (_, i) => `[10:00:${String(i).padStart(2, '0')}] INFO worker=${i} processed batch ${i} ok`).join('\n'),
+    'test-runner output': Array.from({ length: 40 }, (_, i) => `  ✔ completion delivery case ${i} handles the input shape (${(i * 1.7).toFixed(1)}ms)`).join('\n'),
+    'TAP output': Array.from({ length: 40 }, (_, i) => `ok ${i + 1} - completion delivery case ${i} handles the input shape and the fallback`).join('\n'),
+    'Python dict reprs': 'Sweep finished. Rows:\n' + Array.from({ length: 25 }, (_, i) => `{'id': ${i}, 'name': 'task-${i}', 'state': 'ok', 'note': 'fine'}`).join('\n'),
+    'KEY=value env dump': 'Deployed the worker with this environment:\n' + Array.from({ length: 20 }, (_, i) => `SERVICE_${i}_TOKEN=sk-live-${'A'.repeat(20)}${i}`).join('\n'),
+    'YAML': 'Applied the config:\n' + Array.from({ length: 30 }, (_, i) => `  job_${i}:\n    schedule: "*/5 * * * *"\n    enabled: true`).join('\n'),
+    'Python traceback': 'The nightly import failed and I could not recover it.\nTraceback (most recent call last):\n' + Array.from({ length: 12 }, (_, i) => `  File "/srv/app/importer/stage_${i}.py", line ${10 + i}, in run_stage_${i}\n    result = stage_${i + 1}(payload, retries=3)`).join('\n') + '\nKeyError: missing column order_id',
+    'Go panic': 'panic: runtime error: index out of range [3] with length 3\n\ngoroutine 1 [running]:\n' + Array.from({ length: 15 }, (_, i) => `main.stage${i}(0xc000012345, 0x3)\n\t/srv/app/main.go:${40 + i} +0x1d`).join('\n'),
     '40 KB of prose': Array.from({ length: 550 }, (_, i) => `Step ${i + 1} finished and the output was checked against the expected values.`).join(' '),
   };
   for (const [name, summary] of Object.entries(cases)) {
     const { result } = deliverDone(summary);
     assert.notEqual(result.source, 'completion-summary-full', `${name}: promoted verbatim`);
-    assert.ok(result.deliveryText.length <= MAX_VERBATIM_CHARS, `${name}: delivered ${result.deliveryText.length} chars`);
+    assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `${name}: delivered ${result.deliveryText.length} chars`);
   }
+});
+
+test('the verbatim bound counts bytes, so a non-ASCII report cannot outgrow one Telegram part', () => {
+  // 2,906 chars of Japanese are 8,670 UTF-8 bytes: three parts of 3,600 bytes.
+  const report = ['作業が完了しました。', '**項目1:** ' + '字幕のずれを修正しました。'.repeat(85), '**項目2:** ' + '欠落していた行を追加しました。'.repeat(75), '**再検証:** ' + '問題はありません。'.repeat(70), '以上です。'].join('\n');
+  assert.ok(report.length < MAX_VERBATIM_BYTES && Buffer.byteLength(report) > MAX_VERBATIM_BYTES);
+  const { result } = deliverDone(report);
+  assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `delivered ${Buffer.byteLength(result.deliveryText)} bytes`);
 });
 
 test('done path: an agent-written "Technically:" split keeps its lead even when summary_human is a prefix', () => {
@@ -275,12 +292,14 @@ test('no-cue multi-section report passes isLikelyHumanFinalReport (regression)',
 test('cue-less section labels do not pass dumps, stack traces or JSON through verbatim', () => {
   const dump = ['**Alpha**: x', '**Bravo**: y', '**Charlie**: z', ...Array.from({ length: 2000 }, (_, i) => `line ${i} of a long dump`)].join('\n');
   const { result } = deliverDone(dump);
-  assert.ok(result.deliveryText.length <= MAX_VERBATIM_CHARS, `delivered ${result.deliveryText.length} chars`);
+  assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `delivered ${result.deliveryText.length} chars`);
 
   const stackTrace = '**Error**: TypeError: x is undefined\n**Stack**:\n    at foo (/srv/app/a.js:1:2)\n    at bar (/srv/app/b.js:3:4)\n**Context**: watcher';
   const jsonLines = '**out**: {"a":1}\n**err**: {"b":2}\n**raw**: {"c":3}\nx\ny';
+  const logLines = ['**stdout**:', ...Array.from({ length: 20 }, (_, i) => `Oct  2 10:00:${String(i).padStart(2, '0')} kebab worker[4${i}]: batch ${i} ok`), '**stderr**:', 'warn: slow disk', '**exit**: 0'].join('\n');
   assert.notEqual(humanizeCompletionText(stackTrace), stackTrace);
   assert.notEqual(humanizeCompletionText(jsonLines), jsonLines);
+  assert.notEqual(humanizeCompletionText(logLines), logLines);
 });
 
 test('watcher path: a cue-less status reply does not replace the agent\'s own --summary', () => {

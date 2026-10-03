@@ -41,13 +41,18 @@ const HUMAN_SUMMARY_LABEL_RE = /^(?:human-readable summary|human summary)\s*:\s*
 const TECHNICAL_DETAILS_LABEL_RE = /^(?:technical details?|details(?:_technical)?)\s*:\s*/i;
 const FINAL_REPORT_HEADING_RE = /^(?:#{1,6}\s*)?(?:root cause|files? changed|changes|validation|tests?(?: run| passed)?|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|result|results|summary|highlights?|notes?|follow[- ]ups?|next steps?|blockers?|implementation|what changed|verification)\s*:?$/i;
 const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validation|sacrificial(?: delivery)?(?: result)?|deployment(?:\/live-runtime)?(?: step)?|live-runtime(?: step)?|final report|human-readable report|files changed|tests passed)\b/i;
-// Upper bound for text delivered verbatim instead of humanized: about one
-// Telegram part (3,600 bytes in delivery-outbox.js) after the completion
-// header, for mostly-ASCII text. Longer text is a dump, not a chat report.
-const MAX_VERBATIM_REPORT_CHARS = 3500;
-const JSON_OBJECT_KEY_RE = /[{,]\s*"[^"\n]{1,80}"\s*:/;
-const STACK_FRAME_RE = /^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$/m;
-const TIMESTAMPED_LINE_RE = /^\s*\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/gm;
+// Upper bound, in UTF-8 bytes, for text delivered verbatim instead of
+// humanized. delivery-outbox.js splits Telegram bodies at 3,600 bytes; this
+// leaves 200 for the "✅ [label] done" header. Longer text is a dump, not a
+// chat report.
+const MAX_VERBATIM_REPORT_BYTES = 3400;
+// Any one of these marks machine output: a JSON or Python dict key, a JS stack
+// frame, a Python traceback header or a Go goroutine dump.
+const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$|^Traceback \(most recent call last\):|^goroutine \d+ \[/m;
+// Lines of logs (ISO, syslog or time-only stamps), test runners (check marks,
+// TAP), KEY=value env dumps and indented YAML keys. Three or more mark machine
+// output.
+const MACHINE_OUTPUT_LINE_RE = /^(?:\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{1,2}:\d{2}:\d{2}\b|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|[✔✓✗✖] |(?:not )?ok \d+ |[A-Z][A-Z0-9_]+=\S)|\s{2,}[\w-]+:(?: |$))/gm;
 // Closing sentences buildHumanizedTechnicalSummary and
 // buildCompletionLeadFromThemes append to a synthetic rewrite, which is how
 // resolveCompletionDelivery recognizes one in a stored summary_human.
@@ -154,12 +159,12 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
 }
 
 // Whether text may be delivered verbatim instead of humanized: it fits one
-// chat message and is not machine output (a payload, JSON, stack frames or
-// log lines), whatever labels or prose lead it carries.
+// chat message and is not machine output (a payload, JSON, tracebacks, logs,
+// test output, env or config dumps), whatever labels or prose lead it carries.
 function isVerbatimDeliverable(text) {
-  if (text.length > MAX_VERBATIM_REPORT_CHARS) return false;
-  if (looksLikeRawPayloadText(text) || JSON_OBJECT_KEY_RE.test(text) || STACK_FRAME_RE.test(text)) return false;
-  return (text.match(TIMESTAMPED_LINE_RE) || []).length < 3;
+  if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
+  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
 }
 
 function getPassThroughHumanFinalReport(text) {
@@ -1471,7 +1476,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // still wins for a commit-style summary, when the agent wrote its own lead
   // ("Technically:" / "Technical details:" tail, which the humanizer splits
   // into lead and details block), or when the report is not
-  // verbatim-deliverable (too long, payload, JSON, stack frames, logs).
+  // verbatim-deliverable (over one message, or machine output).
   if (
     rawCompletionSummary
     && !EXPLICIT_TECHNICAL_MARKER_RE.test(rawCompletionSummary)
