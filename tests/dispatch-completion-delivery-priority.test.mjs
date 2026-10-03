@@ -418,3 +418,28 @@ test('a long run of closing quotes or brackets splits in linear time', () => {
     assert.ok(elapsed < 500, `${closer}: ${elapsed.toFixed(0)} ms`);
   }
 });
+
+// nhl-ml (#66): a 1,216-char report with formulas, ranges and file names. The
+// producer keeps its first sentences as summary_human.
+const nhlReport = readFileSync(join(__dirname, 'fixtures', 'nhl-ml-full-summary.txt'), 'utf8');
+
+test('nhl-ml: the done path delivers the full report, and the stored lead is the report as written', () => {
+  const { completion, result } = deliverDone(nhlReport);
+  assert.ok(completion.summary_human.length < nhlReport.length * 0.6, 'the producer still cuts this report');
+  assert.ok(nhlReport.startsWith(completion.summary_human), completion.summary_human);
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, nhlReport);
+});
+
+test('nhl-ml past the verbatim bound: the stored lead and the delivered rewrite keep formulas and file names intact', () => {
+  const report = [nhlReport, nhlReport, nhlReport].join(' ');
+  assert.ok(Buffer.byteLength(report) > MAX_VERBATIM_BYTES);
+  const { completion, result } = deliverDone(report);
+  assert.equal(result.source, 'summary_human');
+  assert.ok(report.startsWith(completion.summary_human), completion.summary_human);
+  for (const token of ['conf = 2.5 + edge*20', 'conf = 1.0 + edge*(4/0.15)', 'nhl-power-model.py', 'edge-scanner.py']) {
+    assert.ok(completion.summary_human.includes(token), token);
+  }
+  assert.ok(result.deliveryText.includes('conf = 1.0 + edge*(4/0.15)'), result.deliveryText);
+  assert.doesNotMatch(result.deliveryText, /\d\. \d|\w\. (?:py|aac)\b/);
+});
