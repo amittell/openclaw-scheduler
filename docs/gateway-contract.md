@@ -980,9 +980,26 @@ names an authorization provider. A resolver that also requires a second
 `authorize()` call must set that provider field and implement `authorize()`;
 the scheduler never adds it implicitly.
 
-The scheduler can load local identity, authorization, and proof-verifier
-plugins from `SCHEDULER_PROVIDER_PATH` at startup. Every `*.js` file in that
-directory is imported and registered by `provider-registry.js`.
+The scheduler can load local identity, authorization, proof-verifier, and
+evidence plugins from `SCHEDULER_PROVIDER_PATH`. Every `*.js` file in that
+directory is imported and registered by `provider-registry.js`. The dispatcher
+loads the directory at startup. The CLI loads it once, only before
+`runs evidence` or `doctor` cryptographically verifies a handoff v4 evidence
+row, so a plugin-signed envelope can be re-verified outside the dispatcher.
+Both apply the same world-writable refusal and write loader diagnostics to
+stderr, so `--json` stdout stays a single JSON document. A relative path
+resolves against each process's working directory, so use an absolute path.
+If the CLI cannot read the directory, it logs the reason to stderr, built-in
+providers still verify, and only rows whose provider was not loaded fail.
+
+Plugin modules must have no side effects at import: no output on stdout, no
+listeners or servers, and no timers. The CLI imports every `*.js` file in the
+directory, including identity and authorization plugins, before it verifies
+evidence. A module that prints to stdout breaks `--json` output, and one that
+binds a port can make the command fail. As a safety net, after a command that
+tried to load plugins prints its result, the CLI exits once stdout and stderr
+have flushed, so an open timer or socket cannot keep `runs evidence` or
+`doctor` running.
 
 This is a high-trust boundary:
 
@@ -992,6 +1009,10 @@ This is a high-trust boundary:
   loaded, the v0.2 runtime fails closed instead of falling back to structural
   checks. This includes provider-qualified `authorization_ref` policy
   resolution.
+- If a handoff v4 evidence row names a provider that is neither an agentcli
+  built-in nor registered by a loaded plugin, signing and re-verification fail
+  closed with `EVIDENCE_PROVIDER_NOT_LOADED`, and the error names
+  `SCHEDULER_PROVIDER_PATH`.
 - Credential handoff materialization supports `session_target: "shell"` and
   `session_target: "isolated"`. Isolated jobs negotiate
   `chat-completions-env-inject-v1` before dispatch. Main-session jobs fail
@@ -1001,10 +1022,86 @@ This is a high-trust boundary:
 For the broader trust architecture that frames this provider trust boundary
 within the scheduler/child execution model, see `docs/trust-architecture.md`.
 
+### Evidence Provider Plugins
+
+An evidence plugin's default export declares `type: "evidence"`, a `name` that
+matches the evidence profile's `provider`, and agentcli's evidence provider
+methods. A loaded plugin takes precedence over an agentcli built-in of the same
+name.
+
+```js
+export default {
+  name: 'example-kms',
+  type: 'evidence',
+  methods: ['example-kms-signature'],
+  // config: the run's declared provider_config, or {} when it has none.
+  // ctx: { env, cwd, principal }. Return a truthy signing config, or null.
+  resolve(config, ctx) {},
+  // Return { attested: true, envelope } with envelope.method set. Public
+  // verification material (key id, public key, certificate) goes in the
+  // envelope.
+  attest(serializedPayload, signingConfig, ctx) {},
+  // options: { record?, principal, allowedSignersPath, providerConfig }.
+  // Return { verified: true, payload, key_fingerprint, principal } or
+  // { verified: false, reason }.
+  verify(envelope, options, ctx) {},
+  describe(envelope, ctx) {},
+};
+```
+
+`options.providerConfig` is the run's declared `provider_config`. Handoff v4
+jobs compiled by agentcli persist `provider_config_hash`, not
+`provider_config`, so for them it is `{}`, as is the `config` that `resolve()`
+receives. It is also `{}` once the run is pruned. Like the `ssh` provider with
+`AGENTCLI_SIGNING_KEY`, such a plugin finds its signing inputs in the
+dispatcher environment. On re-verification, when the row records them,
+`options.principal` and `options.allowedSignersPath` come from the row's
+`evidence_principal` and `evidence_allowed_signers_path` columns and override
+the declared config, `AGENTCLI_EVIDENCE_PRINCIPAL`, and
+`AGENTCLI_ALLOWED_SIGNERS`. Signing always records the principal. It records
+an allowed-signers path only when one was configured; without it, the path
+falls back to the declared config and then the CLI's
+`AGENTCLI_ALLOWED_SIGNERS`.
+
+The scheduler stores the envelope on the immutable evidence row and passes it
+back to `verify()` on re-verification, including after the run and job rows
+are pruned. The envelope is also what `runs evidence` prints and what an
+external verifier receives, so everything in it must be public.
+
+Envelope material is not a trust anchor. Anyone who can write the scheduler
+database can insert a row whose envelope carries their own public key and a
+valid signature by that key, and the row, payload, and artifact checks all
+pass. `verify()` must decide whom to trust from inputs outside the database:
+an allowlist of key fingerprints in its own configuration or environment, a
+KMS key it resolves itself, or a Sigstore identity and issuer policy. Key
+material in the envelope may only select among keys that policy already
+trusts. A `verify()` that trusts a key read from the envelope or the row
+proves only that the row is internally consistent. `options.providerConfig`
+also comes from the database, so the same rule applies to it. `verify()` runs
+in the dispatcher at signing and in the CLI on re-verification, so its trust
+policy must be available to both. Removing a key from an allowlist makes every
+envelope it signed fail re-verification, so keep retired keys whose evidence
+is still retained in the verification policy.
+
+Return `key_fingerprint` and `principal` from `verify()`. `runs evidence`
+reports only what `verify()` returns; it never falls back to envelope fields,
+which a database writer could change without touching the signature.
+
+A trust pin protects a plugin's own rows. It does not stop someone who can
+write the scheduler database from inserting a row that names a different
+provider: each row chooses its provider, and an `ssh` row also supplies the
+principal and allowed-signers path it is verified against. Handoff v4 evidence
+verification detects tampering with a row signed by a trusted key. It does not
+detect a self-consistent row that a database writer inserts under `ssh`, or
+under a provider whose `verify()` does not pin trust, so write access to the
+scheduler database is part of the trust boundary.
+
 Reference:
 - `dispatcher.js` `main()` (provider loading at startup)
+- `cli.js` `loadEvidenceProviderPlugins()` (loading before evidence verification)
 - `provider-registry.js` `loadProviders()`
 - `provider-registry.js` `resolveAuthorizationRef()`
+- `evidence-runtime.js` (`prepareArtifactBoundEvidence()`, `verifyPersistedArtifactBoundEvidence()`)
 - `v02-runtime.js` (`resolveIdentity()`, `verifyAuthorizationProof()`, `evaluateAuthorization()`)
 
 ---

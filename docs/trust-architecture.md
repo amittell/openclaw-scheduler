@@ -215,9 +215,11 @@ mint restricted keys dynamically.
 ### 2. Scheduler loads providers at startup
 
 Every `*.js` file in `SCHEDULER_PROVIDER_PATH` is dynamically imported
-and registered by type (identity, authorization, proof-verifier). The
-directory must not be world-writable. This is the root of trust for the
-provider plugin system.
+and registered by type (identity, authorization, proof-verifier, evidence).
+The directory must not be world-writable. This is the root of trust for the
+provider plugin system. The CLI imports the same directory, with the same
+refusal, before `runs evidence` or `doctor` verifies handoff v4 evidence, so
+plugin code also runs in the operator's CLI process.
 
 ### 3. Scheduler resolves credentials at dispatch time
 
@@ -294,20 +296,45 @@ output, postcondition, and terminal status. The selected provider must sign or
 externally verify the payload when verification is required. SSH evidence uses
 `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the declared principal and
 allowed signers. Required evidence is never silently downgraded to the checksum
-backend.
+backend. For `ssh` evidence, re-verification reads the principal and the
+allowed-signers path from the evidence row; the recorded path takes precedence
+over `AGENTCLI_ALLOWED_SIGNERS`. Both are database values.
+
+An evidence plugin from `SCHEDULER_PROVIDER_PATH` can sign with another method.
+It carries any public verification material, such as a key id, public key, or
+certificate, in the envelope it returns, which the scheduler stores immutably
+and passes back to the plugin's `verify()`. That material is not a trust
+anchor: anyone with write access to the scheduler database can insert a row
+whose envelope carries their own key and a valid signature by it. `verify()`
+must decide whom to trust from inputs outside the database, such as a key
+fingerprint allowlist in its own configuration or environment, a KMS key it
+resolves itself, or a Sigstore identity and issuer policy, and use envelope
+material only to select among keys that policy already trusts. That protects
+the plugin's own rows. It does not stop a database writer from inserting a row
+that names another provider, including `ssh`, whose principal and
+allowed-signers path the row also supplies.
 
 `openclaw-scheduler runs evidence RUN_ID --json` reconstructs the persisted
-execution input and re-verifies the cryptographic envelope. Payload, signature,
-artifact, or execution transplant tampering exits nonzero. Evidence never
-includes raw materialized credentials, bearer tokens, proof values, private
-keys, or provider secrets.
+execution input and re-verifies the cryptographic envelope. Payload, artifact,
+or execution transplant tampering that leaves the row inconsistent exits
+nonzero, and so does any change the signature covers. A self-consistent row
+written by someone with write access to the scheduler database is not detected
+when it names `ssh`, because the row also supplies the principal and
+allowed-signers path, or when it names a provider whose `verify()` does not pin
+trust outside the database. A plugin-signed row
+whose provider is not loaded in the CLI process fails closed with
+`EVIDENCE_PROVIDER_NOT_LOADED`. Evidence never includes raw materialized
+credentials, bearer tokens, proof values, private keys, or provider secrets.
 
 ## Trust Boundary Definition
 
 The operator controls:
 
 - The scheduler's execution environment (host, env vars, process).
-- The provider plugin directory (`SCHEDULER_PROVIDER_PATH`).
+- The provider plugin directory (`SCHEDULER_PROVIDER_PATH`), which both the
+  dispatcher and the evidence-verifying CLI commands import.
+- Write access to the scheduler database, which can insert evidence rows that
+  verify.
 - The gateway connection (`OPENCLAW_GATEWAY_URL`,
   `OPENCLAW_GATEWAY_TOKEN`).
 - The manifest content (via `agentcli compile` + `agentcli apply`).
