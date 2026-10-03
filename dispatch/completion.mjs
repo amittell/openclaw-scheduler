@@ -2,6 +2,14 @@ const MAX_DELIVERY_SENTENCES = 5;
 const MAX_DELIVERY_CHARS = 700;
 const MAX_LIST_ITEMS = 3;
 
+// Channel budget for a full human-readable completion summary. Summaries up to
+// one Telegram message (4096 chars) are delivered intact; the downstream
+// delivery outbox transparently chunks anything longer into [n/N] parts.
+// Truncation (only for prose beyond this budget) cuts at a clean sentence
+// boundary and never alters the characters of kept text (no space-inserted
+// decimals).
+export const MAX_PROSE_DELIVERY_CHARS = 4096;
+
 const GENERIC_COMPLETION_TEXT_RE = /^(?:completed(?:\s*\([^\n)]*\))?|done|ok|okay|success|successful|complete|all set|none|n\/?a)[.!?]*$/i;
 const TRIVIAL_CHATTER_RE = /^(?:hi|hello|hey|yo|sup|thanks|thank you|cool|nice|sure|yep|yeah|k|kk|roger|copy that)[.!?]*$/i;
 const INTERNAL_DONE_PAYLOAD_RE = /"message"\s*:\s*"Label marked done via agent signal\."|"status"\s*:\s*"done"/i;
@@ -236,7 +244,14 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
 function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
-  return normalized.match(/[^.!?]+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
+  // Split only at sentence-ending punctuation (. ! ?) that is followed by
+  // whitespace. Decimals, version strings, formulas, and ranges (e.g. "2.5",
+  // "v0.6.5", "4.4 -> 3.6") have a non-whitespace character after the dot, so
+  // they are never split. The terminator stays attached to its fragment.
+  return normalized
+    .split(/(?<=[.!?])(?=\s)/)
+    .map(part => part.trim())
+    .filter(Boolean);
 }
 
 function asSentence(text) {
@@ -423,22 +438,29 @@ function summarizeProse(text) {
   const normalized = prepareLines(text).join(' ').replace(/\s+/g, ' ').trim();
   if (!normalized || isGenericOrTrivial(normalized)) return null;
 
-  const sentences = splitSentences(normalized);
-  if (!sentences.length) return truncateText(normalized, MAX_DELIVERY_CHARS);
-  if (normalized.length <= MAX_DELIVERY_CHARS && sentences.length <= MAX_DELIVERY_SENTENCES) {
+  // Deliver the full human-readable summary intact when it fits the channel
+  // budget. The downstream outbox chunks anything longer into [n/N] parts, so
+  // only genuinely oversized prose is truncated here.
+  if (normalized.length <= MAX_PROSE_DELIVERY_CHARS) {
     return normalized;
   }
 
+  const sentences = splitSentences(normalized);
+  if (!sentences.length) return truncateText(normalized, MAX_PROSE_DELIVERY_CHARS);
+
+  // Truncate only at a clean sentence boundary so the characters of kept text
+  // are never altered (no space-inserted decimals); the teaser length is also
+  // capped so a single kept sentence cannot exceed the channel budget.
   const kept = [];
   let chars = 0;
   for (const sentence of sentences) {
     const next = kept.length ? chars + 1 + sentence.length : chars + sentence.length;
-    if (kept.length >= MAX_DELIVERY_SENTENCES || next > MAX_DELIVERY_CHARS) break;
+    if (kept.length >= MAX_DELIVERY_SENTENCES || next > MAX_PROSE_DELIVERY_CHARS) break;
     kept.push(sentence);
     chars = next;
   }
 
-  if (!kept.length) return truncateText(normalized, MAX_DELIVERY_CHARS);
+  if (!kept.length) return truncateText(normalized, MAX_PROSE_DELIVERY_CHARS);
   return kept.join(' ');
 }
 

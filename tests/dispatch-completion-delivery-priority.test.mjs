@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
+import { humanizeCompletionText, resolveCompletionDelivery, summarizeCompletionText, MAX_PROSE_DELIVERY_CHARS } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
@@ -77,13 +77,36 @@ test('markdown-heading reports still pass (existing path regression guard)', () 
   assert.equal(humanized, report, 'heading-based report must pass through unmodified');
 });
 
-test('non-report chatter is still summarized, not passed through', () => {
-  const chatter = Array.from({ length: 12 }, (_, i) =>
+test('non-report chatter beyond the channel budget is still truncated, not passed through', () => {
+  const chatter = Array.from({ length: 40 }, (_, i) =>
     `Sentence ${i + 1} describes some routine maintenance that was performed on the pipeline today with no structural headings or bold labels.`).join(' ');
-  assert.ok(chatter.length > 700, 'chatter must exceed the pass-through budget');
+  assert.ok(chatter.length > MAX_PROSE_DELIVERY_CHARS, 'chatter must exceed the channel pass-through budget');
   const humanized = humanizeCompletionText(chatter);
   assert.ok(humanized, 'chatter must still produce a delivery text');
-  assert.ok(humanized.length < chatter.length, 'long non-report prose must be summarized, not passed through');
+  assert.ok(humanized.length < chatter.length, 'oversized non-report prose must be truncated, not passed through');
+  assert.ok(humanized.length <= MAX_PROSE_DELIVERY_CHARS, 'truncated prose must respect the channel budget');
+});
+
+test('prose within the channel budget passes through intact (full summary, not a teaser)', () => {
+  const summary = Array.from({ length: 12 }, (_, i) =>
+    `Sentence ${i + 1} describes some routine maintenance that was performed on the pipeline today with no structural headings or bold labels.`).join(' ');
+  assert.ok(summary.length < MAX_PROSE_DELIVERY_CHARS, 'summary must fit the channel budget');
+  const humanized = humanizeCompletionText(summary);
+  assert.equal(humanized, summary, 'in-budget prose must be delivered intact, not summarized');
+});
+
+test('completion summary keeps decimals/formulas intact and delivers the full text (regression)', () => {
+  const fixture = readFileSync(join(__dirname, 'fixtures', 'nhl-ml-full-summary.txt'), 'utf8').trim();
+  assert.ok(fixture.length > 700, 'fixture must exceed the old teaser budget');
+  const summarized = summarizeCompletionText(fixture);
+  assert.ok(summarized, 'must produce a delivery text');
+  // Decimals and formulas must survive un-mangled (no space-inserted "2. 5").
+  assert.ok(summarized.includes('conf = 2.5'), 'decimal conf = 2.5 must be intact');
+  assert.ok(summarized.includes('conf = 1.0 + edge*(4/0.15)'), 'formula must be intact');
+  assert.ok(!/2\. 5|5\. 0|12\. 5pp/.test(summarized), 'no space-inserted decimals');
+  // The full summary is delivered (not a 155-char teaser) because it fits the channel budget.
+  assert.equal(summarized, fixture, 'in-budget summary must pass through intact');
+  assert.ok(summarized.length > 400, 'must not be truncated to the old teaser length');
 });
 
 test('lastReply is used when summary_human is noise and lastReply is a real report', () => {
