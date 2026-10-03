@@ -280,7 +280,8 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
 function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
-  return normalized.match(/[^.!?]+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
+  // A period followed by a digit is a decimal ("0.00s", "v0.6"), not a sentence end.
+  return normalized.match(/(?:[^.!?]|\.(?=\d))+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
 }
 
 function asSentence(text) {

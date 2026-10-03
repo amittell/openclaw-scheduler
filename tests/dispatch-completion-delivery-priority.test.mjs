@@ -130,6 +130,16 @@ test('done path: mangled-prefix summary_human promotes full completion.summary',
   assert.ok(result.deliveryText.includes('0.00s') && result.deliveryText.includes('344.25'), 'numbers must be intact in the promoted summary');
 });
 
+test('a report past the verbatim bound is still humanized with its decimals intact', () => {
+  // Past the bound the report falls back to summary_human, which used to
+  // split "0.00s" into "0. 00s" and "344.25" into "344. 25".
+  const appendix = ' Appendix: per-line drift table re-checked line by line for every one of the 241 cues, all inside 0.40s, with the same staging layout as round 7 and the same publish recipe. ';
+  const { result } = deliverDone(alignReport.summary + appendix.repeat(10));
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.includes('fixed to 0.00s drift') && result.deliveryText.includes('344.25 to 347.50'), result.deliveryText);
+  assert.ok(!result.deliveryText.includes('0. 00s'));
+});
+
 test('done path: a legacy summaryHuman payload promotes the full summary too', () => {
   const result = resolveCompletionDelivery({
     completion: { summary: alignFull, summaryHuman: alignMangled, checklist: CHECKLIST },
@@ -140,7 +150,7 @@ test('done path: a legacy summaryHuman payload promotes the full summary too', (
 
 test('sm-round8-align-fix: the full report reaches chat on the done and watcher paths', () => {
   const { completion, result } = deliverDone(alignReport.summary);
-  assert.ok(completion.summary_human.includes('0. 00s'), 'the producer still truncates and mangles this report');
+  assert.ok(completion.summary_human.length < alignReport.summary.length / 2, 'the producer still truncates this report');
   assert.equal(result.source, 'completion-summary-full');
   assert.equal(result.deliveryText, alignReport.summary);
 
