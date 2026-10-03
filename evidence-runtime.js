@@ -8,7 +8,10 @@ import {
   getHandoffArtifact,
   sha256,
 } from './handoff-artifact.js';
-import { getEvidenceProvider as getRuntimeEvidenceProvider } from './provider-registry.js';
+import {
+  getEvidenceProvider as getRuntimeEvidenceProvider,
+  getProviderLoadProblem,
+} from './provider-registry.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 
 let agentcliPromise = null;
@@ -170,11 +173,24 @@ function resultEvidence(run, opts = {}) {
 async function resolveProvider(profile, agentcli, ctx) {
   const runtimeProvider = getRuntimeEvidenceProvider(profile.provider);
   if (runtimeProvider) return { provider: runtimeProvider, source: 'scheduler-plugin' };
-  const provider = agentcli.resolveEvidenceProvider({
-    evidenceProvider: profile.provider,
-    env: ctx.env,
-  });
-  return { provider, source: 'agentcli' };
+  try {
+    const provider = agentcli.resolveEvidenceProvider({
+      evidenceProvider: profile.provider,
+      env: ctx.env,
+    });
+    return { provider, source: 'agentcli' };
+  } catch (error) {
+    // agentcli reports an unregistered provider name as invalid_argument.
+    if (error?.code !== 'invalid_argument') throw error;
+    const loadProblem = getProviderLoadProblem();
+    throw evidenceError(
+      'EVIDENCE_PROVIDER_NOT_LOADED',
+      `Evidence provider ${profile.provider} is not loaded: it is not an agentcli built-in, `
+        + 'and no plugin from SCHEDULER_PROVIDER_PATH registered it in this process'
+        + (loadProblem ? `; SCHEDULER_PROVIDER_PATH was not loaded: ${loadProblem}` : '')
+        + ` (${error.message})`,
+    );
+  }
 }
 
 function evidencePrincipal(profile, opts = {}) {
@@ -187,7 +203,7 @@ function evidencePrincipal(profile, opts = {}) {
     || 'agentcli';
 }
 
-function providerVerifyOptions(profile, record, opts, principal) {
+function providerVerifyOptions(profile, record, opts, principal, providerConfig) {
   const config = profile.provider_config || {};
   const configuredPath = config.allowed_signers_path
     || config.allowed_signers
@@ -199,6 +215,7 @@ function providerVerifyOptions(profile, record, opts, principal) {
     allowedSignersPath: configuredPath
       ? resolve(opts.cwd || process.cwd(), configuredPath)
       : null,
+    providerConfig,
   };
 }
 
@@ -272,18 +289,19 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
     env: opts.env || process.env,
   });
   const principal = evidencePrincipal(profile, opts);
-  const providerConfig = await provider.resolve(profile.provider_config || {}, {
+  const declaredConfig = profile.provider_config || {};
+  const signingConfig = await provider.resolve(declaredConfig, {
     env: opts.env || process.env,
     cwd: opts.cwd || process.cwd(),
     principal,
   });
-  if (!providerConfig) {
+  if (!signingConfig) {
     throw evidenceError(
       'EVIDENCE_PROVIDER_RESOLUTION_FAILED',
       'Evidence provider ' + profile.provider + ' did not resolve signing credentials',
     );
   }
-  const attestation = await provider.attest(serialized, providerConfig, {
+  const attestation = await provider.attest(serialized, signingConfig, {
     runId: run.id,
     artifactDigest: run.handoff_artifact_digest,
   });
@@ -295,7 +313,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
   }
 
   const record = evidenceRecord(run, artifact, timestamp, opts);
-  const verifyOptions = providerVerifyOptions(profile, record, opts, principal);
+  const verifyOptions = providerVerifyOptions(profile, record, opts, principal, declaredConfig);
   const verification = source === 'agentcli'
     ? await agentcli.verifyEvidenceEnvelope(attestation.envelope, verifyOptions, {
         runId: run.id,
@@ -646,6 +664,9 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
       record,
       opts,
       evidencePrincipal(profile, opts),
+      // The declared config lives in the run's declaration snapshot, which is
+      // gone once the run is pruned.
+      run ? declaredProviderConfig : {},
     );
     const verification = source === 'agentcli'
       ? await agentcli.verifyEvidenceEnvelope(envelope, verifyOptions, {
@@ -689,8 +710,10 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
         cryptographically_verified: true,
         provider: profile.provider,
         method: envelope.method,
-        principal: verification.principal || envelope.principal || null,
-        key_fingerprint: verification.key_fingerprint || envelope.key_fingerprint || null,
+        // Only what verify() vouched for; envelope fields outside the
+        // signature could name anyone.
+        principal: verification.principal || null,
+        key_fingerprint: verification.key_fingerprint || null,
       },
     };
   } catch (error) {
