@@ -18,6 +18,35 @@ All notable changes to this project will be documented in this file.
   unchanged. Sentences no longer split at a decimal point. Reports carrying
   a cue word are still unbounded (#65).
 
+- **Split completion prose only at sentence ends (#69).** The humanized
+  lead ended a sentence at any period not followed by a digit, so file
+  names, URLs and closing quotes came out split, as in `nhl-power-model. py`
+  and `"Done. "`. A sentence now ends at `. ! ?` plus any closing quotes or
+  brackets, where whitespace follows, so a shortened lead is always the
+  start of the report as written. The split stays linear on long runs of
+  closing quotes.
+
+- **Plugin-signed handoff v4 evidence re-verifies from the CLI, including
+  after its run and job are pruned (#68).** Only the dispatcher loaded
+  `SCHEDULER_PROVIDER_PATH`, so `runs evidence` and `doctor` reported an
+  envelope signed by an evidence plugin as `Unknown evidence provider`. The
+  CLI now loads that directory once, and only before it verifies v4 evidence,
+  with the dispatcher's world-writable refusal. Loader diagnostics go to
+  stderr, so `--json` stdout stays one JSON document, and a command that
+  tried to load plugins exits after flushing its output even if a plugin
+  leaves a timer open. `verify()` now also receives the run's declared
+  `provider_config` as `options.providerConfig` (`{}` for agentcli-compiled
+  jobs, which persist only its hash). A provider that is neither a loaded
+  plugin nor an agentcli built-in fails closed with
+  `EVIDENCE_PROVIDER_NOT_LOADED`, naming `SCHEDULER_PROVIDER_PATH` and why
+  it did not load; a plugin directory the CLI cannot read no longer stops
+  built-in providers from verifying. `runs evidence` reports a signer's
+  `principal` and `key_fingerprint` only when the provider's `verify()`
+  returns them, not from unsigned envelope fields. Plugins carry public
+  verification material in the envelope and must pin trust outside the
+  scheduler database; the gateway contract documents why, and what that does
+  not cover. No schema change.
+
 - **Stop polling Gateway sessions when no task-tracker agent can use them (#62).**
   The dispatcher's message-delivery pass (about every 20s by default) posted
   `sessions_list` to the Gateway's `/tools/invoke` on every pass to refresh

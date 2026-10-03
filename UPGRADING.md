@@ -414,11 +414,23 @@ made after the backup, so export or inspect those rows first when they matter.
 
 ## Provider plugins (v0.2)
 
-If you use provider-backed identity, authorization, or proof verification, set
-`SCHEDULER_PROVIDER_PATH` to a directory containing your provider `*.js` files.
-This is a high-trust boundary: every file in that directory is dynamically imported
-at scheduler startup. The directory must not be world-writable. See
-`docs/gateway-contract.md` for the full provider plugin contract.
+If you use provider-backed identity, authorization, proof verification, or
+evidence signing, set `SCHEDULER_PROVIDER_PATH` to a directory containing your
+provider `*.js` files. This is a high-trust boundary: every file in that
+directory is dynamically imported at scheduler startup. The directory must not
+be world-writable. See `docs/gateway-contract.md` for the full provider plugin
+contract.
+
+`openclaw-scheduler runs evidence` and `openclaw-scheduler doctor` also import
+that directory before they verify handoff v4 evidence. When a plugin signs
+evidence, set `SCHEDULER_PROVIDER_PATH` in the shell that runs those commands
+as well as in the service environment, and use an absolute path: a relative
+path resolves against each process's working directory. Without it, a
+plugin-signed row reports `EVIDENCE_PROVIDER_NOT_LOADED` and `doctor` counts it
+as invalid. The plugin's trust policy, such as its allowlist of signing keys,
+must be available to the CLI as well. Because the CLI imports every plugin in
+the directory, plugin modules must not print to stdout or start listeners or
+timers when imported.
 
 ### Adopting jobs under agentcli
 

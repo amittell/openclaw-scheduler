@@ -1559,7 +1559,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_DEBUG` | *(unset)* | `1` or `true` enables debug logging; `0` or `false` disables it |
 | `SCHEDULER_ALERT_TARGET` | *(unset; alerts disabled)* | Explicit numeric Telegram operator chat ID for repeated isolated-job failures. Surrounding whitespace is trimmed; zero, usernames, prefixes, embedded whitespace and unsafe integers are rejected. No default recipient or fallback route is used. Alerts are attempted only after successful completion bookkeeping commits. |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
-| `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files loaded at startup. High trust boundary -- only point at operator-controlled code. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
+| `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files. The dispatcher loads it at startup; the CLI loads it before `runs evidence` or `doctor` verifies handoff v4 evidence, so set it there too when a plugin signs evidence. Use an absolute path: a relative one resolves against each process's working directory. High trust boundary -- only point at operator-controlled code; world-writable directories are refused. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory for `config.json` |
 | `DISPATCH_STATE_DIR` | `~/.openclaw/scheduler/dispatch` | Allowed state root for the dispatch labels ledger |
 | `DISPATCH_LABELS_PATH` | `<DISPATCH_STATE_DIR>/labels.json` | Override the labels ledger path. Relative paths resolve beneath the state root; absolute paths must remain beneath it after traversal normalization, and existing parents must remain beneath it after symbolic-link resolution |
@@ -2317,8 +2317,13 @@ lineage. Offloaded stdout and stderr are hashed in full, not from their stored
 excerpts. Historical verification reloads the exact artifact bound to the run.
 The SSH
 provider signs and verifies with `ssh-keygen -Y`; other declared providers must
-implement equivalent verification. `openclaw-scheduler runs evidence RUN_ID
---json` re-verifies the persisted envelope against the stored execution.
+implement equivalent verification. An evidence plugin loaded from
+`SCHEDULER_PROVIDER_PATH` carries its public verification material in the
+envelope and must decide whom to trust from inputs outside the scheduler
+database; see
+[evidence provider plugins](docs/gateway-contract.md#evidence-provider-plugins).
+`openclaw-scheduler runs evidence RUN_ID --json` loads those plugins and
+re-verifies the persisted envelope against the stored execution.
 
 Earlier handoff consumers and direct scheduler job specifications retain the
 immutable canonical SHA-256 checksum backend. That legacy path remains a

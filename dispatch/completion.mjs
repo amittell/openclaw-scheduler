@@ -280,8 +280,14 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
 function splitSentences(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
-  // A period followed by a digit is a decimal ("0.00s", "v0.6"), not a sentence end.
-  return normalized.match(/(?:[^.!?]|\.(?=\d))+(?:[.!?]+|$)/g)?.map(part => part.trim()).filter(Boolean) || [];
+  // A sentence ends at . ! or ?, and any closing quotes or brackets after it,
+  // where whitespace follows. A dot inside a token ("0.00s", "v0.6.6",
+  // "dub_eng_v9.aac", "example.com/a.html") has no whitespace after it, so it
+  // never splits. The closers stay with their sentence, so rejoining kept
+  // sentences with one space reproduces the text. The whitespace lookahead
+  // comes first so the lookbehind runs only where a split can happen; ungated,
+  // it rescans a run of closers at every position and a 100k run takes seconds.
+  return normalized.split(/(?=\s)(?<=[.!?]["'”’)\]}]*)\s+/);
 }
 
 function asSentence(text) {
