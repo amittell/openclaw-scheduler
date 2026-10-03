@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
+import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery, summarizeCompletionText } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
@@ -378,4 +378,43 @@ test('watcher path: a cue-less status reply does not replace the agent\'s own --
   const replyOnly = resolveCompletionDelivery({ lastReply: statusReply, completion: null });
   assert.equal(replyOnly.source, 'lastReply');
   assert.equal(replyOnly.deliveryText, statusReply);
+});
+
+test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
+  // Each case runs past five sentences, so the producer cuts it to the first
+  // five. A split inside a token rejoins as "dub_eng_v9. aac"; a split before
+  // a closing quote or bracket moves it onto the next sentence.
+  const more = Array.from({ length: 6 }, (_, i) => `Check ${i + 1} passed on the staging host.`);
+  const cases = {
+    decimals: ['Drift fixed to 0.00s and cue 344.25 moved to 347.50.'],
+    version: ['Released v0.6.6 to the mirror.'],
+    formula: ['Confidence is now conf = 1.0 + edge*(4/0.15) over the band.'],
+    range: ['Utah moved 4.4 -> 3.6 after the change.'],
+    'file name': ['Re-encoded dub_eng_v9.aac from the new mix.'],
+    url: ['Docs are at https://example.com/guide/v2.html for review.'],
+    'ellipsis without a space': ['Waited...then retried the push.'],
+    'closing quote': ['The reviewer wrote "Done."', 'Next we merged it.'],
+    'closing bracket': ['(See the log above.)', 'Then retry the job.'],
+  };
+  for (const [name, lead] of Object.entries(cases)) {
+    const sentences = [...lead, ...more];
+    assert.equal(summarizeCompletionText(sentences.join(' ')), sentences.slice(0, 5).join(' '), name);
+  }
+
+  // An abbreviation still ends a sentence, but the cut is the text as written.
+  const abbreviated = ['Transient errors, e.g. timeouts, now retry.', ...more].join(' ');
+  const lead = summarizeCompletionText(abbreviated);
+  assert.ok(abbreviated.startsWith(lead) && lead.includes('e.g. timeouts'), lead);
+});
+
+test('a long run of closing quotes or brackets splits in linear time', () => {
+  // The lookbehind once rescanned the run at every position: 100,000 quotes
+  // took over 10 s here. A linear split takes a few milliseconds.
+  for (const closer of ['"', ')']) {
+    const text = `Fixed it. ${closer.repeat(100_000)}`;
+    const started = performance.now();
+    assert.equal(summarizeCompletionText(text), 'Fixed it.');
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 500, `${closer}: ${elapsed.toFixed(0)} ms`);
+  }
 });
