@@ -1,4 +1,6 @@
 // Job CRUD operations
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve as pathResolve } from 'node:path';
 import { randomUUID } from 'crypto';
 import { Cron } from 'croner';
 import { RE2JS } from 're2js';
@@ -8,7 +10,8 @@ import { cancelRunBeforeExecution, requestRunCancellation } from './run-state.js
 import { cancelApprovalsForJob } from './approval-state.js';
 import { cancelDeliveriesForJob } from './delivery-outbox.js';
 import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
-import { assertValidAgentId, assertValidSessionKey } from './identifiers.js';
+import { assertContainedPath, assertValidAgentId, assertValidSessionKey } from './identifiers.js';
+import { resolveDispatchStateDir } from './dispatch/paths.mjs';
 import { normalizeAgentSelection } from './agent-selection.js';
 import {
   assertValidHandoffArtifact,
@@ -1916,6 +1919,137 @@ export function pruneExpiredJobs() {
       )
   `).run();
   return aged.changes + orphans.changes + ttlExpired.changes;
+}
+
+// Delivery watcher orphan reaper.
+//
+// Dispatch delivery watchers are enabled cron jobs named "<brand>-deliver:<label>"
+// (optionally with a ":handoff:<ts>" suffix) that poll a dispatch label until its
+// parent work finishes. They are created with ttl_hours (default 48) and
+// delete_after_run=1, but delete_after_run only fires on a terminal 'ok' run and
+// the TTL pruning above only deletes disabled jobs -- a watcher that keeps ticking
+// (skipped/ok every minute) stays enabled forever and never expires. Evidence:
+// dispatch-deliver:830-acceptance-run(-v4) created 2026-09-13 with ttl_hours=48
+// were still enabled and ticking 14 days later. This reaper deletes an ENABLED
+// dispatch-deliver job once its ttl_hours window has passed AND the watched
+// dispatch label is terminal (or no longer present in the labels ledger).
+const TERMINAL_DISPATCH_LABEL_STATUSES = new Set(['done', 'error', 'interrupted']);
+
+function resolveLabelsFileForPrune() {
+  // Reuse the dispatch path resolver's state-dir logic and containment checks
+  // (dispatch/paths.mjs): a relative DISPATCH_LABELS_PATH override resolves
+  // beneath DISPATCH_STATE_DIR, and an override escaping the state dir throws
+  // (caught by readDispatchLabelsForPrune -> null -> fail closed, no reaping).
+  const stateDir = resolveDispatchStateDir();
+  const candidate = pathResolve(stateDir, process.env.DISPATCH_LABELS_PATH || 'labels.json');
+  if (candidate === stateDir) {
+    throw new Error('DISPATCH_LABELS_PATH must name a file beneath DISPATCH_STATE_DIR');
+  }
+  return assertContainedPath(stateDir, candidate, 'DISPATCH_LABELS_PATH');
+}
+
+function readDispatchLabelsForPrune() {
+  try {
+    const labelsPath = resolveLabelsFileForPrune();
+    if (!existsSync(labelsPath)) return null;
+    const parsed = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the dispatch label watched by a delivery watcher job is terminal
+ * (or the ledger/label is missing, i.e. the watched work is gone). Null --
+ * not terminal -- when the label still has a non-terminal status.
+ */
+function dispatchLabelTerminalForPrune(jobName) {
+  const labels = readDispatchLabelsForPrune();
+  if (!labels) return null;
+  const marker = '-deliver:';
+  const markerIndex = jobName.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const fullLabel = jobName.slice(markerIndex + marker.length);
+  // Labels are arbitrary strings and may themselves end in ":handoff:<digits>"
+  // (e.g. a user label foo:handoff:123). Prefer the full suffix when it exists
+  // as a ledger key; only fall back to the stripped base label for
+  // handoff-created watchers, whose ledger key is the base label.
+  const fullEntry = labels[fullLabel];
+  if (fullEntry && typeof fullEntry === 'object') {
+    return TERMINAL_DISPATCH_LABEL_STATUSES.has(fullEntry.status) ? true : null;
+  }
+  const baseLabel = fullLabel.replace(/:handoff:\d+$/, '');
+  if (baseLabel === fullLabel) return true; // no handoff suffix, key absent
+  const baseEntry = labels[baseLabel];
+  if (!baseEntry || typeof baseEntry !== 'object') return true;
+  return TERMINAL_DISPATCH_LABEL_STATUSES.has(baseEntry.status) ? true : null;
+}
+
+// Safety guards re-checked inside the delete transaction. A concurrent
+// dispatcher that commits a pending/claimed queue row or a child before this
+// transaction starts is visible to the re-check, and one that commits after is
+// blocked by the write lock (its insert then fails the FK against the deleted
+// job), so the guards and the delete are atomic.
+const REAPER_GUARD_SQL = [
+  `SELECT 1 FROM runs
+   WHERE job_id = ?
+     AND status NOT IN ('ok', 'error', 'timeout', 'skipped', 'cancelled', 'crashed', 'recovery_blocked')
+   LIMIT 1`,
+  `SELECT 1 FROM runs WHERE job_id = ? AND status = 'recovery_blocked' LIMIT 1`,
+  `SELECT 1 FROM job_dispatch_queue
+   WHERE job_id = ? AND status IN ('pending', 'claimed', 'awaiting_approval')
+   LIMIT 1`,
+  `SELECT 1 FROM jobs WHERE parent_id = ? LIMIT 1`,
+];
+
+/**
+ * Delete enabled dispatch-deliver watcher jobs that are past their ttl_hours
+ * window and whose watched label is terminal. Aging is based on the immutable
+ * created_at, not last_run_at: updateJobAfterRun() (dispatcher-maintenance.js)
+ * refreshes last_run_at after every run that reaches bookkeeping, so a watcher
+ * that keeps ticking every minute would never age out on last_run_at. Same
+ * safety guards as the TTL pruning above: no in-flight run, no
+ * recovery_blocked run, no pending/claimed queue row, no live children; the
+ * guards and the delete run in one immediate transaction. Returns the number
+ * of deleted jobs.
+ */
+export function pruneOrphanedDeliveryWatchers() {
+  const db = getDb();
+  const candidates = db.prepare(`
+    SELECT id, name
+    FROM jobs
+    WHERE enabled = 1
+      AND ttl_hours IS NOT NULL
+      AND ttl_hours > 0
+      AND created_at < datetime('now', '-' || ttl_hours || ' hours')
+      AND name LIKE '%-deliver:%'
+  `).all();
+  let deleted = 0;
+  for (const candidate of candidates) {
+    if (dispatchLabelTerminalForPrune(candidate.name) !== true) continue;
+    const reap = () => {
+      for (const sql of REAPER_GUARD_SQL) {
+        if (db.prepare(sql).get(candidate.id)) {
+          const defer = new Error('watcher safety guard changed; deferring to next prune pass');
+          defer.code = 'REAPER_GUARD_DEFER';
+          throw defer;
+        }
+      }
+      // deleteJob sees db.inTransaction === true here and runs in this same
+      // transaction, so its JOB_ACTIVE_RUNS guard and the DELETE are atomic
+      // with the checks above.
+      if (deleteJob(candidate.id)) deleted += 1;
+    };
+    try {
+      db.transaction(reap).immediate();
+    } catch (error) {
+      if (error?.code !== 'REAPER_GUARD_DEFER' && error?.code !== 'JOB_ACTIVE_RUNS') throw error;
+      // A run raced into flight (or a guard row appeared): skip and retry on
+      // the next prune pass.
+    }
+  }
+  return deleted;
 }
 
 /**

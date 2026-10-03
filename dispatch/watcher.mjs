@@ -56,7 +56,7 @@ import {
 } from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
 import { resolveLabelsPath } from './paths.mjs';
-import { assertRouteMatchesSource, parseOriginRoute, parseSourceContext } from './source-context.mjs';
+import { assertRouteMatchesSource, effectiveDeliveryTarget, parseOriginRoute, parseSourceContext } from './source-context.mjs';
 import { callGatewayRpc } from './gateway-rpc.mjs';
 import {
   projectOpenClawTranscriptEntries,
@@ -1369,14 +1369,19 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     // A run adopted from an agent's sessions_spawn call keeps the completion
     // scope recorded at prepare, which the done signal also claims under.
     const identity = labelCompletionIdentity(label, claimEntry);
-    if (claimEntry?.deliverTo && claimEntry?.deliveryMode !== 'none') {
+    // The origin (request source) is the programmatic default delivery target:
+    // an explicit deliverTo wins, otherwise the recorded origin is used. This
+    // guarantees a recorded completion payload is announced to the requester
+    // even when the label has no explicit deliverTo (no silent drop).
+    const completionTarget = effectiveDeliveryTarget(claimEntry);
+    if (completionTarget && claimEntry?.deliveryMode !== 'none') {
       const deliveryResult = enqueueCompletionNotification({
         label,
         summary: completion.summary,
         completion: completionPayload,
         resolvedDelivery: completion,
-        deliverTo: claimEntry.deliverTo,
-        deliveryChannel: claimEntry.deliverChannel || 'telegram',
+        deliverTo: completionTarget.target,
+        deliveryChannel: completionTarget.channel,
         sessionKey: identity.sessionKey,
         runId: identity.runId,
         deliveryScope: identity.deliveryScope,
