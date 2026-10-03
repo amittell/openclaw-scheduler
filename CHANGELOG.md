@@ -4,10 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.6] -- 2026-10-03
+
 ### Fixed
 
+- **Deliver the agent's own completion report, not a lossy summary stub (#53).**
+  On the done path the completion notification used `summary_human`, which
+  cut a 1,909-char report to a 198-char stub and split decimals ("0. 00s").
+  When `summary_human` is a cut-down copy or a synthetic rewrite of a prose
+  report, the report itself is now delivered, with its checks line (tests,
+  pushed sha), if it fits one Telegram part (3,400 UTF-8 bytes) and is not
+  logs, JSON, a traceback or other machine output. Otherwise delivery is
+  unchanged. Sentences no longer split at a decimal point. Reports carrying
+  a cue word are still unbounded (#65).
+
+- **Split completion prose only at sentence ends (#69).** The humanized
+  lead ended a sentence at any period not followed by a digit, so file
+  names, URLs and closing quotes came out split, as in `nhl-power-model. py`
+  and `"Done. "`. A sentence now ends at `. ! ?` plus any closing quotes or
+  brackets, where whitespace follows, so a shortened lead is always the
+  start of the report as written. The split stays linear on long runs of
+  closing quotes.
+
 - **Plugin-signed handoff v4 evidence re-verifies from the CLI, including
-  after its run and job are pruned (#64).** Only the dispatcher loaded
+  after its run and job are pruned (#68).** Only the dispatcher loaded
   `SCHEDULER_PROVIDER_PATH`, so `runs evidence` and `doctor` reported an
   envelope signed by an evidence plugin as `Unknown evidence provider`. The
   CLI now loads that directory once, and only before it verifies v4 evidence,
@@ -26,7 +46,8 @@ All notable changes to this project will be documented in this file.
   verification material in the envelope and must pin trust outside the
   scheduler database; the gateway contract documents why, and what that does
   not cover. No schema change.
-- **Stop polling Gateway sessions when no task-tracker agent can use them.**
+
+- **Stop polling Gateway sessions when no task-tracker agent can use them (#62).**
   The dispatcher's message-delivery pass (about every 20s by default) posted
   `sessions_list` to the Gateway's `/tools/invoke` on every pass to refresh
   task-tracker heartbeats, even with no trackers at all, and discarded every
