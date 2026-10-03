@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
+import { buildTerminalCompletionPayload, humanizeCompletionText, resolveCompletionDelivery } from '../dispatch/completion.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const payload = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-fix-payload.json'), 'utf8'));
@@ -94,4 +94,288 @@ test('lastReply is used when summary_human is noise and lastReply is a real repo
   });
   assert.equal(result.source, 'lastReply');
   assert.ok(result.deliveryText.includes('Root cause of the aac/wav mismatch'));
+});
+
+// DONE-path regression (sm-round8-align-fix, 2026-09-24): the done path does
+// not recover lastReply, so resolveCompletionDelivery was falling back to
+// completion.summary_human -- a lossy derivative that mangled numbers
+// ("0.00s" -> "0. 00s") and collapsed a 1909-char report to 198 chars. The
+// full completion.summary must win when summary_human is a truncation of it
+// (clean or mangled prefix) or a synthetic technical rewrite, and must NOT win
+// when the agent wrote its own lead (the fitness "Technically:" shape) or when
+// summary is not a chat-sized report.
+const CHECKLIST = { work_complete: true };
+const PUSHED_CHECKLIST = { work_complete: true, tests_passed: true, pushed: true };
+const SHA = 'deadbeef'.repeat(5);
+const MAX_VERBATIM_BYTES = 3400;
+const alignFull = 'Round-8 alignment fix complete (all 3 items, re-verified, staged). ITEM 1 (7 SRT-offset lines): 3 were real EN sub offsets, fixed to 0.00s drift - i=37 Bunny. #32 344.25 to 347.50, i=83 Um show me. #75 738.11 to 739.00. ITEM 2 (32 missing-cue lines): 16 real EN lines got new 1:1 cues, 16 are jp_fallback. SRT 224 to 241 cues, sequential, chronological, 0 new overlaps. ITEM 3 (1251.9 gap): CONFIRMED real dropped JP line, regenerated No! via IndexTTS2 best-of-6, surgical mix and re-encode to dub_eng_v10.aac. RE-VERIFY: gate_03s.py OK, P1 max drift 4.54s to 0.36s. STAGED: srt md5 772f57d1 (241 cues), aac md5 04f634ff, lines_index md5 9f1cc522 (266 entries).';
+const alignMangled = alignFull.slice(0, 160).replace('0.00s', '0. 00s').replace('344.25', '344. 25');
+// lastReply is the worker's real final reply (1,599 chars). The stored
+// --summary was not kept; summary is the same report as one paragraph, the
+// shape the producer truncates.
+const alignReport = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'sm-round8-align-fix-report.json'), 'utf8'));
+
+function deliverDone(summary) {
+  const completion = buildTerminalCompletionPayload({ summary, checklist: CHECKLIST });
+  return { completion, result: resolveCompletionDelivery({ completion, fallbackSummary: completion.summary }) };
+}
+
+test('done path: mangled-prefix summary_human promotes full completion.summary', () => {
+  const result = resolveCompletionDelivery({
+    completion: { summary: alignFull, summary_human: alignMangled, checklist: CHECKLIST },
+    fallbackSummary: alignFull,
+  });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, alignFull);
+  assert.ok(result.deliveryText.includes('0.00s') && result.deliveryText.includes('344.25'), 'numbers must be intact in the promoted summary');
+});
+
+test('a report past the verbatim bound is still humanized with its decimals intact', () => {
+  // Past the bound the report falls back to summary_human, which used to
+  // split "0.00s" into "0. 00s" and "344.25" into "344. 25".
+  const appendix = ' Appendix: per-line drift table re-checked line by line for every one of the 241 cues, all inside 0.40s, with the same staging layout as round 7 and the same publish recipe. ';
+  const { result } = deliverDone(alignReport.summary + appendix.repeat(10));
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.includes('fixed to 0.00s drift') && result.deliveryText.includes('344.25 to 347.50'), result.deliveryText);
+  assert.ok(!result.deliveryText.includes('0. 00s'));
+});
+
+test('done path: a legacy summaryHuman payload promotes the full summary too', () => {
+  const result = resolveCompletionDelivery({
+    completion: { summary: alignFull, summaryHuman: alignMangled, checklist: CHECKLIST },
+  });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, alignFull);
+});
+
+test('sm-round8-align-fix: the full report reaches chat on the done and watcher paths', () => {
+  const { completion, result } = deliverDone(alignReport.summary);
+  assert.ok(completion.summary_human.length < alignReport.summary.length / 2, 'the producer still truncates this report');
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, alignReport.summary);
+
+  // The watcher's last reply has section labels but no final-report cue, so
+  // the agent's own --summary, delivered in full, stays authoritative.
+  const watcher = resolveCompletionDelivery({ lastReply: alignReport.lastReply, completion, fallbackSummary: completion.summary });
+  assert.equal(watcher.deliveryText, alignReport.summary);
+});
+
+test('done path: a synthetic technical rewrite in summary_human gives way to the full report', () => {
+  // sm-round8-fix stored the humanizer's technical rewrite: one fragment plus
+  // its stock follow-up sentences, 133 chars standing in for a 1,619-char report.
+  assert.ok(payload.completion.summary_human.endsWith('Future runs should be less likely to hit the same problem.'));
+  assert.ok(payload.completion.summary.length > 1500);
+  const result = resolveCompletionDelivery({
+    completion: payload.completion,
+    fallbackSummary: payload.completion.summary,
+  });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, payload.completion.summary);
+});
+
+test('done path: commit-style summaries keep their lead and the pushed sha at any length', () => {
+  // 12cb8d5 promoted these raw from about 309 chars up, and the
+  // "Checks: tests passed; pushed deadbee." line went with the lead.
+  const clauses = [
+    'fix(sync): retry the Health Auto Export import on 429 with backoff and jitter capped at 30s',
+    'guard the workouts.json parse against empty arrays and null dates',
+    'keep the last good fitness.db snapshot when an import fails mid-way',
+    'add focused tests for the retry, the empty-array guard and the snapshot fallback',
+  ];
+  const cases = {
+    'commit prefix, four clauses': clauses.join('; '),
+    'commit prefix, written as sentences': 'fix(sync): Retry the Health Auto Export import on 429 with backoff and jitter capped at 30s. Guard the workouts.json parse against empty arrays and null dates. Keep the last good fitness.db snapshot when an import fails mid-way. Add focused tests for the retry, the empty-array guard and the snapshot fallback. Verified on the live fitness.db snapshot.',
+    'file prefix, written as sentences': 'dispatch/completion.mjs: Made summary_human win over deliveryText for every completion. Moved details_technical into a separate block below the lead. Added focused tests for the payload-precedence regressions. Passed lastReply into resolveCompletionDelivery on the watcher path. Reused resolvedDelivery in hooks.mjs instead of resolving twice. Kept the claimCompletionDelivery dedupe between the two paths.',
+    'clause list without a prefix': 'make summary_human win over deliveryText for every completion; move details_technical into a separate block below the lead; add focused tests for the payload-precedence regressions; pass lastReply into resolveCompletionDelivery on the watcher path; reuse resolvedDelivery in hooks.mjs instead of resolving twice; keep the claimCompletionDelivery dedupe between the two paths; update the focused tests for the watcher and done paths',
+  };
+  assert.equal(cases['commit prefix, four clauses'].length, 309);
+  for (const [name, summary] of Object.entries(cases)) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.notEqual(result.source, 'completion-summary-full', `${name}: promoted raw`);
+    assert.ok(result.deliveryText.startsWith(completion.summary_human), `${name}: lost the lead`);
+    assert.ok(result.deliveryText.includes('Checks: tests passed; pushed deadbee.'), `${name}: lost the sha`);
+  }
+});
+
+test('done path: a promoted report keeps the checks line', () => {
+  const completion = { ...payload.completion, checklist: PUSHED_CHECKLIST, sha: SHA };
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, `${payload.completion.summary}\n\nChecks: tests passed; pushed deadbee.`);
+});
+
+test('done path: thin completion.summary does not trigger the full-summary path', () => {
+  const result = resolveCompletionDelivery({
+    completion: { summary_human: 'Work complete. Files changed.', summary: 'done', checklist: CHECKLIST },
+    fallbackSummary: 'done',
+  });
+  assert.notEqual(result.source, 'completion-summary-full');
+  assert.ok(result.deliveryText, 'still delivers something');
+});
+
+test('done path: promotion starts above 200 chars', () => {
+  // Fifteen short sentences and a count; the producer keeps the first five.
+  const items = Array.from({ length: 15 }, (_, i) => `Item ${i + 1} ok.`).join(' ');
+  const ofLength = (n) => `${items} Counted ${'9'.repeat(n - items.length - ' Counted  rows.'.length)} rows.`;
+  const atFloor = deliverDone(ofLength(200));
+  assert.equal(atFloor.result.source, 'summary_human');
+  assert.equal(atFloor.result.deliveryText, atFloor.completion.summary_human);
+  const overFloor = deliverDone(ofLength(201));
+  assert.equal(overFloor.result.source, 'completion-summary-full');
+  assert.equal(overFloor.result.deliveryText, ofLength(201));
+});
+
+test('done path: a humanized lead that keeps most of the report is delivered as it is', () => {
+  const phases = (n) => Array.from({ length: n }, (_, i) => `Phase ${i + 1} of the migration finished and its row counts matched production.`).join(' ');
+  // Six sentences: the producer keeps five, 83% of the report.
+  const most = deliverDone(phases(6));
+  assert.ok(most.completion.summary_human.length > phases(6).length * 0.6);
+  assert.equal(most.result.source, 'summary_human');
+  assert.equal(most.result.deliveryText, most.completion.summary_human);
+  // Ten sentences: the same five are half the report, so the report goes out.
+  const half = deliverDone(phases(10));
+  assert.ok(half.completion.summary_human.length < phases(10).length * 0.6);
+  assert.equal(half.result.source, 'completion-summary-full');
+  assert.equal(half.result.deliveryText, phases(10));
+});
+
+test('done path: machine output and over-long summaries are never delivered verbatim', () => {
+  const item = (i) => `{"id":${i},"name":"maintenance-task-${i}","state":"ok","note":"fine"}`;
+  const cases = {
+    'prose lead then a JSON blob': 'Finished the maintenance sweep. Output follows:\n{"results":[' + Array.from({ length: 30 }, (_, i) => item(i + 1)).join(','),
+    'JSON in an untagged code fence': '```\n{\n' + Array.from({ length: 40 }, (_, i) => `  "key${i}": "value number ${i}",`).join('\n') + '\n}\n```',
+    'raw log lines': Array.from({ length: 30 }, (_, i) => `2026-09-24T10:00:${String(i).padStart(2, '0')}Z INFO worker=${i} processed batch ${i} ok`).join('\n'),
+    'syslog lines': Array.from({ length: 30 }, (_, i) => `Oct  2 10:00:${String(i).padStart(2, '0')} kebab worker[4${i}]: processed batch ${i} ok in ${i * 3}ms`).join('\n'),
+    'time-only log lines': Array.from({ length: 30 }, (_, i) => `[10:00:${String(i).padStart(2, '0')}] INFO worker=${i} processed batch ${i} ok`).join('\n'),
+    'test-runner output': Array.from({ length: 40 }, (_, i) => `  ✔ completion delivery case ${i} handles the input shape (${(i * 1.7).toFixed(1)}ms)`).join('\n'),
+    'TAP output': Array.from({ length: 40 }, (_, i) => `ok ${i + 1} - completion delivery case ${i} handles the input shape and the fallback`).join('\n'),
+    'Python dict reprs': 'Sweep finished. Rows:\n' + Array.from({ length: 25 }, (_, i) => `{'id': ${i}, 'name': 'task-${i}', 'state': 'ok', 'note': 'fine'}`).join('\n'),
+    'KEY=value env dump': 'Deployed the worker with this environment:\n' + Array.from({ length: 20 }, (_, i) => `SERVICE_${i}_TOKEN=sk-live-${'A'.repeat(20)}${i}`).join('\n'),
+    'YAML': 'Applied the config:\n' + Array.from({ length: 30 }, (_, i) => `  job_${i}:\n    schedule: "*/5 * * * *"\n    enabled: true`).join('\n'),
+    'Python traceback': 'The nightly import failed and I could not recover it.\nTraceback (most recent call last):\n' + Array.from({ length: 12 }, (_, i) => `  File "/srv/app/importer/stage_${i}.py", line ${10 + i}, in run_stage_${i}\n    result = stage_${i + 1}(payload, retries=3)`).join('\n') + '\nKeyError: missing column order_id',
+    'Go panic': 'panic: runtime error: index out of range [3] with length 3\n\ngoroutine 1 [running]:\n' + Array.from({ length: 15 }, (_, i) => `main.stage${i}(0xc000012345, 0x3)\n\t/srv/app/main.go:${40 + i} +0x1d`).join('\n'),
+    '40 KB of prose': Array.from({ length: 550 }, (_, i) => `Step ${i + 1} finished and the output was checked against the expected values.`).join(' '),
+  };
+  for (const [name, summary] of Object.entries(cases)) {
+    const { result } = deliverDone(summary);
+    assert.notEqual(result.source, 'completion-summary-full', `${name}: promoted verbatim`);
+    assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `${name}: delivered ${result.deliveryText.length} chars`);
+  }
+});
+
+test('the verbatim bound counts bytes, so a non-ASCII report cannot outgrow one Telegram part', () => {
+  // 2,906 chars of Japanese are 8,670 UTF-8 bytes: three parts of 3,600 bytes.
+  const report = ['作業が完了しました。', '**項目1:** ' + '字幕のずれを修正しました。'.repeat(85), '**項目2:** ' + '欠落していた行を追加しました。'.repeat(75), '**再検証:** ' + '問題はありません。'.repeat(70), '以上です。'].join('\n');
+  assert.ok(report.length < MAX_VERBATIM_BYTES && Buffer.byteLength(report) > MAX_VERBATIM_BYTES);
+  const { result } = deliverDone(report);
+  assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `delivered ${Buffer.byteLength(result.deliveryText)} bytes`);
+});
+
+test('done path: a promoted report goes out without color codes or carriage returns', () => {
+  const prose = Array.from({ length: 14 }, (_, i) => `Step ${i + 1} finished and the output was checked against the expected values.`).join(' ');
+  const colored = deliverDone(`${prose} Final check: \u001b[32mPASS\u001b[0m on all 14 steps.`).result;
+  assert.equal(colored.source, 'completion-summary-full');
+  assert.equal(colored.deliveryText, `${prose} Final check: PASS on all 14 steps.`);
+
+  const crlf = deliverDone(prose.replace(/\. /g, '.\r\n')).result;
+  assert.equal(crlf.source, 'completion-summary-full');
+  assert.equal(crlf.deliveryText, prose.replace(/\. /g, '.\n'));
+
+  // Escapes other than color codes are terminal output, not a report.
+  const cursor = deliverDone(`${prose} \u001b[2KProgress: all steps done.`).result;
+  assert.notEqual(cursor.source, 'completion-summary-full');
+});
+
+test('done path: an agent-written "Technically:" split keeps its lead even when summary_human is a prefix', () => {
+  const lead = 'Fixed the planner so the next session is recommended after the last completed one.';
+  const { completion, result } = deliverDone(`${lead} Technically: mapped imported workout ids back to the program schedule, updated the focused progression tests, and verified on the live database snapshot that the last completed W2D4 now plans W2D5.`);
+  assert.equal(completion.summary_human, lead);
+  assert.notEqual(result.source, 'completion-summary-full');
+  assert.ok(result.deliveryText.startsWith(`${lead}\n\nTechnical details:`));
+  assert.ok(!result.deliveryText.includes('Technically:'), 'the raw marker must not reach chat');
+});
+
+test('done path: transport noise is never promoted verbatim', () => {
+  const noise = 'Auto-resolved as done: ' + Array.from({ length: 8 }, (_, i) => `Step ${i + 1} finished and the output was checked.`).join(' ');
+  const result = resolveCompletionDelivery({
+    completion: { summary: noise, summary_human: noise.slice(0, 120), checklist: CHECKLIST },
+  });
+  assert.notEqual(result.source, 'completion-summary-full');
+  assert.ok(!result.deliveryText.startsWith('Auto-resolved'));
+});
+
+test('raw JSON-ish summary without marker keys is not promoted (integration)', () => {
+  // P2 from the adversarial review: looksLikeRawPayloadText is a marker-key
+  // heuristic, so a truncated single-line JSON without marker keys slipped
+  // through and got promoted verbatim. Run it through the REAL producer
+  // (buildTerminalCompletionPayload) to pin the end-to-end shape.
+  const item = (i) => `{"id":${i},"name":"maintenance-task-${i}","state":"done","note":"ok"}`;
+  const truncatedJson = '{"results":[' + Array.from({ length: 30 }, (_, i) => item(i + 1)).join(',') + ']';
+  const payload = buildTerminalCompletionPayload({ summary: truncatedJson, checklist: { work_complete: true } });
+  const result = resolveCompletionDelivery({ completion: payload, fallbackSummary: truncatedJson });
+  // The P2 fix: a JSON-shaped summary (no marker keys) must NOT be promoted
+  // verbatim via the completion-summary-full path. (The summary_human fallback
+  // may still carry a JSON fragment - that is pre-existing behavior outside
+  // this PR's scope, guarded separately by looksLikeRawPayloadText.)
+  assert.notEqual(result.source, 'completion-summary-full', 'JSON-shaped summary must never be promoted verbatim');
+});
+
+test('no-cue multi-section report passes isLikelyHumanFinalReport (regression)', () => {
+  // Copilot comment on PR #53: the existing bold-label fixture contains cue
+  // words (Root cause / Files changed / Validation) so it is accepted by the
+  // earlier hasCue branch. This fixture uses 3+ neutral bold labels with no
+  // cue word and must pass through the new no-cue branch unchanged.
+  const report = [
+    'The work is complete.',
+    '',
+    '**Item 1 (7 SRT-offset lines):** 3 real offsets fixed to 0.00s drift.',
+    '',
+    '**Item 2 (32 missing-cue lines):** 16 got new 1:1 cues.',
+    '',
+    '**Re-verify:** gate_03s.py OK, P1 max drift 0.36s.',
+    '',
+    '**Staged** in the workdir: srt 241 cues, aac v10.',
+  ].join('\n');
+  const humanized = humanizeCompletionText(report);
+  assert.equal(humanized, report, 'no-cue report with 3+ bold-label sections must pass through unmodified');
+});
+
+test('cue-less section labels need five lines to pass through as written', () => {
+  const fourLines = [
+    'Round-9 subtitle pass is finished.',
+    '**Item 1:** 4 offsets fixed to 0.00s drift.',
+    '**Item 2:** 9 missing cues added 1:1.',
+    '**Re-verify:** gate_03s.py OK, max drift 0.31s.',
+  ].join('\n');
+  const fiveLines = `${fourLines}\nStaged in the covfix workdir.`;
+  assert.notEqual(deliverDone(fourLines).result.deliveryText, fourLines);
+  assert.equal(deliverDone(fiveLines).result.deliveryText, fiveLines);
+});
+
+test('cue-less section labels do not pass dumps, stack traces or JSON through verbatim', () => {
+  const dump = ['**Alpha**: x', '**Bravo**: y', '**Charlie**: z', ...Array.from({ length: 2000 }, (_, i) => `line ${i} of a long dump`)].join('\n');
+  const { result } = deliverDone(dump);
+  assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `delivered ${result.deliveryText.length} chars`);
+
+  const stackTrace = '**Error**: TypeError: x is undefined\n**Stack**:\n    at foo (/srv/app/a.js:1:2)\n    at bar (/srv/app/b.js:3:4)\n**Context**: watcher';
+  const jsonLines = '**out**: {"a":1}\n**err**: {"b":2}\n**raw**: {"c":3}\nx\ny';
+  const logLines = ['**stdout**:', ...Array.from({ length: 20 }, (_, i) => `Oct  2 10:00:${String(i).padStart(2, '0')} kebab worker[4${i}]: batch ${i} ok`), '**stderr**:', 'warn: slow disk', '**exit**: 0'].join('\n');
+  assert.notEqual(humanizeCompletionText(stackTrace), stackTrace);
+  assert.notEqual(humanizeCompletionText(jsonLines), jsonLines);
+  assert.notEqual(humanizeCompletionText(logLines), logLines);
+});
+
+test('watcher path: a cue-less status reply does not replace the agent\'s own --summary', () => {
+  const statusReply = '**Status:** still running\n**Next:** will check logs\n**ETA:** 10 min\nWorking on it.\nMore soon.';
+  const summary = 'Migrated the billing tables and verified row counts match production.';
+  const completion = buildTerminalCompletionPayload({ summary, checklist: CHECKLIST });
+  const result = resolveCompletionDelivery({ lastReply: statusReply, completion });
+  assert.equal(result.source, 'summary_human');
+  assert.equal(result.deliveryText, summary);
+
+  // Without a structured completion the reply is all there is, delivered as written.
+  const replyOnly = resolveCompletionDelivery({ lastReply: statusReply, completion: null });
+  assert.equal(replyOnly.source, 'lastReply');
+  assert.equal(replyOnly.deliveryText, statusReply);
 });
