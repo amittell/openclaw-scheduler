@@ -185,6 +185,7 @@ test('done path: commit-style summaries keep their lead and the pushed sha at an
   const cases = {
     'commit prefix, four clauses': clauses.join('; '),
     'commit prefix, written as sentences': 'fix(sync): Retry the Health Auto Export import on 429 with backoff and jitter capped at 30s. Guard the workouts.json parse against empty arrays and null dates. Keep the last good fitness.db snapshot when an import fails mid-way. Add focused tests for the retry, the empty-array guard and the snapshot fallback. Verified on the live fitness.db snapshot.',
+    'file prefix, written as sentences': 'dispatch/completion.mjs: Made summary_human win over deliveryText for every completion. Moved details_technical into a separate block below the lead. Added focused tests for the payload-precedence regressions. Passed lastReply into resolveCompletionDelivery on the watcher path. Reused resolvedDelivery in hooks.mjs instead of resolving twice. Kept the claimCompletionDelivery dedupe between the two paths.',
     'clause list without a prefix': 'make summary_human win over deliveryText for every completion; move details_technical into a separate block below the lead; add focused tests for the payload-precedence regressions; pass lastReply into resolveCompletionDelivery on the watcher path; reuse resolvedDelivery in hooks.mjs instead of resolving twice; keep the claimCompletionDelivery dedupe between the two paths; update the focused tests for the watcher and done paths',
   };
   assert.equal(cases['commit prefix, four clauses'].length, 309);
@@ -211,6 +212,32 @@ test('done path: thin completion.summary does not trigger the full-summary path'
   });
   assert.notEqual(result.source, 'completion-summary-full');
   assert.ok(result.deliveryText, 'still delivers something');
+});
+
+test('done path: promotion starts above 200 chars', () => {
+  // Fifteen short sentences and a count; the producer keeps the first five.
+  const items = Array.from({ length: 15 }, (_, i) => `Item ${i + 1} ok.`).join(' ');
+  const ofLength = (n) => `${items} Counted ${'9'.repeat(n - items.length - ' Counted  rows.'.length)} rows.`;
+  const atFloor = deliverDone(ofLength(200));
+  assert.equal(atFloor.result.source, 'summary_human');
+  assert.equal(atFloor.result.deliveryText, atFloor.completion.summary_human);
+  const overFloor = deliverDone(ofLength(201));
+  assert.equal(overFloor.result.source, 'completion-summary-full');
+  assert.equal(overFloor.result.deliveryText, ofLength(201));
+});
+
+test('done path: a humanized lead that keeps most of the report is delivered as it is', () => {
+  const phases = (n) => Array.from({ length: n }, (_, i) => `Phase ${i + 1} of the migration finished and its row counts matched production.`).join(' ');
+  // Six sentences: the producer keeps five, 83% of the report.
+  const most = deliverDone(phases(6));
+  assert.ok(most.completion.summary_human.length > phases(6).length * 0.6);
+  assert.equal(most.result.source, 'summary_human');
+  assert.equal(most.result.deliveryText, most.completion.summary_human);
+  // Ten sentences: the same five are half the report, so the report goes out.
+  const half = deliverDone(phases(10));
+  assert.ok(half.completion.summary_human.length < phases(10).length * 0.6);
+  assert.equal(half.result.source, 'completion-summary-full');
+  assert.equal(half.result.deliveryText, phases(10));
 });
 
 test('done path: machine output and over-long summaries are never delivered verbatim', () => {
@@ -312,6 +339,18 @@ test('no-cue multi-section report passes isLikelyHumanFinalReport (regression)',
   ].join('\n');
   const humanized = humanizeCompletionText(report);
   assert.equal(humanized, report, 'no-cue report with 3+ bold-label sections must pass through unmodified');
+});
+
+test('cue-less section labels need five lines to pass through as written', () => {
+  const fourLines = [
+    'Round-9 subtitle pass is finished.',
+    '**Item 1:** 4 offsets fixed to 0.00s drift.',
+    '**Item 2:** 9 missing cues added 1:1.',
+    '**Re-verify:** gate_03s.py OK, max drift 0.31s.',
+  ].join('\n');
+  const fiveLines = `${fourLines}\nStaged in the covfix workdir.`;
+  assert.notEqual(deliverDone(fourLines).result.deliveryText, fourLines);
+  assert.equal(deliverDone(fiveLines).result.deliveryText, fiveLines);
 });
 
 test('cue-less section labels do not pass dumps, stack traces or JSON through verbatim', () => {
