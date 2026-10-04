@@ -160,10 +160,13 @@ test('sm-round8-align-fix: the full report reaches chat on the done and watcher 
   assert.equal(watcher.deliveryText, alignReport.summary);
 });
 
-test('done path: a synthetic technical rewrite in summary_human gives way to the full report', () => {
-  // sm-round8-fix stored the humanizer's technical rewrite: one fragment plus
-  // its stock follow-up sentences, 133 chars standing in for a 1,619-char report.
-  assert.ok(payload.completion.summary_human.endsWith('Future runs should be less likely to hit the same problem.'));
+test('done path: a lossy summary_human gives way to the full report', () => {
+  // sm-round8-fix once stored the humanizer's technical rewrite: one fragment
+  // plus its stock follow-up sentences, 133 chars standing in for a 1,619-char
+  // report. The boilerplate family is removed; the stored lead is now the real
+  // condensed content (a truncation of the report), and the full report still
+  // wins on the done path.
+  assert.ok(payload.completion.summary_human.length < payload.completion.summary.length / 2);
   assert.ok(payload.completion.summary.length > 1500);
   const result = resolveCompletionDelivery({
     completion: payload.completion,
@@ -378,6 +381,164 @@ test('watcher path: a cue-less status reply does not replace the agent\'s own --
   const replyOnly = resolveCompletionDelivery({ lastReply: statusReply, completion: null });
   assert.equal(replyOnly.source, 'lastReply');
   assert.equal(replyOnly.deliveryText, statusReply);
+});
+
+test('humanizeCompletionText never emits the removed boilerplate family', () => {
+  // The generic themed filler ("The requested fix is in place.", "That should
+  // make the workflow more reliable.", "Final completion updates now start
+  // with a short plain-English summary.", ...) must not reach chat. The
+  // humanized lead for a technical summary is the real condensed content.
+  const boilerplate = [
+    'The requested fix is in place.',
+    'The requested behavior is now in place.',
+    'The update is in place.',
+    'Added focused coverage for the weak spot.',
+    'That makes the behavior easier to trust.',
+    'Future regressions should get caught quickly.',
+    'That should make the workflow more reliable.',
+    'Future runs should be less likely to hit the same problem.',
+    'That makes the new behavior available without extra follow-up.',
+    'Future runs should use it automatically.',
+    'That should make the result easier to work with.',
+    'Future runs should reflect the change automatically.',
+    'Final completion updates now arrive as one clean plain-English summary.',
+    'Final completion updates now start with a short plain-English summary.',
+    'That makes the result easier to scan and avoids noisy repeat messages.',
+    'That makes the result easier to read without hiding the useful detail.',
+    'That makes the result easier to scan without hiding the useful detail.',
+    'Future runs should show the clean summary first, with technical details underneath when needed.',
+  ];
+  const technicalSummaries = [
+    'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
+    'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions',
+    payload.completion.summary,
+    'Add focused tests for the retry, the empty-array guard and the snapshot fallback',
+  ];
+  for (const summary of technicalSummaries) {
+    const humanized = humanizeCompletionText(summary);
+    assert.ok(humanized, `must stay non-empty for ${summary.slice(0, 40)}`);
+    for (const sentence of boilerplate) {
+      assert.ok(!humanized.includes(sentence), `boilerplate leaked: ${sentence}`);
+    }
+  }
+});
+
+test('done path: an explicit human summary embedded in the report keeps precedence over the full report', () => {
+  // Copilot finding: the embedded-substring rule must NOT promote the full
+  // report when summary_human is an explicit human-written summary that merely
+  // happens to appear in the longer report. It is a machine derivative only
+  // when the humanizer reproduces it verbatim from the report.
+  const explicitHuman = 'Resolved the duplicate billing notifications.';
+  const report = 'Investigated the billing pipeline. ' + explicitHuman
+    + ' The fix rewrites the dedup key and adds a regression test. Verified against the last 30 days of transactions and the outbox now sends one message per event.';
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: explicitHuman,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true, tests_passed: true } },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'summary_human', 'explicit human summary wins, not completion-summary-full');
+  assert.ok(result.deliveryText.startsWith(explicitHuman), 'the explicit concise summary is delivered first');
+});
+
+test('done path: a machine-derivative lead embedded in the report still gives way to the full report', () => {
+  // The sm-round8-fix class: summary_human is exactly what the humanizer
+  // produces from the report (a fragment lead), so the full report wins.
+  const report = payload.completion.summary;
+  const machineLead = humanizeCompletionText(report);
+  assert.ok(machineLead && machineLead.length < report.length / 2, 'fixture lead is a short machine derivative');
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: machineLead,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true, tests_passed: true } },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'completion-summary-full', 'machine derivative promotes the full report');
+  assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
+});
+
+test('humanizeCompletionText caps a long single-clause technical lead at the delivery length', () => {
+  // Codex finding: a long single-clause summary (file prefix + thousands of
+  // chars, no delimiter) used to bypass the 700-char cap once the fragment
+  // lead returned directly. The outbox must not split it into many messages.
+  const longClause = 'src/foo.js: ' + 'plain english explanation of what changed and why it matters for the operator '.repeat(40);
+  const humanized = humanizeCompletionText(longClause);
+  assert.ok(humanized, 'must stay non-empty');
+  assert.ok(humanized.length <= 700, `fragment lead must respect the 700-char cap, got ${humanized.length}`);
+});
+
+test('known limitation: the fragment lead uses only the first two fragments', () => {
+  // The humanizer picks the first two plain-English fragments (selection must
+  // stay stable so the machine-derivative gate can reproduce the stored lead
+  // verbatim). A meaningful clause past the second fragment is dropped from
+  // the lead. Pins the current behavior.
+  const report = 'fix(db): corrected pool sizing in shard 0; updated backoff constants in the retry loop; the nightly load no longer starves the read replica during peak';
+  const lead = humanizeCompletionText(report);
+  assert.equal(lead, 'Corrected pool sizing in shard 0 and updated backoff constants in the retry loop.');
+  assert.ok(!lead.includes('starves the read replica'), 'the third-fragment clause is not in the lead');
+});
+
+test('known limitation: the gate is exact-reproduction, so a drifted machine lead is not promoted', () => {
+  // isLossyHumanizedLead only promotes a machine-derivative lead when the
+  // humanizer reproduces the stored summary_human verbatim from the report.
+  // A lead that differs by one character (e.g. stored by an older humanizer
+  // revision) is not a prefix, not embedded, and not a legacy synthetic
+  // rewrite, so the lossy-lead rules do not fire and the stored lead is
+  // delivered as-is. Pins the current behavior.
+  const report = payload.completion.summary;
+  const realLead = humanizeCompletionText(report);
+  assert.ok(realLead, 'the fixture report produces a machine lead');
+  const drifted = `${realLead.slice(0, -1)}x.`;
+  assert.notEqual(drifted, realLead);
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: drifted,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true } },
+      checklist: { work_complete: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'summary_human', 'a drifted machine lead keeps summary_human precedence');
+  assert.ok(result.deliveryText.startsWith(drifted), 'the drifted lead is delivered as stored');
+});
+
+test('legacy payloads: a pre-removal boilerplate summary_human still promotes the full report', () => {
+  // Payloads written before the boilerplate family was removed store a lead
+  // like "Md5 032cde47 (stale round-7). That should make the workflow more
+  // reliable. ...". The recognition list (SYNTHETIC_FOLLOW_UPS) must keep
+  // promoting the full report for those stored payloads.
+  const report = payload.completion.summary;
+  const legacyLead = 'Md5 032cde47 (stale round-7). That should make the workflow more reliable. Future runs should be less likely to hit the same problem.';
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: legacyLead,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true } },
+      checklist: { work_complete: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'completion-summary-full', 'legacy boilerplate lead gives way to the full report');
+  assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
 });
 
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
