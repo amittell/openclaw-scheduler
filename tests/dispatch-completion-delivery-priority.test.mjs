@@ -395,6 +395,10 @@ test('the humanized lead splits only at sentence ends, so dotted tokens and clos
     'ellipsis without a space': ['Waited...then retried the push.'],
     'closing quote': ['The reviewer wrote "Done."', 'Next we merged it.'],
     'closing bracket': ['(See the log above.)', 'Then retry the job.'],
+    'curly double quote': ['The reviewer wrote “Done.”', 'Next we merged it.'],
+    'curly single quote': ['The note said ‘ship it.’', 'Then we shipped.'],
+    'square bracket': ['[See the log above.]', 'Then retry the job.'],
+    'curly brace': ['{Checked the config.}', 'Then reloaded it.'],
   };
   for (const [name, lead] of Object.entries(cases)) {
     const sentences = [...lead, ...more];
