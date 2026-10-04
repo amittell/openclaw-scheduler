@@ -6958,7 +6958,7 @@ console.log('\n-- Completion payload helpers --');
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: helperSha,
   });
-  const expectedTechnicalLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
+  const expectedTechnicalLead = 'Cleaned up how the final completion message is delivered.';
   assert(humanizedTechnicalPayload.summary_human === expectedTechnicalLead, 'completion helper: technical commit-style summary gets a plain-English lead');
   assert(humanizedTechnicalPayload.summary === technicalCommitSummary, 'completion helper: technical commit-style payload preserves the authoritative raw summary');
   assert(!humanizedTechnicalPayload.summary_human.includes('fix(dispatch):'), 'completion helper: humanized summary does not leak commit-style prefix');
@@ -6979,7 +6979,7 @@ console.log('\n-- Completion payload helpers --');
     summary: weakTechnicalLeadSummary,
     checklist: { work_complete: true, tests_passed: true },
   });
-  const expectedWeakLead = 'Final completion updates now start with a short plain-English summary. That makes the result easier to scan without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.';
+  const expectedWeakLead = 'Move technical details into a separate block.';
   assert(weakTechnicalLeadPayload.summary_human === expectedWeakLead, 'completion helper: weak technical lead is rewritten into plain English first');
   assert(weakTechnicalLeadPayload.summary === weakTechnicalLeadSummary, 'completion helper: weak technical lead payload preserves the authoritative raw summary');
   assert(!/dispatch\/completion\.mjs|summary_human|deliveryText|details_technical|payload-precedence/.test(weakTechnicalLeadPayload.summary_human), 'completion helper: plain-English lead strips filenames and internal implementation terms');
@@ -6994,30 +6994,20 @@ console.log('\n-- Completion payload helpers --');
   assert(weakTechnicalLeadDelivery.deliveryText && weakTechnicalLeadDelivery.deliveryText.includes('make summary_human win over deliveryText'), 'completion helper: rewritten plain-English lead still surfaces the core technical fix');
 
   const sportsBacktestRawSummary = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+  const sportsBacktestPayload = buildTerminalCompletionPayload({
+    summary: sportsBacktestRawSummary,
+    checklist: { work_complete: true, tests_passed: true },
+  });
   const sportsBacktestMetaDelivery = resolveCompletionDelivery({
     lastReply: null,
-    completion: {
-      version: 2,
-      summary_human: expectedTechnicalLead,
-      summary: expectedTechnicalLead,
-      deliveryText: expectedTechnicalLead,
-      prose: expectedTechnicalLead,
-      details_technical: {
-        checklist: { work_complete: true, tests_passed: true },
-        raw_summary: sportsBacktestRawSummary,
-      },
-      checklist: { work_complete: true, tests_passed: true },
-      debug: {
-        rawSummary: sportsBacktestRawSummary,
-        normalizedSummary: expectedTechnicalLead,
-        deliverySource: 'summary_human',
-      },
-    },
+    completion: sportsBacktestPayload,
     fallbackSummary: 'completed (agent signal)',
   });
   assert(sportsBacktestMetaDelivery.source === 'summary_human', 'completion helper: explicit summary_human beats raw task artifact');
-  assert(sportsBacktestMetaDelivery.deliveryText === expectedTechnicalLead, 'completion helper: explicit summary_human is delivered instead of raw_summary');
-  assert(!sportsBacktestMetaDelivery.deliveryText.includes('Ran one-year sports betting model validation'), 'completion helper: raw task artifact is suppressed when summary_human exists');
+  assert(sportsBacktestMetaDelivery.deliveryText.startsWith(sportsBacktestPayload.summary_human), 'completion helper: the stored summary_human is delivered first instead of the raw artifact');
+  assert(sportsBacktestMetaDelivery.deliveryText.includes('Checks: tests passed.'), 'completion helper: the checks line stays with the delivery');
+  assert(sportsBacktestMetaDelivery.deliveryText.includes('one-year sports betting model validation'), 'completion helper: the technical lead carries the real condensed content');
+  assert(!sportsBacktestMetaDelivery.deliveryText.includes('Final completion updates now'), 'completion helper: no boilerplate lead for a technical summary');
 
   const fitnessStyleWeakSummary = 'Fixed the Tonal planner so it now treats saved current_tonal_week/current_tonal_day as the last completed Tonal session and recommends the next scheduled session instead of repeating the completed one. Technically: mapped imported Tonal workoutId values back to tonal_program_schedule, updated focused progression tests, verified on the live fitness.db snapshot that last completed W2D4 now plans next W2D5, and confirmed the missing Apple Health walk is source-side because the synced Health Auto Export data contains zero workout objects/workouts.json count 0.';
   const expectedFitnessLead = "Fixed the Tonal planner so it now treats your saved progress as the last completed Tonal session and recommends the next scheduled session instead of repeating the one you already finished. I also checked the missing Apple Health walk, and the source export is empty right now, so there isn't anything new to import yet.";
@@ -9616,7 +9606,7 @@ console.log('\n-- Post-Office Routing: dispatch completion watcher + announce pa
     summary: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     checklist: { work_complete: true, tests_passed: true, pushed: true },
     sha: repoSha,
-    expectedDeliveryText: 'Final completion updates now start with a short plain-English summary. That makes the result easier to read without hiding the useful detail. Future runs should show the clean summary first, with technical details underneath when needed.',
+    expectedDeliveryText: 'Cleaned up how the final completion message is delivered.',
     expectedTechnicalDetailsText: 'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
     expectEnqueued: true,
   });

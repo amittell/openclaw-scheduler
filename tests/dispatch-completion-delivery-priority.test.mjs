@@ -160,10 +160,13 @@ test('sm-round8-align-fix: the full report reaches chat on the done and watcher 
   assert.equal(watcher.deliveryText, alignReport.summary);
 });
 
-test('done path: a synthetic technical rewrite in summary_human gives way to the full report', () => {
-  // sm-round8-fix stored the humanizer's technical rewrite: one fragment plus
-  // its stock follow-up sentences, 133 chars standing in for a 1,619-char report.
-  assert.ok(payload.completion.summary_human.endsWith('Future runs should be less likely to hit the same problem.'));
+test('done path: a lossy summary_human gives way to the full report', () => {
+  // sm-round8-fix once stored the humanizer's technical rewrite: one fragment
+  // plus its stock follow-up sentences, 133 chars standing in for a 1,619-char
+  // report. The boilerplate family is removed; the stored lead is now the real
+  // condensed content (a truncation of the report), and the full report still
+  // wins on the done path.
+  assert.ok(payload.completion.summary_human.length < payload.completion.summary.length / 2);
   assert.ok(payload.completion.summary.length > 1500);
   const result = resolveCompletionDelivery({
     completion: payload.completion,
@@ -378,6 +381,46 @@ test('watcher path: a cue-less status reply does not replace the agent\'s own --
   const replyOnly = resolveCompletionDelivery({ lastReply: statusReply, completion: null });
   assert.equal(replyOnly.source, 'lastReply');
   assert.equal(replyOnly.deliveryText, statusReply);
+});
+
+test('humanizeCompletionText never emits the removed boilerplate family', () => {
+  // The generic themed filler ("The requested fix is in place.", "That should
+  // make the workflow more reliable.", "Final completion updates now start
+  // with a short plain-English summary.", ...) must not reach chat. The
+  // humanized lead for a technical summary is the real condensed content.
+  const boilerplate = [
+    'The requested fix is in place.',
+    'The requested behavior is now in place.',
+    'The update is in place.',
+    'Added focused coverage for the weak spot.',
+    'That makes the behavior easier to trust.',
+    'Future regressions should get caught quickly.',
+    'That should make the workflow more reliable.',
+    'Future runs should be less likely to hit the same problem.',
+    'That makes the new behavior available without extra follow-up.',
+    'Future runs should use it automatically.',
+    'That should make the result easier to work with.',
+    'Future runs should reflect the change automatically.',
+    'Final completion updates now arrive as one clean plain-English summary.',
+    'Final completion updates now start with a short plain-English summary.',
+    'That makes the result easier to scan and avoids noisy repeat messages.',
+    'That makes the result easier to read without hiding the useful detail.',
+    'That makes the result easier to scan without hiding the useful detail.',
+    'Future runs should show the clean summary first, with technical details underneath when needed.',
+  ];
+  const technicalSummaries = [
+    'fix(dispatch): normalize completion delivery; add watcher tests; preserve structured completion summary',
+    'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions',
+    payload.completion.summary,
+    'Add focused tests for the retry, the empty-array guard and the snapshot fallback',
+  ];
+  for (const summary of technicalSummaries) {
+    const humanized = humanizeCompletionText(summary);
+    assert.ok(humanized, `must stay non-empty for ${summary.slice(0, 40)}`);
+    for (const sentence of boilerplate) {
+      assert.ok(!humanized.includes(sentence), `boilerplate leaked: ${sentence}`);
+    }
+  }
 });
 
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
