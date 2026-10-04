@@ -423,6 +423,62 @@ test('humanizeCompletionText never emits the removed boilerplate family', () => 
   }
 });
 
+test('done path: an explicit human summary embedded in the report keeps precedence over the full report', () => {
+  // Copilot finding: the embedded-substring rule must NOT promote the full
+  // report when summary_human is an explicit human-written summary that merely
+  // happens to appear in the longer report. It is a machine derivative only
+  // when the humanizer reproduces it verbatim from the report.
+  const explicitHuman = 'Resolved the duplicate billing notifications.';
+  const report = 'Investigated the billing pipeline. ' + explicitHuman
+    + ' The fix rewrites the dedup key and adds a regression test. Verified against the last 30 days of transactions and the outbox now sends one message per event.';
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: explicitHuman,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true, tests_passed: true } },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'summary_human', 'explicit human summary wins, not completion-summary-full');
+  assert.ok(result.deliveryText.startsWith(explicitHuman), 'the explicit concise summary is delivered first');
+});
+
+test('done path: a machine-derivative lead embedded in the report still gives way to the full report', () => {
+  // The sm-round8-fix class: summary_human is exactly what the humanizer
+  // produces from the report (a fragment lead), so the full report wins.
+  const report = payload.completion.summary;
+  const machineLead = humanizeCompletionText(report);
+  assert.ok(machineLead && machineLead.length < report.length / 2, 'fixture lead is a short machine derivative');
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: machineLead,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true, tests_passed: true } },
+      checklist: { work_complete: true, tests_passed: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'completion-summary-full', 'machine derivative promotes the full report');
+  assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
+});
+
+test('humanizeCompletionText caps a long single-clause technical lead at the delivery length', () => {
+  // Codex finding: a long single-clause summary (file prefix + thousands of
+  // chars, no delimiter) used to bypass the 700-char cap once the fragment
+  // lead returned directly. The outbox must not split it into many messages.
+  const longClause = 'src/foo.js: ' + 'plain english explanation of what changed and why it matters for the operator '.repeat(40);
+  const humanized = humanizeCompletionText(longClause);
+  assert.ok(humanized, 'must stay non-empty');
+  assert.ok(humanized.length <= 700, `fragment lead must respect the 700-char cap, got ${humanized.length}`);
+});
+
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
   // Each case runs past five sentences, so the producer cuts it to the first
   // five. A split inside a token rejoins as "dub_eng_v9. aac"; a split before

@@ -808,14 +808,23 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
   const sourceFragments = primaryFragments.length > 0 ? primaryFragments : fragments;
 
+  // Fragment-based lead: the first two plain-English fragments. The selection
+  // must stay stable -- the machine-derivative gate in isLossyHumanizedLead
+  // reproduces the stored lead verbatim from the report, so changing which
+  // fragments are picked would change the stored lead for every such payload.
+  // (A plain-English clause that only appears past the first two fragments is
+  // a known limitation; the fallback below still delivers real content.) The
+  // fragment lead is a user-facing notification, so keep it within the
+  // delivery-length cap (a single long clause with no delimiter is otherwise
+  // unbounded).
   const chosen = sourceFragments
     .slice(0, 2)
     .map(fragment => toPastTenseFragment(fragment))
     .filter(Boolean)
     .filter(fragment => isPlainEnglishLeadText(fragment));
 
-  if (chosen.length === 1) return asSentence(chosen[0]);
-  if (chosen.length >= 2) return `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
+  if (chosen.length === 1) return truncateText(asSentence(chosen[0]), MAX_DELIVERY_CHARS);
+  if (chosen.length >= 2) return truncateText(`${chosen[0]} and ${lowerFirst(chosen[1])}.`, MAX_DELIVERY_CHARS);
   if (fallback && isPlainEnglishLeadText(fallback)) return asSentence(fallback);
   return fallback || null;
 }
@@ -1350,8 +1359,14 @@ function isLossyHumanizedLead(summary, summaryHuman) {
   if (strippedSummary.startsWith(strippedHuman)) return true;
   // A fragment-based lead the humanizer wrote from a clause of a prose report
   // (e.g. "Md5 032cde47 (stale round-7)." for a 1,619-char report) is embedded
-  // in the report, not a prefix: it is a lossy derivative too.
-  if (strippedHuman.length >= 15 && isProseReport(summary) && strippedSummary.includes(strippedHuman)) return true;
+  // in the report, not a prefix: it is a lossy derivative too. Gate this on the
+  // stored summary_human being a machine derivative of THIS report -- i.e. the
+  // humanizer reproduces it verbatim from the report. An explicit human summary
+  // that merely happens to appear in the report is not a derivative and keeps
+  // its precedence (it is not reproduced verbatim by the humanizer).
+  const machineDerivative = isProseReport(summary)
+    && humanizeCompletionText(summary) === summaryHuman;
+  if (strippedHuman.length >= 15 && machineDerivative && strippedSummary.includes(strippedHuman)) return true;
   return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
 }
 
