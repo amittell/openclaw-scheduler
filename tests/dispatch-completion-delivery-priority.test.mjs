@@ -479,6 +479,68 @@ test('humanizeCompletionText caps a long single-clause technical lead at the del
   assert.ok(humanized.length <= 700, `fragment lead must respect the 700-char cap, got ${humanized.length}`);
 });
 
+test('known limitation: the fragment lead uses only the first two fragments', () => {
+  // The humanizer picks the first two plain-English fragments (selection must
+  // stay stable so the machine-derivative gate can reproduce the stored lead
+  // verbatim). A meaningful clause past the second fragment is dropped from
+  // the lead. Pins the current behavior.
+  const report = 'fix(db): corrected pool sizing in shard 0; updated backoff constants in the retry loop; the nightly load no longer starves the read replica during peak';
+  const lead = humanizeCompletionText(report);
+  assert.equal(lead, 'Corrected pool sizing in shard 0 and updated backoff constants in the retry loop.');
+  assert.ok(!lead.includes('starves the read replica'), 'the third-fragment clause is not in the lead');
+});
+
+test('known limitation: the gate is exact-reproduction, so a drifted machine lead is not promoted', () => {
+  // isLossyHumanizedLead only promotes a machine-derivative lead when the
+  // humanizer reproduces the stored summary_human verbatim from the report.
+  // A lead that differs by one character (e.g. stored by an older humanizer
+  // revision) is not a prefix, not embedded, and not a legacy synthetic
+  // rewrite, so the lossy-lead rules do not fire and the stored lead is
+  // delivered as-is. Pins the current behavior.
+  const report = payload.completion.summary;
+  const realLead = humanizeCompletionText(report);
+  assert.ok(realLead, 'the fixture report produces a machine lead');
+  const drifted = `${realLead.slice(0, -1)}x.`;
+  assert.notEqual(drifted, realLead);
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: drifted,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true } },
+      checklist: { work_complete: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'summary_human', 'a drifted machine lead keeps summary_human precedence');
+  assert.ok(result.deliveryText.startsWith(drifted), 'the drifted lead is delivered as stored');
+});
+
+test('legacy payloads: a pre-removal boilerplate summary_human still promotes the full report', () => {
+  // Payloads written before the boilerplate family was removed store a lead
+  // like "Md5 032cde47 (stale round-7). That should make the workflow more
+  // reliable. ...". The recognition list (SYNTHETIC_FOLLOW_UPS) must keep
+  // promoting the full report for those stored payloads.
+  const report = payload.completion.summary;
+  const legacyLead = 'Md5 032cde47 (stale round-7). That should make the workflow more reliable. Future runs should be less likely to hit the same problem.';
+  const result = resolveCompletionDelivery({
+    lastReply: null,
+    completion: {
+      version: 2,
+      summary_human: legacyLead,
+      summary: report,
+      details_technical: { raw_summary: report, checklist: { work_complete: true } },
+      checklist: { work_complete: true },
+      debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' },
+    },
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert.equal(result.source, 'completion-summary-full', 'legacy boilerplate lead gives way to the full report');
+  assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
+});
+
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
   // Each case runs past five sentences, so the producer cuts it to the first
   // five. A split inside a token rejoins as "dub_eng_v9. aac"; a split before
