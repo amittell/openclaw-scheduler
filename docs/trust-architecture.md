@@ -294,11 +294,29 @@ envelope. The canonical payload binds the immutable artifact, runtime instance,
 exact lineage, identity, proof, authorization, command result, structured
 output, postcondition, and terminal status. The selected provider must sign or
 externally verify the payload when verification is required. SSH evidence uses
-`ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the declared principal and
-allowed signers. Required evidence is never silently downgraded to the checksum
-backend. For `ssh` evidence, re-verification reads the principal and the
-allowed-signers path from the evidence row; the recorded path takes precedence
-over `AGENTCLI_ALLOWED_SIGNERS`. Both are database values.
+`ssh-keygen -Y sign` and `ssh-keygen -Y verify`. Required evidence is never
+silently downgraded to the checksum backend.
+
+`ssh-keygen -Y verify` accepts any key that the allowed-signers file lists for
+the principal, so that file is the trust anchor for `ssh` evidence, and only
+the operator chooses it. The dispatcher when it signs, and the CLI when
+`runs evidence` or `doctor` re-verifies, use the file that
+`AGENTCLI_ALLOWED_SIGNERS` names in their own environment. The evidence row
+records the path it was signed against, and a declaration's
+`provider_config` can name one, but both are database values: such a path is
+used only when the operator lists it in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS`,
+absolute paths separated by the platform path delimiter (`:` on macOS and
+Linux); relative entries are ignored with a warning. A listed file is trusted
+for every key in it and for every row that names it, so it belongs in the list
+only if the operator created it and still trusts every key in it. A recorded
+path the operator does not recognize, or the scheduler database itself, is a
+sign of a forged row, not a file to list. With neither configured, `ssh`
+evidence fails closed with `EVIDENCE_TRUST_NOT_CONFIGURED`, and `doctor`
+counts those rows separately as `trust_not_configured`. The principal still comes from the row; it
+selects among the keys that the trusted file lists. `runs evidence` reports
+`integrity.trust_source`: `operator` for `AGENTCLI_ALLOWED_SIGNERS`,
+`operator-listed-recorded-path` for a listed recorded path, and `provider` for
+a plugin, whose `verify()` makes its own trust decision.
 
 An evidence plugin from `SCHEDULER_PROVIDER_PATH` can sign with another method.
 It carries any public verification material, such as a key id, public key, or
@@ -310,18 +328,19 @@ must decide whom to trust from inputs outside the database, such as a key
 fingerprint allowlist in its own configuration or environment, a KMS key it
 resolves itself, or a Sigstore identity and issuer policy, and use envelope
 material only to select among keys that policy already trusts. That protects
-the plugin's own rows. It does not stop a database writer from inserting a row
-that names another provider, including `ssh`, whose principal and
-allowed-signers path the row also supplies.
+the plugin's own rows. A database writer can still insert a row that names
+another provider: an `ssh` row then verifies only against an allowed-signers
+file the operator trusts, and a row that names a plugin whose `verify()` does
+not pin trust is not detected.
 
 `openclaw-scheduler runs evidence RUN_ID --json` reconstructs the persisted
 execution input and re-verifies the cryptographic envelope. Payload, artifact,
 or execution transplant tampering that leaves the row inconsistent exits
 nonzero, and so does any change the signature covers. A self-consistent row
 written by someone with write access to the scheduler database is not detected
-when it names `ssh`, because the row also supplies the principal and
-allowed-signers path, or when it names a provider whose `verify()` does not pin
-trust outside the database. A plugin-signed row
+when it names a provider whose `verify()` does not pin trust outside the
+database. An `ssh` row verifies only when its key is in an allowed-signers file
+the operator trusts, whatever path the row names. A plugin-signed row
 whose provider is not loaded in the CLI process fails closed with
 `EVIDENCE_PROVIDER_NOT_LOADED`. Evidence never includes raw materialized
 credentials, bearer tokens, proof values, private keys, or provider secrets.
@@ -334,7 +353,11 @@ The operator controls:
 - The provider plugin directory (`SCHEDULER_PROVIDER_PATH`), which both the
   dispatcher and the evidence-verifying CLI commands import.
 - Write access to the scheduler database, which can insert evidence rows that
-  verify.
+  verify under a provider whose `verify()` does not pin trust outside the
+  database.
+- The allowed-signers files named by `AGENTCLI_ALLOWED_SIGNERS` and
+  `SCHEDULER_TRUSTED_ALLOWED_SIGNERS`, which decide whose `ssh` evidence
+  verifies.
 - The gateway connection (`OPENCLAW_GATEWAY_URL`,
   `OPENCLAW_GATEWAY_TOKEN`).
 - The manifest content (via `agentcli compile` + `agentcli apply`).

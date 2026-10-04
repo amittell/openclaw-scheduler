@@ -110,6 +110,66 @@ export DISPATCH_LABELS_PATH="$HOME/.openclaw/dispatch/labels.json"
 An unsafe or mismatched override now fails startup before the scheduler creates,
 reads, or writes the escaped path.
 
+### `ssh` evidence trust for 0.6.7
+
+Version 0.6.7 no longer trusts an allowed-signers path because the scheduler
+database names it. Before, `runs evidence` and `doctor` re-verified handoff v4
+`ssh` evidence against the path recorded on each evidence row, ahead of
+`AGENTCLI_ALLOWED_SIGNERS`. Now the dispatcher when it signs, and the CLI when
+it re-verifies, use the file `AGENTCLI_ALLOWED_SIGNERS` names in that
+process's own environment. A path recorded on the row, or named by a job's
+evidence `provider_config`, is used only when the operator lists it in
+`SCHEDULER_TRUSTED_ALLOWED_SIGNERS` (absolute paths separated by `:`; relative
+entries are ignored with a warning). Evidence from `SCHEDULER_PROVIDER_PATH`
+plugins and the checksum evidence of handoff versions 1 to 3 are unaffected.
+
+Check whether a host has `ssh` evidence:
+
+```bash
+sqlite3 -readonly "${SCHEDULER_DB:-$HOME/.openclaw/scheduler/scheduler.db}" \
+  "SELECT evidence_allowed_signers_path, COUNT(*) FROM evidence_records
+   WHERE evidence_method = 'ssh-signature' GROUP BY 1"
+```
+
+If that prints nothing, existing evidence is unaffected. Otherwise:
+
+1. Set `AGENTCLI_ALLOWED_SIGNERS` to the absolute path of the allowed-signers
+   file the host trusts, in every environment that runs `openclaw-scheduler
+   runs evidence` or `doctor`, and in the service environment
+   (`EnvironmentVariables` in the launchd plist, or `Environment=` in the
+   systemd unit). A shell profile such as `~/.zshenv` reaches only `zsh`; a
+   cron or launchd job, CI step, or `bash` or `sh` script that runs `doctor`
+   needs the variable in its own environment. The CLI used to work without it
+   because it read the recorded path; now `runs evidence` exits 1 and `doctor`
+   counts the row as invalid with `EVIDENCE_TRUST_NOT_CONFIGURED`.
+2. Rows that record a different path are checked against
+   `AGENTCLI_ALLOWED_SIGNERS` instead. If that file does not list their key,
+   they fail with `EVIDENCE_VERIFICATION_FAILED`, and the error names the
+   recorded path it did not use. Look at each such path before doing anything
+   with it. List it in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS` only if you
+   recognize it as an allowed-signers file you created, for example the same
+   file before it moved, and you still trust every key in it: a listed file is
+   trusted for every key it contains and for every row that names it. Do not
+   list an old file to keep rows signed by a key you removed because it leaked
+   or was retired; those rows should fail. A path you do not recognize, a file
+   you do not control, or the scheduler database itself is a sign of a forged
+   row; leave it unlisted and investigate. A path that contains `:` cannot be
+   listed.
+3. Run `openclaw-scheduler doctor --deep --json` and confirm
+   `diagnostics.evidence_records.invalid` is `0`.
+   `diagnostics.evidence_records.trust_not_configured` counts the rows that
+   failed only because no allowed-signers file is configured, and each entry
+   in `invalid_samples` carries its error `code`.
+   `openclaw-scheduler runs evidence RUN_ID --json` reports which file verified
+   a row as `integrity.trust_source`: `operator` or
+   `operator-listed-recorded-path`.
+
+Signing changes the same way. A v4 `ssh` job compiled by agentcli already
+failed to sign without `AGENTCLI_ALLOWED_SIGNERS` (`allowed_signers file not
+found`); it now fails with `EVIDENCE_TRUST_NOT_CONFIGURED`, which names the
+variable. A job whose evidence `provider_config` names an allowed-signers file
+is signed against `AGENTCLI_ALLOWED_SIGNERS` unless that file is listed.
+
 ---
 
 ## Step 1: Pull or Install the Update

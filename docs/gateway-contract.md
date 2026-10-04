@@ -1061,7 +1061,9 @@ the declared config, `AGENTCLI_EVIDENCE_PRINCIPAL`, and
 `AGENTCLI_ALLOWED_SIGNERS`. Signing always records the principal. It records
 an allowed-signers path only when one was configured; without it, the path
 falls back to the declared config and then the CLI's
-`AGENTCLI_ALLOWED_SIGNERS`.
+`AGENTCLI_ALLOWED_SIGNERS`. That is what a plugin receives. agentcli's
+built-in `ssh` provider is never handed a path only because the database names
+it; see the end of this section.
 
 The scheduler stores the envelope on the immutable evidence row and passes it
 back to `verify()` on re-verification, including after the run and job rows
@@ -1087,14 +1089,20 @@ Return `key_fingerprint` and `principal` from `verify()`. `runs evidence`
 reports only what `verify()` returns; it never falls back to envelope fields,
 which a database writer could change without touching the signature.
 
-A trust pin protects a plugin's own rows. It does not stop someone who can
-write the scheduler database from inserting a row that names a different
-provider: each row chooses its provider, and an `ssh` row also supplies the
-principal and allowed-signers path it is verified against. Handoff v4 evidence
-verification detects tampering with a row signed by a trusted key. It does not
-detect a self-consistent row that a database writer inserts under `ssh`, or
-under a provider whose `verify()` does not pin trust, so write access to the
-scheduler database is part of the trust boundary.
+A trust pin protects a plugin's own rows. Each row chooses its provider, so
+someone who can write the scheduler database can insert a row that names a
+different one. Rows under agentcli's built-in `ssh` provider verify only
+against an allowed-signers file the operator trusts: the one
+`AGENTCLI_ALLOWED_SIGNERS` names in the verifying process, or a path the row
+records that the operator also lists in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS`
+(only files the operator created and still fully trusts belong there). With
+neither, they fail closed with `EVIDENCE_TRUST_NOT_CONFIGURED`.
+`runs evidence` reports which one verified a row as `integrity.trust_source`
+(`operator`, `operator-listed-recorded-path`, or `provider` for a plugin).
+Handoff v4 evidence verification detects tampering with a row signed by a
+trusted key. It does not detect a self-consistent row that a database writer
+inserts under a provider whose `verify()` does not pin trust, so write access
+to the scheduler database is part of the trust boundary.
 
 Reference:
 - `dispatcher.js` `main()` (provider loading at startup)

@@ -271,16 +271,19 @@ payload, immutable evidence row, and historical handoff artifact instead of
 reporting the missing operational rows as an integrity failure.
 
 The SSH provider uses `ssh-keygen -Y sign` and `ssh-keygen -Y verify` with the
-declared key, principal, namespace, and allowed-signers file. Provider methods,
-verification metadata, payload hash, artifact digest, and verification outcome
-are immutable. `runs evidence RUN_ID --json` reconstructs the persisted
-execution input and cryptographically re-verifies the envelope. Tampering that
-leaves the row inconsistent, any change the signature covers, transplantation,
-a stale artifact, or unavailable required verification exits nonzero. A
-self-consistent row written by someone with write access to the scheduler
-database is not detected when it names `ssh`, because the row also supplies the
-principal and allowed-signers path, or when it names a provider whose
-`verify()` does not pin trust outside the database (see
+declared key, principal, and namespace, and an allowed-signers file the
+operator trusts: `AGENTCLI_ALLOWED_SIGNERS`, or a recorded or declared path
+listed in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS`. A path is never trusted only
+because the database names it; with neither configured, verification fails
+closed with `EVIDENCE_TRUST_NOT_CONFIGURED`. Provider methods, verification
+metadata, payload hash, artifact digest, and verification outcome are
+immutable. `runs evidence RUN_ID --json` reconstructs the persisted execution
+input, cryptographically re-verifies the envelope, and reports
+`integrity.trust_source`. Tampering that leaves the row inconsistent, any
+change the signature covers, transplantation, a stale artifact, or unavailable
+required verification exits nonzero. A self-consistent row written by someone
+with write access to the scheduler database is not detected when it names a
+provider whose `verify()` does not pin trust outside the database (see
 `docs/trust-architecture.md`).
 
 ## Gateway Compatibility

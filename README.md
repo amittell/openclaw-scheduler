@@ -1560,6 +1560,8 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_ALERT_TARGET` | *(unset; alerts disabled)* | Explicit numeric Telegram operator chat ID for repeated isolated-job failures. Surrounding whitespace is trimmed; zero, usernames, prefixes, embedded whitespace and unsafe integers are rejected. No default recipient or fallback route is used. Alerts are attempted only after successful completion bookkeeping commits. |
 | `SCHEDULER_SHELL` | `/bin/zsh` (macOS), `/bin/bash` (Linux/WSL2) | Shell used for shell jobs |
 | `SCHEDULER_PROVIDER_PATH` | *(unset)* | Directory of provider plugin `*.js` files. The dispatcher loads it at startup; the CLI loads it before `runs evidence` or `doctor` verifies handoff v4 evidence, so set it there too when a plugin signs evidence. Use an absolute path: a relative one resolves against each process's working directory. High trust boundary -- only point at operator-controlled code; world-writable directories are refused. See [gateway contract](docs/gateway-contract.md#local-provider-plugins) |
+| `AGENTCLI_ALLOWED_SIGNERS` | *(unset)* | Allowed-signers file that `ssh` handoff v4 evidence is signed and re-verified against. The dispatcher reads it when it signs; `runs evidence` and `doctor` read it from their own environment, so set it there too, as an absolute path. Unset, `ssh` evidence fails closed with `EVIDENCE_TRUST_NOT_CONFIGURED` unless the row's recorded path is in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS` |
+| `SCHEDULER_TRUSTED_ALLOWED_SIGNERS` | *(unset)* | Further allowed-signers files the operator trusts for `ssh` evidence, as absolute paths separated by `:`; relative entries are ignored with a warning. A path that an evidence row records is used only when it is listed here; otherwise `AGENTCLI_ALLOWED_SIGNERS` is used. A listed file is trusted for every key in it and every row that names it, so list only files you created and still fully trust, never a path because a row names it (see UPGRADING.md) |
 | `DISPATCH_CONFIG_DIR` | `~/.openclaw/dispatch` | Override dispatch config directory for `config.json` |
 | `DISPATCH_STATE_DIR` | `~/.openclaw/scheduler/dispatch` | Allowed state root for the dispatch labels ledger |
 | `DISPATCH_LABELS_PATH` | `<DISPATCH_STATE_DIR>/labels.json` | Override the labels ledger path. Relative paths resolve beneath the state root; absolute paths must remain beneath it after traversal normalization, and existing parents must remain beneath it after symbolic-link resolution |
@@ -2316,8 +2318,11 @@ identity, proof, authorization, complete output digests, postcondition, and
 lineage. Offloaded stdout and stderr are hashed in full, not from their stored
 excerpts. Historical verification reloads the exact artifact bound to the run.
 The SSH
-provider signs and verifies with `ssh-keygen -Y`; other declared providers must
-implement equivalent verification. An evidence plugin loaded from
+provider signs and verifies with `ssh-keygen -Y` against an allowed-signers file
+the operator configures (`AGENTCLI_ALLOWED_SIGNERS`) or lists
+(`SCHEDULER_TRUSTED_ALLOWED_SIGNERS`), never one used only because the evidence
+row names it; other declared providers must implement equivalent verification.
+An evidence plugin loaded from
 `SCHEDULER_PROVIDER_PATH` carries its public verification material in the
 envelope and must decide whom to trust from inputs outside the scheduler
 database; see
