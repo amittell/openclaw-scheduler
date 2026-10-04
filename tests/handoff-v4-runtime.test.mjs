@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { compileManifestToScheduler } from '@amittell/agentcli';
@@ -3367,6 +3367,9 @@ test('verified evidence envelopes without payload digests use one consistent has
     import('@amittell/agentcli/evidence'),
     import('@amittell/agentcli/evidence/payload'),
   ]);
+  // agentcli verification always takes the operator's allowed-signers file;
+  // this stub verifier never opens it.
+  const allowedSignersPath = '/operator/allowed_signers';
   const provider = {
     resolve() { return {}; },
     attest(serialized) {
@@ -3420,7 +3423,7 @@ test('verified evidence envelopes without payload digests use one consistent has
       { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
       artifact,
       run.id,
-      { agentcli: mismatchedAgentcli, principal: 'fallback-principal' },
+      { agentcli: mismatchedAgentcli, principal: 'fallback-principal', allowedSignersPath },
     ),
     error => error.code === 'EVIDENCE_PAYLOAD_MISMATCH',
   );
@@ -3428,13 +3431,13 @@ test('verified evidence envelopes without payload digests use one consistent has
     { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
     artifact,
     run.id,
-    { agentcli, principal: 'fallback-principal' },
+    { agentcli, principal: 'fallback-principal', allowedSignersPath },
   );
   const envelope = JSON.parse(stored.evidence_envelope);
   assert.equal(Object.hasOwn(envelope, 'payload_digest'), false);
   assert.equal(stored.hash, sha256(canonicalStringify(envelope)));
 
-  const verified = await verifyPersistedArtifactBoundEvidence(run.id, { agentcli });
+  const verified = await verifyPersistedArtifactBoundEvidence(run.id, { agentcli, allowedSignersPath });
   assert.equal(verified.integrity.valid, true, verified.integrity.error);
   assert.equal(verified.integrity.cryptographically_verified, true);
 });
@@ -3510,6 +3513,7 @@ test('evidence verify receives the declared provider_config, only verify() names
     assert.deepEqual(lastVerify('config-plugin').providerConfig, declaredConfig);
     assert.equal(withRun.integrity.principal, null);
     assert.equal(withRun.integrity.key_fingerprint, null);
+    assert.equal(withRun.integrity.trust_source, 'provider');
     assert.equal(deleteJob(signed.job.id), true);
     const pruned = await verifyPersistedArtifactBoundEvidence(signed.run.id);
     assert.equal(pruned.integrity.valid, true, pruned.integrity.error);
@@ -3525,10 +3529,15 @@ test('evidence verify receives the declared provider_config, only verify() names
         return { verified: true, payload: JSON.parse(envelope.signed_payload) };
       },
     };
-    const viaAgentcli = await signRun('agentcli-builtin', { agentcli });
+    const operatorTrust = { agentcli, allowedSignersPath: '/operator/allowed_signers' };
+    const viaAgentcli = await signRun('agentcli-builtin', operatorTrust);
     assert.deepEqual(lastVerify('agentcli-builtin').providerConfig, declaredConfig);
-    const agentcliVerified = await verifyPersistedArtifactBoundEvidence(viaAgentcli.run.id, { agentcli });
+    const agentcliVerified = await verifyPersistedArtifactBoundEvidence(
+      viaAgentcli.run.id,
+      operatorTrust,
+    );
     assert.equal(agentcliVerified.integrity.valid, true, agentcliVerified.integrity.error);
+    assert.equal(agentcliVerified.integrity.trust_source, 'operator');
     assert.deepEqual(lastVerify('agentcli-builtin').providerConfig, declaredConfig);
 
     const throwingAgentcli = error => ({
@@ -3694,13 +3703,41 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     assert.equal(stored.evidence_allowed_signers_path, allowedSignersPath);
     assert.equal(stored.payload.includes('expected-output'), false);
 
+    // The recorded principal wins over the caller's. The recorded path is used
+    // because the operator lists it (in any absolute spelling), not because the
+    // row names it, and then the caller's own (here missing) file is not consulted.
     const verified = await verifyPersistedArtifactBoundEvidence(run.id, {
       allowedSignersPath: join(unrelatedCwd, 'wrong-allowed-signers'),
       principal: 'wrong-principal',
-      env: { USER: 'wrong-principal' },
+      env: {
+        USER: 'wrong-principal',
+        SCHEDULER_TRUSTED_ALLOWED_SIGNERS: `${workdir}/unlisted/../allowed_signers`,
+      },
     });
     assert.equal(verified.integrity.valid, true, verified.integrity.error);
     assert.equal(verified.integrity.cryptographically_verified, true);
+    assert.equal(verified.integrity.trust_source, 'operator-listed-recorded-path');
+
+    // A relative entry would name a different file in every working directory,
+    // so it is ignored with a warning even where it resolves to the recorded path.
+    const warnings = [];
+    const consoleError = console.error;
+    console.error = (...parts) => { warnings.push(parts.join(' ')); };
+    let relativeEntry;
+    try {
+      relativeEntry = await verifyPersistedArtifactBoundEvidence(run.id, {
+        cwd: workdir,
+        env: { SCHEDULER_TRUSTED_ALLOWED_SIGNERS: 'allowed_signers' },
+      });
+    } finally {
+      console.error = consoleError;
+    }
+    assert.equal(relativeEntry.integrity.code, 'EVIDENCE_TRUST_NOT_CONFIGURED');
+    assert.equal(
+      warnings.some(warning => warning.includes('entry "allowed_signers": not an absolute path')),
+      true,
+      JSON.stringify(warnings),
+    );
     assert.equal(verified.payload.execution_id, run.id);
     assert.equal(
       verified.payload.bindings.handoff_artifact_digest,
@@ -3715,7 +3752,11 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       ['cli.js', 'doctor', '--deep', '--json'],
       {
         cwd: join(import.meta.dirname, '..'),
-        env: { ...process.env, SCHEDULER_DB: doctorDbPath },
+        env: {
+          ...process.env,
+          SCHEDULER_DB: doctorDbPath,
+          AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath,
+        },
         encoding: 'utf8',
       },
     );
@@ -3786,6 +3827,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     });
     assert.equal(trustRevoked.integrity.valid, false);
     assert.equal(trustRevoked.integrity.cryptographically_verified, false);
+    assert.doesNotMatch(trustRevoked.integrity.error, /does not list/);
 
     writeFileSync(
       allowedSignersPath,
@@ -3798,7 +3840,9 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     let retainedVerification;
     try {
       process.chdir(unrelatedCwd);
-      retainedVerification = await verifyPersistedArtifactBoundEvidence(run.id);
+      retainedVerification = await verifyPersistedArtifactBoundEvidence(run.id, {
+        env: { AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath },
+      });
     } finally {
       process.chdir(originalCwd);
     }
@@ -3807,6 +3851,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       true,
       retainedVerification.integrity.error,
     );
+    assert.equal(retainedVerification.integrity.trust_source, 'operator');
     assert.equal(retainedVerification.payload.execution_id, run.id);
     assert.equal(retainedVerification.evidence_provider, 'ssh');
     assert.equal(retainedVerification.evidence_principal, 'scheduler-test');
@@ -3820,5 +3865,68 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
   } finally {
     rmSync(workdir, { recursive: true, force: true });
     rmSync(unrelatedCwd, { recursive: true, force: true });
+  }
+});
+
+test('ssh evidence signing checks against the operator allowed-signers file, not one a declaration names', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'scheduler-v4-evidence-trust-'));
+  try {
+    const keyPath = join(workdir, 'evidence-key');
+    const generated = spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', keyPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(generated.status, 0, generated.stderr);
+    const signer = `scheduler-test ${readFileSync(`${keyPath}.pub`, 'utf8').trim()}\n`;
+    const operatorPath = join(workdir, 'operator_allowed_signers');
+    // The list delimiter in the name also checks that the error does not offer
+    // to list a path that cannot be listed.
+    const declaredPath = join(workdir, `declared${delimiter}allowed_signers`);
+    writeFileSync(operatorPath, signer, { mode: 0o600 });
+    writeFileSync(declaredPath, signer, { mode: 0o600 });
+
+    // A declaration with a provider_config reaches the runtime only through
+    // the database (a direct job spec or a run snapshot), never from the operator.
+    const job = createV4Job('Declared allowed signers');
+    const run = createRun(job.id);
+    const profile = {
+      ref: 'declared-allowed-signers',
+      provider: 'ssh',
+      provider_config: { principal: 'scheduler-test', allowed_signers_path: declaredPath },
+      payload: { format: 'canonical-json' },
+      verify: { required: true },
+    };
+    getDb().prepare(
+      'UPDATE runs SET evidence_ref_snapshot = ?, evidence_declaration_snapshot = ? WHERE id = ?',
+    ).run(profile.ref, JSON.stringify(profile), run.id);
+    finishRun(run.id, 'ok', {
+      summary: 'declared allowed signers',
+      shell_exit_code: 0,
+      shell_stdout: 'declared-allowed-signers',
+      shell_stderr: '',
+      shell_stdout_sha256: sha256('declared-allowed-signers'),
+      shell_stderr_sha256: sha256(''),
+    });
+    const sign = env => persistArtifactBoundEvidence(
+      { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
+      assertArtifactMatchesJob(job),
+      run.id,
+      { env: { PATH: process.env.PATH, AGENTCLI_SIGNING_KEY: keyPath, ...env } },
+    );
+
+    await assert.rejects(
+      () => sign({}),
+      error => error.code === 'EVIDENCE_TRUST_NOT_CONFIGURED'
+        && error.message.includes(`names ${declaredPath}, which contains "${delimiter}" and cannot be listed`),
+    );
+    const stored = await sign({ AGENTCLI_ALLOWED_SIGNERS: operatorPath });
+    assert.equal(stored.evidence_allowed_signers_path, operatorPath);
+    const verified = await verifyPersistedArtifactBoundEvidence(run.id, {
+      env: { AGENTCLI_ALLOWED_SIGNERS: operatorPath },
+    });
+    assert.equal(verified.integrity.valid, true, verified.integrity.error);
+    assert.equal(verified.integrity.trust_source, 'operator');
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
   }
 });

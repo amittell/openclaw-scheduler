@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { delimiter, isAbsolute, resolve } from 'node:path';
 import { getDb } from './db.js';
 import {
   assertValidHandoffArtifact,
@@ -203,19 +203,82 @@ function evidencePrincipal(profile, opts = {}) {
     || 'agentcli';
 }
 
-function providerVerifyOptions(profile, record, opts, principal, providerConfig) {
+// A relative entry would trust a different file in every working directory.
+const warnedRelativeTrustEntries = new Set();
+
+function trustedListEntries(env) {
+  return (env.SCHEDULER_TRUSTED_ALLOWED_SIGNERS || '').split(delimiter).filter(entry => {
+    if (!entry || isAbsolute(entry)) return Boolean(entry);
+    if (!warnedRelativeTrustEntries.has(entry)) {
+      warnedRelativeTrustEntries.add(entry);
+      console.error(
+        `[evidence] Ignoring SCHEDULER_TRUSTED_ALLOWED_SIGNERS entry "${entry}": not an absolute path`,
+      );
+    }
+    return false;
+  }).map(entry => resolve(entry));
+}
+
+// agentcli's ssh verify accepts any key listed in the allowed-signers file it is
+// given, so choosing that file is the trust decision. The path an evidence row
+// or a run's declaration names is a database value: it is used only when the
+// operator lists it in SCHEDULER_TRUSTED_ALLOWED_SIGNERS. Otherwise the
+// operator's AGENTCLI_ALLOWED_SIGNERS is used, and with neither, verification
+// fails closed. agentcli picks its verifier from the envelope's method, not the
+// row's provider name, so this covers everything agentcli verifies. Plugins pin
+// trust in their own verify() (docs/gateway-contract.md) and keep receiving the
+// recorded path.
+function evidenceTrust(source, recordedPath, opts) {
+  const env = opts.env || process.env;
+  const absolute = path => (path ? resolve(opts.cwd || process.cwd(), path) : null);
+  const recorded = absolute(recordedPath);
+  const operator = absolute(opts.allowedSignersPath || env.AGENTCLI_ALLOWED_SIGNERS);
+  if (source !== 'agentcli') return { source: 'provider', path: recorded || operator };
+  if (trustedListEntries(env).includes(recorded)) {
+    return { source: 'operator-listed-recorded-path', path: recorded };
+  }
+  if (operator) {
+    return { source: 'operator', path: operator, ignored: recorded !== operator ? recorded : null };
+  }
+  let listing = '';
+  if (recorded?.includes(delimiter)) {
+    listing = ` The scheduler database names ${recorded}, which contains "${delimiter}" and `
+      + 'cannot be listed in SCHEDULER_TRUSTED_ALLOWED_SIGNERS.';
+  } else if (recorded) {
+    listing = ` The scheduler database names ${recorded}. List it in `
+      + `SCHEDULER_TRUSTED_ALLOWED_SIGNERS (absolute paths separated by "${delimiter}") only if `
+      + 'it is an allowed-signers file you created and you still trust every key in it; a path '
+      + 'you do not recognize, such as the scheduler database itself, is a sign of a forged row.';
+  }
+  throw evidenceError(
+    'EVIDENCE_TRUST_NOT_CONFIGURED',
+    'No allowed-signers file is configured for ssh evidence: set AGENTCLI_ALLOWED_SIGNERS to '
+      + `the allowed-signers file this host trusts.${listing}`,
+  );
+}
+
+function verificationFailure(verification, trust, fallback) {
+  return evidenceError(
+    'EVIDENCE_VERIFICATION_FAILED',
+    (verification?.reason || fallback)
+      + (trust.ignored
+        ? `; checked against ${trust.path}, not ${trust.ignored}, which the scheduler database `
+          + 'names and SCHEDULER_TRUSTED_ALLOWED_SIGNERS does not list'
+        : ''),
+  );
+}
+
+function providerVerifyOptions(profile, record, opts, principal, providerConfig, source) {
   const config = profile.provider_config || {};
-  const configuredPath = config.allowed_signers_path
-    || config.allowed_signers
-    || opts.allowedSignersPath
-    || (opts.env || process.env).AGENTCLI_ALLOWED_SIGNERS;
+  const trust = evidenceTrust(source, config.allowed_signers_path || config.allowed_signers, opts);
   return {
-    ...(record ? { record } : {}),
-    principal,
-    allowedSignersPath: configuredPath
-      ? resolve(opts.cwd || process.cwd(), configuredPath)
-      : null,
-    providerConfig,
+    trust,
+    options: {
+      ...(record ? { record } : {}),
+      principal,
+      allowedSignersPath: trust.path,
+      providerConfig,
+    },
   };
 }
 
@@ -313,7 +376,14 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
   }
 
   const record = evidenceRecord(run, artifact, timestamp, opts);
-  const verifyOptions = providerVerifyOptions(profile, record, opts, principal, declaredConfig);
+  const { trust, options: verifyOptions } = providerVerifyOptions(
+    profile,
+    record,
+    opts,
+    principal,
+    declaredConfig,
+    source,
+  );
   const verification = source === 'agentcli'
     ? await agentcli.verifyEvidenceEnvelope(attestation.envelope, verifyOptions, {
         runId: run.id,
@@ -324,10 +394,7 @@ export async function prepareArtifactBoundEvidence(job, artifactRecord, run, opt
         artifactDigest: run.handoff_artifact_digest,
       });
   if (verification?.verified !== true) {
-    throw evidenceError(
-      'EVIDENCE_VERIFICATION_FAILED',
-      verification?.reason || 'Evidence provider verification failed',
-    );
+    throw verificationFailure(verification, trust, 'Evidence provider verification failed');
   }
   const verifiedPayload = assertVerifiedEvidencePayload(
     agentcli,
@@ -659,7 +726,7 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
     const { provider, source } = await resolveProvider(profile, agentcli, {
       env: opts.env || process.env,
     });
-    const verifyOptions = providerVerifyOptions(
+    const { trust, options: verifyOptions } = providerVerifyOptions(
       profile,
       record,
       opts,
@@ -667,6 +734,7 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
       // The declared config lives in the run's declaration snapshot, which is
       // gone once the run is pruned.
       run ? declaredProviderConfig : {},
+      source,
     );
     const verification = source === 'agentcli'
       ? await agentcli.verifyEvidenceEnvelope(envelope, verifyOptions, {
@@ -678,9 +746,10 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
           artifactDigest: row.handoff_artifact_digest,
         });
     if (verification?.verified !== true) {
-      throw evidenceError(
-        'EVIDENCE_VERIFICATION_FAILED',
-        verification?.reason || 'Persisted evidence cryptographic verification failed',
+      throw verificationFailure(
+        verification,
+        trust,
+        'Persisted evidence cryptographic verification failed',
       );
     }
     if (run) {
@@ -714,6 +783,7 @@ export async function verifyPersistedArtifactBoundEvidence(runId, opts = {}) {
         // signature could name anyone.
         principal: verification.principal || null,
         key_fingerprint: verification.key_fingerprint || null,
+        trust_source: trust.source,
       },
     };
   } catch (error) {

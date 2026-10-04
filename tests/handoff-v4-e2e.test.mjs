@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
@@ -24,6 +24,7 @@ import {
   registerEvidenceProvider,
   registerIdentityProvider,
 } from '@amittell/agentcli';
+import { sshEvidenceProvider } from '@amittell/agentcli/evidence/ssh';
 import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
@@ -1054,6 +1055,7 @@ test('plugin evidence signs in the dispatcher and re-verifies from the CLI after
     OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
     SCHEDULER_PROVIDER_PATH: providerDir,
     [TRUSTED_FINGERPRINTS_ENV]: signerFingerprint,
+    AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath,
     SCHEDULER_TICK_MS: '1000',
     SCHEDULER_MESSAGE_DELIVERY_MS: '600000',
     SCHEDULER_PRUNE_MS: '600000',
@@ -1067,7 +1069,6 @@ test('plugin evidence signs in the dispatcher and re-verifies from the CLI after
       ...env,
       V4_E2E_ED25519_KEY: keyPath,
       AGENTCLI_SIGNING_KEY: sshKeyPath,
-      AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath,
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -1125,6 +1126,7 @@ test('plugin evidence signs in the dispatcher and re-verifies from the CLI after
   assert.equal(verified.payload.evidence.integrity.cryptographically_verified, true);
   assert.equal(verified.payload.evidence.integrity.provider, PLUGIN_EVIDENCE_PROVIDER);
   assert.equal(verified.payload.evidence.integrity.key_fingerprint, signerFingerprint);
+  assert.equal(verified.payload.evidence.integrity.trust_source, 'provider');
   assert.equal(verified.payload.evidence.payload.execution_id, run.id);
 
   const doctor = runCliResult(['doctor', '--deep'], env);
@@ -1162,6 +1164,7 @@ test('plugin evidence signs in the dispatcher and re-verifies from the CLI after
       const sshVerified = runCliResult(['runs', 'evidence', sshRun.id], shapeEnv);
       assert.equal(sshVerified.status, 0, `${shape}: ${JSON.stringify(sshVerified.payload)}`);
       assert.equal(sshVerified.payload.evidence.integrity.cryptographically_verified, true);
+      assert.equal(sshVerified.payload.evidence.integrity.trust_source, 'operator');
       const pluginRow = runCliResult(['runs', 'evidence', run.id], shapeEnv);
       assert.equal(pluginRow.status, 1, shape);
       assert.equal(pluginRow.payload.evidence.integrity.code, 'EVIDENCE_PROVIDER_NOT_LOADED');
@@ -1253,4 +1256,267 @@ test('plugin evidence signs in the dispatcher and re-verifies from the CLI after
   assert.equal(tampered.payload.ok, false);
   assert.equal(tampered.payload.evidence.integrity.code, 'EVIDENCE_VERIFICATION_FAILED');
   assert.match(tampered.payload.evidence.integrity.error, /signature does not verify/);
+});
+
+test('ssh evidence re-verifies only against allowed-signers files the operator configures or lists', async t => {
+  const fixture = mkdtempSync(join(tmpdir(), 'scheduler-ssh-trust-e2e-'));
+  const dbPath = join(fixture, 'scheduler.db');
+  const keyPath = join(fixture, 'operator-key');
+  const allowedSignersPath = join(fixture, 'allowed_signers');
+  const principal = process.env.USER || 'agentcli';
+  let dispatcher;
+  t.after(async () => {
+    await stopChild(dispatcher);
+    closeDb();
+    rmSync(fixture, { recursive: true, force: true });
+  });
+  const keygen = path => {
+    const generated = spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', path], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(generated.status, 0, generated.stderr);
+    return readFileSync(`${path}.pub`, 'utf8').trim();
+  };
+  writeFileSync(allowedSignersPath, `${principal} ${keygen(keyPath)}\n`, { mode: 0o600 });
+
+  setDbPath(dbPath);
+  await initDb();
+  const applied = await applyFreshManifest({
+    version: '0.2',
+    evidence_profiles: [{
+      id: 'v4-e2e-ssh-trust',
+      provider: 'ssh',
+      methods: ['ssh-signature'],
+      payload: { format: 'canonical-json' },
+      verify: { required: true },
+    }],
+    workflows: [{
+      id: 'handoff-v4-ssh-trust',
+      name: 'Handoff v4 ssh evidence trust',
+      tasks: [{
+        id: 'ssh-trust',
+        name: 'Handoff v4 ssh evidence trust',
+        target: { session_target: 'shell' },
+        shell: { program: 'printf', args: ['ssh-trust'] },
+        schedule: { cron: '0 0 * * *' },
+        runtime: { timeout_ms: 10_000 },
+        evidence: { ref: 'v4-e2e-ssh-trust' },
+      }],
+    }],
+  }, { PATH: process.env.PATH || '/usr/bin' });
+  assert.equal(applied.job_count, 1);
+  const job = getDb().prepare('SELECT * FROM jobs WHERE name = ?').get('Handoff v4 ssh evidence trust');
+  assert(runJobNow(job.id)?.dispatch_id, 'ssh evidence dispatch was not queued');
+  closeDb();
+
+  // Neither trust setting may leak in from the environment running the tests.
+  const {
+    AGENTCLI_ALLOWED_SIGNERS: _operatorPath,
+    SCHEDULER_TRUSTED_ALLOWED_SIGNERS: _listedPaths,
+    ...inherited
+  } = process.env;
+  const env = {
+    ...inherited,
+    SCHEDULER_DB: dbPath,
+    OPENCLAW_SCHEDULER_HOME: fixture,
+    OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
+    SCHEDULER_TICK_MS: '1000',
+    SCHEDULER_MESSAGE_DELIVERY_MS: '600000',
+    SCHEDULER_PRUNE_MS: '600000',
+    SCHEDULER_BACKUP_MS: '600000',
+    SCHEDULER_HEARTBEAT_CHECK_MS: '600000',
+  };
+  const operatorEnv = { ...env, AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath };
+  dispatcher = spawn(process.execPath, [dispatcherPath], {
+    cwd: root,
+    env: { ...operatorEnv, AGENTCLI_SIGNING_KEY: keyPath },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let dispatcherStderr = '';
+  dispatcher.stderr.on('data', chunk => { dispatcherStderr += chunk; });
+  const probe = new Database(dbPath, { readonly: true });
+  let run;
+  let evidence;
+  try {
+    ({ run, evidence } = await waitFor(() => {
+      if (dispatcher.exitCode != null || dispatcher.signalCode != null) {
+        throw new Error(`dispatcher exited: ${dispatcherStderr}`);
+      }
+      const latest = probe.prepare('SELECT * FROM runs WHERE job_id = ?').get(job.id);
+      return {
+        run: latest,
+        evidence: latest
+          ? probe.prepare('SELECT * FROM evidence_records WHERE run_id = ?').get(latest.id)
+          : null,
+        dispatcher_stderr: dispatcherStderr.slice(-2000),
+      };
+    }, state => {
+      if (state.run && !['pending', 'running', 'ok'].includes(state.run.status)) {
+        throw new Error(`ssh evidence run failed: ${JSON.stringify(state)}`);
+      }
+      return state.run?.status === 'ok' && state.evidence ? state : null;
+    }, 'ssh evidence signing'));
+  } finally {
+    probe.close();
+  }
+  await stopChild(dispatcher);
+  assert.equal(evidence.evidence_allowed_signers_path, allowedSignersPath);
+
+  // Forgery by a database writer, triggers intact: rebind the payload to a new
+  // run id, sign it with an attacker key, and name an allowed-signers file the
+  // attacker controls. One is a file beside the database; the other is the
+  // database file itself, which ssh-keygen reads line by line, so a signer line
+  // in the row's own text makes it a valid allowed-signers file.
+  const attackerKeyPath = join(fixture, 'attacker-key');
+  const attackerSigner = `mallory ${keygen(attackerKeyPath)}`;
+  const attackerSignersPath = join(fixture, 'attacker_allowed_signers');
+  writeFileSync(attackerSignersPath, `${attackerSigner}\n`, { mode: 0o600 });
+  const forgedRunIds = [];
+  const writer = new Database(dbPath);
+  try {
+    assert.equal(
+      writer.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_v4_evidence_%'").get().count,
+      2,
+    );
+    for (const [suffix, signersPath] of [['file', attackerSignersPath], ['db', dbPath]]) {
+      const forgedRunId = `${run.id}-forged-${suffix}`;
+      const forgedPayload = canonicalStringify({
+        ...JSON.parse(evidence.payload),
+        execution_id: forgedRunId,
+      });
+      const forged = sshEvidenceProvider.attest(forgedPayload, {
+        keyPath: attackerKeyPath,
+        principal: 'mallory',
+      });
+      assert.equal(forged.attested, true, forged.reason);
+      writer.prepare(`
+        INSERT INTO evidence_records (
+          id, run_id, job_id, evidence_ref, algorithm, hash, payload, retention_policy,
+          retention_until, handoff_artifact_digest, source_run_id,
+          source_run_handoff_artifact_digest, evidence_method, evidence_verified,
+          evidence_envelope, evidence_provider, evidence_principal,
+          evidence_allowed_signers_path, created_at
+        ) VALUES (?, ?, ?, ?, 'sha256', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'ssh', 'mallory', ?, ?)
+      `).run(
+        `${evidence.id}-forged-${suffix}`,
+        forgedRunId,
+        evidence.job_id,
+        `\n${attackerSigner}\n`,
+        forged.envelope.payload_digest,
+        forgedPayload,
+        evidence.retention_policy,
+        evidence.retention_until,
+        evidence.handoff_artifact_digest,
+        evidence.source_run_id,
+        evidence.source_run_handoff_artifact_digest,
+        evidence.evidence_method,
+        canonicalStringify(forged.envelope),
+        signersPath,
+        evidence.created_at,
+      );
+      forgedRunIds.push(forgedRunId);
+    }
+    writer.pragma('wal_checkpoint(TRUNCATE)');
+  } finally {
+    writer.close();
+  }
+  const outcome = result => ({
+    status: result.status,
+    valid: result.payload.evidence?.integrity?.valid,
+    code: result.payload.evidence?.integrity?.code,
+  });
+  const forgedWithOperator = forgedRunIds.map(runId =>
+    runCliResult(['runs', 'evidence', runId], operatorEnv));
+  assert.deepEqual(
+    forgedWithOperator.map(outcome),
+    forgedRunIds.map(() => ({ status: 1, valid: false, code: 'EVIDENCE_VERIFICATION_FAILED' })),
+    JSON.stringify(forgedWithOperator.map(result => result.payload.evidence?.integrity)),
+  );
+  for (const forged of forgedWithOperator) {
+    assert.match(
+      forged.payload.evidence.integrity.error,
+      /SCHEDULER_TRUSTED_ALLOWED_SIGNERS does not list/,
+    );
+  }
+
+  const verified = runCliResult(['runs', 'evidence', run.id], operatorEnv);
+  assert.equal(verified.status, 0, JSON.stringify(verified.payload));
+  assert.equal(verified.payload.evidence.integrity.cryptographically_verified, true);
+  assert.equal(verified.payload.evidence.integrity.trust_source, 'operator');
+  assert.equal(verified.payload.evidence.integrity.principal, principal);
+  assert.match(verified.payload.evidence.integrity.key_fingerprint, /^SHA256:/);
+  const operatorDoctor = runCliResult(['doctor', '--deep'], operatorEnv);
+  assert.equal(operatorDoctor.payload.diagnostics.evidence_records.checked, 3);
+  assert.equal(operatorDoctor.payload.diagnostics.evidence_records.invalid, 2);
+  assert.equal(operatorDoctor.payload.diagnostics.evidence_records.trust_not_configured, 0);
+  assert.deepEqual(
+    operatorDoctor.payload.diagnostics.evidence_records.invalid_samples.map(sample => sample.code),
+    ['EVIDENCE_VERIFICATION_FAILED', 'EVIDENCE_VERIFICATION_FAILED'],
+  );
+
+  // No trust configured: the legitimate row fails closed and says what to set.
+  const unconfigured = runCliResult(['runs', 'evidence', run.id], env);
+  assert.deepEqual(outcome(unconfigured), {
+    status: 1,
+    valid: false,
+    code: 'EVIDENCE_TRUST_NOT_CONFIGURED',
+  });
+  const unconfiguredError = unconfigured.payload.evidence.integrity.error;
+  assert.match(unconfiguredError, /set AGENTCLI_ALLOWED_SIGNERS/);
+  // Listing is offered only for a file the operator recognizes, never as the fix.
+  assert.equal(
+    unconfiguredError.includes(`names ${allowedSignersPath}. List it in SCHEDULER_TRUSTED_ALLOWED_SIGNERS`),
+    true,
+    unconfiguredError,
+  );
+  assert.match(unconfiguredError, /only if it is an allowed-signers file you created/);
+  assert.match(unconfiguredError, /sign of a forged row/);
+  const unconfiguredDoctor = runCliResult(['doctor', '--deep'], env).payload;
+  assert.equal(unconfiguredDoctor.ok, false);
+  assert.equal(unconfiguredDoctor.diagnostics.evidence_records.invalid, 3);
+  assert.equal(unconfiguredDoctor.diagnostics.evidence_records.trust_not_configured, 3);
+  assert.deepEqual(
+    [...new Set(unconfiguredDoctor.diagnostics.evidence_records.invalid_samples.map(sample => sample.code))],
+    ['EVIDENCE_TRUST_NOT_CONFIGURED'],
+  );
+  assert.equal(
+    unconfiguredDoctor.warnings.some(warning => /no allowed-signers file is configured/.test(warning)),
+    true,
+  );
+  assert.equal(
+    unconfiguredDoctor.warnings.some(warning => /checksum or execution-binding/.test(warning)),
+    false,
+  );
+
+  // A listed recorded path verifies, alone or beside an operator file that does
+  // not hold the signing key; unlisted recorded paths do not.
+  const otherOperatorPath = join(fixture, 'other_allowed_signers');
+  writeFileSync(otherOperatorPath, `${principal} ${keygen(join(fixture, 'other-key'))}\n`, { mode: 0o600 });
+  const listedEnv = {
+    ...env,
+    SCHEDULER_TRUSTED_ALLOWED_SIGNERS: [join(fixture, 'unrelated'), allowedSignersPath].join(delimiter),
+  };
+  for (const trustEnv of [listedEnv, { ...listedEnv, AGENTCLI_ALLOWED_SIGNERS: otherOperatorPath }]) {
+    const listed = runCliResult(['runs', 'evidence', run.id], trustEnv);
+    assert.equal(listed.status, 0, JSON.stringify(listed.payload));
+    assert.equal(listed.payload.evidence.integrity.trust_source, 'operator-listed-recorded-path');
+  }
+  const otherOperator = runCliResult(['runs', 'evidence', run.id], {
+    ...env,
+    AGENTCLI_ALLOWED_SIGNERS: otherOperatorPath,
+  });
+  assert.equal(outcome(otherOperator).code, 'EVIDENCE_VERIFICATION_FAILED');
+  assert.equal(
+    otherOperator.payload.evidence.integrity.error.includes(`not ${allowedSignersPath}`),
+    true,
+    otherOperator.payload.evidence.integrity.error,
+  );
+  for (const runId of forgedRunIds) {
+    assert.equal(
+      outcome(runCliResult(['runs', 'evidence', runId], listedEnv)).code,
+      'EVIDENCE_TRUST_NOT_CONFIGURED',
+    );
+  }
+  assert.equal(runCliResult(['doctor', '--deep'], listedEnv).payload.diagnostics.evidence_records.invalid, 2);
 });

@@ -406,6 +406,8 @@ export interface EvidenceRecord {
     method?: string | null;
     principal?: string | null;
     key_fingerprint?: string | null;
+    /** Who chose the trust anchor for a cryptographically verified v4 row. */
+    trust_source?: 'operator' | 'operator-listed-recorded-path' | 'provider';
     code?: string;
     algorithm?: 'sha256';
     expected_hash?: string;
