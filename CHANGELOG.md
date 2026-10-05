@@ -4,10 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.7] -- 2026-10-05
+
+### Fixed
+
+- **Completion notifications no longer open with generic filler (#72).** The
+  humanized lead replaced technical completion summaries with themed sentences
+  such as "The requested fix is in place." and "That should make the workflow
+  more reliable." The lead is now built from the summary's own clauses.
+  Summaries stored with the old filler are still recognized as rewrites, so
+  the full report is delivered in their place.
+
+- **Deliver the full report when the lead is a rewrite of it (#76).** After
+  #72, a prose report with one verb-led clause, such as "update md5 ...", went
+  out as a 280-char rewritten lead plus a cut detail line instead of the
+  1,626-char report. Replaying the 351 stored completions on two hosts, 11
+  that 0.6.6 delivered in full were not. The producer now records which leads
+  it rewrote and the done path prefers the report over them; payloads stored
+  by the #72 build are still recognized. A commit-style summary leads with a
+  clause, not the raw summary or its `fix(...)` prefix, and a later check or
+  status clause ("verified in Safari") no longer leads. Technical detail lines
+  stay whole while the delivery fits the 3,400-byte bound a promoted report
+  has (machine output stays cut), a lead the humanizer cut that starts a whole
+  detail line is sent once instead of repeated, and `Human summary:` labels no
+  longer show. The checks line (tests, pushed sha) is kept on every path; a
+  report passed through from the agent's last reply gets it only when it
+  carries a sha the report does not already name.
+
 ### Security
 
 - **`ssh` evidence verifies only against allowed-signers files the operator
-  trusts.** Re-verification of handoff v4 `ssh` evidence took the
+  trusts (#74).** Re-verification of handoff v4 `ssh` evidence took the
   allowed-signers path from the evidence row ahead of
   `AGENTCLI_ALLOWED_SIGNERS`, so anyone who could write the scheduler database
   chose the trust file a row was checked against, and a self-consistent row
