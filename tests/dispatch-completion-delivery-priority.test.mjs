@@ -756,6 +756,22 @@ test('past 3,400 bytes the cut detail lines shrink to the bytes left, and the ch
   const dropped = resolveCompletionDelivery({ lastReply: report, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
   assert.equal(dropped.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
 
+  // Doubled markdown markers shrink when composeDeliveryText cleans the line
+  // again, so one cut can miss: 4e53362 sent 3,402 and 3,404 bytes here.
+  const nearly = reportOf(3239);
+  for (const marker of ['````x````', '********b********']) {
+    const marked = `Technical details: ${'本'.repeat(30)} ${marker} ${marker} ${marker} ${'語'.repeat(60)}`;
+    const result = resolveCompletionDelivery({ lastReply: nearly, completion: { details_technical: marked, ...checks }, fallbackSummary: 'completed' });
+    assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `${marker}: ${Buffer.byteLength(result.deliveryText)}`);
+    assert.ok(result.deliveryText.endsWith('\n- Checks: tests passed; pushed deadbee.'), marker);
+  }
+
+  // When the report and the checks line fill the bound on their own, the
+  // detail lines go and the checks line stays (4e53362 kept the char cuts).
+  const full = reportOf(3380);
+  const filled = resolveCompletionDelivery({ lastReply: full, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(filled.deliveryText, `${full}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
   // A report over the bound on its own keeps the char cuts: no detail line causes it.
   const long = reportOf(3600);
   const over = resolveCompletionDelivery({ lastReply: long, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });

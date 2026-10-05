@@ -1057,20 +1057,32 @@ function buildTechnicalDetailsText({
   // promoted.
   const whole = detailLines(false);
   if (composedBytes(whole) <= MAX_VERBATIM_REPORT_BYTES) return whole.map(entry => entry.line);
-  // Past it, the 260/220-char cuts, then each cuttable line from the last cut
-  // to the bytes still over, or dropped when that leaves a stub. A lead that is
-  // over the bound on its own keeps the char cuts: no detail line causes it.
+  // Past it, the 260/220-char cuts. A lead over the bound on its own, such as
+  // a report sent as written, stays as it is with them: no cut of the details
+  // brings it within the bound.
   const lines = detailLines(true);
-  if (composedBytes(lines.filter(entry => !entry.cuttable)) > MAX_VERBATIM_REPORT_BYTES) {
-    return lines.map(entry => entry.line);
-  }
-  for (let i = lines.length - 1; i >= 0; i--) {
+  if (composedBytes([]) > MAX_VERBATIM_REPORT_BYTES) return lines.map(entry => entry.line);
+  // Otherwise each cuttable line, last first, is cut to the bytes still over
+  // and the body measured again (composeDeliveryText cleans a line again, so
+  // one cut can miss), until the body fits; a line left under
+  // MIN_DETAIL_LINE_BYTES is dropped. When the lead and the checks line fill
+  // the bound on their own, every detail line goes and the checks line stays.
+  // Each pass drops a line or makes line i shorter in bytes, so this ends.
+  let i = lines.length - 1;
+  while (i >= 0) {
     const over = composedBytes(lines) - MAX_VERBATIM_REPORT_BYTES;
     if (over <= 0) break;
-    if (!lines[i].cuttable) continue;
+    if (!lines[i].cuttable) {
+      i -= 1;
+      continue;
+    }
     const line = truncateTextToBytes(lines[i].line, Buffer.byteLength(lines[i].line, 'utf8') - over);
-    if (line) lines[i] = { ...lines[i], line };
-    else lines.splice(i, 1);
+    if (line) {
+      lines[i] = { ...lines[i], line };
+    } else {
+      lines.splice(i, 1);
+      i -= 1;
+    }
   }
   return lines.map(entry => entry.line);
 }
