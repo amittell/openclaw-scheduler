@@ -19,6 +19,10 @@ const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
 const TECHNICAL_COMMIT_PREFIX_RE = /^(?:fix|feat|feature|chore|refactor|perf|docs|test|tests|build|ci|style|revert|hotfix)(?:\([^)]+\))?!?:\s*/i;
 const FILE_CONTEXT_PREFIX_RE = /^(?:(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)):\s*/i;
 const CODEISH_MARKER_RE = /(?:`[^`]+`|--[a-z0-9-]+|\b[A-Z_]{3,}\b|\b[a-z0-9_]+\(\)|\b[a-z]+[A-Z][A-Za-z0-9_]+\b|\b(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\b|\b[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)\b)/;
+// A clause that reports a check or a status on the change instead of stating
+// it ("verified in Safari", "not pushed yet", "still needs review"). The
+// humanizer never leads with one; the checks line carries tests and pushes.
+const LEAD_CAVEAT_RE = /^(?:not|never|still|pending|untested|unverified|verified|tested|checked|confirmed|validated|pushed|committed)\b/i;
 const HUMAN_CUE_RE = /\b(?:now|so that|so\b|because|this\b|future runs?|expect|easier|readable|reliable|cleaner|people|users?|operators?|chat|helps?|lets?|allows?|prevents?|stops?|keeps?|avoids?)\b/i;
 const TECHNICAL_KEYWORDS = [
   'api', 'artifact', 'assert', 'build', 'checklist', 'cli', 'commit', 'completion', 'config', 'context',
@@ -45,6 +49,10 @@ const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validatio
 // leaves 200 for the "✅ [label] done" header. Longer text is a dump, not a
 // chat report.
 const MAX_VERBATIM_REPORT_BYTES = 3400;
+// The shortest detail line worth sending once it is cut to the bytes left in
+// a delivery: about ten English words or twenty CJK characters. Below it the
+// line is dropped rather than sent as a stub.
+const MIN_DETAIL_LINE_BYTES = 60;
 // Any one of these marks machine output: a JSON or Python dict key, a JS stack
 // frame, a Python traceback header or a Go goroutine dump.
 const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$|^Traceback \(most recent call last\):|^goroutine \d+ \[/m;
@@ -52,11 +60,10 @@ const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*
 // TAP), KEY=value env dumps and indented YAML keys. Three or more mark machine
 // output.
 const MACHINE_OUTPUT_LINE_RE = /^(?:\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{1,2}:\d{2}:\d{2}\b|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|[✔✓✗✖] |(?:not )?ok \d+ |[A-Z][A-Z0-9_]+=\S)|\s{2,}[\w-]+:(?: |$))/gm;
-// Legacy closing sentences the old humanizer appended to a synthetic
-// technical rewrite. buildHumanizedTechnicalSummary no longer emits them;
-// the list is kept so resolveCompletionDelivery still recognizes one in a
-// stored summary_human (payloads written before the removal) and promotes
-// the full report instead of delivering the boilerplate.
+// Closing sentences the humanizer appended to every technical rewrite up to
+// v0.6.6. It no longer writes them, and a payload it builds now records the
+// rewrite in debug.leadSource instead; this list only recognizes a rewrite in
+// a payload v0.6.6 stored (isLossyHumanizedLead).
 const TECHNICAL_REWRITE_FOLLOW_UPS = {
   testOnly: 'That makes the behavior easier to trust. Future regressions should get caught quickly.',
   reliability: 'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
@@ -65,6 +72,9 @@ const TECHNICAL_REWRITE_FOLLOW_UPS = {
 };
 const THEMED_LEAD_FOLLOW_UP = 'Future runs should show the clean summary first, with technical details underneath when needed.';
 const SYNTHETIC_FOLLOW_UPS = [...Object.values(TECHNICAL_REWRITE_FOLLOW_UPS), THEMED_LEAD_FOLLOW_UP];
+// debug.leadSource value: summary_human is a lead the technical humanizer
+// built from clauses of the summary, not the agent's own words.
+const TECHNICAL_REWRITE_LEAD_SOURCE = 'technical-rewrite';
 const SENTENCE_BREAK_RE = /[.!?]\s+[A-Z]/g;
 
 export function normalizeCompletionText(value) {
@@ -161,14 +171,18 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
 }
 
 // Whether text may be delivered verbatim instead of humanized: it fits one
-// chat message and is not machine output (a payload, JSON, tracebacks, logs,
-// test output, env or config dumps), whatever labels or prose lead it carries.
+// chat message and is not machine output, whatever labels or prose lead it
+// carries.
 function isVerbatimDeliverable(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+  return Buffer.byteLength(text, 'utf8') <= MAX_VERBATIM_REPORT_BYTES && !isMachineOutput(text);
+}
+
+// A payload, JSON, tracebacks, logs, test output, env or config dumps.
+function isMachineOutput(text) {
   // Color codes are stripped before this check; any other escape is terminal output.
-  if (text.includes(ESC)) return false;
-  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
-  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
+  if (text.includes(ESC)) return true;
+  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return true;
+  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length >= 3;
 }
 
 function getPassThroughHumanFinalReport(text) {
@@ -275,7 +289,27 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return null;
   if (normalized.length <= maxChars) return normalized;
-  return normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd() + '…';
+  // Never end on the first half of a surrogate pair.
+  const cut = normalized.slice(0, Math.max(0, maxChars - 1)).replace(/[\uD800-\uDBFF]$/, '');
+  return cut.trimEnd() + '…';
+}
+
+// text cut to at most maxBytes UTF-8 bytes, "…" included, at a code point
+// boundary (for...of never splits a surrogate pair); null when what is left
+// is under MIN_DETAIL_LINE_BYTES.
+function truncateTextToBytes(text, maxBytes) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const room = maxBytes - Buffer.byteLength('…', 'utf8');
+  let kept = '';
+  let used = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (used + size > room) break;
+    kept += char;
+    used += size;
+  }
+  kept = kept.trimEnd();
+  return Buffer.byteLength(kept, 'utf8') >= MIN_DETAIL_LINE_BYTES ? `${kept}…` : null;
 }
 
 function splitSentences(text) {
@@ -441,9 +475,13 @@ function isItemLine(line) {
   return /^(?:[-*•]\s+|\d+[.)]\s+|#\d+\b)/.test(line);
 }
 
-function summarizeStructuredText(text) {
+// A summary of structured text, and whether it is a cut of that text (cut):
+// the first lines, at most 260 chars. A digest of a heading, context and
+// highlights is not a cut.
+function condenseStructuredText(text) {
   if (looksLikeGunbrokerReport(text)) {
-    return summarizeGunbrokerReport(text);
+    const digest = summarizeGunbrokerReport(text);
+    return digest ? { text: digest, cut: false } : null;
   }
 
   const lines = prepareLines(text);
@@ -464,21 +502,31 @@ function summarizeStructuredText(text) {
     if (heading) parts.push(asSentence(heading));
     if (context) parts.push(asSentence(truncateText(context, 180)));
     if (highlights.length) parts.push(`Highlights: ${highlights.join('; ')}.`);
-    return truncateText(parts.filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
+    const digest = truncateText(parts.filter(Boolean).join(' '), MAX_DELIVERY_CHARS);
+    return digest ? { text: digest, cut: false } : null;
   }
 
-  const compact = truncateText(lines.slice(0, 4).join(' '), 260);
-  return compact ? asSentence(compact) : null;
+  const joined = lines.slice(0, 4).join(' ');
+  const compact = truncateText(joined, 260);
+  return compact ? { text: asSentence(compact), cut: lines.length > 4 || joined.length > 260 } : null;
 }
 
 function summarizeProse(text) {
+  return condenseProse(text)?.text ?? null;
+}
+
+// summarizeProse, and whether it cut the text (cut): its first sentences, or
+// its first 700 chars.
+function condenseProse(text) {
   const normalized = prepareLines(text).join(' ').replace(/\s+/g, ' ').trim();
   if (!normalized || isGenericOrTrivial(normalized)) return null;
 
   const sentences = splitSentences(normalized);
-  if (!sentences.length) return truncateText(normalized, MAX_DELIVERY_CHARS);
+  if (!sentences.length) {
+    return { text: truncateText(normalized, MAX_DELIVERY_CHARS), cut: normalized.length > MAX_DELIVERY_CHARS };
+  }
   if (normalized.length <= MAX_DELIVERY_CHARS && sentences.length <= MAX_DELIVERY_SENTENCES) {
-    return normalized;
+    return { text: normalized, cut: false };
   }
 
   const kept = [];
@@ -490,8 +538,7 @@ function summarizeProse(text) {
     chars = next;
   }
 
-  if (!kept.length) return truncateText(normalized, MAX_DELIVERY_CHARS);
-  return kept.join(' ');
+  return { text: kept.length ? kept.join(' ') : truncateText(normalized, MAX_DELIVERY_CHARS), cut: true };
 }
 
 function countTechnicalKeywordHits(text) {
@@ -753,16 +800,16 @@ function toPastTenseFragment(fragment) {
   return text ? upperFirst(text) : null;
 }
 
+// The clauses of a technical summary, each as written (clause) and cleaned
+// for a lead (text).
 function extractTechnicalFragments(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
 
-  const fragments = prepareLines(normalized)
+  return prepareLines(normalized)
     .flatMap(line => line.split(/\s*;\s*|\s+\|\s+|\s+&&\s+|\s+->\s+|\s+=>\s+/))
-    .map(fragment => fragment.trim())
-    .filter(Boolean);
-
-  return fragments.map(cleanTechnicalFragment).filter(Boolean);
+    .map(clause => ({ clause: clause.trim(), text: cleanTechnicalFragment(clause) }))
+    .filter(fragment => fragment.text);
 }
 
 function isPlainEnglishLeadText(text) {
@@ -793,61 +840,92 @@ function completionUsesHumanizedLead(completion) {
   return getCompletionSummaryStyle(completion) === 'humanized';
 }
 
-// The humanized lead for a technical summary is the real condensed content:
-// fragment-based leads when plain-English fragments exist, otherwise the
-// summarized text itself. Generic themed filler ("The requested fix is in
-// place.", "That should make the workflow more reliable.", ...) is no longer
-// emitted; the legacy follow-up sentences above are only recognized, never
-// produced.
+// The humanized lead for a technical summary is its own content, never
+// generic filler: the first one or two plain-English clauses; else the
+// summary condensed as written, when that reads as plain English; else the
+// first later clause the agent wrote in plain words that states the change
+// rather than a check or a status on it (LEAD_CAVEAT_RE); else the first
+// sentence of the first clause, past its commit or file prefix. A single
+// statement with no such prefix stays as written. humanizeCompletion cuts it
+// to one chat message, like every other lead.
+// The first two rules make the leads #72 (0a135cf) stored without a rewrite
+// record, which isLossyHumanizedLead recognizes by rebuilding them exactly, so
+// they keep their output, including cleaning each clause twice (the cleaned
+// text goes through toPastTenseFragment, which cleans it again and turns
+// "watcher" into "completion completion watcher"). The later rules clean the
+// clause as written once.
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const cleanedRaw = normalizeCompletionText(rawText);
   const fallback = normalizeCompletionText(fallbackSummary);
-  if (!cleanedRaw) return fallback;
+  if (!cleanedRaw) return { lead: fallback, fromFallback: true };
 
   const fragments = extractTechnicalFragments(cleanedRaw);
-  const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
+  const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment.text));
   const sourceFragments = primaryFragments.length > 0 ? primaryFragments : fragments;
+  const plainLead = (text) => {
+    const rewritten = toPastTenseFragment(text);
+    return rewritten && isPlainEnglishLeadText(rewritten) ? rewritten : null;
+  };
 
-  // Fragment-based lead: the first two plain-English fragments. The selection
-  // must stay stable -- the machine-derivative gate in isLossyHumanizedLead
-  // reproduces the stored lead verbatim from the report, so changing which
-  // fragments are picked would change the stored lead for every such payload.
-  // (A plain-English clause that only appears past the first two fragments is
-  // a known limitation; the fallback below still delivers real content.) The
-  // fragment lead is a user-facing notification, so keep it within the
-  // delivery-length cap (a single long clause with no delimiter is otherwise
-  // unbounded).
-  const chosen = sourceFragments
-    .slice(0, 2)
-    .map(fragment => toPastTenseFragment(fragment))
-    .filter(Boolean)
-    .filter(fragment => isPlainEnglishLeadText(fragment));
-
-  if (chosen.length === 1) return truncateText(asSentence(chosen[0]), MAX_DELIVERY_CHARS);
-  if (chosen.length >= 2) return truncateText(`${chosen[0]} and ${lowerFirst(chosen[1])}.`, MAX_DELIVERY_CHARS);
-  if (fallback && isPlainEnglishLeadText(fallback)) return asSentence(fallback);
-  return fallback || null;
+  const chosen = sourceFragments.slice(0, 2).map(fragment => plainLead(fragment.text)).filter(Boolean);
+  let lead = null;
+  if (chosen.length === 1) lead = asSentence(chosen[0]);
+  else if (chosen.length >= 2) lead = `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
+  else if (fallback && isPlainEnglishLeadText(fallback)) return { lead: asSentence(fallback), fromFallback: true };
+  else {
+    const later = sourceFragments.slice(2)
+      .filter(fragment => !CODEISH_MARKER_RE.test(fragment.clause) && !LEAD_CAVEAT_RE.test(fragment.text))
+      .map(fragment => plainLead(fragment.clause))
+      .find(Boolean);
+    if (later) lead = asSentence(later);
+  }
+  if (!lead && sourceFragments.length > 0
+    && (sourceFragments.length > 1 || TECHNICAL_COMMIT_PREFIX_RE.test(cleanedRaw) || FILE_CONTEXT_PREFIX_RE.test(cleanedRaw))) {
+    lead = asSentence(splitSentences(toPastTenseFragment(sourceFragments[0].clause))[0]);
+  }
+  return lead ? { lead, fromFallback: false } : { lead: fallback, fromFallback: true };
 }
 
-export function humanizeCompletionText(value) {
+// humanizeCompletionText, plus whether its text is a technical rewrite: a
+// lead the humanizer built from clauses or sentences of the agent's summary,
+// rather than the agent's own words (a final report, a "Technically:" lead, a
+// "Human summary:" section, the summary as written) or a plain condensation
+// of them.
+function humanizeCompletion(value) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
   const passThroughReport = getPassThroughHumanFinalReport(raw);
-  if (passThroughReport) return passThroughReport;
+  if (passThroughReport) return { text: passThroughReport, technicalRewrite: false };
 
   const structuredSections = extractStructuredSummarySections(raw);
   const summarySource = normalizeCompletionText(structuredSections?.summary || raw);
   if (!summarySource) return null;
 
   const mixedSummary = buildHumanSummaryFromMixedTechnicalText(summarySource);
-  if (mixedSummary) return mixedSummary;
+  if (mixedSummary) return { text: mixedSummary, technicalRewrite: false };
 
-  const summarized = summarizeCompletionText(summarySource);
+  const condensed = summarizeCompletion(summarySource);
+  const summarized = condensed?.text;
   if (!summarized) return null;
-  if (!looksTechnicalCompletionSummary(summarySource, summarized)) return stripHumanSummaryLabel(summarized) || summarized;
+  // leadCut: the lead is a cut of the summary, its first sentences or chars,
+  // so the summary may go out whole in its place (composeDeliveryText).
+  if (!looksTechnicalCompletionSummary(summarySource, summarized)) {
+    return { text: stripHumanSummaryLabel(summarized) || summarized, technicalRewrite: false, leadCut: condensed.cut };
+  }
 
-  return buildHumanizedTechnicalSummary(summarySource, summarized) || summarized;
+  const built = buildHumanizedTechnicalSummary(summarySource, summarized);
+  const lead = built.lead || summarized;
+  const text = truncateText(lead, MAX_DELIVERY_CHARS);
+  return {
+    text,
+    technicalRewrite: !structuredSections?.summary && text !== raw,
+    leadCut: normalizeCompletionText(lead).length > MAX_DELIVERY_CHARS || (built.fromFallback && condensed.cut),
+  };
+}
+
+export function humanizeCompletionText(value) {
+  return humanizeCompletion(value)?.text ?? null;
 }
 
 function summarizeChecklistTechnicalDetails(checklist, sha) {
@@ -874,7 +952,14 @@ function summarizeChecklistTechnicalDetails(checklist, sha) {
   return parts.length > 0 ? `Checks: ${parts.join('; ')}.` : null;
 }
 
-function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRawSummaryDetails = true } = {}) {
+function buildTechnicalDetailsText({
+  rawText,
+  summaryText,
+  completion,
+  includeRawSummaryDetails = true,
+  fromLastReply = false,
+  leadCut = false,
+} = {}) {
   const raw = normalizeCompletionText(rawText);
   const summary = normalizeCompletionText(summaryText);
   const details = getCompletionTechnicalDetails(completion);
@@ -882,7 +967,8 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
 
   const rawSections = extractStructuredSummarySections(raw);
   const splitRaw = extractExplicitTechnicalTail(raw);
-  const rawTechnicalSource = normalizeTechnicalDetailLine(rawSections?.technical || splitRaw?.technicalTail || raw);
+  const rawDetail = rawSections?.technical || splitRaw?.technicalTail || raw;
+  const rawTechnicalSource = normalizeTechnicalDetailLine(rawDetail);
   const rawHasExplicitTechnical = Boolean(rawSections?.technical || splitRaw?.technicalTail);
   // When the summary is the same report as the raw text (pass-through final
   // report), the "technical detail" derived from raw is the report itself
@@ -896,14 +982,15 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
         || (looksTechnicalCompletionSummary(rawTechnicalSource, summary) && rawTechnicalSource !== summary)),
   );
   if (rawTechnical) {
-    parts.push(truncateText(rawTechnicalSource, 260));
+    parts.push([rawTechnicalSource, 260, rawDetail]);
   }
 
   let completionDetailsAreTechnical = false;
   if (typeof details === 'string') {
     const detailSections = extractStructuredSummarySections(details);
     const splitDetails = extractExplicitTechnicalTail(details);
-    const normalized = normalizeTechnicalDetailLine(detailSections?.technical || splitDetails?.technicalTail || details);
+    const detail = detailSections?.technical || splitDetails?.technicalTail || details;
+    const normalized = normalizeTechnicalDetailLine(detail);
     completionDetailsAreTechnical = Boolean(
       normalized && (detailSections?.technical || splitDetails?.technicalTail || looksTechnicalCompletionSummary(normalized, summary)),
     );
@@ -911,13 +998,14 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
       && !isInternalTransportNoiseText(normalized)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || normalized !== rawTechnicalSource)) {
-      parts.push(truncateText(normalized, 220));
+      parts.push([normalized, 220, detail]);
     }
   } else if (includeRawSummaryDetails && details && typeof details === 'object') {
     const rawSummary = normalizeCompletionText(details.raw_summary);
     const detailSummarySections = extractStructuredSummarySections(rawSummary);
     const splitDetailSummary = extractExplicitTechnicalTail(rawSummary);
-    const technicalSummary = normalizeTechnicalDetailLine(detailSummarySections?.technical || splitDetailSummary?.technicalTail || rawSummary);
+    const detail = detailSummarySections?.technical || splitDetailSummary?.technicalTail || rawSummary;
+    const technicalSummary = normalizeTechnicalDetailLine(detail);
     completionDetailsAreTechnical = Boolean(
       technicalSummary && (detailSummarySections?.technical || splitDetailSummary?.technicalTail || looksTechnicalCompletionSummary(technicalSummary, summary)),
     );
@@ -925,37 +1013,83 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
       && !isInternalTransportNoiseText(technicalSummary)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || technicalSummary !== rawTechnicalSource)) {
-      parts.push(truncateText(technicalSummary, 220));
+      parts.push([technicalSummary, 220, detail]);
     }
   }
 
   const checklistDetails = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
   // The checks line (tests passed, pushed sha) is distinct content, not a
-  // duplicate of the summary: include it whenever a technical context exists,
-  // including a verbatim technical lead whose raw detail line is suppressed
-  // as a duplicate of the summary itself (rawIsSameReportAsSummary).
-  if (checklistDetails
-    && (rawTechnical || completionDetailsAreTechnical || looksTechnicalCompletionSummary(summary, summary))) {
-    parts.push(checklistDetails);
+  // duplicate of the summary, so a technical summary carries it even with no
+  // raw detail line (rawIsSameReportAsSummary). A report delivered as written
+  // from lastReply carries it only for a sha the report does not already name.
+  const checksSha = shortSha(completion?.sha);
+  const checksAddToSummary = fromLastReply && rawIsSameReportAsSummary
+    ? Boolean(checksSha) && !summary.toLowerCase().includes(checksSha.toLowerCase())
+    : looksTechnicalCompletionSummary(summary, summary);
+  if (checklistDetails && (rawTechnical || completionDetailsAreTechnical || checksAddToSummary)) {
+    parts.push([checklistDetails]);
   }
 
-  const unique = [];
-  const seen = new Set();
-  for (const part of parts) {
-    const normalized = normalizeTechnicalDetailLine(part) || normalizeCompletionText(part);
-    if (!normalized) continue;
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(normalized);
-  }
+  // Each detail line, whole or cut at 260/220 chars, and whether it may be
+  // cut further: every line but the checks line, which carries the sha.
+  const detailLines = (cut) => {
+    const unique = [];
+    const seen = new Set();
+    for (const [part, maxChars, source] of parts) {
+      const text = maxChars && (cut || isMachineOutput(source)) ? truncateText(part, maxChars) : part;
+      const normalized = normalizeTechnicalDetailLine(text) || normalizeCompletionText(text);
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push({ line: normalized, cuttable: Boolean(maxChars) });
+    }
+    return unique;
+  };
+  const composedBytes = (entries) => Buffer.byteLength(
+    composeDeliveryText(summaryText, entries.map(entry => entry.line), { leadCut }) ?? '',
+    'utf8',
+  );
 
-  return unique;
+  // The bound is the one a promoted report has, on the composed body; the
+  // outbox's "✅ [label] done" header is outside it. Whole detail lines while
+  // the body fits, except machine output, which stays cut as it is never
+  // promoted.
+  const whole = detailLines(false);
+  if (composedBytes(whole) <= MAX_VERBATIM_REPORT_BYTES) return whole.map(entry => entry.line);
+  // Past it, the 260/220-char cuts. A lead over the bound on its own, such as
+  // a report sent as written, stays as it is with them: no cut of the details
+  // brings it within the bound.
+  const lines = detailLines(true);
+  if (composedBytes([]) > MAX_VERBATIM_REPORT_BYTES) return lines.map(entry => entry.line);
+  // Otherwise each cuttable line, last first, is cut to the bytes still over
+  // and the body measured again (composeDeliveryText cleans a line again, so
+  // one cut can miss), until the body fits; a line left under
+  // MIN_DETAIL_LINE_BYTES is dropped. When the lead and the checks line fill
+  // the bound on their own, every detail line goes and the checks line stays.
+  // Each pass drops a line or makes line i shorter in bytes, so this ends.
+  let i = lines.length - 1;
+  while (i >= 0) {
+    const over = composedBytes(lines) - MAX_VERBATIM_REPORT_BYTES;
+    if (over <= 0) break;
+    if (!lines[i].cuttable) {
+      i -= 1;
+      continue;
+    }
+    const line = truncateTextToBytes(lines[i].line, Buffer.byteLength(lines[i].line, 'utf8') - over);
+    if (line) {
+      lines[i] = { ...lines[i], line };
+    } else {
+      lines.splice(i, 1);
+      i -= 1;
+    }
+  }
+  return lines.map(entry => entry.line);
 }
 
-function composeDeliveryText(summaryText, technicalDetailsText = null) {
+function composeDeliveryText(summaryText, technicalDetailsText = null, { leadCut = false } = {}) {
   const summarySections = extractStructuredSummarySections(summaryText);
-  const summary = stripHumanSummaryLabel(summarySections?.summary || summaryText);
+  let summary = stripHumanSummaryLabel(summarySections?.summary || summaryText);
   if (!summary) return null;
 
   const technicalCandidates = [];
@@ -974,6 +1108,17 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
     technicalLines.push(normalized);
   }
 
+  // A lead the humanizer cut from a detail line kept whole (leadCut, recorded
+  // by the code that built it) is that line: it goes out once, as written, in
+  // place of the lead. An agent's report or summary_human carries no such
+  // record and is never replaced. The lead's own text is compared, never a
+  // section of it, less the "…" a cut ends with.
+  const cutLead = leadCut ? summary.replace(/…$/, '').replace(/\s+/g, ' ').trim().toLowerCase() : null;
+  const cutFrom = cutLead
+    ? technicalLines.findIndex(line => line.replace(TECHNICAL_COMMIT_PREFIX_RE, '').replace(FILE_CONTEXT_PREFIX_RE, '').toLowerCase().startsWith(cutLead))
+    : -1;
+  if (cutFrom >= 0) summary = technicalLines.splice(cutFrom, 1)[0];
+
   if (technicalLines.length > 0) {
     return `${summary}\n\nTechnical details:\n- ${technicalLines.join('\n- ')}`;
   }
@@ -981,35 +1126,44 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
 }
 
 export function summarizeCompletionText(value, { skipEmbeddedObject = false } = {}) {
+  return summarizeCompletion(value, { skipEmbeddedObject })?.text ?? null;
+}
+
+// summarizeCompletionText, and whether its text is a cut of the text it
+// summarizes (cut), which composeDeliveryText may send whole instead.
+function summarizeCompletion(value, { skipEmbeddedObject = false } = {}) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
   const passThroughReport = getPassThroughHumanFinalReport(raw);
-  if (passThroughReport) return passThroughReport;
+  if (passThroughReport) return { text: passThroughReport, cut: false };
 
   if (!skipEmbeddedObject) {
     const parsed = extractEmbeddedCompletionObject(raw);
     if (parsed !== null) {
       const candidates = gatherObjectTextCandidates(parsed);
       for (const candidate of candidates) {
-        const summarized = summarizeCompletionText(candidate, { skipEmbeddedObject: true });
-        if (summarized) return summarized;
+        const summarized = summarizeCompletion(candidate, { skipEmbeddedObject: true });
+        if (summarized?.text) return summarized;
       }
       if (looksLikeRawPayloadText(raw)) return null;
     }
   }
 
   if (looksLikeRawPayloadText(raw)) return null;
-  if (looksLikeGunbrokerReport(raw)) return summarizeGunbrokerReport(raw);
+  if (looksLikeGunbrokerReport(raw)) {
+    const digest = summarizeGunbrokerReport(raw);
+    return digest ? { text: digest, cut: false } : null;
+  }
 
   const prepared = prepareLines(raw);
   const structured = prepared.length >= 4 || prepared.some(line => line.includes('|')) || prepared.filter(isItemLine).length >= 2;
   if (structured) {
-    const summary = summarizeStructuredText(raw);
-    if (summary && !isGenericOrTrivial(summary)) return summary;
+    const summary = condenseStructuredText(raw);
+    if (summary?.text && !isGenericOrTrivial(summary.text)) return summary;
   }
 
-  return summarizeProse(raw);
+  return condenseProse(raw);
 }
 
 export function isMeaningfulCompletionText(value) {
@@ -1288,7 +1442,8 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
   const rawSummary = normalizeCompletionText(summary);
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
-  const normalizedSummary = humanizeCompletionText(rawSummary);
+  const humanized = humanizeCompletion(rawSummary);
+  const normalizedSummary = humanized?.text ?? null;
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
@@ -1322,6 +1477,13 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
       normalizedSummary,
       synthesizedReply,
       summaryStyle,
+      // How summary_human (normalizedSummary) was made, when the humanizer
+      // built it from the summary's clauses; resolveCompletionDelivery then
+      // prefers the full prose report (isLossyHumanizedLead).
+      ...(humanized?.technicalRewrite ? { leadSource: TECHNICAL_REWRITE_LEAD_SOURCE } : {}),
+      // The humanizer cut summary_human from a longer text, which
+      // composeDeliveryText may send whole in its place.
+      ...(summaryStyle === 'humanized' && humanized.leadCut ? { leadCut: true } : {}),
       deliverySource: normalizedSummary ? 'summary_human' : synthesizedReply ? 'technical-synthesis' : 'none',
     },
   };
@@ -1345,29 +1507,30 @@ export function getCompletionAuthoritativeSummary(completion) {
 // True when summaryHuman is a machine derivative that dropped most of a
 // substantial summary: either a truncation (a prefix once punctuation and
 // spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling)
-// or a fragment-based lead the humanizer wrote from a clause of the report
-// (the stripped lead is embedded in the stripped report, prose reports only)
-// or a legacy synthetic technical rewrite (it ends with a follow-up sentence
-// the old humanizer wrote, not the agent). Equal or similar-length texts
-// are not lossy.
-function isLossyHumanizedLead(summary, summaryHuman) {
-  if (!summary || !summaryHuman) return false;
-  if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
+// or a technical rewrite of a prose report, a lead the humanizer built from
+// some of its clauses ("Fixed the stale flag reset." for a 418-char report)
+// or from its first sentences. A truncation that keeps most of the report is
+// delivered as it is; a technical rewrite is not, whatever its length, since
+// its details block repeats the head of the report and drops the rest.
+function isLossyHumanizedLead(summary, summaryHuman, technicalRewrite) {
+  if (!summary || !summaryHuman || summary.length <= 200) return false;
+  if (isProseReport(summary) && isTechnicalRewriteLead(summary, summaryHuman, technicalRewrite)) return true;
+  if (summaryHuman.length >= summary.length * 0.6) return false;
   const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  const strippedSummary = strip(summary);
-  const strippedHuman = strip(summaryHuman);
-  if (strippedSummary.startsWith(strippedHuman)) return true;
-  // A fragment-based lead the humanizer wrote from a clause of a prose report
-  // (e.g. "Md5 032cde47 (stale round-7)." for a 1,619-char report) is embedded
-  // in the report, not a prefix: it is a lossy derivative too. Gate this on the
-  // stored summary_human being a machine derivative of THIS report -- i.e. the
-  // humanizer reproduces it verbatim from the report. An explicit human summary
-  // that merely happens to appear in the report is not a derivative and keeps
-  // its precedence (it is not reproduced verbatim by the humanizer).
-  const machineDerivative = isProseReport(summary)
-    && humanizeCompletionText(summary) === summaryHuman;
-  if (strippedHuman.length >= 15 && machineDerivative && strippedSummary.includes(strippedHuman)) return true;
-  return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
+  return strip(summary).startsWith(strip(summaryHuman));
+}
+
+// A rewrite is known by how it was made, never by its words. A payload built
+// now carries the producer's record (technicalRewrite true or false). One
+// stored before the record existed (undefined) is a rewrite when it ends with
+// a follow-up sentence v0.6.6 appended, or when the humanizer rebuilds that
+// exact lead from the report as a rewrite (#72 wrote neither). An explicit
+// summary_human is neither.
+function isTechnicalRewriteLead(summary, summaryHuman, technicalRewrite) {
+  if (technicalRewrite !== undefined) return technicalRewrite;
+  if (SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp))) return true;
+  const rebuilt = humanizeCompletion(summary);
+  return Boolean(rebuilt?.technicalRewrite) && rebuilt.text === summaryHuman;
 }
 
 // A report written as sentences. A commit-style summary ("fix(sync): a; b; c"
@@ -1386,7 +1549,9 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const rawCompletionRawSummary = getCompletionRawSummary(completion);
   const rawFallback = normalizeCompletionText(fallbackSummary);
 
-  const reply = humanizeCompletionText(lastReply);
+  const humanizedReply = humanizeCompletion(lastReply);
+  const reply = humanizedReply?.text ?? null;
+  const replyLeadCut = Boolean(humanizedReply?.leadCut);
   const completionSummaryHuman = humanizeCompletionText(rawCompletionSummaryHuman);
   const completionSummary = humanizeCompletionText(completion?.summary);
   const completionDelivery = humanizeCompletionText(completion?.deliveryText);
@@ -1413,12 +1578,21 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   const isDeliverableText = (rawText, summarizedText) => Boolean(summarizedText)
     && !isInternalTransportNoiseText(summarizedText)
     && (!rawText || !isInternalTransportNoiseText(rawText) || looksLikeRawPayloadText(rawText));
+  // The producer's rewrite record counts only for the very text it produced,
+  // so a summary_human set or changed afterwards keeps its precedence.
+  const technicalRewriteLead = completion?.debug?.leadSource === undefined
+    ? undefined
+    : completion.debug.leadSource === TECHNICAL_REWRITE_LEAD_SOURCE
+      && normalizeCompletionText(completion.debug.normalizedSummary) === rawCompletionSummaryHuman;
   const structuredCandidates = [
     {
       rawText: rawCompletionSummaryHuman,
       text: completionSummaryHuman,
       summary: completionSummaryHuman,
       source: completionDeliverySource === 'technical-synthesis' ? 'technical-synthesis' : 'summary_human',
+      // The producer cut this very text from a longer one.
+      leadCut: completion?.debug?.leadCut === true
+        && normalizeCompletionText(completion.debug.normalizedSummary) === rawCompletionSummaryHuman,
     },
     {
       rawText: rawCompletionSummary,
@@ -1427,12 +1601,14 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       source: completionDeliverySource === 'technical-synthesis' && completionSummary === synthesizedFromTechnical
         ? 'technical-synthesis'
         : 'completion-summary',
+      leadCut: false,
     },
     {
       rawText: rawCompletionDelivery,
       text: completionDelivery,
       summary: completionSummaryHuman || completionSummary || completionDelivery,
       source: completionDeliverySource || 'completion-legacy',
+      leadCut: false,
     },
   ];
 
@@ -1452,9 +1628,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: reply,
       completion,
       includeRawSummaryDetails: false,
+      fromLastReply: true,
+      leadCut: replyLeadCut,
     });
     return {
-      deliveryText: composeDeliveryText(reply, technicalDetailsText),
+      deliveryText: composeDeliveryText(reply, technicalDetailsText, { leadCut: replyLeadCut }),
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
     };
@@ -1464,18 +1642,18 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // On the done path lastReply is not recovered, so when summary_human is a
   // lossy machine derivative of that report, deliver the report itself: a
   // truncation (summarizeProse cut a 1,909-char report to ~200 chars and split
-  // "0.00s" into "0. 00s") or a synthetic technical rewrite of a prose report
-  // (one fragment plus the humanizer's own follow-up sentences). summary_human
-  // still wins for a commit-style summary, when the agent wrote its own lead
-  // ("Technically:" / "Technical details:" tail, which the humanizer splits
-  // into lead and details block), or when the report is not
+  // "0.00s" into "0. 00s") or a technical rewrite of a prose report (a lead
+  // built from some of its clauses or sentences). summary_human still wins when the
+  // agent supplied it, for a commit-style summary, when the agent wrote its
+  // own lead ("Technically:" / "Technical details:" tail, which the humanizer
+  // splits into lead and details block), or when the report is not
   // verbatim-deliverable (over one message, or machine output).
   // The report gets the humanizer's text cleanup: no color codes or CRs.
   const report = normalizeReportLineEndings(rawCompletionSummary);
   if (
     report
     && !EXPLICIT_TECHNICAL_MARKER_RE.test(report)
-    && isLossyHumanizedLead(report, rawCompletionSummaryHuman)
+    && isLossyHumanizedLead(report, rawCompletionSummaryHuman, technicalRewriteLead)
   ) {
     // The checks line (tests passed, pushed sha) that the technical-details
     // block would have carried stays with the report.
@@ -1493,9 +1671,10 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: candidate.text,
       completion,
       includeRawSummaryDetails: summaryUsesHumanizedLead && candidate.source === 'summary_human',
+      leadCut: candidate.leadCut,
     });
     return {
-      deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
+      deliveryText: composeDeliveryText(candidate.text, technicalDetailsText, { leadCut: candidate.leadCut }),
       summary: candidate.summary || candidate.text,
       source: candidate.source,
     };
@@ -1512,9 +1691,11 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: reply,
       completion,
       includeRawSummaryDetails: false,
+      fromLastReply: true,
+      leadCut: replyLeadCut,
     });
     return {
-      deliveryText: composeDeliveryText(reply, technicalDetailsText),
+      deliveryText: composeDeliveryText(reply, technicalDetailsText, { leadCut: replyLeadCut }),
       summary: authoritativeStructuredSummary || reply,
       source: 'lastReply',
     };

@@ -160,13 +160,12 @@ test('sm-round8-align-fix: the full report reaches chat on the done and watcher 
   assert.equal(watcher.deliveryText, alignReport.summary);
 });
 
-test('done path: a lossy summary_human gives way to the full report', () => {
-  // sm-round8-fix once stored the humanizer's technical rewrite: one fragment
-  // plus its stock follow-up sentences, 133 chars standing in for a 1,619-char
-  // report. The boilerplate family is removed; the stored lead is now the real
-  // condensed content (a truncation of the report), and the full report still
-  // wins on the done path.
-  assert.ok(payload.completion.summary_human.length < payload.completion.summary.length / 2);
+test('done path: a technical rewrite stored by 0.6.7 gives way to the full report', () => {
+  // The fixture is sm-round8-fix as 0.6.7 stores it: a 29-char lead built
+  // from one clause of a 1,619-char report, with no follow-up sentence and no
+  // rewrite record. The humanizer rebuilds that exact lead from the report.
+  assert.equal(payload.completion.summary_human, 'Md5 032cde47 (stale round-7).');
+  assert.equal(payload.completion.debug.leadSource, undefined);
   assert.ok(payload.completion.summary.length > 1500);
   const result = resolveCompletionDelivery({
     completion: payload.completion,
@@ -174,6 +173,120 @@ test('done path: a lossy summary_human gives way to the full report', () => {
   });
   assert.equal(result.source, 'completion-summary-full');
   assert.equal(result.deliveryText, payload.completion.summary);
+});
+
+// A clause of the sm-round8-fix report. With a verb in front of it the
+// humanizer leads with that clause rewritten ("Updated md5 ..."), which is
+// neither a prefix nor a substring of the report.
+const MD5_CLAUSE = 'md5 032cde47 (stale round-7) -> 29e5e2d6';
+const REWRITTEN_REPORTS = {
+  'incident, "update md5"': payload.completion.summary.replace(MD5_CLAUSE, `update ${MD5_CLAUSE}`),
+  'incident, "fix md5"': payload.completion.summary.replace(MD5_CLAUSE, `fix ${MD5_CLAUSE}`),
+  'fix -> Fixed': 'Diagnosed the importer stall in src/sync/importer.js after the overnight run. The queue drained but the HAE_EXPORT flag stayed set for six hours; fix the stale flag reset before the next run starts; verified against the live fitness.db snapshot that the W2D4 session plans W2D5. Re-ran the full import twice and both runs finished in under four minutes. No other files changed and nothing was pushed beyond the branch.',
+  'two clauses joined': 'Cleared the stale planner cache that the morning brief read; reused the last good plan when the export was empty; the cron entry in jobs/brief.yaml fired on time but HAE_EXPORT was unset for six hours. Checked three days of logs and every skip lines up with an empty export. Re-ran the brief by hand and the planner block rendered. Re-ran the sync job and the queue drained. Nothing else changed.',
+  'add -> Added': 'Root-caused the duplicate receipt emails to billing/retry_worker.py re-sending invoices whose ack arrived after the window -> add an idempotency key per invoice -> backfilled with scripts/backfill_receipts.py over the last two days. Confirmed on staging that each order produces one receipt. Ran pytest (212 passed) and the lint job. Re-ran the queue twice. Nothing customer-facing changed beyond the duplicate emails ending.',
+};
+const stripPunctuation = (text) => text.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+test('done and watcher paths: a fresh technical rewrite of a prose report gives way to the report', () => {
+  // 0.6.7 delivered the rewritten lead and a cut of the report instead: 280
+  // chars for the 1,626-char "update md5" report, which 0.6.6 sent whole.
+  assert.ok(payload.completion.summary.includes(MD5_CLAUSE));
+  for (const [name, report] of Object.entries(REWRITTEN_REPORTS)) {
+    const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.ok(!stripPunctuation(report).includes(stripPunctuation(completion.summary_human)), `${name}: ${completion.summary_human}`);
+    for (const [path, lastReply] of [['done', undefined], ['watcher', report]]) {
+      const result = resolveCompletionDelivery({ lastReply, completion, fallbackSummary: completion.summary });
+      assert.equal(result.source, 'completion-summary-full', `${name} (${path})`);
+      assert.equal(result.deliveryText, `${report}\n\nChecks: tests passed; pushed deadbee.`, `${name} (${path})`);
+    }
+    assert.equal(completion.debug.leadSource, 'technical-rewrite', name);
+  }
+});
+
+test('done path: a rewritten lead stored by 0.6.7, which has no record, gives way to the report after the upgrade', () => {
+  // 0.6.7 built the same lead from these reports but stored no leadSource.
+  for (const [name, report] of Object.entries(REWRITTEN_REPORTS)) {
+    const debug = { ...buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST }).debug };
+    delete debug.leadSource;
+    const stored = { version: 2, summary_human: debug.normalizedSummary, summary: report, checklist: CHECKLIST, debug };
+    const result = resolveCompletionDelivery({ completion: stored, fallbackSummary: report });
+    assert.equal(result.source, 'completion-summary-full', name);
+    assert.equal(result.deliveryText, report, name);
+  }
+});
+
+test('done path: a technical lead made of the report\'s first sentences gives way to the report, however long', () => {
+  // No plain clause leads this report, so the humanizer leads with its first
+  // five sentences: 448 of 608 chars. The details block then repeats the
+  // head and drops the rest, 731 chars without the last two sentences.
+  // 0.6.6 led with a stock sentence and sent the report.
+  const report = [
+    'Rebuilt the nightly export after the overnight run stalled at the invoice step.',
+    'The export had stopped at row 4,812 when the upstream feed closed early.',
+    'Config: EXPORT_WINDOW_START moved from 02:10 to 02:50 in jobs/export.yaml, and retry_limit raised to 3 for the invoice step.',
+    'Re-ran the import against the morning snapshot and every table matched the source counts.',
+    'Checked the three previous nights and found the same early close on two of them.',
+    'Moved the export window forty minutes later, after the feed closes.',
+    'Ran the job twice by hand and both runs finished in under six minutes with no skipped rows.',
+  ].join(' ');
+  const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.ok(report.startsWith(completion.summary_human) && completion.summary_human.length > report.length * 0.6, completion.summary_human);
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: report });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, `${report}\n\nChecks: tests passed; pushed deadbee.`);
+
+  // The same lead stored by 0.6.7, without the record.
+  const debug = { ...completion.debug };
+  delete debug.leadSource;
+  const stored = resolveCompletionDelivery({ completion: { ...completion, debug }, fallbackSummary: report });
+  assert.equal(stored.source, 'completion-summary-full');
+});
+
+test('the rewrite record marks only the humanizer\'s own lead, never the agent\'s final report', () => {
+  // A final report passed as --summary leads as written. Recording it as a
+  // rewrite would send it as a promoted report instead.
+  const completion = buildTerminalCompletionPayload({ summary: payload.lastReply, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.summary_human, payload.lastReply.trim());
+  assert.equal(completion.debug.leadSource, undefined);
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.startsWith(`${payload.lastReply.trim()}\n\nTechnical details:\n`), result.deliveryText.slice(-80));
+});
+
+test('done path: the producer record outlives a change to the humanizer', () => {
+  // A payload stored by a build whose humanizer wrote a different lead: the
+  // record, not a rebuild of the lead, says it is a rewrite.
+  const report = REWRITTEN_REPORTS['fix -> Fixed'];
+  const produced = buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST });
+  const otherLead = 'Fixed the stale import flag reset.';
+  assert.notEqual(produced.summary_human, otherLead);
+  const stored = { ...produced, summary_human: otherLead, debug: { ...produced.debug, normalizedSummary: otherLead } };
+  const result = resolveCompletionDelivery({ completion: stored, fallbackSummary: report });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, report);
+});
+
+test('done path: every follow-up sentence v0.6.6 appended marks a stored rewrite', () => {
+  const followUps = [
+    'That makes the behavior easier to trust. Future regressions should get caught quickly.',
+    'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
+    'That makes the new behavior available without extra follow-up. Future runs should use it automatically.',
+    'That should make the result easier to work with. Future runs should reflect the change automatically.',
+    'Future runs should show the clean summary first, with technical details underneath when needed.',
+  ];
+  for (const followUp of followUps) {
+    const completion = { ...payload.completion, summary_human: `Re-encoded the dub track. ${followUp}` };
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'completion-summary-full', followUp);
+    assert.equal(result.deliveryText, payload.completion.summary, followUp);
+  }
+
+  // Without the sentence, a lead the humanizer would not write is the agent's.
+  const explicit = { ...payload.completion, summary_human: 'Re-encoded the dub track.' };
+  const result = resolveCompletionDelivery({ completion: explicit, fallbackSummary: explicit.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.startsWith('Re-encoded the dub track.'));
 });
 
 test('done path: commit-style summaries keep their lead and the pushed sha at any length', () => {
@@ -294,6 +407,7 @@ test('done path: an agent-written "Technically:" split keeps its lead even when 
   const lead = 'Fixed the planner so the next session is recommended after the last completed one.';
   const { completion, result } = deliverDone(`${lead} Technically: mapped imported workout ids back to the program schedule, updated the focused progression tests, and verified on the live database snapshot that the last completed W2D4 now plans W2D5.`);
   assert.equal(completion.summary_human, lead);
+  assert.equal(completion.debug.leadSource, undefined, 'the agent\'s own lead is not a rewrite');
   assert.notEqual(result.source, 'completion-summary-full');
   assert.ok(result.deliveryText.startsWith(`${lead}\n\nTechnical details:`));
   assert.ok(!result.deliveryText.includes('Technically:'), 'the raw marker must not reach chat');
@@ -413,6 +527,7 @@ test('humanizeCompletionText never emits the removed boilerplate family', () => 
     'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions',
     payload.completion.summary,
     'Add focused tests for the retry, the empty-array guard and the snapshot fallback',
+    'fix(dispatch): update foo/bar.mjs; change BAZ_QUX',
   ];
   for (const summary of technicalSummaries) {
     const humanized = humanizeCompletionText(summary);
@@ -479,6 +594,256 @@ test('humanizeCompletionText caps a long single-clause technical lead at the del
   assert.ok(humanized.length <= 700, `fragment lead must respect the 700-char cap, got ${humanized.length}`);
 });
 
+test('a commit-style lead is a clause of the summary, never the summary with its prefix', () => {
+  // With no plain-English clause among the first two, 0.6.7 led with the
+  // whole summary, "fix(dispatch):" prefix included.
+  const cases = {
+    'a plain clause past the first two': ['fix(dispatch): update foo/bar.mjs; change BAZ_QUX; users now receive one clear result', 'Users now receive one clear result.'],
+    'no plain clause': ['fix(dispatch): update foo/bar.mjs; change BAZ_QUX', 'Updated bar.mjs.'],
+    'no plain clause and no prefix': ['update foo/bar.mjs; change BAZ_QUX', 'Updated bar.mjs.'],
+    'a single clause': ['fix(cache): bump CACHE_TTL to 30s in scheduler/config.mjs', 'Bump CACHE_TTL to 30s in config.mjs.'],
+    'a single clause past a file prefix': ['src/cache.mjs: bump CACHE_TTL to 30s', 'Bump CACHE_TTL to 30s.'],
+    'a first clause of two sentences': ['fix(cache): bump CACHE_TTL to 30s. Restart the scheduler after the deploy.', 'Bump CACHE_TTL to 30s.'],
+  };
+  for (const [name, [summary, lead]] of Object.entries(cases)) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.summary_human, lead, name);
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.deliveryText, `${lead}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`, name);
+  }
+});
+
+test('a later clause leads only when it states the change, never a check or a status on it', () => {
+  // The first clause states the change; a later one that reports a check or
+  // a status leads with nothing the reader needs ("Verified in Safari.").
+  const caveats = [
+    'verified in Safari', 'not pushed yet', 'never ran on Windows', 'still needs review', 'pending review',
+    'untested on Linux', 'unverified on staging', 'tested on staging', 'checked the resize logs',
+    'confirmed on staging', 'validated against production', 'pushed to the branch', 'committed locally',
+  ];
+  for (const caveat of caveats) {
+    const summary = `fix(ui): HUD overlay no longer flickers on resize; use requestAnimationFrame in hud.ts; ${caveat}`;
+    assert.equal(humanizeCompletionText(summary), 'HUD overlay no longer flickers on resize.', caveat);
+  }
+
+  // The later rules clean the clause as written once: the first two clean it
+  // twice and turn "watcher" into "completion completion watcher".
+  const lead = humanizeCompletionText('fix(watcher): retry the gateway call in watcher.mjs; bump WATCH_TIMEOUT to 30s; not pushed yet');
+  assert.match(lead, /^Retry the gateway call in /);
+  assert.doesNotMatch(lead, /completion completion|pushed/i);
+  assert.equal(humanizeCompletionText('fix(api): update api/limits.mjs; change RATE_LIMIT; operators now see one alert per outage'), 'Operators now see one alert per outage.');
+  assert.equal(humanizeCompletionText('fix(api): update api/limits.mjs; change RATE_LIMIT; the watcher now sends one alert per outage'), 'The completion watcher now sends one alert per outage.');
+});
+
+test('a long commit-style summary leads with one clause and keeps the list in the details', () => {
+  // 725 chars whose first clauses are all identifiers. 0.6.7 led with the
+  // whole list cut at 700 chars, then repeated it as the technical detail.
+  const summary = [
+    'fix(dispatch): normalize completion delivery so summary_human wins over deliveryText',
+    'preserve structured completion summary in details_technical.raw_summary',
+    'add watcher tests for the done path and the watcher path',
+    'route summary_human through getCompletionSummaryHuman so legacy payloads work',
+    'drop the duplicated length check in resolveCompletionDelivery',
+    'move details_technical below the plain-English lead',
+    'dedupe double-delivery between cmdDone and the watcher via claimCompletionDelivery',
+    'update tests/dispatch-completion-delivery-priority.test.mjs and test.js',
+    'keep the checks line with the promoted report in resolveCompletionDelivery',
+    'bound isVerbatimDeliverable at MAX_VERBATIM_REPORT_BYTES for the promoted report',
+  ].join('; ');
+  assert.equal(summary.length, 725);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.summary_human, 'Move technical details below the plain-English lead.');
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  const [lead, details] = result.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(lead, completion.summary_human);
+  assert.ok(details.startsWith('- fix(dispatch): normalize completion delivery so summary_human wins'), details);
+  assert.ok(details.endsWith('- Checks: tests passed; pushed deadbee.'), details);
+});
+
+test('a clause list goes out whole in the details while the delivery fits one message', () => {
+  // A clause list is never promoted, so the details carry the list. Cut at
+  // 260 or 220 chars, 0.6.6 dropped most of this 986-char list.
+  const summary = `fix(import): ${Array.from({ length: 24 }, (_, i) => `route batch ${i + 1} through the import queue`).join('; ')}`;
+  assert.equal(summary.length, 986);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.equal(result.deliveryText, `${completion.summary_human}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`);
+});
+
+test('the details are cut once the whole delivery passes 3,400 UTF-8 bytes, the bound of a promoted report', () => {
+  // "é" is two bytes, so this list passes the bound in bytes while it is
+  // still under 3,400 in chars.
+  const MAX_DELIVERY_BYTES = 3400;
+  const base = `fix(import): ${Array.from({ length: 60 }, (_, i) => `route café batch ${i + 1} through the import queue`).join('; ')}; keep `;
+  const deliver = (summary) => {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human');
+    return { lead: completion.summary_human, deliveryText: result.deliveryText };
+  };
+  const whole = (lead, summary) => `${lead}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`;
+  const probe = deliver(`${base}x`);
+  const padding = MAX_DELIVERY_BYTES - Buffer.byteLength(whole(probe.lead, `${base}x`));
+  assert.ok(padding > 0 && padding < 500, `padding ${padding}`);
+
+  const atBound = `${base}${'x'.repeat(padding + 1)}`;
+  const fits = deliver(atBound);
+  assert.equal(Buffer.byteLength(fits.deliveryText), MAX_DELIVERY_BYTES);
+  assert.equal(fits.deliveryText, whole(fits.lead, atBound));
+
+  const overBound = `${atBound}x`;
+  const over = deliver(overBound);
+  assert.equal(Buffer.byteLength(whole(over.lead, overBound)), MAX_DELIVERY_BYTES + 1);
+  assert.ok(whole(over.lead, overBound).length < MAX_DELIVERY_BYTES, 'under the bound in chars');
+  const [, details] = over.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(details, `- ${overBound.slice(0, 219).trimEnd()}…\n- Checks: tests passed; pushed deadbee.`);
+});
+
+test('a lead the humanizer cut on its fallback route also goes out once', () => {
+  // One clause with a code token and no prefix leads with the summary as
+  // summarizeProse cut it to 700 chars. 4e53362 recorded only cuts of a rule
+  // lead, so these went out as lead plus whole clause (2,233 and 1,769 chars).
+  const clause = (n) => {
+    let text = 'the importer retries the export with MAX_RETRIES set to five';
+    while (text.length < n) text += ' and writes each row to the local store after the sync job finishes';
+    return text.slice(0, n).trimEnd();
+  };
+  const reply = clause(1510);
+  assert.equal(humanizeCompletionText(reply).length, 700);
+  const watcher = resolveCompletionDelivery({ lastReply: reply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher.deliveryText, reply);
+
+  const summary = clause(1006);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.debug.leadCut, true);
+  const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(done.deliveryText, `${summary}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // Only a lead taken from the cut summary carries the record. A rule's own
+  // lead of a long summary stays the lead, never the raw commit string.
+  const rule = `fix(cache): bump CACHE_TTL to 30s. ${Array.from({ length: 6 }, (_, i) => `Restart worker ${i + 1} after the deploy finishes.`).join(' ')}`;
+  const ruled = buildTerminalCompletionPayload({ summary: rule, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(ruled.summary_human, 'Bump CACHE_TTL to 30s.');
+  const ruledResult = resolveCompletionDelivery({ completion: ruled, fallbackSummary: ruled.summary });
+  assert.ok(ruledResult.deliveryText.startsWith('Bump CACHE_TTL to 30s.\n\nTechnical details:\n- fix(cache): '), ruledResult.deliveryText.slice(0, 80));
+});
+
+test('past 3,400 bytes the cut detail lines shrink to the bytes left, and the checks line stays', () => {
+  const roundTrips = (text) => Buffer.from(text, 'utf8').toString('utf8') === text;
+  const checks = { checklist: PUSHED_CHECKLIST, sha: SHA };
+  // CJK is 3 bytes a char, so the 260/220-char cuts left 3,580 bytes.
+  const zh = '导入任务读取导出文件中的每一行数据并写入本地存储';
+  const cjk = (n) => zh.repeat(Math.ceil(n / zh.length)).slice(0, n);
+  const lastReply = `fix(import): ${cjk(900)}; ${cjk(400)}; bump RETRY_LIMIT`;
+  const result = resolveCompletionDelivery({ lastReply, completion: { details_technical: `Technical details: ${cjk(500)}`, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(result.source, 'lastReply');
+  assert.equal(Buffer.byteLength(result.deliveryText), MAX_VERBATIM_BYTES);
+  assert.ok(roundTrips(result.deliveryText));
+  const lines = result.deliveryText.split('\n');
+  assert.ok(lines.at(-2).endsWith('…') && Buffer.byteLength(lines.at(-2)) < 660, Buffer.byteLength(lines.at(-2)));
+  assert.equal(lines.at(-1), '- Checks: tests passed; pushed deadbee.');
+
+  // A line that would be cut below 60 bytes is dropped, not sent as a stub.
+  const reportOf = (bytes) => {
+    const head = ['Root cause: the export window closed before the feed finished.', '', 'Files changed:', '- jobs/export.yaml', '', 'Validation: re-ran the import twice and both runs finished with no skipped rows.', '', 'Notes:'].join('\n');
+    let notes = '';
+    while (Buffer.byteLength(`${head}\n${notes}`) < bytes) notes += 'checked the counts again and they matched. ';
+    return `${head}\n${notes}`.slice(0, bytes).trimEnd();
+  };
+  const details = `Technical details: ${'moved EXPORT_WINDOW_START from 02:10 to 02:50 in jobs/export.yaml and raised retry_limit to 3 for the invoice step; '.repeat(3)}`;
+  const report = reportOf(3300);
+  const dropped = resolveCompletionDelivery({ lastReply: report, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(dropped.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // Doubled markdown markers shrink when composeDeliveryText cleans the line
+  // again, so one cut can miss: 4e53362 sent 3,402 and 3,404 bytes here.
+  const nearly = reportOf(3239);
+  for (const marker of ['````x````', '********b********']) {
+    const marked = `Technical details: ${'本'.repeat(30)} ${marker} ${marker} ${marker} ${'語'.repeat(60)}`;
+    const result = resolveCompletionDelivery({ lastReply: nearly, completion: { details_technical: marked, ...checks }, fallbackSummary: 'completed' });
+    assert.ok(Buffer.byteLength(result.deliveryText) <= MAX_VERBATIM_BYTES, `${marker}: ${Buffer.byteLength(result.deliveryText)}`);
+    assert.ok(result.deliveryText.endsWith('\n- Checks: tests passed; pushed deadbee.'), marker);
+  }
+
+  // When the report and the checks line fill the bound on their own, the
+  // detail lines go and the checks line stays (4e53362 kept the char cuts).
+  const full = reportOf(3380);
+  const filled = resolveCompletionDelivery({ lastReply: full, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(filled.deliveryText, `${full}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // A report over the bound on its own keeps the char cuts: no detail line causes it.
+  const long = reportOf(3600);
+  const over = resolveCompletionDelivery({ lastReply: long, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  const [, overDetails] = over.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(overDetails.split('\n').length, 2, overDetails);
+  assert.ok(overDetails.split('\n')[0].endsWith('…'));
+
+  // A cut never ends on half of a surrogate pair.
+  const emoji = '🙂'.repeat(1000);
+  const split = resolveCompletionDelivery({ lastReply: `fix(import): route batch 1 through the import queue; ${emoji}; bump RETRY_LIMIT`, completion: { details_technical: `Technical details: ${emoji}`, ...checks }, fallbackSummary: 'completed' });
+  assert.ok(roundTrips(split.deliveryText), 'a lone surrogate does not survive UTF-8');
+  const emojiTail = { details_technical: `Technical details: ${cjk(42)}${'🙂'.repeat(200)}`, ...checks };
+  const byteCut = resolveCompletionDelivery({ lastReply, completion: emojiTail, fallbackSummary: 'completed' });
+  assert.ok(Buffer.byteLength(byteCut.deliveryText) <= MAX_VERBATIM_BYTES && roundTrips(byteCut.deliveryText), Buffer.byteLength(byteCut.deliveryText));
+});
+
+test('a lead cut from a detail line kept whole goes out once, as that line', () => {
+  // One 1,627-char clause: the lead is its first 700 chars, cut with "…", and
+  // the whole clause fits as the detail. It went out as both (2,350 chars).
+  const sentence = 'the importer reads every workout row from the export file and writes each row to the local store after the sync job finishes and the queue drains, ';
+  let body = '';
+  while (body.length < 1500) body += sentence;
+  body = body.trim().replace(/,$/, '');
+  const reply = `src/foo.js: ${body}`;
+  assert.equal(reply.length, 1627);
+  const watcher = resolveCompletionDelivery({ lastReply: reply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher.source, 'lastReply');
+  assert.equal(watcher.deliveryText, reply);
+  assert.equal(watcher.deliveryText.split(body).length - 1, 1);
+
+  // truncateText keeps 699 chars and the "…" when the cut lands on a space.
+  const reply699 = `src/foo.js: now ${body}`;
+  assert.equal(humanizeCompletionText(reply699).length, 699);
+  const watcher699 = resolveCompletionDelivery({ lastReply: reply699, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher699.deliveryText, reply699);
+
+  // A clause long enough that the lead and the whole clause together pass
+  // 3,400 bytes still goes out once: the bound measures the merged delivery.
+  const longReply = `src/foo.js: ${body} ${body}`;
+  assert.ok(longReply.length > 3000 && longReply.length + 700 > 3400, longReply.length);
+  assert.equal(resolveCompletionDelivery({ lastReply: longReply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' }).deliveryText, longReply);
+
+  // The done path keeps its checks line. The producer records the cut.
+  for (const [summary, leadLength] of [[reply, 700], [reply699, 699]]) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.summary_human.length, leadLength);
+    assert.equal(completion.debug.leadCut, true);
+    const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(done.deliveryText, `${summary}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+    // The record belongs to the lead the producer cut. A summary_human set
+    // afterwards, even a cut of the same clause, keeps its precedence.
+    const explicitCut = `${completion.summary_human.slice(0, 400).trimEnd()}…`;
+    const replaced = resolveCompletionDelivery({ completion: { ...completion, summary_human: explicitCut }, fallbackSummary: completion.summary });
+    assert.ok(replaced.deliveryText.startsWith(`${explicitCut}\n\nTechnical details:\n`), replaced.deliveryText.slice(0, 80));
+  }
+});
+
+test('a machine-output detail line stays cut even when the whole delivery would fit', () => {
+  // #53 never delivers machine output as written. Whole, this traceback's
+  // detail would make a 1,444-char delivery.
+  const traceback = 'The nightly import failed and I could not recover it.\nTraceback (most recent call last):\n' + Array.from({ length: 12 }, (_, i) => `  File "/srv/app/importer/stage_${i}.py", line ${10 + i}, in run_stage_${i}\n    result = stage_${i + 1}(payload, retries=3)`).join('\n') + '\nKeyError: missing column order_id';
+  const completion = buildTerminalCompletionPayload({ summary: traceback, checklist: { work_complete: true, tests_passed: true } });
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  const [, details] = result.deliveryText.split('\n\nTechnical details:\n');
+  const [detail, checks] = details.split('\n');
+  assert.ok(detail.endsWith('…') && detail.length <= '- '.length + 220, detail);
+  assert.equal(checks, '- Checks: tests passed.');
+  assert.equal(result.deliveryText.length, 359);
+});
+
 test('known limitation: the fragment lead uses only the first two fragments', () => {
   // The humanizer picks the first two plain-English fragments (selection must
   // stay stable so the machine-derivative gate can reproduce the stored lead
@@ -539,6 +904,145 @@ test('legacy payloads: a pre-removal boilerplate summary_human still promotes th
   });
   assert.equal(result.source, 'completion-summary-full', 'legacy boilerplate lead gives way to the full report');
   assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
+});
+
+test('an explicit summary_human keeps its precedence over the report that contains it', () => {
+  const billing = 'Investigated the billing queue after the overnight alert. The retry worker was re-sending invoices whose ack arrived late. Resolved the duplicate billing notifications. Added an idempotency key per invoice and backfilled the last 48 hours. No customer was charged twice; only the emails were duplicated.';
+  const explicitLead = 'Resolved the duplicate billing notifications.';
+  for (const summaryStyle of [undefined, 'verbatim', 'humanized']) {
+    const completion = {
+      version: 2,
+      summary_human: explicitLead,
+      summary: billing,
+      checklist: CHECKLIST,
+      debug: { deliverySource: 'summary_human', ...(summaryStyle ? { summaryStyle } : {}) },
+    };
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human', `summaryStyle=${summaryStyle}`);
+    assert.equal(result.deliveryText, explicitLead, `summaryStyle=${summaryStyle}`);
+  }
+
+  // The rewrite record belongs to the text the producer wrote: a summary_human
+  // replaced afterwards is explicit again, and so is a lead under any other
+  // record.
+  const report = REWRITTEN_REPORTS['fix -> Fixed'];
+  const produced = buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST });
+  const replaced = resolveCompletionDelivery({ completion: { ...produced, summary_human: 'Cleared the stale import flag.' } });
+  assert.equal(replaced.source, 'summary_human');
+  assert.ok(replaced.deliveryText.startsWith('Cleared the stale import flag.'), replaced.deliveryText);
+  const otherRecord = resolveCompletionDelivery({ completion: { ...produced, debug: { ...produced.debug, leadSource: 'agent' } } });
+  assert.equal(otherRecord.source, 'summary_human');
+  assert.ok(otherRecord.deliveryText.startsWith(produced.summary_human), otherRecord.deliveryText);
+});
+
+test('an agent-written "Human summary:" section leads the delivery, never the labelled report', () => {
+  // 0.6.7 rebuilt the section from the report, took it for a rewrite, and sent
+  // the report with its "Human summary:" and "Details:" labels.
+  const details = 'Details: The retry worker re-sent invoices whose acknowledgement arrived after the thirty second window. I added an idempotency key per invoice and backfilled the last two days of orders. The queue drained cleanly afterwards. Nothing else changed in the billing flow.';
+  const sections = {
+    'plain section': 'Human summary: Fixed the duplicate receipt emails so each customer now gets exactly one receipt per order.',
+    'technical section': 'Human summary: fix(billing): add an idempotency key per invoice; backfill receipts for the last two days',
+  };
+  for (const [name, section] of Object.entries(sections)) {
+    const summary = `${section}\n${details}`;
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.debug.leadSource, undefined, name);
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human', name);
+    assert.ok(result.deliveryText.startsWith(`${completion.summary_human}\n\nTechnical details:\n`), `${name}: ${result.deliveryText}`);
+    assert.doesNotMatch(result.deliveryText, /Human summary:|^Details:/m, name);
+  }
+});
+
+const SPORTS_REPORT = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+
+test('watcher path: a report passed through from lastReply carries the checks line only for a sha it does not name', () => {
+  // 0.6.7 appended "Technical details: - Checks: ..." to every technical
+  // report passed through (1,884 -> 1,944 chars). The line stays for a pushed
+  // sha the report leaves out, and goes when it adds nothing.
+  const report = payload.lastReply.trim();
+  const deliver = (lastReply, checklist, sha) => resolveCompletionDelivery({ lastReply, completion: { ...payload.completion, checklist, sha }, fallbackSummary: payload.completion.summary });
+  const withSha = deliver(payload.lastReply, PUSHED_CHECKLIST, SHA);
+  assert.equal(withSha.source, 'lastReply');
+  assert.equal(withSha.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+  assert.equal(deliver(payload.lastReply, { work_complete: true, tests_passed: true }, null).deliveryText, report);
+  const naming = `${report}\n\nPushed deadbee to the branch.`;
+  assert.equal(deliver(naming, PUSHED_CHECKLIST, SHA).deliveryText, naming);
+  // A sha recorded in capitals is the same sha.
+  assert.equal(deliver(naming, PUSHED_CHECKLIST, SHA.toUpperCase()).deliveryText, naming);
+});
+
+test('every other path keeps the checks line and its sha', () => {
+  // A report delivered as written from lastReply after a done call with a
+  // checklist and sha but no --summary: 0.6.6 sent the sha, and 0.6.7 the
+  // checks line (589 chars).
+  const synthesized = buildTerminalCompletionPayload({ summary: null, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(synthesized.debug.deliverySource, 'technical-synthesis');
+  const reply = resolveCompletionDelivery({ lastReply: SPORTS_REPORT, completion: synthesized, fallbackSummary: synthesized.summary });
+  assert.equal(reply.source, 'lastReply');
+  assert.equal(reply.deliveryText, `${SPORTS_REPORT}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // A reply cut down to a lead follows 0.6.7: plain prose gets no checks line.
+  const prose = Array.from({ length: 12 }, (_, i) => `Sentence ${i + 1} describes some routine maintenance that was performed on the pipeline today with no structural headings or bold labels.`).join(' ');
+  const cut = resolveCompletionDelivery({ lastReply: prose, completion: synthesized, fallbackSummary: synthesized.summary });
+  assert.equal(cut.source, 'lastReply');
+  assert.ok(cut.deliveryText.length < prose.length && !cut.deliveryText.includes('Checks:'), cut.deliveryText.length);
+
+  // A technical summary kept as written has no raw detail line, so the checks
+  // line carries the tests and the sha on its own.
+  for (const [checklist, sha, checks] of [[PUSHED_CHECKLIST, SHA, 'Checks: tests passed; pushed deadbee.'], [{ work_complete: true, tests_passed: true }, null, 'Checks: tests passed.']]) {
+    const kept = buildTerminalCompletionPayload({ summary: SPORTS_REPORT, checklist, sha });
+    assert.equal(kept.debug.summaryStyle, 'verbatim');
+    const keptResult = resolveCompletionDelivery({ completion: kept, fallbackSummary: kept.summary });
+    assert.equal(keptResult.deliveryText, `${SPORTS_REPORT}\n\nTechnical details:\n- ${checks}`);
+  }
+});
+
+test('only a lead the humanizer recorded as cut gives way to the detail line it was cut from', () => {
+  // An agent's report or explicit summary_human is never replaced by a detail
+  // line, whatever it ends with. ebf441b replaced the whole report with its
+  // "Details:" tail (445 -> 88 chars, 546 -> 243).
+  const detailsReport = ['Root cause: the importer stalled because the export window closed before the feed finished.', '', 'Files changed:', '- jobs/export.yaml', '- src/sync/importer.js', '', 'Validation: re-ran the import twice and both runs finished with no skipped rows.', '', '**Details:** moved the export window forty minutes later and raised the invoice retry limit to three…'].join('\n');
+  const sectionReport = ['## Root cause', 'The retry worker re-sent invoices whose ack arrived after the window.', '', 'Technical details:', '- added an idempotency key per invoice in billing/retry_worker.py', '- backfilled the last two days', '', '## Validation', '- pytest: 212 passed', '- staging: one receipt per order', '', "Next: watching tonight's run…"].join('\n');
+  for (const report of [detailsReport, sectionReport]) {
+    const name = report.slice(0, 20);
+    const watcher = resolveCompletionDelivery({ lastReply: report, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+    assert.ok(watcher.deliveryText.startsWith(report), `${name} (watcher): ${watcher.deliveryText.length}`);
+    const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.ok(done.deliveryText.startsWith(report), `${name} (done): ${done.deliveryText.length}`);
+    const both = resolveCompletionDelivery({ lastReply: report, completion, fallbackSummary: completion.summary });
+    assert.ok(both.deliveryText.startsWith(report), `${name} (watcher with completion): ${both.deliveryText.length}`);
+  }
+
+  const summary = 'fix(dispatch): fixed `resolveCompletionDelivery()` in dispatch/completion.mjs; bump MAX_VERBATIM_REPORT_BYTES; route the checks line';
+  const explicit = (summaryHuman, rawSummary = summary) => resolveCompletionDelivery({
+    completion: { version: 2, summary_human: summaryHuman, summary: rawSummary, details_technical: { raw_summary: rawSummary }, checklist: { work_complete: true }, debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' } },
+    fallbackSummary: rawSummary,
+  }).deliveryText;
+  for (const lead of ['Fixed…', 'F…']) {
+    assert.ok(explicit(lead).startsWith(`${lead}\n\nTechnical details:\n- fix(dispatch): fixed resolveCompletionDelivery()`), lead);
+  }
+
+  // A 700-char explicit lead with no "…", and a report past the cap that
+  // ends with one, are not cuts at the cap either.
+  const sentence = 'The importer reads every workout row from the export file and writes each row to the local store after the sync job finishes and the queue drains';
+  let lead700 = sentence;
+  while (lead700.length < 700) lead700 += ` and ${sentence.toLowerCase()}`;
+  const lead699 = `${lead700.slice(0, 698).trimEnd()}…`;
+  lead700 = `${lead700.slice(0, 699).trimEnd()}.`;
+  assert.ok(lead700.length >= 699 && lead700.length <= 700, lead700.length);
+  assert.ok(explicit(lead700, `fix(sync): ${lead700} Bump CACHE_TTL to 30s.`).startsWith(`${lead700}\n\nTechnical details:\n`));
+
+  // Nor is an explicit lead shaped exactly like a cut: 699 chars ending "…",
+  // the start of a fix(scope): detail line (the Copilot case on #76).
+  assert.equal(lead699.length, 699);
+  assert.ok(explicit(lead699, `fix(scope): ${lead699.slice(0, -1)} and keeps the last good snapshot. Bump CACHE_TTL to 30s.`).startsWith(`${lead699}\n\nTechnical details:\n`));
+  let longReport = ['Root cause:', 'The export window closed before the feed finished, so the importer stalled at the invoice step for most of the night.', 'Files changed:', 'jobs/export.yaml moved the window forty minutes later.', 'Validation:', 'Re-ran the import twice and both runs finished with no skipped rows and matching counts.'].join('\n');
+  while (longReport.length < 760) longReport += ' Checked the logs again and the counts still matched the source tables.';
+  longReport += ' Watching tonight…';
+  assert.ok(longReport.length > 700 && humanizeCompletionText(longReport) === longReport);
+  assert.ok(explicit(longReport, `${longReport}\nfix(sync): bump CACHE_TTL to 30s; route the retry through RetryQueue`).startsWith(`${longReport}\n\nTechnical details:\n`));
 });
 
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
