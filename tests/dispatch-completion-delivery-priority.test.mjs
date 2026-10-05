@@ -714,6 +714,12 @@ test('a lead cut from a detail line kept whole goes out once, as that line', () 
   assert.equal(watcher.deliveryText, reply);
   assert.equal(watcher.deliveryText.split(body).length - 1, 1);
 
+  // truncateText keeps 699 chars and the "…" when the cut lands on a space.
+  const reply699 = `src/foo.js: now ${body}`;
+  assert.equal(humanizeCompletionText(reply699).length, 699);
+  const watcher699 = resolveCompletionDelivery({ lastReply: reply699, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher699.deliveryText, reply699);
+
   // The done path keeps its checks line.
   const completion = buildTerminalCompletionPayload({ summary: reply, checklist: PUSHED_CHECKLIST, sha: SHA });
   assert.ok(completion.summary_human.endsWith('…') && completion.summary_human.length === 700, completion.summary_human.length);
