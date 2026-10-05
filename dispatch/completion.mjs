@@ -29,7 +29,6 @@ const TECHNICAL_KEYWORDS = [
   'webhook', 'workflow'
 ];
 const TECHNICAL_KEYWORD_RE = new RegExp(`\\b(?:${TECHNICAL_KEYWORDS.join('|')})\\b`, 'gi');
-const RELIABILITY_SIGNAL_RE = /\b(?:fix|guard|retry|timeout|error|fail|stuck|prevent|avoid|dedupe|deduplicat|preserve|ensure|handle|recover|reliab)\b/i;
 const TEST_FRAGMENT_RE = /\b(?:test|tests|spec|coverage|lint|typecheck|tsc|eslint|oxlint|assert(?:ion)?s?)\b/i;
 const TEST_APPLICABILITY_RE = /\b(?:test|tests|pytest|jest|vitest|mocha|cypress|playwright|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test|rspec)\b/i;
 const TEST_NEGATION_RE = /\b(?:do\s+not|don't|dont|never|skip|without|no)\s+(?:run\s+)?(?:the\s+)?tests?\b/i;
@@ -53,9 +52,11 @@ const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*
 // TAP), KEY=value env dumps and indented YAML keys. Three or more mark machine
 // output.
 const MACHINE_OUTPUT_LINE_RE = /^(?:\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{1,2}:\d{2}:\d{2}\b|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|[✔✓✗✖] |(?:not )?ok \d+ |[A-Z][A-Z0-9_]+=\S)|\s{2,}[\w-]+:(?: |$))/gm;
-// Closing sentences buildHumanizedTechnicalSummary and
-// buildCompletionLeadFromThemes append to a synthetic rewrite, which is how
-// resolveCompletionDelivery recognizes one in a stored summary_human.
+// Legacy closing sentences the old humanizer appended to a synthetic
+// technical rewrite. buildHumanizedTechnicalSummary no longer emits them;
+// the list is kept so resolveCompletionDelivery still recognizes one in a
+// stored summary_human (payloads written before the removal) and promotes
+// the full report instead of delivering the boilerplate.
 const TECHNICAL_REWRITE_FOLLOW_UPS = {
   testOnly: 'That makes the behavior easier to trust. Future regressions should get caught quickly.',
   reliability: 'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
@@ -764,23 +765,6 @@ function extractTechnicalFragments(text) {
   return fragments.map(cleanTechnicalFragment).filter(Boolean);
 }
 
-function detectTechnicalThemes(rawText, fragments = []) {
-  const raw = cleanMarkdown(normalizeCompletionText(rawText) || '').toLowerCase();
-  const combined = [raw, fragments.join(' ').toLowerCase()].filter(Boolean).join(' ');
-  const completionTransportTerms = /\b(?:completion|deliver(?:y|ed)?|notification|chat|user-facing)\b/.test(combined);
-  const summarySurfaceTerms = /\b(?:summary|summaries|message|messages|report|reports|human(?:-|\s)?readable|plain english)\b/.test(combined);
-  return {
-    completionFlow: (completionTransportTerms && summarySurfaceTerms)
-      || /\b(?:summary_human|deliverytext|details_technical|payload-precedence|completion delivery)\b/.test(combined),
-    detailSeparation: /\b(?:technical details?|details_technical|debug|underneath|below|separate|separated|split|move|moved)\b/.test(combined),
-    duplicatePrevention: /\b(?:duplicate|double[- ]delivery|single final|dedupe|deduplicat|one clean)\b/.test(combined),
-    contextPreservation: /\b(?:structured|context|preserve|kept|retain|survive)\b/.test(combined),
-    reliability: RELIABILITY_SIGNAL_RE.test(combined),
-    addedBehavior: /\b(?:add|added|introduce|introduced|support|supported|enable|enabled)\b/.test(combined),
-    testOnly: fragments.length > 0 && fragments.every(isTestOrValidationFragment),
-  };
-}
-
 function isPlainEnglishLeadText(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return false;
@@ -790,23 +774,6 @@ function isPlainEnglishLeadText(text) {
     return false;
   }
   return !looksTechnicalCompletionSummary(normalized, normalized);
-}
-
-function buildCompletionLeadFromThemes(themes) {
-  const sentences = [];
-  if (themes.duplicatePrevention) {
-    sentences.push('Final completion updates now arrive as one clean plain-English summary.');
-    sentences.push('That makes the result easier to scan and avoids noisy repeat messages.');
-  } else {
-    sentences.push('Final completion updates now start with a short plain-English summary.');
-    if (themes.contextPreservation) {
-      sentences.push('That makes the result easier to read without hiding the useful detail.');
-    } else {
-      sentences.push('That makes the result easier to scan without hiding the useful detail.');
-    }
-  }
-  sentences.push(THEMED_LEAD_FOLLOW_UP);
-  return truncateText(sentences.join(' '), MAX_DELIVERY_CHARS);
 }
 
 function getCompletionRawSummary(completion) {
@@ -826,6 +793,12 @@ function completionUsesHumanizedLead(completion) {
   return getCompletionSummaryStyle(completion) === 'humanized';
 }
 
+// The humanized lead for a technical summary is the real condensed content:
+// fragment-based leads when plain-English fragments exist, otherwise the
+// summarized text itself. Generic themed filler ("The requested fix is in
+// place.", "That should make the workflow more reliable.", ...) is no longer
+// emitted; the legacy follow-up sentences above are only recognized, never
+// produced.
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const cleanedRaw = normalizeCompletionText(rawText);
   const fallback = normalizeCompletionText(fallbackSummary);
@@ -834,37 +807,26 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const fragments = extractTechnicalFragments(cleanedRaw);
   const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
   const sourceFragments = primaryFragments.length > 0 ? primaryFragments : fragments;
-  const themes = detectTechnicalThemes(cleanedRaw, fragments);
 
-  if (themes.completionFlow) {
-    return buildCompletionLeadFromThemes(themes);
-  }
-
+  // Fragment-based lead: the first two plain-English fragments. The selection
+  // must stay stable -- the machine-derivative gate in isLossyHumanizedLead
+  // reproduces the stored lead verbatim from the report, so changing which
+  // fragments are picked would change the stored lead for every such payload.
+  // (A plain-English clause that only appears past the first two fragments is
+  // a known limitation; the fallback below still delivers real content.) The
+  // fragment lead is a user-facing notification, so keep it within the
+  // delivery-length cap (a single long clause with no delimiter is otherwise
+  // unbounded).
   const chosen = sourceFragments
     .slice(0, 2)
     .map(fragment => toPastTenseFragment(fragment))
     .filter(Boolean)
     .filter(fragment => isPlainEnglishLeadText(fragment));
 
-  let actionSummary;
-  if (chosen.length === 1) {
-    actionSummary = asSentence(chosen[0]);
-  } else if (chosen.length >= 2) {
-    actionSummary = `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
-  } else if (fallback && isPlainEnglishLeadText(fallback)) {
-    actionSummary = asSentence(fallback);
-  } else if (themes.testOnly) {
-    actionSummary = 'Added focused coverage for the weak spot.';
-  } else if (themes.reliability) {
-    actionSummary = 'The requested fix is in place.';
-  } else if (themes.addedBehavior) {
-    actionSummary = 'The requested behavior is now in place.';
-  } else {
-    actionSummary = 'The update is in place.';
-  }
-
-  const theme = ['testOnly', 'reliability', 'addedBehavior'].find(name => themes[name]) || 'other';
-  return truncateText(`${actionSummary} ${TECHNICAL_REWRITE_FOLLOW_UPS[theme]}`, MAX_DELIVERY_CHARS);
+  if (chosen.length === 1) return truncateText(asSentence(chosen[0]), MAX_DELIVERY_CHARS);
+  if (chosen.length >= 2) return truncateText(`${chosen[0]} and ${lowerFirst(chosen[1])}.`, MAX_DELIVERY_CHARS);
+  if (fallback && isPlainEnglishLeadText(fallback)) return asSentence(fallback);
+  return fallback || null;
 }
 
 export function humanizeCompletionText(value) {
@@ -968,7 +930,14 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
   }
 
   const checklistDetails = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
-  if (checklistDetails && (rawTechnical || completionDetailsAreTechnical)) parts.push(checklistDetails);
+  // The checks line (tests passed, pushed sha) is distinct content, not a
+  // duplicate of the summary: include it whenever a technical context exists,
+  // including a verbatim technical lead whose raw detail line is suppressed
+  // as a duplicate of the summary itself (rawIsSameReportAsSummary).
+  if (checklistDetails
+    && (rawTechnical || completionDetailsAreTechnical || looksTechnicalCompletionSummary(summary, summary))) {
+    parts.push(checklistDetails);
+  }
 
   const unique = [];
   const seen = new Set();
@@ -1375,15 +1344,29 @@ export function getCompletionAuthoritativeSummary(completion) {
 
 // True when summaryHuman is a machine derivative that dropped most of a
 // substantial summary: either a truncation (a prefix once punctuation and
-// spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling) or
-// a synthetic technical rewrite of a prose report (it ends with a follow-up
-// sentence the humanizer wrote, not the agent). Equal or similar-length texts
+// spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling)
+// or a fragment-based lead the humanizer wrote from a clause of the report
+// (the stripped lead is embedded in the stripped report, prose reports only)
+// or a legacy synthetic technical rewrite (it ends with a follow-up sentence
+// the old humanizer wrote, not the agent). Equal or similar-length texts
 // are not lossy.
 function isLossyHumanizedLead(summary, summaryHuman) {
   if (!summary || !summaryHuman) return false;
   if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
   const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  if (strip(summary).startsWith(strip(summaryHuman))) return true;
+  const strippedSummary = strip(summary);
+  const strippedHuman = strip(summaryHuman);
+  if (strippedSummary.startsWith(strippedHuman)) return true;
+  // A fragment-based lead the humanizer wrote from a clause of a prose report
+  // (e.g. "Md5 032cde47 (stale round-7)." for a 1,619-char report) is embedded
+  // in the report, not a prefix: it is a lossy derivative too. Gate this on the
+  // stored summary_human being a machine derivative of THIS report -- i.e. the
+  // humanizer reproduces it verbatim from the report. An explicit human summary
+  // that merely happens to appear in the report is not a derivative and keeps
+  // its precedence (it is not reproduced verbatim by the humanizer).
+  const machineDerivative = isProseReport(summary)
+    && humanizeCompletionText(summary) === summaryHuman;
+  if (strippedHuman.length >= 15 && machineDerivative && strippedSummary.includes(strippedHuman)) return true;
   return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
 }
 
