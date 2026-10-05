@@ -911,7 +911,7 @@ function buildTechnicalDetailsText({
   summaryText,
   completion,
   includeRawSummaryDetails = true,
-  checksWithTechnicalLead = false,
+  fromLastReply = false,
 } = {}) {
   const raw = normalizeCompletionText(rawText);
   const summary = normalizeCompletionText(summaryText);
@@ -972,14 +972,14 @@ function buildTechnicalDetailsText({
 
   const checklistDetails = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
   // The checks line (tests passed, pushed sha) is distinct content, not a
-  // duplicate of the summary. A structured lead kept as written has no raw
-  // detail line (rawIsSameReportAsSummary), so a technical one
-  // (checksWithTechnicalLead) carries the checks line on its own. A report
-  // passed through from lastReply is delivered as written.
-  if (checklistDetails
-    && (rawTechnical
-      || completionDetailsAreTechnical
-      || (checksWithTechnicalLead && looksTechnicalCompletionSummary(summary, summary)))) {
+  // duplicate of the summary, so a technical summary carries it even with no
+  // raw detail line (rawIsSameReportAsSummary). A report delivered as written
+  // from lastReply carries it only for a sha the report does not already name.
+  const checksSha = shortSha(completion?.sha);
+  const checksAddToSummary = fromLastReply && rawIsSameReportAsSummary
+    ? Boolean(checksSha) && !summary.includes(checksSha)
+    : looksTechnicalCompletionSummary(summary, summary);
+  if (checklistDetails && (rawTechnical || completionDetailsAreTechnical || checksAddToSummary)) {
     parts.push([checklistDetails]);
   }
 
@@ -1521,6 +1521,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: reply,
       completion,
       includeRawSummaryDetails: false,
+      fromLastReply: true,
     });
     return {
       deliveryText: composeDeliveryText(reply, technicalDetailsText),
@@ -1568,7 +1569,6 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: candidate.text,
       completion,
       includeRawSummaryDetails: summaryUsesHumanizedLead && candidate.source === 'summary_human',
-      checksWithTechnicalLead: true,
     });
     return {
       deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),
@@ -1588,6 +1588,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: reply,
       completion,
       includeRawSummaryDetails: false,
+      fromLastReply: true,
     });
     return {
       deliveryText: composeDeliveryText(reply, technicalDetailsText),

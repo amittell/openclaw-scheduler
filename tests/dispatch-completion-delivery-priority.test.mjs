@@ -845,22 +845,46 @@ test('an agent-written "Human summary:" section leads the delivery, never the la
   }
 });
 
-test('watcher path: a report passed through from lastReply goes out as written, checks or not', () => {
-  // 0.6.7 appended "Technical details: - Checks: ..." to the agent's own
-  // report (1,884 -> 1,944 chars). The checks line rides with a structured
-  // lead, not with the report.
-  const completion = { ...payload.completion, checklist: PUSHED_CHECKLIST, sha: SHA };
-  const result = resolveCompletionDelivery({ lastReply: payload.lastReply, completion, fallbackSummary: completion.summary });
-  assert.equal(result.source, 'lastReply');
-  assert.equal(result.deliveryText, payload.lastReply.trim());
+const SPORTS_REPORT = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+
+test('watcher path: a report passed through from lastReply carries the checks line only for a sha it does not name', () => {
+  // 0.6.7 appended "Technical details: - Checks: ..." to every technical
+  // report passed through (1,884 -> 1,944 chars). The line stays for a pushed
+  // sha the report leaves out, and goes when it adds nothing.
+  const report = payload.lastReply.trim();
+  const deliver = (lastReply, checklist, sha) => resolveCompletionDelivery({ lastReply, completion: { ...payload.completion, checklist, sha }, fallbackSummary: payload.completion.summary });
+  const withSha = deliver(payload.lastReply, PUSHED_CHECKLIST, SHA);
+  assert.equal(withSha.source, 'lastReply');
+  assert.equal(withSha.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+  assert.equal(deliver(payload.lastReply, { work_complete: true, tests_passed: true }, null).deliveryText, report);
+  const naming = `${report}\n\nPushed deadbee to the branch.`;
+  assert.equal(deliver(naming, PUSHED_CHECKLIST, SHA).deliveryText, naming);
+});
+
+test('every other path keeps the checks line and its sha', () => {
+  // A report delivered as written from lastReply after a done call with a
+  // checklist and sha but no --summary: 0.6.6 sent the sha, and 0.6.7 the
+  // checks line (589 chars).
+  const synthesized = buildTerminalCompletionPayload({ summary: null, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(synthesized.debug.deliverySource, 'technical-synthesis');
+  const reply = resolveCompletionDelivery({ lastReply: SPORTS_REPORT, completion: synthesized, fallbackSummary: synthesized.summary });
+  assert.equal(reply.source, 'lastReply');
+  assert.equal(reply.deliveryText, `${SPORTS_REPORT}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // A reply cut down to a lead follows 0.6.7: plain prose gets no checks line.
+  const prose = Array.from({ length: 12 }, (_, i) => `Sentence ${i + 1} describes some routine maintenance that was performed on the pipeline today with no structural headings or bold labels.`).join(' ');
+  const cut = resolveCompletionDelivery({ lastReply: prose, completion: synthesized, fallbackSummary: synthesized.summary });
+  assert.equal(cut.source, 'lastReply');
+  assert.ok(cut.deliveryText.length < prose.length && !cut.deliveryText.includes('Checks:'), cut.deliveryText.length);
 
   // A technical summary kept as written has no raw detail line, so the checks
-  // line carries the pushed sha on its own.
-  const report = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
-  const kept = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
-  assert.equal(kept.debug.summaryStyle, 'verbatim');
-  const keptResult = resolveCompletionDelivery({ completion: kept, fallbackSummary: kept.summary });
-  assert.equal(keptResult.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+  // line carries the tests and the sha on its own.
+  for (const [checklist, sha, checks] of [[PUSHED_CHECKLIST, SHA, 'Checks: tests passed; pushed deadbee.'], [{ work_complete: true, tests_passed: true }, null, 'Checks: tests passed.']]) {
+    const kept = buildTerminalCompletionPayload({ summary: SPORTS_REPORT, checklist, sha });
+    assert.equal(kept.debug.summaryStyle, 'verbatim');
+    const keptResult = resolveCompletionDelivery({ completion: kept, fallbackSummary: kept.summary });
+    assert.equal(keptResult.deliveryText, `${SPORTS_REPORT}\n\nTechnical details:\n- ${checks}`);
+  }
 });
 
 test('only a lead the humanizer cut at its 700-char cap gives way to the detail line it was cut from', () => {
