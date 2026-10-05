@@ -660,6 +660,46 @@ test('a long commit-style summary leads with one clause and keeps the list in th
   assert.ok(details.endsWith('- Checks: tests passed; pushed deadbee.'), details);
 });
 
+test('a clause list goes out whole in the details while the delivery fits one message', () => {
+  // A clause list is never promoted, so the details carry the list. Cut at
+  // 260 or 220 chars, 0.6.6 dropped most of this 986-char list.
+  const summary = `fix(import): ${Array.from({ length: 24 }, (_, i) => `route batch ${i + 1} through the import queue`).join('; ')}`;
+  assert.equal(summary.length, 986);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.equal(result.deliveryText, `${completion.summary_human}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`);
+});
+
+test('the details are cut once the whole delivery passes 3,400 UTF-8 bytes, the bound of a promoted report', () => {
+  // "é" is two bytes, so this list passes the bound in bytes while it is
+  // still under 3,400 in chars.
+  const MAX_DELIVERY_BYTES = 3400;
+  const base = `fix(import): ${Array.from({ length: 60 }, (_, i) => `route café batch ${i + 1} through the import queue`).join('; ')}; keep `;
+  const deliver = (summary) => {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human');
+    return { lead: completion.summary_human, deliveryText: result.deliveryText };
+  };
+  const whole = (lead, summary) => `${lead}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`;
+  const probe = deliver(`${base}x`);
+  const padding = MAX_DELIVERY_BYTES - Buffer.byteLength(whole(probe.lead, `${base}x`));
+  assert.ok(padding > 0 && padding < 500, `padding ${padding}`);
+
+  const atBound = `${base}${'x'.repeat(padding + 1)}`;
+  const fits = deliver(atBound);
+  assert.equal(Buffer.byteLength(fits.deliveryText), MAX_DELIVERY_BYTES);
+  assert.equal(fits.deliveryText, whole(fits.lead, atBound));
+
+  const overBound = `${atBound}x`;
+  const over = deliver(overBound);
+  assert.equal(Buffer.byteLength(whole(over.lead, overBound)), MAX_DELIVERY_BYTES + 1);
+  assert.ok(whole(over.lead, overBound).length < MAX_DELIVERY_BYTES, 'under the bound in chars');
+  const [, details] = over.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(details, `- ${overBound.slice(0, 219).trimEnd()}…\n- Checks: tests passed; pushed deadbee.`);
+});
+
 test('known limitation: the fragment lead uses only the first two fragments', () => {
   // The humanizer picks the first two plain-English fragments (selection must
   // stay stable so the machine-derivative gate can reproduce the stored lead

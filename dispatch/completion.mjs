@@ -930,7 +930,7 @@ function buildTechnicalDetailsText({
         || (looksTechnicalCompletionSummary(rawTechnicalSource, summary) && rawTechnicalSource !== summary)),
   );
   if (rawTechnical) {
-    parts.push(truncateText(rawTechnicalSource, 260));
+    parts.push([rawTechnicalSource, 260]);
   }
 
   let completionDetailsAreTechnical = false;
@@ -945,7 +945,7 @@ function buildTechnicalDetailsText({
       && !isInternalTransportNoiseText(normalized)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || normalized !== rawTechnicalSource)) {
-      parts.push(truncateText(normalized, 220));
+      parts.push([normalized, 220]);
     }
   } else if (includeRawSummaryDetails && details && typeof details === 'object') {
     const rawSummary = normalizeCompletionText(details.raw_summary);
@@ -959,7 +959,7 @@ function buildTechnicalDetailsText({
       && !isInternalTransportNoiseText(technicalSummary)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || technicalSummary !== rawTechnicalSource)) {
-      parts.push(truncateText(technicalSummary, 220));
+      parts.push([technicalSummary, 220]);
     }
   }
 
@@ -973,21 +973,28 @@ function buildTechnicalDetailsText({
     && (rawTechnical
       || completionDetailsAreTechnical
       || (checksWithTechnicalLead && looksTechnicalCompletionSummary(summary, summary)))) {
-    parts.push(checklistDetails);
+    parts.push([checklistDetails]);
   }
 
-  const unique = [];
-  const seen = new Set();
-  for (const part of parts) {
-    const normalized = normalizeTechnicalDetailLine(part) || normalizeCompletionText(part);
-    if (!normalized) continue;
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(normalized);
-  }
+  const detailLines = (cut) => {
+    const unique = [];
+    const seen = new Set();
+    for (const [part, maxChars] of parts) {
+      const text = cut && maxChars ? truncateText(part, maxChars) : part;
+      const normalized = normalizeTechnicalDetailLine(text) || normalizeCompletionText(text);
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(normalized);
+    }
+    return unique;
+  };
 
-  return unique;
+  // Whole detail lines while the delivery fits one message, the bound a promoted report has.
+  const whole = detailLines(false);
+  const wholeBytes = Buffer.byteLength(composeDeliveryText(summaryText, whole) ?? '', 'utf8');
+  return wholeBytes <= MAX_VERBATIM_REPORT_BYTES ? whole : detailLines(true);
 }
 
 function composeDeliveryText(summaryText, technicalDetailsText = null) {
