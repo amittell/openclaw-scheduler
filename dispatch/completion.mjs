@@ -977,7 +977,7 @@ function buildTechnicalDetailsText({
   // from lastReply carries it only for a sha the report does not already name.
   const checksSha = shortSha(completion?.sha);
   const checksAddToSummary = fromLastReply && rawIsSameReportAsSummary
-    ? Boolean(checksSha) && !summary.includes(checksSha)
+    ? Boolean(checksSha) && !summary.toLowerCase().includes(checksSha.toLowerCase())
     : looksTechnicalCompletionSummary(summary, summary);
   if (checklistDetails && (rawTechnical || completionDetailsAreTechnical || checksAddToSummary)) {
     parts.push([checklistDetails]);

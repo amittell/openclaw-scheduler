@@ -865,6 +865,8 @@ test('watcher path: a report passed through from lastReply carries the checks li
   assert.equal(deliver(payload.lastReply, { work_complete: true, tests_passed: true }, null).deliveryText, report);
   const naming = `${report}\n\nPushed deadbee to the branch.`;
   assert.equal(deliver(naming, PUSHED_CHECKLIST, SHA).deliveryText, naming);
+  // A sha recorded in capitals is the same sha.
+  assert.equal(deliver(naming, PUSHED_CHECKLIST, SHA.toUpperCase()).deliveryText, naming);
 });
 
 test('every other path keeps the checks line and its sha', () => {
