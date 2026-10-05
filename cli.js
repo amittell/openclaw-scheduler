@@ -391,6 +391,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
       const rows = deep ? rowStatement.all() : rowStatement.all(evidenceLimit);
       let checked = 0;
       let invalidCount = 0;
+      let trustNotConfigured = 0;
       const invalidSamples = [];
       for (const row of rows) {
         checked += 1;
@@ -410,9 +411,11 @@ async function getOperationalDiagnostics(db, opts = {}) {
         }
         if (record?.integrity?.valid !== true) {
           invalidCount += 1;
+          if (record?.integrity?.code === 'EVIDENCE_TRUST_NOT_CONFIGURED') trustNotConfigured += 1;
           if (invalidSamples.length < 20) {
             invalidSamples.push({
               run_id: row.run_id,
+              code: record?.integrity?.code || null,
               error: record?.integrity?.error || 'record unavailable',
             });
           }
@@ -442,6 +445,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
         unchecked: Math.max(0, total - checked),
         verification_complete: checked === total,
         invalid: invalidCount,
+        trust_not_configured: trustNotConfigured,
         invalid_samples: invalidSamples,
         missing: missingCount,
         missing_samples: missingSamples,
@@ -454,6 +458,7 @@ async function getOperationalDiagnostics(db, opts = {}) {
         unchecked: null,
         verification_complete: null,
         invalid: null,
+        trust_not_configured: null,
         invalid_samples: [],
         missing: null,
         missing_samples: [],
@@ -1544,7 +1549,9 @@ switch (command) {
     if ((diagnostics.cancellation_pending_runs || 0) > 0) warnings.push('Active runs have pending cancellation requests.');
     if ((diagnostics.recovery_blocked_runs || 0) > 0) warnings.push('One or more runs are recovery-blocked; affected jobs were disabled for operator review.');
     if ((diagnostics.credential_cleanup_failures || 0) > 0) warnings.push('Credential cleanup failures require operator remediation; affected jobs were disabled.');
-    if ((diagnostics.evidence_records.invalid || 0) > 0) warnings.push('One or more evidence records failed checksum or execution-binding verification.');
+    const untrustedEvidence = diagnostics.evidence_records.trust_not_configured || 0;
+    if ((diagnostics.evidence_records.invalid || 0) > untrustedEvidence) warnings.push('One or more evidence records failed checksum or execution-binding verification.');
+    if (untrustedEvidence > 0) warnings.push('ssh evidence records cannot be verified because no allowed-signers file is configured; set AGENTCLI_ALLOWED_SIGNERS in the environment that runs doctor (see UPGRADING.md).');
     if ((diagnostics.evidence_records.missing || 0) > 0) warnings.push('One or more terminal runs are missing declared evidence records.');
     if (diagnostics.evidence_records.verification_complete === false) {
       warnings.push('Evidence verification was sampled; run doctor --deep to verify every evidence record.');
