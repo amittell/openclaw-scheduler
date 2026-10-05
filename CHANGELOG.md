@@ -15,8 +15,11 @@ All notable changes to this project will be documented in this file.
   file `AGENTCLI_ALLOWED_SIGNERS` names in the verifying process. A path the
   database records or declares is used only when the operator lists it in the
   new `SCHEDULER_TRUSTED_ALLOWED_SIGNERS` (absolute paths separated by `:`).
-  Relative entries are ignored with a warning, and a listed file is trusted
-  for every key in it, so list only files you created and still fully trust.
+  `AGENTCLI_ALLOWED_SIGNERS` must be absolute; a relative value counts as
+  not configured, since it would let the working directory choose the trust
+  file. Relative list entries are ignored with a warning that names their
+  position, not their value, and a listed file is trusted for every key in
+  it, so list only files you created and still fully trust.
   With neither, `ssh` evidence fails closed with
   `EVIDENCE_TRUST_NOT_CONFIGURED`, which points at `AGENTCLI_ALLOWED_SIGNERS`;
   `doctor` counts those rows as `trust_not_configured` with its own warning,

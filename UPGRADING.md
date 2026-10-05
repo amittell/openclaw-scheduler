@@ -141,7 +141,9 @@ If that prints nothing, existing evidence is unaffected. Otherwise:
    cron or launchd job, CI step, or `bash` or `sh` script that runs `doctor`
    needs the variable in its own environment. The CLI used to work without it
    because it read the recorded path; now `runs evidence` exits 1 and `doctor`
-   counts the row as invalid with `EVIDENCE_TRUST_NOT_CONFIGURED`.
+   counts the row as invalid with `EVIDENCE_TRUST_NOT_CONFIGURED`. A relative
+   value counts as not configured, in the dispatcher as well as the CLI,
+   because it would let the working directory choose the trust file.
 2. Rows that record a different path are checked against
    `AGENTCLI_ALLOWED_SIGNERS` instead. If that file does not list their key,
    they fail with `EVIDENCE_VERIFICATION_FAILED`, and the error names the

@@ -301,7 +301,9 @@ silently downgraded to the checksum backend.
 the principal, so that file is the trust anchor for `ssh` evidence, and only
 the operator chooses it. The dispatcher when it signs, and the CLI when
 `runs evidence` or `doctor` re-verifies, use the file that
-`AGENTCLI_ALLOWED_SIGNERS` names in their own environment. The evidence row
+`AGENTCLI_ALLOWED_SIGNERS` names in their own environment. That value must be
+an absolute path; a relative one would let the working directory choose the
+trust file, so it counts as not configured. The evidence row
 records the path it was signed against, and a declaration's
 `provider_config` can name one, but both are database values: such a path is
 used only when the operator lists it in `SCHEDULER_TRUSTED_ALLOWED_SIGNERS`,
