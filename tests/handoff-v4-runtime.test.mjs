@@ -3738,6 +3738,22 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
       true,
       JSON.stringify(warnings),
     );
+
+    // The same holds for the operator's own path: a relative
+    // AGENTCLI_ALLOWED_SIGNERS fails closed even where the working directory
+    // holds a valid allowed-signers file; the absolute spelling verifies.
+    const relativeOperator = await verifyPersistedArtifactBoundEvidence(run.id, {
+      cwd: workdir,
+      env: { AGENTCLI_ALLOWED_SIGNERS: 'allowed_signers' },
+    });
+    assert.equal(relativeOperator.integrity.code, 'EVIDENCE_TRUST_NOT_CONFIGURED');
+    assert.match(relativeOperator.integrity.error, /is not absolute, so it is not used/);
+    const absoluteOperator = await verifyPersistedArtifactBoundEvidence(run.id, {
+      cwd: unrelatedCwd,
+      env: { AGENTCLI_ALLOWED_SIGNERS: allowedSignersPath },
+    });
+    assert.equal(absoluteOperator.integrity.valid, true, absoluteOperator.integrity.error);
+    assert.equal(absoluteOperator.integrity.trust_source, 'operator');
     assert.equal(verified.payload.execution_id, run.id);
     assert.equal(
       verified.payload.bindings.handoff_artifact_digest,
@@ -3907,17 +3923,24 @@ test('ssh evidence signing checks against the operator allowed-signers file, not
       shell_stdout_sha256: sha256('declared-allowed-signers'),
       shell_stderr_sha256: sha256(''),
     });
-    const sign = env => persistArtifactBoundEvidence(
+    const sign = (env, opts = {}) => persistArtifactBoundEvidence(
       { ...job, evidence_ref: profile.ref, evidence: JSON.stringify(profile) },
       assertArtifactMatchesJob(job),
       run.id,
-      { env: { PATH: process.env.PATH, AGENTCLI_SIGNING_KEY: keyPath, ...env } },
+      { ...opts, env: { PATH: process.env.PATH, AGENTCLI_SIGNING_KEY: keyPath, ...env } },
     );
 
     await assert.rejects(
       () => sign({}),
       error => error.code === 'EVIDENCE_TRUST_NOT_CONFIGURED'
         && error.message.includes(`names ${declaredPath}, which contains "${delimiter}" and cannot be listed`),
+    );
+    // A relative AGENTCLI_ALLOWED_SIGNERS does not sign, even from the directory
+    // that holds the file.
+    await assert.rejects(
+      () => sign({ AGENTCLI_ALLOWED_SIGNERS: 'operator_allowed_signers' }, { cwd: workdir }),
+      error => error.code === 'EVIDENCE_TRUST_NOT_CONFIGURED'
+        && /is not absolute, so it is not used/.test(error.message),
     );
     const stored = await sign({ AGENTCLI_ALLOWED_SIGNERS: operatorPath });
     assert.equal(stored.evidence_allowed_signers_path, operatorPath);

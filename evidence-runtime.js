@@ -223,8 +223,9 @@ function trustedListEntries(env) {
 // given, so choosing that file is the trust decision. The path an evidence row
 // or a run's declaration names is a database value: it is used only when the
 // operator lists it in SCHEDULER_TRUSTED_ALLOWED_SIGNERS. Otherwise the
-// operator's AGENTCLI_ALLOWED_SIGNERS is used, and with neither, verification
-// fails closed. agentcli picks its verifier from the envelope's method, not the
+// operator's AGENTCLI_ALLOWED_SIGNERS is used if it is absolute (a relative one
+// would let the working directory choose the trust file), and with neither,
+// verification fails closed. agentcli picks its verifier from the envelope's method, not the
 // row's provider name, so this covers everything agentcli verifies. Plugins pin
 // trust in their own verify() (docs/gateway-contract.md) and keep receiving the
 // recorded path.
@@ -232,8 +233,9 @@ function evidenceTrust(source, recordedPath, opts) {
   const env = opts.env || process.env;
   const absolute = path => (path ? resolve(opts.cwd || process.cwd(), path) : null);
   const recorded = absolute(recordedPath);
-  const operator = absolute(opts.allowedSignersPath || env.AGENTCLI_ALLOWED_SIGNERS);
-  if (source !== 'agentcli') return { source: 'provider', path: recorded || operator };
+  const configured = opts.allowedSignersPath || env.AGENTCLI_ALLOWED_SIGNERS;
+  if (source !== 'agentcli') return { source: 'provider', path: recorded || absolute(configured) };
+  const operator = configured && isAbsolute(configured) ? resolve(configured) : null;
   if (trustedListEntries(env).includes(recorded)) {
     return { source: 'operator-listed-recorded-path', path: recorded };
   }
@@ -252,8 +254,13 @@ function evidenceTrust(source, recordedPath, opts) {
   }
   throw evidenceError(
     'EVIDENCE_TRUST_NOT_CONFIGURED',
-    'No allowed-signers file is configured for ssh evidence: set AGENTCLI_ALLOWED_SIGNERS to '
-      + `the allowed-signers file this host trusts.${listing}`,
+    (configured
+      ? 'The allowed-signers path configured for ssh evidence (AGENTCLI_ALLOWED_SIGNERS, or the '
+        + 'allowedSignersPath option) is not absolute, so it is not used: set '
+        + 'AGENTCLI_ALLOWED_SIGNERS to the absolute path of the allowed-signers file this host trusts.'
+      : 'No allowed-signers file is configured for ssh evidence: set AGENTCLI_ALLOWED_SIGNERS to '
+        + 'the allowed-signers file this host trusts.')
+      + listing,
   );
 }
 

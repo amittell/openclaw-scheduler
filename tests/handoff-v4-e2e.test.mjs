@@ -969,9 +969,9 @@ function pluginEvidenceManifest() {
   };
 }
 
-function runCliResult(args, env) {
+function runCliResult(args, env, cwd = root) {
   const result = spawnSync(process.execPath, [cliPath, ...args, '--json'], {
-    cwd: root,
+    cwd,
     env,
     encoding: 'utf8',
     timeout: 20_000,
@@ -1454,6 +1454,16 @@ test('ssh evidence re-verifies only against allowed-signers files the operator c
     operatorDoctor.payload.diagnostics.evidence_records.invalid_samples.map(sample => sample.code),
     ['EVIDENCE_VERIFICATION_FAILED', 'EVIDENCE_VERIFICATION_FAILED'],
   );
+
+  // A relative AGENTCLI_ALLOWED_SIGNERS is not configuration: run from the
+  // directory that holds the operator's file, it still fails closed.
+  const relativeOperator = runCliResult(
+    ['runs', 'evidence', run.id],
+    { ...env, AGENTCLI_ALLOWED_SIGNERS: 'allowed_signers' },
+    fixture,
+  );
+  assert.equal(outcome(relativeOperator).code, 'EVIDENCE_TRUST_NOT_CONFIGURED', JSON.stringify(relativeOperator.payload));
+  assert.match(relativeOperator.payload.evidence.integrity.error, /is not absolute, so it is not used/);
 
   // No trust configured: the legitimate row fails closed and says what to set.
   const unconfigured = runCliResult(['runs', 'evidence', run.id], env);
