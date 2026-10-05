@@ -167,14 +167,18 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
 }
 
 // Whether text may be delivered verbatim instead of humanized: it fits one
-// chat message and is not machine output (a payload, JSON, tracebacks, logs,
-// test output, env or config dumps), whatever labels or prose lead it carries.
+// chat message and is not machine output, whatever labels or prose lead it
+// carries.
 function isVerbatimDeliverable(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_VERBATIM_REPORT_BYTES) return false;
+  return Buffer.byteLength(text, 'utf8') <= MAX_VERBATIM_REPORT_BYTES && !isMachineOutput(text);
+}
+
+// A payload, JSON, tracebacks, logs, test output, env or config dumps.
+function isMachineOutput(text) {
   // Color codes are stripped before this check; any other escape is terminal output.
-  if (text.includes(ESC)) return false;
-  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return false;
-  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length < 3;
+  if (text.includes(ESC)) return true;
+  if (looksLikeRawPayloadText(text) || MACHINE_OUTPUT_MARKER_RE.test(text)) return true;
+  return (text.match(MACHINE_OUTPUT_LINE_RE) || []).length >= 3;
 }
 
 function getPassThroughHumanFinalReport(text) {
@@ -916,7 +920,8 @@ function buildTechnicalDetailsText({
 
   const rawSections = extractStructuredSummarySections(raw);
   const splitRaw = extractExplicitTechnicalTail(raw);
-  const rawTechnicalSource = normalizeTechnicalDetailLine(rawSections?.technical || splitRaw?.technicalTail || raw);
+  const rawDetail = rawSections?.technical || splitRaw?.technicalTail || raw;
+  const rawTechnicalSource = normalizeTechnicalDetailLine(rawDetail);
   const rawHasExplicitTechnical = Boolean(rawSections?.technical || splitRaw?.technicalTail);
   // When the summary is the same report as the raw text (pass-through final
   // report), the "technical detail" derived from raw is the report itself
@@ -930,14 +935,15 @@ function buildTechnicalDetailsText({
         || (looksTechnicalCompletionSummary(rawTechnicalSource, summary) && rawTechnicalSource !== summary)),
   );
   if (rawTechnical) {
-    parts.push([rawTechnicalSource, 260]);
+    parts.push([rawTechnicalSource, 260, rawDetail]);
   }
 
   let completionDetailsAreTechnical = false;
   if (typeof details === 'string') {
     const detailSections = extractStructuredSummarySections(details);
     const splitDetails = extractExplicitTechnicalTail(details);
-    const normalized = normalizeTechnicalDetailLine(detailSections?.technical || splitDetails?.technicalTail || details);
+    const detail = detailSections?.technical || splitDetails?.technicalTail || details;
+    const normalized = normalizeTechnicalDetailLine(detail);
     completionDetailsAreTechnical = Boolean(
       normalized && (detailSections?.technical || splitDetails?.technicalTail || looksTechnicalCompletionSummary(normalized, summary)),
     );
@@ -945,13 +951,14 @@ function buildTechnicalDetailsText({
       && !isInternalTransportNoiseText(normalized)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || normalized !== rawTechnicalSource)) {
-      parts.push([normalized, 220]);
+      parts.push([normalized, 220, detail]);
     }
   } else if (includeRawSummaryDetails && details && typeof details === 'object') {
     const rawSummary = normalizeCompletionText(details.raw_summary);
     const detailSummarySections = extractStructuredSummarySections(rawSummary);
     const splitDetailSummary = extractExplicitTechnicalTail(rawSummary);
-    const technicalSummary = normalizeTechnicalDetailLine(detailSummarySections?.technical || splitDetailSummary?.technicalTail || rawSummary);
+    const detail = detailSummarySections?.technical || splitDetailSummary?.technicalTail || rawSummary;
+    const technicalSummary = normalizeTechnicalDetailLine(detail);
     completionDetailsAreTechnical = Boolean(
       technicalSummary && (detailSummarySections?.technical || splitDetailSummary?.technicalTail || looksTechnicalCompletionSummary(technicalSummary, summary)),
     );
@@ -959,7 +966,7 @@ function buildTechnicalDetailsText({
       && !isInternalTransportNoiseText(technicalSummary)
       && (completionDetailsAreTechnical || rawTechnical)
       && (!rawTechnical || technicalSummary !== rawTechnicalSource)) {
-      parts.push([technicalSummary, 220]);
+      parts.push([technicalSummary, 220, detail]);
     }
   }
 
@@ -979,8 +986,8 @@ function buildTechnicalDetailsText({
   const detailLines = (cut) => {
     const unique = [];
     const seen = new Set();
-    for (const [part, maxChars] of parts) {
-      const text = cut && maxChars ? truncateText(part, maxChars) : part;
+    for (const [part, maxChars, source] of parts) {
+      const text = maxChars && (cut || isMachineOutput(source)) ? truncateText(part, maxChars) : part;
       const normalized = normalizeTechnicalDetailLine(text) || normalizeCompletionText(text);
       if (!normalized) continue;
       const key = normalized.toLowerCase();
@@ -991,7 +998,8 @@ function buildTechnicalDetailsText({
     return unique;
   };
 
-  // Whole detail lines while the delivery fits one message, the bound a promoted report has.
+  // Whole detail lines while the delivery fits one message, the bound a
+  // promoted report has. Machine output stays cut, as it is never promoted.
   const whole = detailLines(false);
   const wholeBytes = Buffer.byteLength(composeDeliveryText(summaryText, whole) ?? '', 'utf8');
   return wholeBytes <= MAX_VERBATIM_REPORT_BYTES ? whole : detailLines(true);
@@ -999,7 +1007,7 @@ function buildTechnicalDetailsText({
 
 function composeDeliveryText(summaryText, technicalDetailsText = null) {
   const summarySections = extractStructuredSummarySections(summaryText);
-  const summary = stripHumanSummaryLabel(summarySections?.summary || summaryText);
+  let summary = stripHumanSummaryLabel(summarySections?.summary || summaryText);
   if (!summary) return null;
 
   const technicalCandidates = [];
@@ -1017,6 +1025,14 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
     seen.add(key);
     technicalLines.push(normalized);
   }
+
+  // A lead cut from a detail line kept whole ("…") is that line: it goes out
+  // once, as written, in place of the lead.
+  const cutLead = summary.endsWith('…') ? normalizeTechnicalDetailLine(summary.slice(0, -1))?.toLowerCase() : null;
+  const cutFrom = cutLead
+    ? technicalLines.findIndex(line => line.replace(TECHNICAL_COMMIT_PREFIX_RE, '').replace(FILE_CONTEXT_PREFIX_RE, '').toLowerCase().startsWith(cutLead))
+    : -1;
+  if (cutFrom >= 0) summary = technicalLines.splice(cutFrom, 1)[0];
 
   if (technicalLines.length > 0) {
     return `${summary}\n\nTechnical details:\n- ${technicalLines.join('\n- ')}`;

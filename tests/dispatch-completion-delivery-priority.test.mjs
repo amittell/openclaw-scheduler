@@ -700,6 +700,41 @@ test('the details are cut once the whole delivery passes 3,400 UTF-8 bytes, the 
   assert.equal(details, `- ${overBound.slice(0, 219).trimEnd()}…\n- Checks: tests passed; pushed deadbee.`);
 });
 
+test('a lead cut from a detail line kept whole goes out once, as that line', () => {
+  // One 1,627-char clause: the lead is its first 700 chars, cut with "…", and
+  // the whole clause fits as the detail. It went out as both (2,350 chars).
+  const sentence = 'the importer reads every workout row from the export file and writes each row to the local store after the sync job finishes and the queue drains, ';
+  let body = '';
+  while (body.length < 1500) body += sentence;
+  body = body.trim().replace(/,$/, '');
+  const reply = `src/foo.js: ${body}`;
+  assert.equal(reply.length, 1627);
+  const watcher = resolveCompletionDelivery({ lastReply: reply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher.source, 'lastReply');
+  assert.equal(watcher.deliveryText, reply);
+  assert.equal(watcher.deliveryText.split(body).length - 1, 1);
+
+  // The done path keeps its checks line.
+  const completion = buildTerminalCompletionPayload({ summary: reply, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.ok(completion.summary_human.endsWith('…') && completion.summary_human.length === 700, completion.summary_human.length);
+  const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(done.deliveryText, `${reply}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+});
+
+test('a machine-output detail line stays cut even when the whole delivery would fit', () => {
+  // #53 never delivers machine output as written. Whole, this traceback's
+  // detail would make a 1,444-char delivery.
+  const traceback = 'The nightly import failed and I could not recover it.\nTraceback (most recent call last):\n' + Array.from({ length: 12 }, (_, i) => `  File "/srv/app/importer/stage_${i}.py", line ${10 + i}, in run_stage_${i}\n    result = stage_${i + 1}(payload, retries=3)`).join('\n') + '\nKeyError: missing column order_id';
+  const completion = buildTerminalCompletionPayload({ summary: traceback, checklist: { work_complete: true, tests_passed: true } });
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  const [, details] = result.deliveryText.split('\n\nTechnical details:\n');
+  const [detail, checks] = details.split('\n');
+  assert.ok(detail.endsWith('…') && detail.length <= '- '.length + 220, detail);
+  assert.equal(checks, '- Checks: tests passed.');
+  assert.equal(result.deliveryText.length, 359);
+});
+
 test('known limitation: the fragment lead uses only the first two fragments', () => {
   // The humanizer picks the first two plain-English fragments (selection must
   // stay stable so the machine-derivative gate can reproduce the stored lead
