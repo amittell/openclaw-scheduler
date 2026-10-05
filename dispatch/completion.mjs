@@ -52,11 +52,10 @@ const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*
 // TAP), KEY=value env dumps and indented YAML keys. Three or more mark machine
 // output.
 const MACHINE_OUTPUT_LINE_RE = /^(?:\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{1,2}:\d{2}:\d{2}\b|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|[✔✓✗✖] |(?:not )?ok \d+ |[A-Z][A-Z0-9_]+=\S)|\s{2,}[\w-]+:(?: |$))/gm;
-// Legacy closing sentences the old humanizer appended to a synthetic
-// technical rewrite. buildHumanizedTechnicalSummary no longer emits them;
-// the list is kept so resolveCompletionDelivery still recognizes one in a
-// stored summary_human (payloads written before the removal) and promotes
-// the full report instead of delivering the boilerplate.
+// Closing sentences the humanizer appended to every technical rewrite up to
+// v0.6.6. It no longer writes them, and a payload it builds now records the
+// rewrite in debug.leadSource instead; this list only recognizes a rewrite in
+// a payload v0.6.6 stored (isLossyHumanizedLead).
 const TECHNICAL_REWRITE_FOLLOW_UPS = {
   testOnly: 'That makes the behavior easier to trust. Future regressions should get caught quickly.',
   reliability: 'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
@@ -65,6 +64,9 @@ const TECHNICAL_REWRITE_FOLLOW_UPS = {
 };
 const THEMED_LEAD_FOLLOW_UP = 'Future runs should show the clean summary first, with technical details underneath when needed.';
 const SYNTHETIC_FOLLOW_UPS = [...Object.values(TECHNICAL_REWRITE_FOLLOW_UPS), THEMED_LEAD_FOLLOW_UP];
+// debug.leadSource value: summary_human is a lead the technical humanizer
+// built from clauses of the summary, not the agent's own words.
+const TECHNICAL_REWRITE_LEAD_SOURCE = 'technical-rewrite';
 const SENTENCE_BREAK_RE = /[.!?]\s+[A-Z]/g;
 
 export function normalizeCompletionText(value) {
@@ -829,25 +831,37 @@ function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   return fallback || null;
 }
 
-export function humanizeCompletionText(value) {
+// humanizeCompletionText, plus whether its text is a technical rewrite: a
+// lead the humanizer built from clauses or sentences of the agent's summary,
+// rather than the agent's own words (a final report, a "Technically:" lead, a
+// "Human summary:" section, the summary as written) or a plain condensation
+// of them.
+function humanizeCompletion(value) {
   const raw = normalizeCompletionText(value);
   if (!raw) return null;
 
   const passThroughReport = getPassThroughHumanFinalReport(raw);
-  if (passThroughReport) return passThroughReport;
+  if (passThroughReport) return { text: passThroughReport, technicalRewrite: false };
 
   const structuredSections = extractStructuredSummarySections(raw);
   const summarySource = normalizeCompletionText(structuredSections?.summary || raw);
   if (!summarySource) return null;
 
   const mixedSummary = buildHumanSummaryFromMixedTechnicalText(summarySource);
-  if (mixedSummary) return mixedSummary;
+  if (mixedSummary) return { text: mixedSummary, technicalRewrite: false };
 
   const summarized = summarizeCompletionText(summarySource);
   if (!summarized) return null;
-  if (!looksTechnicalCompletionSummary(summarySource, summarized)) return stripHumanSummaryLabel(summarized) || summarized;
+  if (!looksTechnicalCompletionSummary(summarySource, summarized)) {
+    return { text: stripHumanSummaryLabel(summarized) || summarized, technicalRewrite: false };
+  }
 
-  return buildHumanizedTechnicalSummary(summarySource, summarized) || summarized;
+  const text = buildHumanizedTechnicalSummary(summarySource, summarized) || summarized;
+  return { text, technicalRewrite: !structuredSections?.summary && text !== raw };
+}
+
+export function humanizeCompletionText(value) {
+  return humanizeCompletion(value)?.text ?? null;
 }
 
 function summarizeChecklistTechnicalDetails(checklist, sha) {
@@ -1288,7 +1302,8 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
   const rawSummary = normalizeCompletionText(summary);
   const normalizedChecklist = cloneChecklist(checklist);
   const normalizedSha = normalizeCompletionText(sha);
-  const normalizedSummary = humanizeCompletionText(rawSummary);
+  const humanized = humanizeCompletion(rawSummary);
+  const normalizedSummary = humanized?.text ?? null;
   const synthesizedReply = normalizedSummary
     ? null
     : synthesizeCompletionReply({ checklist: normalizedChecklist, sha: normalizedSha });
@@ -1322,6 +1337,10 @@ export function buildTerminalCompletionPayload({ summary, checklist, sha } = {})
       normalizedSummary,
       synthesizedReply,
       summaryStyle,
+      // How summary_human (normalizedSummary) was made, when the humanizer
+      // built it from the summary's clauses; resolveCompletionDelivery then
+      // prefers the full prose report (isLossyHumanizedLead).
+      ...(humanized?.technicalRewrite ? { leadSource: TECHNICAL_REWRITE_LEAD_SOURCE } : {}),
       deliverySource: normalizedSummary ? 'summary_human' : synthesizedReply ? 'technical-synthesis' : 'none',
     },
   };
@@ -1345,29 +1364,30 @@ export function getCompletionAuthoritativeSummary(completion) {
 // True when summaryHuman is a machine derivative that dropped most of a
 // substantial summary: either a truncation (a prefix once punctuation and
 // spaces are stripped, which also covers the "0.00s" -> "0. 00s" mangling)
-// or a fragment-based lead the humanizer wrote from a clause of the report
-// (the stripped lead is embedded in the stripped report, prose reports only)
-// or a legacy synthetic technical rewrite (it ends with a follow-up sentence
-// the old humanizer wrote, not the agent). Equal or similar-length texts
-// are not lossy.
-function isLossyHumanizedLead(summary, summaryHuman) {
-  if (!summary || !summaryHuman) return false;
-  if (summary.length <= 200 || summaryHuman.length >= summary.length * 0.6) return false;
+// or a technical rewrite of a prose report, a lead the humanizer built from
+// some of its clauses ("Fixed the stale flag reset." for a 418-char report)
+// or from its first sentences. A truncation that keeps most of the report is
+// delivered as it is; a technical rewrite is not, whatever its length, since
+// its details block repeats the head of the report and drops the rest.
+function isLossyHumanizedLead(summary, summaryHuman, technicalRewrite) {
+  if (!summary || !summaryHuman || summary.length <= 200) return false;
+  if (isProseReport(summary) && isTechnicalRewriteLead(summary, summaryHuman, technicalRewrite)) return true;
+  if (summaryHuman.length >= summary.length * 0.6) return false;
   const strip = (t) => t.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  const strippedSummary = strip(summary);
-  const strippedHuman = strip(summaryHuman);
-  if (strippedSummary.startsWith(strippedHuman)) return true;
-  // A fragment-based lead the humanizer wrote from a clause of a prose report
-  // (e.g. "Md5 032cde47 (stale round-7)." for a 1,619-char report) is embedded
-  // in the report, not a prefix: it is a lossy derivative too. Gate this on the
-  // stored summary_human being a machine derivative of THIS report -- i.e. the
-  // humanizer reproduces it verbatim from the report. An explicit human summary
-  // that merely happens to appear in the report is not a derivative and keeps
-  // its precedence (it is not reproduced verbatim by the humanizer).
-  const machineDerivative = isProseReport(summary)
-    && humanizeCompletionText(summary) === summaryHuman;
-  if (strippedHuman.length >= 15 && machineDerivative && strippedSummary.includes(strippedHuman)) return true;
-  return isProseReport(summary) && SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp));
+  return strip(summary).startsWith(strip(summaryHuman));
+}
+
+// A rewrite is known by how it was made, never by its words. A payload built
+// now carries the producer's record (technicalRewrite true or false). One
+// stored before the record existed (undefined) is a rewrite when it ends with
+// a follow-up sentence v0.6.6 appended, or when the humanizer rebuilds that
+// exact lead from the report as a rewrite (#72 wrote neither). An explicit
+// summary_human is neither.
+function isTechnicalRewriteLead(summary, summaryHuman, technicalRewrite) {
+  if (technicalRewrite !== undefined) return technicalRewrite;
+  if (SYNTHETIC_FOLLOW_UPS.some(followUp => summaryHuman.endsWith(followUp))) return true;
+  const rebuilt = humanizeCompletion(summary);
+  return Boolean(rebuilt?.technicalRewrite) && rebuilt.text === summaryHuman;
 }
 
 // A report written as sentences. A commit-style summary ("fix(sync): a; b; c"
@@ -1464,18 +1484,24 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
   // On the done path lastReply is not recovered, so when summary_human is a
   // lossy machine derivative of that report, deliver the report itself: a
   // truncation (summarizeProse cut a 1,909-char report to ~200 chars and split
-  // "0.00s" into "0. 00s") or a synthetic technical rewrite of a prose report
-  // (one fragment plus the humanizer's own follow-up sentences). summary_human
-  // still wins for a commit-style summary, when the agent wrote its own lead
-  // ("Technically:" / "Technical details:" tail, which the humanizer splits
-  // into lead and details block), or when the report is not
+  // "0.00s" into "0. 00s") or a technical rewrite of a prose report (a lead
+  // built from some of its clauses or sentences). summary_human still wins when the
+  // agent supplied it, for a commit-style summary, when the agent wrote its
+  // own lead ("Technically:" / "Technical details:" tail, which the humanizer
+  // splits into lead and details block), or when the report is not
   // verbatim-deliverable (over one message, or machine output).
   // The report gets the humanizer's text cleanup: no color codes or CRs.
+  // The producer's rewrite record counts only for the very text it produced,
+  // so a summary_human set or changed afterwards keeps its precedence.
   const report = normalizeReportLineEndings(rawCompletionSummary);
+  const technicalRewriteLead = completion?.debug?.leadSource === undefined
+    ? undefined
+    : completion.debug.leadSource === TECHNICAL_REWRITE_LEAD_SOURCE
+      && normalizeCompletionText(completion.debug.normalizedSummary) === rawCompletionSummaryHuman;
   if (
     report
     && !EXPLICIT_TECHNICAL_MARKER_RE.test(report)
-    && isLossyHumanizedLead(report, rawCompletionSummaryHuman)
+    && isLossyHumanizedLead(report, rawCompletionSummaryHuman, technicalRewriteLead)
   ) {
     // The checks line (tests passed, pushed sha) that the technical-details
     // block would have carried stays with the report.

@@ -160,13 +160,12 @@ test('sm-round8-align-fix: the full report reaches chat on the done and watcher 
   assert.equal(watcher.deliveryText, alignReport.summary);
 });
 
-test('done path: a lossy summary_human gives way to the full report', () => {
-  // sm-round8-fix once stored the humanizer's technical rewrite: one fragment
-  // plus its stock follow-up sentences, 133 chars standing in for a 1,619-char
-  // report. The boilerplate family is removed; the stored lead is now the real
-  // condensed content (a truncation of the report), and the full report still
-  // wins on the done path.
-  assert.ok(payload.completion.summary_human.length < payload.completion.summary.length / 2);
+test('done path: a technical rewrite stored by 0.6.7 gives way to the full report', () => {
+  // The fixture is sm-round8-fix as 0.6.7 stores it: a 29-char lead built
+  // from one clause of a 1,619-char report, with no follow-up sentence and no
+  // rewrite record. The humanizer rebuilds that exact lead from the report.
+  assert.equal(payload.completion.summary_human, 'Md5 032cde47 (stale round-7).');
+  assert.equal(payload.completion.debug.leadSource, undefined);
   assert.ok(payload.completion.summary.length > 1500);
   const result = resolveCompletionDelivery({
     completion: payload.completion,
@@ -174,6 +173,120 @@ test('done path: a lossy summary_human gives way to the full report', () => {
   });
   assert.equal(result.source, 'completion-summary-full');
   assert.equal(result.deliveryText, payload.completion.summary);
+});
+
+// A clause of the sm-round8-fix report. With a verb in front of it the
+// humanizer leads with that clause rewritten ("Updated md5 ..."), which is
+// neither a prefix nor a substring of the report.
+const MD5_CLAUSE = 'md5 032cde47 (stale round-7) -> 29e5e2d6';
+const REWRITTEN_REPORTS = {
+  'incident, "update md5"': payload.completion.summary.replace(MD5_CLAUSE, `update ${MD5_CLAUSE}`),
+  'incident, "fix md5"': payload.completion.summary.replace(MD5_CLAUSE, `fix ${MD5_CLAUSE}`),
+  'fix -> Fixed': 'Diagnosed the importer stall in src/sync/importer.js after the overnight run. The queue drained but the HAE_EXPORT flag stayed set for six hours; fix the stale flag reset before the next run starts; verified against the live fitness.db snapshot that the W2D4 session plans W2D5. Re-ran the full import twice and both runs finished in under four minutes. No other files changed and nothing was pushed beyond the branch.',
+  'two clauses joined': 'Cleared the stale planner cache that the morning brief read; reused the last good plan when the export was empty; the cron entry in jobs/brief.yaml fired on time but HAE_EXPORT was unset for six hours. Checked three days of logs and every skip lines up with an empty export. Re-ran the brief by hand and the planner block rendered. Re-ran the sync job and the queue drained. Nothing else changed.',
+  'add -> Added': 'Root-caused the duplicate receipt emails to billing/retry_worker.py re-sending invoices whose ack arrived after the window -> add an idempotency key per invoice -> backfilled with scripts/backfill_receipts.py over the last two days. Confirmed on staging that each order produces one receipt. Ran pytest (212 passed) and the lint job. Re-ran the queue twice. Nothing customer-facing changed beyond the duplicate emails ending.',
+};
+const stripPunctuation = (text) => text.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+test('done and watcher paths: a fresh technical rewrite of a prose report gives way to the report', () => {
+  // 0.6.7 delivered the rewritten lead and a cut of the report instead: 280
+  // chars for the 1,626-char "update md5" report, which 0.6.6 sent whole.
+  assert.ok(payload.completion.summary.includes(MD5_CLAUSE));
+  for (const [name, report] of Object.entries(REWRITTEN_REPORTS)) {
+    const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.ok(!stripPunctuation(report).includes(stripPunctuation(completion.summary_human)), `${name}: ${completion.summary_human}`);
+    for (const [path, lastReply] of [['done', undefined], ['watcher', report]]) {
+      const result = resolveCompletionDelivery({ lastReply, completion, fallbackSummary: completion.summary });
+      assert.equal(result.source, 'completion-summary-full', `${name} (${path})`);
+      assert.equal(result.deliveryText, `${report}\n\nChecks: tests passed; pushed deadbee.`, `${name} (${path})`);
+    }
+    assert.equal(completion.debug.leadSource, 'technical-rewrite', name);
+  }
+});
+
+test('done path: a rewritten lead stored by 0.6.7, which has no record, gives way to the report after the upgrade', () => {
+  // 0.6.7 built the same lead from these reports but stored no leadSource.
+  for (const [name, report] of Object.entries(REWRITTEN_REPORTS)) {
+    const debug = { ...buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST }).debug };
+    delete debug.leadSource;
+    const stored = { version: 2, summary_human: debug.normalizedSummary, summary: report, checklist: CHECKLIST, debug };
+    const result = resolveCompletionDelivery({ completion: stored, fallbackSummary: report });
+    assert.equal(result.source, 'completion-summary-full', name);
+    assert.equal(result.deliveryText, report, name);
+  }
+});
+
+test('done path: a technical lead made of the report\'s first sentences gives way to the report, however long', () => {
+  // No plain clause leads this report, so the humanizer leads with its first
+  // five sentences: 448 of 608 chars. The details block then repeats the
+  // head and drops the rest, 731 chars without the last two sentences.
+  // 0.6.6 led with a stock sentence and sent the report.
+  const report = [
+    'Rebuilt the nightly export after the overnight run stalled at the invoice step.',
+    'The export had stopped at row 4,812 when the upstream feed closed early.',
+    'Config: EXPORT_WINDOW_START moved from 02:10 to 02:50 in jobs/export.yaml, and retry_limit raised to 3 for the invoice step.',
+    'Re-ran the import against the morning snapshot and every table matched the source counts.',
+    'Checked the three previous nights and found the same early close on two of them.',
+    'Moved the export window forty minutes later, after the feed closes.',
+    'Ran the job twice by hand and both runs finished in under six minutes with no skipped rows.',
+  ].join(' ');
+  const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.ok(report.startsWith(completion.summary_human) && completion.summary_human.length > report.length * 0.6, completion.summary_human);
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: report });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, `${report}\n\nChecks: tests passed; pushed deadbee.`);
+
+  // The same lead stored by 0.6.7, without the record.
+  const debug = { ...completion.debug };
+  delete debug.leadSource;
+  const stored = resolveCompletionDelivery({ completion: { ...completion, debug }, fallbackSummary: report });
+  assert.equal(stored.source, 'completion-summary-full');
+});
+
+test('the rewrite record marks only the humanizer\'s own lead, never the agent\'s final report', () => {
+  // A final report passed as --summary leads as written. Recording it as a
+  // rewrite would send it as a promoted report instead.
+  const completion = buildTerminalCompletionPayload({ summary: payload.lastReply, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.summary_human, payload.lastReply.trim());
+  assert.equal(completion.debug.leadSource, undefined);
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.startsWith(`${payload.lastReply.trim()}\n\nTechnical details:\n`), result.deliveryText.slice(-80));
+});
+
+test('done path: the producer record outlives a change to the humanizer', () => {
+  // A payload stored by a build whose humanizer wrote a different lead: the
+  // record, not a rebuild of the lead, says it is a rewrite.
+  const report = REWRITTEN_REPORTS['fix -> Fixed'];
+  const produced = buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST });
+  const otherLead = 'Fixed the stale import flag reset.';
+  assert.notEqual(produced.summary_human, otherLead);
+  const stored = { ...produced, summary_human: otherLead, debug: { ...produced.debug, normalizedSummary: otherLead } };
+  const result = resolveCompletionDelivery({ completion: stored, fallbackSummary: report });
+  assert.equal(result.source, 'completion-summary-full');
+  assert.equal(result.deliveryText, report);
+});
+
+test('done path: every follow-up sentence v0.6.6 appended marks a stored rewrite', () => {
+  const followUps = [
+    'That makes the behavior easier to trust. Future regressions should get caught quickly.',
+    'That should make the workflow more reliable. Future runs should be less likely to hit the same problem.',
+    'That makes the new behavior available without extra follow-up. Future runs should use it automatically.',
+    'That should make the result easier to work with. Future runs should reflect the change automatically.',
+    'Future runs should show the clean summary first, with technical details underneath when needed.',
+  ];
+  for (const followUp of followUps) {
+    const completion = { ...payload.completion, summary_human: `Re-encoded the dub track. ${followUp}` };
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'completion-summary-full', followUp);
+    assert.equal(result.deliveryText, payload.completion.summary, followUp);
+  }
+
+  // Without the sentence, a lead the humanizer would not write is the agent's.
+  const explicit = { ...payload.completion, summary_human: 'Re-encoded the dub track.' };
+  const result = resolveCompletionDelivery({ completion: explicit, fallbackSummary: explicit.summary });
+  assert.equal(result.source, 'summary_human');
+  assert.ok(result.deliveryText.startsWith('Re-encoded the dub track.'));
 });
 
 test('done path: commit-style summaries keep their lead and the pushed sha at any length', () => {
@@ -294,6 +407,7 @@ test('done path: an agent-written "Technically:" split keeps its lead even when 
   const lead = 'Fixed the planner so the next session is recommended after the last completed one.';
   const { completion, result } = deliverDone(`${lead} Technically: mapped imported workout ids back to the program schedule, updated the focused progression tests, and verified on the live database snapshot that the last completed W2D4 now plans W2D5.`);
   assert.equal(completion.summary_human, lead);
+  assert.equal(completion.debug.leadSource, undefined, 'the agent\'s own lead is not a rewrite');
   assert.notEqual(result.source, 'completion-summary-full');
   assert.ok(result.deliveryText.startsWith(`${lead}\n\nTechnical details:`));
   assert.ok(!result.deliveryText.includes('Technically:'), 'the raw marker must not reach chat');
@@ -539,6 +653,54 @@ test('legacy payloads: a pre-removal boilerplate summary_human still promotes th
   });
   assert.equal(result.source, 'completion-summary-full', 'legacy boilerplate lead gives way to the full report');
   assert.ok(result.deliveryText.startsWith(report), 'the full report is delivered');
+});
+
+test('an explicit summary_human keeps its precedence over the report that contains it', () => {
+  const billing = 'Investigated the billing queue after the overnight alert. The retry worker was re-sending invoices whose ack arrived late. Resolved the duplicate billing notifications. Added an idempotency key per invoice and backfilled the last 48 hours. No customer was charged twice; only the emails were duplicated.';
+  const explicitLead = 'Resolved the duplicate billing notifications.';
+  for (const summaryStyle of [undefined, 'verbatim', 'humanized']) {
+    const completion = {
+      version: 2,
+      summary_human: explicitLead,
+      summary: billing,
+      checklist: CHECKLIST,
+      debug: { deliverySource: 'summary_human', ...(summaryStyle ? { summaryStyle } : {}) },
+    };
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human', `summaryStyle=${summaryStyle}`);
+    assert.equal(result.deliveryText, explicitLead, `summaryStyle=${summaryStyle}`);
+  }
+
+  // The rewrite record belongs to the text the producer wrote: a summary_human
+  // replaced afterwards is explicit again, and so is a lead under any other
+  // record.
+  const report = REWRITTEN_REPORTS['fix -> Fixed'];
+  const produced = buildTerminalCompletionPayload({ summary: report, checklist: CHECKLIST });
+  const replaced = resolveCompletionDelivery({ completion: { ...produced, summary_human: 'Cleared the stale import flag.' } });
+  assert.equal(replaced.source, 'summary_human');
+  assert.ok(replaced.deliveryText.startsWith('Cleared the stale import flag.'), replaced.deliveryText);
+  const otherRecord = resolveCompletionDelivery({ completion: { ...produced, debug: { ...produced.debug, leadSource: 'agent' } } });
+  assert.equal(otherRecord.source, 'summary_human');
+  assert.ok(otherRecord.deliveryText.startsWith(produced.summary_human), otherRecord.deliveryText);
+});
+
+test('an agent-written "Human summary:" section leads the delivery, never the labelled report', () => {
+  // 0.6.7 rebuilt the section from the report, took it for a rewrite, and sent
+  // the report with its "Human summary:" and "Details:" labels.
+  const details = 'Details: The retry worker re-sent invoices whose acknowledgement arrived after the thirty second window. I added an idempotency key per invoice and backfilled the last two days of orders. The queue drained cleanly afterwards. Nothing else changed in the billing flow.';
+  const sections = {
+    'plain section': 'Human summary: Fixed the duplicate receipt emails so each customer now gets exactly one receipt per order.',
+    'technical section': 'Human summary: fix(billing): add an idempotency key per invoice; backfill receipts for the last two days',
+  };
+  for (const [name, section] of Object.entries(sections)) {
+    const summary = `${section}\n${details}`;
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.debug.leadSource, undefined, name);
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.source, 'summary_human', name);
+    assert.ok(result.deliveryText.startsWith(`${completion.summary_human}\n\nTechnical details:\n`), `${name}: ${result.deliveryText}`);
+    assert.doesNotMatch(result.deliveryText, /Human summary:|^Details:/m, name);
+  }
 });
 
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
