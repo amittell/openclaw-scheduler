@@ -204,15 +204,18 @@ function evidencePrincipal(profile, opts = {}) {
 }
 
 // A relative entry would trust a different file in every working directory.
+// The warning names the entry's position, not its value: environment values
+// are not echoed to logs.
 const warnedRelativeTrustEntries = new Set();
 
 function trustedListEntries(env) {
-  return (env.SCHEDULER_TRUSTED_ALLOWED_SIGNERS || '').split(delimiter).filter(entry => {
+  return (env.SCHEDULER_TRUSTED_ALLOWED_SIGNERS || '').split(delimiter).filter((entry, index) => {
     if (!entry || isAbsolute(entry)) return Boolean(entry);
     if (!warnedRelativeTrustEntries.has(entry)) {
       warnedRelativeTrustEntries.add(entry);
       console.error(
-        `[evidence] Ignoring SCHEDULER_TRUSTED_ALLOWED_SIGNERS entry "${entry}": not an absolute path`,
+        `[evidence] Ignoring entry ${index + 1} of SCHEDULER_TRUSTED_ALLOWED_SIGNERS: `
+          + 'not an absolute path',
       );
     }
     return false;

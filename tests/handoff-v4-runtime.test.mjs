@@ -3720,6 +3720,7 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
 
     // A relative entry would name a different file in every working directory,
     // so it is ignored with a warning even where it resolves to the recorded path.
+    // The warning gives the entry's position, never the environment value.
     const warnings = [];
     const consoleError = console.error;
     console.error = (...parts) => { warnings.push(parts.join(' ')); };
@@ -3727,17 +3728,15 @@ test('persisted SSH evidence is cryptographically reverified against the exact e
     try {
       relativeEntry = await verifyPersistedArtifactBoundEvidence(run.id, {
         cwd: workdir,
-        env: { SCHEDULER_TRUSTED_ALLOWED_SIGNERS: 'allowed_signers' },
+        env: { SCHEDULER_TRUSTED_ALLOWED_SIGNERS: `/elsewhere/allowed_signers${delimiter}./allowed_signers` },
       });
     } finally {
       console.error = consoleError;
     }
     assert.equal(relativeEntry.integrity.code, 'EVIDENCE_TRUST_NOT_CONFIGURED');
-    assert.equal(
-      warnings.some(warning => warning.includes('entry "allowed_signers": not an absolute path')),
-      true,
-      JSON.stringify(warnings),
-    );
+    assert.deepEqual(warnings, [
+      '[evidence] Ignoring entry 2 of SCHEDULER_TRUSTED_ALLOWED_SIGNERS: not an absolute path',
+    ]);
 
     // The same holds for the operator's own path: a relative
     // AGENTCLI_ALLOWED_SIGNERS fails closed even where the working directory
