@@ -700,6 +700,35 @@ test('the details are cut once the whole delivery passes 3,400 UTF-8 bytes, the 
   assert.equal(details, `- ${overBound.slice(0, 219).trimEnd()}…\n- Checks: tests passed; pushed deadbee.`);
 });
 
+test('a lead the humanizer cut on its fallback route also goes out once', () => {
+  // One clause with a code token and no prefix leads with the summary as
+  // summarizeProse cut it to 700 chars. 4e53362 recorded only cuts of a rule
+  // lead, so these went out as lead plus whole clause (2,233 and 1,769 chars).
+  const clause = (n) => {
+    let text = 'the importer retries the export with MAX_RETRIES set to five';
+    while (text.length < n) text += ' and writes each row to the local store after the sync job finishes';
+    return text.slice(0, n).trimEnd();
+  };
+  const reply = clause(1510);
+  assert.equal(humanizeCompletionText(reply).length, 700);
+  const watcher = resolveCompletionDelivery({ lastReply: reply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+  assert.equal(watcher.deliveryText, reply);
+
+  const summary = clause(1006);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.debug.leadCut, true);
+  const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  assert.equal(done.deliveryText, `${summary}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // Only a lead taken from the cut summary carries the record. A rule's own
+  // lead of a long summary stays the lead, never the raw commit string.
+  const rule = `fix(cache): bump CACHE_TTL to 30s. ${Array.from({ length: 6 }, (_, i) => `Restart worker ${i + 1} after the deploy finishes.`).join(' ')}`;
+  const ruled = buildTerminalCompletionPayload({ summary: rule, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(ruled.summary_human, 'Bump CACHE_TTL to 30s.');
+  const ruledResult = resolveCompletionDelivery({ completion: ruled, fallbackSummary: ruled.summary });
+  assert.ok(ruledResult.deliveryText.startsWith('Bump CACHE_TTL to 30s.\n\nTechnical details:\n- fix(cache): '), ruledResult.deliveryText.slice(0, 80));
+});
+
 test('past 3,400 bytes the cut detail lines shrink to the bytes left, and the checks line stays', () => {
   const roundTrips = (text) => Buffer.from(text, 'utf8').toString('utf8') === text;
   const checks = { checklist: PUSHED_CHECKLIST, sha: SHA };
