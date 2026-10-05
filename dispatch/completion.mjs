@@ -902,7 +902,13 @@ function summarizeChecklistTechnicalDetails(checklist, sha) {
   return parts.length > 0 ? `Checks: ${parts.join('; ')}.` : null;
 }
 
-function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRawSummaryDetails = true } = {}) {
+function buildTechnicalDetailsText({
+  rawText,
+  summaryText,
+  completion,
+  includeRawSummaryDetails = true,
+  checksWithTechnicalLead = false,
+} = {}) {
   const raw = normalizeCompletionText(rawText);
   const summary = normalizeCompletionText(summaryText);
   const details = getCompletionTechnicalDetails(completion);
@@ -959,11 +965,14 @@ function buildTechnicalDetailsText({ rawText, summaryText, completion, includeRa
 
   const checklistDetails = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
   // The checks line (tests passed, pushed sha) is distinct content, not a
-  // duplicate of the summary: include it whenever a technical context exists,
-  // including a verbatim technical lead whose raw detail line is suppressed
-  // as a duplicate of the summary itself (rawIsSameReportAsSummary).
+  // duplicate of the summary. A structured lead kept as written has no raw
+  // detail line (rawIsSameReportAsSummary), so a technical one
+  // (checksWithTechnicalLead) carries the checks line on its own. A report
+  // passed through from lastReply is delivered as written.
   if (checklistDetails
-    && (rawTechnical || completionDetailsAreTechnical || looksTechnicalCompletionSummary(summary, summary))) {
+    && (rawTechnical
+      || completionDetailsAreTechnical
+      || (checksWithTechnicalLead && looksTechnicalCompletionSummary(summary, summary)))) {
     parts.push(checklistDetails);
   }
 
@@ -1533,6 +1542,7 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
       summaryText: candidate.text,
       completion,
       includeRawSummaryDetails: summaryUsesHumanizedLead && candidate.source === 'summary_human',
+      checksWithTechnicalLead: true,
     });
     return {
       deliveryText: composeDeliveryText(candidate.text, technicalDetailsText),

@@ -770,6 +770,24 @@ test('an agent-written "Human summary:" section leads the delivery, never the la
   }
 });
 
+test('watcher path: a report passed through from lastReply goes out as written, checks or not', () => {
+  // 0.6.7 appended "Technical details: - Checks: ..." to the agent's own
+  // report (1,884 -> 1,944 chars). The checks line rides with a structured
+  // lead, not with the report.
+  const completion = { ...payload.completion, checklist: PUSHED_CHECKLIST, sha: SHA };
+  const result = resolveCompletionDelivery({ lastReply: payload.lastReply, completion, fallbackSummary: completion.summary });
+  assert.equal(result.source, 'lastReply');
+  assert.equal(result.deliveryText, payload.lastReply.trim());
+
+  // A technical summary kept as written has no raw detail line, so the checks
+  // line carries the pushed sha on its own.
+  const report = 'Ran one-year sports betting model validation across NBA, NCAAB, NHL, MLB, and NFL using existing backtest paths and current closing_lines coverage. Updated guardrails to block NBA ATS/ML until month-stable validation returns, kept NCAAB/NFL blocked, kept MLB paper-only, and raised NHL puckline default threshold to 2.0 goals as the only validated real-money path. Added focused tests and saved the report at data/exports/betting/one-year-model-validation-2026-06-07.md. Verification passed: py_compile plus 29 focused unittests.';
+  const kept = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(kept.debug.summaryStyle, 'verbatim');
+  const keptResult = resolveCompletionDelivery({ completion: kept, fallbackSummary: kept.summary });
+  assert.equal(keptResult.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+});
+
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
   // Each case runs past five sentences, so the producer cuts it to the first
   // five. A split inside a token rejoins as "dub_eng_v9. aac"; a split before
