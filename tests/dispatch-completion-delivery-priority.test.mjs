@@ -863,6 +863,47 @@ test('watcher path: a report passed through from lastReply goes out as written, 
   assert.equal(keptResult.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
 });
 
+test('only a lead the humanizer cut at its 700-char cap gives way to the detail line it was cut from', () => {
+  // An agent's report or explicit summary_human is never replaced by a detail
+  // line, whatever it ends with. ebf441b replaced the whole report with its
+  // "Details:" tail (445 -> 88 chars, 546 -> 243).
+  const detailsReport = ['Root cause: the importer stalled because the export window closed before the feed finished.', '', 'Files changed:', '- jobs/export.yaml', '- src/sync/importer.js', '', 'Validation: re-ran the import twice and both runs finished with no skipped rows.', '', '**Details:** moved the export window forty minutes later and raised the invoice retry limit to three…'].join('\n');
+  const sectionReport = ['## Root cause', 'The retry worker re-sent invoices whose ack arrived after the window.', '', 'Technical details:', '- added an idempotency key per invoice in billing/retry_worker.py', '- backfilled the last two days', '', '## Validation', '- pytest: 212 passed', '- staging: one receipt per order', '', "Next: watching tonight's run…"].join('\n');
+  for (const report of [detailsReport, sectionReport]) {
+    const name = report.slice(0, 20);
+    const watcher = resolveCompletionDelivery({ lastReply: report, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
+    assert.ok(watcher.deliveryText.startsWith(report), `${name} (watcher): ${watcher.deliveryText.length}`);
+    const completion = buildTerminalCompletionPayload({ summary: report, checklist: PUSHED_CHECKLIST, sha: SHA });
+    const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.ok(done.deliveryText.startsWith(report), `${name} (done): ${done.deliveryText.length}`);
+    const both = resolveCompletionDelivery({ lastReply: report, completion, fallbackSummary: completion.summary });
+    assert.ok(both.deliveryText.startsWith(report), `${name} (watcher with completion): ${both.deliveryText.length}`);
+  }
+
+  const summary = 'fix(dispatch): fixed `resolveCompletionDelivery()` in dispatch/completion.mjs; bump MAX_VERBATIM_REPORT_BYTES; route the checks line';
+  const explicit = (summaryHuman, rawSummary = summary) => resolveCompletionDelivery({
+    completion: { version: 2, summary_human: summaryHuman, summary: rawSummary, details_technical: { raw_summary: rawSummary }, checklist: { work_complete: true }, debug: { summaryStyle: 'humanized', deliverySource: 'summary_human' } },
+    fallbackSummary: rawSummary,
+  }).deliveryText;
+  for (const lead of ['Fixed…', 'F…']) {
+    assert.ok(explicit(lead).startsWith(`${lead}\n\nTechnical details:\n- fix(dispatch): fixed resolveCompletionDelivery()`), lead);
+  }
+
+  // A 700-char explicit lead with no "…", and a report past the cap that
+  // ends with one, are not cuts at the cap either.
+  const sentence = 'The importer reads every workout row from the export file and writes each row to the local store after the sync job finishes and the queue drains';
+  let lead700 = sentence;
+  while (lead700.length < 700) lead700 += ` and ${sentence.toLowerCase()}`;
+  lead700 = `${lead700.slice(0, 699).trimEnd()}.`;
+  assert.ok(lead700.length >= 699 && lead700.length <= 700, lead700.length);
+  assert.ok(explicit(lead700, `fix(sync): ${lead700} Bump CACHE_TTL to 30s.`).startsWith(`${lead700}\n\nTechnical details:\n`));
+  let longReport = ['Root cause:', 'The export window closed before the feed finished, so the importer stalled at the invoice step for most of the night.', 'Files changed:', 'jobs/export.yaml moved the window forty minutes later.', 'Validation:', 'Re-ran the import twice and both runs finished with no skipped rows and matching counts.'].join('\n');
+  while (longReport.length < 760) longReport += ' Checked the logs again and the counts still matched the source tables.';
+  longReport += ' Watching tonight…';
+  assert.ok(longReport.length > 700 && humanizeCompletionText(longReport) === longReport);
+  assert.ok(explicit(longReport, `${longReport}\nfix(sync): bump CACHE_TTL to 30s; route the retry through RetryQueue`).startsWith(`${longReport}\n\nTechnical details:\n`));
+});
+
 test('the humanized lead splits only at sentence ends, so dotted tokens and closing quotes survive', () => {
   // Each case runs past five sentences, so the producer cuts it to the first
   // five. A split inside a token rejoins as "dub_eng_v9. aac"; a split before

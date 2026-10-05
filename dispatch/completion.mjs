@@ -1026,9 +1026,12 @@ function composeDeliveryText(summaryText, technicalDetailsText = null) {
     technicalLines.push(normalized);
   }
 
-  // A lead cut from a detail line kept whole ("…") is that line: it goes out
-  // once, as written, in place of the lead.
-  const cutLead = summary.endsWith('…') ? normalizeTechnicalDetailLine(summary.slice(0, -1))?.toLowerCase() : null;
+  // A lead the humanizer cut at its cap (truncateText leaves 699 or 700 chars
+  // ending "…") from a detail line kept whole is that line: it goes out once,
+  // as written, in place of the lead. The lead's own text is compared, never a
+  // section of it, so an agent's report or summary_human is never replaced.
+  const capCut = summary.endsWith('…') && summary.length >= MAX_DELIVERY_CHARS - 1 && summary.length <= MAX_DELIVERY_CHARS;
+  const cutLead = capCut ? summary.slice(0, -1).replace(/\s+/g, ' ').trim().toLowerCase() : null;
   const cutFrom = cutLead
     ? technicalLines.findIndex(line => line.replace(TECHNICAL_COMMIT_PREFIX_RE, '').replace(FILE_CONTEXT_PREFIX_RE, '').toLowerCase().startsWith(cutLead))
     : -1;
