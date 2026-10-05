@@ -720,11 +720,26 @@ test('a lead cut from a detail line kept whole goes out once, as that line', () 
   const watcher699 = resolveCompletionDelivery({ lastReply: reply699, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' });
   assert.equal(watcher699.deliveryText, reply699);
 
-  // The done path keeps its checks line.
-  const completion = buildTerminalCompletionPayload({ summary: reply, checklist: PUSHED_CHECKLIST, sha: SHA });
-  assert.ok(completion.summary_human.endsWith('…') && completion.summary_human.length === 700, completion.summary_human.length);
-  const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
-  assert.equal(done.deliveryText, `${reply}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+  // A clause long enough that the lead and the whole clause together pass
+  // 3,400 bytes still goes out once: the bound measures the merged delivery.
+  const longReply = `src/foo.js: ${body} ${body}`;
+  assert.ok(longReply.length > 3000 && longReply.length + 700 > 3400, longReply.length);
+  assert.equal(resolveCompletionDelivery({ lastReply: longReply, completion: null, fallbackSummary: 'completed (stop_reason=end_turn)' }).deliveryText, longReply);
+
+  // The done path keeps its checks line. The producer records the cut.
+  for (const [summary, leadLength] of [[reply, 700], [reply699, 699]]) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.summary_human.length, leadLength);
+    assert.equal(completion.debug.leadCut, true);
+    const done = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(done.deliveryText, `${summary}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+    // The record belongs to the lead the producer cut. A summary_human set
+    // afterwards, even a cut of the same clause, keeps its precedence.
+    const explicitCut = `${completion.summary_human.slice(0, 400).trimEnd()}…`;
+    const replaced = resolveCompletionDelivery({ completion: { ...completion, summary_human: explicitCut }, fallbackSummary: completion.summary });
+    assert.ok(replaced.deliveryText.startsWith(`${explicitCut}\n\nTechnical details:\n`), replaced.deliveryText.slice(0, 80));
+  }
 });
 
 test('a machine-output detail line stays cut even when the whole delivery would fit', () => {
@@ -895,7 +910,7 @@ test('every other path keeps the checks line and its sha', () => {
   }
 });
 
-test('only a lead the humanizer cut at its 700-char cap gives way to the detail line it was cut from', () => {
+test('only a lead the humanizer recorded as cut gives way to the detail line it was cut from', () => {
   // An agent's report or explicit summary_human is never replaced by a detail
   // line, whatever it ends with. ebf441b replaced the whole report with its
   // "Details:" tail (445 -> 88 chars, 546 -> 243).
@@ -926,9 +941,15 @@ test('only a lead the humanizer cut at its 700-char cap gives way to the detail 
   const sentence = 'The importer reads every workout row from the export file and writes each row to the local store after the sync job finishes and the queue drains';
   let lead700 = sentence;
   while (lead700.length < 700) lead700 += ` and ${sentence.toLowerCase()}`;
+  const lead699 = `${lead700.slice(0, 698).trimEnd()}…`;
   lead700 = `${lead700.slice(0, 699).trimEnd()}.`;
   assert.ok(lead700.length >= 699 && lead700.length <= 700, lead700.length);
   assert.ok(explicit(lead700, `fix(sync): ${lead700} Bump CACHE_TTL to 30s.`).startsWith(`${lead700}\n\nTechnical details:\n`));
+
+  // Nor is an explicit lead shaped exactly like a cut: 699 chars ending "…",
+  // the start of a fix(scope): detail line (the Copilot case on #76).
+  assert.equal(lead699.length, 699);
+  assert.ok(explicit(lead699, `fix(scope): ${lead699.slice(0, -1)} and keeps the last good snapshot. Bump CACHE_TTL to 30s.`).startsWith(`${lead699}\n\nTechnical details:\n`));
   let longReport = ['Root cause:', 'The export window closed before the feed finished, so the importer stalled at the invoice step for most of the night.', 'Files changed:', 'jobs/export.yaml moved the window forty minutes later.', 'Validation:', 'Re-ran the import twice and both runs finished with no skipped rows and matching counts.'].join('\n');
   while (longReport.length < 760) longReport += ' Checked the logs again and the counts still matched the source tables.';
   longReport += ' Watching tonight…';
