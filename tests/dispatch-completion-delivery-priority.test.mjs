@@ -527,6 +527,7 @@ test('humanizeCompletionText never emits the removed boilerplate family', () => 
     'dispatch/completion.mjs: make summary_human win over deliveryText; move details_technical into a separate block; add focused tests for payload-precedence regressions',
     payload.completion.summary,
     'Add focused tests for the retry, the empty-array guard and the snapshot fallback',
+    'fix(dispatch): update foo/bar.mjs; change BAZ_QUX',
   ];
   for (const summary of technicalSummaries) {
     const humanized = humanizeCompletionText(summary);
@@ -591,6 +592,72 @@ test('humanizeCompletionText caps a long single-clause technical lead at the del
   const humanized = humanizeCompletionText(longClause);
   assert.ok(humanized, 'must stay non-empty');
   assert.ok(humanized.length <= 700, `fragment lead must respect the 700-char cap, got ${humanized.length}`);
+});
+
+test('a commit-style lead is a clause of the summary, never the summary with its prefix', () => {
+  // With no plain-English clause among the first two, 0.6.7 led with the
+  // whole summary, "fix(dispatch):" prefix included.
+  const cases = {
+    'a plain clause past the first two': ['fix(dispatch): update foo/bar.mjs; change BAZ_QUX; users now receive one clear result', 'Users now receive one clear result.'],
+    'no plain clause': ['fix(dispatch): update foo/bar.mjs; change BAZ_QUX', 'Updated bar.mjs.'],
+    'no plain clause and no prefix': ['update foo/bar.mjs; change BAZ_QUX', 'Updated bar.mjs.'],
+    'a single clause': ['fix(cache): bump CACHE_TTL to 30s in scheduler/config.mjs', 'Bump CACHE_TTL to 30s in config.mjs.'],
+    'a single clause past a file prefix': ['src/cache.mjs: bump CACHE_TTL to 30s', 'Bump CACHE_TTL to 30s.'],
+    'a first clause of two sentences': ['fix(cache): bump CACHE_TTL to 30s. Restart the scheduler after the deploy.', 'Bump CACHE_TTL to 30s.'],
+  };
+  for (const [name, [summary, lead]] of Object.entries(cases)) {
+    const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+    assert.equal(completion.summary_human, lead, name);
+    const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+    assert.equal(result.deliveryText, `${lead}\n\nTechnical details:\n- ${summary}\n- Checks: tests passed; pushed deadbee.`, name);
+  }
+});
+
+test('a later clause leads only when it states the change, never a check or a status on it', () => {
+  // The first clause states the change; a later one that reports a check or
+  // a status leads with nothing the reader needs ("Verified in Safari.").
+  const caveats = [
+    'verified in Safari', 'not pushed yet', 'never ran on Windows', 'still needs review', 'pending review',
+    'untested on Linux', 'unverified on staging', 'tested on staging', 'checked the resize logs',
+    'confirmed on staging', 'validated against production', 'pushed to the branch', 'committed locally',
+  ];
+  for (const caveat of caveats) {
+    const summary = `fix(ui): HUD overlay no longer flickers on resize; use requestAnimationFrame in hud.ts; ${caveat}`;
+    assert.equal(humanizeCompletionText(summary), 'HUD overlay no longer flickers on resize.', caveat);
+  }
+
+  // The later rules clean the clause as written once: the first two clean it
+  // twice and turn "watcher" into "completion completion watcher".
+  const lead = humanizeCompletionText('fix(watcher): retry the gateway call in watcher.mjs; bump WATCH_TIMEOUT to 30s; not pushed yet');
+  assert.match(lead, /^Retry the gateway call in /);
+  assert.doesNotMatch(lead, /completion completion|pushed/i);
+  assert.equal(humanizeCompletionText('fix(api): update api/limits.mjs; change RATE_LIMIT; operators now see one alert per outage'), 'Operators now see one alert per outage.');
+  assert.equal(humanizeCompletionText('fix(api): update api/limits.mjs; change RATE_LIMIT; the watcher now sends one alert per outage'), 'The completion watcher now sends one alert per outage.');
+});
+
+test('a long commit-style summary leads with one clause and keeps the list in the details', () => {
+  // 725 chars whose first clauses are all identifiers. 0.6.7 led with the
+  // whole list cut at 700 chars, then repeated it as the technical detail.
+  const summary = [
+    'fix(dispatch): normalize completion delivery so summary_human wins over deliveryText',
+    'preserve structured completion summary in details_technical.raw_summary',
+    'add watcher tests for the done path and the watcher path',
+    'route summary_human through getCompletionSummaryHuman so legacy payloads work',
+    'drop the duplicated length check in resolveCompletionDelivery',
+    'move details_technical below the plain-English lead',
+    'dedupe double-delivery between cmdDone and the watcher via claimCompletionDelivery',
+    'update tests/dispatch-completion-delivery-priority.test.mjs and test.js',
+    'keep the checks line with the promoted report in resolveCompletionDelivery',
+    'bound isVerbatimDeliverable at MAX_VERBATIM_REPORT_BYTES for the promoted report',
+  ].join('; ');
+  assert.equal(summary.length, 725);
+  const completion = buildTerminalCompletionPayload({ summary, checklist: PUSHED_CHECKLIST, sha: SHA });
+  assert.equal(completion.summary_human, 'Move technical details below the plain-English lead.');
+  const result = resolveCompletionDelivery({ completion, fallbackSummary: completion.summary });
+  const [lead, details] = result.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(lead, completion.summary_human);
+  assert.ok(details.startsWith('- fix(dispatch): normalize completion delivery so summary_human wins'), details);
+  assert.ok(details.endsWith('- Checks: tests passed; pushed deadbee.'), details);
 });
 
 test('known limitation: the fragment lead uses only the first two fragments', () => {

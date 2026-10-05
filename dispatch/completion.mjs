@@ -19,6 +19,10 @@ const STACK_TRACE_LINE_RE = /^\s*at\s+\S+/;
 const TECHNICAL_COMMIT_PREFIX_RE = /^(?:fix|feat|feature|chore|refactor|perf|docs|test|tests|build|ci|style|revert|hotfix)(?:\([^)]+\))?!?:\s*/i;
 const FILE_CONTEXT_PREFIX_RE = /^(?:(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)):\s*/i;
 const CODEISH_MARKER_RE = /(?:`[^`]+`|--[a-z0-9-]+|\b[A-Z_]{3,}\b|\b[a-z0-9_]+\(\)|\b[a-z]+[A-Z][A-Za-z0-9_]+\b|\b(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\b|\b[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md|py|sh|sql|ya?ml|toml)\b)/;
+// A clause that reports a check or a status on the change instead of stating
+// it ("verified in Safari", "not pushed yet", "still needs review"). The
+// humanizer never leads with one; the checks line carries tests and pushes.
+const LEAD_CAVEAT_RE = /^(?:not|never|still|pending|untested|unverified|verified|tested|checked|confirmed|validated|pushed|committed)\b/i;
 const HUMAN_CUE_RE = /\b(?:now|so that|so\b|because|this\b|future runs?|expect|easier|readable|reliable|cleaner|people|users?|operators?|chat|helps?|lets?|allows?|prevents?|stops?|keeps?|avoids?)\b/i;
 const TECHNICAL_KEYWORDS = [
   'api', 'artifact', 'assert', 'build', 'checklist', 'cli', 'commit', 'completion', 'config', 'context',
@@ -755,16 +759,16 @@ function toPastTenseFragment(fragment) {
   return text ? upperFirst(text) : null;
 }
 
+// The clauses of a technical summary, each as written (clause) and cleaned
+// for a lead (text).
 function extractTechnicalFragments(text) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return [];
 
-  const fragments = prepareLines(normalized)
+  return prepareLines(normalized)
     .flatMap(line => line.split(/\s*;\s*|\s+\|\s+|\s+&&\s+|\s+->\s+|\s+=>\s+/))
-    .map(fragment => fragment.trim())
-    .filter(Boolean);
-
-  return fragments.map(cleanTechnicalFragment).filter(Boolean);
+    .map(clause => ({ clause: clause.trim(), text: cleanTechnicalFragment(clause) }))
+    .filter(fragment => fragment.text);
 }
 
 function isPlainEnglishLeadText(text) {
@@ -795,40 +799,50 @@ function completionUsesHumanizedLead(completion) {
   return getCompletionSummaryStyle(completion) === 'humanized';
 }
 
-// The humanized lead for a technical summary is the real condensed content:
-// fragment-based leads when plain-English fragments exist, otherwise the
-// summarized text itself. Generic themed filler ("The requested fix is in
-// place.", "That should make the workflow more reliable.", ...) is no longer
-// emitted; the legacy follow-up sentences above are only recognized, never
-// produced.
+// The humanized lead for a technical summary is its own content, never
+// generic filler: the first one or two plain-English clauses; else the
+// summary condensed as written, when that reads as plain English; else the
+// first later clause the agent wrote in plain words that states the change
+// rather than a check or a status on it (LEAD_CAVEAT_RE); else the first
+// sentence of the first clause, past its commit or file prefix. A single
+// statement with no such prefix stays as written. Like every other lead it is
+// one chat message at most.
+// The first two rules make the leads #72 (0a135cf) stored without a rewrite
+// record, which isLossyHumanizedLead recognizes by rebuilding them exactly, so
+// they keep their output, including cleaning each clause twice (the cleaned
+// text goes through toPastTenseFragment, which cleans it again and turns
+// "watcher" into "completion completion watcher"). The later rules clean the
+// clause as written once.
 function buildHumanizedTechnicalSummary(rawText, fallbackSummary) {
   const cleanedRaw = normalizeCompletionText(rawText);
   const fallback = normalizeCompletionText(fallbackSummary);
   if (!cleanedRaw) return fallback;
 
   const fragments = extractTechnicalFragments(cleanedRaw);
-  const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment));
+  const primaryFragments = fragments.filter(fragment => !isTestOrValidationFragment(fragment.text));
   const sourceFragments = primaryFragments.length > 0 ? primaryFragments : fragments;
+  const plainLead = (text) => {
+    const rewritten = toPastTenseFragment(text);
+    return rewritten && isPlainEnglishLeadText(rewritten) ? rewritten : null;
+  };
 
-  // Fragment-based lead: the first two plain-English fragments. The selection
-  // must stay stable -- the machine-derivative gate in isLossyHumanizedLead
-  // reproduces the stored lead verbatim from the report, so changing which
-  // fragments are picked would change the stored lead for every such payload.
-  // (A plain-English clause that only appears past the first two fragments is
-  // a known limitation; the fallback below still delivers real content.) The
-  // fragment lead is a user-facing notification, so keep it within the
-  // delivery-length cap (a single long clause with no delimiter is otherwise
-  // unbounded).
-  const chosen = sourceFragments
-    .slice(0, 2)
-    .map(fragment => toPastTenseFragment(fragment))
-    .filter(Boolean)
-    .filter(fragment => isPlainEnglishLeadText(fragment));
-
-  if (chosen.length === 1) return truncateText(asSentence(chosen[0]), MAX_DELIVERY_CHARS);
-  if (chosen.length >= 2) return truncateText(`${chosen[0]} and ${lowerFirst(chosen[1])}.`, MAX_DELIVERY_CHARS);
-  if (fallback && isPlainEnglishLeadText(fallback)) return asSentence(fallback);
-  return fallback || null;
+  const chosen = sourceFragments.slice(0, 2).map(fragment => plainLead(fragment.text)).filter(Boolean);
+  let lead = null;
+  if (chosen.length === 1) lead = asSentence(chosen[0]);
+  else if (chosen.length >= 2) lead = `${chosen[0]} and ${lowerFirst(chosen[1])}.`;
+  else if (fallback && isPlainEnglishLeadText(fallback)) lead = asSentence(fallback);
+  else {
+    const later = sourceFragments.slice(2)
+      .filter(fragment => !CODEISH_MARKER_RE.test(fragment.clause) && !LEAD_CAVEAT_RE.test(fragment.text))
+      .map(fragment => plainLead(fragment.clause))
+      .find(Boolean);
+    if (later) lead = asSentence(later);
+  }
+  if (!lead && sourceFragments.length > 0
+    && (sourceFragments.length > 1 || TECHNICAL_COMMIT_PREFIX_RE.test(cleanedRaw) || FILE_CONTEXT_PREFIX_RE.test(cleanedRaw))) {
+    lead = asSentence(splitSentences(toPastTenseFragment(sourceFragments[0].clause))[0]);
+  }
+  return truncateText(lead || fallback, MAX_DELIVERY_CHARS);
 }
 
 // humanizeCompletionText, plus whether its text is a technical rewrite: a
