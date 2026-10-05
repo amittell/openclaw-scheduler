@@ -49,6 +49,10 @@ const FINAL_REPORT_CUE_RE = /\b(?:root cause|files? changed|tests? run|validatio
 // leaves 200 for the "✅ [label] done" header. Longer text is a dump, not a
 // chat report.
 const MAX_VERBATIM_REPORT_BYTES = 3400;
+// The shortest detail line worth sending once it is cut to the bytes left in
+// a delivery: about ten English words or twenty CJK characters. Below it the
+// line is dropped rather than sent as a stub.
+const MIN_DETAIL_LINE_BYTES = 60;
 // Any one of these marks machine output: a JSON or Python dict key, a JS stack
 // frame, a Python traceback header or a Go goroutine dump.
 const MACHINE_OUTPUT_MARKER_RE = /[{,]\s*["'][^"'\n]{1,80}["']\s*:|^\s*at\s+\S.*:\d+(?::\d+)?\)?\s*$|^Traceback \(most recent call last\):|^goroutine \d+ \[/m;
@@ -285,7 +289,27 @@ function truncateText(text, maxChars = MAX_DELIVERY_CHARS) {
   const normalized = normalizeCompletionText(text);
   if (!normalized) return null;
   if (normalized.length <= maxChars) return normalized;
-  return normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd() + '…';
+  // Never end on the first half of a surrogate pair.
+  const cut = normalized.slice(0, Math.max(0, maxChars - 1)).replace(/[\uD800-\uDBFF]$/, '');
+  return cut.trimEnd() + '…';
+}
+
+// text cut to at most maxBytes UTF-8 bytes, "…" included, at a code point
+// boundary (for...of never splits a surrogate pair); null when what is left
+// is under MIN_DETAIL_LINE_BYTES.
+function truncateTextToBytes(text, maxBytes) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const room = maxBytes - Buffer.byteLength('…', 'utf8');
+  let kept = '';
+  let used = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (used + size > room) break;
+    kept += char;
+    used += size;
+  }
+  kept = kept.trimEnd();
+  return Buffer.byteLength(kept, 'utf8') >= MIN_DETAIL_LINE_BYTES ? `${kept}…` : null;
 }
 
 function splitSentences(text) {
@@ -991,6 +1015,8 @@ function buildTechnicalDetailsText({
     parts.push([checklistDetails]);
   }
 
+  // Each detail line, whole or cut at 260/220 chars, and whether it may be
+  // cut further: every line but the checks line, which carries the sha.
   const detailLines = (cut) => {
     const unique = [];
     const seen = new Set();
@@ -1001,16 +1027,37 @@ function buildTechnicalDetailsText({
       const key = normalized.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
-      unique.push(normalized);
+      unique.push({ line: normalized, cuttable: Boolean(maxChars) });
     }
     return unique;
   };
+  const composedBytes = (entries) => Buffer.byteLength(
+    composeDeliveryText(summaryText, entries.map(entry => entry.line), { leadCut }) ?? '',
+    'utf8',
+  );
 
-  // Whole detail lines while the delivery fits one message, the bound a
-  // promoted report has. Machine output stays cut, as it is never promoted.
+  // The bound is the one a promoted report has, on the composed body; the
+  // outbox's "✅ [label] done" header is outside it. Whole detail lines while
+  // the body fits, except machine output, which stays cut as it is never
+  // promoted.
   const whole = detailLines(false);
-  const wholeBytes = Buffer.byteLength(composeDeliveryText(summaryText, whole, { leadCut }) ?? '', 'utf8');
-  return wholeBytes <= MAX_VERBATIM_REPORT_BYTES ? whole : detailLines(true);
+  if (composedBytes(whole) <= MAX_VERBATIM_REPORT_BYTES) return whole.map(entry => entry.line);
+  // Past it, the 260/220-char cuts, then each cuttable line from the last cut
+  // to the bytes still over, or dropped when that leaves a stub. A lead that is
+  // over the bound on its own keeps the char cuts: no detail line causes it.
+  const lines = detailLines(true);
+  if (composedBytes(lines.filter(entry => !entry.cuttable)) > MAX_VERBATIM_REPORT_BYTES) {
+    return lines.map(entry => entry.line);
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const over = composedBytes(lines) - MAX_VERBATIM_REPORT_BYTES;
+    if (over <= 0) break;
+    if (!lines[i].cuttable) continue;
+    const line = truncateTextToBytes(lines[i].line, Buffer.byteLength(lines[i].line, 'utf8') - over);
+    if (line) lines[i] = { ...lines[i], line };
+    else lines.splice(i, 1);
+  }
+  return lines.map(entry => entry.line);
 }
 
 function composeDeliveryText(summaryText, technicalDetailsText = null, { leadCut = false } = {}) {

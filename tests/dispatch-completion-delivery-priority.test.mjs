@@ -700,6 +700,49 @@ test('the details are cut once the whole delivery passes 3,400 UTF-8 bytes, the 
   assert.equal(details, `- ${overBound.slice(0, 219).trimEnd()}…\n- Checks: tests passed; pushed deadbee.`);
 });
 
+test('past 3,400 bytes the cut detail lines shrink to the bytes left, and the checks line stays', () => {
+  const roundTrips = (text) => Buffer.from(text, 'utf8').toString('utf8') === text;
+  const checks = { checklist: PUSHED_CHECKLIST, sha: SHA };
+  // CJK is 3 bytes a char, so the 260/220-char cuts left 3,580 bytes.
+  const zh = '导入任务读取导出文件中的每一行数据并写入本地存储';
+  const cjk = (n) => zh.repeat(Math.ceil(n / zh.length)).slice(0, n);
+  const lastReply = `fix(import): ${cjk(900)}; ${cjk(400)}; bump RETRY_LIMIT`;
+  const result = resolveCompletionDelivery({ lastReply, completion: { details_technical: `Technical details: ${cjk(500)}`, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(result.source, 'lastReply');
+  assert.equal(Buffer.byteLength(result.deliveryText), MAX_VERBATIM_BYTES);
+  assert.ok(roundTrips(result.deliveryText));
+  const lines = result.deliveryText.split('\n');
+  assert.ok(lines.at(-2).endsWith('…') && Buffer.byteLength(lines.at(-2)) < 660, Buffer.byteLength(lines.at(-2)));
+  assert.equal(lines.at(-1), '- Checks: tests passed; pushed deadbee.');
+
+  // A line that would be cut below 60 bytes is dropped, not sent as a stub.
+  const reportOf = (bytes) => {
+    const head = ['Root cause: the export window closed before the feed finished.', '', 'Files changed:', '- jobs/export.yaml', '', 'Validation: re-ran the import twice and both runs finished with no skipped rows.', '', 'Notes:'].join('\n');
+    let notes = '';
+    while (Buffer.byteLength(`${head}\n${notes}`) < bytes) notes += 'checked the counts again and they matched. ';
+    return `${head}\n${notes}`.slice(0, bytes).trimEnd();
+  };
+  const details = `Technical details: ${'moved EXPORT_WINDOW_START from 02:10 to 02:50 in jobs/export.yaml and raised retry_limit to 3 for the invoice step; '.repeat(3)}`;
+  const report = reportOf(3300);
+  const dropped = resolveCompletionDelivery({ lastReply: report, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  assert.equal(dropped.deliveryText, `${report}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+
+  // A report over the bound on its own keeps the char cuts: no detail line causes it.
+  const long = reportOf(3600);
+  const over = resolveCompletionDelivery({ lastReply: long, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
+  const [, overDetails] = over.deliveryText.split('\n\nTechnical details:\n');
+  assert.equal(overDetails.split('\n').length, 2, overDetails);
+  assert.ok(overDetails.split('\n')[0].endsWith('…'));
+
+  // A cut never ends on half of a surrogate pair.
+  const emoji = '🙂'.repeat(1000);
+  const split = resolveCompletionDelivery({ lastReply: `fix(import): route batch 1 through the import queue; ${emoji}; bump RETRY_LIMIT`, completion: { details_technical: `Technical details: ${emoji}`, ...checks }, fallbackSummary: 'completed' });
+  assert.ok(roundTrips(split.deliveryText), 'a lone surrogate does not survive UTF-8');
+  const emojiTail = { details_technical: `Technical details: ${cjk(42)}${'🙂'.repeat(200)}`, ...checks };
+  const byteCut = resolveCompletionDelivery({ lastReply, completion: emojiTail, fallbackSummary: 'completed' });
+  assert.ok(Buffer.byteLength(byteCut.deliveryText) <= MAX_VERBATIM_BYTES && roundTrips(byteCut.deliveryText), Buffer.byteLength(byteCut.deliveryText));
+});
+
 test('a lead cut from a detail line kept whole goes out once, as that line', () => {
   // One 1,627-char clause: the lead is its first 700 chars, cut with "…", and
   // the whole clause fits as the detail. It went out as both (2,350 chars).
