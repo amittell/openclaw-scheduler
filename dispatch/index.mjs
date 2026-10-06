@@ -25,6 +25,8 @@
  *   1  -- stuck runs found, or hard error
  *   2  -- argument error
  *   3  -- OpenClaw refused a Gateway turn from an agent shell (ATTRIBUTED_SPAWN_REQUIRED)
+ *   4  -- refused: the label already holds a live in-flight run (IN_FLIGHT_REFUSED;
+ *          re-run with --force-retry to take over explicitly)
  *
  * Usage: openclaw-scheduler <subcommand> [options]
  */
@@ -529,6 +531,149 @@ const EXIT_ATTRIBUTED_SPAWN_REQUIRED = 3;
 const AWAITING_SPAWN = 'awaiting-spawn';
 // The requesting agent calls its tool and adopt within seconds of enqueue.
 const AWAITING_SPAWN_STALE_MS = 15 * 60 * 1000;
+
+// -- In-flight guard --------------------------------------------------------
+// Two processes must never start two live sessions on the same label (the
+// 2026-10-05 double-dispatch race: an unconditional setLabel in both enqueue
+// routes let a second fresh spawn clobber a live row). A fresh enqueue is
+// therefore refused while the label's row still holds an in-flight run: a
+// status in {"", running, queued, awaiting-spawn, unknown} that is FRESH --
+// lastPing within 3 min (matching the watcher's FLAT_WINDOW_MS), or, for rows
+// that predate a heartbeat, the spawn anchor (spawnedAt/updatedAt) within 3
+// min; awaiting-spawn rows are fresh until 15 min old (AWAITING_SPAWN_STALE_MS).
+// Stale or wedged rows are NOT refused: takeover is how a dead run recovers.
+// The designed recovery paths (interrupted redispatch, 529 retry, gateway-
+// restart respawn) take over explicitly with --force-retry.
+const INFLIGHT_STATUSES = new Set(['', 'running', 'queued', 'awaiting-spawn', 'unknown']);
+const INFLIGHT_FRESH_MS = 3 * 60 * 1000;
+const EXIT_IN_FLIGHT_REFUSED = 4;
+
+class InFlightRefusal extends Error {
+  constructor(payload) {
+    super(`enqueue refused: label ${JSON.stringify(payload.label)} has an in-flight run`);
+    this.name = 'InFlightRefusal';
+    this.payload = payload;
+  }
+}
+
+/**
+ * In-flight guard decision: does `entry` hold a live run that a fresh session
+ * must not duplicate? Returns a machine-parseable refusal payload, or null
+ * when the row may be taken over (missing, terminal, or stale/wedged).
+ */
+function inflightGuardCheck(label, entry, nowMs = Date.now()) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const status = entry.status == null ? '' : String(entry.status);
+  if (!INFLIGHT_STATUSES.has(status)) return null;
+
+  const sessionKey = typeof entry.sessionKey === 'string' && entry.sessionKey ? entry.sessionKey : null;
+  const lastPingAt = toTimestampMs(entry.lastPing);
+  const lastPingAgeSeconds = lastPingAt == null ? null : Math.round((nowMs - lastPingAt) / 1000);
+  let ageMs;
+  if (status === AWAITING_SPAWN) {
+    // A prepared tool spawn carries no sessionKey yet; the run's age is its
+    // preparedAt (written by prepareAttributedSpawn on every record).
+    const startedAt = toTimestampMs(entry.preparedAt ?? entry.updatedAt);
+    ageMs = startedAt == null ? 0 : Math.max(0, nowMs - startedAt);
+    if (ageMs >= AWAITING_SPAWN_STALE_MS) return null;
+  } else {
+    // An in-flight status without a sessionKey is a wedged or mid-write row,
+    // not a live run: take it over.
+    if (!sessionKey) return null;
+    if (lastPingAt != null) {
+      ageMs = Math.max(0, nowMs - lastPingAt);
+      if (ageMs >= INFLIGHT_FRESH_MS) return null;
+    } else {
+      // No heartbeat yet (fresh gateway spawn, watcher not pinging): anchor
+      // on the row's own timestamps. A row with no usable anchor at all is
+      // treated as fresh (protect rather than double-spawn).
+      const anchorAt = toTimestampMs(entry.spawnedAt ?? entry.updatedAt);
+      ageMs = anchorAt == null ? 0 : Math.max(0, nowMs - anchorAt);
+      if (anchorAt != null && ageMs >= INFLIGHT_FRESH_MS) return null;
+    }
+  }
+  return {
+    ok: false,
+    refused: 'in-flight',
+    label,
+    existing: {
+      status,
+      sessionKey,
+      ageSeconds: Math.round(ageMs / 1000),
+      lastPingAgeSeconds,
+    },
+    message: `Refused: label "${label}" already holds an in-flight run (status=${JSON.stringify(status)}, session=${JSON.stringify(sessionKey)}, ${Math.round(ageMs / 1000)}s old${lastPingAt != null ? `, last ping ${lastPingAgeSeconds}s ago` : ''}). ` +
+      'Starting a second fresh session on the same label is not allowed. Wait for the in-flight run to settle ' +
+      `(${BRAND} status --label "${label}"), or take over explicitly with --force-retry (the designed recovery path).`,
+  };
+}
+
+/** Machine-parseable refusal on stdout + human remedy on stderr, exit 4. */
+function emitInFlightRefusal(payload) {
+  out(payload);
+  process.stderr.write(`[${BRAND}] ${payload.message}\n`);
+  process.exit(EXIT_IN_FLIGHT_REFUSED);
+}
+
+/**
+ * Gateway route: reserve a fresh spawn on the label BEFORE the gateway call.
+ * The ~15s window between a ledger check and the gateway spawn is where a
+ * second process would slip in, so the claim runs under the labels lock and
+ * re-reads the row after acquisition. The claim row (status running, the new
+ * sessionKey, no runId yet) is overwritten by the successful spawn's
+ * setLabel, which always records a runId.
+ */
+function claimFreshSpawn(label, { sessionKey, agent, forceRetry }) {
+  const claimedAt = new Date().toISOString();
+  mutateLabels((labels) => {
+    const refusal = inflightGuardCheck(label, labels[label]);
+    if (refusal && !forceRetry) throw new InFlightRefusal(refusal);
+    const data = {
+      ...clearedHandoffRunState(),
+      sessionKey,
+      agent,
+      mode:       'fresh',
+      status:     'running',
+      spawnedAt:  claimedAt,
+      runId:      null,
+      claimedAt,
+      lastPing:   null,
+      summary:    null,
+      error:      null,
+      completion: null,
+      completionDeliveredAt: null,
+      ...(forceRetry ? { forcedRetryAt: claimedAt } : {}),
+    };
+    const updated = { ...labels[label], ...data, updatedAt: claimedAt };
+    assertValidLabelSessionMetadata(label, updated);
+    labels[label] = updated;
+    return updated;
+  });
+  return { claimedAt, sessionKey };
+}
+
+/**
+ * Roll back a failed fresh-spawn claim: the gateway call never started a run
+ * (or its refusal is unambiguous), so the half-claim must not wedge the label
+ * for 3 minutes. Only the exact claim this process wrote is released; a row
+ * that already carries a runId (spawn succeeded) or was replaced by another
+ * writer is left untouched.
+ */
+function releaseFreshSpawnClaim(label, claim) {
+  if (!claim) return;
+  try {
+    mutateLabels((labels) => {
+      const entry = labels[label];
+      if (!entry || entry.sessionKey !== claim.sessionKey || entry.claimedAt !== claim.claimedAt || entry.runId != null) {
+        return false;
+      }
+      delete labels[label];
+      return true;
+    });
+  } catch (err) {
+    process.stderr.write(`[${BRAND}] claim rollback for "${label}" failed (row left in place): ${err.message}\n`);
+  }
+}
 
 /**
  * Per-run facts of the agent-shell handoff. Every new run of a label, through
@@ -1998,6 +2143,7 @@ function prepareAttributedSpawn({
   idleThresholdSeconds,
   monitor,
   requestedModel,
+  forceRetry,
 }) {
   // sessions_spawn carries model and thinking for a new child; sessions_send
   // has neither, so a continuation applies explicitly requested overrides to
@@ -2039,44 +2185,61 @@ function prepareAttributedSpawn({
     taskFile = writeSpawnTaskFile(taskMessage);
     // Clear per-run facts a previous use of this label left behind: a stale
     // completion or delivery receipt would satisfy the new run's watcher.
-    setLabel(label, {
-      ...clearedHandoffRunState(),
-      sessionKey: isFresh ? null : sessionKey,
-      ...(isFresh ? { sessionId: null } : {}),
-      runId:          null,
-      agent,
-      mode:           isFresh ? 'fresh' : 'reuse',
-      model:          model || null,
-      thinking,
-      origin:         origin || null,
-      sourceContext:  sourceContext || null,
-      deliverTo:      deliverTo || null,
-      deliverChannel: deliverChannel || null,
-      deliveryMode:   deliverMode || null,
-      deliveryDisabled,
-      deliveryDisabledReason,
-      verifyCmd:      verifyCmd || null,
-      spawnVia:       tool,
-      preparedAt:     new Date().toISOString(),
-      preparedRunId,
-      completionScope,
-      spawnedAt:      null,
-      timeoutSeconds: timeoutS,
-      gatewayTimeoutSeconds: gatewayTimeoutS,
-      idleThresholdSeconds,
-      timeout:        timeoutS,
-      monitor,
-      status:         AWAITING_SPAWN,
-      summary:        null,
-      error:          null,
-      completion:     null,
-      completionDeliveredAt: null,
-      lastPing:       null,
-      taskPrompt:     message.slice(0, 2000),
-      taskFile:       taskFile.path,
-      taskSha256:     taskFile.sha256,
+    // Tool route of the in-flight guard: the refusal check and the row write
+    // run in ONE ledger transaction (withLabelsLock serializes processes), so
+    // two concurrent fresh enqueues cannot both prepare an awaiting-spawn row
+    // for the same label. Reuse continues the row's own session (sessions_send)
+    // and is left unchanged in v1.
+    mutateLabels((labels) => {
+      if (isFresh) {
+        const refusal = inflightGuardCheck(label, labels[label]);
+        if (refusal && !forceRetry) throw new InFlightRefusal(refusal);
+      }
+      const data = {
+        ...clearedHandoffRunState(),
+        sessionKey: isFresh ? null : sessionKey,
+        ...(isFresh ? { sessionId: null } : {}),
+        runId:          null,
+        agent,
+        mode:           isFresh ? 'fresh' : 'reuse',
+        model:          model || null,
+        thinking,
+        origin:         origin || null,
+        sourceContext:  sourceContext || null,
+        deliverTo:      deliverTo || null,
+        deliverChannel: deliverChannel || null,
+        deliveryMode:   deliverMode || null,
+        deliveryDisabled,
+        deliveryDisabledReason,
+        verifyCmd:      verifyCmd || null,
+        spawnVia:       tool,
+        preparedAt:     new Date().toISOString(),
+        preparedRunId,
+        completionScope,
+        spawnedAt:      null,
+        timeoutSeconds: timeoutS,
+        gatewayTimeoutSeconds: gatewayTimeoutS,
+        idleThresholdSeconds,
+        timeout:        timeoutS,
+        monitor,
+        status:         AWAITING_SPAWN,
+        summary:        null,
+        error:          null,
+        completion:     null,
+        completionDeliveredAt: null,
+        lastPing:       null,
+        taskPrompt:     message.slice(0, 2000),
+        taskFile:       taskFile.path,
+        taskSha256:     taskFile.sha256,
+        ...(isFresh && forceRetry ? { forcedRetryAt: new Date().toISOString() } : {}),
+      };
+      const updated = { ...labels[label], ...data, updatedAt: new Date().toISOString() };
+      assertValidLabelSessionMetadata(label, updated);
+      labels[label] = updated;
+      return updated;
     });
   } catch (err) {
+    if (err instanceof InFlightRefusal) emitInFlightRefusal(err.payload);
     die(`could not record ${AWAITING_SPAWN} label: ${err.message}`);
   }
 
@@ -2143,6 +2306,11 @@ function prepareAttributedSpawn({
  *   --mode <fresh|reuse>
  *       fresh  -- always spawn new session (default)
  *       reuse  -- look up prior session_key for this label, send into it
+ *   --force-retry        Explicit takeover of a label that still holds a live in-flight
+ *                        run. Without it, a fresh enqueue on such a label is refused
+ *                        (exit 4, machine-parseable JSON on stdout). Stale rows (no
+ *                        heartbeat for 3 min, or awaiting-spawn over 15 min) are taken
+ *                        over without the flag. Reuse mode is unchanged (v1 caveat).
  *   --session-key <key>      Explicit session key override
  *   --model <string>         Model override (e.g. anthropic/claude-sonnet-4-6)
  *   --spawn-via <route>      auto|gateway|tool (default: auto). auto uses tool in an
@@ -2265,6 +2433,15 @@ async function cmdEnqueue(flags) {
   // -- Verify command flag -----------------------------------
   const verifyCmd       = flags['verify-cmd'] || null;
 
+  // -- In-flight guard ----------------------------------------
+  // A fresh enqueue would start a SECOND live session on a label that still
+  // holds a live run (the 2026-10-05 double-dispatch race). --force-retry is
+  // the explicit takeover the designed recovery paths (interrupted redispatch,
+  // 529 retry, gateway-restart respawn) pass; it also stamps the row with
+  // forcedRetryAt. Reuse mode continues the row's own session and is not
+  // guarded in v1 (documented caveat).
+  const forceRetry      = !!flags['force-retry'];
+
   // -- Watchdog monitoring flags -----------------------------
   const noMonitorRaw    = flags['no-monitor'];
   const noMonitorReason = typeof noMonitorRaw === 'string' && noMonitorRaw.trim()
@@ -2357,6 +2534,7 @@ async function cmdEnqueue(flags) {
       idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
       monitor,
       requestedModel: flags.model || null,
+      forceRetry,
     });
     return;
   }
@@ -2368,6 +2546,25 @@ async function cmdEnqueue(flags) {
   // runtime. Current sessions.patch intentionally rejects spawnDepth.
   if (isFresh) {
     patchSessionOverrides(sessionKey, { model, thinking });
+  }
+
+  // -- In-flight guard, gateway route: claim the label BEFORE the gateway call
+  // The gateway agent call takes up to ~15s; a check-then-act ledger read
+  // around it would let a second fresh enqueue slip in mid-call. The claim
+  // reserves the label under the labels mutex (re-reading the row after lock
+  // acquisition, exactly like every other writer) and is released again when
+  // the spawn provably did not start. It runs AFTER patchSessionOverrides so
+  // a rejected model (which dies before any session exists) leaves no row;
+  // the tool route already returned above and enforces the same guard
+  // atomically inside prepareAttributedSpawn's single ledger transaction.
+  let spawnClaim = null;
+  if (isFresh) {
+    try {
+      spawnClaim = claimFreshSpawn(label, { sessionKey, agent, forceRetry });
+    } catch (err) {
+      if (err instanceof InFlightRefusal) emitInFlightRefusal(err.payload);
+      throw err;
+    }
   }
 
   const taskMessage = buildDispatchTaskMessage({ label, message, deliverTo, deliverChannel, origin });
@@ -2396,17 +2593,31 @@ async function cmdEnqueue(flags) {
     }, { timeout: 15000 });
   } catch (err) {
     // An explicit --spawn-via gateway from an agent shell lands here on
-    // OpenClaw 2026.9.6+. Nothing has been recorded for this label yet.
+    // OpenClaw 2026.9.6+. That refusal is certain: the CLI refused locally
+    // before the gateway accepted anything, so the reserved claim row (which
+    // names a session that will never exist) must not wedge the label --
+    // release it.
     if (isAttributionRefusal(err)) {
+      releaseFreshSpawnClaim(label, spawnClaim);
       failAttributedSpawnRequired({ method: 'agent', routeFlag: '--spawn-via', error: err });
     }
+    // Any other gateway failure is uncertain: the spawn may have been
+    // accepted before the error surfaced (network/timeout). The claim row
+    // then records a possibly-live session (status running + sessionKey),
+    // which is exactly the mapping status/done need. It is NOT deleted here;
+    // without a live heartbeat it stops being "fresh" after 3 minutes and a
+    // new enqueue may take the label over.
+    process.stderr.write(
+      `[${BRAND}] gateway spawn failed for "${label}" (claim row kept, session may still be live): ${err.message}\n`,
+    );
     die(`gateway agent call failed: ${err.message}`);
   }
 
   try {
     const runId = response?.runId || idem;
 
-    // Update ledger
+    // Update ledger. The claim row already holds this sessionKey; the spawn
+    // runId below is what turns it into a recorded run (runId != null).
     setLabel(label, {
       ...clearedHandoffRunState(),
       sessionKey,
@@ -2425,6 +2636,7 @@ async function cmdEnqueue(flags) {
       verifyCmd:      verifyCmd || null,
       spawnVia:       'gateway',
       spawnedAt:      new Date().toISOString(),
+      claimedAt:      undefined,
       timeoutSeconds: timeoutS,
       gatewayTimeoutSeconds: gatewayTimeoutS,
       idleThresholdSeconds: parseInt(flags['idle-threshold'] || '300', 10),
@@ -2435,7 +2647,9 @@ async function cmdEnqueue(flags) {
       error:          null,
       // Store task prompt for gate checks in done (first 2000 chars)
       taskPrompt:     message.slice(0, 2000),
+      ...(forceRetry ? { forcedRetryAt: new Date().toISOString() } : {}),
     });
+    spawnClaim = null;
 
     await activateDispatchRun({
       label,
@@ -2461,6 +2675,9 @@ async function cmdEnqueue(flags) {
       verb: 'spawned',
     });
   } catch (err) {
+    // The gateway call already succeeded: the run exists and the label must
+    // keep its row (claim or otherwise). Activation/ledger failures are
+    // reported; nothing is rolled back.
     die(`gateway agent call failed: ${err.message}`);
   }
 }
@@ -4019,6 +4236,10 @@ Subcommands:
            [--no-monitor] [--monitor-interval <cron>] [--monitor-timeout <min>]
            [--verify-cmd <shell_cmd>]
            [--spawn-via auto|gateway|tool]
+           [--force-retry]  (explicit takeover of a label with a live in-flight run;
+            without it a fresh enqueue is refused with exit 4 and JSON { refused: "in-flight" };
+            stale rows -- no heartbeat for 3 min, or awaiting-spawn over 15 min -- are taken
+            over without the flag)
            (stdin is auto-read when piped and no explicit message source is set)
            (from an OpenClaw agent exec shell, auto prints a sessions_spawn call for the
             agent to make and records the label as awaiting-spawn; see adopt)

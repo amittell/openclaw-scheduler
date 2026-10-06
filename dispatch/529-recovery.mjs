@@ -165,7 +165,10 @@ function respawnSession(label, entry) {
     return 'send';
   } catch {}
 
-  // Fallback: fresh enqueue
+  // Fallback: fresh enqueue. This spawns a NEW session on a row the 529 path
+  // already classified as failed, so it is the designed takeover and passes
+  // the fresh in-flight guard with --force-retry. The primary `send` route
+  // above reuses the same session and is left unchanged.
   try {
     const args = [
       INDEX_PATH, 'enqueue',
@@ -173,6 +176,7 @@ function respawnSession(label, entry) {
       '--message', continuationMsg,
       '--mode', 'fresh',
       '--spawn-via', 'gateway',
+      '--force-retry',
     ];
     if (entry?.model) args.push('--model', entry.model);
     if (entry?.thinking) args.push('--thinking', entry.thinking);

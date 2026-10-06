@@ -209,6 +209,8 @@ test('(2) tick after backoff: respawn via enqueue --mode reuse with continuation
     assert.equal(flag('--label'), 'int-x');
     assert.equal(flag('--mode'), 'reuse', 'continues the same session');
     assert.equal(flag('--spawn-via'), 'gateway', 'scheduler-originated redispatch never becomes an agent handoff');
+    assert.ok(args.includes('--force-retry'),
+      'redispatch is the designed takeover and must pass --force-retry explicitly');
     assert.match(flag('--message'), /interrupted before completion/i, 'continuation prompt present');
     assert.match(flag('--message'), /do not redo completed steps/i, 'continuation prompt present');
     assert.equal(flag('--model'), 'gpufarm/qwen3.8-27b', 'original model preserved');
