@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.8] -- 2026-10-07
+
+### Fixed
+
+- **`enqueue` refuses a fresh spawn on a label that still has a live run
+  (#77).** Two processes enqueuing the same label each started a fresh
+  session; on 2026-10-05 two sessions ran on one label and worktree for 25+
+  minutes. Both spawn routes now check the label's row first and exit `4`
+  with a `refused: "in-flight"` JSON payload while that row is live: a
+  heartbeat within 3 minutes, a run that never pings within its gateway
+  timeout plus 3 minutes, or an `awaiting-spawn` row under 15 minutes old.
+  Stale rows and first-ever labels are not refused. The Gateway route
+  reserves the label before the `agent` call and records the run only if it
+  still holds that reservation; a definite Gateway rejection or a local
+  refusal restores the row the reservation replaced, and a refused tool-route
+  enqueue leaves no task file behind. `--force-retry` takes over a live row
+  and stamps `forcedRetryAt` on that run only; the interrupted-run respawn,
+  the 529 fresh fallback and the gateway-restart respawn pass it.
+
+- **The enqueue cleanup deletes only its own task files (#77).** When a
+  tool-route enqueue is refused or fails, it removes the task file it wrote.
+  That delete now resolves the path and refuses anything outside
+  `spawn-tasks/` in the dispatch state directory. This resolves CodeQL
+  `js/path-injection` alert #207.
+
 ## [0.6.7] -- 2026-10-05
 
 ### Fixed
