@@ -32,7 +32,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, statSync, openSync, readSync, closeSync, renameSync, mkdirSync, unlinkSync } from 'fs';
-import { dirname, join, resolve as pathResolve } from 'path';
+import { dirname, join, resolve as pathResolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash, randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -2191,6 +2191,16 @@ function writeSpawnTaskFile(taskMessage) {
   return { path, sha256: createHash('sha256').update(taskMessage).digest('hex') };
 }
 
+/** Remove a task file writeSpawnTaskFile made, refusing any path outside spawn-tasks/. */
+function removeSpawnTaskFile(path) {
+  const dir = pathResolve(LABELS_STATE_DIR, 'spawn-tasks');
+  const resolved = pathResolve(path);
+  if (!resolved.startsWith(dir + sep)) {
+    throw new Error(`refusing to remove ${resolved}: it is not inside ${dir}`);
+  }
+  unlinkSync(resolved);
+}
+
 /**
  * Tool route of enqueue: record the label as awaiting-spawn and print the
  * sessions_spawn (or, to continue a session, sessions_send) call for the
@@ -2322,7 +2332,7 @@ function prepareAttributedSpawn({
     // refused or failed enqueue would leave a copy of its prompt behind.
     if (taskFile) {
       try {
-        unlinkSync(taskFile.path);
+        removeSpawnTaskFile(taskFile.path);
       } catch (unlinkErr) {
         process.stderr.write(`[${BRAND}] could not remove unused task file ${taskFile.path}: ${unlinkErr.message}\n`);
       }
