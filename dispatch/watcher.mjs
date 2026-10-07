@@ -660,6 +660,10 @@ function respawnSession(label) {
         '--message', continuationMsg,
         '--mode', 'fresh',
         '--spawn-via', 'gateway',
+        // The 529 retry is the designed takeover of a row the recovery paths
+        // already classified as failed: an explicit --force-retry bypasses the
+        // fresh in-flight guard without wedging behind a half-alive row.
+        '--force-retry',
       ];
       if (entry?.model) enqueueArgs.push('--model', entry.model);
       if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -708,6 +712,9 @@ function respawnAfterGwRestart(label) {
       '--message', continuationMsg,
       '--mode', 'fresh',
       '--spawn-via', 'gateway',
+      // The original session is gone (gateway restart wiped it); this is the
+      // designed takeover and must pass the fresh in-flight guard.
+      '--force-retry',
     ];
     if (entry?.model) enqueueArgs.push('--model', entry.model);
     if (entry?.thinking) enqueueArgs.push('--thinking', entry.thinking);
@@ -1485,6 +1492,11 @@ function respawnInterrupted(label) {
       '--message', continuationMsg,
       '--mode', 'reuse',
       '--spawn-via', 'gateway',
+      // This redispatch only runs after production auto-resolve classified
+      // the session as interrupted (the watcher flips the row back to running
+      // before respawning): it is the designed takeover, so it must pass the
+      // fresh in-flight guard explicitly.
+      '--force-retry',
     ];
     // Carry the original label's agent forward: cmdEnqueue defaults --agent to
     // 'main' and validates the reused sessionKey against that agent, so a label

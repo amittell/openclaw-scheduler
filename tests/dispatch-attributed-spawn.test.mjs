@@ -972,7 +972,10 @@ test('label reuse: after an adopted run, a run that finishes before adopt still 
     seedSession(fixture, CHILD_KEY);
     assert.equal(runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY], AGENT_SHELL).status, 0);
 
-    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    // The finished run's row still reads as in-flight (status running, fresh
+    // timestamps), so a new fresh run on the same label is the explicit
+    // takeover the guard requires --force-retry for.
+    assert.equal(runDispatch(fixture, enqueueArgs(label, ['--force-retry']), AGENT_SHELL).status, 0);
     finishBeforeAdopt(fixture, label);
     const adopted = runDispatch(fixture, ['adopt', '--label', label, '--session-key', CHILD_KEY_2], AGENT_SHELL);
     assert.equal(adopted.status, 0, adopted.stderr || adopted.stdout);
@@ -1023,7 +1026,10 @@ test('label reuse: a tool-route run after a Gateway run arms its own session', (
     assert.equal(runDispatch(fixture, enqueueArgs(label)).status, 0);
     const gatewayKey = readLabels(fixture)[label].sessionKey;
 
-    assert.equal(runDispatch(fixture, enqueueArgs(label), AGENT_SHELL).status, 0);
+    // The Gateway run's row still reads as in-flight (status running, fresh
+    // timestamps), so the new tool-route run is the explicit takeover the
+    // guard requires --force-retry for.
+    assert.equal(runDispatch(fixture, enqueueArgs(label, ['--force-retry']), AGENT_SHELL).status, 0);
     const pending = readLabels(fixture)[label];
     assert.equal(pending.status, 'awaiting-spawn');
     assert.equal(pending.sessionKey, null);
