@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -81,6 +82,21 @@ function buildFixture() {
     'if (method === \'agent\' && sleepMs > 0) {',
     '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);',
     '}',
+    // Failure modes of the `agent` call: OpenClaw's attribution refusal, a
+    // typed INVALID_REQUEST rejection, and an untyped transport failure.
+    "const agentMode = method === 'agent' ? (process.env.STUB_AGENT_MODE || '') : '';",
+    "if (agentMode === 'attribution') {",
+    "  process.stderr.write('Error: refusing this turn because it would lose inter-session attribution\\n');",
+    '  process.exit(1);',
+    '}',
+    "if (agentMode === 'invalid') {",
+    "  process.stdout.write(JSON.stringify({ ok: false, error: { type: 'gateway_request_error', code: 'INVALID_REQUEST', message: 'invalid agent params' } }));",
+    '  process.exit(1);',
+    '}',
+    "if (agentMode === 'uncertain') {",
+    "  process.stderr.write('Error: gateway connection reset\\n');",
+    '  process.exit(1);',
+    '}',
     "process.stdout.write(method === 'agent' ? JSON.stringify({ ok: true, runId: 'run-gw' }) : '{}');",
     '',
   ].join('\n'));
@@ -101,6 +117,7 @@ function envFor(fixture, extra = {}) {
   delete base.OPENCLAW_SHELL;
   delete base.OPENCLAW_SUBAGENT_EXEC;
   delete base.STUB_AGENT_SLEEP_MS;
+  delete base.STUB_AGENT_MODE;
   return {
     ...base,
     HOME: fixture.root,
@@ -360,6 +377,186 @@ test('(g) tool route: an agent-shell fresh enqueue on a live row is refused with
     assert.equal(body.existing.sessionKey, LIVE_KEY);
     assert.deepEqual(readLabels(fixture), { guarded: seeded }, 'the awaiting-spawn transaction wrote nothing');
     assert.equal(readCalls(fixture).filter((call) => call.method === 'agent').length, 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+// -- Review follow-ups (PR #77) ------------------------------------------------
+
+async function waitFor(check, timeoutMs, what) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = check();
+    if (value) return value;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+}
+
+function readClaim(fixture, label) {
+  try {
+    const row = readLabels(fixture)[label];
+    return row && row.claimedAt && row.runId == null && row.sessionKey ? row : null;
+  } catch {
+    return null; // mid-rename read; the next poll sees the settled file
+  }
+}
+
+function spawnTaskFiles(fixture) {
+  const dir = join(fixture.stateDir, 'spawn-tasks');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith('.txt'));
+}
+
+test('(h) a row that never pings stays live for its gateway lifetime, not 3 minutes', () => {
+  const fixture = buildFixture();
+  try {
+    // An unmonitored run (--no-monitor / no delivery target) has no watcher,
+    // so lastPing stays null while the turn is healthy. 5 minutes into a
+    // 600s run it is still live: a plain fresh enqueue must be refused.
+    seedLiveRow(fixture, {
+      lastPing: null,
+      spawnedAt: iso(5 * 60_000),
+      timeoutSeconds: 600,
+      gatewayTimeoutSeconds: 600,
+    });
+    const refused = runDispatch(fixture, enqueueArgs('guarded'));
+    assert.equal(refused.status, 4, refused.stderr || refused.stdout);
+    assert.equal(parseBody(refused, 'refusal').existing.sessionKey, LIVE_KEY);
+
+    // Past its gateway lifetime plus the 3-minute window (600s + 180s), the
+    // gateway has ended the turn: the label can be taken over.
+    seedLiveRow(fixture, {
+      lastPing: null,
+      spawnedAt: iso(14 * 60_000),
+      timeoutSeconds: 600,
+      gatewayTimeoutSeconds: 600,
+    });
+    const taken = runDispatch(fixture, enqueueArgs('guarded'));
+    assert.equal(taken.status, 0, taken.stderr || taken.stdout);
+    assert.notEqual(readLabels(fixture).guarded.sessionKey, LIVE_KEY);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(i) a certain refusal restores the row the claim replaced; a first-ever label is removed', () => {
+  const fixture = buildFixture();
+  try {
+    // --force-retry claims over a live run, then OpenClaw refuses the explicit
+    // Gateway route from an agent shell: the live run's mapping must survive.
+    const seeded = seedLiveRow(fixture);
+    const refused = runDispatch(
+      fixture,
+      enqueueArgs('guarded', ['--force-retry', '--spawn-via', 'gateway']),
+      { ...AGENT_SHELL, STUB_AGENT_MODE: 'attribution' },
+    );
+    assert.equal(refused.status, 3, refused.stderr || refused.stdout);
+    assert.deepEqual(readLabels(fixture), { guarded: seeded }, 'the replaced row is restored as it was');
+
+    writeFileSync(fixture.labelsPath, '{}\n');
+    const fresh = runDispatch(
+      fixture,
+      enqueueArgs('first', ['--spawn-via', 'gateway']),
+      { ...AGENT_SHELL, STUB_AGENT_MODE: 'attribution' },
+    );
+    assert.equal(fresh.status, 3, fresh.stderr || fresh.stdout);
+    assert.deepEqual(readLabels(fixture), {}, 'a first-ever label leaves no claim behind');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(j) a typed INVALID_REQUEST rejection releases the claim; an untyped failure keeps it', () => {
+  const fixture = buildFixture();
+  try {
+    const rejected = runDispatch(fixture, enqueueArgs('typed'), { STUB_AGENT_MODE: 'invalid' });
+    assert.notEqual(rejected.status, 0, 'the enqueue fails');
+    assert.match(rejected.stderr, /no run started/);
+    assert.deepEqual(readLabels(fixture), {}, 'a definite rejection holds no claim');
+
+    const uncertain = runDispatch(fixture, enqueueArgs('typed'), { STUB_AGENT_MODE: 'uncertain' });
+    assert.notEqual(uncertain.status, 0, 'the enqueue fails');
+    const kept = readLabels(fixture).typed;
+    assert.ok(kept, 'an uncertain failure keeps the claim: the session may be live');
+    assert.equal(kept.status, 'running');
+    assert.equal(kept.runId, null);
+    assert.ok(kept.claimedAt);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(k) a spawn whose claim was taken over mid-call does not overwrite the newer run', { timeout: 90_000 }, async () => {
+  const fixture = buildFixture();
+  try {
+    // A holds its gateway call open; B takes the label over with --force-retry
+    // and finishes first. A's late success must leave B's mapping alone.
+    const first = runDispatchAsync(fixture, enqueueArgs('race'), { STUB_AGENT_SLEEP_MS: '4000' });
+    const claimA = await waitFor(() => readClaim(fixture, 'race'), 30_000, "A's claim row");
+    const second = runDispatch(fixture, enqueueArgs('race', ['--force-retry']));
+    assert.equal(second.status, 0, second.stderr || second.stdout);
+    const winner = parseBody(second, 'accept');
+    assert.notEqual(winner.sessionKey, claimA.sessionKey);
+
+    const late = await first;
+    assert.equal(late.status, 1, `the superseded spawn reports failure; stderr=${late.stderr}`);
+    assert.match(late.stderr, /taken over while this spawn was in flight/);
+    const row = readLabels(fixture).race;
+    assert.equal(row.sessionKey, winner.sessionKey, "the label keeps B's session");
+    assert.ok(row.forcedRetryAt, "B's takeover stamp survives");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(l) a claim settled while the spawn was in flight is not reset to running', { timeout: 90_000 }, async () => {
+  const fixture = buildFixture();
+  try {
+    const pending = runDispatchAsync(fixture, enqueueArgs('settle'), { STUB_AGENT_SLEEP_MS: '3000' });
+    const claim = await waitFor(() => readClaim(fixture, 'settle'), 30_000, 'the claim row');
+    // A terminal update (status/done) lands on the claim during the call.
+    writeFileSync(fixture.labelsPath, JSON.stringify({ settle: { ...claim, status: 'done' } }, null, 2));
+
+    const result = await pending;
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(parseBody(result, 'settled').status, 'settled');
+    const row = readLabels(fixture).settle;
+    assert.equal(row.status, 'done', 'the terminal status is kept');
+    assert.equal(row.runId, 'run-gw', 'the run id is still recorded');
+    assert.equal(row.claimedAt, undefined);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(m) a refused tool-route enqueue leaves no task file behind', () => {
+  const fixture = buildFixture();
+  try {
+    seedLiveRow(fixture);
+    const before = spawnTaskFiles(fixture).length;
+    const result = runDispatch(fixture, enqueueArgs('guarded'), AGENT_SHELL);
+    assert.equal(result.status, 4, result.stderr || result.stdout);
+    assert.equal(spawnTaskFiles(fixture).length, before, 'the refused prompt is not retained');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('(n) a non-forced run clears the forcedRetryAt stamp of an earlier forced run', () => {
+  const fixture = buildFixture();
+  try {
+    // A stale row that an earlier --force-retry stamped: the plain takeover
+    // is not a forced retry, so the ledger must not say it was.
+    seedLiveRow(fixture, {
+      lastPing: iso(10 * 60_000),
+      spawnedAt: iso(30 * 60_000),
+      forcedRetryAt: iso(30 * 60_000),
+    });
+    const result = runDispatch(fixture, enqueueArgs('guarded'));
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(readLabels(fixture).guarded.forcedRetryAt, undefined);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
