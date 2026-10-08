@@ -25,6 +25,15 @@ npm test
 npm run lint
 ```
 
+Tests are safe to run on a host with a live OpenClaw Gateway, including
+`node test.js` and `node --test tests/<file>` run directly. Each test entry
+point first imports `tests/isolate-environment.mjs`, which gives the process a
+temporary `HOME` and database, removes inherited `OPENCLAW_*`, `SCHEDULER_*`,
+`DISPATCH_*` and `GIT_*` variables, points the Gateway URL at a closed port,
+and puts a refusing `openclaw` ahead of any installed CLI on `PATH`. A new test
+file must import it first; `tests/test-environment.test.mjs` fails otherwise.
+A fixture that needs the CLI puts its own stub ahead of the guard on `PATH`.
+
 ### Local Verification Gate
 
 Before pushing or opening a PR, run the full local gate:
