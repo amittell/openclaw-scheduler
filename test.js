@@ -63,7 +63,6 @@ import {
   buildTerminalCompletionPayload,
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
-  humanizeCompletionText,
   resolveCompletionDelivery,
 } from './dispatch/completion.mjs';
 import {
