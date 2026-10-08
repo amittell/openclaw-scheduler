@@ -27,7 +27,7 @@ function createFixture() {
  * chooses (typically absent or 0, mirroring a long mid-turn dispatch run),
  * with a bounded transcript tail ending in an assistant message.
  */
-function seedRunningSession(databasePath, { totalTokens, assistantUsage, storeStatus = 'running' }) {
+function seedRunningSession(databasePath, { totalTokens, totalTokensFresh, totalTokensVersion, assistantUsage, storeStatus = 'running' }) {
   const database = new Database(databasePath);
   database.exec(`
     PRAGMA journal_mode = WAL;
@@ -64,6 +64,8 @@ function seedRunningSession(databasePath, { totalTokens, assistantUsage, storeSt
   const now = Date.now();
   const entry = { sessionId: SESSION_ID, thinkingLevel: 'low', status: 'running' };
   if (totalTokens !== undefined) entry.totalTokens = totalTokens;
+  if (totalTokensFresh !== undefined) entry.totalTokensFresh = totalTokensFresh;
+  if (totalTokensVersion !== undefined) entry.totalTokensVersion = totalTokensVersion;
   database.prepare(`
     INSERT INTO session_nodes (
       session_key, current_session_id, entry_json, updated_at, created_at,
@@ -202,17 +204,39 @@ test('tokensEstimate falls back to the usage part sum when the usage object has 
   }
 });
 
-test('status leaves tokens authoritative and skips the estimate when totalTokens is populated', () => {
+test('status leaves tokens authoritative and skips the estimate when totalTokens is fresh', () => {
   const fixture = createFixture();
   try {
     seedRunningSession(fixture.databasePath, {
       totalTokens: 321,
+      totalTokensFresh: true,
+      totalTokensVersion: 1,
       assistantUsage: { input: 1, output: 1, cacheRead: 1, cacheWrite: 0, totalTokens: 999, cost: 0 },
     });
     const status = runStatus(fixture, 'estimate-skipped');
     assert.equal(status.status, 'running');
     assert.equal(status.liveness.tokens, 321);
     assert.equal(status.liveness.tokensEstimate, null);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('stale stored total (totalTokensFresh false) does not suppress the transcript estimate', () => {
+  const fixture = createFixture();
+  try {
+    // Compaction/fork paths retain the prior positive total but mark it stale;
+    // the estimate must fill the gap while tokens still reports the stale total.
+    seedRunningSession(fixture.databasePath, {
+      totalTokens: 321,
+      totalTokensFresh: false,
+      totalTokensVersion: undefined,
+      assistantUsage: { input: 1, output: 1, cacheRead: 1, cacheWrite: 0, totalTokens: 999, cost: 0 },
+    });
+    const status = runStatus(fixture, 'estimate-stale-total');
+    assert.equal(status.status, 'running');
+    assert.equal(status.liveness.tokens, 321);
+    assert.equal(status.liveness.tokensEstimate, 999);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

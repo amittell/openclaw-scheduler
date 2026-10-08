@@ -1053,6 +1053,22 @@ function readTranscriptTokenEstimate(sessionEntry, agent) {
   }
 }
 
+// Matches the gateway's resolveFreshSessionTotalTokens semantics (openclaw
+// src/config/sessions/types.ts): a stored total only counts as current when it
+// is positive, explicitly fresh, and at the current version. A positive total
+// with totalTokensFresh === false (compaction/fork paths) or with the flag
+// absent (legacy store) is stale, so the transcript estimate may fill the gap.
+const SESSION_TOTAL_TOKENS_VERSION = 1;
+function hasFreshStoredTotalTokens(sessionEntry) {
+  return Boolean(
+    sessionEntry
+    && typeof sessionEntry.totalTokens === 'number'
+    && sessionEntry.totalTokens > 0
+    && sessionEntry.totalTokensFresh === true
+    && sessionEntry.totalTokensVersion === SESSION_TOTAL_TOKENS_VERSION,
+  );
+}
+
 /**
  * Auto-detect the originating channel from the most recently active main session.
  * Reads the SQLite-first compatibility store, finds sessions active within the last 10 minutes,
@@ -3347,7 +3363,7 @@ function cmdStatus(flags) {
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
         tokensEstimate:
-          sessionEntry.totalTokens
+          hasFreshStoredTotalTokens(sessionEntry)
             ? null
             : readTranscriptTokenEstimate(sessionEntry, statusAgent),
       };
