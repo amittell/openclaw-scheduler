@@ -2,6 +2,7 @@
 // Scheduler v2 unified test suite -- in-memory, self-contained
 // Covers: schema, cron, jobs, runs, messages, agents, chaining, retry, cancellation
 
+import './tests/isolate-environment.mjs';
 import Database from 'better-sqlite3';
 import { execFileSync, spawn, spawnSync } from 'child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'fs';

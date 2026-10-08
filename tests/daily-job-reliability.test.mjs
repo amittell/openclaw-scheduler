@@ -1,5 +1,6 @@
 // Daily-job reliability: delivery route normalization (Bug A) and
 // transient-LLM retry + failure alerting (Bug B) for isolated agent-turn jobs.
+import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';

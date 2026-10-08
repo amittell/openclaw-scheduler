@@ -1,3 +1,4 @@
+import './isolate-environment.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -325,9 +326,8 @@ test('Retired Gateway session-store API never follows symlinks or touches a sent
     writeFileSync(sentinel, '{}');
     symlinkSync(outside, join(home, '.openclaw', 'agents', 'main'));
 
-    await withRestoredEnv(['HOME', 'OPENCLAW_GATEWAY_URL'], async () => {
+    await withRestoredEnv(['HOME'], async () => {
       process.env.HOME = home;
-      process.env.OPENCLAW_GATEWAY_URL = 'http://127.0.0.1:18789';
       const gateway = await import(`../gateway.js?store-path-security=${Date.now()}`);
       const result = gateway.applySessionOverridesToSessionStore(
         'agent:main:scheduler:test',
@@ -395,7 +395,6 @@ test('dispatch quarantines poisoned legacy labels and never follows their paths'
         HOME: home,
         DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
-        OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -437,7 +436,6 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
         HOME: home,
         DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
-        OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
     });
 
@@ -459,7 +457,6 @@ test('dispatch fails closed on a non-object labels ledger root', () => {
         HOME: home,
         DISPATCH_STATE_DIR: dirname(labelsPath),
         DISPATCH_LABELS_PATH: labelsPath,
-        OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
       },
     });
     assert.notEqual(mutation.status, 0, mutation.stdout);
@@ -488,7 +485,6 @@ test('dispatch does not resolve inherited object properties as label entries', (
           HOME: home,
           DISPATCH_STATE_DIR: dirname(labelsPath),
           DISPATCH_LABELS_PATH: labelsPath,
-          OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
         },
       });
       assert.equal(result.status, 0, result.stderr);
