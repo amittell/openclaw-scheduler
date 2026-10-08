@@ -1295,7 +1295,7 @@ export function buildCompletionSignalInstructions({ label, taskPrompt, doneScrip
   lines.push('Summary format (required):');
   lines.push('  - LEAD with 2-4 plain-English sentences a non-technical reader can follow: what changed, why it matters, and what was verified. Avoid jargon, file paths, and commit SHAs in the lead.');
   lines.push('  - Then, on a new line, add the technical detail (files touched, commits, test counts, hosts, etc.).');
-  lines.push('  - Keep the whole summary under ~3,000 characters so it fits one Telegram message.');
+  lines.push('  - Keep the whole summary under ~3,000 UTF-8 bytes so it fits one Telegram message (the delivery budget is 3,400 bytes); count bytes, not characters -- CJK text is 2-3 bytes per character.');
   lines.push('');
   lines.push('Checklist rules:');
   lines.push('  - work_complete MUST be true -- you are asserting you have finished ALL assigned work');

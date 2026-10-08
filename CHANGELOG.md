@@ -18,7 +18,7 @@ All notable changes to this project will be documented in this file.
   now instructs the agent to LEAD with 2-4 plain-English sentences a
   non-technical reader can follow (what changed, why it matters, what was
   verified), followed by the technical detail on a new line, keeping the whole
-  summary under ~3,000 characters so it fits one Telegram message. This is a
+  summary under ~3,000 UTF-8 bytes (delivery budget 3,400 bytes) so it fits one Telegram message. This is a
   prompt-template fix only: the humanizer's detection and verbatim paths
   (`isLikelyHumanFinalReport`, the 0.6.6 boilerplate-removal behavior, #72) are
   unchanged. Tests cover the new template instruction and confirm both a
