@@ -1292,6 +1292,11 @@ export function buildCompletionSignalInstructions({ label, taskPrompt, doneScrip
   lines.push(`    --checklist '${checklistExample}' \\`);
   lines.push('    [--sha "<git commit SHA if applicable>"]');
   lines.push('');
+  lines.push('Summary format (required):');
+  lines.push('  - LEAD with 2-4 plain-English sentences a non-technical reader can follow: what changed, why it matters, and what was verified. Avoid jargon, file paths, and commit SHAs in the lead.');
+  lines.push('  - Then, on a new line, add the technical detail (files touched, commits, test counts, hosts, etc.).');
+  lines.push('  - Keep the whole summary under ~3,000 characters so it fits one Telegram message.');
+  lines.push('');
   lines.push('Checklist rules:');
   lines.push('  - work_complete MUST be true -- you are asserting you have finished ALL assigned work');
   lines.push('  - Only include tests_passed if validation/testing was actually required for this task');
