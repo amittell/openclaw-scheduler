@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.9] -- 2026-10-08
+
+### Changed
+
+- **Completion signals now require a plain-English lead in `--summary`.**
+  `buildCompletionSignalInstructions()` previously told the child agent to
+  pass `--summary "<human-readable summary of what you actually did>"` with no
+  format instruction, so agents wrote dense technical summaries ("Diagnosed
+  weak base power-model ratings: root cause is NBA PRESEASON...") and the
+  humanizer -- which correctly detects those as technical and delivers them
+  verbatim -- produced notifications with no human-readable lead. The template
+  now instructs the agent to LEAD with 2-4 plain-English sentences a
+  non-technical reader can follow (what changed, why it matters, what was
+  verified), followed by the technical detail on a new line, keeping the whole
+  summary under ~3,000 UTF-8 bytes (delivery budget 3,400 bytes) so it fits one Telegram message. This is a
+  prompt-template fix only: the humanizer's detection and verbatim paths
+  (`isLikelyHumanFinalReport`, the 0.6.6 boilerplate-removal behavior, #72) are
+  unchanged. Tests cover the new template instruction and confirm both a
+  format-following summary and a dense technical summary still deliver their
+  actual content un-rewritten.
+
 ## [0.6.8] -- 2026-10-07
 
 ### Fixed
