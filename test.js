@@ -6898,6 +6898,46 @@ console.log('\n-- Completion payload helpers --');
   assert(alreadyHumanTechnical.deliveryText === 'Updated the completion watcher so structured summaries survive handoff and users now get one clean final report.', 'completion helper: already-human technical summary passes through unchanged');
   assert(!alreadyHumanTechnical.deliveryText.includes('Technical details:'), 'completion helper: already-human technical summary does not grow a technical footer');
 
+  // 0.6.9: prompt-template fix (plain-English lead). We fixed the prompt, not
+  // the humanizer: the delivery path must carry the agent's actual summary
+  // content through un-rewritten -- no boilerplate filler replacing it. The
+  // delivery appends a Checks/Technical-details block, so assert the genuine
+  // summary is preserved verbatim at the head, not exact whole-string equality.
+  const plainEnglishLead = 'The scheduler now tells agents to open their completion summary with a short plain-English lead, so notifications read like a report instead of a log dump.';
+  const plainEnglishLeadSummary = [
+    plainEnglishLead,
+    'This matters because the delivery is the only thing most readers see.',
+    'Verified by running the full test suite on the dev repo and both deployed hosts.',
+    '',
+    'Technical detail: dispatch/completion.mjs buildCompletionSignalInstructions() gained a Summary format section; test.js gained 5 assertions; version bumped 0.6.8 -> 0.6.9; commit 000000000000; 346+ tests green on mac-mini and rh-bot.',
+  ].join('\n');
+  const plainEnglishLeadPayload = buildTerminalCompletionPayload({
+    summary: plainEnglishLeadSummary,
+    checklist: { work_complete: true, tests_passed: true },
+  });
+  const plainEnglishLeadDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: plainEnglishLeadPayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(plainEnglishLeadDelivery.deliveryText.startsWith(plainEnglishLead), 'completion helper: format-following summary leads with the plain-English sentences verbatim');
+  assert(plainEnglishLeadDelivery.deliveryText.includes('Technical detail:'), 'completion helper: format-following summary keeps its technical tail');
+  assert(plainEnglishLeadDelivery.source === 'completion-summary-full', 'completion helper: format-following summary is delivered as the full report, not a humanized lead');
+  assert(!/The requested fix is in place|That should make the workflow more reliable/.test(plainEnglishLeadDelivery.deliveryText), 'completion helper: format-following summary is not replaced by boilerplate filler');
+
+  const denseTechnicalSummary = 'Diagnosed weak base power-model ratings: root cause is NBA PRESEASON games scored by a different process. Patched settle-bet.py to skip preseason rows, reconciled 3 bets, 346 tests green, pushed 000000000000 to main.';
+  const denseTechnicalPayload = buildTerminalCompletionPayload({
+    summary: denseTechnicalSummary,
+    checklist: { work_complete: true, tests_passed: true },
+  });
+  const denseTechnicalDelivery = resolveCompletionDelivery({
+    lastReply: null,
+    completion: denseTechnicalPayload,
+    fallbackSummary: 'completed (agent signal)',
+  });
+  assert(denseTechnicalDelivery.deliveryText.startsWith(denseTechnicalSummary), 'completion helper: dense technical summary still passes through verbatim (prompt fix, not humanizer rewrite)');
+  assert(!/The requested fix is in place|That should make the workflow more reliable/.test(denseTechnicalDelivery.deliveryText), 'completion helper: dense technical summary is not replaced by boilerplate filler');
+
   const observedBadCaseReport = [
     'Implemented root cause fix for chilisaus completion delivery:',
     '',
@@ -7244,6 +7284,12 @@ console.log('\n-- Completion instructions + conservative transcript recovery hel
 
   assert(pushChecklist === '{"work_complete":true,"tests_passed":true,"pushed":true}', 'completion instructions: push-required task example includes tests_passed and pushed');
   assert(pushInstructions.includes('If the required push for this task has not happened yet, you are not done.'), 'completion instructions: push-required task keeps push gate');
+
+  const plainEnglishLeadInstruction = 'LEAD with 2-4 plain-English sentences a non-technical reader can follow';
+  assert(noPushInstructions.includes(plainEnglishLeadInstruction), 'completion instructions: summary format requires a plain-English lead');
+  assert(pushInstructions.includes(plainEnglishLeadInstruction), 'completion instructions: plain-English lead instruction is present for push tasks too');
+  assert(noPushInstructions.includes('what changed, why it matters, and what was verified'), 'completion instructions: lead instruction names the required content (what/why/verified)');
+  assert(noPushInstructions.includes('technical detail'), 'completion instructions: technical detail follows the lead');
 
   const recoveredTerminal = extractTerminalAssistantReplyFromEntries([
     { role: 'user', content: [{ type: 'text', text: 'Do the work' }] },
