@@ -1,3 +1,4 @@
+import './isolate-environment.mjs';
 import assert from 'node:assert/strict';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';

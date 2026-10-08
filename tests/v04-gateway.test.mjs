@@ -1,3 +1,4 @@
+import './isolate-environment.mjs';
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';

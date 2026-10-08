@@ -1,3 +1,4 @@
+import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setDbPath, initDb, closeDb, getDb } from '../db.js';

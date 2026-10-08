@@ -1,9 +1,10 @@
+import './isolate-environment.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { delimiter, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import { createTestEnvironment } from '../scripts/test-environment.mjs';
@@ -160,4 +161,88 @@ test('every test-all phase isolates hook Git selectors and leaves the invoking r
   for (const name of ['outside-home', 'outside-config', 'outside-scheduler', 'outside-state', 'outside-dispatch', 'outside-dispatch-state']) {
     assert.equal(existsSync(join(root, name)), false, `${name} must stay untouched`);
   }
+});
+
+test('every test entry point isolates itself before loading scheduler modules', () => {
+  // `node test.js` and `node --test tests/<file>` bypass test-all.mjs, so each
+  // entry point must apply the isolation itself, ahead of every other import.
+  const entries = [
+    ['test.js', './tests/isolate-environment.mjs'],
+    ...readdirSync(join(sourceRoot, 'tests'))
+      .filter(name => name.endsWith('.test.mjs'))
+      .map(name => [join('tests', name), './isolate-environment.mjs']),
+  ];
+  assert.ok(entries.some(([file]) => file === join('tests', 'test-environment.test.mjs')));
+  for (const [file, specifier] of entries) {
+    const firstImport = readFileSync(join(sourceRoot, file), 'utf8').match(/^import\b.*$/m)?.[0];
+    assert.equal(firstImport, `import '${specifier}';`, file);
+  }
+});
+
+test('a directly started test process cannot reach the invoking Gateway, credentials or database', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'scheduler-test-direct-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const operatorHome = join(root, 'operator');
+  const operatorBin = join(root, 'operator-bin');
+  const cliReceipt = join(root, 'operator-cli-ran');
+  mkdirSync(join(operatorHome, '.openclaw'), { recursive: true });
+  mkdirSync(operatorBin);
+  writeFileSync(join(operatorHome, '.openclaw', 'openclaw.json'), JSON.stringify({
+    gateway: { port: 18789, auth: { token: 'operator-token' } },
+  }));
+  // Stands in for the installed CLI, which would dial ws://127.0.0.1:18789.
+  writeFileSync(join(operatorBin, 'openclaw'), `#!/bin/sh\necho ran >> ${JSON.stringify(cliReceipt)}\n`, { mode: 0o755 });
+  const probe = join(root, 'probe.mjs');
+  writeFileSync(probe, `
+    import ${JSON.stringify(pathToFileURL(join(sourceRoot, 'tests', 'isolate-environment.mjs')).href)};
+    import { spawnSync } from 'node:child_process';
+    const env = process.env;
+    const cli = childEnv => spawnSync('openclaw', ['gateway', 'call', 'health', '--json'], { env: childEnv }).status;
+    process.stdout.write(JSON.stringify({
+      home: env.HOME,
+      db: env.SCHEDULER_DB,
+      url: env.OPENCLAW_GATEWAY_URL,
+      token: env.OPENCLAW_GATEWAY_TOKEN ?? null,
+      stateDir: env.OPENCLAW_STATE_DIR ?? null,
+      inheritedCli: cli(env),
+      // A fixture that rebuilds its environment from PATH alone loses the URL.
+      rebuiltCli: cli({ PATH: env.PATH }),
+    }));
+  `);
+  const invoker = {
+    ...process.env,
+    HOME: operatorHome,
+    PATH: `${operatorBin}${delimiter}${process.env.PATH}`,
+    OPENCLAW_GATEWAY_TOKEN: 'operator-token',
+    OPENCLAW_STATE_DIR: join(operatorHome, '.openclaw'),
+  };
+  delete invoker.OPENCLAW_GATEWAY_URL;
+  const probeWith = env => {
+    const run = spawnSync(process.execPath, [probe], { env, encoding: 'utf8', timeout: 20_000 });
+    assert.equal(run.status, 0, run.stderr);
+    return JSON.parse(run.stdout);
+  };
+
+  const direct = probeWith({ ...invoker, SCHEDULER_DB: join(operatorHome, 'live.db') });
+  assert.notEqual(direct.home, operatorHome);
+  assert.equal(direct.db, join(direct.home, 'scheduler.db'));
+  assert.equal(direct.url, 'http://127.0.0.1:9');
+  assert.equal(direct.token, null);
+  assert.equal(direct.stateDir, null);
+  assert.equal(direct.inheritedCli, 127);
+  assert.equal(direct.rebuiltCli, 127);
+  assert.equal(existsSync(direct.home), false, 'the per-process HOME is removed on exit');
+
+  // The legacy suite's documented `SCHEDULER_DB=:memory: node test.js` keeps its in-memory database.
+  assert.equal(probeWith({ ...invoker, SCHEDULER_DB: ':memory:' }).db, ':memory:');
+
+  // A test file started by test-all.mjs keeps the runner's environment.
+  const runnerHome = join(root, 'runner');
+  const runner = probeWith(createTestEnvironment(runnerHome, { env: invoker, dbPath: ':memory:' }));
+  assert.equal(runner.home, runnerHome);
+  assert.equal(runner.db, ':memory:');
+  assert.equal(runner.token, null);
+  assert.equal(runner.inheritedCli, 127);
+
+  assert.equal(existsSync(cliReceipt), false, 'the invoking openclaw CLI never ran');
 });
