@@ -1018,39 +1018,32 @@ function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
  * authoritative for control decisions (watcher deadline extension / steer),
  * so callers must not mix the estimate into that path.
  *
+ * The tail comes from readJsonlTailEntries, the same validated and
+ * root-contained reader the completion helpers use; a refused or unreadable
+ * transcript yields null rather than failing status.
+ *
  * @param {Object|null} sessionEntry - Session store entry for the tracked session
  * @param {string} agent - Agent id owning the transcript store
  * @returns {number|null} - Estimated live token count, or null when not derivable
  */
 function readTranscriptTokenEstimate(sessionEntry, agent) {
-  if (!sessionEntry || !sessionEntry.sessionId) return null;
-  try {
-    const transcript = readOpenClawTranscriptTail(agent, sessionEntry.sessionId, {
-      env: process.env,
-      homeDir: HOME_DIR,
-      limit: 100,
-    });
-    const entries = projectOpenClawTranscriptEntries(transcript?.events || []);
-    if (!Array.isArray(entries)) return null;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i];
-      if (!entry || entry.role !== 'assistant') continue;
-      const usage = entry.usage;
-      if (!usage || typeof usage !== 'object') continue;
-      if (typeof usage.totalTokens === 'number' && usage.totalTokens > 0) {
-        return Math.round(usage.totalTokens);
-      }
-      const partSum = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
-        .filter((n) => typeof n === 'number' && n > 0)
-        .reduce((a, b) => a + b, 0);
-      if (partSum > 0) return Math.round(partSum);
+  if (!sessionEntry?.sessionId) return null;
+  const entries = readJsonlTailEntries(sessionEntry.sessionId, agent, 100);
+  if (!Array.isArray(entries)) return null;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry || entry.role !== 'assistant') continue;
+    const usage = entry.usage;
+    if (!usage || typeof usage !== 'object') continue;
+    if (typeof usage.totalTokens === 'number' && usage.totalTokens > 0) {
+      return Math.round(usage.totalTokens);
     }
-    return null;
-  } catch {
-    // readOpenClawTranscriptTail validates inputs and can throw; a store entry
-    // can also lack a sessionId. No estimate is better than a crashed status.
-    return null;
+    const partSum = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
+      .filter((n) => typeof n === 'number' && n > 0)
+      .reduce((a, b) => a + b, 0);
+    if (partSum > 0) return Math.round(partSum);
   }
+  return null;
 }
 
 // Matches the gateway's resolveFreshSessionTotalTokens semantics (openclaw
