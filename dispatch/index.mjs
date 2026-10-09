@@ -1005,6 +1005,64 @@ function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
 }
 
 /**
+ * Best-effort transcript-derived token estimate for sessions whose canonical
+ * totalTokens field is not yet populated. The gateway only persists a real
+ * totalTokens at turn completion, and bootstrap writes 0; long dispatch runs
+ * are one long turn (many model calls ending in toolUse), so mid-run the store
+ * entry has no totalTokens even though per-call usage already exists in the
+ * transcript. Scan the newest bounded tail for the most recent assistant
+ * message carrying positive usage and report its totalTokens
+ * (fallback: input + cacheRead + cacheWrite + output).
+ *
+ * Display-only: this backs liveness.tokensEstimate. liveness.tokens stays
+ * authoritative for control decisions (watcher deadline extension / steer),
+ * so callers must not mix the estimate into that path.
+ *
+ * The tail comes from readJsonlTailEntries, the same validated and
+ * root-contained reader the completion helpers use; a refused or unreadable
+ * transcript yields null rather than failing status.
+ *
+ * @param {Object|null} sessionEntry - Session store entry for the tracked session
+ * @param {string} agent - Agent id owning the transcript store
+ * @returns {number|null} - Estimated live token count, or null when not derivable
+ */
+function readTranscriptTokenEstimate(sessionEntry, agent) {
+  if (!sessionEntry?.sessionId) return null;
+  const entries = readJsonlTailEntries(sessionEntry.sessionId, agent, 100);
+  if (!Array.isArray(entries)) return null;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry || entry.role !== 'assistant') continue;
+    const usage = entry.usage;
+    if (!usage || typeof usage !== 'object') continue;
+    if (typeof usage.totalTokens === 'number' && usage.totalTokens > 0) {
+      return Math.round(usage.totalTokens);
+    }
+    const partSum = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
+      .filter((n) => typeof n === 'number' && n > 0)
+      .reduce((a, b) => a + b, 0);
+    if (partSum > 0) return Math.round(partSum);
+  }
+  return null;
+}
+
+// Matches the gateway's resolveFreshSessionTotalTokens semantics (openclaw
+// src/config/sessions/types.ts): a stored total only counts as current when it
+// is positive, explicitly fresh, and at the current version. A positive total
+// with totalTokensFresh === false (compaction/fork paths) or with the flag
+// absent (legacy store) is stale, so the transcript estimate may fill the gap.
+const SESSION_TOTAL_TOKENS_VERSION = 1;
+function hasFreshStoredTotalTokens(sessionEntry) {
+  return Boolean(
+    sessionEntry
+    && typeof sessionEntry.totalTokens === 'number'
+    && sessionEntry.totalTokens > 0
+    && sessionEntry.totalTokensFresh === true
+    && sessionEntry.totalTokensVersion === SESSION_TOTAL_TOKENS_VERSION,
+  );
+}
+
+/**
  * Auto-detect the originating channel from the most recently active main session.
  * Reads the SQLite-first compatibility store, finds sessions active within the last 10 minutes,
  * excludes subagent sessions, returns deliveryContext.to of the most recent one.
@@ -3297,6 +3355,10 @@ function cmdStatus(flags) {
           typeof sessionEntry.abortedLastRun === 'boolean' ? sessionEntry.abortedLastRun : undefined,
         model:     sessionEntry.model || null,
         tokens:    sessionEntry.totalTokens || null,
+        tokensEstimate:
+          hasFreshStoredTotalTokens(sessionEntry)
+            ? null
+            : readTranscriptTokenEstimate(sessionEntry, statusAgent),
       };
     } else {
       liveness = { error: 'session not found in sessions store' };

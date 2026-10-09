@@ -1,7 +1,7 @@
 import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -219,6 +219,57 @@ test('legacy sessions.json and JSONL remain a fallback when SQLite is absent', (
     assert.equal(readOpenClawTranscriptTail('main', SESSION_ID, options).source, 'legacy-jsonl');
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('transcript tail reads refuse paths that leave the agent state root', () => {
+  const fixture = createFixture();
+  // A complete agent root outside the state dir: a readable SQLite transcript
+  // and a legacy JSONL transcript, so any escape would return its events.
+  const outside = mkdtempSync(join(tmpdir(), 'dispatch-sqlite-store-outside-'));
+  try {
+    const options = {
+      env: { OPENCLAW_STATE_DIR: fixture.stateDir, HOME: fixture.root },
+      homeDir: fixture.root,
+    };
+    mkdirSync(join(outside, 'agent'));
+    mkdirSync(join(outside, 'sessions'));
+    seedDatabase(join(outside, 'agent', 'openclaw-agent.sqlite'));
+    const legacyLine = `${JSON.stringify({ role: 'assistant', content: 'outside' })}\n`;
+    writeFileSync(join(outside, 'sessions', `${SESSION_ID}.jsonl`), legacyLine);
+
+    const agentsDir = join(fixture.stateDir, 'agents');
+    const sessionsDir = join(agentsDir, 'main', 'sessions');
+    const transcriptPath = join(sessionsDir, `${SESSION_ID}.jsonl`);
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(transcriptPath, legacyLine);
+    assert.equal(readOpenClawTranscriptTail('main', SESSION_ID, options).events.length, 1);
+
+    assert.throws(() => readOpenClawTranscriptTail('main', `../${SESSION_ID}`, options), /session_id/);
+    assert.throws(() => readOpenClawTranscriptTail('../main', SESSION_ID, options), /agent_id/);
+
+    rmSync(transcriptPath);
+    symlinkSync(join(outside, 'sessions', `${SESSION_ID}.jsonl`), transcriptPath);
+    assert.throws(
+      () => readOpenClawTranscriptTail('main', SESSION_ID, options),
+      /transcript path escapes its allowed root through a symbolic link/,
+    );
+
+    symlinkSync(outside, join(agentsDir, 'linked'));
+    assert.throws(
+      () => readOpenClawTranscriptTail('linked', SESSION_ID, options),
+      /agent state directory escapes its allowed root through a symbolic link/,
+    );
+
+    rmSync(fixture.agentDir, { recursive: true, force: true });
+    symlinkSync(join(outside, 'agent'), fixture.agentDir);
+    assert.throws(
+      () => readOpenClawTranscriptTail('main', SESSION_ID, options),
+      /database path escapes its allowed root through a symbolic link/,
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 
