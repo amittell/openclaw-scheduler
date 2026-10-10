@@ -1013,7 +1013,7 @@ export const jobs: {
   // Lifecycle
   cancelJob(jobId: string, opts?: { cascade?: boolean }): string[];
   pruneExpiredJobs(): number;
-  pruneOrphanedDeliveryWatchers(): number;
+  pruneOrphanedDispatchJobs(): number;
 };
 
 export const runs: {

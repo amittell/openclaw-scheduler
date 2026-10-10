@@ -1921,18 +1921,29 @@ export function pruneExpiredJobs() {
   return aged.changes + orphans.changes + ttlExpired.changes;
 }
 
-// Delivery watcher orphan reaper.
+// Dispatch job family orphan reaper.
 //
-// Dispatch delivery watchers are enabled cron jobs named "<brand>-deliver:<label>"
-// (optionally with a ":handoff:<ts>" suffix) that poll a dispatch label until its
-// parent work finishes. They are created with ttl_hours (default 48) and
-// delete_after_run=1, but delete_after_run only fires on a terminal 'ok' run and
-// the TTL pruning above only deletes disabled jobs -- a watcher that keeps ticking
-// (skipped/ok every minute) stays enabled forever and never expires. Evidence:
-// dispatch-deliver:830-acceptance-run(-v4) created 2026-09-13 with ttl_hours=48
-// were still enabled and ticking 14 days later. This reaper deletes an ENABLED
-// dispatch-deliver job once its ttl_hours window has passed AND the watched
-// dispatch label is terminal (or no longer present in the labels ledger).
+// The dispatch job family is the set of per-label cron jobs that watch a
+// dispatch label until its parent work finishes:
+//   - "<brand>-deliver:<label>" (brand is "dispatch" in practice): delivery
+//     watchers, created with ttl_hours (default 48) and delete_after_run=1,
+//     but delete_after_run only fires on a terminal 'ok' run and the TTL
+//     pruning above only deletes disabled jobs -- a watcher that keeps ticking
+//     (skipped/ok every minute) stays enabled forever and never expires.
+//     Evidence: dispatch-deliver:830-acceptance-run(-v4) created 2026-09-13
+//     with ttl_hours=48 were still enabled and ticking 14 days later.
+//   - "dispatch-checkin:<label>" and "watchdog:<label>": check-in and watchdog
+//     jobs, typically */5 or */15 cron WITHOUT ttl_hours. When they reach a
+//     terminal label they try to delete themselves, but their own run is still
+//     active, so deleteJob throws JOB_ACTIVE_RUNS and the script falls back to
+//     disabling -- the disabled row then persists forever (the TTL pruner only
+//     touches jobs with ttl_hours set, and this reaper previously only matched
+//     the "-deliver:" name).
+// This reaper deletes a job from the family once its watched dispatch label is
+// terminal (or no longer present in the labels ledger) AND it has aged past
+// the family-specific window: the ttl_hours window for "-deliver:" jobs, and
+// a fixed creation grace for the checkin/watchdog jobs (so a brand-new job is
+// never reaped while racing its own self-delete).
 const TERMINAL_DISPATCH_LABEL_STATUSES = new Set(['done', 'error', 'interrupted']);
 
 function resolveLabelsFileForPrune() {
@@ -1959,18 +1970,47 @@ function readDispatchLabelsForPrune() {
   }
 }
 
+// Dispatch job family name prefixes. The label is the suffix after the prefix.
+// "-deliver:" is matched as a suffix (the brand prefix is variable); the other
+// two are anchored at the start of the name. The standing job
+// "delivery-failure-alert" contains no colon-label and must never be reaped.
+const DELIVER_LABEL_MARKER = '-deliver:';
+const CHECKIN_JOB_PREFIX = 'dispatch-checkin:';
+const WATCHDOG_JOB_PREFIX = 'watchdog:';
+// Creation grace for the checkin/watchdog families, which lack ttl_hours: a
+// job younger than one check-in interval is never reaped, so a brand-new job
+// racing its own self-delete (JOB_ACTIVE_RUNS -> disabled) survives until the
+// next pass.
+const DISPATCH_FAMILY_CREATION_GRACE_MINUTES = 5;
+
 /**
- * True when the dispatch label watched by a delivery watcher job is terminal
- * (or the ledger/label is missing, i.e. the watched work is gone). Null --
- * not terminal -- when the label still has a non-terminal status.
+ * Parse the watched dispatch label from a dispatch job family name. Returns
+ * the label suffix, or null when the name is not a dispatch job family member
+ * (e.g. the standing "delivery-failure-alert" job).
+ */
+function dispatchJobLabelForPrune(jobName) {
+  if (jobName.startsWith(CHECKIN_JOB_PREFIX)) {
+    return jobName.slice(CHECKIN_JOB_PREFIX.length);
+  }
+  if (jobName.startsWith(WATCHDOG_JOB_PREFIX)) {
+    return jobName.slice(WATCHDOG_JOB_PREFIX.length);
+  }
+  const markerIndex = jobName.indexOf(DELIVER_LABEL_MARKER);
+  if (markerIndex < 0) return null;
+  return jobName.slice(markerIndex + DELIVER_LABEL_MARKER.length);
+}
+
+/**
+ * True when the dispatch label watched by a dispatch job family member is
+ * terminal (or the ledger/label is missing, i.e. the watched work is gone).
+ * Null -- not terminal -- when the label still has a non-terminal status or
+ * when the job name is not a dispatch job family member.
  */
 function dispatchLabelTerminalForPrune(jobName) {
+  const fullLabel = dispatchJobLabelForPrune(jobName);
+  if (fullLabel === null) return null;
   const labels = readDispatchLabelsForPrune();
   if (!labels) return null;
-  const marker = '-deliver:';
-  const markerIndex = jobName.indexOf(marker);
-  if (markerIndex < 0) return null;
-  const fullLabel = jobName.slice(markerIndex + marker.length);
   // Labels are arbitrary strings and may themselves end in ":handoff:<digits>"
   // (e.g. a user label foo:handoff:123). Prefer the full suffix when it exists
   // as a ledger key; only fall back to the stripped base label for
@@ -2004,27 +2044,51 @@ const REAPER_GUARD_SQL = [
 ];
 
 /**
- * Delete enabled dispatch-deliver watcher jobs that are past their ttl_hours
- * window and whose watched label is terminal. Aging is based on the immutable
- * created_at, not last_run_at: updateJobAfterRun() (dispatcher-maintenance.js)
- * refreshes last_run_at after every run that reaches bookkeeping, so a watcher
- * that keeps ticking every minute would never age out on last_run_at. Same
- * safety guards as the TTL pruning above: no in-flight run, no
- * recovery_blocked run, no pending/claimed queue row, no live children; the
- * guards and the delete run in one immediate transaction. Returns the number
- * of deleted jobs.
+ * Delete dispatch job family members ("<brand>-deliver:<label>",
+ * "dispatch-checkin:<label>", "watchdog:<label>") whose watched label is
+ * terminal or absent from the labels ledger, once the job has aged past its
+ * family-specific window. Aging is
+ * based on the immutable created_at, not last_run_at: updateJobAfterRun()
+ * (dispatcher-maintenance.js) refreshes last_run_at after every run that
+ * reaches bookkeeping, so a job that keeps ticking every minute would never
+ * age out on last_run_at. The "-deliver:" family keeps its existing
+ * enabled-only + ttl_hours requirement (no regression); the checkin/watchdog
+ * family (no ttl_hours) uses a fixed creation grace instead and is reaped
+ * whether enabled or disabled -- the disabled rows are the residue this
+ * reaper exists to clear: a checkin/watchdog that reaches a terminal label
+ * tries to delete itself, hits JOB_ACTIVE_RUNS (its own run is still active),
+ * and falls back to disabling -- that disabled row would otherwise persist
+ * forever (the TTL pruner only touches jobs with ttl_hours set). Same safety
+ * guards as the TTL pruning above: no in-flight run, no recovery_blocked run,
+ * no pending/claimed queue row, no live children; the guards and the delete
+ * run in one immediate transaction. Returns the number of deleted jobs.
  */
-export function pruneOrphanedDeliveryWatchers() {
+export function pruneOrphanedDispatchJobs() {
   const db = getDb();
+  // The deliver branch keeps its existing `enabled = 1` requirement (no
+  // regression: the deliver reaper only ever cleaned enabled watchers). The
+  // checkin/watchdog branches have NO enabled filter: the residue this reaper
+  // exists to clear is precisely the DISABLED row a checkin/watchdog leaves
+  // behind when its own self-delete hits JOB_ACTIVE_RUNS and falls back to
+  // disabling. A disabled job is safe to reap once its label is terminal and
+  // it has aged past the grace window, and the REAPER_GUARD_SQL re-checks
+  // (no in-flight run, no pending queue, no live children) still gate every
+  // delete.
   const candidates = db.prepare(`
-    SELECT id, name
+    SELECT id, name, ttl_hours
     FROM jobs
-    WHERE enabled = 1
-      AND ttl_hours IS NOT NULL
-      AND ttl_hours > 0
-      AND created_at < datetime('now', '-' || ttl_hours || ' hours')
-      AND name LIKE '%-deliver:%'
-  `).all();
+    WHERE (
+        (name LIKE '%-deliver:%'
+          AND enabled = 1
+          AND ttl_hours IS NOT NULL
+          AND ttl_hours > 0
+          AND created_at < datetime('now', '-' || ttl_hours || ' hours'))
+        OR (name LIKE 'dispatch-checkin:%'
+          AND created_at < datetime('now', '-' || ? || ' minutes'))
+        OR (name LIKE 'watchdog:%'
+          AND created_at < datetime('now', '-' || ? || ' minutes'))
+      )
+  `).all(DISPATCH_FAMILY_CREATION_GRACE_MINUTES, DISPATCH_FAMILY_CREATION_GRACE_MINUTES);
   let deleted = 0;
   for (const candidate of candidates) {
     if (dispatchLabelTerminalForPrune(candidate.name) !== true) continue;
