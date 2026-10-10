@@ -30,7 +30,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
   readFileSync(join(__dirname, 'package.json'), 'utf8')
 );
-import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, pruneOrphanedDeliveryWatchers, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount, canEnqueueDispatch } from './jobs.js';
+import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, pruneOrphanedDispatchJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount, canEnqueueDispatch } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
   updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes,
@@ -1330,8 +1330,8 @@ async function tick() {
       pruneDeliveryHistory({ log, getDb });
       const expiredCount = pruneExpiredJobs();
       if (expiredCount > 0) log('info', `Pruned ${expiredCount} expired disabled job(s)`);
-      const orphanedWatchers = pruneOrphanedDeliveryWatchers();
-      if (orphanedWatchers > 0) log('info', `Pruned ${orphanedWatchers} orphaned delivery watcher job(s) past TTL`);
+      const orphanedDispatchJobs = pruneOrphanedDispatchJobs();
+      if (orphanedDispatchJobs > 0) log('info', `Pruned ${orphanedDispatchJobs} orphaned dispatch job(s) with terminal/absent labels`);
       if (prunedEvidence.changes > 0) log('info', `Pruned ${prunedEvidence.changes} expired evidence record(s)`);
       // Ensure inbox consumer jobs exist for agents with delivery config
       ensureAgentInboxJobs({ log, getDb, createJob });

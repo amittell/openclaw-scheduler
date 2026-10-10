@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
-import { createJob, getJob, pruneOrphanedDeliveryWatchers } from '../jobs.js';
+import { createJob, getJob, pruneOrphanedDispatchJobs } from '../jobs.js';
 import { enqueueDispatch } from '../dispatch-queue.js';
 import { createRun, finishRun } from '../runs.js';
 
@@ -72,7 +72,7 @@ test('enabled dispatch-deliver watcher past TTL with terminal parent label is re
   const job = makeWatcherJob('dispatch-deliver:830-acceptance-run');
   ageWatcherJob(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined, 'watcher job should be deleted');
 });
 
@@ -82,11 +82,11 @@ test('enabled dispatch-deliver watcher past TTL with in-flight run is NOT reaped
   ageWatcherJob(job.id);
   const running = createRun(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
   assert.equal(getJob(job.id).id, job.id, 'job must survive while a run is in flight');
 
   finishRun(running.id, 'cancelled', { summary: 'cleanup' });
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined);
 });
 
@@ -95,11 +95,11 @@ test('enabled dispatch-deliver watcher past TTL whose label is still running is 
   const job = makeWatcherJob('dispatch-deliver:still-running');
   ageWatcherJob(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
   assert.equal(getJob(job.id).id, job.id, 'job must survive while the watched label is non-terminal');
 
   setLabels({ 'still-running': { status: 'interrupted', updatedAt: new Date().toISOString() } });
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined);
 });
 
@@ -119,12 +119,12 @@ test('non-dispatch-deliver jobs are unaffected by the watcher reaper', () => {
   });
   ageWatcherJob(plain.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
   assert.equal(getJob(plain.id).id, plain.id, 'plain ttl job must not be touched');
 
   const otherWatcher = makeWatcherJob('dispatch-deliver:unknown-label');
   ageWatcherJob(otherWatcher.id);
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(otherWatcher.id), undefined, 'watcher whose label is absent from the ledger is terminal');
   getDb().prepare('DELETE FROM jobs WHERE id = ?').run(plain.id);
 });
@@ -134,7 +134,7 @@ test('watcher with a handoff suffix resolves to its base label', () => {
   const job = makeWatcherJob(`dispatch-deliver:handoff-label:handoff:${Date.now()}`);
   ageWatcherJob(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined);
 });
 
@@ -144,11 +144,11 @@ test('watcher with a pending queue row is NOT reaped', () => {
   ageWatcherJob(job.id);
   const dispatch = enqueueDispatch(job.id, { kind: 'manual' });
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
   assert.equal(getJob(job.id).id, job.id, 'job must survive while a dispatch is queued');
 
   getDb().prepare("UPDATE job_dispatch_queue SET status = 'done' WHERE id = ?").run(dispatch.id);
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined);
 });
 
@@ -161,11 +161,11 @@ test('full :handoff:<digits> suffix is preferred when it exists as a ledger key'
   const job = makeWatcherJob('dispatch-deliver:foo:handoff:123');
   ageWatcherJob(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
   assert.equal(getJob(job.id).id, job.id, 'watcher must survive while the full-suffix label is running');
 
   setLabels({ 'foo:handoff:123': { status: 'done', updatedAt: new Date().toISOString() } });
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined, 'watcher is reaped once the full-suffix label is terminal');
 });
 
@@ -183,7 +183,7 @@ test('aging is based on created_at, not last_run_at', () => {
     WHERE id = ?
   `).run(job.id);
 
-  assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined, 'ticking watcher is reaped once created_at is past TTL');
 });
 
@@ -204,7 +204,7 @@ test('enqueue race: a queue row committed by another dispatcher is re-checked in
         (id, job_id, dispatch_kind, status, scheduled_for, binding_scheduled_for, created_at)
       VALUES (?, ?, 'manual', 'pending', datetime('now'), datetime('now'), datetime('now'))
     `).run(queueId, job.id);
-    assert.equal(pruneOrphanedDeliveryWatchers(), 0);
+    assert.equal(pruneOrphanedDispatchJobs(), 0);
     assert.equal(getJob(job.id).id, job.id, 'job must survive a racing enqueue');
     const row = racer.prepare('SELECT status FROM job_dispatch_queue WHERE id = ?').get(queueId);
     assert.equal(row.status, 'pending', 'racing queue row must not be cascade-deleted');
@@ -231,14 +231,14 @@ test('relative DISPATCH_LABELS_PATH is resolved beneath DISPATCH_STATE_DIR', () 
   try {
     const job = makeWatcherJob('dispatch-deliver:rel-label');
     ageWatcherJob(job.id);
-    assert.equal(pruneOrphanedDeliveryWatchers(), 1);
+    assert.equal(pruneOrphanedDispatchJobs(), 1);
     assert.equal(getJob(job.id), undefined, 'relative override must resolve beneath stateDir');
   } finally {
     process.env.DISPATCH_LABELS_PATH = savedLabels;
   }
 });
 
-test('index.d.ts declares pruneOrphanedDeliveryWatchers on the jobs namespace', () => {
+test('index.d.ts declares pruneOrphanedDispatchJobs on the jobs namespace', () => {
   const dts = readFileSync(join(__dirname, '..', 'index.d.ts'), 'utf8');
-  assert.match(dts, /pruneOrphanedDeliveryWatchers\(\): number;/, 'jobs namespace must declare the new export');
+  assert.match(dts, /pruneOrphanedDispatchJobs\(\): number;/, 'jobs namespace must declare the new export');
 });
