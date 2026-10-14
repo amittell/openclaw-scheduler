@@ -205,6 +205,41 @@ test('tokensEstimate falls back to the usage part sum when the usage object has 
   }
 });
 
+for (const { name, usageJson, expected } of [
+  { name: 'non-finite total', usageJson: '{"totalTokens":1e400,"input":100,"output":50}', expected: 150 },
+  { name: 'non-finite component', usageJson: '{"input":100,"cacheRead":1e400,"cacheWrite":-5,"output":50}', expected: 150 },
+  { name: 'overflowing part sum', usageJson: '{"input":1e308,"output":1e308}', expected: 77 },
+]) {
+  test(`tokensEstimate ignores ${name} and uses finite usage`, () => {
+    const fixture = createFixture();
+    try {
+      seedRunningSession(fixture.databasePath, {
+        totalTokens: undefined,
+        assistantUsage: { totalTokens: 77 },
+      });
+      // JSON permits exponents that parse to Infinity. Insert raw JSON so
+      // JSON.stringify does not replace the non-finite witness with null.
+      const database = new Database(fixture.databasePath);
+      database.prepare(`
+        INSERT INTO transcript_events (session_id, seq, event_json, created_at)
+        VALUES (?, 3, ?, ?)
+      `).run(
+        SESSION_ID,
+        `{"type":"message","message":{"role":"assistant","usage":${usageJson}}}`,
+        Date.now(),
+      );
+      database.close();
+
+      const status = runStatus(fixture, 'estimate-finite');
+      assert.equal(status.status, 'running');
+      assert.equal(status.liveness.tokens, null);
+      assert.equal(status.liveness.tokensEstimate, expected);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
 test('status leaves tokens authoritative and skips the estimate when totalTokens is fresh', () => {
   const fixture = createFixture();
   try {
@@ -218,6 +253,29 @@ test('status leaves tokens authoritative and skips the estimate when totalTokens
     assert.equal(status.status, 'running');
     assert.equal(status.liveness.tokens, 321);
     assert.equal(status.liveness.tokensEstimate, null);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a non-finite stored total does not suppress finite transcript usage', () => {
+  const fixture = createFixture();
+  try {
+    seedRunningSession(fixture.databasePath, {
+      totalTokens: 321,
+      totalTokensFresh: true,
+      totalTokensVersion: 1,
+      assistantUsage: { totalTokens: 999 },
+    });
+    const database = new Database(fixture.databasePath);
+    database.prepare(`
+      UPDATE session_nodes SET entry_json = replace(entry_json, '"totalTokens":321', '"totalTokens":1e400')
+      WHERE session_key = ?
+    `).run(SESSION_KEY);
+    database.close();
+
+    const status = runStatus(fixture, 'estimate-invalid-stored');
+    assert.equal(status.liveness.tokensEstimate, 999);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

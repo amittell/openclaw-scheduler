@@ -138,7 +138,10 @@ test('dispatcher leases refuse a second owner and fence stale owners after takeo
   assert.equal(releaseDispatcherLease('runtime-test', 'owner-c', 3), true);
 });
 
-test('dispatcher runtime renews leadership independently while the caller awaits', async () => {
+test('dispatcher runtime renews leadership independently while the caller awaits', async t => {
+  // Exercise the actual periodic timer without making ownership depend on
+  // the host scheduling a 20ms callback before a 60ms real-time lease expires.
+  t.mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'], now: 1000 });
   let expiresAt = 0;
   let renewals = 0;
   const runtime = createDispatcherRuntime({
@@ -161,11 +164,16 @@ test('dispatcher runtime renews leadership independently while the caller awaits
     assertLease: () => Date.now() < expiresAt,
   });
 
-  assert.ok(runtime.start());
-  await delay(180);
-  assert.ok(renewals >= 3, `expected periodic renewals, observed ${renewals}`);
-  assert.equal(runtime.assertLeadership(), true);
-  await runtime.stop();
+  try {
+    assert.ok(runtime.start());
+    const callerWait = delay(180);
+    for (let tick = 0; tick < 9; tick++) t.mock.timers.tick(20);
+    await callerWait;
+    assert.ok(renewals >= 3, `expected periodic renewals, observed ${renewals}`);
+    assert.equal(runtime.assertLeadership(), true);
+  } finally {
+    await runtime.stop();
+  }
 });
 
 test('terminal transitions are fenced CAS operations and cannot be overwritten', () => {
@@ -847,7 +855,9 @@ test('shell timeout kills the complete descendant process group', async () => {
   try {
     const result = await runShellCommand(
       `${shellQuote(process.execPath)} ${shellQuote(fixture.path)}`,
-      150,
+      // Allow the real Node process to start its descendant before timeout;
+      // the assertions below still require timeout and complete group death.
+      2_000,
       null,
       { killGraceMs: 75, envPolicy: 'minimal' },
     );

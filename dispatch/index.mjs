@@ -1010,7 +1010,7 @@ function readJsonlTailEntries(sessionId, agent = 'main', maxLines = 200) {
  * totalTokens at turn completion, and bootstrap writes 0; long dispatch runs
  * are one long turn (many model calls ending in toolUse), so mid-run the store
  * entry has no totalTokens even though per-call usage already exists in the
- * transcript. Scan the newest bounded tail for the most recent assistant
+ * transcript. Scan the newest 100 entries for the most recent assistant
  * message carrying positive usage and report its totalTokens
  * (fallback: input + cacheRead + cacheWrite + output).
  *
@@ -1035,13 +1035,13 @@ function readTranscriptTokenEstimate(sessionEntry, agent) {
     if (!entry || entry.role !== 'assistant') continue;
     const usage = entry.usage;
     if (!usage || typeof usage !== 'object') continue;
-    if (typeof usage.totalTokens === 'number' && usage.totalTokens > 0) {
+    if (Number.isFinite(usage.totalTokens) && usage.totalTokens > 0) {
       return Math.round(usage.totalTokens);
     }
     const partSum = [usage.input, usage.cacheRead, usage.cacheWrite, usage.output]
-      .filter((n) => typeof n === 'number' && n > 0)
+      .filter((n) => Number.isFinite(n) && n > 0)
       .reduce((a, b) => a + b, 0);
-    if (partSum > 0) return Math.round(partSum);
+    if (Number.isFinite(partSum) && partSum > 0) return Math.round(partSum);
   }
   return null;
 }
@@ -1055,7 +1055,7 @@ const SESSION_TOTAL_TOKENS_VERSION = 1;
 function hasFreshStoredTotalTokens(sessionEntry) {
   return Boolean(
     sessionEntry
-    && typeof sessionEntry.totalTokens === 'number'
+    && Number.isFinite(sessionEntry.totalTokens)
     && sessionEntry.totalTokens > 0
     && sessionEntry.totalTokensFresh === true
     && sessionEntry.totalTokensVersion === SESSION_TOTAL_TOKENS_VERSION,
