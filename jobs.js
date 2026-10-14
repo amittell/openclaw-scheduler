@@ -1970,7 +1970,8 @@ function readDispatchLabelsForPrune() {
   }
 }
 
-// Dispatch job family name prefixes. The label is the suffix after the prefix.
+// Dispatch job family name prefixes. Delivery/checkin labels use the suffix;
+// watchdogs use their configured watchdog_target_label.
 // "-deliver:" is matched as a suffix (the brand prefix is variable); the other
 // two are anchored at the start of the name. The standing job
 // "delivery-failure-alert" contains no colon-label and must never be reaped.
@@ -1988,13 +1989,19 @@ const DISPATCH_FAMILY_CREATION_GRACE_MINUTES = 5;
  * the label suffix, or null when the name is not a dispatch job family member
  * (e.g. the standing "delivery-failure-alert" job).
  */
-function dispatchJobLabelForPrune(jobName) {
+function dispatchJobLabelForPrune(job) {
+  const jobName = job.name;
+  // A watchdog record keeps its explicit target contract even when its name
+  // also belongs to the checkin or delivery family.
+  if (job.job_type === 'watchdog') {
+    return typeof job.watchdog_target_label === 'string' && job.watchdog_target_label.length > 0
+      ? job.watchdog_target_label
+      : null;
+  }
   if (jobName.startsWith(CHECKIN_JOB_PREFIX)) {
     return jobName.slice(CHECKIN_JOB_PREFIX.length);
   }
-  if (jobName.startsWith(WATCHDOG_JOB_PREFIX)) {
-    return jobName.slice(WATCHDOG_JOB_PREFIX.length);
-  }
+  if (jobName.startsWith(WATCHDOG_JOB_PREFIX)) return null;
   const markerIndex = jobName.indexOf(DELIVER_LABEL_MARKER);
   if (markerIndex < 0) return null;
   return jobName.slice(markerIndex + DELIVER_LABEL_MARKER.length);
@@ -2006,8 +2013,8 @@ function dispatchJobLabelForPrune(jobName) {
  * Null -- not terminal -- when the label still has a non-terminal status or
  * when the job name is not a dispatch job family member.
  */
-function dispatchLabelTerminalForPrune(jobName) {
-  const fullLabel = dispatchJobLabelForPrune(jobName);
+function dispatchLabelTerminalForPrune(job) {
+  const fullLabel = dispatchJobLabelForPrune(job);
   if (fullLabel === null) return null;
   const labels = readDispatchLabelsForPrune();
   if (!labels) return null;
@@ -2019,6 +2026,9 @@ function dispatchLabelTerminalForPrune(jobName) {
   if (fullEntry && typeof fullEntry === 'object') {
     return TERMINAL_DISPATCH_LABEL_STATUSES.has(fullEntry.status) ? true : null;
   }
+  // An explicit watchdog target is a literal ledger key, not a generated
+  // delivery-watcher name with a handoff suffix.
+  if (job.job_type === 'watchdog') return true;
   const baseLabel = fullLabel.replace(/:handoff:\d+$/, '');
   if (baseLabel === fullLabel) return true; // no handoff suffix, key absent
   const baseEntry = labels[baseLabel];
@@ -2054,7 +2064,9 @@ const REAPER_GUARD_SQL = [
  * age out on last_run_at. The "-deliver:" family keeps its existing
  * enabled-only + ttl_hours requirement (no regression); the checkin/watchdog
  * family (no ttl_hours) uses a fixed creation grace instead and is reaped
- * whether enabled or disabled -- the disabled rows are the residue this
+ * whether enabled or disabled. Watchdogs must be actual watchdog records
+ * with watchdog_self_destruct enabled, and their configured target label
+ * determines terminal state. The disabled rows are the residue this
  * reaper exists to clear: a checkin/watchdog that reaches a terminal label
  * tries to delete itself, hits JOB_ACTIVE_RUNS (its own run is still active),
  * and falls back to disabling -- that disabled row would otherwise persist
@@ -2075,10 +2087,12 @@ export function pruneOrphanedDispatchJobs() {
   // (no in-flight run, no pending queue, no live children) still gate every
   // delete.
   const candidates = db.prepare(`
-    SELECT id, name, ttl_hours
+    SELECT id, name, ttl_hours, job_type, watchdog_target_label
     FROM jobs
     WHERE (
         (name LIKE '%-deliver:%'
+          AND name NOT LIKE 'dispatch-checkin:%'
+          AND name NOT LIKE 'watchdog:%'
           AND enabled = 1
           AND ttl_hours IS NOT NULL
           AND ttl_hours > 0
@@ -2086,12 +2100,14 @@ export function pruneOrphanedDispatchJobs() {
         OR (name LIKE 'dispatch-checkin:%'
           AND created_at < datetime('now', '-' || ? || ' minutes'))
         OR (name LIKE 'watchdog:%'
+          AND job_type = 'watchdog'
           AND created_at < datetime('now', '-' || ? || ' minutes'))
       )
+      AND (job_type IS NOT 'watchdog' OR watchdog_self_destruct = 1)
   `).all(DISPATCH_FAMILY_CREATION_GRACE_MINUTES, DISPATCH_FAMILY_CREATION_GRACE_MINUTES);
   let deleted = 0;
   for (const candidate of candidates) {
-    if (dispatchLabelTerminalForPrune(candidate.name) !== true) continue;
+    if (dispatchLabelTerminalForPrune(candidate) !== true) continue;
     const reap = () => {
       for (const sql of REAPER_GUARD_SQL) {
         if (db.prepare(sql).get(candidate.id)) {
@@ -2114,6 +2130,14 @@ export function pruneOrphanedDispatchJobs() {
     }
   }
   return deleted;
+}
+
+/**
+ * @deprecated Use pruneOrphanedDispatchJobs for dispatch-family cleanup.
+ * Retained as a forwarding API for existing package consumers.
+ */
+export function pruneOrphanedDeliveryWatchers() {
+  return pruneOrphanedDispatchJobs();
 }
 
 /**

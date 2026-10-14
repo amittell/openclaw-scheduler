@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
-import { createJob, getJob, pruneOrphanedDispatchJobs } from '../jobs.js';
+import { createJob, getJob, pruneOrphanedDispatchJobs, updateJob } from '../jobs.js';
+import { jobs as publicJobs } from '../index.js';
 import { createRun, finishRun } from '../runs.js';
 
 const tmpRoot = mkdtempSync(join(tmpdir(), 'scheduler-orphan-dispatch-reaper-'));
@@ -159,6 +160,118 @@ test('watchdog job whose label is absent from the ledger is reaped', () => {
 
   assert.equal(pruneOrphanedDispatchJobs(), 1);
   assert.equal(getJob(job.id), undefined);
+});
+
+for (const enabled of [0, 1]) {
+  for (const status of ['done', null]) {
+    test(`watchdog opted out of self-destruction survives with enabled=${enabled} and label=${status ?? 'absent'}`, () => {
+      const label = `wd-retained-${enabled}-${status ?? 'absent'}`;
+      setLabels(status ? { [label]: labelEntry(status) } : {});
+      const job = makeWatchdogJob(`watchdog:${label}`, label, { enabled, watchdog_self_destruct: 0 });
+      ageJob(job.id, "datetime('now', '-10 minutes')");
+
+      assert.equal(pruneOrphanedDispatchJobs(), 0);
+      assert.equal(getJob(job.id).id, job.id, 'explicit opt-out must survive maintenance');
+
+      updateJob(job.id, { watchdog_self_destruct: 1 });
+      assert.equal(pruneOrphanedDispatchJobs(), 1, 'opting into self-destruction permits cleanup');
+      assert.equal(getJob(job.id), undefined);
+    });
+  }
+}
+
+test('a shell job named watchdog is not a self-destructing watchdog record', () => {
+  setLabels({ 'wd-shell': labelEntry('done') });
+  const job = makeCheckinJob('watchdog:wd-shell');
+  ageJob(job.id, "datetime('now', '-10 minutes')");
+
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
+  assert.equal(getJob(job.id).id, job.id);
+  getDb().prepare('DELETE FROM jobs WHERE id = ?').run(job.id);
+});
+
+test('watchdog cleanup uses its configured target when the display name differs', () => {
+  setLabels({ 'wd-actual-target': labelEntry('running') });
+  const job = makeWatchdogJob('watchdog:wd-display-name', 'wd-actual-target');
+  ageJob(job.id, "datetime('now', '-10 minutes')");
+
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
+  assert.equal(getJob(job.id).id, job.id, 'an absent display-name label does not make the real target terminal');
+
+  setLabels({
+    'wd-display-name': labelEntry('running'),
+    'wd-actual-target': labelEntry('done'),
+  });
+  assert.equal(pruneOrphanedDispatchJobs(), 1, 'terminal configured target permits cleanup despite a running name label');
+  assert.equal(getJob(job.id), undefined);
+});
+
+test('a delivery marker inside a watchdog name does not bypass its self-destruct opt-out', () => {
+  setLabels({ 'wd-deliver:overlap': labelEntry('done') });
+  const job = makeWatchdogJob('watchdog:wd-deliver:overlap', 'wd-deliver:overlap', {
+    watchdog_self_destruct: 0,
+    ttl_hours: 1,
+  });
+  ageJob(job.id, "datetime('now', '-2 hours')");
+
+  assert.equal(pruneOrphanedDispatchJobs(), 0);
+  assert.equal(getJob(job.id).id, job.id, 'the deliver SQL arm must not admit an opted-out watchdog');
+
+  updateJob(job.id, { watchdog_self_destruct: 1 });
+  assert.equal(pruneOrphanedDispatchJobs(), 1);
+  assert.equal(getJob(job.id), undefined);
+});
+
+for (const prefix of ['dispatch-checkin:', 'brand-deliver:']) {
+  test(`ordinary job with ${prefix} name is not restricted by watchdog metadata`, () => {
+    const label = `ordinary-${prefix}`;
+    setLabels({ [label]: labelEntry('done') });
+    const job = makeCheckinJob(`${prefix}${label}`, { watchdog_self_destruct: 0, ttl_hours: 1 });
+    ageJob(job.id, "datetime('now', '-2 hours')");
+
+    assert.equal(pruneOrphanedDispatchJobs(), 1, 'watchdog-only settings must not restrict ordinary family cleanup');
+    assert.equal(getJob(job.id), undefined);
+  });
+
+  test(`watchdog record with ${prefix} name honors its self-destruct opt-out`, () => {
+    const label = `wd-opt-out-${prefix}`;
+    setLabels({ [label]: labelEntry('done') });
+    const job = makeWatchdogJob(`${prefix}${label}`, label, { watchdog_self_destruct: 0, ttl_hours: 1 });
+    ageJob(job.id, "datetime('now', '-2 hours')");
+
+    assert.equal(pruneOrphanedDispatchJobs(), 0);
+    assert.equal(getJob(job.id).id, job.id);
+
+    updateJob(job.id, { watchdog_self_destruct: 1 });
+    assert.equal(pruneOrphanedDispatchJobs(), 1);
+    assert.equal(getJob(job.id), undefined);
+  });
+
+  test(`watchdog record with ${prefix} name uses its configured target`, () => {
+    const nameLabel = `wd-display-${prefix}`;
+    const target = `wd-target-${prefix}`;
+    setLabels({ [target]: labelEntry('running') });
+    const job = makeWatchdogJob(`${prefix}${nameLabel}`, target, { ttl_hours: 1 });
+    ageJob(job.id, "datetime('now', '-2 hours')");
+
+    assert.equal(pruneOrphanedDispatchJobs(), 0);
+    assert.equal(getJob(job.id).id, job.id);
+
+    setLabels({ [nameLabel]: labelEntry('running'), [target]: labelEntry('done') });
+    assert.equal(pruneOrphanedDispatchJobs(), 1);
+    assert.equal(getJob(job.id), undefined);
+  });
+}
+
+test('the legacy reaper remains callable through the public jobs namespace', () => {
+  setLabels({ 'legacy-checkin': labelEntry('done') });
+  const job = makeCheckinJob('dispatch-checkin:legacy-checkin', { enabled: 0 });
+  ageJob(job.id, "datetime('now', '-10 minutes')");
+
+  assert.equal(typeof publicJobs.pruneOrphanedDeliveryWatchers, 'function');
+  assert.equal(publicJobs.pruneOrphanedDeliveryWatchers(), 1, 'legacy API forwards to generalized cleanup');
+  assert.equal(getJob(job.id), undefined);
+  assert.equal(publicJobs.pruneOrphanedDeliveryWatchers(), 0);
 });
 
 test('dispatch-deliver job keeps ttl-based aging: past ttl reaped, within ttl not', () => {

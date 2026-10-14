@@ -1014,6 +1014,8 @@ export const jobs: {
   cancelJob(jobId: string, opts?: { cascade?: boolean }): string[];
   pruneExpiredJobs(): number;
   pruneOrphanedDispatchJobs(): number;
+  /** @deprecated Use pruneOrphanedDispatchJobs for dispatch-family cleanup. */
+  pruneOrphanedDeliveryWatchers(): number;
 };
 
 export const runs: {
