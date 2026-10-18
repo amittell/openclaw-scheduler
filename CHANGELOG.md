@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.10] -- 2026-10-18
+
+### Added
+
+- **CLI/daemon version guard: a split deploy can no longer hide.** On the
+  2026-10-10 deploy of 0.6.9, only the launchd service copy was updated on
+  mac-mini and rh-bot; the global CLI copy stayed at 0.6.7. Because `enqueue`
+  builds the completion template from the CLI copy, every dispatch for 8 days
+  rendered with the old template and nobody noticed until a notification
+  arrived unreadable. The dispatcher now writes its own version (plus a
+  startup timestamp) to `$SCHEDULER_HOME/daemon-version.json` at startup and
+  refreshes it every minute (immediately if the file is missing). Every CLI
+  command that talks to the daemon -- and every dispatch subcommand except
+  read-only `list` -- compares its own copy against that record and fails
+  loudly on mismatch: non-zero exit with a stderr message naming BOTH
+  versions and BOTH install paths, plus the remediation steps. `doctor`
+  reports the guard state in its output (`version_guard`) and exits non-zero
+  on mismatch; `doctor --no-version-guard` reports state without tripping the
+  hard exit. A missing record (daemon stopped, or a pre-0.6.10 daemon) is a
+  warning, not a failure, so operators can still inspect state. Set
+  `SCHEDULER_VERSION_GUARD=1` to downgrade a mismatch to a stderr warning
+  while remediating; `SCHEDULER_VERSION_GUARD_FORCE=1` enables the guard from
+  a source checkout (tests use this). Source checkouts and in-memory test DBs
+  do not trip the guard by default.
+
 ## [0.6.9] -- 2026-10-08
 
 ### Changed

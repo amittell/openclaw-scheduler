@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "Durable continuity and governed-workflow sidecar for OpenClaw agents and shell jobs",
   "type": "module",
   "main": "./index.js",
@@ -139,6 +139,7 @@
     "task-tracker.js",
     "team-adapter.js",
     "v02-runtime.js",
+    "version-guard.js",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",

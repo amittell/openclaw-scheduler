@@ -12,10 +12,11 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
+import { resolveDaemonVersionPath, writeDaemonVersionFile } from './version-guard.js';
 import {
   generateIdempotencyKey as _genIdemKey,
   generateChainIdempotencyKey as _genChainKey,
@@ -1104,8 +1105,23 @@ function submitDueDispatches() {
 }
 
 // -- Main tick -----------------------------------------------
+let lastVersionGuardRefresh = 0;
 async function tick() {
   const now = Date.now();
+
+  // Keep the daemon version record fresh (and recover it if the file was
+  // removed). Rewrite immediately when missing; otherwise refresh at most
+  // once per minute so ticks stay cheap.
+  const versionGuardPath = resolveDaemonVersionPath(process.env);
+  const versionGuardMissing = versionGuardPath ? !existsSync(versionGuardPath) : true;
+  if (versionGuardMissing || now - lastVersionGuardRefresh >= 60_000) {
+    lastVersionGuardRefresh = now;
+    try {
+      writeDaemonVersionFile({ version: SCHEDULER_VERSION });
+    } catch (err) {
+      log('warn', `Version guard refresh failed: ${err.message}`);
+    }
+  }
 
   // Gateway health check
   if (!gatewayHealthy || now - lastGatewayCheck >= 60000) {
@@ -1440,6 +1456,14 @@ async function main() {
   });
 
   await initDb();
+
+  // Version guard: record this daemon's version where the CLI can find it.
+  // The CLI fails loudly when its own copy differs (2026-10-18 incident: a
+  // deploy updated only the service copy and dispatches ran 8 days on a
+  // stale completion template). Refreshed every tick so a deploy + restart
+  // is reflected immediately.
+  const daemonVersionPath = writeDaemonVersionFile({ version: SCHEDULER_VERSION });
+  if (daemonVersionPath) log('info', `Version guard: wrote ${SCHEDULER_VERSION} to ${daemonVersionPath}`);
 
   dispatcherRuntime = createDispatcherRuntime({
     ownerId: createDispatcherOwnerId(),
