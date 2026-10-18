@@ -9,8 +9,9 @@
 // has acquired the dispatcher lease); the CLI compares it against its own
 // version and fails loudly on mismatch.
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
-import { dirname, isAbsolute, join, resolve, sep } from 'path';
+import { dirname, isAbsolute, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { assertContainedPath } from './identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -59,21 +60,20 @@ export function resolveVersionGuardHome(env = process.env) {
   return resolve(join(root, '.openclaw', 'scheduler'));
 }
 
-// The version file must stay inside the home directory: reject any value
-// whose resolved path escapes it (defends against `../` segments and
-// symlink-free traversal in the env-provided home).
-function isContainedIn(root, candidate) {
-  const prefix = root.endsWith(sep) ? root : root + sep;
-  const resolved = resolve(candidate);
-  return resolved === root || resolved.startsWith(prefix);
-}
-
+// The version file must stay inside the home directory. assertContainedPath
+// (the repo's CodeQL-recognized sanitizer, also used by dispatch/paths.mjs)
+// proves containment lexically and after symlink canonicalization, throwing
+// on escape; a throw makes the guard a no-op rather than touching a path
+// outside the scheduler home.
 export function resolveDaemonVersionPath(env = process.env) {
   const home = resolveVersionGuardHome(env);
   if (!home) return null;
   const path = join(home, DAEMON_VERSION_FILE_NAME);
-  if (!isContainedIn(home, path)) return null;
-  return path;
+  try {
+    return assertContainedPath(home, path, 'daemon version file');
+  } catch {
+    return null;
+  }
 }
 
 // Atomic write: a temp file in the same directory, then rename over the
