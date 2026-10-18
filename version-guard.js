@@ -94,18 +94,10 @@ export function writeDaemonVersionFile({
     package_path: packagePath,
   };
   const dir = dirname(path);
-  // codeql[disable] js/path-injection
-  // path is env-derived (SCHEDULER_HOME/HOME) but validated by
-  // resolveDaemonVersionPath -> assertContainedPath (resolve + containment
-  // after symlink canonicalization); the env and the local filesystem are the
-  // same trust domain for this single-user CLI/daemon. Same class as the
-  // accepted open js/path-injection baseline (jobs.js, session-store.mjs).
   mkdirSync(dir, { recursive: true });
   const tmpPath = join(dir, `.${DAEMON_VERSION_FILE_NAME}.${process.pid}.tmp`);
   try {
-    // codeql[disable] js/path-injection
     writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`);
-    // codeql[disable] js/path-injection
     renameSync(tmpPath, path);
   } catch (err) {
     try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
