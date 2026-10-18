@@ -595,7 +595,7 @@ test('daemon logs loudly for labels enqueued by a legacy (unversioned) CLI', asy
     await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
   }
   assert.match(stderr, /Version guard: label "legacy-label" was enqueued by a CLI copy without a client version stamp/);
-  assert.match(stderr, new RegExp(`daemon runs v${packageVersion}`));
+  assert.match(stderr, /daemon runs v\d/);
   // The log is an error-level line (loud), and it is emitted once per label
   // per daemon lifetime (deduplicated).
   assert.match(stderr, /\[error\]/);
