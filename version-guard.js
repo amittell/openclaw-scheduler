@@ -9,7 +9,7 @@
 // has acquired the dispatcher lease); the CLI compares it against its own
 // version and fails loudly on mismatch.
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
-import { dirname, isAbsolute, join, resolve } from 'path';
+import { dirname, isAbsolute, join, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,14 +53,27 @@ export function resolveVersionGuardHome(env = process.env) {
     return root;
   }
   const home = firstNonEmpty(env.HOME) || firstNonEmpty(env.USERPROFILE) || '';
-  if (home) return resolve(join(home, '.openclaw', 'scheduler'));
-  return '';
+  if (!home || !isAbsolute(home)) return '';
+  const root = resolve(home);
+  if (root === '/') return '';
+  return resolve(join(root, '.openclaw', 'scheduler'));
+}
+
+// The version file must stay inside the home directory: reject any value
+// whose resolved path escapes it (defends against `../` segments and
+// symlink-free traversal in the env-provided home).
+function isContainedIn(root, candidate) {
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  const resolved = resolve(candidate);
+  return resolved === root || resolved.startsWith(prefix);
 }
 
 export function resolveDaemonVersionPath(env = process.env) {
   const home = resolveVersionGuardHome(env);
   if (!home) return null;
-  return join(home, DAEMON_VERSION_FILE_NAME);
+  const path = join(home, DAEMON_VERSION_FILE_NAME);
+  if (!isContainedIn(home, path)) return null;
+  return path;
 }
 
 // Atomic write: a temp file in the same directory, then rename over the

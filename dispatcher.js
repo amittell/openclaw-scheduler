@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveDispatchStateDir } from './dispatch/paths.mjs';
+import { resolveLabelsPath } from './dispatch/paths.mjs';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 import { resolveDaemonVersionPath, writeDaemonVersionFile } from './version-guard.js';
 import {
@@ -1137,8 +1137,10 @@ function removeDaemonVersionRecordIfOwned() {
 const legacyClientLabels = new Set();
 function logLegacyClientLabels() {
   try {
-    const stateDir = resolveDispatchStateDir(process.env);
-    const labelsPath = join(stateDir, process.env.DISPATCH_LABELS_PATH || 'labels.json');
+    // resolveLabelsPath validates DISPATCH_LABELS_PATH and keeps it inside the
+    // dispatch state dir (rejects traversal), so the read cannot be steered
+    // outside the scheduler home by the environment.
+    const labelsPath = resolveLabelsPath({ env: process.env });
     if (!existsSync(labelsPath)) return;
     const parsed = JSON.parse(readFileSync(labelsPath, 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
