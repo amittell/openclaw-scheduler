@@ -12,9 +12,10 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveDispatchStateDir } from './dispatch/paths.mjs';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
 import { resolveDaemonVersionPath, writeDaemonVersionFile } from './version-guard.js';
 import {
@@ -1106,22 +1107,76 @@ function submitDueDispatches() {
 
 // -- Main tick -----------------------------------------------
 let lastVersionGuardRefresh = 0;
+// True once THIS process published the version record (after acquiring the
+// lease). Shutdown/fatal cleanup only removes the record it owns, so a
+// process that failed to become the dispatcher never deletes the live
+// daemon's record.
+let daemonVersionPublished = false;
+function removeDaemonVersionRecordIfOwned() {
+  if (!daemonVersionPublished) return;
+  daemonVersionPublished = false;
+  try {
+    const versionGuardPath = resolveDaemonVersionPath(process.env);
+    if (!versionGuardPath || !existsSync(versionGuardPath)) return;
+    // Only remove the record if it still names THIS process: a lease-expiry
+    // race could have let a newer dispatcher take over and rewrite it.
+    let record = null;
+    try { record = JSON.parse(readFileSync(versionGuardPath, 'utf8')); } catch { return; }
+    if (record && record.pid !== process.pid) return;
+    unlinkSync(versionGuardPath);
+  } catch (err) {
+    log('warn', `Version guard record cleanup failed: ${err.message}`);
+  }
+}
+// Labels whose ledger row carries no clientVersion: written by an enqueue
+// CLI older than the version stamp (pre-0.6.11). The CLI side of the
+// version guard cannot see a mismatch it does not contain, so the daemon
+// logs it loudly here at the boundary every legacy client traverses.
+// (Rollout procedure: upgrade both copies atomically, then restart the
+// service; the log line names both versions and the affected label.)
+const legacyClientLabels = new Set();
+function logLegacyClientLabels() {
+  try {
+    const stateDir = resolveDispatchStateDir(process.env);
+    const labelsPath = join(stateDir, process.env.DISPATCH_LABELS_PATH || 'labels.json');
+    if (!existsSync(labelsPath)) return;
+    const parsed = JSON.parse(readFileSync(labelsPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    for (const [name, entry] of Object.entries(parsed)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      if (entry.clientVersion != null) {
+        legacyClientLabels.delete(name);
+        continue;
+      }
+      if (entry.status !== 'running' && entry.status !== 'awaiting-spawn') continue;
+      if (legacyClientLabels.has(name)) continue;
+      legacyClientLabels.add(name);
+      log('error', `Version guard: label "${name}" was enqueued by a CLI copy without a client version stamp (daemon runs v${SCHEDULER_VERSION}). The CLI copy is older than 0.6.11 and cannot self-check its version against the daemon; its completion template may be stale. Upgrade the CLI copy to v${SCHEDULER_VERSION} (npm install openclaw-scheduler@${SCHEDULER_VERSION} into the CLI install) and re-enqueue.`, { label: name, daemonVersion: SCHEDULER_VERSION });
+    }
+  } catch (err) {
+    log('warn', `Legacy client version check skipped: ${err.message}`);
+  }
+}
 async function tick() {
   const now = Date.now();
 
   // Keep the daemon version record fresh (and recover it if the file was
   // removed). Rewrite immediately when missing; otherwise refresh at most
-  // once per minute so ticks stay cheap.
+  // once per minute so ticks stay cheap. The record is only written after
+  // the dispatcher lease is held (see main()), so a process that fails to
+  // become the dispatcher never publishes a version.
   const versionGuardPath = resolveDaemonVersionPath(process.env);
   const versionGuardMissing = versionGuardPath ? !existsSync(versionGuardPath) : true;
   if (versionGuardMissing || now - lastVersionGuardRefresh >= 60_000) {
     lastVersionGuardRefresh = now;
     try {
-      writeDaemonVersionFile({ version: SCHEDULER_VERSION });
+      writeDaemonVersionFile({ version: SCHEDULER_VERSION, packagePath: __dirname });
     } catch (err) {
       log('warn', `Version guard refresh failed: ${err.message}`);
     }
   }
+
+  logLegacyClientLabels();
 
   // Gateway health check
   if (!gatewayHealthy || now - lastGatewayCheck >= 60000) {
@@ -1403,6 +1458,15 @@ function shutdown(signal) {
       await dispatcherRuntime.stop({ drain: true });
     }
     try {
+      // This process was the dispatcher: remove the version record so a
+      // stopped daemon is reported as unknown (stopped), not as a stale
+      // match. The lease is released by stop() above; a process that never
+      // acquired the lease never wrote the record (see main()).
+      removeDaemonVersionRecordIfOwned();
+    } catch (err) {
+      log('warn', `Version guard record cleanup failed: ${err.message}`);
+    }
+    try {
       // Force WAL checkpoint before close to ensure all data is in main DB
       const cpResult = checkpointWal();
       if (cpResult) {
@@ -1457,14 +1521,6 @@ async function main() {
 
   await initDb();
 
-  // Version guard: record this daemon's version where the CLI can find it.
-  // The CLI fails loudly when its own copy differs (2026-10-18 incident: a
-  // deploy updated only the service copy and dispatches ran 8 days on a
-  // stale completion template). Refreshed every tick so a deploy + restart
-  // is reflected immediately.
-  const daemonVersionPath = writeDaemonVersionFile({ version: SCHEDULER_VERSION });
-  if (daemonVersionPath) log('info', `Version guard: wrote ${SCHEDULER_VERSION} to ${daemonVersionPath}`);
-
   dispatcherRuntime = createDispatcherRuntime({
     ownerId: createDispatcherOwnerId(),
     leaseTtlMs: LEASE_TTL_MS,
@@ -1486,6 +1542,19 @@ async function main() {
   const acquiredLease = dispatcherRuntime.start();
   if (!acquiredLease) {
     throw new Error('Another live dispatcher owns the scheduler lease');
+  }
+
+  // Version guard: record this daemon's version where the CLI can find it,
+  // only AFTER this process owns the dispatcher lease (2026-10-18 incident:
+  // a deploy updated only the service copy and dispatches ran 8 days on a
+  // stale completion template). Publishing the version before the lease
+  // would leave a false-match record when this process exits because the
+  // older daemon still holds the lease; tick() refreshes the record while
+  // the lease is held, and shutdown removes it.
+  const daemonVersionPath = writeDaemonVersionFile({ version: SCHEDULER_VERSION, packagePath: __dirname });
+  if (daemonVersionPath) {
+    daemonVersionPublished = true;
+    log('info', `Version guard: wrote ${SCHEDULER_VERSION} to ${daemonVersionPath}`);
   }
   log('info', 'Dispatcher lease acquired', {
     ownerId: dispatcherRuntime.ownerId,
@@ -1549,6 +1618,10 @@ main().catch(async err => {
     }
     await dispatcherRuntime.stop({ drain: true });
   }
+  // A process that failed to become the dispatcher must not leave a version
+  // record behind (the older daemon that holds the lease keeps refreshing it).
+  // Only remove the record if THIS process published it.
+  removeDaemonVersionRecordIfOwned();
   closeDb();
   process.exit(1);
 });

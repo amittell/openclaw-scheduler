@@ -81,7 +81,7 @@ import {
   readOpenClawTranscriptTail,
 } from './session-store.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
-import { guardVersionMismatch, guardWarningLine } from '../version-guard.js';
+import { guardVersionMismatch, guardWarningLine, readPackageVersion } from '../version-guard.js';
 import {
   agentIdFromSessionKey as validatedAgentIdFromSessionKey,
   assertValidAgentId,
@@ -95,6 +95,9 @@ import {
 } from '../identifiers.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Client version stamp: the daemon logs labels enqueued by a CLI copy that
+// predates this field (no self-check possible on the client side).
+const CLIENT_VERSION = readPackageVersion(dirname(__dirname));
 const HOME_DIR = process.env.HOME || homedir();
 const GATEWAY_BASE_URL = parseGatewayBaseUrl(
   process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789',
@@ -662,6 +665,7 @@ function claimFreshSpawn(label, { sessionKey, agent, forceRetry, timeoutSeconds,
       agent,
       mode:       'fresh',
       status:     'running',
+      clientVersion: CLIENT_VERSION,
       spawnedAt:  claimedAt,
       runId:      null,
       claimedAt,
@@ -2347,6 +2351,7 @@ function prepareAttributedSpawn({
         ...(isFresh ? { sessionId: null } : {}),
         runId:          null,
         agent,
+        clientVersion:  CLIENT_VERSION,
         mode:           isFresh ? 'fresh' : 'reuse',
         model:          model || null,
         thinking,
@@ -2793,6 +2798,7 @@ async function cmdEnqueue(flags) {
       sessionKey,
       runId,
       agent,
+      clientVersion: CLIENT_VERSION,
       mode:      isFresh ? 'fresh' : 'reuse',
       model:     model || null,
       thinking,
