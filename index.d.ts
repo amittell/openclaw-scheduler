@@ -1013,6 +1013,8 @@ export const jobs: {
   // Lifecycle
   cancelJob(jobId: string, opts?: { cascade?: boolean }): string[];
   pruneExpiredJobs(): number;
+  pruneOrphanedDispatchJobs(): number;
+  /** @deprecated Use pruneOrphanedDispatchJobs for dispatch-family cleanup. */
   pruneOrphanedDeliveryWatchers(): number;
 };
 

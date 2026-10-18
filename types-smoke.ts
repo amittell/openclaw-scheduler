@@ -131,6 +131,9 @@ const poolRunning: boolean = jobs.hasRunningRunForPool('pool');
 // ---- jobs: lifecycle ----
 const cancelled: string[] = jobs.cancelJob('id', { cascade: true });
 const pruned: number = jobs.pruneExpiredJobs();
+const orphanedDispatchJobs: number = jobs.pruneOrphanedDispatchJobs();
+const orphanedDeliveryWatchers: number = jobs.pruneOrphanedDeliveryWatchers();
+void orphanedDispatchJobs; void orphanedDeliveryWatchers;
 
 // ---- runs ----
 const run: RunRecord = runs.createRun('job-1', { status: 'running', retry_count: 0 });
