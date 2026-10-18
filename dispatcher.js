@@ -1116,23 +1116,19 @@ function removeDaemonVersionRecordIfOwned() {
   if (!daemonVersionPublished) return;
   daemonVersionPublished = false;
   try {
-    const versionGuardPath = resolveDaemonVersionPath(process.env);
-    // codeql[disable] js/path-injection
-    // versionGuardPath is env-derived but validated by
+    // versionGuardPath is env-derived (SCHEDULER_HOME/HOME) but validated by
     // resolveDaemonVersionPath -> assertContainedPath (resolve + containment
     // after symlink canonicalization); the env and the local filesystem are
-    // the same trust domain for this single-user daemon. Same class as the
-    // accepted open js/path-injection baseline (jobs.js, session-store.mjs).
+    // the same trust domain for this single-user daemon.
+    const versionGuardPath = resolveDaemonVersionPath(process.env);
     if (!versionGuardPath || !existsSync(versionGuardPath)) return;
     // Only remove the record if it still names THIS process: a lease-expiry
     // race could have let a newer dispatcher take over and rewrite it.
     let record = null;
     try {
-      // codeql[disable] js/path-injection
       record = JSON.parse(readFileSync(versionGuardPath, 'utf8'));
     } catch { return; }
     if (record && record.pid !== process.pid) return;
-    // codeql[disable] js/path-injection
     unlinkSync(versionGuardPath);
   } catch (err) {
     log('warn', `Version guard record cleanup failed: ${err.message}`);
