@@ -2,7 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.11] -- 2026-10-18
+
+### Changed
+
+- **Version guard is enabled by default for every install layout, including
+  git-clone.** The 0.6.10 path heuristic disabled the guard for every
+  non-`node_modules` install, which silently excluded the documented
+  git-clone production layouts (README "Upgrading"). The guard now runs
+  everywhere except in-memory test DBs and processes that set
+  `SCHEDULER_VERSION_GUARD_DEV` (any value) - the explicit opt-out for
+  development and test checkouts. `SCHEDULER_VERSION_GUARD_FORCE` is a
+  no-op alias of the new default (enabled) behavior, kept so existing
+  docs and tests keep working.
+
+### Fixed
+
+- **The daemon publishes its version only after acquiring the dispatcher
+  lease, and removes the record on shutdown.** 0.6.10 wrote
+  `daemon-version.json` at startup, before `dispatcherRuntime.start()`; a
+  newly upgraded dispatcher that lost the lease to the old one published a
+  false-match record and then exited. The write now happens after the
+  lease is acquired, the refresh in `tick()` is unchanged, and shutdown
+  (SIGTERM/SIGINT) or a fatal startup error removes the record only if this
+  process published it (checked against the recorded PID), so a stopped
+  daemon reads as "unknown" (stopped) and a lease loser never deletes the
+  live daemon's record.
+- **Stale daemon version records expire.** A record older than the refresh
+  interval plus a 2-minute tolerance, or a record whose PID is provably
+  dead, is treated as "daemon stopped / unknown" (warning), never as a
+  match or a hard mismatch. This covers the upgrade-while-stopped case:
+  the CLI no longer hard-fails against a record left behind by a stopped
+  daemon.
+- **The version record is written atomically.** The daemon now writes a
+  temp file in the same directory and renames it over the record, so a
+  concurrent CLI reader sees either the complete old or the complete new
+  JSON - never a truncated file that 0.6.10 parsed as "unknown" and let
+  through.
+- **The record carries the daemon install path.** `package_path` names the
+  daemon copy's directory, so a mismatch error identifies both installs
+  ("CLI ... vs daemon ... (recorded at ...; daemon install ...)") instead
+  of telling the operator to upgrade "the other install" without naming it.
+- **Mismatch remediation is platform-appropriate.** The restart
+  instruction now branches on `process.platform`: `launchctl kickstart -k
+  gui/$(id -u)/ai.openclaw.scheduler` on macOS, `systemctl --user restart
+  openclaw-scheduler` on Linux, neutral wording elsewhere. The unknown-
+  record branch uses the same instruction.
+- **`doctor --deep --no-version-guard` (any flag order) initializes the
+  database.** `commandRequiresDb` no longer returns false for doctor with
+  `--no-version-guard`; the guard-skip is reported in the output
+  (`version_guard.skipped`) without skipping `initDb()`.
+- **Legacy clients cannot bypass the guard silently.** `enqueue` now stamps
+  its own version (`clientVersion`) into the labels ledger row it writes.
+  The daemon scans the ledger each tick and logs an ERROR line (to the
+  scheduler log, once per label per daemon lifetime) naming both versions
+  and the label for any running/awaiting-spawn row written by a CLI copy
+  that predates the stamp. A stale CLI cannot be made to fail (it does not
+  contain the check), so the mismatch is made visible at the boundary every
+  legacy client traverses. Rollout procedure: upgrade both copies to the
+  same version, then restart the service; the ERROR line disappears once
+  the upgraded CLI re-enqueues.
+- **Guard home paths are validated.** `SCHEDULER_HOME` /
+  `OPENCLAW_SCHEDULER_HOME` must be absolute; the resolved
+  `daemon-version.json` path must stay inside the home (rejects `../`
+  traversal and relative values). An invalid value makes the guard a no-op
+  instead of touching an unexpected file.
 
 ## [0.6.10] -- 2026-10-18
 
@@ -25,9 +89,11 @@ All notable changes to this project will be documented in this file.
   hard exit. A missing record (daemon stopped, or a pre-0.6.10 daemon) is a
   warning, not a failure, so operators can still inspect state. Set
   `SCHEDULER_VERSION_GUARD=1` to downgrade a mismatch to a stderr warning
-  while remediating; `SCHEDULER_VERSION_GUARD_FORCE=1` enables the guard from
-  a source checkout (tests use this). Source checkouts and in-memory test DBs
-  do not trip the guard by default.
+  while remediating. Development and test checkouts set
+  `SCHEDULER_VERSION_GUARD_DEV` to opt out (0.6.11 made the guard the
+  default for all install layouts, including git-clone; the 0.6.10
+  `SCHEDULER_VERSION_GUARD_FORCE` env var remains as a no-op alias). In-memory test DBs
+  do not trip the guard.
 
 ## [0.6.9] -- 2026-10-08
 

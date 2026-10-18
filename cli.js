@@ -53,9 +53,9 @@ function commandRequiresDb(cmd, subcommand, rest) {
   if (!cmd || ['help', '--help', '-h', 'version', '--version', '-v'].includes(cmd)) return false;
   if (cmd === 'schema' || cmd === 'capabilities') return false;
   if (isValidationOnlyCommand(cmd, subcommand, rest)) return false;
-  // doctor --no-version-guard reports the guard state without tripping the
-  // top-level guard's hard failure (it exits 1 on mismatch by itself).
-  if (cmd === 'doctor' && rest.includes('--no-version-guard')) return false;
+  // doctor always needs the DB (it inspects schema and tables); --no-version-guard
+  // only skips the guard's hard-fail exit, not database initialization.
+  if (cmd === 'doctor') return true;
   return true;
 }
 
