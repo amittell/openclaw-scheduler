@@ -1136,10 +1136,9 @@ function removeDaemonVersionRecordIfOwned() {
 }
 // Labels whose ledger row carries no clientVersion: written by an enqueue
 // CLI older than the version stamp (pre-0.6.11). The CLI side of the
-// version guard cannot see a mismatch it does not contain, so the daemon
-// logs it loudly here at the boundary every legacy client traverses.
-// (Rollout procedure: upgrade both copies atomically, then restart the
-// service; the log line names both versions and the affected label.)
+// version guard cannot see a mismatch it does not contain. This scan only
+// diagnoses observed ledger entries after dispatch; it cannot reject legacy
+// clients that call Gateway directly. Rollout must replace those CLI copies.
 const legacyClientLabels = new Set();
 function logLegacyClientLabels() {
   try {
@@ -1168,6 +1167,13 @@ function logLegacyClientLabels() {
 async function tick() {
   const now = Date.now();
 
+  // A previous lease can expire or be replaced between ticks. Verify ownership
+  // before publishing a version record or doing any other work for this tick.
+  if (!dispatcherRuntime?.renew()) {
+    running = false;
+    throw new Error('Dispatcher lease was lost; refusing further state transitions');
+  }
+
   // Keep the daemon version record fresh (and recover it if the file was
   // removed). Rewrite immediately when missing; otherwise refresh at most
   // once per minute so ticks stay cheap. The record is only written after
@@ -1195,13 +1201,14 @@ async function tick() {
     }
   }
 
+  // 1. Materialize every due schedule, then submit durable queue entries to
+  // the bounded worker pool. A crash cannot lose a selected due occurrence.
+  // Gateway health awaited I/O, so the pre-publication check cannot cover
+  // ownership changes during that request.
   if (!dispatcherRuntime?.renew()) {
     running = false;
     throw new Error('Dispatcher lease was lost; refusing further state transitions');
   }
-
-  // 1. Materialize every due schedule, then submit durable queue entries to
-  // the bounded worker pool. A crash cannot lose a selected due occurrence.
   try {
     const materialized = materializeDueSchedules();
     const submitted = submitDueDispatches();

@@ -23,13 +23,15 @@ All notable changes to this project will be documented in this file.
   `daemon-version.json` at startup, before `dispatcherRuntime.start()`; a
   newly upgraded dispatcher that lost the lease to the old one published a
   false-match record and then exited. The write now happens after the
-  lease is acquired, the refresh in `tick()` is unchanged, and shutdown
+  lease is acquired. Each tick renews ownership before refreshing the
+  record and again after awaited Gateway health I/O, before materializing
+  schedules. Shutdown
   (SIGTERM/SIGINT) or a fatal startup error removes the record only if this
   process published it (checked against the recorded PID), so a stopped
   daemon reads as "unknown" (stopped) and a lease loser never deletes the
   live daemon's record.
-- **Stale daemon version records expire.** A record older than the refresh
-  interval plus a 2-minute tolerance, or a record whose PID is provably
+- **Stale daemon version records expire.** A record older than 2 minutes
+  (the refresh interval is 1 minute), or a record whose PID is provably
   dead, is treated as "daemon stopped / unknown" (warning), never as a
   match or a hard mismatch. This covers the upgrade-while-stopped case:
   the CLI no longer hard-fails against a record left behind by a stopped
@@ -52,16 +54,17 @@ All notable changes to this project will be documented in this file.
   database.** `commandRequiresDb` no longer returns false for doctor with
   `--no-version-guard`; the guard-skip is reported in the output
   (`version_guard.skipped`) without skipping `initDb()`.
-- **Legacy clients cannot bypass the guard silently.** `enqueue` now stamps
+- **The daemon reports observed unversioned dispatches.** `enqueue` now stamps
   its own version (`clientVersion`) into the labels ledger row it writes.
   The daemon scans the ledger each tick and logs an ERROR line (to the
-  scheduler log, once per label per daemon lifetime) naming both versions
-  and the label for any running/awaiting-spawn row written by a CLI copy
-  that predates the stamp. A stale CLI cannot be made to fail (it does not
-  contain the check), so the mismatch is made visible at the boundary every
-  legacy client traverses. Rollout procedure: upgrade both copies to the
-  same version, then restart the service; the ERROR line disappears once
-  the upgraded CLI re-enqueues.
+  scheduler log, once per label per daemon lifetime) naming its version
+  and the label for a running/awaiting-spawn row without a client stamp.
+  This is a diagnostic after dispatch, not an enforcement boundary: old
+  clients call Gateway directly and can still enqueue. A short-lived row
+  may finish between scans. Before relying on the guard, a rollout must
+  replace every CLI entrypoint with the matching version, including global
+  installs and configured dispatch wrappers. Cross-version rejection of
+  arbitrary legacy clients requires enforcement on their Gateway path.
 - **Guard home paths are validated.** `SCHEDULER_HOME` /
   `OPENCLAW_SCHEDULER_HOME` must be absolute; the resolved
   `daemon-version.json` path must stay inside the home (rejects `../`

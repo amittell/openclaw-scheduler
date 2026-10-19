@@ -17,9 +17,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const DAEMON_VERSION_FILE_NAME = 'daemon-version.json';
 
-// The daemon refreshes the record at most once per minute. A record older
-// than the refresh interval plus this tolerance belongs to a daemon that is
-// no longer writing: treat it as unknown (stopped), never as a match.
+// The daemon refreshes the record at most once per minute. This is the total
+// age cutoff (two minutes), allowing one extra refresh interval before a
+// record is treated as unknown (stopped), never as a match.
 export const DAEMON_RECORD_STALE_MS = 2 * 60 * 1000;
 
 function firstNonEmpty(value) {
