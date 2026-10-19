@@ -1,10 +1,12 @@
 import './isolate-environment.mjs';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 import { createTestEnvironment } from '../scripts/test-environment.mjs';
 import {
@@ -196,6 +198,16 @@ test('writeDaemonVersionFile writes atomically and round-trips under both home e
   assert.equal(readDaemonVersionFile(dispatchEnv).version, packageVersion);
 });
 
+test('refresh replaces the record instead of truncating the file readers hold open', { skip: process.platform === 'win32' }, t => {
+  const home = fixtureHome(t);
+  const env = { SCHEDULER_HOME: join(home, 'scheduler') };
+  const path = writeDaemonVersionFile({ version: 'old', env });
+  const originalInode = statSync(path).ino;
+  writeDaemonVersionFile({ version: 'new', env });
+  assert.notEqual(statSync(path).ino, originalInode, 'refresh must rename a new file over the old record');
+  assert.equal(readDaemonVersionFile(env).version, 'new');
+});
+
 test('resolveDaemonVersionPath rejects traversal and relative homes', () => {
   assert.equal(resolveDaemonVersionPath({ SCHEDULER_HOME: '../etc', HOME: null, USERPROFILE: null }), null, 'relative home is rejected');
   assert.equal(resolveDaemonVersionPath({ SCHEDULER_HOME: '../../root/daemon-version.json', HOME: null, USERPROFILE: null }), null);
@@ -209,6 +221,7 @@ test('guardVersionMismatch is enabled for git-clone and npm installs by default;
   // (no daemon record here -> unknown), unlike the old heuristic that
   // disabled it for every non-node_modules path.
   const checkout = guardVersionMismatch({ env });
+  assert.ok(checkout, 'checkout installs must run the guard');
   assert.equal(checkout.status, 'unknown', 'checkout installs keep the guard enabled by default');
 
   // Explicit dev/test opt-out disables the guard entirely.
@@ -270,7 +283,9 @@ test('cli doctor --deep --no-version-guard still initializes the database (flag 
   assert.equal(payload.database.init_ok, true);
 
   // Reversed order behaves the same.
-  const reversed = runCli(['doctor', '--no-version-guard', '--deep', '--json'], cliEnv(home));
+  const reversedHome = fixtureHome(t);
+  writeDaemonVersion(reversedHome, '0.5.0');
+  const reversed = runCli(['doctor', '--no-version-guard', '--deep', '--json'], cliEnv(reversedHome));
   assert.equal(reversed.status, 0, reversed.stderr);
   assert.equal(JSON.parse(reversed.stdout).database.missing_tables.length, 0);
 });
@@ -444,12 +459,14 @@ test('dispatcher writes daemon-version.json only after lease acquisition and rem
   assert.equal(record.version, packageVersion);
   assert.ok(record.written_at, 'record has a startup timestamp');
   assert.equal(record.package_path, root, 'record names the daemon install path');
-  // The record's own timestamp proves the write happened after the lease was
-  // acquired (stderr buffering makes line-order checks unreliable).
-  const leaseLine = stderr.split('\n').find(line => line.includes('Dispatcher lease acquired'));
-  assert.ok(leaseLine, 'startup log names the lease acquisition');
-  const leaseAt = Date.parse(leaseLine.slice(0, 24));
-  assert.ok(Number.isFinite(leaseAt), `lease line has a timestamp: ${leaseLine}`);
+  // The log is emitted after publication, so its timestamp cannot prove when
+  // the lease was acquired. Read the actual lease acquisition from SQLite.
+  const leaseDb = new Database(dbPath, { readonly: true });
+  const lease = leaseDb.prepare('SELECT acquired_at, owner_id FROM dispatcher_leases WHERE name = ?').get('scheduler-dispatcher');
+  leaseDb.close();
+  assert.ok(lease.owner_id.includes(`:${child.pid}:`));
+  const leaseAt = Date.parse(`${lease.acquired_at.replace(' ', 'T')}Z`);
+  assert.ok(Number.isFinite(leaseAt), `lease has an acquisition timestamp: ${lease.acquired_at}`);
   assert.ok(Date.parse(record.written_at) >= leaseAt, 'version record is published after lease acquisition');
 
   // Refresh: delete the file and wait for the next tick to rewrite it.
@@ -539,9 +556,135 @@ test('a dispatcher that fails to acquire the lease does not publish a version re
   }
   assert.equal(second.exitCode, 1, `second dispatcher should exit 1: ${secondStderr}`);
   assert.match(secondStderr, /Another live dispatcher owns the scheduler lease/);
+  assert.ok(existsSync(versionFile), 'the lease loser did not delete the live daemon record');
   const recordAfter = JSON.parse(readFileSync(versionFile, 'utf8'));
   assert.equal(recordAfter.pid, first.pid, 'the lease loser did not overwrite the live daemon record');
-  assert.ok(existsSync(versionFile), 'the lease loser did not delete the live daemon record');
+});
+
+test('a dispatcher that loses its lease does not refresh the version record', async t => {
+  const home = fixtureHome(t);
+  const schedulerHome = join(home, 'scheduler');
+  const dbPath = join(schedulerHome, 'scheduler.db');
+  const versionFile = join(schedulerHome, 'daemon-version.json');
+  const writesPath = join(home, 'version-writes.log');
+  const observerPath = join(home, 'observe-version-writes.mjs');
+  // Observe the real writer. A write followed by fatal cleanup must still
+  // count, since a concurrent CLI could have read that false-match record.
+  writeFileSync(observerPath, `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const write = fs.writeFileSync;
+    fs.writeFileSync = function(path, ...args) {
+      if (String(path).includes('daemon-version.json')) {
+        fs.appendFileSync(${JSON.stringify(writesPath)}, 'write\\n');
+      }
+      return write.call(this, path, ...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  const env = {
+    ...cliEnv(home),
+    SCHEDULER_TICK_MS: '1000',
+    SCHEDULER_HEARTBEAT_CHECK_MS: '600000',
+    SCHEDULER_MESSAGE_DELIVERY_MS: '600000',
+    SCHEDULER_PRUNE_MS: '600000',
+    SCHEDULER_BACKUP_MS: '600000',
+  };
+  const child = spawn(process.execPath, ['--import', observerPath, dispatcherPath], {
+    cwd: root, env, stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise(resolveExit => child.once('exit', resolveExit));
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+    try { await exited; } finally { clearTimeout(timer); }
+  });
+  const readyDeadline = Date.now() + 15_000;
+  while (!stderr.includes('Gateway unreachable') && Date.now() < readyDeadline) {
+    if (child.exitCode !== null) throw new Error(`dispatcher exited early: ${stderr}`);
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+  assert.match(stderr, /Gateway unreachable/, 'first tick completed its version refresh');
+  assert.ok(existsSync(versionFile));
+  const before = readFileSync(writesPath, 'utf8');
+  assert.ok(before.includes('write'), 'observer saw the real startup writer');
+  const db = new Database(dbPath);
+  const changed = db.prepare("UPDATE dispatcher_leases SET owner_id = 'successor', fencing_token = fencing_token + 1 WHERE name = 'scheduler-dispatcher'").run();
+  db.close();
+  assert.equal(changed.changes, 1, 'takeover changes the actual live lease');
+  rmSync(versionFile);
+  const exitDeadline = Date.now() + 10_000;
+  while (child.exitCode === null && Date.now() < exitDeadline) {
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+  assert.equal(child.exitCode, 1, `dispatcher refused the lost lease: ${stderr}`);
+  assert.match(stderr, /Dispatcher lease was lost/);
+  assert.equal(readFileSync(writesPath, 'utf8'), before, 'lease loser must never republish, even temporarily');
+  assert.equal(existsSync(versionFile), false);
+});
+
+test('lease takeover during Gateway health prevents schedule materialization', async t => {
+  const home = fixtureHome(t);
+  const schedulerHome = join(home, 'scheduler');
+  const dbPath = join(schedulerHome, 'scheduler.db');
+  let healthResponse = null;
+  const server = createServer((request, response) => {
+    if (request.url === '/health') healthResponse = response;
+    else response.writeHead(404).end();
+  });
+  let child = null;
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolveClose => server.close(resolveClose));
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise(resolveExit => child.once('exit', resolveExit));
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+    try { await exited; } finally { clearTimeout(timer); }
+  });
+  await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+  const env = {
+    ...cliEnv(home),
+    OPENCLAW_GATEWAY_URL: `http://127.0.0.1:${server.address().port}`,
+    SCHEDULER_TICK_MS: '1000',
+  };
+  const added = runCli(['jobs', 'add', JSON.stringify({
+    name: 'lease-health-control', schedule_cron: '0 * * * *',
+    session_target: 'shell', payload_kind: 'shellCommand', payload_message: 'exit 0',
+    run_timeout_ms: 1000, delivery_mode: 'none', origin: 'system',
+  }), '--json'], env);
+  assert.equal(added.status, 0, added.stderr);
+  const db = new Database(dbPath);
+  t.after(() => db.close());
+  const due = db.prepare("UPDATE jobs SET next_run_at = '2000-01-01 00:00:00' WHERE name = 'lease-health-control'").run();
+  assert.equal(due.changes, 1, 'one enabled schedule is due before the health request');
+  child = spawn(process.execPath, [dispatcherPath], { cwd: root, env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const healthDeadline = Date.now() + 15_000;
+  while (!healthResponse && Date.now() < healthDeadline) {
+    if (child.exitCode !== null) throw new Error(`dispatcher exited early: ${stderr}`);
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+  assert.ok(healthResponse, 'the production Gateway health request is blocked');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM job_dispatch_queue').get().count, 0);
+  const changed = db.prepare("UPDATE dispatcher_leases SET owner_id = 'successor', fencing_token = fencing_token + 1 WHERE name = 'scheduler-dispatcher'").run();
+  assert.equal(changed.changes, 1, 'lease changes while health I/O is pending');
+  healthResponse.writeHead(503).end();
+  const exitDeadline = Date.now() + 10_000;
+  while (child.exitCode === null && Date.now() < exitDeadline) {
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+  assert.equal(child.exitCode, 1, stderr);
+  assert.match(stderr, /Gateway unreachable/);
+  assert.match(stderr, /Dispatcher lease was lost/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM job_dispatch_queue').get().count, 0,
+    'a lease loser cannot materialize the due schedule after awaited health I/O');
 });
 
 test('daemon logs loudly for labels enqueued by a legacy (unversioned) CLI', async t => {
