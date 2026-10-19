@@ -17,6 +17,7 @@ import {
 } from './messages.js';
 import { upsertAgent, getAgent, listAgents } from './agents.js';
 import { resolveSchedulerHome } from './paths.js';
+import { guardVersionMismatch, guardWarningLine } from './version-guard.js';
 import {
   SCHEDULER_PRODUCT_SCHEMA_LABEL,
   SCHEDULER_SCHEMAS,
@@ -52,6 +53,9 @@ function commandRequiresDb(cmd, subcommand, rest) {
   if (!cmd || ['help', '--help', '-h', 'version', '--version', '-v'].includes(cmd)) return false;
   if (cmd === 'schema' || cmd === 'capabilities') return false;
   if (isValidationOnlyCommand(cmd, subcommand, rest)) return false;
+  // doctor always needs the DB (it inspects schema and tables); --no-version-guard
+  // only skips the guard's hard-fail exit, not database initialization.
+  if (cmd === 'doctor') return true;
   return true;
 }
 
@@ -177,6 +181,7 @@ Aliases:
 Status:
   status                             Overall scheduler status
   doctor [--deep]                    Validate DB/schema/runtime health; --deep verifies every evidence record
+  doctor --no-version-guard          Report the CLI/daemon version guard state without the hard-fail exit
 
 Schema:
   schema [jobs|runs|messages|approvals|dispatches|dispatcher_leases|delivery_outbox|delivery_attachments|evidence_records|all]
@@ -194,6 +199,19 @@ if (dbPathMismatchNotice) {
     fail(formatDbPathMismatchNotice(dbPathMismatchNotice, { validation: true }));
   }
   process.stderr.write(`${formatDbPathMismatchNotice(dbPathMismatchNotice)}\n`);
+}
+
+// Version guard: refuse to run when this CLI copy and the daemon copy differ.
+// The dispatch completion template is built from the CLI copy, so a mismatched
+// deploy silently produces wrong output (2026-10-18 incident). Setting
+// SCHEDULER_VERSION_GUARD (any value) downgrades the failure to a stderr
+// warning while the operator remediates.
+const versionGuard = requiresDb && command !== 'doctor' ? guardVersionMismatch({ command: `openclaw-scheduler ${command}${sub ? ` ${sub}` : ''}` }) : null;
+if (versionGuard && versionGuard.status !== 'match') {
+  if (versionGuard.status === 'mismatch' && !firstNonEmpty(process.env.SCHEDULER_VERSION_GUARD)) {
+    fail(guardWarningLine(versionGuard), 1, 'VERSION_MISMATCH', versionGuard);
+  }
+  process.stderr.write(`${guardWarningLine(versionGuard)}\n`);
 }
 
 function fmt(obj) { return JSON.stringify(obj, null, 2); }
@@ -1531,8 +1549,13 @@ switch (command) {
       }
     }
     const doctorArgs = [sub, ...args].filter(Boolean);
-    const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep');
+    const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep' && arg !== '--no-version-guard');
     if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
+    const doctorSkipGuard = doctorArgs.includes('--no-version-guard');
+    const versionGuard = guardVersionMismatch({ command: 'doctor' });
+    if (versionGuard && versionGuard.status !== 'match' && !doctorSkipGuard) {
+      process.stderr.write(`${guardWarningLine(versionGuard)}\n`);
+    }
     const diagnostics = await getOperationalDiagnostics(db, {
       deepEvidence: doctorArgs.includes('--deep'),
       verifyV4Evidence: true,
@@ -1558,11 +1581,23 @@ switch (command) {
     }
     if (!integrityOk) warnings.push('SQLite quick_check reported database integrity errors.');
     if (foreignKeyViolations.length > 0) warnings.push('SQLite foreign-key violations require repair before safe operation.');
+    if (versionGuard && versionGuard.status === 'unknown') {
+      warnings.push('Version guard: no daemon version record found; the dispatcher may be stopped or pre-date 0.6.10 (see version_guard).');
+    }
+    // A mismatch is a hard failure for doctor. An unknown record (daemon
+    // stopped, or pre-0.6.10) is a warning only -- doctor already reports a
+    // missing lease, and operators must still be able to inspect state while
+    // the daemon is down.
+    const versionGuardHealthy = !versionGuard
+      || versionGuard.status === 'match'
+      || versionGuard.status === 'unknown'
+      || doctorSkipGuard;
     const healthy = missingTables.length === 0
       && schemaVersion === SCHEDULER_SCHEMA_VERSION
       && dbParentWritable
       && integrityOk
       && foreignKeyViolations.length === 0
+      && versionGuardHealthy
       && (diagnostics.recovery_blocked_runs || 0) === 0
       && (diagnostics.credential_cleanup_failures || 0) === 0
       && (diagnostics.evidence_records.invalid || 0) === 0
@@ -1570,6 +1605,15 @@ switch (command) {
     const result = {
       ok: healthy,
       package: { name: pkg.name, version: pkg.version, node: process.version },
+      version_guard: versionGuard ? {
+        status: versionGuard.status,
+        cli_version: versionGuard.cliVersion,
+        daemon_version: versionGuard.daemonVersion,
+        cli_path: versionGuard.cliPath,
+        daemon_path: versionGuard.daemonPath,
+        skipped: doctorSkipGuard || null,
+        message: versionGuard.message,
+      } : null,
       paths: {
         scheduler_home: resolveSchedulerHome(process.env),
         db_path: dbPath,
@@ -1596,6 +1640,13 @@ switch (command) {
     emit(result, () => {
       console.log(`Scheduler doctor: ${healthy ? 'healthy' : 'unhealthy'}`);
       console.log(`Package: ${pkg.name} ${pkg.version} on ${process.version}`);
+      if (versionGuard) {
+        const state = doctorSkipGuard ? 'skipped' : versionGuard.status;
+        console.log(`Version guard: CLI ${versionGuard.cliVersion} vs daemon ${versionGuard.daemonVersion ?? 'unknown'} (${state})`);
+        if (versionGuard.message) console.log(`  ${versionGuard.message}`);
+      } else {
+        console.log('Version guard: not applicable (source checkout or in-memory DB)');
+      }
       console.log(`Database: ${dbPath}`);
       console.log(`Schema: ${schemaVersion ?? 'unknown'} / ${SCHEDULER_SCHEMA_VERSION}`);
       console.log(`Required tables: ${missingTables.length === 0 ? 'present' : `missing ${missingTables.join(', ')}`}`);
