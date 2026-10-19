@@ -201,7 +201,8 @@ test('writeDaemonVersionFile writes atomically and round-trips under both home e
 test('refresh replaces the record instead of truncating the file readers hold open', { skip: process.platform === 'win32' }, t => {
   const home = fixtureHome(t);
   const env = { SCHEDULER_HOME: join(home, 'scheduler') };
-  const path = writeDaemonVersionFile({ version: 'old', env });
+  const path = join(home, 'scheduler', 'daemon-version.json');
+  assert.equal(writeDaemonVersionFile({ version: 'old', env }), path);
   const originalInode = statSync(path).ino;
   writeDaemonVersionFile({ version: 'new', env });
   assert.notEqual(statSync(path).ino, originalInode, 'refresh must rename a new file over the old record');
