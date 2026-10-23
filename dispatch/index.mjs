@@ -80,6 +80,7 @@ import {
   readOpenClawSessionStore,
   readOpenClawTranscriptTail,
 } from './session-store.mjs';
+import { getJsonlTurnAbortReason } from './turn-abort.mjs';
 import { buildDispatchDeliverySurface } from '../scripts/dispatch-cli-utils.mjs';
 import {
   agentIdFromSessionKey as validatedAgentIdFromSessionKey,
@@ -1276,67 +1277,6 @@ function getJsonlTerminalReplyReason(entries) {
         ? 'terminal assistant reply observed in JSONL'
         : null;
     }
-  }
-
-  return null;
-}
-
-function contentHasTurnAbortMarker(content) {
-  if (!content) return false;
-  if (typeof content === 'string') return content.includes('<turn_aborted>');
-  if (!Array.isArray(content)) return false;
-  return content.some(part => {
-    const text = part?.text || part?.input_text || part?.content || '';
-    return typeof text === 'string' && text.includes('<turn_aborted>');
-  });
-}
-
-function entryRole(entry) {
-  return entry?.role
-    || entry?.message?.role
-    || entry?.payload?.role
-    || entry?.payload?.message?.role
-    || null;
-}
-
-function entryHasTurnAborted(entry) {
-  if (!entry || typeof entry !== 'object') return false;
-  if (entry.type === 'turn_aborted') return true;
-  if (entry.payload?.type === 'turn_aborted') return true;
-
-  const role = entryRole(entry);
-  if (role !== 'user') return false;
-  return contentHasTurnAbortMarker(entry.content)
-    || contentHasTurnAbortMarker(entry.message?.content)
-    || contentHasTurnAbortMarker(entry.payload?.content)
-    || contentHasTurnAbortMarker(entry.payload?.message?.content);
-}
-
-function entryStartsPostAbortActivity(entry) {
-  if (!entry || typeof entry !== 'object' || entryHasTurnAborted(entry)) return false;
-  const role = entryRole(entry);
-  if (role === 'assistant' || role === 'user') return true;
-
-  const payloadType = entry.payload?.type || null;
-  return entry.type === 'response_item' && [
-    'message',
-    'function_call',
-    'function_call_output',
-    'custom_tool_call',
-    'custom_tool_call_output',
-  ].includes(payloadType);
-}
-
-function getJsonlTurnAbortReason(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entryHasTurnAborted(entry)) {
-      const reason = entry?.payload?.reason || entry?.reason || 'interrupted';
-      return `turn_aborted observed in session JSONL (${reason})`;
-    }
-    if (entryStartsPostAbortActivity(entry)) return null;
   }
 
   return null;

@@ -63,6 +63,7 @@ import {
   readOpenClawSessionStore,
   readOpenClawTranscriptTail,
 } from './session-store.mjs';
+import { getJsonlTurnAbortReason } from './turn-abort.mjs';
 import { sendMessage } from '../messages.js';
 import { ensureArtifactsDir, resolveArtifactsDir } from '../paths.js';
 import {
@@ -903,67 +904,6 @@ function formatDiagnosticSnippet(reply) {
   return `\n\nLast assistant report observed:\n${clipped}`;
 }
 
-function contentHasTurnAbortMarker(content) {
-  if (!content) return false;
-  if (typeof content === 'string') return content.includes('<turn_aborted>');
-  if (!Array.isArray(content)) return false;
-  return content.some(part => {
-    const text = part?.text || part?.input_text || part?.content || '';
-    return typeof text === 'string' && text.includes('<turn_aborted>');
-  });
-}
-
-function entryRole(entry) {
-  return entry?.role
-    || entry?.message?.role
-    || entry?.payload?.role
-    || entry?.payload?.message?.role
-    || null;
-}
-
-function entryHasTurnAborted(entry) {
-  if (!entry || typeof entry !== 'object') return false;
-  if (entry.type === 'turn_aborted') return true;
-  if (entry.payload?.type === 'turn_aborted') return true;
-
-  const role = entryRole(entry);
-  if (role !== 'user') return false;
-  return contentHasTurnAbortMarker(entry.content)
-    || contentHasTurnAbortMarker(entry.message?.content)
-    || contentHasTurnAbortMarker(entry.payload?.content)
-    || contentHasTurnAbortMarker(entry.payload?.message?.content);
-}
-
-function entryStartsPostAbortActivity(entry) {
-  if (!entry || typeof entry !== 'object' || entryHasTurnAborted(entry)) return false;
-  const role = entryRole(entry);
-  if (role === 'assistant' || role === 'user') return true;
-
-  const payloadType = entry.payload?.type || null;
-  return entry.type === 'response_item' && [
-    'message',
-    'function_call',
-    'function_call_output',
-    'custom_tool_call',
-    'custom_tool_call_output',
-  ].includes(payloadType);
-}
-
-function getJsonlTurnAbortReasonFromEntries(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entryHasTurnAborted(entry)) {
-      const reason = entry?.payload?.reason || entry?.reason || 'interrupted';
-      return `turn_aborted observed in session JSONL (${reason})`;
-    }
-    if (entryStartsPostAbortActivity(entry)) return null;
-  }
-
-  return null;
-}
-
 function entryArtifactEvidenceReason(entry) {
   if (!entry || typeof entry !== 'object') return null;
 
@@ -1190,7 +1130,7 @@ function getSessionJsonlEntriesFromStatus(status, maxLines = 200) {
 }
 
 function getSessionTurnAbortReason(status) {
-  return getJsonlTurnAbortReasonFromEntries(getSessionJsonlEntriesFromStatus(status, 80));
+  return getJsonlTurnAbortReason(getSessionJsonlEntriesFromStatus(status, 80));
 }
 
 function getSessionArtifactEvidence(status) {
@@ -1938,19 +1878,26 @@ function runOnceAndExit() {
     if (stallReason) {
       const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
       if (artifactEvidence?.found) {
+        // Artifact-backed stall: the session produced real output before dying.
+        // Route to the interrupted (redispatchable) outcome instead of error.
+        // emitInterruptedOutcome always exits (redispatch scheduled, budget
+        // exhausted, or verify-cmd passed), so nothing below runs on this path.
         emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
         });
+      } else {
+        // No artifact evidence: a genuine stall with no recoverable output.
+        // Mark the label error and terminate.
+        process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+        markLabelError(label, stallReason);
+        process.stdout.write(
+          `❌ *dispatch* [${label}] failed\n` +
+          `Summary: ${stallReason}\n`
+        );
+        process.exit(0);
       }
-      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
-      markLabelError(label, stallReason);
-      process.stdout.write(
-        `❌ *dispatch* [${label}] failed\n` +
-        `Summary: ${stallReason}\n`
-      );
-      process.exit(0);
     }
   }
 
@@ -2350,19 +2297,24 @@ while (Date.now() < deadline) {
     if (stallReason) {
       const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
       if (artifactEvidence?.found) {
+        // Artifact-backed stall: route to the interrupted (redispatchable)
+        // outcome instead of error. emitInterruptedOutcome always exits.
         emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
         });
+      } else {
+        // No artifact evidence: a genuine stall with no recoverable output.
+        // Mark the label error and terminate.
+        process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+        markLabelError(label, stallReason);
+        process.stdout.write(
+          `❌ *dispatch* [${label}] failed\n` +
+          `Summary: ${stallReason}\n`
+        );
+        process.exit(1);
       }
-      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
-      markLabelError(label, stallReason);
-      process.stdout.write(
-        `❌ *dispatch* [${label}] failed\n` +
-        `Summary: ${stallReason}\n`
-      );
-      process.exit(1);
     }
   }
 

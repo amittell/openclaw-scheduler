@@ -57,6 +57,7 @@
     "dispatch/paths.mjs",
     "dispatch/session-store.mjs",
     "dispatch/source-context.mjs",
+    "dispatch/turn-abort.mjs",
     "dispatch/README.md",
     "dispatch/watcher.mjs",
     "scripts/dispatch-cli-utils.mjs",
