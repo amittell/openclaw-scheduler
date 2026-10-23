@@ -921,10 +921,51 @@ function entryRole(entry) {
     || null;
 }
 
+function entryHasProviderAbort(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+
+  // (1) Assistant entry that ended with stopReason/stop_reason === "aborted":
+  //     the provider aborted the in-flight model request (e.g. the fleet-wide
+  //     kebab-rtx6000/qwen3.6-27b outage on 2026-06-27). Such an entry
+  //     typically has empty content and an errorMessage like "Request was
+  //     aborted". Recognizing it as a turn abort routes the session to the
+  //     interrupted (redispatchable) path instead of the stall path.
+  const role = entryRole(entry);
+  if (role === 'assistant') {
+    const stopReason = entry?.stopReason ?? entry?.stop_reason
+      ?? entry?.message?.stopReason ?? entry?.message?.stop_reason
+      ?? entry?.payload?.stopReason ?? entry?.payload?.stop_reason
+      ?? entry?.payload?.message?.stopReason ?? entry?.payload?.message?.stop_reason
+      ?? null;
+    if (stopReason === 'aborted') return true;
+  }
+
+  // (2) openclaw:prompt-error custom entry carrying the abort message ("This
+  //     operation was aborted"). OpenClaw persists this right after a provider
+  //     abort so the transcript tail is unambiguous.
+  const isPromptError = entry?.customType === 'openclaw:prompt-error'
+    || entry?.type === 'openclaw:prompt-error'
+    || entry?.payload?.type === 'openclaw:prompt-error'
+    || entry?.payload?.customType === 'openclaw:prompt-error';
+  if (isPromptError) {
+    const errMsg = entry?.data?.error
+      ?? entry?.error
+      ?? entry?.payload?.data?.error
+      ?? entry?.payload?.error
+      ?? '';
+    if (typeof errMsg === 'string' && /operation was aborted|was aborted/i.test(errMsg)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function entryHasTurnAborted(entry) {
   if (!entry || typeof entry !== 'object') return false;
   if (entry.type === 'turn_aborted') return true;
   if (entry.payload?.type === 'turn_aborted') return true;
+  if (entryHasProviderAbort(entry)) return true;
 
   const role = entryRole(entry);
   if (role !== 'user') return false;
@@ -1938,19 +1979,26 @@ function runOnceAndExit() {
     if (stallReason) {
       const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
       if (artifactEvidence?.found) {
+        // Artifact-backed stall: the session produced real output before dying.
+        // Route to the interrupted (redispatchable) outcome instead of error.
+        // emitInterruptedOutcome always exits (redispatch scheduled, budget
+        // exhausted, or verify-cmd passed), so nothing below runs on this path.
         emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
         });
+      } else {
+        // No artifact evidence: a genuine stall with no recoverable output.
+        // Mark the label error and terminate.
+        process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+        markLabelError(label, stallReason);
+        process.stdout.write(
+          `❌ *dispatch* [${label}] failed\n` +
+          `Summary: ${stallReason}\n`
+        );
+        process.exit(0);
       }
-      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
-      markLabelError(label, stallReason);
-      process.stdout.write(
-        `❌ *dispatch* [${label}] failed\n` +
-        `Summary: ${stallReason}\n`
-      );
-      process.exit(0);
     }
   }
 
@@ -2350,19 +2398,24 @@ while (Date.now() < deadline) {
     if (stallReason) {
       const artifactEvidence = result?.artifactEvidence || getSessionArtifactEvidence(status);
       if (artifactEvidence?.found) {
+        // Artifact-backed stall: route to the interrupted (redispatchable)
+        // outcome instead of error. emitInterruptedOutcome always exits.
         emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
         });
+      } else {
+        // No artifact evidence: a genuine stall with no recoverable output.
+        // Mark the label error and terminate.
+        process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
+        markLabelError(label, stallReason);
+        process.stdout.write(
+          `❌ *dispatch* [${label}] failed\n` +
+          `Summary: ${stallReason}\n`
+        );
+        process.exit(1);
       }
-      process.stderr.write(`[watcher] [${label}] ${stallReason}\n`);
-      markLabelError(label, stallReason);
-      process.stdout.write(
-        `❌ *dispatch* [${label}] failed\n` +
-        `Summary: ${stallReason}\n`
-      );
-      process.exit(1);
     }
   }
 
