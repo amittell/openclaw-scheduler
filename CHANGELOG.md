@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Completion-delivery safety net for `done` labels whose watcher was lost
+  (`dispatch/completion-safety-net.mjs`).** The one-shot delivery watcher job
+  (`<brand>-deliver:<label>`, `delete_after_run` + `ttl_hours: 48`) was the
+  only path that delivered a dispatch completion: if it was deleted, expired,
+  or lost on a scheduler/gateway restart, a `done` label with
+  `completionDeliveredAt` still null was never delivered and its
+  `completion_debts` row stayed open forever (2 stale open debts from
+  2026-08-26, plus the 2026-10-23 `watcher-abort-stall-fix` incident that had
+  to be delivered manually). The new periodic script (mirrors
+  `529-recovery.mjs`, registered the same way: `*/10 * * * *` shell job,
+  `alert-gate.sh` wrapper on this host) scans `labels.json` for `done` labels
+  with a recorded delivery target and no `completionDeliveredAt`, skips labels
+  with a live watcher run, re-derives the completion from the transcript with
+  the same conservative logic as `result` (only a clean terminal assistant
+  reply or the recorded structured completion counts -- never a fabricated
+  one), re-enqueues through the durable outbox (the
+  `dispatch-completion:<scope>:<routeHash>` idempotency key makes repeated
+  runs a no-op dedupe), and on success closes the completion debt and stamps
+  `completionDeliveredAt` under the labels lock. Labels are bounded by a 48h
+  age window (overridable via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a
+  per-label retry cap of 3, and a 5-minute minimum between attempts.
+
 ## [0.6.9] -- 2026-10-08
 
 ### Changed

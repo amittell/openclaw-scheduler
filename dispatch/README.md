@@ -20,6 +20,7 @@ No scheduler DB dependency. No dispatcher tick delay. Sessions start instantly.
 | `watcher.mjs` | Delivery monitoring process |
 | `label-lock.mjs` | Process-safe mutex for ledger read-modify-write operations |
 | `529-recovery.mjs` | Transient error recovery |
+| `completion-safety-net.mjs` | Completion-delivery safety net for done labels with a lost watcher |
 | `deliver-watcher.sh` | Shell wrapper for result retrieval |
 | `chilisaus.mjs` | Branded chilisaus wrapper over this dispatch engine |
 | `gateway-rpc.mjs` | Gateway CLI parsing and RPC error-envelope validation |
@@ -629,6 +630,40 @@ openclaw-scheduler jobs add '{
   "delivery_to": "YOUR_CHAT_ID"
 }'
 ```
+
+---
+
+## Completion Delivery Safety Net (cron job)
+
+The one-shot delivery watcher job (`<brand>-deliver:<label>`, `delete_after_run`
++ `ttl_hours: 48`) is the only path that delivers a dispatch completion. If it
+is deleted, expires, or is lost on a scheduler/gateway restart, a `done` label
+whose `completionDeliveredAt` is still null would never be delivered (the
+`completion_debts` row stays open forever). The safety net closes that gap:
+
+```bash
+openclaw-scheduler jobs add '{
+  "name": "Chilisaus Completion Safety Net",
+  "schedule_cron": "*/10 * * * *",
+  "session_target": "shell",
+  "payload_message": "node ~/.openclaw/scheduler/dispatch/completion-safety-net.mjs",
+  "delivery_mode": "announce",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_CHAT_ID"
+}'
+```
+
+It scans `labels.json` for `done` labels with no `completionDeliveredAt` and a
+recorded delivery target, skips labels with a live watcher run, re-derives the
+completion from the transcript (only a clean terminal assistant reply or the
+recorded structured completion counts -- never a fabricated one), re-enqueues
+through the durable outbox (idempotency key makes repeated runs a no-op
+dedupe), and on success closes the completion debt and stamps
+`completionDeliveredAt`. Labels are bounded by a 48h age window (overridable
+via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a per-label retry cap of 3, and a
+5-minute minimum between attempts. On this host the job is wrapped with
+`alert-gate.sh` (verdict probe `verdict_completion_safety_net`) exactly like
+the `Chilisaus 529 Recovery` job.
 
 ---
 
