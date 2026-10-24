@@ -9,7 +9,9 @@ import { spawnSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 
-import { readFileSync as readFileSyncImported } from 'node:fs';
+import { applyBundledSchema, closeDb, setDbPath } from '../db.js';
+import { claimDelivery, markDeliveryDelivered } from '../delivery-outbox.js';
+import { validateJobSpec } from '../jobs.js';
 import { buildCompletionDeliveryScope } from '../dispatch/hooks.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -178,13 +180,8 @@ function readLabels(fixture) {
  */
 function initFixtureDb(fixture) {
   const dbPath = join(fixture.root, 'scheduler.db');
-  const schema = readFileSyncImported(join(REPO_DIR, 'schema.sql'), 'utf8');
-  const db = new Database(dbPath);
-  try {
-    db.exec(schema);
-  } finally {
-    db.close();
-  }
+  setDbPath(dbPath);
+  try { applyBundledSchema(); } finally { closeDb(); }
   return dbPath;
 }
 
@@ -266,7 +263,7 @@ function completionScope(label, entry) {
   });
 }
 
-test('done label with a lost watcher gets its completion re-delivered and the debt closed', () => {
+test('enqueue stays pending until all outbox delivery is confirmed', () => {
   const fixture = createFixture();
   try {
     seedSession(fixture.databasePath, {
@@ -276,11 +273,11 @@ test('done label with a lost watcher gets its completion re-delivered and the de
     writeLabels(fixture, { [label]: doneLabel() });
     const { run, env } = runSafetyNet(fixture);
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /✅ Delivered: lost-watcher-done/, run.stdout);
+    assert.match(run.stdout, /Queued: lost-watcher-done/, run.stdout);
 
     const labels = readLabels(fixture);
-    assert.ok(labels[label].completionDeliveredAt, 'completionDeliveredAt stamped');
-    assert.equal(labels[label].completionDeliverySource, 'safety-net');
+    assert.equal(labels[label].completionDeliveredAt, undefined);
+    assert.equal(labels[label].completionDeliverySource, undefined);
     assert.equal(labels[label].completionRetryCount, 1);
 
     const db = new Database(env.SCHEDULER_DB);
@@ -295,11 +292,17 @@ test('done label with a lost watcher gets its completion re-delivered and the de
       assert.equal(outbox.idempotency_key, `dispatch-completion:${completionScope(label, labels[label])}:${routeHash()}`);
       assert.match(outbox.body, /The work is complete/);
       const debt = db.prepare(`SELECT * FROM completion_debts WHERE task_label = ?`).get(label);
-      assert.equal(debt.status, 'closed', 'completion debt closed');
-      assert.match(debt.close_reason, /safety-net/);
+      assert.equal(debt.status, 'delivering');
+      assert.equal(debt.final_reported_at, null);
+      const claimed = claimDelivery(outbox.id, { db, owner: 'fixture' });
+      assert.equal(markDeliveryDelivered(outbox.id, claimed.claim_token, { db }).transitioned, true);
+      assert.equal(db.prepare('SELECT status FROM completion_debts WHERE task_label = ?').get(label).status, 'closed');
     } finally {
       db.close();
     }
+    const confirmed = runSafetyNet(fixture);
+    assert.equal(confirmed.run.status, 0, confirmed.run.stderr);
+    assert.ok(readLabels(fixture)[label].completionDeliveredAt);
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -368,6 +371,54 @@ test('no clean terminal reply re-derivable -> skipped, no fabricated delivery', 
     }
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('unrelated prefix and wildcard watcher names do not suppress recovery', () => {
+  for (const [label, otherLabel] of [['backup', 'backup-extra'], ['backup_%', 'backup-1']]) {
+    const fixture = createFixture();
+    try {
+      seedSession(fixture.databasePath, { terminalReply: 'Completed the requested work and verified the output.' });
+      writeLabels(fixture, { [label]: doneLabel() });
+      const dbPath = initFixtureDb(fixture);
+      createWatcherRun(dbPath, otherLabel);
+      const { run } = runSafetyNet(fixture, { db: dbPath });
+      assert.equal(run.status, 0, run.stderr);
+      assert.ok(run.stdout.includes(`Queued: ${label}`), run.stdout);
+      assert.equal(readLabels(fixture)[label].completionRetryCount, 1);
+    } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('recorded watcher identity takes precedence over another run using the same label', () => {
+  const fixture = createFixture();
+  try {
+    seedSession(fixture.databasePath, { terminalReply: 'Completed the requested work and verified the output.' });
+    const label = 'reused-watcher';
+    writeLabels(fixture, { [label]: doneLabel({ deliveryWatcherJobId: 'current-run-watcher' }) });
+    const dbPath = initFixtureDb(fixture);
+    createWatcherRun(dbPath, label);
+    const { run } = runSafetyNet(fixture, { db: dbPath });
+    assert.equal(run.status, 0, run.stderr);
+    assert.ok(run.stdout.includes(`Queued: ${label}`), run.stdout);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('the recorded watcher job and legacy handoff watcher still suppress duplicate recovery', () => {
+  for (const recorded of [true, false]) {
+    const fixture = createFixture();
+    try {
+      seedSession(fixture.databasePath, { terminalReply: 'Completed the requested work and verified the output.' });
+      const label = 'watcher-specific';
+      const watcherLabel = recorded ? 'renamed-watcher' : `${label}:handoff:123456`;
+      writeLabels(fixture, { [label]: doneLabel(recorded
+        ? { deliveryWatcherJobId: `watcher-job-${watcherLabel}` } : {}) });
+      const dbPath = initFixtureDb(fixture);
+      createWatcherRun(dbPath, watcherLabel);
+      const { run } = runSafetyNet(fixture, { db: dbPath });
+      assert.equal(run.status, 0, run.stderr);
+      assert.equal(readLabels(fixture)[label].completionRetryCount, undefined);
+    } finally { rmSync(fixture.root, { recursive: true, force: true }); }
   }
 });
 
@@ -481,7 +532,8 @@ test('retry cap stops hammering a label that never yields a clean completion', (
     writeLabels(fixture, {
       [label]: doneLabel({
         completionRetryCount: 3,
-        lastCompletionAttemptAt: new Date(Date.now() - 60_000).toISOString(),
+        completionRetryScope: completionScope(label, doneLabel()),
+        lastCompletionAttemptAt: new Date(Date.now() - 600_000).toISOString(),
       }),
     });
 
@@ -493,4 +545,191 @@ test('retry cap stops hammering a label that never yields a clean completion', (
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+function runFixtureCode(fixture, code) {
+  return spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+    cwd: REPO_DIR, encoding: 'utf8', timeout: 30_000,
+    env: { ...process.env, HOME: fixture.root, OPENCLAW_STATE_DIR: fixture.stateDir,
+      DISPATCH_CONFIG_DIR: fixture.configDir, DISPATCH_STATE_DIR: fixture.dispatchState,
+      DISPATCH_LABELS_PATH: fixture.labelsPath, SCHEDULER_DB: join(fixture.root, 'scheduler.db') },
+  });
+}
+
+test('documented registration validates with a timeout and system origin', () => {
+  const doc = readFileSync(join(REPO_DIR, 'dispatch/README.md'), 'utf8');
+  const match = [...doc.matchAll(/jobs add '(\{[^']+\})'/g)]
+    .map(item => JSON.parse(item[1])).find(item => item.name === 'Chilisaus Completion Safety Net');
+  assert.ok(match);
+  assert.equal(match.origin, 'system');
+  assert.equal(match.run_timeout_ms, 300000);
+  assert.doesNotThrow(() => validateJobSpec(match));
+});
+
+test('thin transcript retains the normal structured-completion precedence', () => {
+  const fixture = createFixture();
+  try {
+    seedSession(fixture.databasePath, { terminalReply: 'I have finished the requested work.' });
+    const completion = { summary_human: 'The backup repair is ready. Deployment remains blocked until the restore check passes.' };
+    writeLabels(fixture, { 'structured-result': doneLabel({ completion }) });
+    const { run, dbPath } = runSafetyNet(fixture);
+    assert.equal(run.status, 0, run.stderr);
+    const db = new Database(dbPath);
+    try {
+      const row = db.prepare('SELECT body FROM delivery_outbox').get();
+      assert.match(row.body, /Deployment remains blocked/);
+      assert.doesNotMatch(row.body, /I have finished the requested work/);
+    } finally { db.close(); }
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('a reused label receives a fresh retry budget and interval', () => {
+  const fixture = createFixture();
+  try {
+    seedSession(fixture.databasePath, { terminalReply: 'The backup is verified and the restore check passed.' });
+    const label = 'reused';
+    writeLabels(fixture, { [label]: doneLabel({ runId: 'new-run', completionRetryCount: 3,
+      completionRetryScope: completionScope(label, doneLabel()), lastCompletionAttemptAt: new Date().toISOString() }) });
+    const { run } = runSafetyNet(fixture);
+    assert.equal(run.status, 0, run.stderr);
+    const row = readLabels(fixture)[label];
+    assert.equal(row.completionRetryCount, 1);
+    assert.equal(row.completionRetryScope, completionScope(label, row));
+    assert.match(run.stdout, /Queued: reused/);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('replacement before enqueue cannot receive the claimed old completion', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, { race: doneLabel() });
+    const run = runFixtureCode(fixture, `
+      import assert from 'node:assert/strict';
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { initDb, getDb } from './db.js';
+      import { claimAttempt, enqueueClaim } from './dispatch/completion-safety-net.mjs';
+      await initDb();
+      const claim = claimAttempt('race');
+      const replacement = { ...claim.entry, runId: 'replacement-run', summary: 'Replacement must survive' };
+      writeFileSync(process.env.DISPATCH_LABELS_PATH, JSON.stringify({ race: replacement }));
+      const result = enqueueClaim('race', claim, { deliveryText: 'Old report', summary: 'Old report' });
+      assert.equal(result.reason, 'label-changed');
+      assert.deepEqual(JSON.parse(readFileSync(process.env.DISPATCH_LABELS_PATH)).race, replacement);
+      assert.equal(getDb().prepare('SELECT COUNT(*) AS n FROM delivery_outbox').get().n, 0);
+      assert.equal(getDb().prepare('SELECT COUNT(*) AS n FROM completion_debts').get().n, 0);
+    `);
+    assert.equal(run.status, 0, run.stderr);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('delayed old confirmation cannot close or stamp a replacement run', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, { race: doneLabel() });
+    const run = runFixtureCode(fixture, `
+      import assert from 'node:assert/strict';
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { initDb, getDb } from './db.js';
+      import { claimDelivery, markDeliveryDelivered } from './delivery-outbox.js';
+      import { recordCompletionDeliveryDebt, buildCompletionDeliveryScope } from './dispatch/hooks.mjs';
+      import { claimAttempt, enqueueClaim, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      await initDb();
+      const claim = claimAttempt('race');
+      const queued = enqueueClaim('race', claim, { deliveryText: 'Old report', summary: 'Old report' });
+      assert.equal(queued.enqueued, true);
+      const replacement = { ...claim.entry, runId: 'replacement-run', summary: 'Replacement must survive' };
+      writeFileSync(process.env.DISPATCH_LABELS_PATH, JSON.stringify({ race: replacement }));
+      const nextScope = buildCompletionDeliveryScope({ label: 'race', sessionKey: replacement.sessionKey, runId: replacement.runId });
+      recordCompletionDeliveryDebt({ label: 'race', sessionKey: replacement.sessionKey, runId: replacement.runId,
+        deliveryScope: nextScope, openReason: 'replacement-awaits-report' });
+      await Promise.resolve();
+      assert.equal(reconcileConfirmedDelivery('race', claim.entry), false);
+      const delivery = claimDelivery(queued.outboxId, { owner: 'fixture' });
+      assert.equal(markDeliveryDelivered(queued.outboxId, delivery.claim_token).transitioned, true);
+      assert.equal(reconcileConfirmedDelivery('race', claim.entry), false);
+      assert.deepEqual(JSON.parse(readFileSync(process.env.DISPATCH_LABELS_PATH)).race, replacement);
+      assert.equal(getDb().prepare('SELECT status FROM completion_debts WHERE delivery_scope = ?').get(nextScope).status, 'open');
+      assert.equal(getDb().prepare('SELECT status FROM completion_debts WHERE delivery_scope = ?').get(claim.identity.deliveryScope).status, 'closed');
+    `);
+    assert.equal(run.status, 0, run.stderr);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('an existing pending claim is not mistaken for confirmed delivery', () => {
+  const fixture = createFixture();
+  try {
+    seedSession(fixture.databasePath, { terminalReply: 'The backup is verified and the restore check passed.' });
+    const label = 'pending-claim';
+    writeLabels(fixture, { [label]: doneLabel() });
+    const first = runSafetyNet(fixture);
+    assert.equal(first.run.status, 0, first.run.stderr);
+    const entry = readLabels(fixture)[label];
+    entry.lastCompletionAttemptAt = new Date(Date.now() - 360000).toISOString();
+    writeLabels(fixture, { [label]: entry });
+    const second = runSafetyNet(fixture);
+    assert.equal(second.run.status, 0, second.run.stderr);
+    assert.equal(readLabels(fixture)[label].completionDeliveredAt, undefined);
+    const db = new Database(first.dbPath);
+    try {
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM delivery_outbox').get().n, 1);
+      const debt = db.prepare('SELECT * FROM completion_debts').get();
+      assert.equal(debt.status, 'delivering');
+      assert.equal(debt.final_reported_at, null);
+    } finally { db.close(); }
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('partial or failed multipart delivery cannot confirm the label', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, { multipart: doneLabel() });
+    const run = runFixtureCode(fixture, `
+      import assert from 'node:assert/strict';
+      import { initDb } from './db.js';
+      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered, markDeliveryFailed } from './delivery-outbox.js';
+      import { claimAttempt, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      await initDb();
+      const claim = claimAttempt('multipart');
+      const queued = enqueueMultipartDelivery({ body: 'The verified backup report contains important results. '.repeat(100),
+        channel: 'telegram', target: 'test-target', idempotencyKey: 'multipart-fixture',
+        completionLabel: 'multipart', completionScope: claim.identity.deliveryScope, maxPartBytes: 3000 });
+      assert.ok(queued.deliveries.length > 1);
+      const first = queued.deliveries[0];
+      const owned = claimDelivery(first.id, { owner: 'fixture' });
+      markDeliveryDelivered(first.id, owned.claim_token);
+      assert.equal(reconcileConfirmedDelivery('multipart', claim.entry), false);
+      const second = queued.deliveries[1];
+      const failed = claimDelivery(second.id, { owner: 'fixture' });
+      markDeliveryFailed(second.id, failed.claim_token, 'fixture failure');
+      assert.equal(reconcileConfirmedDelivery('multipart', claim.entry), false);
+    `);
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(readLabels(fixture).multipart.completionDeliveredAt, undefined);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('the last confirmed multipart part permits a completion stamp', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, { multipart: doneLabel() });
+    const run = runFixtureCode(fixture, `
+      import assert from 'node:assert/strict';
+      import { initDb } from './db.js';
+      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered } from './delivery-outbox.js';
+      import { claimAttempt, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      await initDb();
+      const claim = claimAttempt('multipart');
+      const queued = enqueueMultipartDelivery({ body: 'The verified backup report contains important results. '.repeat(100),
+        channel: 'telegram', target: 'test-target', idempotencyKey: 'multipart-fixture',
+        completionLabel: 'multipart', completionScope: claim.identity.deliveryScope, maxPartBytes: 3000 });
+      assert.ok(queued.deliveries.length > 1);
+      for (const [index, part] of queued.deliveries.entries()) {
+        const owned = claimDelivery(part.id, { owner: 'fixture' });
+        markDeliveryDelivered(part.id, owned.claim_token);
+        assert.equal(reconcileConfirmedDelivery('multipart', claim.entry), index === queued.deliveries.length - 1);
+      }
+    `);
+    assert.equal(run.status, 0, run.stderr);
+    assert.ok(readLabels(fixture).multipart.completionDeliveredAt);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });

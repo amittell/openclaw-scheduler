@@ -23,10 +23,11 @@ All notable changes to this project will be documented in this file.
   reply or the recorded structured completion counts -- never a fabricated
   one), re-enqueues through the durable outbox (the
   `dispatch-completion:<scope>:<routeHash>` idempotency key makes repeated
-  runs a no-op dedupe), and on success closes the completion debt and stamps
-  `completionDeliveredAt` under the labels lock. Labels are bounded by a 48h
+  runs a no-op dedupe). Debt stays pending until every outbox part is confirmed
+  delivered; only then does recovery stamp `completionDeliveredAt` under the
+  labels lock against the original completion scope. Labels are bounded by a 48h
   age window (overridable via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a
-  per-label retry cap of 3, and a 5-minute minimum between attempts.
+  per-completion-scope retry cap of 3, and a 5-minute minimum between attempts.
 
 ## [0.6.9] -- 2026-10-08
 

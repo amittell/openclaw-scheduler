@@ -644,6 +644,8 @@ whose `completionDeliveredAt` is still null would never be delivered (the
 ```bash
 openclaw-scheduler jobs add '{
   "name": "Chilisaus Completion Safety Net",
+  "origin": "system",
+  "run_timeout_ms": 300000,
   "schedule_cron": "*/10 * * * *",
   "session_target": "shell",
   "payload_message": "node ~/.openclaw/scheduler/dispatch/completion-safety-net.mjs",
@@ -658,12 +660,11 @@ recorded delivery target, skips labels with a live watcher run, re-derives the
 completion from the transcript (only a clean terminal assistant reply or the
 recorded structured completion counts -- never a fabricated one), re-enqueues
 through the durable outbox (idempotency key makes repeated runs a no-op
-dedupe), and on success closes the completion debt and stamps
-`completionDeliveredAt`. Labels are bounded by a 48h age window (overridable
-via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a per-label retry cap of 3, and a
-5-minute minimum between attempts. On this host the job is wrapped with
-`alert-gate.sh` (verdict probe `verdict_completion_safety_net`) exactly like
-the `Chilisaus 529 Recovery` job.
+dedupe). Enqueue success leaves the debt pending until every outbox part is
+confirmed delivered; only then can recovery stamp `completionDeliveredAt`. Labels are bounded by a 48h age window (overridable
+via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a per-completion-scope retry cap of 3, and a
+5-minute minimum between attempts. If your installation uses an alert gate,
+optionally wrap the command with it before registering the job.
 
 ---
 
