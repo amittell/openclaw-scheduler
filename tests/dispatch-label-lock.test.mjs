@@ -351,7 +351,7 @@ test('the actual npm archive contains and runs dispatch writers and their mutex'
   assert.equal(pack.status, 0, pack.stderr);
   const [packed] = JSON.parse(pack.stdout);
   const runtimePaths = ['dispatch/index.mjs', 'dispatch/watcher.mjs', 'dispatch/label-lock.mjs',
-    'dispatch/paths.mjs', 'dispatch/529-recovery.mjs'];
+    'dispatch/paths.mjs', 'dispatch/529-recovery.mjs', 'dispatch/completion-safety-net.mjs'];
   for (const path of runtimePaths) {
     assert.ok(packed.files.some((entry) => entry.path === path), `archive missing ${path}`);
   }
@@ -365,15 +365,15 @@ test('the actual npm archive contains and runs dispatch writers and their mutex'
       `archive changed ${path}`);
   }
   symlinkSync(realpathSync(join(REPO_DIR, 'node_modules')), join(packageDir, 'node_modules'), 'dir');
-  for (const entrypoint of ['index.mjs', 'watcher.mjs', '529-recovery.mjs']) {
+  for (const entrypoint of ['index.mjs', 'watcher.mjs', '529-recovery.mjs', 'completion-safety-net.mjs']) {
     const result = spawnSync(process.execPath, [join(packageDir, 'dispatch', entrypoint)], {
       cwd: packageDir, env, encoding: 'utf8', timeout: 15_000,
     });
     assert.equal(result.error, undefined);
-    assert.equal(result.status, entrypoint === '529-recovery.mjs' ? 0 : 2, result.stderr);
+    assert.equal(result.status, entrypoint === 'index.mjs' || entrypoint === 'watcher.mjs' ? 2 : 0, result.stderr);
     assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND|Cannot find module/);
     const expected = { 'watcher.mjs': /--label is required/, 'index.mjs': /Usage:/i,
-      '529-recovery.mjs': /no 529 errors found/ };
+      '529-recovery.mjs': /no 529 errors found/, 'completion-safety-net.mjs': /no undelivered done labels found/ };
     assert.match(result.stdout + result.stderr, expected[entrypoint]);
   }
   const packedLock = pathToFileURL(join(packageDir, 'dispatch/label-lock.mjs')).href;

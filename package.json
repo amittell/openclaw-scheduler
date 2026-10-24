@@ -43,6 +43,7 @@
   "files": [
     "bin",
     "dispatch/529-recovery.mjs",
+    "dispatch/completion-safety-net.mjs",
     "dispatch/completion.mjs",
     "dispatch/config.example.json",
     "dispatch/chilisaus.config.example.json",
