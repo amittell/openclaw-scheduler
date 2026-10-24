@@ -41,8 +41,8 @@
  *   1 -- hard error
  */
 
-import { readFileSync, writeFileSync, renameSync } from 'fs';
-import { dirname, join, resolve } from 'path';
+import { readFileSync, writeFileSync, renameSync, realpathSync } from 'fs';
+import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
@@ -399,6 +399,17 @@ export async function runSafetyNet() {
 
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    // Node canonicalizes the loaded module, but argv can retain a symlinked
+    // install or temporary directory (including macOS /var -> /private/var).
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   await runSafetyNet();
 }

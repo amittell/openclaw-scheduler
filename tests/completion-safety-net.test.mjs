@@ -1,7 +1,7 @@
 import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -228,7 +228,7 @@ function doneLabel(overrides = {}) {
   };
 }
 
-function runSafetyNet(fixture, { db = null } = {}) {
+function runSafetyNet(fixture, { db = null, script = SAFETY_NET_PATH } = {}) {
   const dbPath = db || join(fixture.root, 'scheduler.db');
   const env = {
     ...process.env,
@@ -241,7 +241,7 @@ function runSafetyNet(fixture, { db = null } = {}) {
     OPENCLAW_GATEWAY_TOKEN: '',
     PATH: `${fixture.root}:${process.env.PATH || ''}`,
   };
-  const run = spawnSync(process.execPath, [SAFETY_NET_PATH], {
+  const run = spawnSync(process.execPath, [script], {
     encoding: 'utf8',
     env,
     timeout: 60_000,
@@ -731,5 +731,35 @@ test('the last confirmed multipart part permits a completion stamp', () => {
     `);
     assert.equal(run.status, 0, run.stderr);
     assert.ok(readLabels(fixture).multipart.completionDeliveredAt);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+
+test('the CLI runs through a symlinked repository root', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, {});
+    const linkedRoot = join(fixture.root, 'linked-repository');
+    symlinkSync(REPO_DIR, linkedRoot, 'dir');
+    const { run } = runSafetyNet(fixture, {
+      script: join(linkedRoot, 'dispatch', 'completion-safety-net.mjs'),
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stderr, /no undelivered done labels found/);
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+
+test('importing recovery helpers does not run the CLI or open the database', () => {
+  const fixture = createFixture();
+  try {
+    writeLabels(fixture, { untouched: doneLabel() });
+    const before = readFileSync(fixture.labelsPath, 'utf8');
+    const run = runFixtureCode(fixture, "await import('./dispatch/completion-safety-net.mjs');");
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, '');
+    assert.equal(existsSync(join(fixture.root, 'scheduler.db')), false);
+    assert.equal(readFileSync(fixture.labelsPath, 'utf8'), before);
   } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });
