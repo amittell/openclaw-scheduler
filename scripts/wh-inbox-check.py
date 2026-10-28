@@ -25,8 +25,9 @@ Output (stdout), one block per seat:
     INBOX_CHECK_DONE
 
 Exit code: 0 if every requested seat produced a parseable inbox (even with
-errors=non-empty), 1 if any seat failed auth/inbox/parse. PARSE_FAIL is only
-emitted for genuinely unparseable JSON, never for a shape mismatch.
+errors=non-empty), 1 if any seat failed auth/inbox/parse. PARSE_FAIL reports
+invalid JSON or unusable response shapes; valid obligations lists and items
+objects are both accepted.
 """
 import json
 import os
@@ -96,7 +97,7 @@ def main():
             ob = run(["obligations", "list", "--handle", handle, "--json"], env)
             if ob.returncode == 0:
                 oj = json.loads(ob.stdout)
-                items = oj.get("items", oj if isinstance(oj, list) else [])
+                items = oj if isinstance(oj, list) else oj.get("items", [])
                 if not isinstance(items, list):
                     items = []
                 pend = [i for i in items if str(i.get("status", "")).lower() != "handled"]
