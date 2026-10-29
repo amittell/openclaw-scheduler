@@ -160,8 +160,15 @@ for (const longPath of [false, true]) {
     const raw = `Summary:\nThe export finished.\n\nResults:\n${'Every accepted row matched its source. '.repeat(2000).trimEnd()}\n\nValidation:\nTwo independent dry runs matched.\n\nBlockers:\nThe production run still needs operator approval.`;
     const completion = buildTerminalCompletionPayload({ summary: raw,
       checklist: { work_complete: true, tests_passed: true, pushed: true }, sha: 'deadbeef123' });
-    const artifacts = longPath ? join(fix.root, ...Array(10).fill('段'.repeat(50))) : join(fix.root, 'artifacts');
+    // Exercise the long-note fallback without exceeding macOS PATH_MAX (1024).
+    // Four 150-byte components still exceed this fixture's 400-byte note budget.
+    const artifacts = longPath ? join(fix.root, ...Array(4).fill('段'.repeat(50))) : join(fix.root, 'artifacts');
     try {
+      if (longPath) {
+        assert.ok(Buffer.byteLength(artifacts, 'utf8') > 400);
+        const artifactShape = join(artifacts, 'dispatch-completions', `2026-10-29T00-00-00.000Z-${label}.txt`);
+        assert.ok(Buffer.byteLength(artifactShape, 'utf8') < 1000, 'fixture artifact path fits macOS PATH_MAX');
+      }
       const stub = join(fix.root, 'synthetic-session.mjs');
       writeFileSync(stub, `process.stdout.write(JSON.stringify(${JSON.stringify({ ok: true, label, status: 'done', summary: raw, lastReply: raw, completion })}) + '\\n');\n`);
       writeFileSync(fix.labelsPath, JSON.stringify({ [label]: {
