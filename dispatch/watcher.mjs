@@ -55,7 +55,7 @@ import {
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
-import { resolveLabelsPath } from './paths.mjs';
+import { resolveContainedFilePath, resolveLabelsPath } from './paths.mjs';
 import { assertRouteMatchesSource, effectiveDeliveryTarget, parseOriginRoute, parseSourceContext } from './source-context.mjs';
 import { callGatewayRpc } from './gateway-rpc.mjs';
 import {
@@ -124,7 +124,8 @@ function completionArtifactPath(label) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'completion';
   const dir = ensureArtifactsDir(join(resolveArtifactsDir({ env: process.env }), 'dispatch-completions'));
-  return join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}.txt`);
+  const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}.txt`;
+  return resolveContainedFilePath(dir, fileName, 'completion artifact file name');
 }
 
 function formatCompletionStdout(label, deliveryText, { fullDeliveryText = deliveryText, completion, runId } = {}) {

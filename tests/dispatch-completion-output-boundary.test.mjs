@@ -202,6 +202,39 @@ for (const longPath of [false, true]) {
   });
 }
 
+test('watcher spill keeps traversal-shaped labels inside the artifacts directory', () => {
+  const raw = `Summary:\nThe export finished.\n\nResults:\n${'Every accepted row matched its source. '.repeat(2000).trimEnd()}\n\nValidation:\nTwo independent dry runs matched.`;
+  const completion = buildTerminalCompletionPayload({ summary: raw, checklist: CHECKLIST });
+  for (const makeLabel of [() => '../../escape', () => 'a/b', () => '..\\..\\escape', root => join(root, 'escape')]) {
+    const fix = fixture();
+    const label = makeLabel(fix.root);
+    const artifactsRoot = join(fix.root, 'artifacts');
+    const spillDir = join(artifactsRoot, 'dispatch-completions');
+    try {
+      const stub = join(fix.root, 'synthetic-session.mjs');
+      writeFileSync(stub, `process.stdout.write(JSON.stringify(${JSON.stringify({ ok: true, label, status: 'done', summary: raw, lastReply: raw, completion })}) + '\\n');\n`);
+      writeFileSync(fix.labelsPath, JSON.stringify({ [label]: {
+        runId: RUN_ID, status: 'running', agent: 'main', spawnedAt: new Date().toISOString(), timeoutSeconds: 600,
+      } }));
+      const before = new Set(readdirSync(fix.root));
+      const result = spawnSync(process.execPath, [WATCHER, '--label', label, '--timeout', '600', '--once'], {
+        encoding: 'utf8', timeout: 30_000, env: { ...process.env,
+          SCHEDULER_DB: fix.dbPath, DISPATCH_STATE_DIR: fix.root, DISPATCH_LABELS_PATH: fix.labelsPath,
+          SCHEDULER_ARTIFACTS_DIR: artifactsRoot, DISPATCH_INDEX_PATH: stub, OPENCLAW_SCHEDULER_NOTIFY_DISABLED: '1' },
+      });
+      assert.equal(result.status, 0, result.stderr || String(result.error));
+      assert.deepEqual(readdirSync(artifactsRoot), ['dispatch-completions'], label);
+      const files = readdirSync(spillDir);
+      assert.equal(files.length, 1, label);
+      assert.match(files[0], /^[A-Za-z0-9._-]+\.txt$/, label);
+      assert.ok(readFileSync(join(spillDir, files[0]), 'utf8').includes(raw));
+      assert.ok(result.stdout.includes(`Full completion report saved to ${join(spillDir, files[0])}`), label);
+      const added = readdirSync(fix.root).filter(name => !before.has(name) && !/^(scheduler\.db|labels\.json)/.test(name));
+      assert.deepEqual(added, ['artifacts'], `${label}: nothing else is written beside the artifacts directory`);
+    } finally { closeDb(); rmSync(fix.root, { recursive: true, force: true }); }
+  }
+});
+
 for (const [kind, raw] of [['human', humanReport('The export completed with every row present. '.repeat(250))], ['machine', cueDump()]]) {
   test(`done enqueue stores one bounded outbox part (${kind}) and preserves the original completion summary`, () => {
     const fix = fixture();
