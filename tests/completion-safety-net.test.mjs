@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
@@ -17,6 +17,9 @@ import { buildCompletionDeliveryScope } from '../dispatch/hooks.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
 const SAFETY_NET_PATH = join(REPO_DIR, 'dispatch', 'completion-safety-net.mjs');
+// Fixture scripts run from REPO_DIR; absolute URLs keep scripts/ci-gate.sh from
+// resolving their imports against tests/.
+const repoModuleUrl = path => JSON.stringify(pathToFileURL(join(REPO_DIR, path)).href);
 const SESSION_KEY = 'agent:main:subagent:11111111-2222-3333-4444-555555555555';
 const SESSION_ID = '99999999-8888-7777-6666-555555555555';
 const DELIVER_TO = '484946046';
@@ -606,8 +609,8 @@ test('replacement before enqueue cannot receive the claimed old completion', () 
     const run = runFixtureCode(fixture, `
       import assert from 'node:assert/strict';
       import { readFileSync, writeFileSync } from 'node:fs';
-      import { initDb, getDb } from './db.js';
-      import { claimAttempt, enqueueClaim } from './dispatch/completion-safety-net.mjs';
+      import { initDb, getDb } from ${repoModuleUrl('db.js')};
+      import { claimAttempt, enqueueClaim } from ${repoModuleUrl('dispatch/completion-safety-net.mjs')};
       await initDb();
       const claim = claimAttempt('race');
       const replacement = { ...claim.entry, runId: 'replacement-run', summary: 'Replacement must survive' };
@@ -629,10 +632,10 @@ test('delayed old confirmation cannot close or stamp a replacement run', () => {
     const run = runFixtureCode(fixture, `
       import assert from 'node:assert/strict';
       import { readFileSync, writeFileSync } from 'node:fs';
-      import { initDb, getDb } from './db.js';
-      import { claimDelivery, markDeliveryDelivered } from './delivery-outbox.js';
-      import { recordCompletionDeliveryDebt, buildCompletionDeliveryScope } from './dispatch/hooks.mjs';
-      import { claimAttempt, enqueueClaim, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      import { initDb, getDb } from ${repoModuleUrl('db.js')};
+      import { claimDelivery, markDeliveryDelivered } from ${repoModuleUrl('delivery-outbox.js')};
+      import { recordCompletionDeliveryDebt, buildCompletionDeliveryScope } from ${repoModuleUrl('dispatch/hooks.mjs')};
+      import { claimAttempt, enqueueClaim, reconcileConfirmedDelivery } from ${repoModuleUrl('dispatch/completion-safety-net.mjs')};
       await initDb();
       const claim = claimAttempt('race');
       const queued = enqueueClaim('race', claim, { deliveryText: 'Old report', summary: 'Old report' });
@@ -685,9 +688,9 @@ test('partial or failed multipart delivery cannot confirm the label', () => {
     writeLabels(fixture, { multipart: doneLabel() });
     const run = runFixtureCode(fixture, `
       import assert from 'node:assert/strict';
-      import { initDb } from './db.js';
-      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered, markDeliveryFailed } from './delivery-outbox.js';
-      import { claimAttempt, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      import { initDb } from ${repoModuleUrl('db.js')};
+      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered, markDeliveryFailed } from ${repoModuleUrl('delivery-outbox.js')};
+      import { claimAttempt, reconcileConfirmedDelivery } from ${repoModuleUrl('dispatch/completion-safety-net.mjs')};
       await initDb();
       const claim = claimAttempt('multipart');
       const queued = enqueueMultipartDelivery({ body: 'The verified backup report contains important results. '.repeat(100),
@@ -714,9 +717,9 @@ test('the last confirmed multipart part permits a completion stamp', () => {
     writeLabels(fixture, { multipart: doneLabel() });
     const run = runFixtureCode(fixture, `
       import assert from 'node:assert/strict';
-      import { initDb } from './db.js';
-      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered } from './delivery-outbox.js';
-      import { claimAttempt, reconcileConfirmedDelivery } from './dispatch/completion-safety-net.mjs';
+      import { initDb } from ${repoModuleUrl('db.js')};
+      import { enqueueMultipartDelivery, claimDelivery, markDeliveryDelivered } from ${repoModuleUrl('delivery-outbox.js')};
+      import { claimAttempt, reconcileConfirmedDelivery } from ${repoModuleUrl('dispatch/completion-safety-net.mjs')};
       await initDb();
       const claim = claimAttempt('multipart');
       const queued = enqueueMultipartDelivery({ body: 'The verified backup report contains important results. '.repeat(100),
