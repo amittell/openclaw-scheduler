@@ -348,6 +348,7 @@ Notes:
 - The minimum runtime guard rejects very short sessions unless `--force-done --reason ...` is provided.
 - Older labels created before `taskPrompt` storage will warn and skip the git-SHA gate.
 - Gateway activity checks fail open: if the session API is unavailable, `done` logs a warning and continues.
+- Completion bodies are limited to 3,400 UTF-8 bytes before the outbox header. Short human reports retain their sections; longer reports share the budget across sections, retain checks and add a continuation note referencing the run ID when available. The stored source summary and oversized-report artifact remain complete. Machine output is summarized even when it contains report headings such as `Root cause` or `Validation`. The same boundary applies to `done` and watcher completions.
 
 ### `send` — message a running session
 

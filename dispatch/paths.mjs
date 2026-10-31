@@ -54,3 +54,28 @@ export function resolveLabelsPath({ legacyCandidates = [], env = process.env } =
 
   return labelsPath;
 }
+
+/**
+ * Resolve a single file name inside dirPath. Separators, NUL, "." and ".."
+ * are refused, and the resolved path must stay strictly beneath dirPath. The
+ * prefix check cannot fail after that validation; it stays because it is the
+ * containment form CodeQL's path-injection query recognizes.
+ */
+export function resolveContainedFilePath(dirPath, fileName, name = 'file name') {
+  if (
+    typeof fileName !== 'string'
+    || fileName === ''
+    || fileName === '.'
+    || fileName === '..'
+    || /[\\/\0]/.test(fileName)
+  ) {
+    throw new Error(`${name} must be a single path component`);
+  }
+  const allowedRoot = pathResolve(dirPath);
+  const allowedPrefix = allowedRoot.endsWith(sep) ? allowedRoot : `${allowedRoot}${sep}`;
+  const candidate = pathResolve(allowedRoot, fileName);
+  if (!candidate.startsWith(allowedPrefix)) {
+    throw new Error(`${name} escapes its directory`);
+  }
+  return candidate;
+}

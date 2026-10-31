@@ -771,14 +771,19 @@ test('past 3,400 bytes the cut detail lines shrink to the bytes left, and the ch
   // detail lines go and the checks line stays (4e53362 kept the char cuts).
   const full = reportOf(3380);
   const filled = resolveCompletionDelivery({ lastReply: full, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
-  assert.equal(filled.deliveryText, `${full}\n\nTechnical details:\n- Checks: tests passed; pushed deadbee.`);
+  assert.ok(Buffer.byteLength(filled.deliveryText) <= MAX_VERBATIM_BYTES);
+  assert.ok(filled.deliveryText.startsWith(full.slice(0, 300)));
+  assert.ok(filled.deliveryText.includes('Checks: tests passed; pushed deadbee.'));
+  assert.ok(filled.deliveryText.endsWith('Full text remains in the run record.'));
 
-  // A report over the bound on its own keeps the char cuts: no detail line causes it.
+  // An oversized human report keeps its opening sections and a continuation
+  // reference, while the final body (including checks) stays within the bound.
   const long = reportOf(3600);
   const over = resolveCompletionDelivery({ lastReply: long, completion: { details_technical: details, ...checks }, fallbackSummary: 'completed' });
-  const [, overDetails] = over.deliveryText.split('\n\nTechnical details:\n');
-  assert.equal(overDetails.split('\n').length, 2, overDetails);
-  assert.ok(overDetails.split('\n')[0].endsWith('…'));
+  assert.ok(Buffer.byteLength(over.deliveryText) <= MAX_VERBATIM_BYTES);
+  assert.ok(over.deliveryText.startsWith(long.slice(0, 300)));
+  assert.ok(over.deliveryText.includes('Checks: tests passed; pushed deadbee.'));
+  assert.ok(over.deliveryText.endsWith('Full text remains in the run record.'));
 
   // A cut never ends on half of a surrogate pair.
   const emoji = '🙂'.repeat(1000);
