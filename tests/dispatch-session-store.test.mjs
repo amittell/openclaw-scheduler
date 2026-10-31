@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -13,6 +13,7 @@ import {
   projectOpenClawTranscriptEntries,
   readOpenClawSessionStore,
   readOpenClawTranscriptTail,
+  resolveAgentSessionStorePaths,
 } from '../dispatch/session-store.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -270,6 +271,46 @@ test('transcript tail reads refuse paths that leave the agent state root', () =>
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('store reads refuse traversal-shaped agent and session ids before reaching another store', () => {
+  const fixture = createFixture();
+  try {
+    const options = {
+      env: { OPENCLAW_STATE_DIR: fixture.stateDir, HOME: fixture.root },
+      homeDir: fixture.root,
+    };
+    const agentRoot = join(fixture.stateDir, 'agents', 'main');
+    const paths = resolveAgentSessionStorePaths('main', options);
+    assert.equal(paths.agentRoot, agentRoot);
+    for (const key of ['databasePath', 'legacySessionsPath', 'legacyTranscriptDir']) {
+      assert.ok(paths[key].startsWith(`${agentRoot}${sep}`), key);
+    }
+
+    // A complete store outside the state dir, at the target of ../../agents/escape.
+    const decoyRoot = join(fixture.root, 'agents', 'escape');
+    mkdirSync(join(decoyRoot, 'agent'), { recursive: true });
+    mkdirSync(join(decoyRoot, 'sessions'), { recursive: true });
+    seedDatabase(join(decoyRoot, 'agent', 'openclaw-agent.sqlite'));
+    writeFileSync(
+      join(decoyRoot, 'sessions', `${SESSION_ID}.jsonl`),
+      `${JSON.stringify({ role: 'assistant', content: 'outside' })}\n`,
+    );
+    const decoyOptions = { env: { OPENCLAW_STATE_DIR: fixture.root, HOME: fixture.root }, homeDir: fixture.root };
+    assert.ok(readOpenClawSessionStore('escape', decoyOptions).entries[SESSION_KEY], 'control: the decoy is readable');
+    assert.equal(readOpenClawTranscriptTail('escape', SESSION_ID, decoyOptions).events.length, 1);
+
+    for (const agentId of ['../../agents/escape', 'a/b', '..\\..\\agents\\escape', decoyRoot, '.', '..']) {
+      assert.throws(() => resolveAgentSessionStorePaths(agentId, options), /agent_id/, agentId);
+      assert.throws(() => readOpenClawSessionStore(agentId, options), /agent_id/, agentId);
+      assert.throws(() => readOpenClawTranscriptTail(agentId, SESSION_ID, options), /agent_id/, agentId);
+    }
+    for (const sessionId of ['../x', 'a/b', '..\\x', join(decoyRoot, 'sessions', SESSION_ID), '', '.', '..']) {
+      assert.throws(() => readOpenClawTranscriptTail('main', sessionId, options), /session_id/, sessionId);
+    }
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
   }
 });
 
