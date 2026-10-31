@@ -5,15 +5,17 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import test from 'node:test';
 
 import {
+  resolveContainedFilePath,
   resolveDispatchStateDir,
   resolveLabelsPath,
 } from '../dispatch/paths.mjs';
@@ -160,6 +162,26 @@ test('labels paths cannot escape through a symbolic-link directory', {
       /DISPATCH_LABELS_PATH escapes its allowed root through a symbolic link/u,
     );
     assert.equal(existsSync(join(outsideDir, 'labels.json')), false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('artifact file names must be one component inside their directory', () => {
+  const rootDir = makeTempDir('dispatch-artifact-name-');
+  const artifactDir = join(rootDir, 'artifacts');
+
+  try {
+    assert.equal(resolveContainedFilePath(artifactDir, 'report.txt'), join(artifactDir, 'report.txt'));
+    assert.equal(resolveContainedFilePath(sep, 'report.txt'), join(sep, 'report.txt'));
+    for (const fileName of ['../x', 'a/b', '..\\x', join(rootDir, 'outside.txt'), '', '.', '..', 'x\0y', undefined]) {
+      assert.throws(
+        () => resolveContainedFilePath(artifactDir, fileName, 'artifact name'),
+        /artifact name must be a single path component/u,
+        String(fileName),
+      );
+    }
+    assert.deepEqual(readdirSync(rootDir), [], 'resolving a name creates nothing');
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

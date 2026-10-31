@@ -133,6 +133,7 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
   if (isInternalTransportNoiseText(normalized)) return false;
   if (looksLikeRawPayloadText(normalized)) return false;
   if (looksLikeGunbrokerReport(normalized)) return false;
+  if (isMachineOutput(normalized)) return false;
 
   const rawLines = normalized
     .split('\n')
@@ -165,9 +166,9 @@ function isLikelyHumanFinalReport(text, { requireCue = false } = {}) {
   // final report even without a specific cue word. Domain reports (dubbing
   // alignment fixes, etc.) use labels like "**Item 1**", "**Re-verify**",
   // "**Staged**" that carry no FINAL_REPORT_CUE_RE keyword. Labels alone also
-  // match dumps, stack traces and status updates, so this shape must also be
-  // verbatim-deliverable.
-  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5 && isVerbatimDeliverable(normalized);
+  // match dumps and stack traces, which the machine-output check above rejects.
+  // The delivery boundary applies the same byte budget with or without cues.
+  return (headingCount >= 3 || boldLabelCount >= 3) && rawLines.length >= 5;
 }
 
 // Whether text may be delivered verbatim instead of humanized: it fits one
@@ -1546,7 +1547,7 @@ function isProseReport(text) {
   return (text.match(SENTENCE_BREAK_RE) || []).length > (text.match(/;/g) || []).length;
 }
 
-export function resolveCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
+function selectCompletionDelivery({ lastReply, completion, fallbackSummary } = {}) {
   const rawReply = normalizeCompletionText(lastReply);
   const rawCompletionSummaryHuman = getCompletionSummaryHuman(completion);
   const rawCompletionSummary = normalizeCompletionText(completion?.summary);
@@ -1762,5 +1763,80 @@ export function resolveCompletionDelivery({ lastReply, completion, fallbackSumma
     deliveryText: null,
     summary: authoritativeStructuredSummary || preferredSummary || completionDelivery || reply || null,
     source: 'none',
+  };
+}
+
+// Give every report section a share before using spare bytes on longer ones.
+// A long Results section must not hide Validation, Notes or Blockers below it.
+function shortenReportSections(text, maxBytes) {
+  const sections = [];
+  let lines = [];
+  for (const line of text.split('\n')) {
+    const heading = FINAL_REPORT_HEADING_RE.test(cleanMarkdown(line.trim()))
+      || /^\*\*[^*]{2,60}\*\*/.test(line.trim());
+    if (heading && lines.some(part => part.trim())) {
+      sections.push(lines.join('\n').trim());
+      lines = [];
+    }
+    lines.push(line);
+  }
+  if (lines.some(part => part.trim())) sections.push(lines.join('\n').trim());
+  const budget = maxBytes - 2 * (sections.length - 1);
+  if (sections.length < 2 || budget < sections.length * MIN_DETAIL_LINE_BYTES) {
+    return truncateTextToBytes(text, maxBytes);
+  }
+  const lengths = sections.map(section => Buffer.byteLength(section, 'utf8'));
+  const shares = lengths.map(length => Math.min(length, Math.floor(budget / sections.length)));
+  let spare = budget - shares.reduce((sum, share) => sum + share, 0);
+  for (let i = 0; i < shares.length; i += 1) {
+    const extra = Math.min(spare, lengths[i] - shares[i]);
+    shares[i] += extra;
+    spare -= extra;
+  }
+  return sections.map((section, i) => truncateTextToBytes(section, shares[i])).join('\n\n');
+}
+
+// Shared final body formatter for durable enqueue and watcher spill notices.
+// A caller-supplied note gets a short fallback when its path or error is too
+// long, so metadata cannot consume the entire report budget.
+export function boundCompletionDeliveryText(text, {
+  runId, completion, maxBytes = MAX_VERBATIM_REPORT_BYTES, additionalNote = null,
+} = {}) {
+  const limit = Math.min(MAX_VERBATIM_REPORT_BYTES, maxBytes);
+  const safeRunId = typeof runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(runId)
+    ? runId
+    : null;
+  const continuation = safeRunId
+    ? `Report shortened for delivery. Full text remains in run ${safeRunId}.`
+    : 'Report shortened for delivery. Full text remains in the run record.';
+  const extra = additionalNote && Buffer.byteLength(additionalNote.text, 'utf8') > Math.floor(limit / 3)
+    ? additionalNote.fallback
+    : additionalNote?.text;
+  const note = truncateTextToBytes([continuation, extra].filter(Boolean).join('\n\n'),
+    Math.max(0, limit - MIN_DETAIL_LINE_BYTES - 4)) || '';
+  const checks = summarizeChecklistTechnicalDetails(completion?.checklist, completion?.sha);
+  const checksLine = checks ? `\n- ${checks}` : null;
+  const preserveChecks = checksLine && text.endsWith(checksLine);
+  // Reserve checks and both notices before sharing the remaining section
+  // budget. Unknown checklist keys can themselves be long legacy input.
+  const boundedChecks = preserveChecks ? truncateTextToBytes(checks,
+    limit - Buffer.byteLength(note, 'utf8') - MIN_DETAIL_LINE_BYTES - 4) : null;
+  const tail = [boundedChecks, note].filter(Boolean).join('\n\n');
+  const body = preserveChecks ? text.slice(0, -checksLine.length).replace(/\n\nTechnical details:$/, '') : text;
+  const room = Math.max(0, limit - Buffer.byteLength(`\n\n${tail}`, 'utf8'));
+  const excerpt = shortenReportSections(body, room);
+  return [excerpt, tail].filter(Boolean).join('\n\n');
+}
+
+// Only the selected delivery is bounded; an unselected long transcript cannot
+// add a continuation notice to an explicit short lead.
+export function resolveCompletionDelivery({ runId, ...input } = {}) {
+  const result = selectCompletionDelivery(input);
+  const text = result.deliveryText;
+  if (!text || Buffer.byteLength(text, 'utf8') <= MAX_VERBATIM_REPORT_BYTES) return result;
+  return {
+    ...result,
+    fullDeliveryText: text,
+    deliveryText: boundCompletionDeliveryText(text, { runId, completion: input.completion }),
   };
 }

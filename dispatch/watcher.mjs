@@ -45,7 +45,7 @@ import { withLabelsLock } from './label-lock.mjs';
 import {
   extractTerminalAssistantReplyFromEntries,
   hasCompletionSignal,
-  resolveCompletionDelivery,
+  boundCompletionDeliveryText, resolveCompletionDelivery,
 } from './completion.mjs';
 import {
   claimCompletionDelivery,
@@ -55,7 +55,7 @@ import {
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
-import { resolveLabelsPath } from './paths.mjs';
+import { resolveContainedFilePath, resolveLabelsPath } from './paths.mjs';
 import { assertRouteMatchesSource, effectiveDeliveryTarget, parseOriginRoute, parseSourceContext } from './source-context.mjs';
 import { callGatewayRpc } from './gateway-rpc.mjs';
 import {
@@ -119,51 +119,43 @@ function byteLength(text) {
   return Buffer.byteLength(String(text ?? ''), 'utf8');
 }
 
-function sliceUtf8Bytes(text, maxBytes) {
-  const source = String(text ?? '');
-  if (byteLength(source) <= maxBytes) return source;
-
-  let usedBytes = 0;
-  let endIndex = 0;
-  for (const char of source) {
-    const charBytes = byteLength(char);
-    if (usedBytes + charBytes > maxBytes) break;
-    usedBytes += charBytes;
-    endIndex += char.length;
-  }
-  return source.slice(0, endIndex).trimEnd();
-}
-
 function completionArtifactPath(label) {
   const safeLabel = String(label || 'completion')
     .replace(/[^a-z0-9._-]+/gi, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'completion';
   const dir = ensureArtifactsDir(join(resolveArtifactsDir({ env: process.env }), 'dispatch-completions'));
-  return join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}.txt`);
+  const fileName = `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}.txt`;
+  return resolveContainedFilePath(dir, fileName, 'completion artifact file name');
 }
 
-function formatCompletionStdout(label, deliveryText) {
+function formatCompletionStdout(label, deliveryText, { fullDeliveryText = deliveryText, completion, runId } = {}) {
   const header = `🌶️ *dispatch* [${label}] completed:\n\n`;
   const body = String(deliveryText ?? '');
-  const bodyBytes = byteLength(body);
+  const fullBody = String(fullDeliveryText ?? body);
+  const bodyBytes = byteLength(fullBody);
 
   if (bodyBytes <= COMPLETION_INLINE_LIMIT_BYTES) {
     return `${header}${body}\n`;
   }
 
   let artifactNote;
+  let artifactFallback;
   try {
     const artifactPath = completionArtifactPath(label);
-    writeFileSync(artifactPath, body, 'utf8');
-    artifactNote = `\n\nFull completion report saved to ${artifactPath} (${bodyBytes} bytes). Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes to avoid dumping an oversized report.`;
+    writeFileSync(artifactPath, fullBody, 'utf8');
+    artifactFallback = `Full completion report saved locally (${bodyBytes} bytes).`;
+    artifactNote = `Full completion report saved to ${artifactPath} (${bodyBytes} bytes). Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes to avoid dumping an oversized report.`;
   } catch (err) {
-    artifactNote = `\n\nFull completion report was ${bodyBytes} bytes, but saving the oversized report failed: ${err.message}. Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes.`;
+    artifactFallback = `Saving the full completion report failed (${bodyBytes} bytes).`;
+    artifactNote = `Full completion report was ${bodyBytes} bytes, but saving the oversized report failed: ${err.message}. Inline delivery capped at ${COMPLETION_INLINE_LIMIT_BYTES} bytes.`;
   }
 
-  const bodyBudget = Math.max(0, COMPLETION_INLINE_LIMIT_BYTES - byteLength(artifactNote));
-  const inlineBody = sliceUtf8Bytes(body, bodyBudget);
-  return `${header}${inlineBody}${artifactNote}\n`;
+  const inlineBody = boundCompletionDeliveryText(fullBody, {
+    completion, runId, maxBytes: COMPLETION_INLINE_LIMIT_BYTES,
+    additionalNote: { text: artifactNote, fallback: artifactFallback },
+  });
+  return `${header}${inlineBody}\n`;
 }
 
 function getGatewayToken() {
@@ -1308,6 +1300,7 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
     lastReply,
     completion: completionPayload,
     fallbackSummary,
+    runId: labelCompletionIdentity(label, entry).runId,
   });
   markLabelDone(label, completion.summary);
 
@@ -1388,7 +1381,11 @@ function deliverResult(label, lastReply, fallbackSummary, completionPayload = nu
         last_label_status: deliveredEntry?.status || 'done',
       },
     });
-    process.stdout.write(formatCompletionStdout(label, completion.deliveryText));
+    process.stdout.write(formatCompletionStdout(label, completion.deliveryText, {
+      fullDeliveryText: completion.fullDeliveryText,
+      completion: completionPayload,
+      runId: identity.runId,
+    }));
     process.exit(0);
   }
 

@@ -547,7 +547,7 @@ export function enqueueCompletionNotification({
   }
   const delivery = resolvedDelivery && typeof resolvedDelivery === 'object'
     ? resolvedDelivery
-    : resolveCompletionDelivery({ completion, fallbackSummary: summary });
+    : resolveCompletionDelivery({ completion, fallbackSummary: summary, runId });
   const bodyText = delivery.deliveryText || null;
   const scope = buildCompletionDeliveryScope({ label, sessionKey, runId, deliveryScope });
   const baseMetadata = {
