@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { execFileSync } from 'node:child_process';
+import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createTestEnvironment } from './test-environment.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = mkdtempSync(join(tmpdir(), 'openclaw-scheduler-package-'));
@@ -102,6 +104,12 @@ void snapshot;
   ], { cwd: fixture });
 
   const installRoot = join(fixture, 'installed-consumer');
+  const consumerHome = join(fixture, 'consumer-home');
+  const consumerEnv = createTestEnvironment(consumerHome);
+  // Exercise the installed guard against fixture records, with every runtime
+  // path isolated from the operator's environment and installed daemon.
+  delete consumerEnv.SCHEDULER_VERSION_GUARD_DEV;
+  consumerEnv.npm_config_cache = join(fixture, 'npm-cache');
   mkdirSync(installRoot);
   writeFileSync(join(installRoot, 'package.json'), '{"name":"package-smoke","private":true}\n', 'utf8');
   run(npmCommand, [
@@ -112,31 +120,54 @@ void snapshot;
     '--no-package-lock',
     '--ignore-scripts=false',
     tarball,
-  ], { cwd: installRoot });
+  ], { cwd: installRoot, env: consumerEnv });
   const installedPackage = join(installRoot, 'node_modules', 'openclaw-scheduler');
   const version = JSON.parse(run(process.execPath, [
     join(installedPackage, 'bin', 'openclaw-scheduler.js'),
     'version',
     '--json',
-  ], { cwd: installRoot }));
+  ], { cwd: installRoot, env: consumerEnv }));
   const expectedVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
   if (version.version !== expectedVersion) {
     throw new Error(`installed package version ${version.version} does not match ${expectedVersion}`);
   }
+  const daemonRecordPath = join(consumerHome, '.openclaw', 'scheduler', 'daemon-version.json');
+  mkdirSync(dirname(daemonRecordPath), { recursive: true });
+  const writeDaemonRecord = version => writeFileSync(daemonRecordPath, JSON.stringify({
+    version,
+    written_at: new Date().toISOString(),
+    pid: process.pid,
+    package_path: installedPackage,
+  }));
+  writeDaemonRecord(expectedVersion);
   const doctor = JSON.parse(run(process.execPath, [
     join(installedPackage, 'bin', 'openclaw-scheduler.js'),
     'doctor',
     '--json',
   ], {
     cwd: installRoot,
-    env: {
-      ...process.env,
-      SCHEDULER_DB: join(fixture, 'installed-smoke.db'),
-    },
+    env: consumerEnv,
   }));
   if (doctor.ok !== true || doctor.database?.schema_version !== 30) {
     throw new Error(`installed package doctor failed: ${JSON.stringify(doctor)}`);
   }
+  assert.equal(doctor.version_guard?.status, 'match');
+  assert.equal(doctor.version_guard.daemon_version, expectedVersion);
+  assert.equal(doctor.version_guard.daemon_path, daemonRecordPath);
+
+  writeDaemonRecord('0.0.0-package-mismatch');
+  const mismatch = spawnSync(process.execPath, [
+    join(installedPackage, 'bin', 'openclaw-scheduler.js'),
+    'doctor',
+    '--json',
+  ], { cwd: installRoot, env: consumerEnv, encoding: 'utf8' });
+  assert.ifError(mismatch.error);
+  assert.equal(mismatch.status, 1, 'installed doctor must refuse a mismatching fixture daemon');
+  assert.match(mismatch.stderr, /scheduler version mismatch/);
+  const mismatchDoctor = JSON.parse(mismatch.stdout);
+  assert.equal(mismatchDoctor.version_guard?.status, 'mismatch');
+  assert.equal(mismatchDoctor.version_guard.daemon_version, '0.0.0-package-mismatch');
+  assert.equal(mismatchDoctor.version_guard.daemon_path, daemonRecordPath);
 
   const unexpectedArchives = readdirSync(packageRoot).filter(name => name.endsWith('.tgz'));
   if (unexpectedArchives.length > 0) {
