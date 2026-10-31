@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve as pathResolve } from 'node:path';
+import { join, resolve as pathResolve, sep } from 'node:path';
 
 import Database from 'better-sqlite3';
 
@@ -32,28 +32,40 @@ export function resolveOpenClawStateDir({ env = process.env, homeDir } = {}) {
     || join(effectiveHome, '.openclaw');
 }
 
+// The prefix check is the containment form CodeQL's path-injection query recognizes;
+// assertContainedPath then repeats it through symbolic links.
+function resolveContainedStorePath(root, segments, name) {
+  const allowedRoot = pathResolve(root);
+  const allowedPrefix = allowedRoot.endsWith(sep) ? allowedRoot : `${allowedRoot}${sep}`;
+  const candidate = pathResolve(allowedRoot, ...segments);
+  if (!candidate.startsWith(allowedPrefix)) {
+    throw new Error(`${name} escapes its allowed root`);
+  }
+  return assertContainedPath(allowedRoot, candidate, name);
+}
+
 export function resolveAgentSessionStorePaths(agentId = 'main', options = {}) {
   const validatedAgentId = assertValidAgentId(agentId, 'agent_id');
   const stateDir = resolveOpenClawStateDir(options);
   const agentsRoot = pathResolve(stateDir, 'agents');
-  const agentRoot = assertContainedPath(
+  const agentRoot = resolveContainedStorePath(
     agentsRoot,
-    pathResolve(agentsRoot, validatedAgentId),
+    [validatedAgentId],
     'OpenClaw agent state directory',
   );
-  const databasePath = assertContainedPath(
+  const databasePath = resolveContainedStorePath(
     agentRoot,
-    pathResolve(agentRoot, 'agent', SQLITE_FILE),
+    ['agent', SQLITE_FILE],
     'OpenClaw agent database path',
   );
-  const legacySessionsPath = assertContainedPath(
+  const legacySessionsPath = resolveContainedStorePath(
     agentRoot,
-    pathResolve(agentRoot, 'sessions', 'sessions.json'),
+    ['sessions', 'sessions.json'],
     'legacy OpenClaw sessions store path',
   );
-  const legacyTranscriptDir = assertContainedPath(
+  const legacyTranscriptDir = resolveContainedStorePath(
     agentRoot,
-    pathResolve(agentRoot, 'sessions'),
+    ['sessions'],
     'legacy OpenClaw transcript directory',
   );
   return { agentRoot, databasePath, legacySessionsPath, legacyTranscriptDir, stateDir };
@@ -331,9 +343,9 @@ function readSqliteTranscript(databasePath, sessionId, limit) {
 }
 
 function readLegacyTranscript(legacyTranscriptDir, sessionId, limit) {
-  const transcriptPath = assertContainedPath(
+  const transcriptPath = resolveContainedStorePath(
     legacyTranscriptDir,
-    pathResolve(legacyTranscriptDir, `${sessionId}.jsonl`),
+    [`${sessionId}.jsonl`],
     'legacy OpenClaw transcript path',
   );
   try {
