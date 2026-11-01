@@ -37,7 +37,7 @@ const MIN = 60 * 1000;
  *       if/else so artifact-backed stalls get the interrupted (redispatchable)
  *       outcome and only no-artifact stalls mark error.
  *
- * (1) provider-abort signature + artifacts -> interrupted (turn-abort), not stalled
+ * (1) assistant-only provider abort + artifacts -> interrupted (turn-abort), not stalled
  * (2) stall branch with artifactEvidence.found=true -> interrupted, not error
  * (3) stall WITHOUT artifacts still marks error
  * (4) non-aborted completed session unchanged (delivered as done)
@@ -109,7 +109,7 @@ function readLabels(fix) {
   return JSON.parse(readFileSync(fix.labelsPath, 'utf8'));
 }
 
-test('(1) provider-abort signature + artifacts -> interrupted (turn-abort), not stalled', () => {
+test('(1) assistant-only provider abort + artifacts -> interrupted (turn-abort), not stalled', () => {
   const fix = makeFixture('abort');
   try {
     const label = 'abort-x';
@@ -117,12 +117,12 @@ test('(1) provider-abort signature + artifacts -> interrupted (turn-abort), not 
     const sessionId = 'abort-x-session';
     const now = Date.now();
     // Recent activity (within the idle-failure window) so this is NOT a stall;
-    // the only terminal signal is the provider-abort signature in the tail.
+    // the assistant stopReason is the only abort signal. A trailing prompt-error
+    // would mask a regression in this branch of the reverse-scanned detector.
     writeSessionStore(fix, sessionKey, sessionId, new Date(now - 5 * MIN));
     const jsonlPath = writeTranscript(fix, sessionId, [
       { role: 'toolResult', isError: false, content: 'Wrote song_manifest.json (3058 bytes)' },
       { role: 'assistant', content: [], stopReason: 'aborted', errorMessage: 'Request was aborted' },
-      { type: 'custom', customType: 'openclaw:prompt-error', data: { error: 'This operation was aborted' } },
     ]);
     utimesSync(jsonlPath, new Date(now - 5 * MIN), new Date(now - 5 * MIN));
     const stubPath = writeStub(fix, { label, sessionKey, ageMs: 15 * MIN });
