@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, isAbsolute, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { assertContainedPath } from './identifiers.js';
+import { withLabelsLockSync } from './dispatch/label-lock.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -76,6 +77,25 @@ export function resolveDaemonVersionPath(env = process.env) {
   }
 }
 
+// Publication and PID-checked deletion share an OS-backed mutex. Never unlink
+// the persistent mutex: replacing its inode would split concurrent owners.
+function withVersionRecordLock(path, env, fn) {
+  assertContainedPath(resolveVersionGuardHome(env), `${path}.lock.sqlite3`, 'daemon version mutex');
+  return withLabelsLockSync(path, fn, { timeoutMs: 1000 });
+}
+
+export function removeDaemonVersionFileIfOwned({ env = process.env } = {}) {
+  const path = resolveDaemonVersionPath(env);
+  if (!path) return false;
+  return withVersionRecordLock(path, env, () => {
+    let record;
+    try { record = JSON.parse(readFileSync(path, 'utf8')); } catch { return false; }
+    if (record?.pid !== process.pid) return false;
+    unlinkSync(path);
+    return true;
+  });
+}
+
 // Atomic write: a temp file in the same directory, then rename over the
 // record. A concurrent reader sees either the complete old or the complete
 // new JSON, never a truncated/partial file.
@@ -84,26 +104,31 @@ export function writeDaemonVersionFile({
   env = process.env,
   now = () => new Date(),
   packagePath = __dirname,
+  canWrite = () => true,
 } = {}) {
   const path = resolveDaemonVersionPath(env);
   if (!path) return null;
-  const record = {
-    version: String(version),
-    written_at: now().toISOString(),
-    pid: process.pid,
-    package_path: packagePath,
-  };
-  const dir = dirname(path);
-  mkdirSync(dir, { recursive: true });
-  const tmpPath = join(dir, `.${DAEMON_VERSION_FILE_NAME}.${process.pid}.tmp`);
-  try {
-    writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`);
-    renameSync(tmpPath, path);
-  } catch (err) {
-    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
-    throw err;
-  }
-  return path;
+  return withVersionRecordLock(path, env, () => {
+    // Recheck leadership after waiting for a predecessor to release the mutex.
+    if (!canWrite()) return null;
+    const record = {
+      version: String(version),
+      written_at: now().toISOString(),
+      pid: process.pid,
+      package_path: packagePath,
+    };
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true });
+    const tmpPath = join(dir, `.${DAEMON_VERSION_FILE_NAME}.${process.pid}.tmp`);
+    try {
+      writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`);
+      renameSync(tmpPath, path);
+    } catch (err) {
+      try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+      throw err;
+    }
+    return path;
+  });
 }
 
 // POSIX liveness probe: kill(pid, 0) throws ESRCH when the process is gone.

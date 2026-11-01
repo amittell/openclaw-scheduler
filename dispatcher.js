@@ -12,12 +12,12 @@
 //   5. Expire old messages
 //   6. Prune old runs (hourly)
 
-import { existsSync, readFileSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { resolveLabelsPath } from './dispatch/paths.mjs';
 import { initDb, closeDb, getDb, checkpointWal } from './db.js';
-import { resolveDaemonVersionPath, writeDaemonVersionFile } from './version-guard.js';
+import { removeDaemonVersionFileIfOwned, resolveDaemonVersionPath, writeDaemonVersionFile } from './version-guard.js';
 import {
   generateIdempotencyKey as _genIdemKey,
   generateChainIdempotencyKey as _genChainKey,
@@ -1107,6 +1107,11 @@ function submitDueDispatches() {
 
 // -- Main tick -----------------------------------------------
 let lastVersionGuardRefresh = 0;
+let versionGuardTimer = null;
+function stopVersionGuardTimer() {
+  if (versionGuardTimer) clearInterval(versionGuardTimer);
+  versionGuardTimer = null;
+}
 // True once THIS process published the version record (after acquiring the
 // lease). Shutdown/fatal cleanup only removes the record it owns, so a
 // process that failed to become the dispatcher never deletes the live
@@ -1116,20 +1121,7 @@ function removeDaemonVersionRecordIfOwned() {
   if (!daemonVersionPublished) return;
   daemonVersionPublished = false;
   try {
-    // versionGuardPath is env-derived (SCHEDULER_HOME/HOME) but validated by
-    // resolveDaemonVersionPath -> assertContainedPath (resolve + containment
-    // after symlink canonicalization); the env and the local filesystem are
-    // the same trust domain for this single-user daemon.
-    const versionGuardPath = resolveDaemonVersionPath(process.env);
-    if (!versionGuardPath || !existsSync(versionGuardPath)) return;
-    // Only remove the record if it still names THIS process: a lease-expiry
-    // race could have let a newer dispatcher take over and rewrite it.
-    let record = null;
-    try {
-      record = JSON.parse(readFileSync(versionGuardPath, 'utf8'));
-    } catch { return; }
-    if (record && record.pid !== process.pid) return;
-    unlinkSync(versionGuardPath);
+    removeDaemonVersionFileIfOwned();
   } catch (err) {
     log('warn', `Version guard record cleanup failed: ${err.message}`);
   }
@@ -1164,6 +1156,25 @@ function logLegacyClientLabels() {
     log('warn', `Legacy client version check skipped: ${err.message}`);
   }
 }
+function refreshDaemonVersionRecord(force = false) {
+  if (!running) return;
+  const versionGuardPath = resolveDaemonVersionPath(process.env);
+  const missing = versionGuardPath ? !existsSync(versionGuardPath) : true;
+  if (!force && !missing && Date.now() - lastVersionGuardRefresh < 60_000) return;
+  try {
+    const path = writeDaemonVersionFile({
+      version: SCHEDULER_VERSION,
+      packagePath: __dirname,
+      canWrite: () => Boolean(dispatcherRuntime?.renew()),
+    });
+    if (path) {
+      daemonVersionPublished = true;
+      lastVersionGuardRefresh = Date.now();
+    }
+  } catch (err) {
+    log('warn', `Version guard refresh failed: ${err.message}`);
+  }
+}
 async function tick() {
   const now = Date.now();
 
@@ -1174,21 +1185,7 @@ async function tick() {
     throw new Error('Dispatcher lease was lost; refusing further state transitions');
   }
 
-  // Keep the daemon version record fresh (and recover it if the file was
-  // removed). Rewrite immediately when missing; otherwise refresh at most
-  // once per minute so ticks stay cheap. The record is only written after
-  // the dispatcher lease is held (see main()), so a process that fails to
-  // become the dispatcher never publishes a version.
-  const versionGuardPath = resolveDaemonVersionPath(process.env);
-  const versionGuardMissing = versionGuardPath ? !existsSync(versionGuardPath) : true;
-  if (versionGuardMissing || now - lastVersionGuardRefresh >= 60_000) {
-    lastVersionGuardRefresh = now;
-    try {
-      writeDaemonVersionFile({ version: SCHEDULER_VERSION, packagePath: __dirname });
-    } catch (err) {
-      log('warn', `Version guard refresh failed: ${err.message}`);
-    }
-  }
+  refreshDaemonVersionRecord();
 
   logLegacyClientLabels();
 
@@ -1466,6 +1463,7 @@ function shutdown(signal) {
   shutdownPromise = (async () => {
     log('info', `Shutting down (${signal})`);
     running = false;
+    stopVersionGuardTimer();
     for (const [runId] of activeRunControllers) {
       abortActiveRun(runId, `Dispatcher shutting down (${signal})`, 'shutdown');
     }
@@ -1475,8 +1473,8 @@ function shutdown(signal) {
     try {
       // This process was the dispatcher: remove the version record so a
       // stopped daemon is reported as unknown (stopped), not as a stale
-      // match. The lease is released by stop() above; a process that never
-      // acquired the lease never wrote the record (see main()).
+      // match. The shared mutex makes the ownership check and unlink atomic
+      // with successor publication, even after stop() released the lease.
       removeDaemonVersionRecordIfOwned();
     } catch (err) {
       log('warn', `Version guard record cleanup failed: ${err.message}`);
@@ -1548,6 +1546,7 @@ async function main() {
     onTaskError: (error, meta) => log('error', `Dispatch worker failed: ${error.message}`, meta),
     onLeaseLost: meta => {
       running = false;
+      stopVersionGuardTimer();
       log('error', 'Dispatcher lease lost; stopping new work', meta);
       for (const [runId] of activeRunControllers) {
         abortActiveRun(runId, 'Dispatcher lease lost', 'lease_lost');
@@ -1566,11 +1565,18 @@ async function main() {
   // would leave a false-match record when this process exits because the
   // older daemon still holds the lease; tick() refreshes the record while
   // the lease is held, and shutdown removes it.
-  const daemonVersionPath = writeDaemonVersionFile({ version: SCHEDULER_VERSION, packagePath: __dirname });
+  const daemonVersionPath = writeDaemonVersionFile({
+    version: SCHEDULER_VERSION, packagePath: __dirname,
+    canWrite: () => Boolean(dispatcherRuntime?.renew()),
+  });
   if (daemonVersionPath) {
     daemonVersionPublished = true;
     log('info', `Version guard: wrote ${SCHEDULER_VERSION} to ${daemonVersionPath}`);
   }
+  lastVersionGuardRefresh = Date.now();
+  // Tick intervals may be an hour; version freshness must not depend on them.
+  versionGuardTimer = setInterval(() => refreshDaemonVersionRecord(true), 60_000);
+  versionGuardTimer.unref();
   log('info', 'Dispatcher lease acquired', {
     ownerId: dispatcherRuntime.ownerId,
     fencingToken: dispatcherRuntime.fencingToken,
@@ -1627,6 +1633,7 @@ async function main() {
 
 main().catch(async err => {
   log('error', `Fatal: ${err.message}`);
+  stopVersionGuardTimer();
   if (dispatcherRuntime) {
     for (const [runId] of activeRunControllers) {
       abortActiveRun(runId, 'Dispatcher fatal shutdown', 'fatal');

@@ -1552,6 +1552,7 @@ switch (command) {
     const unknownDoctorArgs = doctorArgs.filter(arg => arg !== '--deep' && arg !== '--no-version-guard');
     if (unknownDoctorArgs.length > 0) fail(`Unknown doctor option: ${unknownDoctorArgs[0]}`, 1, 'INVALID_ARGUMENT');
     const doctorSkipGuard = doctorArgs.includes('--no-version-guard');
+    const doctorWarnOnly = Boolean(firstNonEmpty(process.env.SCHEDULER_VERSION_GUARD));
     const versionGuard = guardVersionMismatch({ command: 'doctor' });
     if (versionGuard && versionGuard.status !== 'match' && !doctorSkipGuard) {
       process.stderr.write(`${guardWarningLine(versionGuard)}\n`);
@@ -1584,14 +1585,16 @@ switch (command) {
     if (versionGuard && versionGuard.status === 'unknown') {
       warnings.push('Version guard: no daemon version record found; the dispatcher may be stopped or pre-date 0.6.10 (see version_guard).');
     }
-    // A mismatch is a hard failure for doctor. An unknown record (daemon
+    // A mismatch fails doctor unless the same warning-only override used by
+    // other CLI commands is set. An unknown record (daemon
     // stopped, or pre-0.6.10) is a warning only -- doctor already reports a
     // missing lease, and operators must still be able to inspect state while
     // the daemon is down.
     const versionGuardHealthy = !versionGuard
       || versionGuard.status === 'match'
       || versionGuard.status === 'unknown'
-      || doctorSkipGuard;
+      || doctorSkipGuard
+      || doctorWarnOnly;
     const healthy = missingTables.length === 0
       && schemaVersion === SCHEDULER_SCHEMA_VERSION
       && dbParentWritable
@@ -1612,6 +1615,7 @@ switch (command) {
         cli_path: versionGuard.cliPath,
         daemon_path: versionGuard.daemonPath,
         skipped: doctorSkipGuard || null,
+        warning_only: doctorWarnOnly || null,
         message: versionGuard.message,
       } : null,
       paths: {

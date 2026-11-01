@@ -746,3 +746,154 @@ test('daemon logs loudly for labels enqueued by a legacy (unversioned) CLI', asy
   const count = stderr.split('without a client version stamp').length - 1;
   assert.ok(count <= 2, `legacy label logged once (saw ${count} times)`);
 });
+
+test('doctor warning-only override preserves mismatch diagnostics and unrelated failures', t => {
+  const home = fixtureHome(t);
+  writeDaemonVersion(home, '0.5.0');
+  const env = cliEnv(home, { extra: { SCHEDULER_VERSION_GUARD: '1' } });
+  const result = runCli(['doctor', '--json'], env);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.version_guard.status, 'mismatch');
+  assert.equal(payload.version_guard.skipped, null, 'override keeps the diagnostic enabled');
+  assert.match(result.stderr, /version mismatch/i);
+  const emptyOverride = runCli(['doctor', '--json'], { ...env, SCHEDULER_VERSION_GUARD: ' ' });
+  assert.equal(emptyOverride.status, 1, 'an empty override does not disable failure');
+
+  // A separate synthetic foreign-key violation must still fail health checks.
+  const db = new Database(env.SCHEDULER_DB);
+  db.pragma('foreign_keys = OFF');
+  db.exec('CREATE TABLE guard_parent (id INTEGER PRIMARY KEY); CREATE TABLE guard_child (parent INTEGER REFERENCES guard_parent(id)); INSERT INTO guard_child VALUES (1)');
+  db.close();
+  const unhealthy = runCli(['doctor', '--json'], env);
+  assert.equal(unhealthy.status, 1, 'warning-only version override cannot hide database errors');
+  assert.equal(JSON.parse(unhealthy.stdout).database.foreign_key_violations, 1);
+});
+
+async function waitForGuardFixture(check, message, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (!check() && Date.now() < deadline) {
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+  }
+  assert.ok(check(), message);
+}
+
+function guardFixtureProcess(t, home, args, extra = {}) {
+  const child = spawn(process.execPath, args, {
+    cwd: root, env: cliEnv(home, { extra }), stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise(resolveExit => child.once('exit', resolveExit));
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => child.kill('SIGKILL'), 2000);
+    try { await exited; } finally { clearTimeout(timer); }
+  });
+  return { child, stderr: () => stderr };
+}
+
+test('shutdown ownership check cannot delete a concurrent successor publication', async t => {
+  const home = fixtureHome(t);
+  const versionFile = join(home, 'scheduler', 'daemon-version.json');
+  const readMarker = join(home, 'cleanup-read');
+  const writerMarker = join(home, 'writer-started');
+  const observer = join(home, 'pause-cleanup.mjs');
+  // Pause the real shutdown reader after it reads its own PID, before unlink.
+  // A separate process publishes through the real writer during that window.
+  writeFileSync(observer, `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    let stopping = false;
+    process.on('SIGTERM', () => { stopping = true; });
+    const read = fs.readFileSync;
+    fs.readFileSync = function(path, ...args) {
+      const result = read.call(this, path, ...args);
+      if (stopping && String(path) === ${JSON.stringify(versionFile)}) {
+        fs.writeFileSync(${JSON.stringify(readMarker)}, 'read');
+        const end = Date.now() + 3000;
+        while (!fs.existsSync(${JSON.stringify(writerMarker)}) && Date.now() < end) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+  `);
+  const first = guardFixtureProcess(t, home, ['--import', observer, dispatcherPath], {
+    SCHEDULER_TICK_MS: '300000',
+  });
+  await waitForGuardFixture(() => first.stderr().includes('Gateway unreachable'), first.stderr());
+  first.child.kill('SIGTERM');
+  await waitForGuardFixture(() => existsSync(readMarker), 'shutdown reached the real PID read');
+  const writer = guardFixtureProcess(t, home, ['--input-type=module', '-e', `
+    import { writeFileSync } from 'node:fs';
+    import { writeDaemonVersionFile } from ${JSON.stringify(new URL('../version-guard.js', import.meta.url).href)};
+    writeFileSync(${JSON.stringify(writerMarker)}, 'started');
+    writeDaemonVersionFile({version: 'successor'});
+  `]);
+  await waitForGuardFixture(() => first.child.exitCode !== null, 'old dispatcher exits');
+  await waitForGuardFixture(() => writer.child.exitCode !== null, 'successor writer exits');
+  assert.equal(first.child.exitCode, 0, first.stderr());
+  assert.equal(writer.child.exitCode, 0, writer.stderr());
+  assert.ok(existsSync(versionFile), 'old dispatcher must not erase the successor record');
+  const record = JSON.parse(readFileSync(versionFile, 'utf8'));
+  assert.equal(record.version, 'successor');
+  assert.equal(record.pid, writer.child.pid);
+});
+
+test('long tick version timer refreshes independently and stops after lease takeover', async t => {
+  const home = fixtureHome(t);
+  const versionFile = join(home, 'scheduler', 'daemon-version.json');
+  const observer = join(home, 'accelerate-minute.mjs');
+  const callsFile = join(home, 'minute-calls');
+  const clearsFile = join(home, 'minute-clears');
+  // Accelerate only the production minute interval, retaining its callback,
+  // lease checks, filesystem writes and cleanup. The 300000ms tick is unchanged.
+  writeFileSync(observer, `
+    import { appendFileSync } from 'node:fs';
+    const interval = globalThis.setInterval;
+    const clear = globalThis.clearInterval;
+    const minuteTimers = new Set();
+    globalThis.setInterval = (fn, delay, ...args) => {
+      if (delay !== 60000) return interval(fn, delay, ...args);
+      const timer = interval(() => {
+        appendFileSync(${JSON.stringify(callsFile)}, 'call\\n');
+        fn(...args);
+      }, 50);
+      minuteTimers.add(timer);
+      return timer;
+    };
+    globalThis.clearInterval = timer => {
+      if (minuteTimers.delete(timer)) appendFileSync(${JSON.stringify(clearsFile)}, 'clear\\n');
+      return clear(timer);
+    };
+  `);
+  const daemon = guardFixtureProcess(t, home, ['--import', observer, dispatcherPath], {
+    SCHEDULER_TICK_MS: '300000',
+  });
+  await waitForGuardFixture(() => daemon.stderr().includes('Gateway unreachable'), 'first long tick reaches health check');
+  const first = JSON.parse(readFileSync(versionFile, 'utf8'));
+  rmSync(versionFile);
+  await waitForGuardFixture(() => existsSync(versionFile), 'minute timer restores the missing record while tick sleeps', 1500);
+  const refreshed = JSON.parse(readFileSync(versionFile, 'utf8'));
+  assert.ok(Date.parse(refreshed.written_at) > Date.parse(first.written_at));
+  assert.equal(refreshed.pid, daemon.child.pid);
+  const db = new Database(join(home, 'scheduler', 'scheduler.db'));
+  const changed = db.prepare("UPDATE dispatcher_leases SET owner_id = 'successor', fencing_token = fencing_token + 1 WHERE name = 'scheduler-dispatcher'").run();
+  db.close();
+  assert.equal(changed.changes, 1);
+  rmSync(versionFile);
+  await waitForGuardFixture(() => existsSync(clearsFile), 'lease takeover clears the minute timer');
+  const calls = readFileSync(callsFile, 'utf8');
+  await new Promise(resolveDelay => setTimeout(resolveDelay, 150));
+  assert.equal(readFileSync(callsFile, 'utf8'), calls, 'no timer callbacks after lease loss');
+  assert.equal(existsSync(versionFile), false, 'lease loser cannot publish a fresh record');
+  daemon.child.kill('SIGTERM');
+  await waitForGuardFixture(() => daemon.child.exitCode !== null, 'long tick daemon exits on shutdown');
+  assert.equal(daemon.child.exitCode, 0, daemon.stderr());
+});
