@@ -43,15 +43,53 @@ function routingBodyModel(agentId) {
 // The Gateway is always loopback for this scheduler. Refuse to send the
 // summarization request to any non-loopback host (SSRF guard): if the resolved
 // gateway URL points elsewhere, the caller fails open (returns null) and
-// delivers the raw content instead. Accepts plain hosts and hosts with a port.
-function isLoopbackGatewayUrl(gatewayUrl) {
-  let parsed;
+// delivers the raw content instead.
+//
+// The URL handed to fetch is constructed ONLY from validated primitives -- a
+// literal protocol string, an allowlisted hostname constant, and a numeric
+// port -- never from the raw configured string. This breaks the taint path an
+// external (attacker-controlled) host would otherwise flow down into fetch.
+/**
+ * Build the gateway chat-completions endpoint from validated loopback parts.
+ * Returns null when the configured URL is malformed, uses a non-http(s)
+ * protocol, embeds credentials, or targets a non-loopback host.
+ *
+ * Every character of the returned endpoint derives from either a literal
+ * constant (the protocol and the allowlisted loopback host) or a validated
+ * numeric port -- never from the raw configured string. Mapping the parsed
+ * values onto literals breaks the taint path that an attacker-controlled
+ * OPENCLAW_GATEWAY_URL would otherwise flow down into fetch.
+ *
+ * @param {string} gatewayUrl - The configured gateway base URL.
+ * @returns {string|null} The endpoint, or null to fail open.
+ */
+function buildLoopbackEndpoint(gatewayUrl) {
+  let url;
   try {
-    parsed = new URL(gatewayUrl);
+    url = new URL(gatewayUrl);
   } catch {
-    return false;
+    return null;
   }
-  return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1';
+  // Protocol must be http(s); map onto a literal so no taint flows through.
+  let proto;
+  if (url.protocol === 'http:') proto = 'http:';
+  else if (url.protocol === 'https:') proto = 'https:';
+  else return null;
+  // Credentials (user:pass@) are never acceptable on a loopback gateway URL.
+  if (url.username !== '' || url.password !== '') return null;
+  // Host must be a loopback constant; map onto a literal (bracketed IPv6) so
+  // the fetch target's host is a constant independent of the configured
+  // string. The WHATWG parser reports the IPv6 host as '[::1]'; accept the
+  // bare '::1' form too so the allowlist is parser-agnostic.
+  let host;
+  if (url.hostname === '127.0.0.1') host = '127.0.0.1';
+  else if (url.hostname === 'localhost') host = 'localhost';
+  else if (url.hostname === '::1' || url.hostname === '[::1]') host = '[::1]';
+  else return null;
+  // Port is a validated integer (or empty for the protocol default).
+  const port = url.port ? Number(url.port) : '';
+  if (port !== '' && !Number.isInteger(port)) return null;
+  return proto + '//' + host + (port !== '' ? ':' + port : '') + '/v1/chat/completions';
 }
 
 // Bound the summary call so a slow model cannot stall the delivery path.
@@ -109,10 +147,12 @@ export async function summarizeDeliveryContent(opts = {}) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_SUMMARY_TIMEOUT_MS;
   const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : fetch;
   const gatewayUrl = opts.gatewayUrl || process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-  // SSRF guard: only ever talk to a loopback gateway. A non-loopback or
-  // malformed URL fails open (null) so the raw content is delivered.
-  if (!isLoopbackGatewayUrl(gatewayUrl)) return null;
-  const endpoint = new URL(gatewayUrl).href.replace(/\/$/, '') + '/v1/chat/completions';
+  // SSRF guard: only ever talk to a loopback gateway. The endpoint is built
+  // from validated loopback primitives (see buildLoopbackEndpoint); a
+  // non-loopback or malformed URL fails open (null) so the raw content is
+  // delivered.
+  const endpoint = buildLoopbackEndpoint(gatewayUrl);
+  if (!endpoint) return null;
 
   // Truncate the input so the prompt stays bounded regardless of output size.
   const input = rawContent.length > MAX_INPUT_CHARS

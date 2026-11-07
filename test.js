@@ -13495,6 +13495,19 @@ console.log('\n-- delivery_summary: unit (prompt, gating, fail-open) --');
   assert(seenEndpoints.pop() === 'http://127.0.0.1:18789/v1/chat/completions', 'delivery_summary: loopback endpoint resolves to the gateway chat-completions path');
   assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: loopFetch, gatewayUrl: 'http://localhost:18789' }) === 'ok', 'delivery_summary: localhost URL is allowed');
   assert(seenEndpoints.pop() === 'http://localhost:18789/v1/chat/completions', 'delivery_summary: localhost endpoint resolves correctly');
+  // Non-default loopback port: the endpoint must be built from the validated
+  // port (not the raw string) and resolve to exactly that host:port.
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: loopFetch, gatewayUrl: 'http://127.0.0.1:19999' }) === 'ok', 'delivery_summary: non-default loopback port is allowed');
+  assert(seenEndpoints.pop() === 'http://127.0.0.1:19999/v1/chat/completions', 'delivery_summary: non-default loopback port endpoint resolves exactly');
+  // IPv6 loopback: the hostname constant is allowlisted and the bracketed form
+  // is reconstructed, so the endpoint is built from validated parts.
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: loopFetch, gatewayUrl: 'http://[::1]:19999' }) === 'ok', 'delivery_summary: IPv6 loopback is allowed');
+  assert(seenEndpoints.pop() === 'http://[::1]:19999/v1/chat/completions', 'delivery_summary: IPv6 loopback endpoint resolves exactly');
+  // Credentials embedded in the URL are rejected (fail open to null, no fetch).
+  const credFetch = async () => { throw new Error('fetch must not be called for a gateway URL with credentials'); };
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: credFetch, gatewayUrl: 'http://user:pass@127.0.0.1:18789' }) === null, 'delivery_summary: gateway URL with credentials fails open to null without fetch');
+  // A non-http(s) protocol is rejected (fail open to null, no fetch).
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: credFetch, gatewayUrl: 'ftp://127.0.0.1:18789' }) === null, 'delivery_summary: non-http(s) protocol fails open to null without fetch');
   assert(cleanSummary('Summary: all good.') === 'all good.', 'delivery_summary: cleanSummary strips wrapper before lowercase prose');
   assert(cleanSummary('Summary: Q3 revenue up 12%.') === 'Summary: Q3 revenue up 12%.', 'delivery_summary: cleanSummary preserves a titled Summary: line (capitalized)');
   assert(cleanSummary('Summary: 42 tests passed.') === 'Summary: 42 tests passed.', 'delivery_summary: cleanSummary preserves a Summary: line followed by a digit');
