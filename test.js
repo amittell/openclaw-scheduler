@@ -11500,7 +11500,7 @@ console.log('\n-- v0.2 Capabilities CLI --');
     encoding: 'utf8',
   }));
   assert(capsOut.scheduler_version, 'capabilities: scheduler_version present');
-  assert(capsOut.schema_version === 30, 'capabilities: schema_version is 30');
+  assert(capsOut.schema_version === 31, 'capabilities: schema_version is 31');
   assert(capsOut.handoff_version === '4', 'capabilities: handoff_version is 4');
   assert(capsOut.features, 'capabilities: features object present');
   assert(capsOut.features.identity_declaration === true, 'capabilities: identity_declaration enabled');
@@ -13435,6 +13435,171 @@ console.log('\n-- Package file allowlist includes dispatch imports --');
     packageJson.files.includes('dispatch/paths.mjs'),
     'package files include dispatch/paths.mjs helper imported by dispatch entrypoints',
   );
+}
+
+// ======================================================================
+// v31: opt-in LLM summarization of delivery bodies (delivery_summary: 'llm')
+// ======================================================================
+console.log('\n-- delivery_summary: unit (prompt, gating, fail-open) --');
+{
+  const {
+    shouldSummarizeDelivery, summarizeDeliveryContent, cleanSummary,
+    buildSummaryPrompt, DEFAULT_SUMMARY_THRESHOLD_CHARS,
+  } = await import('./delivery-summary.js');
+
+  const llmJob = { delivery_summary: 'llm', delivery_mode: 'announce' };
+  const long = 'word '.repeat(100); // > threshold
+  assert(DEFAULT_SUMMARY_THRESHOLD_CHARS === 400, 'delivery_summary: default threshold is 400 chars');
+  assert(shouldSummarizeDelivery(llmJob, long) === true, 'delivery_summary: enabled + long content summarizes');
+  assert(shouldSummarizeDelivery(llmJob, 'short') === false, 'delivery_summary: short content does not summarize');
+  assert(shouldSummarizeDelivery({ ...llmJob, delivery_summary: 'none' }, long) === false, 'delivery_summary: disabled never summarizes');
+  assert(shouldSummarizeDelivery({ ...llmJob, delivery_mode: 'none' }, long) === false, 'delivery_summary: delivery_mode none never summarizes');
+  const prompt = buildSummaryPrompt(long, { jobName: 'backup', status: 'ok' });
+  assert(prompt.includes('backup') && prompt.includes('status: ok'), 'delivery_summary: prompt carries job name + status');
+  assert(prompt.includes(long.slice(0, 20)), 'delivery_summary: prompt carries the raw output');
+
+  const okFetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'Backup finished and all files were verified. No action needed.' } }] }) });
+  const sum = await summarizeDeliveryContent({ rawContent: long, fetchImpl: okFetch });
+  assert(sum === 'Backup finished and all files were verified. No action needed.', 'delivery_summary: LLM success returns the summary');
+  const failFetch = async () => ({ ok: false, status: 500, text: async () => 'boom' });
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: failFetch }) === null, 'delivery_summary: LLM 500 fails open to null');
+  const throwFetch = async () => { throw new Error('network down'); };
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: throwFetch }) === null, 'delivery_summary: LLM throw fails open to null');
+  const slowFetch = (_url, init) => new Promise((res, rej) => { init.signal.addEventListener('abort', () => rej(new Error('aborted'))); setTimeout(() => res({ ok: true, json: async () => ({ choices: [{ message: { content: 'late' } }] }) }), 5000); });
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: slowFetch, timeoutMs: 200 }) === null, 'delivery_summary: bounded timeout fails open to null');
+  assert(cleanSummary('Summary: all good.') === 'all good.', 'delivery_summary: cleanSummary strips wrapper');
+  assert(cleanSummary('"quoted"') === 'quoted', 'delivery_summary: cleanSummary strips quotes');
+  assert(cleanSummary('   ') === null, 'delivery_summary: cleanSummary rejects empty');
+  assert(cleanSummary('```js\nfoo()\n```') === null, 'delivery_summary: cleanSummary rejects code fence');
+  assert(cleanSummary('a'.repeat(3000)) === null, 'delivery_summary: cleanSummary rejects oversized output');
+}
+
+console.log('\n-- delivery_summary: handleDelivery persists summary_source --');
+{
+  const { createDeliveryHelpers } = await import('./dispatcher-delivery.js');
+  const { enqueueDelivery } = await import('./delivery-outbox.js');
+  const liveDb = getDb();
+  const { handleDelivery } = createDeliveryHelpers({
+    log: () => {},
+    resolveDeliveryAlias: () => null,
+  });
+  const summaryJob = createJob({
+    name: 'summary-source-handle', schedule_cron: '0 9 * * *',
+    session_target: 'shell', payload_kind: 'shellCommand', payload_message: 'echo src',
+    delivery_mode: 'announce', delivery_channel: 'telegram', delivery_to: '445566778899',
+    delivery_summary: 'llm', run_timeout_ms: 5000, origin: 'system',
+  });
+  const job = { ...getJob(summaryJob.id) };
+  const before = liveDb.prepare('SELECT COUNT(*) AS cnt FROM delivery_outbox').get().cnt;
+  await handleDelivery(job, 'llm-summarized body', { summarySource: 'llm' });
+  const after = liveDb.prepare('SELECT COUNT(*) AS cnt FROM delivery_outbox').get().cnt;
+  assert(after === before + 1, 'delivery_summary: handleDelivery enqueues one outbox item with summarySource');
+  const row = liveDb.prepare('SELECT body, summary_source FROM delivery_outbox WHERE job_id = ? ORDER BY created_at DESC LIMIT 1').get(job.id);
+  assert(row.summary_source === 'llm', 'delivery_summary: outbox row records summary_source=llm');
+  assert(row.body === 'llm-summarized body', 'delivery_summary: outbox body is the summarized text');
+  // Option off => raw content delivered unchanged, no summary_source.
+  const rawDelivery = enqueueDelivery({ channel: 'telegram', target: '445566778899', body: 'raw unchanged content', jobId: job.id });
+  const rawRow = liveDb.prepare('SELECT summary_source FROM delivery_outbox WHERE id = ?').get(rawDelivery.id);
+  assert(rawRow.summary_source === null, 'delivery_summary: option-off delivery has null summary_source');
+  deleteJob(job.id);
+}
+
+console.log('\n-- delivery_summary: schema round-trip through jobs add/update --');
+{
+  const job = createJob({
+    name: 'llm-summary-roundtrip',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo roundtrip',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '112233445566',
+    delivery_summary: 'llm',
+    run_timeout_ms: 5000,
+    origin: 'system',
+  });
+  assert(getJob(job.id).delivery_summary === 'llm', 'delivery_summary: createJob persists delivery_summary=llm');
+  assert(updateJob(job.id, { delivery_summary: 'none' }).delivery_summary === 'none', 'delivery_summary: updateJob flips to none');
+  assert(updateJob(job.id, { delivery_summary: 'llm' }).delivery_summary === 'llm', 'delivery_summary: updateJob flips back to llm');
+  let rejected = false;
+  try { updateJob(job.id, { delivery_summary: 'bogus' }); } catch { rejected = true; }
+  assert(rejected, 'delivery_summary: invalid value is rejected on update');
+  deleteJob(job.id);
+}
+
+console.log('\n-- delivery_summary: finalizeDispatch precomputes summary before delivery --');
+{
+  const job = createJob({
+    name: 'llm-summary-finalize',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo finalize',
+    delivery_mode: 'announce-always',
+    delivery_channel: 'telegram',
+    delivery_to: '778899001122',
+    delivery_summary: 'llm',
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  const longContent = 'log line '.repeat(60); // > 400 chars
+  const originalFetch = globalThis.fetch;
+  const delivered = [];
+  let idemCounter = 0;
+  const finalizeDeps = () => ({
+    ...buildPrepareDispatchDeps(),
+    shouldRetry: () => false,
+    canEnqueueDispatch: () => false,
+    scheduleRetry: () => null,
+    generateIdempotencyKey: () => `idem-sum-${++idemCounter}`,
+    handleDelivery: async (j, content, o) => { delivered.push({ content, summarySource: o?.summarySource ?? null }); return { id: 'fake' }; },
+    dequeueJob: () => true,
+  });
+  try {
+    // Success path: gateway returns a concise summary.
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'The job finished and its output was verified. Nothing needs attention.' } }] }) });
+    const ctx = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    await finalizeDispatch(
+      getJob(job.id),
+      ctx,
+      {
+        status: 'ok', summary: 'ok', content: longContent, errorMessage: null,
+        runFinishFields: { shell_stdout: longContent },
+        deliveryOverride: longContent, skipDelivery: false, skipJobUpdate: false, skipChildren: true,
+        skipDequeue: false, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 1, 'delivery_summary: finalizeDispatch delivers once on the success path');
+    assert(delivered[0].content === 'The job finished and its output was verified. Nothing needs attention.', 'delivery_summary: delivered body is the LLM summary, not the raw output');
+    assert(delivered[0].summarySource === 'llm', 'delivery_summary: success path tags summary_source=llm');
+    const run = getDb().prepare('SELECT shell_stdout FROM runs WHERE job_id = ? ORDER BY started_at DESC LIMIT 1').get(job.id);
+    assert(run.shell_stdout === longContent, 'delivery_summary: full raw output is preserved in the run record');
+
+    // Failure path: gateway errors, delivery falls back to raw content.
+    delivered.length = 0;
+    globalThis.fetch = async () => { throw new Error('gateway down'); };
+    const ctx2 = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    await finalizeDispatch(
+      getJob(job.id),
+      ctx2,
+      {
+        status: 'ok', summary: 'ok', content: longContent, errorMessage: null,
+        runFinishFields: { shell_stdout: longContent },
+        deliveryOverride: longContent, skipDelivery: false, skipJobUpdate: false, skipChildren: true,
+        skipDequeue: false, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 1, 'delivery_summary: failure path still delivers once');
+    assert(delivered[0].content === longContent, 'delivery_summary: failure path delivers the raw content (fail-open)');
+    assert(delivered[0].summarySource === 'raw-fallback', 'delivery_summary: failure path tags summary_source=raw-fallback');
+  } finally {
+    globalThis.fetch = originalFetch;
+    getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(job.id);
+    deleteJob(job.id);
+  }
 }
 
 closeDb();

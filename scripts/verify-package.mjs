@@ -134,7 +134,7 @@ void snapshot;
       SCHEDULER_DB: join(fixture, 'installed-smoke.db'),
     },
   }));
-  if (doctor.ok !== true || doctor.database?.schema_version !== 30) {
+  if (doctor.ok !== true || doctor.database?.schema_version !== 31) {
     throw new Error(`installed package doctor failed: ${JSON.stringify(doctor)}`);
   }
 

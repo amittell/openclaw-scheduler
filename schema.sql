@@ -1,4 +1,4 @@
--- OpenClaw Scheduler Schema (current: v0.5.0, schema version: 29)
+-- OpenClaw Scheduler Schema (current: v0.5.0, schema version: 31)
 -- Full standalone scheduler + message router
 
 -- ============================================================
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'announce-always' | 'none'
   delivery_channel TEXT,
   delivery_to     TEXT,
+  delivery_summary TEXT DEFAULT 'none',               -- 'none' | 'llm' (v31: opt-in LLM summary of long delivery bodies)
   
   -- Metadata
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
@@ -475,6 +476,7 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
   part_count      INTEGER,
   completion_label TEXT,
   completion_scope TEXT,
+  summary_source  TEXT,                               -- 'llm' | 'raw-fallback' (v31: which path produced the delivered body)
   attempt_count   INTEGER NOT NULL DEFAULT 0,
   max_attempts    INTEGER NOT NULL DEFAULT 5,
   next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -909,3 +911,4 @@ INSERT OR IGNORE INTO schema_migrations (version) VALUES (27);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (28);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (29);
 INSERT OR IGNORE INTO schema_migrations (version) VALUES (30);
+INSERT OR IGNORE INTO schema_migrations (version) VALUES (31);

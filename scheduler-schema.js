@@ -1,4 +1,4 @@
-export const SCHEDULER_SCHEMA_VERSION = 30;
+export const SCHEDULER_SCHEMA_VERSION = 31;
 export const SCHEDULER_PRODUCT_SCHEMA_LABEL = 'v0.5.0';
 
 export const SCHEDULER_SCHEMAS = {
@@ -29,6 +29,11 @@ export const SCHEDULER_SCHEMAS = {
       max_trigger_fanout: { type: 'integer', min: 1, default: 25 },
       delivery_mode: { type: 'string', enum: ['announce', 'announce-always', 'none'], default: 'announce' },
       delivery_channel: { type: 'string', nullable: true },
+      // Opt-in LLM summarization of long delivery bodies (v31). When 'llm',
+      // announce deliveries longer than the summary threshold are summarized
+      // through the Gateway chat-completions endpoint before posting; failures
+      // fall back to the raw content (fail-open, never drops a delivery).
+      delivery_summary: { type: 'string', enum: ['none', 'llm'], default: 'none' },
       // REQUIRED on insert for non-exempt jobs. Exempt: job_type='watchdog', name starts with 'watchdog:',
       // session_target='main', or delivery_mode='none'. Set to the origin chat_id so results reach the right chat.
       delivery_to: { type: 'string', nullable: true, required: 'non-system jobs', description: 'Target chat/user id for delivery (e.g. telegram chat_id). Required on insert for non-system jobs.' },

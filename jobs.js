@@ -29,6 +29,7 @@ const MAX_CHAIN_DEPTH = 10;
 const VALID_TRIGGERS = new Set(['success', 'failure', 'complete']);
 const VALID_OVERLAP_POLICIES = new Set(['skip', 'allow', 'queue']);
 const VALID_DELIVERY_MODES = new Set(['announce', 'announce-always', 'none']);
+const VALID_DELIVERY_SUMMARY = new Set(['none', 'llm']);
 const VALID_PAYLOAD_SCOPES = new Set(['own', 'global']);
 const VALID_DELIVERY_GUARANTEES = new Set(['at-most-once', 'at-least-once']);
 const VALID_JOB_CLASSES = new Set(['standard', 'pre_compaction_flush']);
@@ -564,6 +565,7 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
 
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
+  assertEnum('delivery_summary', merged.delivery_summary || 'none', VALID_DELIVERY_SUMMARY);
 
   // INSERT-only: enforce delivery_to for all non-exempt jobs.
   // Exempt from this requirement:
@@ -1350,7 +1352,7 @@ export function createJob(opts) {
       payload_model, payload_model_fallback, payload_thinking, payload_timeout_seconds,
       execution_intent, execution_read_only, shell_env_policy,
       overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals, max_trigger_fanout,
-      delivery_mode, delivery_channel, delivery_to,
+      delivery_mode, delivery_channel, delivery_to, delivery_summary,
       delete_after_run, next_run_at,
       parent_id, trigger_on, trigger_delay_s,
       max_retries, payload_scope, resource_pool,
@@ -1388,7 +1390,7 @@ export function createJob(opts) {
       ?, ?, ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?,
-      ?, ?,
+      ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?,
       ?, ?, ?,
@@ -1444,6 +1446,7 @@ export function createJob(opts) {
     normalized.delivery_mode || 'announce',
     normalized.delivery_channel || null,
     normalized.delivery_to || null,
+    normalized.delivery_summary || 'none',
     normalized.delete_after_run ? 1 : 0,
     nextRun,
     normalized.parent_id || null,
@@ -1585,6 +1588,7 @@ export function updateJob(id, patch) {
     'execution_intent', 'execution_read_only', 'shell_env_policy',
     'overlap_policy', 'run_timeout_ms', 'max_queued_dispatches', 'max_pending_approvals', 'max_trigger_fanout',
     'delivery_mode', 'delivery_channel', 'delivery_to',
+    'delivery_summary',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
     'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
     'max_retries', 'payload_scope', 'resource_pool', 'trigger_condition',

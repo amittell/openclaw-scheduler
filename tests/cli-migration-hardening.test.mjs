@@ -86,11 +86,11 @@ test('help, version, schema, capabilities, and validation avoid database initial
 
   const capabilities = runNode(cliPath, ['capabilities', '--json'], { env });
   assert.equal(capabilities.status, 0, capabilities.stderr);
-  assert.equal(parseStdout(capabilities).schema_version, 30);
+  assert.equal(parseStdout(capabilities).schema_version, 31);
 
   const launcherCapabilities = runNode(binPath, ['--json', 'capabilities'], { env });
   assert.equal(launcherCapabilities.status, 0, launcherCapabilities.stderr);
-  assert.equal(parseStdout(launcherCapabilities).schema_version, 30);
+  assert.equal(parseStdout(launcherCapabilities).schema_version, 31);
 
   const specPath = join(dir, 'job.json');
   writeFileSync(specPath, JSON.stringify(validShellJob()));
@@ -286,7 +286,7 @@ test('hydrated v4 job reads validate the artifact against the persisted job row'
   assert.match(parseStdout(mismatched).error, /effective task hash|execution binding/);
 });
 
-test('doctor reports schema v30 and lease, queue, outbox, and approval diagnostics', t => {
+test('doctor reports schema v31 and lease, queue, outbox, and approval diagnostics', t => {
   const dir = tempRoot(t, 'scheduler-doctor-');
   const result = runNode(cliPath, ['doctor', '--json'], {
     env: { SCHEDULER_DB: join(dir, 'scheduler.db') },
@@ -294,8 +294,8 @@ test('doctor reports schema v30 and lease, queue, outbox, and approval diagnosti
   assert.equal(result.status, 0, result.stderr);
   const payload = parseStdout(result);
   assert.equal(payload.ok, true);
-  assert.equal(payload.database.schema_version, 30);
-  assert.equal(payload.database.latest_schema_version, 30);
+  assert.equal(payload.database.schema_version, 31);
+  assert.equal(payload.database.latest_schema_version, 31);
   assert.ok('dispatcher_lease' in payload.diagnostics);
   assert.ok('dispatch_queue' in payload.diagnostics);
   assert.ok('delivery_outbox' in payload.diagnostics);
@@ -374,7 +374,7 @@ test('current databases remain readable while another process holds the write lo
   }
 });
 
-test('schema v30 consolidation repairs missing required indexes before taking the no-op path', t => {
+test('schema v31 consolidation repairs missing required indexes before taking the no-op path', t => {
   const dir = tempRoot(t, 'scheduler-index-repair-');
   const dbPath = join(dir, 'scheduler.db');
   const env = { SCHEDULER_DB: dbPath };
@@ -383,7 +383,7 @@ test('schema v30 consolidation repairs missing required indexes before taking th
 
   const db = new Database(dbPath);
   try {
-    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 30);
+    assert.equal(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 31);
     db.exec('DROP INDEX idx_delivery_outbox_group_part');
     assert.equal(
       db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_outbox_group_part'").get().count,
@@ -409,7 +409,7 @@ test('schema v30 consolidation repairs missing required indexes before taking th
 
   const noOp = runNode(consolidatePath, [], { env });
   assert.equal(noOp.status, 0, noOp.stderr);
-  assert.match(noOp.stdout, /DB already at v30/);
+  assert.match(noOp.stdout, /DB already at v31/);
 });
 
 test('schema v29 consolidation backfills retained v4 evidence verification metadata', t => {
@@ -544,7 +544,7 @@ test('older runtime refuses a database with a newer schema version', t => {
   assert.equal(runNode(cliPath, ['doctor', '--json'], { env }).status, 0);
   const db = new Database(dbPath);
   try {
-    db.prepare('INSERT INTO schema_migrations (version) VALUES (31)').run();
+    db.prepare('INSERT INTO schema_migrations (version) VALUES (32)').run();
   } finally {
     db.close();
   }
@@ -554,10 +554,10 @@ test('older runtime refuses a database with a newer schema version', t => {
   const payload = parseStdout(rejected);
   assert.equal(payload.code, 'DB_INIT_FAILED');
   assert.equal(payload.details.phase, 'consolidation migration');
-  assert.match(payload.error, /newer than supported version 30/);
+  assert.match(payload.error, /newer than supported version 31/);
   const untouched = new Database(dbPath, { readonly: true });
   try {
-    assert.equal(untouched.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 31);
+    assert.equal(untouched.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 32);
   } finally {
     untouched.close();
   }
@@ -589,7 +589,7 @@ test('schema consolidation repairs complete baseline objects before its no-op pa
   }
   const noOp = runNode(consolidatePath, [], { env });
   assert.equal(noOp.status, 0, noOp.stderr);
-  assert.match(noOp.stdout, /DB already at v30/);
+  assert.match(noOp.stdout, /DB already at v31/);
 });
 
 test('schema consolidation normalizes legacy output-triggered delivery and rejects unknown modes', t => {
@@ -834,7 +834,7 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
 
   const upgraded = runNode(cliPath, ['doctor', '--deep', '--json'], { env });
   assert.equal(upgraded.status, 0, `${upgraded.stderr}\n${upgraded.stdout}`);
-  assert.equal(parseStdout(upgraded).database.schema_version, 30);
+  assert.equal(parseStdout(upgraded).database.schema_version, 31);
   const upgradedDb = new Database(dbPath, { readonly: true });
   try {
     const expectedColumns = {

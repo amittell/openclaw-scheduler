@@ -276,6 +276,7 @@ fails closed for parent output larger than 65,536 UTF-8 bytes.
 | `delivery_mode` | string | no | `none`, `announce`, `announce-always` |
 | `delivery_channel` | string | no | Channel name (telegram, discord, etc.) |
 | `delivery_to` | string | no | Chat ID, channel ID, or @alias |
+| `delivery_summary` | string | no | `none` (default) or `llm` -- summarize long output via the gateway model before posting (fail-open to raw) |
 | `origin` | string | yes (root jobs only; child jobs inherit) | Source chat ID or `system` |
 | `parent_id` | string | no | Parent job ID (for chains) |
 | `trigger_on` | string | no | `success`, `failure`, `complete` |

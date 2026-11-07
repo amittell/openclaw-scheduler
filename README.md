@@ -786,6 +786,54 @@ channel-specific target (chat ID, channel ID, phone number, handle, etc.).
 
 ---
 
+## Delivery Summarization (opt-in)
+
+By default the scheduler posts a job's raw output to the channel. For noisy
+runs (long test suites, verbose logs, big reports) that can be a wall of text.
+Set `delivery_summary: "llm"` on a job to have the scheduler ask the OpenClaw
+gateway to summarize the output into 2-4 plain-English sentences before it is
+posted.
+
+```bash
+openclaw-scheduler jobs add '{
+  "name": "Nightly Test Suite",
+  "schedule_cron": "0 3 * * *",
+  "session_target": "shell",
+  "payload_message": "npm test 2>&1",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_CHAT_ID",
+  "delivery_summary": "llm",
+  "run_timeout_ms": 1800000,
+  "origin": "system"
+}'
+```
+
+How it behaves:
+
+- **Opt-in and off by default.** `delivery_summary` is `"none"` unless you set
+  it to `"llm"`. When `"none"`, the raw output is delivered exactly as before.
+- **Only long output is summarized.** Bodies longer than ~400 characters are
+  summarized; short output is delivered verbatim (no model call).
+- **Uses the gateway's model.** The summary is produced by the gateway's
+  OpenAI-compatible chat-completions endpoint using the job's agent routing
+  model -- no extra API key or config is required.
+- **Fail-open.** If the model call fails, times out (30s bound), or returns
+  nothing usable, the original output is delivered instead. A delivery is
+  never dropped because summarization failed.
+- **Nothing is lost.** The full raw output is always retained in the run record
+  (`runs.shell_stdout` / `runs.summary`), so the summary is a convenience, not
+  a truncation. The outbox row records which path produced the posted body in
+  `summary_source` (`llm` or `raw-fallback`).
+
+```bash
+# Toggle it on an existing job
+openclaw-scheduler jobs update <id> '{"delivery_summary":"llm"}'
+openclaw-scheduler jobs update <id> '{"delivery_summary":"none"}'
+```
+
+---
+
 ## Delivery Aliases
 
 Delivery aliases let you define named delivery targets (e.g., `@my_team`) instead of hard-coding channel/target pairs in every job.
@@ -1381,7 +1429,7 @@ payload_model, payload_model_fallback, payload_thinking, execution_intent, execu
 overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals,
 max_trigger_fanout, output_store_limit_bytes, output_excerpt_limit_bytes,
 output_summary_limit_bytes, output_offload_threshold_bytes,
-max_retries, delivery_mode, delivery_channel,
+max_retries, delivery_mode, delivery_channel, delivery_summary,
 delivery_to, delivery_guarantee, delete_after_run, ttl_hours,
 parent_id, trigger_on, trigger_delay_s, trigger_condition,
 resource_pool, auth_profile, auth_profile_fallback,

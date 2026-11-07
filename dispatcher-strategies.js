@@ -18,6 +18,10 @@ import {
   materializeCredentials,
 } from './credential-runtime.js';
 import { getProviderSession } from './provider-session-store.js';
+import {
+  shouldSummarizeDelivery,
+  summarizeDeliveryContent,
+} from './delivery-summary.js';
 import { negotiateCredentialCapabilities } from './capability-negotiation.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 import {
@@ -1110,6 +1114,38 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
+  // v31: opt-in LLM summarization of long delivery bodies. The summary is
+  // precomputed here (async, before the completion bookkeeping transaction)
+  // and carried through result.deliveryOverride so the durable outbox path
+  // posts the concise text. The full raw output stays in the run record
+  // (result.content / shell_stdout / summary), so nothing is lost. Fail-open:
+  // any LLM error or empty result keeps the raw content and records
+  // summarySource 'raw-fallback'.
+  {
+    const rawBody = String(result.deliveryOverride ?? result.content ?? '');
+    if (shouldSummarizeDelivery(job, rawBody)) {
+      const summary = await summarizeDeliveryContent({
+        rawContent: rawBody,
+        jobName: job.name,
+        status: result.status,
+        agentId: job.agent_id || 'main',
+      });
+      if (summary) {
+        result.deliveryOverride = summary;
+        result.summarySource = 'llm';
+        log('info', `Delivery body LLM-summarized for ${job.name}`, {
+          runId: ctx.run.id,
+          rawChars: rawBody.length,
+          summaryChars: summary.length,
+        });
+      } else {
+        result.summarySource = 'raw-fallback';
+        log('debug', `Delivery summary unavailable; delivering raw for ${job.name}`, {
+          runId: ctx.run.id,
+        });
+      }
+    }
+  }
   // One conservative retry for transient LLM failures (5xx / gateway timeout /
   // aborted-class) on isolated agent-turn jobs. Retry bookkeeping and delivery
   // validation share this transaction, so a later validation error rolls back
@@ -1163,6 +1199,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
       ...(result.imageAttachments?.length > 0
         ? { imageAttachments: result.imageAttachments }
         : {}),
+      ...(result.summarySource ? { summarySource: result.summarySource } : {}),
     };
     if (result.deliveryOverride) {
       return handleDelivery(deliveryJob, result.deliveryOverride, deliveryOpts);

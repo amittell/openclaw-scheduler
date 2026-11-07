@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Opt-in LLM summarization of long delivery bodies.** A new `delivery_summary`
+  job field (`none` default, `llm` opt-in) asks the OpenClaw gateway to
+  summarize a job's output into 2-4 plain-English sentences before it is posted
+  to the channel. Only bodies longer than ~400 characters are summarized; short
+  output is delivered verbatim. The summary uses the gateway's existing
+  chat-completions endpoint and the job's agent routing model, so no extra API
+  key or config is required. It is fail-open: if the model call fails, times
+  out (30s bound), or returns nothing usable, the original output is delivered
+  instead and the delivery is never dropped. The full raw output is always
+  retained in the run record, and the outbox row records which path produced
+  the posted body in `summary_source` (`llm` or `raw-fallback`). Schema bumped
+  to v31 (`jobs.delivery_summary`, `delivery_outbox.summary_source`). `jobs
+  add`/`update` accept the new field.
+
 - **Completion-delivery safety net for `done` labels whose watcher was lost
   (`dispatch/completion-safety-net.mjs`).** The one-shot delivery watcher job
   (`<brand>-deliver:<label>`, `delete_after_run` + `ttl_hours: 48`) was the

@@ -75,6 +75,7 @@ export interface JobSpec {
   delivery_channel?: string | null;
   delivery_to?: string | null;
   delivery_guarantee?: 'at-most-once' | 'at-least-once';
+  delivery_summary?: 'none' | 'llm';
 
   // Workflow chaining
   parent_id?: string | null;
