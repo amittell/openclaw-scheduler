@@ -876,6 +876,19 @@ test('schema v27 predecessor upgrades every handoff v3 field and index', t => {
     const queueBinding = upgradedDb.prepare('PRAGMA table_info(job_dispatch_queue)').all()
       .find(column => column.name === 'binding_scheduled_for');
     assert.equal(queueBinding.notnull, 1);
+    // v31 columns: the doctor/deep upgrade must report both new columns with
+    // their correct types and defaults (jobs.delivery_summary TEXT DEFAULT
+    // 'none', delivery_outbox.summary_source TEXT DEFAULT NULL).
+    const v31JobsSummary = upgradedDb.prepare('PRAGMA table_info(jobs)').all()
+      .find(column => column.name === 'delivery_summary');
+    assert(v31JobsSummary, 'jobs.delivery_summary was not upgraded');
+    assert.equal(v31JobsSummary.type.toUpperCase(), 'TEXT');
+    assert.equal(v31JobsSummary.dflt_value, "'none'");
+    const v31OutboxSummarySource = upgradedDb.prepare('PRAGMA table_info(delivery_outbox)').all()
+      .find(column => column.name === 'summary_source');
+    assert(v31OutboxSummarySource, 'delivery_outbox.summary_source was not upgraded');
+    assert.equal(v31OutboxSummarySource.type.toUpperCase(), 'TEXT');
+    assert.equal(v31OutboxSummarySource.dflt_value, null);
     for (const objectName of [
       'evidence_records', 'idx_evidence_records_created_run',
       'idx_delivery_outbox_group_part', 'idx_delivery_outbox_group_status',

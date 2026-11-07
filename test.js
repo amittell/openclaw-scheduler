@@ -13467,7 +13467,42 @@ console.log('\n-- delivery_summary: unit (prompt, gating, fail-open) --');
   assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: throwFetch }) === null, 'delivery_summary: LLM throw fails open to null');
   const slowFetch = (_url, init) => new Promise((res, rej) => { init.signal.addEventListener('abort', () => rej(new Error('aborted'))); setTimeout(() => res({ ok: true, json: async () => ({ choices: [{ message: { content: 'late' } }] }) }), 5000); });
   assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: slowFetch, timeoutMs: 200 }) === null, 'delivery_summary: bounded timeout fails open to null');
-  assert(cleanSummary('Summary: all good.') === 'all good.', 'delivery_summary: cleanSummary strips wrapper');
+  // SSRF guard: a non-loopback gateway URL must fail open (null) without any fetch call.
+  const spyFetch = async () => { throw new Error('fetch must not be called for a non-loopback gateway'); };
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: spyFetch, gatewayUrl: 'http://attacker.example.com' }) === null, 'delivery_summary: external gateway URL fails open to null without fetch');
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: spyFetch, gatewayUrl: 'https://evil.example.com:8443' }) === null, 'delivery_summary: external gateway URL with port fails open to null');
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: spyFetch, gatewayUrl: 'not a url' }) === null, 'delivery_summary: malformed gateway URL fails open to null');
+  // SSRF guard via the environment variable path: an external OPENCLAW_GATEWAY_URL
+  // must fail open to null without any fetch call (the default loopback URL is
+  // used only when the env var is unset).
+  const savedGatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? null;
+  try {
+    process.env.OPENCLAW_GATEWAY_URL = 'http://attacker.example.com';
+    assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: spyFetch }) === null, 'delivery_summary: external OPENCLAW_GATEWAY_URL fails open to null without fetch');
+    process.env.OPENCLAW_GATEWAY_URL = 'http://127.0.0.1:9';
+    const envLoopFetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) });
+    assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: envLoopFetch }) === 'ok', 'delivery_summary: loopback OPENCLAW_GATEWAY_URL is allowed');
+  } finally {
+    if (savedGatewayUrl === null) delete process.env.OPENCLAW_GATEWAY_URL;
+    else process.env.OPENCLAW_GATEWAY_URL = savedGatewayUrl;
+  }
+  // Loopback variants (with and without port) must still be allowed. Record
+  // the resolved endpoint instead of asserting inside the spy (a throw there
+  // is swallowed by the fail-open catch and would fail open to null).
+  const seenEndpoints = [];
+  const loopFetch = async (url) => { seenEndpoints.push(String(url)); return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) }; };
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: loopFetch, gatewayUrl: 'http://127.0.0.1:18789' }) === 'ok', 'delivery_summary: loopback URL with port is allowed');
+  assert(seenEndpoints.pop() === 'http://127.0.0.1:18789/v1/chat/completions', 'delivery_summary: loopback endpoint resolves to the gateway chat-completions path');
+  assert(await summarizeDeliveryContent({ rawContent: long, fetchImpl: loopFetch, gatewayUrl: 'http://localhost:18789' }) === 'ok', 'delivery_summary: localhost URL is allowed');
+  assert(seenEndpoints.pop() === 'http://localhost:18789/v1/chat/completions', 'delivery_summary: localhost endpoint resolves correctly');
+  assert(cleanSummary('Summary: all good.') === 'all good.', 'delivery_summary: cleanSummary strips wrapper before lowercase prose');
+  assert(cleanSummary('Summary: Q3 revenue up 12%.') === 'Summary: Q3 revenue up 12%.', 'delivery_summary: cleanSummary preserves a titled Summary: line (capitalized)');
+  assert(cleanSummary('Summary: 42 tests passed.') === 'Summary: 42 tests passed.', 'delivery_summary: cleanSummary preserves a Summary: line followed by a digit');
+  assert(cleanSummary('The summary: all good.') === 'all good.', 'delivery_summary: cleanSummary strips the-summary wrapper');
+  assert(cleanSummary('Here is the result: done.') === 'the result: done.', 'delivery_summary: cleanSummary strips here-is wrapper');
+  assert(cleanSummary('Here is Report: done.') === 'Here is Report: done.', 'delivery_summary: cleanSummary preserves here-is before a capitalized word');
+  assert(cleanSummary('Summary:') === null, 'delivery_summary: cleanSummary strips a bare wrapper to null');
+  assert(cleanSummary('Summary: ,') === ',', 'delivery_summary: cleanSummary strips wrapper before a comma');
   assert(cleanSummary('"quoted"') === 'quoted', 'delivery_summary: cleanSummary strips quotes');
   assert(cleanSummary('   ') === null, 'delivery_summary: cleanSummary rejects empty');
   assert(cleanSummary('```js\nfoo()\n```') === null, 'delivery_summary: cleanSummary rejects code fence');
@@ -13595,6 +13630,29 @@ console.log('\n-- delivery_summary: finalizeDispatch precomputes summary before 
     assert(delivered.length === 1, 'delivery_summary: failure path still delivers once');
     assert(delivered[0].content === longContent, 'delivery_summary: failure path delivers the raw content (fail-open)');
     assert(delivered[0].summarySource === 'raw-fallback', 'delivery_summary: failure path tags summary_source=raw-fallback');
+
+    // Soft-failure context preservation: a body posted under the
+    // "⚠️ Job soft-failed" marker keeps that failure context when it is
+    // summarized (a one-line status prefix above the summary).
+    delivered.length = 0;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'The backup stopped after a disk timeout; retrying at the next schedule.' } }] }) });
+    const softFailedBody = '\u26a0\ufe0f Job soft-failed (no retry scheduled): llm-summary-finalize\n\n' + longContent;
+    const ctx3 = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    await finalizeDispatch(
+      getJob(job.id),
+      ctx3,
+      {
+        status: 'error', summary: 'error', content: softFailedBody, errorMessage: 'boom',
+        runFinishFields: { shell_stdout: softFailedBody },
+        deliveryOverride: softFailedBody, skipDelivery: false, skipJobUpdate: true, skipChildren: true,
+        skipDequeue: true, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 1, 'delivery_summary: soft-failure path still delivers once');
+    assert(delivered[0].summarySource === 'llm', 'delivery_summary: soft-failure summary tags summary_source=llm');
+    assert(delivered[0].content.startsWith('\u26a0\ufe0f Job soft-failed: llm-summary-finalize (Status: error)\n'), 'delivery_summary: soft-failure summary keeps the failure marker + status line');
+    assert(delivered[0].content.includes('The backup stopped after a disk timeout; retrying at the next schedule.'), 'delivery_summary: soft-failure summary carries the LLM summary below the marker');
   } finally {
     globalThis.fetch = originalFetch;
     getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(job.id);

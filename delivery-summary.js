@@ -40,6 +40,20 @@ function routingBodyModel(agentId) {
   return route.bodyModel;
 }
 
+// The Gateway is always loopback for this scheduler. Refuse to send the
+// summarization request to any non-loopback host (SSRF guard): if the resolved
+// gateway URL points elsewhere, the caller fails open (returns null) and
+// delivers the raw content instead. Accepts plain hosts and hosts with a port.
+function isLoopbackGatewayUrl(gatewayUrl) {
+  let parsed;
+  try {
+    parsed = new URL(gatewayUrl);
+  } catch {
+    return false;
+  }
+  return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1';
+}
+
 // Bound the summary call so a slow model cannot stall the delivery path.
 const DEFAULT_SUMMARY_TIMEOUT_MS = 30_000;
 // Only summarize bodies meaningfully longer than a short message.
@@ -71,6 +85,11 @@ export function buildSummaryPrompt(rawContent, { jobName, status } = {}) {
  * content. Returns a cleaned summary string, or null on any failure so the
  * caller can fall back to the raw content (fail-open).
  *
+ * The raw content is truncated to MAX_INPUT_CHARS (12,000) characters before
+ * it is sent, so the prompt stays bounded regardless of output size. The
+ * gateway URL must resolve to a loopback host (127.0.0.1 / localhost / ::1);
+ * any other target fails open (returns null) as an SSRF guard.
+ *
  * @param {object} opts
  * @param {string} opts.rawContent - The full delivery body to summarize.
  * @param {string} [opts.jobName] - Job name for prompt context.
@@ -90,6 +109,9 @@ export async function summarizeDeliveryContent(opts = {}) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_SUMMARY_TIMEOUT_MS;
   const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : fetch;
   const gatewayUrl = opts.gatewayUrl || process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
+  // SSRF guard: only ever talk to a loopback gateway. A non-loopback or
+  // malformed URL fails open (null) so the raw content is delivered.
+  if (!isLoopbackGatewayUrl(gatewayUrl)) return null;
   const endpoint = new URL(gatewayUrl).href.replace(/\/$/, '') + '/v1/chat/completions';
 
   // Truncate the input so the prompt stays bounded regardless of output size.
@@ -150,8 +172,17 @@ export function cleanSummary(content) {
   if (typeof content !== 'string') return null;
   let text = content.trim();
   if (!text) return null;
-  // Drop a leading "Here is ...:" / "Summary:" style wrapper if present.
-  text = text.replace(/^(?:here is|here are|summary|the summary)[:\s]+/i, '').trim();
+  // Drop a leading "Here is ...:" / "Summary:" style wrapper, but only when it
+  // is followed by lowercase prose or a comma. A capitalized word or a digit
+  // (e.g. "Summary: Q3 revenue up") is real content, not a wrapper, so it is
+  // preserved verbatim.
+  const wrapper = text.match(/^(?:here is|here are|the summary|summary)[:\s]+/i);
+  if (wrapper) {
+    const rest = text.slice(wrapper[0].length).trim();
+    // Strip only lowercase prose, a comma, or nothing at all (the wrapper
+    // itself, which becomes an empty -> null result).
+    if (rest === '' || /^[a-z,]/.test(rest)) text = rest;
+  }
   // Strip surrounding quotes the model sometimes adds.
   if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
     text = text.slice(1, -1).trim();

@@ -1120,7 +1120,9 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   // posts the concise text. The full raw output stays in the run record
   // (result.content / shell_stdout / summary), so nothing is lost. Fail-open:
   // any LLM error or empty result keeps the raw content and records
-  // summarySource 'raw-fallback'.
+  // summarySource 'raw-fallback'. A body that already carries the soft-failure
+  // prefix keeps its failure context: the summary is posted under a status
+  // line instead of silently replacing the marker.
   {
     const rawBody = String(result.deliveryOverride ?? result.content ?? '');
     if (shouldSummarizeDelivery(job, rawBody)) {
@@ -1131,12 +1133,19 @@ export async function finalizeDispatch(job, ctx, result, deps) {
         agentId: job.agent_id || 'main',
       });
       if (summary) {
-        result.deliveryOverride = summary;
+        // A soft-failure body is posted under the "⚠️ Job soft-failed" marker
+        // (see enqueueCompletionDelivery). Summarizing would drop that failure
+        // context, so re-attach a one-line status prefix above the summary.
+        const failureContext = rawBody.startsWith('\u26a0\ufe0f Job soft-failed') || result.status === 'error';
+        result.deliveryOverride = failureContext
+          ? `\u26a0\ufe0f Job soft-failed: ${job.name} (Status: ${result.status})\n${summary}`
+          : summary;
         result.summarySource = 'llm';
         log('info', `Delivery body LLM-summarized for ${job.name}`, {
           runId: ctx.run.id,
           rawChars: rawBody.length,
           summaryChars: summary.length,
+          preservedFailureContext: failureContext,
         });
       } else {
         result.summarySource = 'raw-fallback';
