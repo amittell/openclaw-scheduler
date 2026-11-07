@@ -1475,6 +1475,7 @@ export default function migrateConsolidate() {
       part_count      INTEGER,
       completion_label TEXT,
       completion_scope TEXT,
+      summary_source  TEXT DEFAULT NULL,
       attempt_count   INTEGER NOT NULL DEFAULT 0,
       max_attempts    INTEGER NOT NULL DEFAULT 5,
       next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),

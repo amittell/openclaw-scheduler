@@ -479,6 +479,24 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
         throw new Error('effective_task_hash does not match handoff_artifact_payload');
       }
     }
+    // v31: delivery_summary is intentionally NOT part of the handoff v4 bound
+    // field set (HANDOFF_V4_BOUND_FIELDS / schedulerJobExecutionProjection), so
+    // a plain update could enable model processing and change the delivered
+    // output without replacing the immutable artifact while artifact validation
+    // still passes. Rather than bind the field (which would invalidate every
+    // existing v4 artifact), reject opting v4 jobs into LLM summarization until
+    // the v4 contract carries it. The field stays at its current value for v4
+    // jobs and 'llm' is refused with a descriptive error. Only a create with
+    // 'llm' or an explicit update to 'llm' is rejected; an unrelated update to
+    // a job that already carries 'llm' (pre-fix state) is not blocked.
+    const settingLlmSummary = mode === 'create'
+      || (normalized.delivery_summary === 'llm' && 'delivery_summary' in normalized);
+    if (settingLlmSummary && merged.delivery_summary === 'llm' && handoffVersion === 4) {
+      throw Object.assign(
+        new Error('delivery_summary=llm is not supported for handoff v4 jobs: the field is outside the v4 artifact binding contract; disable it or replace the artifact contract first'),
+        { code: 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED' },
+      );
+    }
   } else if (
     normalized.handoff_artifact_digest != null
     || normalized.handoff_artifact_payload != null

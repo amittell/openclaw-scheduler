@@ -5,7 +5,8 @@
 import './tests/isolate-environment.mjs';
 import Database from 'better-sqlite3';
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -4089,6 +4090,118 @@ console.log('\n-- Migration Guard --');
   closeDb();
 
   rmSync(legacyDir, { recursive: true, force: true });
+  setDbPath(':memory:');
+  await initDb();
+
+  // v31 migration gap: a DB that predates delivery_outbox has the ALTER TABLE
+  // ADD COLUMN summary_source skipped (table absent), so the fallback CREATE
+  // TABLE must include summary_source -- otherwise the migration reports v31
+  // but every delivery INSERT fails even with summarization disabled.
+  const preOutboxDir = mkdtempSync(join(tmpdir(), 'scheduler-pre-outbox-'));
+  const preOutboxDbPath = join(preOutboxDir, 'scheduler.db');
+  const preOutboxDb = new Database(preOutboxDbPath);
+  preOutboxDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      schedule_cron TEXT NOT NULL,
+      schedule_tz TEXT NOT NULL DEFAULT 'America/New_York',
+      session_target TEXT NOT NULL DEFAULT 'isolated',
+      agent_id TEXT DEFAULT 'main',
+      payload_kind TEXT NOT NULL,
+      payload_message TEXT NOT NULL,
+      payload_timeout_seconds INTEGER DEFAULT 120,
+      overlap_policy TEXT NOT NULL DEFAULT 'skip',
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      delivery_mode TEXT DEFAULT 'announce',
+      delivery_channel TEXT,
+      delivery_to TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      delete_after_run INTEGER NOT NULL DEFAULT 0,
+      parent_id TEXT,
+      trigger_on TEXT,
+      trigger_delay_s INTEGER DEFAULT 0,
+      trigger_condition TEXT DEFAULT NULL,
+      max_retries INTEGER DEFAULT 0,
+      queued_count INTEGER DEFAULT 0,
+      payload_scope TEXT NOT NULL DEFAULT 'own',
+      resource_pool TEXT DEFAULT NULL,
+      delivery_guarantee TEXT DEFAULT 'at-most-once',
+      job_class TEXT DEFAULT 'standard',
+      approval_required INTEGER DEFAULT 0,
+      approval_timeout_s INTEGER DEFAULT 3600,
+      approval_auto TEXT DEFAULT 'reject',
+      context_retrieval TEXT DEFAULT 'none',
+      context_retrieval_limit INTEGER DEFAULT 5,
+      preferred_session_key TEXT DEFAULT NULL,
+      job_type TEXT NOT NULL DEFAULT 'standard',
+      next_run_at TEXT,
+      last_run_at TEXT,
+      last_status TEXT,
+      consecutive_errors INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT,
+      duration_ms INTEGER,
+      last_heartbeat TEXT NOT NULL DEFAULT (datetime('now')),
+      session_key TEXT,
+      session_id TEXT,
+      summary TEXT,
+      error_message TEXT,
+      dispatched_at TEXT,
+      run_timeout_ms INTEGER NOT NULL DEFAULT 300000,
+      retry_count INTEGER DEFAULT 0,
+      retry_of TEXT,
+      idempotency_key TEXT,
+      context_summary TEXT,
+      replay_of TEXT,
+      triggered_by_run TEXT,
+      dispatch_queue_id TEXT
+    );
+    CREATE TABLE messages (id TEXT PRIMARY KEY);
+    CREATE TABLE task_tracker_agents (id TEXT PRIMARY KEY);
+    CREATE TABLE approvals (id TEXT PRIMARY KEY);
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO schema_migrations (version) VALUES (14);
+  `);
+  preOutboxDb.close();
+
+  closeDb();
+  setDbPath(preOutboxDbPath);
+  let preOutboxLogs = '';
+  const originalPreOutboxStderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk, encoding, cb) => {
+    preOutboxLogs += String(chunk);
+    if (typeof cb === 'function') cb();
+    return true;
+  });
+  try {
+    await initDb();
+  } finally {
+    process.stderr.write = originalPreOutboxStderr;
+  }
+  const preOutboxMigrated = getDb();
+  const preOutboxCols = preOutboxMigrated.prepare('PRAGMA table_info(delivery_outbox)').all().map(c => c.name);
+  assert(preOutboxCols.includes('summary_source'), 'migration: pre-outbox DB gets delivery_outbox.summary_source via fallback CREATE TABLE');
+  assert(!preOutboxLogs.includes('migrate-consolidate error'), 'migration: pre-outbox DB consolidates without errors');
+  // A delivery INSERT with summary_source must succeed (summarization on).
+  const { enqueueDelivery: preOutboxEnqueue } = await import('./delivery-outbox.js');
+  const preOutboxDelivery = preOutboxEnqueue({ channel: 'telegram', target: '111222333444', body: 'migrated delivery body', summarySource: 'llm' });
+  const preOutboxRow = preOutboxMigrated.prepare('SELECT summary_source, body FROM delivery_outbox WHERE id = ?').get(preOutboxDelivery.id);
+  assert(preOutboxRow.summary_source === 'llm', 'migration: INSERT with summary_source works on the fallback-created outbox');
+  assert(preOutboxRow.body === 'migrated delivery body', 'migration: delivery body is stored intact on the fallback-created outbox');
+  closeDb();
+
+  rmSync(preOutboxDir, { recursive: true, force: true });
   setDbPath(':memory:');
   await initDb();
 }
@@ -11706,6 +11819,7 @@ function buildPrepareDispatchDeps(overrides = {}) {
       buildShellEnvironment,
       summarizeGovernance,
       generateEvidence,
+      storeRunArtifact,
       ...overrides,
     };
 }
@@ -13520,6 +13634,44 @@ console.log('\n-- delivery_summary: unit (prompt, gating, fail-open) --');
   assert(cleanSummary('   ') === null, 'delivery_summary: cleanSummary rejects empty');
   assert(cleanSummary('```js\nfoo()\n```') === null, 'delivery_summary: cleanSummary rejects code fence');
   assert(cleanSummary('a'.repeat(3000)) === null, 'delivery_summary: cleanSummary rejects oversized output');
+  // Token-path security: the summarizer must resolve the gateway token through
+  // the same credential-root allowlist as the rest of the scheduler. A symlink
+  // pointing outside the allowed roots must NOT be read into the Authorization
+  // header (it could exfiltrate another file's contents to the gateway).
+  {
+    const { resolveGatewayTokenPath } = await import('./gateway.js');
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedTokenEnv = process.env.OPENCLAW_GATEWAY_TOKEN;
+    const savedTokenPathEnv = process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+    try {
+      process.env.NODE_ENV = 'test'; // allow tmpdir() as a credential root
+      delete process.env.OPENCLAW_GATEWAY_TOKEN;
+      const tokenDir = mkdtempSync(join(tmpdir(), 'scheduler-summary-token-'));
+      const legitPath = join(tokenDir, 'legit-token');
+      const escapedPath = join(tokenDir, 'escaped-token');
+      writeFileSync(legitPath, 'legit-summary-token\n');
+      // escapedPath is a symlink whose TARGET lives outside every allowed
+      // credential root; realpath resolves it to /etc/passwd, which the
+      // allowlist rejects.
+      symlinkSync('/etc/passwd', escapedPath);
+      // The legit path inside an allowed root resolves.
+      process.env.OPENCLAW_GATEWAY_TOKEN_PATH = legitPath;
+      assert(resolveGatewayTokenPath() === realpathSync(legitPath), 'delivery_summary: token path inside an allowed root resolves');
+      // A symlink escaping the allowed roots must resolve to null, so the
+      // summarizer never reads the target file as the Authorization header.
+      process.env.OPENCLAW_GATEWAY_TOKEN_PATH = escapedPath;
+      assert(resolveGatewayTokenPath() === null, 'delivery_summary: symlinked token path escaping allowed roots is rejected');
+      assert(resolveGatewayTokenPath('/etc/passwd') === null, 'delivery_summary: absolute path outside allowed roots is rejected');
+      rmSync(tokenDir, { recursive: true, force: true });
+    } finally {
+      if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedNodeEnv;
+      if (savedTokenEnv === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+      else process.env.OPENCLAW_GATEWAY_TOKEN = savedTokenEnv;
+      if (savedTokenPathEnv === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN_PATH;
+      else process.env.OPENCLAW_GATEWAY_TOKEN_PATH = savedTokenPathEnv;
+    }
+  }
 }
 
 console.log('\n-- delivery_summary: handleDelivery persists summary_source --');
@@ -13666,11 +13818,116 @@ console.log('\n-- delivery_summary: finalizeDispatch precomputes summary before 
     assert(delivered[0].summarySource === 'llm', 'delivery_summary: soft-failure summary tags summary_source=llm');
     assert(delivered[0].content.startsWith('\u26a0\ufe0f Job soft-failed: llm-summary-finalize (Status: error)\n'), 'delivery_summary: soft-failure summary keeps the failure marker + status line');
     assert(delivered[0].content.includes('The backup stopped after a disk timeout; retrying at the next schedule.'), 'delivery_summary: soft-failure summary carries the LLM summary below the marker');
+
+    // Long isolated-agent reply (>5000 chars, output_format unset): the full
+    // agent response must be persisted as a run artifact BEFORE the delivery
+    // body is replaced by the summary, so the scheduler retains a complete
+    // copy even though runs.summary is truncated and the outbox only gets the
+    // summary.
+    delivered.length = 0;
+    const longAgentReply = 'agent output line '.repeat(600); // ~12000 chars > 5000
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'The agent finished its long task and verified the results.' } }] }) });
+    const ctxAgent = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    const agentRunId = ctxAgent.run.id;
+    await finalizeDispatch(
+      getJob(job.id),
+      ctxAgent,
+      {
+        status: 'ok', summary: longAgentReply.slice(0, 5000), content: longAgentReply, errorMessage: null,
+        runFinishFields: {},
+        deliveryOverride: longAgentReply, skipDelivery: false, skipJobUpdate: false, skipChildren: true,
+        skipDequeue: false, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 1, 'delivery_summary: long agent reply still delivers once (summarized)');
+    assert(delivered[0].content === 'The agent finished its long task and verified the results.', 'delivery_summary: long agent reply delivers the LLM summary');
+    const agentRun = getDb().prepare('SELECT summary, context_summary FROM runs WHERE id = ?').get(agentRunId);
+    assert(agentRun.summary.length <= 5000, 'delivery_summary: runs.summary stays truncated to 5000 chars for agent jobs');
+    const agentCtx = JSON.parse(agentRun.context_summary || '{}');
+    assert(agentCtx.agent_delivery?.summarized === true, 'delivery_summary: agent delivery context records that the body was summarized');
+    assert(agentCtx.agent_delivery?.raw_chars === longAgentReply.length, 'delivery_summary: agent delivery context records the raw body length');
+    assert(typeof agentCtx.agent_delivery?.full_body?.path === 'string', 'delivery_summary: full agent body is persisted to a run artifact path');
+    assert(readFileSync(agentCtx.agent_delivery.full_body.path, 'utf8') === longAgentReply, 'delivery_summary: persisted agent artifact contains the complete raw reply');
+    const agentSha = `sha256:${createHash('sha256').update(longAgentReply, 'utf8').digest('hex')}`;
+    assert(agentCtx.agent_delivery.full_body.sha256 === agentSha, 'delivery_summary: persisted agent artifact records the raw body sha256');
+    assert(agentCtx.agent_delivery.full_body.bytes === Buffer.byteLength(longAgentReply, 'utf8'), 'delivery_summary: persisted agent artifact records the raw body byte count');
+
+    // skipDelivery: a successful shell/agent job in announce mode skips
+    // delivery (only errors announce). The summary request must be skipped
+    // entirely -- no model call, no finalization delay -- and the raw content
+    // is never posted.
+    delivered.length = 0;
+    let summaryFetchCalls = 0;
+    globalThis.fetch = async () => { summaryFetchCalls++; return { ok: true, json: async () => ({ choices: [{ message: { content: 'should not be requested' } }] }) };
+    };
+    const ctxSkip = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    await finalizeDispatch(
+      getJob(job.id),
+      ctxSkip,
+      {
+        status: 'ok', summary: 'ok', content: longContent, errorMessage: null,
+        runFinishFields: { shell_stdout: longContent },
+        deliveryOverride: longContent, skipDelivery: true, skipJobUpdate: true, skipChildren: true,
+        skipDequeue: true, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 0, 'delivery_summary: skipDelivery posts nothing');
+    assert(summaryFetchCalls === 0, 'delivery_summary: skipDelivery does not request a summary (no model call)');
   } finally {
     globalThis.fetch = originalFetch;
     getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(job.id);
     deleteJob(job.id);
   }
+}
+
+console.log('\n-- delivery_summary: handoff v4 jobs reject delivery_summary=llm --');
+{
+  const { compileManifestToScheduler } = await import('@amittell/agentcli');
+  const JSON_FIELDS = ['identity', 'authorization_proof', 'authorization', 'evidence', 'contract_allowed_paths'];
+  const v4Manifest = {
+    version: '0.2',
+    workflows: [{
+      id: 'workflow-v4-summary-reject',
+      name: 'V4 Summary Reject',
+      tasks: [{
+        id: 'root',
+        name: 'V4 Summary Reject',
+        target: { session_target: 'shell' },
+        shell: { program: 'printf', args: ['ok'] },
+        schedule: { cron: '0 * * * *' },
+        runtime: { timeout_ms: 30_000 },
+        output: { format: 'text', preview_bytes: 512 },
+      }],
+    }],
+  };
+  const v4Jobs = compileManifestToScheduler(v4Manifest, {
+    schedulerHandoffVersion: '4',
+    cwd: process.cwd(),
+    env: { PATH: process.env.PATH || '/usr/bin' },
+  }).jobs;
+  const v4Spec = { ...v4Jobs[0] };
+  delete v4Spec.source;
+  for (const field of JSON_FIELDS) {
+    if (v4Spec[field] != null && typeof v4Spec[field] !== 'string') v4Spec[field] = JSON.stringify(v4Spec[field]);
+  }
+  const v4Job = createJob(v4Spec);
+  assert(Number(v4Job.handoff_version) === 4, 'delivery_summary: v4 fixture job is handoff v4');
+  assert(v4Job.delivery_summary === 'none', 'delivery_summary: v4 job starts with delivery_summary=none');
+  // Opting a v4 job into LLM summarization must be rejected: the field is
+  // outside the v4 artifact binding contract, so a plain update could change
+  // delivered output without replacing the immutable artifact.
+  let v4LlmRejected = null;
+  try { updateJob(v4Job.id, { delivery_summary: 'llm' }); }
+  catch (error) { v4LlmRejected = error; }
+  assert(v4LlmRejected != null, 'delivery_summary: updateJob(delivery_summary=llm) is rejected for v4 jobs');
+  assert(v4LlmRejected.code === 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED', 'delivery_summary: v4 rejection carries the contract error code');
+  assert(getJob(v4Job.id).delivery_summary === 'none', 'delivery_summary: v4 job keeps delivery_summary=none after rejected update');
+  // Flipping to a non-llm value is not a contract change and still works.
+  const cleared = updateJob(v4Job.id, { delivery_summary: 'none' });
+  assert(cleared.delivery_summary === 'none', 'delivery_summary: v4 update to delivery_summary=none is not blocked');
+  deleteJob(v4Job.id);
 }
 
 closeDb();

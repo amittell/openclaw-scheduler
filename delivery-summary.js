@@ -10,20 +10,26 @@
 // content, the original delivery body is used unchanged. A delivery is never
 // dropped because summarization failed.
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { splitModelOverride } from './agent-selection.js';
+import { resolveGatewayTokenPath } from './gateway.js';
 
 /**
  * Resolve the Gateway token the same way the rest of the scheduler does
  * (env override first, then the canonical credential path). Returns null when
  * no token is available; the summary call then relies on the gateway's
  * local-trust auth and fails open if rejected.
+ *
+ * The token path is resolved through resolveGatewayTokenPath() from gateway.js
+ * so OPENCLAW_GATEWAY_TOKEN_PATH is honored AND the file is constrained to the
+ * credential-root allowlist with a no-symlink check on the canonical root.
+ * Without this, a symlink could point the Authorization header at an
+ * arbitrary file's contents.
  */
 function resolveGatewayToken() {
   if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   try {
-    const tokenPath = join(homedir(), '.openclaw', 'credentials', '.gateway-token');
+    const tokenPath = resolveGatewayTokenPath();
+    if (!tokenPath) return null;
     return readFileSync(tokenPath, 'utf-8').trim() || null;
   } catch {
     return null;
