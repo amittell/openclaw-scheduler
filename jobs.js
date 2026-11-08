@@ -495,11 +495,19 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     // not mention the field. A v4 job that never sets the field keeps its
     // stored 'none' (no summarization, no error); a v4 create or update that
     // explicitly passes 'llm' is still refused.
-    const callerSetLlmSummary = 'delivery_summary' in normalized
-      && normalized.delivery_summary === 'llm';
-    if (callerSetLlmSummary && handoffVersion === 4) {
+    //
+    // v32 (PR #91 finding): an explicit null is also refused for v4 jobs. A
+    // null update is accepted and persisted as NULL, and the delivery-time
+    // fallback treats a missing delivery_summary as 'llm'; without this gate
+    // a v4 job could be flipped into summarization through that fallback,
+    // violating the artifact contract. v4 jobs keep their stored value
+    // ('none') and any caller attempt to change the field (to 'llm' or null)
+    // is refused with the contract error code.
+    const callerTouchedSummary = 'delivery_summary' in normalized
+      && (normalized.delivery_summary === 'llm' || normalized.delivery_summary == null);
+    if (callerTouchedSummary && handoffVersion === 4) {
       throw Object.assign(
-        new Error('delivery_summary=llm is not supported for handoff v4 jobs: the field is outside the v4 artifact binding contract; disable it or replace the artifact contract first'),
+        new Error('delivery_summary cannot be changed on handoff v4 jobs: the field is outside the v4 artifact binding contract (v4 jobs always store "none"); replace the artifact contract first to enable summarization'),
         { code: 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED' },
       );
     }

@@ -251,7 +251,13 @@ export function cleanSummary(content) {
  * mirrors the write-time default in jobs.js, where createJob stores 'llm' for
  * non-v4 jobs that never set the field (v4 jobs always store 'none').
  *
- * @param {object} job - The job record (reads delivery_summary, delivery_mode).
+ * Handoff v4 jobs are excluded unconditionally: the LLM would replace the
+ * delivery body, violating the v4 artifact contract (the delivered output is
+ * bound to the immutable artifact). This guard fires regardless of the
+ * stored delivery_summary value, so a null or missing field on a v4 job can
+ * never flip it into summarization.
+ *
+ * @param {object} job - The job record (reads handoff_version, delivery_summary, delivery_mode).
  * @param {string} content - The delivery body.
  * @param {object} [opts]
  * @param {number} [opts.thresholdChars=400] - Summarize only when longer.
@@ -259,6 +265,11 @@ export function cleanSummary(content) {
  */
 export function shouldSummarizeDelivery(job, content, opts = {}) {
   if (!job) return false;
+  // Handoff v4 jobs are never summarized, regardless of delivery_summary:
+  // the summary would replace the delivery body and break the v4 artifact
+  // contract. This also covers the null/missing-field case, where the unset
+  // -> 'llm' fallback below would otherwise treat the job as opted in.
+  if (Number(job.handoff_version) === 4) return false;
   if ((job.delivery_summary ?? 'llm') !== 'llm') return false;
   if (!['announce', 'announce-always'].includes(job.delivery_mode)) return false;
   const threshold = Number.isFinite(opts.thresholdChars) ? opts.thresholdChars : DEFAULT_SUMMARY_THRESHOLD_CHARS;

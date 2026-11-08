@@ -13951,6 +13951,24 @@ console.log('\n-- delivery_summary default flip: unset summarizes, none opts out
   assert(shouldSummarizeDelivery({ delivery_mode: 'none' }, long) === false, 'delivery_summary default: delivery_mode none never summarizes');
   // A null job is safe.
   assert(shouldSummarizeDelivery(null, long) === false, 'delivery_summary default: null job does not summarize');
+  // Handoff v4 jobs are never summarized regardless of delivery_summary: the
+  // unset -> 'llm' fallback must not apply to them (a null or missing field on
+  // a v4 job cannot flip it into summarization). The guard reads handoff_version.
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, handoff_version: 4, delivery_summary: null }, long) === false, 'delivery_summary default: v4 job with null delivery_summary never summarizes');
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, handoff_version: 4 }, long) === false, 'delivery_summary default: v4 job with missing delivery_summary never summarizes');
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, handoff_version: 4, delivery_summary: 'none' }, long) === false, 'delivery_summary default: v4 job with stored none never summarizes');
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, handoff_version: 0, delivery_summary: null }, long) === true, 'delivery_summary default: non-v4 job with null delivery_summary summarizes (fallback applies)');
+
+  // PR #91 finding 2: the public schema (returned by `schema jobs`) must
+  // advertise the new write-time default ('llm' for non-v4 jobs) and describe
+  // the v4 exception, so clients that materialize schema defaults do not
+  // unintentionally opt out. The SQL column default stays 'none' (legacy).
+  const { SCHEDULER_SCHEMAS } = await import('./scheduler-schema.js');
+  const publicSummary = SCHEDULER_SCHEMAS.jobs.fields.delivery_summary;
+  assert(publicSummary.default === 'llm', 'delivery_summary schema: public default is llm (write-time behavior)');
+  assert(publicSummary.enum.includes('none') && publicSummary.enum.includes('llm'), 'delivery_summary schema: enum still lists none + llm');
+  assert(typeof publicSummary.description === 'string' && publicSummary.description.includes('Handoff v4'), 'delivery_summary schema: description covers the v4 exception');
+  assert(publicSummary.description.includes('SQL column default'), 'delivery_summary schema: description notes the legacy SQL default');
 
   // Write-time default: a non-v4 job that never sets the field stores 'llm'.
   const unsetJob = createJob({
@@ -14068,6 +14086,19 @@ console.log('\n-- delivery_summary default flip: handoff v4 edge case --');
   assert(v4LlmRejected != null, 'delivery_summary v4 edge: explicit llm on a v4 job is still rejected');
   assert(v4LlmRejected.code === 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED', 'delivery_summary v4 edge: explicit llm rejection carries the contract code');
   assert(getJob(v4Unset.id).delivery_summary === 'none', 'delivery_summary v4 edge: v4 job keeps none after rejected explicit llm');
+
+  // PR #91 regression: an explicit null update on a v4 job is rejected with
+  // the contract code — it must not persist NULL and flip the job into
+  // summarization through the unset -> 'llm' fallback. The job keeps 'none',
+  // and shouldSummarizeDelivery stays false for it regardless of the field.
+  let v4NullRejected = null;
+  try { updateJob(v4Unset.id, { delivery_summary: null }); }
+  catch (error) { v4NullRejected = error; }
+  assert(v4NullRejected != null, 'delivery_summary v4 edge: explicit null update on a v4 job is rejected');
+  assert(v4NullRejected.code === 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED', 'delivery_summary v4 edge: explicit null rejection carries the contract code');
+  assert(getJob(v4Unset.id).delivery_summary === 'none', 'delivery_summary v4 edge: v4 job keeps none after rejected explicit null');
+  assert(shouldSummarizeDelivery(getJob(v4Unset.id), long) === false, 'delivery_summary v4 edge: v4 job does not summarize after rejected null update');
+
   deleteJob(v4Unset.id);
 
   // A v4 CREATE that explicitly passes 'llm' is still rejected (raw input
