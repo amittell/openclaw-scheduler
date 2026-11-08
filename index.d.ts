@@ -75,6 +75,12 @@ export interface JobSpec {
   delivery_channel?: string | null;
   delivery_to?: string | null;
   delivery_guarantee?: 'at-most-once' | 'at-least-once';
+  /**
+   * Summarize long delivery bodies via the gateway model (fail-open to raw).
+   * v32: 'llm' by default for non-handoff-v4 jobs when unset; an explicit
+   * 'none' opts out. Handoff v4 jobs always store 'none' (summarization is
+   * outside the v4 artifact binding contract).
+   */
   delivery_summary?: 'none' | 'llm';
 
   // Workflow chaining

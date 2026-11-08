@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   delivery_mode   TEXT DEFAULT 'announce',            -- 'announce' | 'announce-always' | 'none'
   delivery_channel TEXT,
   delivery_to     TEXT,
-  delivery_summary TEXT DEFAULT 'none',               -- 'none' | 'llm' (v31: opt-in LLM summary of long delivery bodies)
+  delivery_summary TEXT DEFAULT 'none',               -- 'none' | 'llm' (v31: LLM summary of long delivery bodies; v32: 'llm' is the code default for non-v4 jobs at write time — the stored 'none' default covers pre-v32 rows and handoff v4 jobs, which always store 'none')
   
   -- Metadata
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),

@@ -13930,6 +13930,211 @@ console.log('\n-- delivery_summary: handoff v4 jobs reject delivery_summary=llm 
   deleteJob(v4Job.id);
 }
 
+// ======================================================================
+// v32: delivery_summary defaults to 'llm' (unset summarizes); explicit 'none'
+// is the opt-out; v4 jobs always store 'none' and the v4 gate fires only on
+// an explicit 'llm'. Fail-open contract unchanged.
+// ======================================================================
+console.log('\n-- delivery_summary default flip: unset summarizes, none opts out --');
+{
+  const { shouldSummarizeDelivery } = await import('./delivery-summary.js');
+  const long = 'word '.repeat(100); // > threshold
+  const announce = 'announce';
+
+  // A job record with no delivery_summary value (undefined) summarizes.
+  assert(shouldSummarizeDelivery({ delivery_mode: announce }, long) === true, 'delivery_summary default: unset (undefined) summarizes');
+  // An explicit 'none' is the opt-out and does not summarize.
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, delivery_summary: 'none' }, long) === false, 'delivery_summary default: explicit none does not summarize');
+  // An explicit 'llm' summarizes.
+  assert(shouldSummarizeDelivery({ delivery_mode: announce, delivery_summary: 'llm' }, long) === true, 'delivery_summary default: explicit llm summarizes');
+  // delivery_mode none still short-circuits even when unset.
+  assert(shouldSummarizeDelivery({ delivery_mode: 'none' }, long) === false, 'delivery_summary default: delivery_mode none never summarizes');
+  // A null job is safe.
+  assert(shouldSummarizeDelivery(null, long) === false, 'delivery_summary default: null job does not summarize');
+
+  // Write-time default: a non-v4 job that never sets the field stores 'llm'.
+  const unsetJob = createJob({
+    name: 'default-llm-unset',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo unset',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '111222333444',
+    run_timeout_ms: 5000,
+    origin: 'system',
+  });
+  assert(getJob(unsetJob.id).delivery_summary === 'llm', 'delivery_summary default: non-v4 create without the field stores llm');
+  assert(shouldSummarizeDelivery(getJob(unsetJob.id), long) === true, 'delivery_summary default: the stored llm job summarizes at delivery time');
+  deleteJob(unsetJob.id);
+
+  // An explicit 'none' on create stores 'none' and opts out.
+  const noneJob = createJob({
+    name: 'default-none-explicit',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo none',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '111222333444',
+    delivery_summary: 'none',
+    run_timeout_ms: 5000,
+    origin: 'system',
+  });
+  assert(getJob(noneJob.id).delivery_summary === 'none', 'delivery_summary default: explicit none create stores none');
+  assert(shouldSummarizeDelivery(getJob(noneJob.id), long) === false, 'delivery_summary default: the stored none job does not summarize');
+  // Flipping the opt-out job back to the default ('llm') works.
+  assert(updateJob(noneJob.id, { delivery_summary: 'llm' }).delivery_summary === 'llm', 'delivery_summary default: none -> llm update works');
+  deleteJob(noneJob.id);
+
+  // An existing row that stored 'none' under the old default is NOT
+  // re-enabled by an unrelated update (the default applies to the code path,
+  // not a DB migration).
+  const legacyJob = createJob({
+    name: 'default-legacy-none',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo legacy',
+    delivery_mode: 'announce',
+    delivery_channel: 'telegram',
+    delivery_to: '111222333444',
+    delivery_summary: 'none',
+    run_timeout_ms: 5000,
+    origin: 'system',
+  });
+  const unrelated = updateJob(legacyJob.id, { name: 'default-legacy-none-renamed' });
+  assert(unrelated.delivery_summary === 'none', 'delivery_summary default: unrelated update keeps a stored none (no re-enable)');
+  assert(shouldSummarizeDelivery(unrelated, long) === false, 'delivery_summary default: a stored none row stays opted out');
+  deleteJob(legacyJob.id);
+}
+
+console.log('\n-- delivery_summary default flip: handoff v4 edge case --');
+{
+  const { compileManifestToScheduler } = await import('@amittell/agentcli');
+  const { shouldSummarizeDelivery } = await import('./delivery-summary.js');
+  const JSON_FIELDS = ['identity', 'authorization_proof', 'authorization', 'evidence', 'contract_allowed_paths'];
+  const long = 'word '.repeat(100);
+
+  const buildV4Spec = (idSuffix) => {
+    const v4Manifest = {
+      version: '0.2',
+      workflows: [{
+        id: `workflow-v4-default-${idSuffix}`,
+        name: `V4 Default ${idSuffix}`,
+        tasks: [{
+          id: 'root',
+          name: `V4 Default ${idSuffix}`,
+          target: { session_target: 'shell' },
+          shell: { program: 'printf', args: ['ok'] },
+          schedule: { cron: '0 * * * *' },
+          runtime: { timeout_ms: 30_000 },
+          output: { format: 'text', preview_bytes: 512 },
+        }],
+      }],
+    };
+    const v4Jobs = compileManifestToScheduler(v4Manifest, {
+      schedulerHandoffVersion: '4',
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH || '/usr/bin' },
+    }).jobs;
+    const spec = { ...v4Jobs[0] };
+    delete spec.source;
+    for (const field of JSON_FIELDS) {
+      if (spec[field] != null && typeof spec[field] !== 'string') spec[field] = JSON.stringify(spec[field]);
+    }
+    return spec;
+  };
+
+  // A v4 job that never sets the field: does NOT throw, stores 'none', and
+  // does not summarize (the default never applies to v4 jobs).
+  const v4Unset = createJob(buildV4Spec('unset'));
+  assert(Number(v4Unset.handoff_version) === 4, 'delivery_summary v4 edge: fixture job is handoff v4');
+  assert(v4Unset.delivery_summary === 'none', 'delivery_summary v4 edge: v4 create without the field stores none (no throw)');
+  assert(shouldSummarizeDelivery(getJob(v4Unset.id), long) === false, 'delivery_summary v4 edge: v4 job without the field does not summarize');
+
+  // An unrelated v4 update that does not mention the field: does NOT throw the
+  // delivery_summary gate and keeps 'none' (ttl_hours is not a v4 bound field,
+  // so this exercises the gate without tripping HANDOFF_ARTIFACT_REQUIRED).
+  const v4Unrelated = updateJob(v4Unset.id, { ttl_hours: 24 });
+  assert(v4Unrelated.delivery_summary === 'none', 'delivery_summary v4 edge: unrelated v4 update keeps none (no throw)');
+
+  // An explicit 'llm' on a v4 job is still rejected with the contract code.
+  let v4LlmRejected = null;
+  try { updateJob(v4Unset.id, { delivery_summary: 'llm' }); }
+  catch (error) { v4LlmRejected = error; }
+  assert(v4LlmRejected != null, 'delivery_summary v4 edge: explicit llm on a v4 job is still rejected');
+  assert(v4LlmRejected.code === 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED', 'delivery_summary v4 edge: explicit llm rejection carries the contract code');
+  assert(getJob(v4Unset.id).delivery_summary === 'none', 'delivery_summary v4 edge: v4 job keeps none after rejected explicit llm');
+  deleteJob(v4Unset.id);
+
+  // A v4 CREATE that explicitly passes 'llm' is still rejected (raw input
+  // presence, not the defaulted value, drives the gate).
+  const v4LlmCreateSpec = { ...buildV4Spec('llm-create'), delivery_summary: 'llm' };
+  let v4CreateRejected = null;
+  try { createJob(v4LlmCreateSpec); }
+  catch (error) { v4CreateRejected = error; }
+  assert(v4CreateRejected != null, 'delivery_summary v4 edge: v4 create with explicit llm is rejected');
+  assert(v4CreateRejected.code === 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED', 'delivery_summary v4 edge: v4 create llm rejection carries the contract code');
+}
+
+console.log('\n-- delivery_summary default flip: fail-open on model failure unchanged --');
+{
+  const job = createJob({
+    name: 'default-failopen',
+    schedule_cron: '0 9 * * *',
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'echo failopen',
+    delivery_mode: 'announce-always',
+    delivery_channel: 'telegram',
+    delivery_to: '556677889900',
+    // delivery_summary intentionally omitted -> defaults to 'llm'
+    run_timeout_ms: 300_000,
+    origin: 'system',
+  });
+  assert(getJob(job.id).delivery_summary === 'llm', 'delivery_summary failopen: omitted field defaults to llm');
+  const longContent = 'log line '.repeat(60); // > 400 chars
+  const originalFetch = globalThis.fetch;
+  const delivered = [];
+  let idemCounter = 0;
+  const finalizeDeps = () => ({
+    ...buildPrepareDispatchDeps(),
+    shouldRetry: () => false,
+    canEnqueueDispatch: () => false,
+    scheduleRetry: () => null,
+    generateIdempotencyKey: () => `idem-def-${++idemCounter}`,
+    handleDelivery: async (j, content, o) => { delivered.push({ content, summarySource: o?.summarySource ?? null }); return { id: 'fake' }; },
+    dequeueJob: () => true,
+  });
+  try {
+    // A default-on job whose model call fails must deliver the raw body
+    // (fail-open), tagged raw-fallback — nothing is dropped.
+    globalThis.fetch = async () => { throw new Error('gateway down'); };
+    const ctx = await prepareDispatch(getJob(job.id), {}, finalizeDeps());
+    await finalizeDispatch(
+      getJob(job.id),
+      ctx,
+      {
+        status: 'ok', summary: 'ok', content: longContent, errorMessage: null,
+        runFinishFields: { shell_stdout: longContent },
+        deliveryOverride: longContent, skipDelivery: false, skipJobUpdate: false, skipChildren: true,
+        skipDequeue: false, skipAgentCleanup: true, idemAction: 'noop', retryFiresChildren: false, earlyReturn: false,
+      },
+      finalizeDeps(),
+    );
+    assert(delivered.length === 1, 'delivery_summary failopen: default-on job still delivers once on model failure');
+    assert(delivered[0].content === longContent, 'delivery_summary failopen: model failure delivers the raw content');
+    assert(delivered[0].summarySource === 'raw-fallback', 'delivery_summary failopen: model failure tags raw-fallback');
+  } finally {
+    globalThis.fetch = originalFetch;
+    getDb().prepare('DELETE FROM runs WHERE job_id = ?').run(job.id);
+    deleteJob(job.id);
+  }
+}
+
 closeDb();
 console.log(`\n${'='.repeat(40)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

@@ -786,13 +786,13 @@ channel-specific target (chat ID, channel ID, phone number, handle, etc.).
 
 ---
 
-## Delivery Summarization (opt-in)
+## Delivery Summarization (on by default)
 
 By default the scheduler posts a job's raw output to the channel. For noisy
 runs (long test suites, verbose logs, big reports) that can be a wall of text.
-Set `delivery_summary: "llm"` on a job to have the scheduler ask the OpenClaw
-gateway to summarize the output into 2-4 plain-English sentences before it is
-posted.
+Since v32 the scheduler asks the OpenClaw gateway to summarize long output into
+2-4 plain-English sentences before it is posted, unless the job opts out with
+`delivery_summary: "none"`.
 
 ```bash
 openclaw-scheduler jobs add '{
@@ -803,7 +803,6 @@ openclaw-scheduler jobs add '{
   "delivery_mode": "announce-always",
   "delivery_channel": "telegram",
   "delivery_to": "YOUR_CHAT_ID",
-  "delivery_summary": "llm",
   "run_timeout_ms": 1800000,
   "origin": "system"
 }'
@@ -811,8 +810,13 @@ openclaw-scheduler jobs add '{
 
 How it behaves:
 
-- **Opt-in and off by default.** `delivery_summary` is `"none"` unless you set
-  it to `"llm"`. When `"none"`, the raw output is delivered exactly as before.
+- **On by default.** `delivery_summary` is `"llm"` for jobs that never set it
+  (the default applies at write time — new jobs store `"llm"`). Set
+  `"none"` to deliver raw output exactly as before. Pre-existing jobs that
+  stored `"none"` under the old default keep it: a stored `"none"` is the
+  opt-out and is never re-enabled by an upgrade. Handoff v4 jobs always store
+  `"none"` (summarization is outside the v4 artifact binding contract and is
+  rejected with `HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED`).
 - **Only long output is summarized.** Bodies longer than ~400 characters are
   summarized; short output is delivered verbatim (no model call).
 - **Uses the gateway's model.** The summary is produced by the gateway's
@@ -827,9 +831,9 @@ How it behaves:
   `summary_source` (`llm` or `raw-fallback`).
 
 ```bash
-# Toggle it on an existing job
-openclaw-scheduler jobs update <id> '{"delivery_summary":"llm"}'
+# Opt a job out of summarization (or back in)
 openclaw-scheduler jobs update <id> '{"delivery_summary":"none"}'
+openclaw-scheduler jobs update <id> '{"delivery_summary":"llm"}'
 ```
 
 ---
