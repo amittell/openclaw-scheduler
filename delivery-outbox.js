@@ -355,6 +355,10 @@ export function enqueueDelivery(opts = {}) {
   const completionScope = completionScopeValue == null
     ? null
     : requiredString(completionScopeValue, 'completionScope');
+  const summarySourceValue = opts.summarySource ?? opts.summary_source ?? null;
+  const summarySource = summarySourceValue == null
+    ? null
+    : requiredString(summarySourceValue, 'summarySource');
   const requested = {
     channel,
     target,
@@ -386,8 +390,9 @@ export function enqueueDelivery(opts = {}) {
         INSERT INTO delivery_outbox (
           id, message_id, job_id, run_id, channel, target, body,
           status, idempotency_key, delivery_group_id, part_index, part_count,
-          completion_label, completion_scope, max_attempts, next_attempt_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+          completion_label, completion_scope, max_attempts, next_attempt_at,
+          summary_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
       `).run(
         id,
@@ -404,7 +409,8 @@ export function enqueueDelivery(opts = {}) {
         completionLabel,
         completionScope,
         maxAttempts,
-        nextAttemptAt
+        nextAttemptAt,
+        summarySource
       );
 
       if (info.changes === 0) {

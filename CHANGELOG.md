@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Opt-in LLM summarization of long delivery bodies.** A new `delivery_summary`
+  job field (`none` default, `llm` opt-in) asks the OpenClaw gateway to
+  summarize a job's output into 2-4 plain-English sentences before it is posted
+  to the channel. Only bodies longer than ~400 characters are summarized; short
+  output is delivered verbatim. The summary uses the gateway's existing
+  chat-completions endpoint and the job's agent routing model, so no extra API
+  key or config is required. It is fail-open: if the model call fails, times
+  out (30s bound), or returns nothing usable, the original output is delivered
+  instead and the delivery is never dropped. The full raw output is always
+  retained in the run record, and the outbox row records which path produced
+  the posted body in `summary_source` (`llm` or `raw-fallback`). Schema bumped
+  to v31 (`jobs.delivery_summary`, `delivery_outbox.summary_source`). `jobs
+  add`/`update` accept the new field.
+
 - **Completion-delivery safety net for `done` labels whose watcher was lost
   (`dispatch/completion-safety-net.mjs`).** The one-shot delivery watcher job
   (`<brand>-deliver:<label>`, `delete_after_run` + `ttl_hours: 48`) was the
@@ -28,6 +42,47 @@ All notable changes to this project will be documented in this file.
   labels lock against the original completion scope. Labels are bounded by a 48h
   age window (overridable via `COMPLETION_SAFETY_NET_MAX_AGE_MS`), a
   per-completion-scope retry cap of 3, and a 5-minute minimum between attempts.
+
+### Fixed
+
+- **Handoff v4 jobs reject `delivery_summary=llm` (contract gap).** The
+  `delivery_summary` field was writable on handoff v4 jobs but absent from the
+  v4 bound-field contract (`HANDOFF_V4_BOUND_FIELDS` /
+  `schedulerJobExecutionProjection`), so a plain update could enable model
+  processing and change the delivered output without replacing the immutable
+  artifact while artifact validation still succeeded. Rather than bind the
+  field (which would invalidate every existing v4 artifact and force a full
+  re-attestation), the safer choice is to reject opting v4 jobs into LLM
+  summarization with `HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED` until the v4
+  contract carries the field. A create with `llm` or an explicit update to
+  `llm` is refused; the field otherwise keeps its current value.
+
+- **Summarized long isolated-agent replies now persist a complete copy.**
+  When an isolated agent job replies with a body longer than 5000 characters
+  and `delivery_summary=llm` replaces the delivery body with the summary, the
+  full raw response is offloaded to a run artifact (`agent-output`) before the
+  replacement, with its path, sha256, and byte count recorded in the run's
+  `context_summary.agent_delivery`. Previously the run record only kept the
+  5000-char `runs.summary` truncation plus hashes, so the outbox summary would
+  have been the only surviving copy.
+
+- **Summary requests are skipped when no delivery will be posted.** A
+  successful shell/agent job in announce mode sets `skipDelivery` (only errors
+  announce); the LLM summary is now only requested when a delivery will
+  actually post, so long output no longer incurs a model request and up to the
+  30s finalization delay for nothing.
+
+- **Gateway token path for delivery summaries follows the credential-root
+  allowlist.** The summarizer now resolves the gateway token through
+  `resolveGatewayTokenPath()` (honoring `OPENCLAW_GATEWAY_TOKEN_PATH` with the
+  no-symlink / allowed-root checks) instead of reading a hard-coded path, so a
+  symlink can no longer point the Authorization header at an arbitrary file.
+
+- **Consolidation migration adds `summary_source` to the fallback outbox
+  table.** Databases that predate `delivery_outbox` skip the
+  `ALTER TABLE ... ADD COLUMN summary_source` (table absent) and get the table
+  from the fallback `CREATE TABLE`, which now includes `summary_source TEXT
+  DEFAULT NULL` so delivery INSERTs succeed even with summarization disabled.
 
 ## [0.6.9] -- 2026-10-08
 

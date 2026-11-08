@@ -115,6 +115,8 @@ export function createDeliveryHelpers({
         attachments,
         idempotencyKey,
         maxAttempts: opts.maxAttempts,
+        // v31: which path produced this body ('llm' | 'raw-fallback' | null).
+        summarySource: opts.summarySource ?? null,
       });
       log('info', `Delivery enqueued: ${job.name}`, {
         deliveryId: delivery.id,
@@ -123,6 +125,7 @@ export function createDeliveryHelpers({
         to: target,
         attachments: delivery.attachments?.length || 0,
         parts: delivery.partCount || 1,
+        summarySource: opts.summarySource ?? null,
       });
       return delivery;
     } catch (err) {

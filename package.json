@@ -95,6 +95,7 @@
     "db.js",
     "dispatch-queue.js",
     "delivery-outbox.js",
+    "delivery-summary.js",
     "dispatcher-approvals.js",
     "dispatcher-delivery.js",
     "dispatcher-maintenance.js",
