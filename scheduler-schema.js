@@ -29,11 +29,16 @@ export const SCHEDULER_SCHEMAS = {
       max_trigger_fanout: { type: 'integer', min: 1, default: 25 },
       delivery_mode: { type: 'string', enum: ['announce', 'announce-always', 'none'], default: 'announce' },
       delivery_channel: { type: 'string', nullable: true },
-      // Opt-in LLM summarization of long delivery bodies (v31). When 'llm',
-      // announce deliveries longer than the summary threshold are summarized
-      // through the Gateway chat-completions endpoint before posting; failures
-      // fall back to the raw content (fail-open, never drops a delivery).
-      delivery_summary: { type: 'string', enum: ['none', 'llm'], default: 'none' },
+      // LLM summarization of long delivery bodies (v31; ON by default since
+      // v32). When 'llm', announce deliveries longer than the summary
+      // threshold are summarized through the Gateway chat-completions
+      // endpoint before posting; failures fall back to the raw content
+      // (fail-open, never drops a delivery). Write-time default: a non-handoff-
+      // v4 job that never sets the field stores 'llm' (unset means summarize);
+      // an explicit 'none' is the opt-out. Handoff v4 jobs always store 'none'
+      // (summarization is outside the v4 artifact binding contract). The SQL
+      // column default remains 'none' so pre-v32 rows keep their stored value.
+      delivery_summary: { type: 'string', enum: ['none', 'llm'], default: 'llm', description: 'Summarize long announce delivery bodies via the gateway model (fail-open to raw). Write-time default is "llm" for non-handoff-v4 jobs that never set the field; an explicit "none" opts out. Handoff v4 jobs always store "none". The SQL column default remains "none" for pre-v32 rows.' },
       // REQUIRED on insert for non-exempt jobs. Exempt: job_type='watchdog', name starts with 'watchdog:',
       // session_target='main', or delivery_mode='none'. Set to the origin chat_id so results reach the right chat.
       delivery_to: { type: 'string', nullable: true, required: 'non-system jobs', description: 'Target chat/user id for delivery (e.g. telegram chat_id). Required on insert for non-system jobs.' },

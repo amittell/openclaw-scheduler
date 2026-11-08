@@ -1,10 +1,12 @@
-// delivery-summary.js -- Opt-in LLM summarization of long delivery bodies.
+// delivery-summary.js -- LLM summarization of long delivery bodies.
+// v32: ON by default for non-handoff-v4 jobs (an unset delivery_summary means
+// summarize); an explicit delivery_summary: 'none' is the opt-out.
 //
-// When a job is configured with delivery_summary: 'llm', the announce delivery
-// path asks the Gateway's OpenAI-compatible chat-completions endpoint to
-// produce a short human-readable summary of the run output before it is
-// posted to the channel. This keeps chat notifications concise while the full
-// raw output stays available in the run record.
+// When a job summarizes, the announce delivery path asks the Gateway's
+// OpenAI-compatible chat-completions endpoint to produce a short
+// human-readable summary of the run output before it is posted to the channel.
+// This keeps chat notifications concise while the full raw output stays
+// available in the run record.
 //
 // Fail-open contract: if the LLM call fails, times out, or returns empty
 // content, the original delivery body is used unchanged. A delivery is never
@@ -244,14 +246,31 @@ export function cleanSummary(content) {
 /**
  * Decide whether a delivery body should be summarized.
  *
- * @param {object} job - The job record (reads delivery_summary, delivery_mode).
+ * v32: the default is 'llm' — a job record without a delivery_summary value
+ * (undefined) summarizes long bodies; only an explicit 'none' opts out. This
+ * mirrors the write-time default in jobs.js, where createJob stores 'llm' for
+ * non-v4 jobs that never set the field (v4 jobs always store 'none').
+ *
+ * Handoff v4 jobs are excluded unconditionally: the LLM would replace the
+ * delivery body, violating the v4 artifact contract (the delivered output is
+ * bound to the immutable artifact). This guard fires regardless of the
+ * stored delivery_summary value, so a null or missing field on a v4 job can
+ * never flip it into summarization.
+ *
+ * @param {object} job - The job record (reads handoff_version, delivery_summary, delivery_mode).
  * @param {string} content - The delivery body.
  * @param {object} [opts]
  * @param {number} [opts.thresholdChars=400] - Summarize only when longer.
  * @returns {boolean}
  */
 export function shouldSummarizeDelivery(job, content, opts = {}) {
-  if (!job || job.delivery_summary !== 'llm') return false;
+  if (!job) return false;
+  // Handoff v4 jobs are never summarized, regardless of delivery_summary:
+  // the summary would replace the delivery body and break the v4 artifact
+  // contract. This also covers the null/missing-field case, where the unset
+  // -> 'llm' fallback below would otherwise treat the job as opted in.
+  if (Number(job.handoff_version) === 4) return false;
+  if ((job.delivery_summary ?? 'llm') !== 'llm') return false;
   if (!['announce', 'announce-always'].includes(job.delivery_mode)) return false;
   const threshold = Number.isFinite(opts.thresholdChars) ? opts.thresholdChars : DEFAULT_SUMMARY_THRESHOLD_CHARS;
   const text = String(content ?? '');

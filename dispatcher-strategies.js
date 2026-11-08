@@ -1114,7 +1114,9 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
-  // v31: opt-in LLM summarization of long delivery bodies. The summary is
+  // v31/v32: LLM summarization of long delivery bodies (on by default for
+  // non-v4 jobs since v32; explicit delivery_summary='none' opts out). The
+  // summary is
   // precomputed here (async, before the completion bookkeeping transaction)
   // and carried through result.deliveryOverride so the durable outbox path
   // posts the concise text. The full raw output stays in the run record

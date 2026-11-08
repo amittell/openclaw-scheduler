@@ -6,8 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Long delivery bodies are summarized by default (explicit `none` opt-out).**
+  `delivery_summary` now defaults to `llm` for non-handoff-v4 jobs that never
+  set the field, so long announce bodies are summarized out of the box. The
+  default lives at write time (`jobs add` stores `llm`), not as a DB migration:
+  pre-existing rows that stored `none` under the old default keep it, and a
+  stored `none` is always the explicit opt-out. Handoff v4 jobs always store
+  `none` — summarization is outside the v4 artifact binding contract — and the
+  `HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED` gate now fires only when the caller
+  explicitly sets `llm` (raw input presence), so a v4 create/update that never
+  mentions the field is unaffected. The fail-open contract is unchanged: a
+  failed or timed-out model call delivers the raw body, nothing is dropped, and
+  `skipDelivery` still short-circuits. No schema change.
+
 - **Opt-in LLM summarization of long delivery bodies.** A new `delivery_summary`
-  job field (`none` default, `llm` opt-in) asks the OpenClaw gateway to
+  job field (`none` | `llm`; since the v32 default-flip entry above, `llm` is
+  the default for non-v4 jobs that never set it) asks the OpenClaw gateway to
   summarize a job's output into 2-4 plain-English sentences before it is posted
   to the channel. Only bodies longer than ~400 characters are summarized; short
   output is delivered verbatim. The summary uses the gateway's existing

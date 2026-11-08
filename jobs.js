@@ -486,14 +486,28 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
     // still passes. Rather than bind the field (which would invalidate every
     // existing v4 artifact), reject opting v4 jobs into LLM summarization until
     // the v4 contract carries it. The field stays at its current value for v4
-    // jobs and 'llm' is refused with a descriptive error. Only a create with
-    // 'llm' or an explicit update to 'llm' is rejected; an unrelated update to
-    // a job that already carries 'llm' (pre-fix state) is not blocked.
-    const settingLlmSummary = mode === 'create'
-      || (normalized.delivery_summary === 'llm' && 'delivery_summary' in normalized);
-    if (settingLlmSummary && merged.delivery_summary === 'llm' && handoffVersion === 4) {
+    // jobs and 'llm' is refused with a descriptive error.
+    //
+    // v32: the gate fires ONLY when the caller explicitly set 'llm' (raw input
+    // presence), never on the code default. Since v32 the default for non-v4
+    // jobs is 'llm' (unset means summarize), so basing the gate on the
+    // defaulted/merged value would reject every v4 create or update that does
+    // not mention the field. A v4 job that never sets the field keeps its
+    // stored 'none' (no summarization, no error); a v4 create or update that
+    // explicitly passes 'llm' is still refused.
+    //
+    // v32 (PR #91 finding): an explicit null is also refused for v4 jobs. A
+    // null update is accepted and persisted as NULL, and the delivery-time
+    // fallback treats a missing delivery_summary as 'llm'; without this gate
+    // a v4 job could be flipped into summarization through that fallback,
+    // violating the artifact contract. v4 jobs keep their stored value
+    // ('none') and any caller attempt to change the field (to 'llm' or null)
+    // is refused with the contract error code.
+    const callerTouchedSummary = 'delivery_summary' in normalized
+      && (normalized.delivery_summary === 'llm' || normalized.delivery_summary == null);
+    if (callerTouchedSummary && handoffVersion === 4) {
       throw Object.assign(
-        new Error('delivery_summary=llm is not supported for handoff v4 jobs: the field is outside the v4 artifact binding contract; disable it or replace the artifact contract first'),
+        new Error('delivery_summary cannot be changed on handoff v4 jobs: the field is outside the v4 artifact binding contract (v4 jobs always store "none"); replace the artifact contract first to enable summarization'),
         { code: 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED' },
       );
     }
@@ -1464,7 +1478,17 @@ export function createJob(opts) {
     normalized.delivery_mode || 'announce',
     normalized.delivery_channel || null,
     normalized.delivery_to || null,
-    normalized.delivery_summary || 'none',
+    // v32: summarize long delivery bodies by default. The default lives at
+    // write time (this INSERT), not as a DB migration: a non-v4 job that never
+    // sets delivery_summary stores 'llm', while pre-existing rows that stored
+    // 'none' under the old default keep it — a stored 'none' is always the
+    // explicit opt-out and is never re-enabled. v4 jobs always store 'none':
+    // summarization is outside the v4 artifact binding contract (see the
+    // HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED gate above), so the default
+    // never applies to them.
+    Number(normalized.handoff_version) === 4
+      ? 'none'
+      : (normalized.delivery_summary || 'llm'),
     normalized.delete_after_run ? 1 : 0,
     nextRun,
     normalized.parent_id || null,
