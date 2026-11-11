@@ -12,6 +12,7 @@ export { normalizeAgentSelection } from './agent-selection.js';
 import { callGatewayPreparation, callGatewaySessionMetadata, GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
 export { GatewayPreparationError } from './dispatch/gateway-rpc.mjs';
 import { negotiateGatewayEnvironmentInjection } from './gateway-capabilities.js';
+import { readOpenClawConfig } from './dispatch/default-model.mjs';
 import {
   agentIdFromSessionKey,
   assertValidAgentId,
@@ -908,10 +909,36 @@ export function normalizeDeliveryTarget(channel, target) {
 }
 
 /**
+ * The channel account an agent's deliveries leave through, read from the
+ * OpenClaw config's `bindings` (`{ agentId, match: { channel, accountId } }`).
+ * Without it the gateway sends from the channel's default account, which is
+ * not a member of a non-main agent's chats, and Telegram answers "chat not
+ * found". `main`, unknown agents and wildcard bindings return undefined and
+ * keep the gateway's default account.
+ */
+export function resolveDeliveryAccountId(agentId, channel, { config } = {}) {
+  const agent = typeof agentId === 'string' ? agentId.trim() : '';
+  const wanted = typeof channel === 'string' ? channel.trim().toLowerCase() : '';
+  if (!agent || agent === 'main' || !wanted) return undefined;
+  const bindings = (config ?? readOpenClawConfig())?.bindings;
+  if (!Array.isArray(bindings)) return undefined;
+  for (const binding of bindings) {
+    if (binding?.agentId !== agent) continue;
+    const match = binding.match ?? {};
+    if (typeof match.channel !== 'string' || match.channel.trim().toLowerCase() !== wanted) continue;
+    const accountId = typeof match.accountId === 'string' ? match.accountId.trim() : '';
+    if (accountId && accountId !== '*') return accountId;
+  }
+  return undefined;
+}
+
+/**
  * Send a message to a Telegram/channel target via message tool.
  * Automatically resolves delivery aliases (e.g. '@team_room', 'owner_dm').
+ * `opts.agentId` (the owning job's agent) selects that agent's bound account;
+ * `opts.accountId` names one directly.
  */
-export async function deliverMessage(channel, target, message) {
+export async function deliverMessage(channel, target, message, opts = {}) {
   let { channel: resolvedChannel, target: resolvedTarget } = normalizeDeliveryTarget(channel, target);
 
   // Resolve alias: try '@name' strip and bare name lookup
@@ -923,6 +950,7 @@ export async function deliverMessage(channel, target, message) {
     }
   }
 
+  const accountId = opts.accountId ?? resolveDeliveryAccountId(opts.agentId, resolvedChannel);
   const parts = splitMessageForChannel(resolvedChannel, message);
   let lastResponse = null;
   const responses = [];
@@ -933,6 +961,7 @@ export async function deliverMessage(channel, target, message) {
         message: part,
         ...(resolvedChannel ? { channel: resolvedChannel } : {}),
         ...(resolvedTarget ? { target: resolvedTarget } : {}),
+        ...(accountId ? { accountId } : {}),
       });
       // The gateway returns HTTP 200 with an in-band {result:{isError:true}} (or
       // {ok:false}) when the message tool fails to deliver -- only transport-level

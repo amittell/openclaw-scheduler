@@ -22,7 +22,7 @@ import { watch } from 'fs';
 import { hostname } from 'os';
 import { getDb } from '../db.js';
 import { resolveSchedulerDbPath } from '../paths.js';
-import { deliverMessage, invokeGatewayTool } from '../gateway.js';
+import { deliverMessage, invokeGatewayTool, resolveDeliveryAccountId } from '../gateway.js';
 import { ackMessage, recordMessageAttempt } from '../messages.js';
 import {
   claimDueDeliveries,
@@ -194,12 +194,14 @@ function gatewayFailure(response) {
 
 async function deliverPersistedAttachment(delivery, attachment, invokeTool = invokeGatewayTool, db = null) {
   const mediaPath = materializeDeliveryAttachment(attachment, db ? { db } : {});
+  const accountId = resolveDeliveryAccountId(delivery.job_agent_id, delivery.channel);
   const response = await invokeTool('message', {
     action: 'send',
     channel: delivery.channel,
     target: delivery.target,
     message: attachment.name,
     media: mediaPath,
+    ...(accountId ? { accountId } : {}),
   });
   const failure = gatewayFailure(response);
   if (failure) throw new Error(`Gateway message failed for attachment '${attachment.name}': ${failure}`);
@@ -295,7 +297,7 @@ export async function drainDeliveryOutbox(db, opts) {
         subject: delivery.job_name || 'Notification',
         created_at: delivery.created_at,
       }, { brand });
-      if (text) await deliverText(delivery.channel, delivery.target, text);
+      if (text) await deliverText(delivery.channel, delivery.target, text, { agentId: delivery.job_agent_id ?? undefined });
       heartbeat.assertOwned();
 
       for (const attachment of delivery.attachments || []) {

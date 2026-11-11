@@ -3104,6 +3104,29 @@ async function resolveConfiguredAuthProfile(authProfile, deps, agentId, timeoutM
   }
 }
 
+// The dispatcher's health check aborts a session-based run whose
+// runs.last_heartbeat is older than its stale threshold (90 s by default).
+// An agent turn is bounded by its own idle and absolute timeouts, so the run
+// keeps its heartbeat current while the turn is in flight; without this every
+// turn longer than the threshold was aborted as "Agent turn aborted by caller".
+const RUN_HEARTBEAT_INTERVAL_MS = 30_000;
+
+function startRunHeartbeat(runId, deps) {
+  const { updateHeartbeat, log } = deps;
+  if (typeof updateHeartbeat !== 'function' || !runId) return () => {};
+  const beat = () => {
+    try {
+      updateHeartbeat(runId);
+    } catch (err) {
+      log?.('warn', 'Run heartbeat update failed', { runId, error: err?.message });
+    }
+  };
+  beat();
+  const timer = setInterval(beat, deps.runHeartbeatIntervalMs ?? RUN_HEARTBEAT_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 async function runAgentTurnForSelection(
   job, deps, prompt, sessionKey, selection, dispatchAgentTurn,
   materializedEnv = null, capabilityBinding = null, signal = null, attemptState = {},
@@ -3238,57 +3261,62 @@ export async function executeAgent(job, ctx, deps) {
   const attemptState = { runId: ctx.run.id, deadlineMs: agentDeadlineMs, pinApplied: false };
 
   let turnResult;
+  const stopRunHeartbeat = startRunHeartbeat(ctx.run.id, deps);
   try {
-    if (isRunCancellationRequested?.(ctx.run.id)) {
-      throw new Error('Run cancelled before agent turn start');
-    }
-    turnResult = await runAgentTurnForSelection(
-      job,
-      deps,
-      prompt,
-      sessionKey,
-      primarySelection,
-      dispatchAgentTurn,
-      ctx.materializedEnv || null,
-      ctx.gatewayCapabilityBinding || null,
-      ctx.abortSignal || null,
-      attemptState,
-    );
-  } catch (primaryError) {
-    const canTryConfiguredFallback = fallbackSelection
-      && !sameAgentSelection(primarySelection, fallbackSelection)
-      && !isGatewayCompatibilityFailure(primaryError)
-      && primaryError?.uncertain !== true
-      && primaryError?.code !== 'ABORT_ERR'
-      && !ctx.abortSignal?.aborted
-      && !isRunCancellationRequested?.(ctx.run.id)
-      && Date.now() < agentDeadlineMs;
-    if (!canTryConfiguredFallback) throw primaryError;
-
-    log('warn', 'Primary agent selection failed; retrying with configured fallback', {
-      jobId: job.id,
-      primary: describeAgentSelection(primarySelection),
-      fallback: describeAgentSelection(fallbackSelection),
-      error: primaryError.message,
-    });
-
     try {
+      if (isRunCancellationRequested?.(ctx.run.id)) {
+        throw new Error('Run cancelled before agent turn start');
+      }
       turnResult = await runAgentTurnForSelection(
         job,
         deps,
         prompt,
         sessionKey,
-        fallbackSelection,
+        primarySelection,
         dispatchAgentTurn,
         ctx.materializedEnv || null,
         ctx.gatewayCapabilityBinding || null,
         ctx.abortSignal || null,
         attemptState,
       );
-      log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });
-    } catch (fallbackError) {
-      throw new Error(`Primary agent selection failed: ${primaryError.message}; configured fallback also failed: ${fallbackError.message}`, { cause: fallbackError });
+    } catch (primaryError) {
+      const canTryConfiguredFallback = fallbackSelection
+        && !sameAgentSelection(primarySelection, fallbackSelection)
+        && !isGatewayCompatibilityFailure(primaryError)
+        && primaryError?.uncertain !== true
+        && primaryError?.code !== 'ABORT_ERR'
+        && !ctx.abortSignal?.aborted
+        && !isRunCancellationRequested?.(ctx.run.id)
+        && Date.now() < agentDeadlineMs;
+      if (!canTryConfiguredFallback) throw primaryError;
+
+      log('warn', 'Primary agent selection failed; retrying with configured fallback', {
+        jobId: job.id,
+        primary: describeAgentSelection(primarySelection),
+        fallback: describeAgentSelection(fallbackSelection),
+        error: primaryError.message,
+      });
+
+      try {
+        turnResult = await runAgentTurnForSelection(
+          job,
+          deps,
+          prompt,
+          sessionKey,
+          fallbackSelection,
+          dispatchAgentTurn,
+          ctx.materializedEnv || null,
+          ctx.gatewayCapabilityBinding || null,
+          ctx.abortSignal || null,
+          attemptState,
+        );
+        log('info', 'Configured agent fallback succeeded', { jobId: job.id, fallback: describeAgentSelection(fallbackSelection) });
+      } catch (fallbackError) {
+        throw new Error(`Primary agent selection failed: ${primaryError.message}; configured fallback also failed: ${fallbackError.message}`, { cause: fallbackError });
+      }
     }
+  } finally {
+    stopRunHeartbeat();
   }
 
   // Acknowledge inbox messages only after the gateway accepted and completed
