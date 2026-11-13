@@ -1157,6 +1157,15 @@ export const dispatchQueue: {
   recoverStaleDispatchClaims(opts?: Record<string, unknown>): number;
   cancelDisabledDispatches(): number;
   listDispatchesForJob(jobId: string, limit?: number): DispatchRecord[];
+  TERMINAL_DISPATCH_STATUSES: readonly string[];
+  DEFAULT_DISPATCH_RETENTION_DAYS: number;
+  DEFAULT_DISPATCH_PRUNE_BATCH_SIZE: number;
+  pruneTerminalDispatches(opts?: {
+    db?: SchedulerDatabase;
+    retentionDays?: number;
+    limit?: number;
+    before?: Date | number;
+  }): { pruned: number; cutoff: string; limit: number };
 };
 
 export const gateway: {

@@ -136,6 +136,37 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Dispatcher no longer stalls past its lease on a large dispatch history.**
+  `getDispatchBacklogCount` counted a job's active dispatches through
+  `idx_dispatch_queue_job (job_id)` and read every historical row of the job
+  to test `status`, and `job_dispatch_queue` was never pruned. On one
+  production host the table held 225,000 `done` rows (41,164 for a single
+  every-2-minutes job), the count took 4.7 s with a cold cache, and a 121 s
+  stall inside that statement outlived the 30 s dispatcher lease, so the
+  daemon exited on "Dispatcher lease lost" about 40 times a day. Two changes:
+  - New partial covering index `idx_dispatch_queue_job_active` on
+    `job_dispatch_queue(job_id, status) WHERE status IN ('pending', 'claimed',
+    'awaiting_approval')`. It serves the backlog count, the dispatch-family
+    reaper guard, the cancel update and the active-dispatch `NOT EXISTS`
+    checks in job pruning; the backlog count now takes under 1 ms on that
+    host's data. Net-new installs get it from `schema.sql`; existing installs
+    get it from the consolidation migration on the next start, which now
+    requires it, checks its columns and `WHERE` clause, and rebuilds a
+    same-named index with another definition. The schema version stays 31,
+    so an older release can still open the database. A database where the
+    index was created by hand with this exact definition is left unchanged.
+  - The hourly prune pass deletes terminal (`done`, `failed`, `cancelled`)
+    dispatch rows processed more than `SCHEDULER_DISPATCH_RETENTION_DAYS`
+    (default 14, range 1 to 3650) days ago, using `created_at` for rows never
+    processed. It runs at most 25 batches of 2,000 rows per pass and yields to
+    the event loop between batches (about 80 ms per batch on a synthetic
+    300,000-row table). It never deletes a row bound to a handoff v4
+    artifact, a row still referenced by a run that has not finished (or is
+    `recovery_blocked`), a row referenced by a pending, approved or
+    dispatching approval, or the scheduled occurrence its job is still due
+    on. Passes that delete rows log `Pruned N terminal dispatch queue
+    row(s)`.
+
 - **Handoff v4 jobs reject `delivery_summary=llm` (contract gap).** The
   `delivery_summary` field was writable on handoff v4 jobs but absent from the
   v4 bound-field contract (`HANDOFF_V4_BOUND_FIELDS` /

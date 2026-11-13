@@ -651,7 +651,7 @@ targets do not create an agent session.
 │  5. Message delivery + spawn handling                        │
 │  6. Task tracker dead-man's-switch                           │
 │  7. Expire old messages                                      │
-│  8. Prune old runs + WAL checkpoint (hourly)                 │
+│  8. Prune old runs/dispatches + WAL checkpoint (hourly)      │
 │  9. Backup to MinIO (every 5 min)                            │
 └──────────────────────────────────────────────────────────────┘
          │                              │
@@ -1599,6 +1599,7 @@ All CLI commands support `--json` for machine-readable output (useful for piping
 | `SCHEDULER_MESSAGE_DELIVERY_MS` | `15000` | Message and spawn interval in ms, from `5000` through `3600000` |
 | `SCHEDULER_DELIVERY_BATCH_SIZE` | `10` | Delivery batch size, from `1` through `1000` |
 | `SCHEDULER_PRUNE_MS` | `3600000` | Prune interval in ms, from `60000` through `604800000` |
+| `SCHEDULER_DISPATCH_RETENTION_DAYS` | `14` | Days a terminal (`done`, `failed`, `cancelled`) dispatch queue row is kept after it was processed, from `1` through `3650`. Each prune pass deletes at most 25 batches of 2000 rows and never deletes a row bound to a handoff v4 artifact, one still referenced by an unfinished run or an active approval, or the occurrence its job is still due on |
 | `SCHEDULER_BACKUP_MS` | `300000` | MinIO backup interval in ms, from `60000` through `604800000` |
 | `SCHEDULER_LEASE_TTL_MS` | `30000` | Dispatcher lease TTL in ms, from `15000` through `3600000` |
 | `SCHEDULER_MAX_CONCURRENCY` | `4` | Worker concurrency, from `1` through `64` |

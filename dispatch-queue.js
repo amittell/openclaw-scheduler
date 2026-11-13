@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getDb } from './db.js';
 import { sqliteNow } from './dispatcher-utils.js';
+import { TERMINAL_RUN_STATUSES } from './run-state.js';
 
 const VALID_DISPATCH_KINDS = new Set(['manual', 'chain', 'retry', 'schedule', 'at']);
 const VALID_DISPATCH_STATUSES = new Set([
@@ -11,6 +12,65 @@ const VALID_DISPATCH_STATUSES = new Set([
   'cancelled',
   'failed',
 ]);
+
+// Statuses setDispatchStatus treats as final: it stamps processed_at for them
+// and never moves a row out of them.
+export const TERMINAL_DISPATCH_STATUSES = Object.freeze(['done', 'cancelled', 'failed']);
+export const DEFAULT_DISPATCH_RETENTION_DAYS = 14;
+export const DEFAULT_DISPATCH_PRUNE_BATCH_SIZE = 2_000;
+
+// A run in one of these statuses is finished with its dispatch row. Everything
+// else keeps the row: the active statuses, recovery_blocked (held for operator
+// review), and any status this list does not know.
+const PRUNABLE_RUN_STATUSES = TERMINAL_RUN_STATUSES.filter(status => status !== 'recovery_blocked');
+// approval-state.js ACTIVE_STATUSES. recoverInterruptedApprovalDispatches reads
+// the dispatch row of a 'dispatching' approval to decide whether it was
+// dispatched; a deleted row (dispatch_queue_id set to NULL) would cancel it.
+const ACTIVE_APPROVAL_STATUSES = Object.freeze(['pending', 'approved', 'dispatching']);
+
+function sqlList(values) {
+  return values.map(value => `'${value}'`).join(', ');
+}
+
+// One bounded DELETE. Kept rows: non-terminal; processed (or, if never
+// processed, created) at or after the cutoff; handoff v4 bound
+// (pruneRuns keeps the source run of a v4 dispatch through this row); still
+// referenced by an unfinished run or an active approval; or the occurrence the
+// job is still due on (scheduled/at ids are deterministic, so the row is what
+// stops materializeDueSchedules from enqueueing that occurrence again).
+// scheduled_for < cutoff is implied for almost every prunable row and lets the
+// search use idx_dispatch_queue_due instead of reading every terminal row; a
+// row scheduled after it was processed is only kept longer.
+const PRUNE_TERMINAL_DISPATCHES_SQL = `
+  DELETE FROM job_dispatch_queue
+  WHERE rowid IN (
+    SELECT q.rowid
+    FROM job_dispatch_queue AS q
+    WHERE q.status IN (${sqlList(TERMINAL_DISPATCH_STATUSES)})
+      AND q.scheduled_for < @cutoff
+      AND julianday(COALESCE(q.processed_at, q.created_at)) < julianday(@cutoff)
+      AND q.handoff_artifact_digest IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM runs AS r
+        WHERE r.dispatch_queue_id = q.id
+          AND r.status NOT IN (${sqlList(PRUNABLE_RUN_STATUSES)})
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM approvals AS a
+        WHERE a.dispatch_queue_id = q.id
+          AND a.status IN (${sqlList(ACTIVE_APPROVAL_STATUSES)})
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM jobs AS j
+        WHERE j.id = q.job_id
+          AND (
+            (q.dispatch_kind = 'schedule' AND j.next_run_at = q.binding_scheduled_for)
+            OR (q.dispatch_kind = 'at' AND j.schedule_at = q.binding_scheduled_for)
+          )
+      )
+    LIMIT @limit
+  )
+`;
 
 function claimExpiryModifier(leaseMs) {
   if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
@@ -316,4 +376,40 @@ export function listDispatchesForJob(jobId, limit = 20) {
     ORDER BY created_at DESC
     LIMIT ?
   `).all(jobId, limit);
+}
+
+function positiveSafeInteger(value, fallback, name) {
+  if (value == null) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function sqliteUtcTimestamp(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('before must be a valid Date or epoch milliseconds');
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * Delete at most `limit` terminal dispatch rows older than the retention
+ * window, in one statement, so no single write holds the SQLite write lock for
+ * long. Callers loop over batches (pruneDispatchQueueHistory in
+ * dispatcher-maintenance.js). `before` (Date or epoch ms) overrides the cutoff
+ * that `retentionDays` would give.
+ */
+export function pruneTerminalDispatches(opts = {}) {
+  const db = opts.db || getDb();
+  const retentionDays = positiveSafeInteger(
+    opts.retentionDays,
+    DEFAULT_DISPATCH_RETENTION_DAYS,
+    'retentionDays',
+  );
+  const limit = positiveSafeInteger(opts.limit, DEFAULT_DISPATCH_PRUNE_BATCH_SIZE, 'limit');
+  const cutoff = sqliteUtcTimestamp(
+    opts.before ?? Date.now() - retentionDays * 24 * 60 * 60 * 1000,
+  );
+  const pruned = db.prepare(PRUNE_TERMINAL_DISPATCHES_SQL).run({ cutoff, limit }).changes;
+  return { pruned, cutoff, limit };
 }

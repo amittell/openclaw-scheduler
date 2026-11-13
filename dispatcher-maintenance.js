@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { transitionRunTerminal } from './run-state.js';
 import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { pruneTerminalDeliveries } from './delivery-outbox.js';
+import {
+  DEFAULT_DISPATCH_PRUNE_BATCH_SIZE,
+  DEFAULT_DISPATCH_RETENTION_DAYS,
+  pruneTerminalDispatches,
+} from './dispatch-queue.js';
 
 // Shared with lifecycle tests through static imports; importing this module does not start the service.
 export function createScheduleBookkeeping({
@@ -103,6 +108,63 @@ export function pruneDeliveryHistory({
     log('warn', `Skipped ${result.skippedUnsafePaths} unsafe delivery attachment path(s) during pruning`);
   }
   return result;
+}
+
+export const DISPATCH_PRUNE_MAX_BATCHES = 25;
+
+const yieldToEventLoop = () => new Promise(resolve => setImmediate(resolve));
+
+/**
+ * Prune terminal job_dispatch_queue rows past the retention window in bounded
+ * batches. Each batch is one short write; between batches the event loop runs
+ * (lease renewal, workers), so a large first pass cannot stall the dispatcher.
+ * At most maxBatches * batchSize rows go per pass; the rest wait for the next.
+ */
+export async function pruneDispatchQueueHistory({
+  log,
+  retentionDays = DEFAULT_DISPATCH_RETENTION_DAYS,
+  batchSize = DEFAULT_DISPATCH_PRUNE_BATCH_SIZE,
+  maxBatches = DISPATCH_PRUNE_MAX_BATCHES,
+  now = Date.now(),
+  shouldContinue = () => true,
+  pruneBatch = pruneTerminalDispatches,
+  pause = yieldToEventLoop,
+} = {}) {
+  if (!Number.isSafeInteger(maxBatches) || maxBatches <= 0) {
+    throw new Error('maxBatches must be a positive integer');
+  }
+  if (!Number.isSafeInteger(retentionDays) || retentionDays <= 0) {
+    throw new Error('retentionDays must be a positive integer');
+  }
+  const before = now - retentionDays * 24 * 60 * 60 * 1000;
+  let pruned = 0;
+  let batches = 0;
+  let cutoff = null;
+  let exhausted = false;
+  while (batches < maxBatches) {
+    if (batches > 0) {
+      await pause();
+      if (!shouldContinue()) break;
+    }
+    const result = pruneBatch({ retentionDays, limit: batchSize, before });
+    batches += 1;
+    pruned += result.pruned;
+    cutoff = result.cutoff;
+    if (result.pruned < batchSize) {
+      exhausted = true;
+      break;
+    }
+  }
+  if (pruned > 0 && typeof log === 'function') {
+    log('info', `Pruned ${pruned} terminal dispatch queue row(s)`, {
+      batches,
+      batchSize,
+      retentionDays,
+      cutoff,
+      more: !exhausted,
+    });
+  }
+  return { pruned, batches, cutoff, more: !exhausted };
 }
 
 const RECONCILABLE_TERMINAL_STATUSES = [

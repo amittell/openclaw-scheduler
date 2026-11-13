@@ -443,6 +443,11 @@ CREATE INDEX IF NOT EXISTS idx_dispatch_queue_due ON job_dispatch_queue(status, 
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job ON job_dispatch_queue(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_source_run ON job_dispatch_queue(source_run_id) WHERE source_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_dispatch_queue_claim_expiry ON job_dispatch_queue(status, claim_expires_at) WHERE status = 'claimed';
+-- Per-job active backlog (getDispatchBacklogCount, the reaper guard, cancel).
+-- Without it the planner seeks idx_dispatch_queue_job and reads every
+-- historical row of the job to test status. The IN list must stay identical,
+-- in the same order, to the one the queries use or SQLite will not use it.
+CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('pending', 'claimed', 'awaiting_approval');
 
 -- ============================================================
 -- DISPATCHER LEASES: singleton leadership with fencing (v27)

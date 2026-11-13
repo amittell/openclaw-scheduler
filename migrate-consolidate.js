@@ -305,6 +305,7 @@ export default function migrateConsolidate() {
     'idx_delivery_outbox_group_part', 'idx_delivery_outbox_group_status',
     'idx_delivery_outbox_idempotency', 'idx_dispatch_queue_claim_expiry',
     'idx_dispatch_queue_due', 'idx_dispatch_queue_job',
+    'idx_dispatch_queue_job_active',
     'idx_dispatch_queue_source_run', 'idx_dispatcher_leases_expiry',
     'idx_evidence_records_created_run', 'idx_evidence_records_hash',
     'idx_evidence_records_job', 'idx_idem_expires', 'idx_idem_job',
@@ -342,7 +343,8 @@ export default function migrateConsolidate() {
     'idx_delivery_outbox_due', 'idx_delivery_outbox_group_part',
     'idx_delivery_outbox_group_status', 'idx_delivery_outbox_idempotency',
     'idx_dispatch_queue_claim_expiry', 'idx_dispatch_queue_due',
-    'idx_dispatch_queue_job', 'idx_dispatch_queue_source_run',
+    'idx_dispatch_queue_job', 'idx_dispatch_queue_job_active',
+    'idx_dispatch_queue_source_run',
     'idx_dispatcher_leases_expiry', 'idx_evidence_records_created_run',
     'idx_evidence_records_hash', 'idx_evidence_records_job',
     'idx_handoff_artifacts_job', 'idx_handoff_artifacts_manifest',
@@ -403,6 +405,36 @@ export default function migrateConsolidate() {
     const where = sql.includes(' where ') ? sql.slice(sql.indexOf(' where ') + 7) : null;
     return where === spec.where;
   };
+  // Partial indexes a hot query depends on. SQLite uses a partial index only
+  // when the query's WHERE clause implies the index's, so a same-named index
+  // with other columns or another IN list would leave the query on the slow
+  // plan. The definition matches the index created by hand on production
+  // hosts, so those databases pass this check unchanged.
+  const requiredPartialIndexes = [
+    {
+      name: 'idx_dispatch_queue_job_active',
+      table: 'job_dispatch_queue',
+      columns: ['job_id', 'status'],
+      where: 'status in (pending, claimed, awaiting_approval)',
+      // Same text as schema.sql, so every install stores the same definition.
+      sql: "CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('pending', 'claimed', 'awaiting_approval')",
+    },
+  ];
+  const partialIndexMatches = (spec) => {
+    if (!hasIndex(spec.name)) return false;
+    const listed = db.prepare(`PRAGMA index_list(${spec.table})`).all()
+      .find(index => index.name === spec.name);
+    if (!listed || listed.unique !== 0 || listed.partial !== 1) return false;
+    const columns = db.prepare(`PRAGMA index_info(${spec.name})`).all()
+      .sort((left, right) => left.seqno - right.seqno)
+      .map(column => column.name);
+    if (JSON.stringify(columns) !== JSON.stringify(spec.columns)) return false;
+    const sql = normalizeSql(
+      db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(spec.name)?.sql,
+    );
+    const where = sql.includes(' where ') ? sql.slice(sql.indexOf(' where ') + 7) : null;
+    return where !== null && where.replaceAll(' ', '') === spec.where.replaceAll(' ', '');
+  };
   const recordedVersionCount = hasTable('schema_migrations')
     ? db.prepare(`
         SELECT COUNT(DISTINCT version) AS count
@@ -447,6 +479,7 @@ export default function migrateConsolidate() {
     && schemaNoOpIndexes.every(hasIndex)
     && schemaNoOpTriggers.every(hasTrigger)
     && criticalUniqueIndexes.every(criticalIndexMatches)
+    && requiredPartialIndexes.every(partialIndexMatches)
     && legacyAtIsoCount === 0
     && legacyPayloadMismatchCount === 0
     && legacyMissingDeliveryOptOutCount === 0
@@ -1627,6 +1660,11 @@ export default function migrateConsolidate() {
       db.exec(`DROP INDEX ${spec.name}`);
     }
   }
+  for (const spec of requiredPartialIndexes) {
+    if (hasIndex(spec.name) && !partialIndexMatches(spec)) {
+      db.exec(`DROP INDEX ${spec.name}`);
+    }
+  }
 
   try {
     db.exec(`
@@ -1786,6 +1824,12 @@ export default function migrateConsolidate() {
     `);
   } catch { /* index may already exist */ }
 
+  for (const spec of requiredPartialIndexes) {
+    try {
+      db.exec(spec.sql);
+    } catch { /* base table may be irreparably incomplete; final checks fail closed */ }
+  }
+
   try {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_dispatch_queue_source_run
@@ -1832,6 +1876,11 @@ export default function migrateConsolidate() {
   for (const spec of criticalUniqueIndexes) {
     if (hasTable(spec.table) && !criticalIndexMatches(spec)) {
       throw new Error(`Migration v31 failed to enforce required unique index ${spec.name}`);
+    }
+  }
+  for (const spec of requiredPartialIndexes) {
+    if (hasTable(spec.table) && !partialIndexMatches(spec)) {
+      throw new Error(`Migration v31 failed to create required partial index ${spec.name}`);
     }
   }
   for (const trigger of schemaNoOpTriggers) {

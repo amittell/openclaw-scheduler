@@ -98,6 +98,7 @@ import {
   expireStaleMessages,
   ensureAgentInboxJobs,
   pruneDeliveryHistory,
+  pruneDispatchQueueHistory,
   reconcileCompletedDueSchedules,
   createScheduleBookkeeping,
 } from './dispatcher-maintenance.js';
@@ -1418,6 +1419,16 @@ async function tick() {
       if (prunedEvidence.changes > 0) log('info', `Pruned ${prunedEvidence.changes} expired evidence record(s)`);
       // Ensure inbox consumer jobs exist for agents with delivery config
       ensureAgentInboxJobs({ log, getDb, createJob });
+      // Terminal dispatch rows, in bounded batches that yield to the event loop.
+      try {
+        await pruneDispatchQueueHistory({
+          log,
+          retentionDays: dispatcherConfig.dispatchRetentionDays,
+          shouldContinue: () => running,
+        });
+      } catch (err) {
+        log('error', `Dispatch queue prune error: ${err.message}`);
+      }
       // Checkpoint WAL to disk -- reduces data loss window on crash/SIGKILL
       const cpResult = checkpointWal();
       if (cpResult) {
