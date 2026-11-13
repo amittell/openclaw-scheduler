@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.12] -- 2026-11-13
+
+### Fixed
+
+- **Provider-aborted dispatch sessions are classified `interrupted`, not `stalled` (PR #84, 5b9faa6).** During the 2026-06-27 kebab-rtx6000/qwen3.6-27b provider outage, in-flight model requests were aborted fleet-wide; surviving worker transcripts end with a successful tool write, then an assistant entry `content=[] / stopReason="aborted" / errorMessage="Request was aborted"` plus an `openclaw:prompt-error` custom entry. `dispatch/watcher.mjs` `entryHasTurnAborted()` only recognized `type===turn_aborted` and user-role `<turn_aborted>` markers, so those sessions skipped the turn-abort path and fell through to the stall path (stalled/error instead of interrupted/redispatchable). The watcher now recognizes the provider-abort signature via `entryHasProviderAbort()` and routes such sessions to the interrupt path.
+
+### Changed
+
+- **Release line = 0.6.11 version-guard line + origin/main.** Branch `release/0.6.12` merges origin/main (PR #84) into the 0.6.11 CLI/daemon version-guard line (PR #83 commits); guard behavior unchanged.
+
 ## [0.6.11] -- 2026-10-18
 
 ### Changed
