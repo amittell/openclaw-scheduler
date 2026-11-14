@@ -378,6 +378,26 @@ test('dispatch enqueue fails loudly on mismatch; list stays available', t => {
   assert.match(enqueuedWarned.stderr, /gateway/i, 'enqueue must continue past the guard in warn mode');
 });
 
+test('whitespace-only SCHEDULER_VERSION_GUARD hard-fails identically on cli and dispatch paths', t => {
+  const home = fixtureHome(t);
+  writeDaemonVersion(home, '0.5.0');
+
+  // cli path: whitespace counts as unset (firstNonEmpty), so the guard
+  // hard-fails instead of downgrading to a warning.
+  const cliWhitespace = runCli(['status', '--json'], cliEnv(home, { extra: { SCHEDULER_VERSION_GUARD: ' ' } }));
+  assert.equal(cliWhitespace.status, 1, 'cli: whitespace-only override must hard-fail');
+  assert.equal(JSON.parse(cliWhitespace.stdout).code, 'VERSION_MISMATCH');
+
+  // dispatch path: the same value must behave identically (pre-fix it was
+  // truthy and downgraded the failure to a warning).
+  const dispatchWhitespace = runDispatch(
+    ['enqueue', '--label', 'vg-whitespace-probe', '--message', 'probe', '--deliver-to', '123456789'],
+    cliEnv(home, { extra: { SCHEDULER_VERSION_GUARD: '   ' } }),
+  );
+  assert.equal(dispatchWhitespace.status, 1, 'dispatch: whitespace-only override must hard-fail');
+  assert.match(dispatchWhitespace.stderr, /version mismatch/i);
+});
+
 test('dispatch enqueue stamps the ledger row with the client version', t => {
   const home = fixtureHome(t);
   writeDaemonVersion(home, packageVersion);
