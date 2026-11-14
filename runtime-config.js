@@ -15,6 +15,7 @@ export const DISPATCHER_INTEGER_SETTINGS = Object.freeze({
   messageDeliveryMs: freezeSetting('SCHEDULER_MESSAGE_DELIVERY_MS', 15_000, 5_000, 3_600_000),
   deliveryBatchSize: freezeSetting('SCHEDULER_DELIVERY_BATCH_SIZE', 10, 1, 1_000),
   pruneIntervalMs: freezeSetting('SCHEDULER_PRUNE_MS', 3_600_000, 60_000, 604_800_000),
+  dispatchRetentionDays: freezeSetting('SCHEDULER_DISPATCH_RETENTION_DAYS', 14, 1, 3_650),
   backupIntervalMs: freezeSetting('SCHEDULER_BACKUP_MS', 300_000, 60_000, 604_800_000),
   leaseTtlMs: freezeSetting('SCHEDULER_LEASE_TTL_MS', 30_000, 15_000, 3_600_000),
   maxConcurrency: freezeSetting('SCHEDULER_MAX_CONCURRENCY', 4, 1, 64),

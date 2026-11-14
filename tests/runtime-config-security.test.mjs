@@ -42,6 +42,7 @@ test('dispatcher runtime configuration uses the documented valid defaults', () =
     messageDeliveryMs: 15_000,
     deliveryBatchSize: 10,
     pruneIntervalMs: 3_600_000,
+    dispatchRetentionDays: 14,
     backupIntervalMs: 300_000,
     leaseTtlMs: 30_000,
     maxConcurrency: 4,

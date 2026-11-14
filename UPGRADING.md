@@ -172,6 +172,22 @@ found`); it now fails with `EVIDENCE_TRUST_NOT_CONFIGURED`, which names the
 variable. A job whose evidence `provider_config` names an allowed-signers file
 is signed against `AGENTCLI_ALLOWED_SIGNERS` unless that file is listed.
 
+### Dispatch queue retention
+
+The dispatcher now deletes terminal (`done`, `failed`, `cancelled`) rows from
+`job_dispatch_queue` once they were processed more than 14 days ago. Before,
+the table was never pruned. To keep a longer history, set
+`SCHEDULER_DISPATCH_RETENTION_DAYS` (1 to 3650) in the service environment
+before restarting. Each hourly prune pass deletes at most 50,000 rows, so a
+host with a large backlog drains over several passes; look for
+`Pruned N terminal dispatch queue row(s)` in the log. The database file keeps
+its size (SQLite reuses the freed pages) unless you run `VACUUM` while the
+service is stopped.
+
+The first start also adds the index `idx_dispatch_queue_job_active`. A host
+where it was already created by hand with the same definition is left as is.
+The schema version stays 31.
+
 ---
 
 ## Step 1: Pull or Install the Update

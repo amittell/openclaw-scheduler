@@ -223,6 +223,11 @@ const claimed: DispatchRecord | null = dispatchQueue.claimDispatch('id');
 const released: DispatchRecord | null = dispatchQueue.releaseDispatch('id', '2026-01-01 00:00:00');
 const statusUpdated: DispatchRecord | null = dispatchQueue.setDispatchStatus('id', 'done');
 const jobDispatches: DispatchRecord[] = dispatchQueue.listDispatchesForJob('job-1', 20);
+const prunedDispatches: number = dispatchQueue.pruneTerminalDispatches({
+  retentionDays: dispatchQueue.DEFAULT_DISPATCH_RETENTION_DAYS,
+  limit: dispatchQueue.DEFAULT_DISPATCH_PRUNE_BATCH_SIZE,
+}).pruned;
+void prunedDispatches; void dispatchQueue.TERMINAL_DISPATCH_STATUSES;
 
 // ---- gateway ----
 void gateway.TELEGRAM_MAX_MESSAGE_LENGTH;
