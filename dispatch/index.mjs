@@ -4425,13 +4425,21 @@ Subcommands:
 const [,, subcommand, ...rest] = process.argv;
 const flags = parseFlags(rest);
 
+// Same helper cli.js uses for the version-guard env override: whitespace-only
+// values count as UNSET, so both entry points hard-fail identically.
+function firstNonEmpty(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : '';
+}
+
 // Version guard: the completion template and dispatch behavior are built from
 // THIS copy, so a mismatched daemon/CLI deploy must fail loudly here (2026-10-18
 // incident). `list` is read-only and stays available during remediation.
 if (subcommand && subcommand !== 'list') {
   const versionGuard = guardVersionMismatch({ command: `dispatch ${subcommand}` });
   if (versionGuard && versionGuard.status !== 'match') {
-    if (versionGuard.status === 'mismatch' && !process.env.SCHEDULER_VERSION_GUARD) {
+    if (versionGuard.status === 'mismatch' && !firstNonEmpty(process.env.SCHEDULER_VERSION_GUARD)) {
       process.stderr.write(`${guardWarningLine(versionGuard)}\n`);
       process.exit(1);
     }
