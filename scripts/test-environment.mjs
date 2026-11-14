@@ -31,6 +31,11 @@ export function createTestEnvironment(home, { env = process.env, dbPath = join(h
     GIT_CONFIG_GLOBAL: join(home, '.gitconfig'),
     GIT_CONFIG_NOSYSTEM: '1',
     SCHEDULER_DB: dbPath,
+    // Version guard: tests run the CLI from a source checkout against
+    // isolated fixture homes (no daemon record), so the guard is disabled
+    // for the test process and every subprocess it spawns. The guard itself
+    // is covered by tests/version-guard.test.mjs with SCHEDULER_VERSION_GUARD_DEV unset.
+    SCHEDULER_VERSION_GUARD_DEV: '1',
     // Fixtures explicitly opt into their stub Gateway; never discover a live one.
     OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
     PATH: env.PATH ? `${guardBin}${delimiter}${env.PATH}` : guardBin,
