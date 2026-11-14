@@ -35,7 +35,7 @@ const { version: SCHEDULER_VERSION = '0.0.0' } = JSON.parse(
 import { getDueJobs, getDueAtJobs, hasRunningRun, hasRunningRunForPool, updateJob, nextRunFromCron, deleteJob, getJob, pruneExpiredJobs, pruneOrphanedDispatchJobs, fireTriggeredChildren, createJob, shouldRetry, scheduleRetry, enqueueJob, dequeueJob, getDispatchBacklogCount, canEnqueueDispatch } from './jobs.js';
 import {
   createRun, finishRun, getRun, getStaleRuns, getTimedOutRuns, getRunningRuns,
-  updateRunSession, pruneRuns, updateContextSummary, persistV02Outcomes,
+  updateRunSession, updateHeartbeat, pruneRuns, updateContextSummary, persistV02Outcomes,
   persistTerminalEvidence, pruneEvidenceRecords, quarantineRunRecovery,
 } from './runs.js';
 import {
@@ -652,7 +652,7 @@ function buildDispatchDeps(dispatcherFence = null) {
     // Shell
     normalizeShellResult,
     // Agent
-    waitForGateway, updateRunSession, setAgentStatus,
+    waitForGateway, updateRunSession, updateHeartbeat, setAgentStatus,
     buildJobPrompt, markDelivered, claimInboxForRun, ackClaimedInboxForRun,
     releaseClaimedInboxForRun, runAgentTurnWithActivityTimeout,
     // Isolated cron-dispatch primitive: HTTP-only wrapper around the

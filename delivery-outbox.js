@@ -134,7 +134,7 @@ function nonNegativeInteger(value, fallback, name) {
 
 function getDeliveryRow(db, id) {
   return db.prepare(`
-    SELECT o.*, j.name AS job_name
+    SELECT o.*, j.name AS job_name, j.agent_id AS job_agent_id
     FROM delivery_outbox o
     LEFT JOIN jobs j ON j.id = o.job_id
     WHERE o.id = ?
@@ -540,7 +540,7 @@ export function getDeliveryCheckpoint(idempotencyKey, opts = {}) {
   const baseKey = requiredString(idempotencyKey, 'idempotencyKey');
   const partPrefix = `${baseKey}:part:`;
   const rows = db.prepare(`
-    SELECT o.*, j.name AS job_name
+    SELECT o.*, j.name AS job_name, j.agent_id AS job_agent_id
     FROM delivery_outbox o
     LEFT JOIN jobs j ON j.id = o.job_id
     WHERE o.idempotency_key = ?
@@ -569,7 +569,7 @@ export function getDeliveryCheckpoint(idempotencyKey, opts = {}) {
 export function getDeliveryByIdempotencyKey(idempotencyKey, opts = {}) {
   const db = opts.db || getDb();
   const row = db.prepare(`
-    SELECT o.*, j.name AS job_name
+    SELECT o.*, j.name AS job_name, j.agent_id AS job_agent_id
     FROM delivery_outbox o
     LEFT JOIN jobs j ON j.id = o.job_id
     WHERE o.idempotency_key = ?
@@ -601,7 +601,7 @@ export function listDeliveries(opts = {}) {
     params.push(opts.runId);
   }
   const rows = db.prepare(`
-    SELECT o.*, j.name AS job_name
+    SELECT o.*, j.name AS job_name, j.agent_id AS job_agent_id
     FROM delivery_outbox o
     LEFT JOIN jobs j ON j.id = o.job_id
     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
