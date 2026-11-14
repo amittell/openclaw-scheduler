@@ -22,6 +22,7 @@ import {
   shouldSummarizeDelivery,
   summarizeDeliveryContent,
 } from './delivery-summary.js';
+import { applyDeliveryFrom } from './delivery-from.js';
 import { negotiateCredentialCapabilities } from './capability-negotiation.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 import {
@@ -1114,6 +1115,20 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
+  // delivery_from: when the delivered body comes from result.content (agent
+  // replies and every strategy that sets no deliveryOverride), deliver it from
+  // the job's marker line. This runs before summarization, so a summary sees
+  // only the report, and before enqueueCompletionDelivery adds the soft-failure
+  // header, so that header is kept. result.content and result.summary are not
+  // touched: the run record, trigger conditions, and the idempotency result
+  // hash keep the full text. Shell jobs apply the marker in executeShell,
+  // before their failure header is added to deliveryOverride.
+  const deliversContent = !result.skipDelivery
+    && result.deliveryOverride == null
+    && ['announce', 'announce-always'].includes(job.delivery_mode);
+  const deliveryText = deliversContent
+    ? applyDeliveryFrom(job, result.content, { log, runId: ctx.run.id })
+    : result.content;
   // v31/v32: LLM summarization of long delivery bodies (on by default for
   // non-v4 jobs since v32; explicit delivery_summary='none' opts out). The
   // summary is
@@ -1126,7 +1141,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   // prefix keeps its failure context: the summary is posted under a status
   // line instead of silently replacing the marker.
   {
-    const rawBody = String(result.deliveryOverride ?? result.content ?? '');
+    const rawBody = String(result.deliveryOverride ?? deliveryText ?? '');
     // Skip the summary request entirely when no delivery will be posted: a
     // successful shell/agent job in announce mode sets skipDelivery (only
     // errors announce), so summarizing long output would burn a model request
@@ -1147,17 +1162,20 @@ export async function finalizeDispatch(job, ctx, result, deps) {
         // the raw body would be lost. We therefore offload the full raw body to
         // a run artifact (the same storeRunArtifact mechanism the shell path
         // uses for oversized stdout) and record its path + sha256 + bytes in
-        // context_summary so a complete persisted copy always exists.
+        // context_summary so a complete persisted copy always exists. The copy
+        // is the text before delivery_from selected the report from it, so the
+        // record keeps the whole reply even when only the report was summarized.
+        const fullBody = String(result.deliveryOverride ?? result.content ?? '');
         let persistedFullBody = null;
         try {
           const fullBodyPath = deps.storeRunArtifact
-            ? (deps.storeRunArtifact('agent-output', ctx.run.id, rawBody) || null)
+            ? (deps.storeRunArtifact('agent-output', ctx.run.id, fullBody) || null)
             : null;
           if (fullBodyPath) {
             persistedFullBody = {
               path: fullBodyPath,
-              sha256: `sha256:${createHash('sha256').update(rawBody, 'utf8').digest('hex')}`,
-              bytes: Buffer.byteLength(rawBody, 'utf8'),
+              sha256: `sha256:${createHash('sha256').update(fullBody, 'utf8').digest('hex')}`,
+              bytes: Buffer.byteLength(fullBody, 'utf8'),
             };
           }
         } catch (persistErr) {
@@ -1265,7 +1283,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   };
   const enqueueCompletionDelivery = (retryScheduled) => {
     if (result.skipDelivery) return null;
-    const deliveryContent = result.deliveryOverride ?? result.content;
+    const deliveryContent = result.deliveryOverride ?? deliveryText;
     const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
       && deliveryContent?.trim();
     if (!shouldAnnounce) return null;
@@ -3032,13 +3050,15 @@ export async function executeShell(job, ctx, deps) {
       });
     }
   } else {
-    // Shell delivery logic: announce-always sends on all results, announce sends on error only
+    // Shell delivery logic: announce-always sends on all results, announce sends on error only.
+    // delivery_from selects the payload before the failure header is added.
     const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
+    const deliveryFromOpts = { log, runId: ctx.run.id };
     if (job.delivery_mode === 'announce-always' && announcePayload) {
       const prefix = shellResult.status === 'ok' ? '' : `\u26a0\ufe0f Shell job failed: ${job.name}\n\n`;
-      result.deliveryOverride = `${prefix}${announcePayload}`;
+      result.deliveryOverride = `${prefix}${applyDeliveryFrom(job, announcePayload, deliveryFromOpts)}`;
     } else if (job.delivery_mode === 'announce' && shellResult.status !== 'ok' && announcePayload) {
-      result.deliveryOverride = announcePayload;
+      result.deliveryOverride = applyDeliveryFrom(job, announcePayload, deliveryFromOpts);
     } else {
       result.skipDelivery = true;
     }

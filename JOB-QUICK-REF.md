@@ -277,6 +277,7 @@ fails closed for parent output larger than 65,536 UTF-8 bytes.
 | `delivery_channel` | string | no | Channel name (telegram, discord, etc.) |
 | `delivery_to` | string | no | Chat ID, channel ID, or @alias |
 | `delivery_summary` | string | no | `llm` (default for non-v4 jobs) or `none` -- summarize long output via the gateway model before posting (fail-open to raw); handoff v4 jobs always store `none` |
+| `delivery_from` | string | no | Deliver only from the last line that starts with this text (after leading whitespace) to the end; full text and one warning when no line matches. One line, 1-200 characters; `null` clears; not for handoff v4 jobs |
 | `origin` | string | yes (root jobs only; child jobs inherit) | Source chat ID or `system` |
 | `parent_id` | string | no | Parent job ID (for chains) |
 | `trigger_on` | string | no | `success`, `failure`, `complete` |
