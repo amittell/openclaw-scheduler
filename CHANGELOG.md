@@ -160,12 +160,18 @@ All notable changes to this project will be documented in this file.
     (default 14, range 1 to 3650) days ago, using `created_at` for rows never
     processed. It runs at most 25 batches of 2,000 rows per pass and yields to
     the event loop between batches (about 80 ms per batch on a synthetic
-    300,000-row table). It never deletes a row bound to a handoff v4
+    300,000-row table); batches advance a cursor past candidates already
+    examined, so a row kept by a protection predicate is examined at most
+    once per pass. It never deletes a row bound to a handoff v4
     artifact, a row still referenced by a run that has not finished (or is
     `recovery_blocked`), a row referenced by a pending, approved or
     dispatching approval, or the scheduled occurrence its job is still due
-    on. Passes that delete rows log `Pruned N terminal dispatch queue
-    row(s)`.
+    on (a one-shot at occurrence stops being due once the job's `last_run_at`
+    has caught up to its `schedule_at`, matching `getDueAtJobs`). Passes that
+    delete rows log `Pruned N terminal dispatch queue row(s)`. Deleting a
+    row also clears the `dispatch_queue_id` references in `runs` and
+    `approvals` in the same transaction, which upgraded databases need (their
+    reference columns predate the `ON DELETE SET NULL` foreign keys).
 
 - **Handoff v4 jobs reject `delivery_summary=llm` (contract gap).** The
   `delivery_summary` field was writable on handoff v4 jobs but absent from the

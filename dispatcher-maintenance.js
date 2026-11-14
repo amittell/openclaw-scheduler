@@ -116,8 +116,10 @@ const yieldToEventLoop = () => new Promise(resolve => setImmediate(resolve));
 
 /**
  * Prune terminal job_dispatch_queue rows past the retention window in bounded
- * batches. Each batch is one short write; between batches the event loop runs
- * (lease renewal, workers), so a large first pass cannot stall the dispatcher.
+ * batches. Each batch is one short transaction; between batches the event
+ * loop runs (lease renewal, workers), so a large first pass cannot stall the
+ * dispatcher. Batches advance a cursor past already-examined candidates, so
+ * a row kept by a protection predicate is examined at most once per pass.
  * At most maxBatches * batchSize rows go per pass; the rest wait for the next.
  */
 export async function pruneDispatchQueueHistory({
@@ -141,15 +143,26 @@ export async function pruneDispatchQueueHistory({
   let batches = 0;
   let cutoff = null;
   let exhausted = false;
+  let afterScheduledFor = null;
+  let afterRowid = null;
   while (batches < maxBatches) {
     if (batches > 0) {
       await pause();
       if (!shouldContinue()) break;
     }
-    const result = pruneBatch({ retentionDays, limit: batchSize, before });
+    const result = pruneBatch({
+      retentionDays,
+      limit: batchSize,
+      before,
+      ...(afterScheduledFor != null ? { afterScheduledFor, afterRowid } : {}),
+    });
     batches += 1;
     pruned += result.pruned;
     cutoff = result.cutoff;
+    if (typeof result.afterScheduledFor === 'string' && Number.isSafeInteger(result.afterRowid)) {
+      afterScheduledFor = result.afterScheduledFor;
+      afterRowid = result.afterRowid;
+    }
     if (result.pruned < batchSize) {
       exhausted = true;
       break;

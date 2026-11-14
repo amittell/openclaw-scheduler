@@ -415,11 +415,48 @@ export default function migrateConsolidate() {
       name: 'idx_dispatch_queue_job_active',
       table: 'job_dispatch_queue',
       columns: ['job_id', 'status'],
-      where: 'status in (pending, claimed, awaiting_approval)',
+      where: "status in ('pending', 'claimed', 'awaiting_approval')",
       // Same text as schema.sql, so every install stores the same definition.
       sql: "CREATE INDEX IF NOT EXISTS idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('pending', 'claimed', 'awaiting_approval')",
     },
   ];
+  // WHERE-clause comparison that preserves string-literal contents verbatim.
+  // SQLite uses a partial index only when the query's predicates match the
+  // index's under the column's BINARY collation, so 'PENDING' or 'pending '
+  // are not the same predicate as 'pending': an index built with them would
+  // never serve the active-backlog query. Keywords and whitespace outside
+  // literals are still normalized (case, runs collapsed to one space).
+  const normalizeWhereClause = (value) => {
+    let out = '';
+    let inLiteral = false;
+    const source = String(value || '').replace(/;/g, '');
+    for (let index = 0; index < source.length; index += 1) {
+      const character = source[index];
+      if (inLiteral) {
+        out += character;
+        if (character === "'") {
+          if (source[index + 1] === "'") {
+            out += "'";
+            index += 1;
+          } else {
+            inLiteral = false;
+          }
+        }
+        continue;
+      }
+      if (character === "'") {
+        inLiteral = true;
+        out += "'";
+        continue;
+      }
+      if (/\s/.test(character)) {
+        if (out !== '' && !/\s$/.test(out)) out += ' ';
+        continue;
+      }
+      out += character.toLowerCase();
+    }
+    return out.trim();
+  };
   const partialIndexMatches = (spec) => {
     if (!hasIndex(spec.name)) return false;
     const listed = db.prepare(`PRAGMA index_list(${spec.table})`).all()
@@ -429,11 +466,13 @@ export default function migrateConsolidate() {
       .sort((left, right) => left.seqno - right.seqno)
       .map(column => column.name);
     if (JSON.stringify(columns) !== JSON.stringify(spec.columns)) return false;
-    const sql = normalizeSql(
-      db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(spec.name)?.sql,
-    );
-    const where = sql.includes(' where ') ? sql.slice(sql.indexOf(' where ') + 7) : null;
-    return where !== null && where.replaceAll(' ', '') === spec.where.replaceAll(' ', '');
+    // The raw stored definition, not normalizeSql's output: that one
+    // lowercases and strips quotes, which would hide wrong-case or padded
+    // literals inside the WHERE clause.
+    const rawSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(spec.name)?.sql ?? '';
+    const whereMatch = rawSql.match(/\bwhere\b([\s\S]*)$/i);
+    const where = whereMatch ? whereMatch[1] : null;
+    return where !== null && normalizeWhereClause(where) === normalizeWhereClause(spec.where);
   };
   const recordedVersionCount = hasTable('schema_migrations')
     ? db.prepare(`

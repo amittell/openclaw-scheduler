@@ -165,7 +165,7 @@ test('retentionDays and before move the cutoff', () => {
   assert.throws(() => pruneTerminalDispatches({ limit: 1.5 }), /limit must be a positive integer/);
 });
 
-test('one statement deletes at most limit rows and the search stays on an index', () => {
+test('one batch deletes at most limit rows and the search stays on an index', () => {
   for (let index = 0; index < 7; index++) insertDispatch(`old-${index}`, { status: 'done' });
   assert.equal(pruneTerminalDispatches({ limit: 3 }).pruned, 3);
   assert.equal(remainingIds().length, 4);
@@ -182,9 +182,9 @@ test('one statement deletes at most limit rows and the search stays on an index'
   } finally {
     delete db.prepare;
   }
-  const deleteSql = seen.find(sql => /DELETE FROM job_dispatch_queue/.test(sql));
-  assert.ok(deleteSql, 'the prune statement was prepared');
-  const plan = db.prepare(`EXPLAIN QUERY PLAN ${deleteSql}`)
+  const selectSql = seen.find(sql => /FROM job_dispatch_queue AS q/.test(sql));
+  assert.ok(selectSql, 'the candidate select was prepared');
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${selectSql}`)
     .all({ cutoff: daysAgo(14), limit: 1 })
     .map(row => row.detail);
   assert.ok(
@@ -192,6 +192,125 @@ test('one statement deletes at most limit rows and the search stays on an index'
     `candidate search must use idx_dispatch_queue_due: ${plan.join(' | ')}`,
   );
   assert.equal(plan.some(detail => /^SCAN /.test(detail)), false, `no full scan: ${plan.join(' | ')}`);
+  for (const expected of [
+    /UPDATE runs SET dispatch_queue_id = NULL WHERE dispatch_queue_id IN \(\?\)/,
+    /UPDATE approvals SET dispatch_queue_id = NULL WHERE dispatch_queue_id IN \(\?\)/,
+    /DELETE FROM job_dispatch_queue WHERE id IN \(\?\)/,
+  ]) {
+    assert.ok(seen.some(sql => expected.test(sql)), `expected statement ${expected} was prepared`);
+  }
+  const deleteSql = seen.find(sql => /DELETE FROM job_dispatch_queue/.test(sql));
+  const deletePlan = db.prepare(`EXPLAIN QUERY PLAN ${deleteSql}`)
+    .all('probe')
+    .map(row => row.detail);
+  assert.equal(deletePlan.some(detail => /^SCAN /.test(detail)), false, `no full scan: ${deletePlan.join(' | ')}`);
+});
+
+test('the cursor predicate keeps the candidate search on the due index', () => {
+  for (let index = 0; index < 4; index++) insertDispatch(`plan-${index}`, { status: 'done' });
+  const db = getDb();
+  const seen = [];
+  const original = db.prepare;
+  db.prepare = function prepare(sql) {
+    seen.push(sql);
+    return original.call(this, sql);
+  };
+  try {
+    pruneTerminalDispatches({ limit: 2, afterScheduledFor: daysAgo(20), afterRowid: 1 });
+  } finally {
+    delete db.prepare;
+  }
+  const selectSql = seen.find(sql => /FROM job_dispatch_queue AS q/.test(sql));
+  assert.ok(selectSql, 'the cursor candidate select was prepared');
+  assert.ok(/q\.rowid > @afterRowid/.test(selectSql), 'the cursor predicate is present in the statement');
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${selectSql}`)
+    .all({ cutoff: daysAgo(14), limit: 2, afterScheduledFor: daysAgo(20), afterRowid: 1 })
+    .map(row => row.detail);
+  assert.ok(
+    plan.some(detail => /SEARCH q USING INDEX idx_dispatch_queue_due/.test(detail)),
+    `candidate search must use idx_dispatch_queue_due: ${plan.join(' | ')}`,
+  );
+  assert.equal(plan.some(detail => /^SCAN (q|job_dispatch_queue)\b/.test(detail)), false, `no full scan: ${plan.join(' | ')}`);
+});
+
+test('a pass advances its cursor past examined rows that share one scheduled_for', () => {
+  for (let index = 0; index < 7; index++) insertDispatch(`cur-${String(index).padStart(2, '0')}`, { status: 'done' });
+  const first = pruneTerminalDispatches({ limit: 3 });
+  assert.equal(first.pruned, 3);
+  assert.ok(typeof first.afterScheduledFor === 'string' && Number.isSafeInteger(first.afterRowid), 'a pass returns its cursor');
+  const second = pruneTerminalDispatches({ limit: 3, afterScheduledFor: first.afterScheduledFor, afterRowid: first.afterRowid });
+  assert.equal(second.pruned, 3);
+  assert.deepEqual(remainingIds(), ['cur-06']);
+  const third = pruneTerminalDispatches({ limit: 3, afterScheduledFor: second.afterScheduledFor, afterRowid: second.afterRowid });
+  assert.equal(third.pruned, 1);
+  assert.deepEqual(remainingIds(), []);
+  assert.throws(
+    () => pruneTerminalDispatches({ afterScheduledFor: daysAgo(20) }),
+    /afterScheduledFor and afterRowid must be set together/,
+  );
+});
+
+test('an at-occurrence is pruned only once it is no longer outstanding', () => {
+  const makeAtJob = (name, slot) => createJob({
+    name,
+    schedule_kind: 'at',
+    schedule_at: slot,
+    session_target: 'shell',
+    payload_kind: 'shellCommand',
+    payload_message: 'true',
+    delivery_mode: 'none',
+    run_timeout_ms: 5_000,
+    origin: 'system',
+  });
+  const completedSlot = daysAgo(20);
+  const earlySlot = daysAgo(19);
+  const outstandingSlot = daysAgo(18);
+  const db = getDb();
+  const completedJob = makeAtJob('at completed', completedSlot);
+  const earlyJob = makeAtJob('at early', earlySlot);
+  const outstandingJob = makeAtJob('at outstanding', outstandingSlot);
+  // Ran after the slot: the occurrence is done and will never be due again
+  // (getDueAtJobs keeps it out via last_run_at >= schedule_at).
+  db.prepare(`UPDATE jobs SET last_run_at = datetime(?, '+3 hours') WHERE id = ?`).run(completedSlot, completedJob.id);
+  // Ran before the slot: getDueAtJobs still considers the occurrence due, so
+  // the dispatch row stays as the thing that stops re-enqueueing it.
+  db.prepare(`UPDATE jobs SET last_run_at = datetime(?, '-3 hours') WHERE id = ?`).run(earlySlot, earlyJob.id);
+  // OutstandingJob keeps last_run_at = NULL.
+  insertDispatch('at-completed-row', { status: 'done', kind: 'at', scheduledFor: completedSlot });
+  insertDispatch('at-early-row', { status: 'done', kind: 'at', scheduledFor: earlySlot });
+  insertDispatch('at-outstanding-row', { status: 'done', kind: 'at', scheduledFor: outstandingSlot });
+  db.prepare('UPDATE job_dispatch_queue SET job_id = ? WHERE id = ?').run(completedJob.id, 'at-completed-row');
+  db.prepare('UPDATE job_dispatch_queue SET job_id = ? WHERE id = ?').run(earlyJob.id, 'at-early-row');
+  db.prepare('UPDATE job_dispatch_queue SET job_id = ? WHERE id = ?').run(outstandingJob.id, 'at-outstanding-row');
+  assert.equal(pruneTerminalDispatches().pruned, 1);
+  assert.deepEqual(remainingIds(), ['at-early-row', 'at-outstanding-row']);
+});
+
+test('upgraded schema without ON DELETE SET NULL leaves no dangling references', () => {
+  // Recreate the reference columns the way the consolidation migration adds
+  // them to existing databases: plain TEXT, no REFERENCES, no ON DELETE
+  // SET NULL (the partial indexes stay, as the migration creates them).
+  const db = getDb();
+  for (const [table, indexName] of [['runs', 'idx_runs_dispatch_queue'], ['approvals', 'idx_approvals_dispatch_queue']]) {
+    db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+    db.exec(`ALTER TABLE ${table} DROP COLUMN dispatch_queue_id`);
+    db.exec(`ALTER TABLE ${table} ADD COLUMN dispatch_queue_id TEXT`);
+    db.exec(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${table}(dispatch_queue_id) WHERE dispatch_queue_id IS NOT NULL`);
+  }
+  insertDispatch('upg-done', { status: 'done' });
+  insertRun('upg-run', 'upg-done', 'ok');
+  insertApproval('upg-approval', 'upg-done', 'dispatched');
+  assert.equal(pruneTerminalDispatches().pruned, 1);
+  assert.equal(remainingIds().length, 0);
+  assert.equal(db.prepare("SELECT dispatch_queue_id FROM runs WHERE id = 'upg-run'").get().dispatch_queue_id, null);
+  assert.equal(db.prepare("SELECT dispatch_queue_id FROM approvals WHERE id = 'upg-approval'").get().dispatch_queue_id, null);
+  for (const table of ['runs', 'approvals']) {
+    assert.equal(
+      db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE dispatch_queue_id IS NOT NULL AND dispatch_queue_id NOT IN (SELECT id FROM job_dispatch_queue)`).get().n,
+      0,
+      `${table} has no dangling dispatch references`,
+    );
+  }
 });
 
 test('a prune pass is bounded by maxBatches, yields between batches, and logs', async () => {

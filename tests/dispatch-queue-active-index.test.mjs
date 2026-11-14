@@ -194,12 +194,22 @@ test('a database with the hand-made index is a no-op and keeps that index unchan
 });
 
 test('a same-named index with another definition is rebuilt to the required shape', async () => {
-  let db = await openFresh('wrong-shape');
-  db.exec(`DROP INDEX IF EXISTS ${ACTIVE_INDEX}`);
-  db.exec(`CREATE INDEX ${ACTIVE_INDEX} ON job_dispatch_queue(job_id, status) WHERE status IN ('claimed', 'pending', 'awaiting_approval')`);
+  // Reordered IN list, wrong-case literals, and a padded literal are all
+  // different predicates under the status column's BINARY collation, so the
+  // consolidation check must rebuild each of them to the required shape.
+  const cases = [
+    ['wrong-order', "CREATE INDEX idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('claimed', 'pending', 'awaiting_approval')"],
+    ['wrong-case', "CREATE INDEX idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('PENDING', 'CLAIMED', 'AWAITING_APPROVAL')"],
+    ['wrong-space', "CREATE INDEX idx_dispatch_queue_job_active ON job_dispatch_queue(job_id, status) WHERE status IN ('pending ', 'claimed', 'awaiting_approval')"],
+  ];
+  for (const [name, createSql] of cases) {
+    let db = await openFresh(name);
+    db.exec(`DROP INDEX IF EXISTS ${ACTIVE_INDEX}`);
+    db.exec(createSql);
 
-  db = await reopen('wrong-shape');
-  assert.match(indexSql(db), /WHERE status IN \('pending', 'claimed', 'awaiting_approval'\)/);
-  assertHotPlansUseActiveIndex(db);
-  assert.equal(migrateConsolidate(), false);
+    db = await reopen(name);
+    assert.match(indexSql(db), /WHERE status IN \('pending', 'claimed', 'awaiting_approval'\)/, `${name} index rebuilt`);
+    assertHotPlansUseActiveIndex(db);
+    assert.equal(migrateConsolidate(), false, `${name} database is a no-op after repair`);
+  }
 });

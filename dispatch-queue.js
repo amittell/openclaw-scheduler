@@ -18,6 +18,10 @@ const VALID_DISPATCH_STATUSES = new Set([
 export const TERMINAL_DISPATCH_STATUSES = Object.freeze(['done', 'cancelled', 'failed']);
 export const DEFAULT_DISPATCH_RETENTION_DAYS = 14;
 export const DEFAULT_DISPATCH_PRUNE_BATCH_SIZE = 2_000;
+// Bound for a single batch: the selected ids become bind parameters of the
+// unlink and delete statements, which must stay under SQLite's variable
+// limit (32,766 on every SQLite this project builds against).
+export const MAX_DISPATCH_PRUNE_BATCH = 32_000;
 
 // A run in one of these statuses is finished with its dispatch row. Everything
 // else keeps the row: the active statuses, recovery_blocked (held for operator
@@ -32,45 +36,66 @@ function sqlList(values) {
   return values.map(value => `'${value}'`).join(', ');
 }
 
-// One bounded DELETE. Kept rows: non-terminal; processed (or, if never
-// processed, created) at or after the cutoff; handoff v4 bound
-// (pruneRuns keeps the source run of a v4 dispatch through this row); still
-// referenced by an unfinished run or an active approval; or the occurrence the
-// job is still due on (scheduled/at ids are deterministic, so the row is what
-// stops materializeDueSchedules from enqueueing that occurrence again).
+// One bounded selection of prunable terminal rows. Kept rows: non-terminal;
+// processed (or, if never processed, created) at or after the cutoff;
+// handoff v4 bound (pruneRuns keeps the source run of a v4 dispatch through
+// this row); still referenced by an unfinished run or an active approval; or
+// the occurrence the job is still due on (scheduled/at ids are deterministic,
+// so the row is what stops materializeDueSchedules from enqueueing that
+// occurrence again; a one-shot at occurrence stops being outstanding once the
+// job's last_run_at has caught up to schedule_at, mirroring getDueAtJobs).
 // scheduled_for < cutoff is implied for almost every prunable row and lets the
 // search use idx_dispatch_queue_due instead of reading every terminal row; a
 // row scheduled after it was processed is only kept longer.
-const PRUNE_TERMINAL_DISPATCHES_SQL = `
-  DELETE FROM job_dispatch_queue
-  WHERE rowid IN (
-    SELECT q.rowid
-    FROM job_dispatch_queue AS q
-    WHERE q.status IN (${sqlList(TERMINAL_DISPATCH_STATUSES)})
-      AND q.scheduled_for < @cutoff
-      AND julianday(COALESCE(q.processed_at, q.created_at)) < julianday(@cutoff)
-      AND q.handoff_artifact_digest IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM runs AS r
-        WHERE r.dispatch_queue_id = q.id
-          AND r.status NOT IN (${sqlList(PRUNABLE_RUN_STATUSES)})
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM approvals AS a
-        WHERE a.dispatch_queue_id = q.id
-          AND a.status IN (${sqlList(ACTIVE_APPROVAL_STATUSES)})
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM jobs AS j
-        WHERE j.id = q.job_id
-          AND (
-            (q.dispatch_kind = 'schedule' AND j.next_run_at = q.binding_scheduled_for)
-            OR (q.dispatch_kind = 'at' AND j.schedule_at = q.binding_scheduled_for)
-          )
-      )
-    LIMIT @limit
-  )
+//
+// The candidates are selected once, and that exact id set is then unlinked
+// from runs/approvals and deleted in one transaction. On upgraded databases
+// those reference columns are plain TEXT without ON DELETE SET NULL, so the
+// explicit unlink keeps the delete safe there too (a net-new install applies
+// ON DELETE SET NULL as well; the unlink is then a no-op).
+//
+// The afterScheduledFor/afterRowid cursor lets a pass advance past every
+// candidate it already examined: with it, a protected row is examined at most
+// once per pass instead of once per batch, so a backlog of permanently kept
+// rows costs one bounded scan per pass. Rows skipped across status groups are
+// picked up by the next pass (retention is eventual, never a hard deadline).
+const PRUNE_TERMINAL_CANDIDATES_SQL = (afterPredicate) => `
+  SELECT q.id, q.rowid, q.scheduled_for
+  FROM job_dispatch_queue AS q
+  WHERE q.status IN (${sqlList(TERMINAL_DISPATCH_STATUSES)})
+    AND q.scheduled_for < @cutoff
+    ${afterPredicate}
+    AND julianday(COALESCE(q.processed_at, q.created_at)) < julianday(@cutoff)
+    AND q.handoff_artifact_digest IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM runs AS r
+      WHERE r.dispatch_queue_id = q.id
+        AND r.status NOT IN (${sqlList(PRUNABLE_RUN_STATUSES)})
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM approvals AS a
+      WHERE a.dispatch_queue_id = q.id
+        AND a.status IN (${sqlList(ACTIVE_APPROVAL_STATUSES)})
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM jobs AS j
+      WHERE j.id = q.job_id
+        AND (
+          (q.dispatch_kind = 'schedule' AND j.next_run_at = q.binding_scheduled_for)
+          OR (q.dispatch_kind = 'at' AND j.schedule_at = q.binding_scheduled_for
+              AND (j.last_run_at IS NULL OR datetime(j.last_run_at) < datetime(j.schedule_at)))
+        )
+    )
+  LIMIT @limit
 `;
+
+const idListSql = (ids) => ids.map(() => '?').join(', ');
+const UNLINK_RUN_DISPATCHES_SQL = (ids) =>
+  `UPDATE runs SET dispatch_queue_id = NULL WHERE dispatch_queue_id IN (${idListSql(ids)})`;
+const UNLINK_APPROVAL_DISPATCHES_SQL = (ids) =>
+  `UPDATE approvals SET dispatch_queue_id = NULL WHERE dispatch_queue_id IN (${idListSql(ids)})`;
+const DELETE_TERMINAL_DISPATCHES_SQL = (ids) =>
+  `DELETE FROM job_dispatch_queue WHERE id IN (${idListSql(ids)})`;
 
 function claimExpiryModifier(leaseMs) {
   if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
@@ -394,10 +419,13 @@ function sqliteUtcTimestamp(value) {
 
 /**
  * Delete at most `limit` terminal dispatch rows older than the retention
- * window, in one statement, so no single write holds the SQLite write lock for
- * long. Callers loop over batches (pruneDispatchQueueHistory in
- * dispatcher-maintenance.js). `before` (Date or epoch ms) overrides the cutoff
- * that `retentionDays` would give.
+ * window in one transaction, so no single write holds the SQLite write lock
+ * for long. Callers loop over batches (pruneDispatchQueueHistory in
+ * dispatcher-maintenance.js), threading `afterScheduledFor`/`afterRowid`
+ * between batches so the pass does not re-examine rows it already processed.
+ * `before` (Date or epoch ms) overrides the cutoff that `retentionDays` would
+ * give. Returns the farthest examined-and-deleted candidate as the next
+ * cursor (null when nothing was pruned).
  */
 export function pruneTerminalDispatches(opts = {}) {
   const db = opts.db || getDb();
@@ -407,9 +435,40 @@ export function pruneTerminalDispatches(opts = {}) {
     'retentionDays',
   );
   const limit = positiveSafeInteger(opts.limit, DEFAULT_DISPATCH_PRUNE_BATCH_SIZE, 'limit');
+  if (limit > MAX_DISPATCH_PRUNE_BATCH) {
+    throw new Error(`limit must be at most ${MAX_DISPATCH_PRUNE_BATCH}`);
+  }
+  let afterPredicate = '';
+  let cursor = {};
+  if (opts.afterScheduledFor != null || opts.afterRowid != null) {
+    if (typeof opts.afterScheduledFor !== 'string' || !Number.isSafeInteger(opts.afterRowid)) {
+      throw new Error('afterScheduledFor and afterRowid must be set together');
+    }
+    afterPredicate = 'AND (q.scheduled_for > @afterScheduledFor'
+      + ' OR (q.scheduled_for = @afterScheduledFor AND q.rowid > @afterRowid))';
+    cursor = { afterScheduledFor: opts.afterScheduledFor, afterRowid: opts.afterRowid };
+  }
   const cutoff = sqliteUtcTimestamp(
     opts.before ?? Date.now() - retentionDays * 24 * 60 * 60 * 1000,
   );
-  const pruned = db.prepare(PRUNE_TERMINAL_DISPATCHES_SQL).run({ cutoff, limit }).changes;
-  return { pruned, cutoff, limit };
+  const candidates = db.prepare(PRUNE_TERMINAL_CANDIDATES_SQL(afterPredicate))
+    .all({ cutoff, limit, ...cursor });
+  const pruned = candidates.length;
+  if (pruned === 0) {
+    return { pruned, cutoff, limit, afterScheduledFor: null, afterRowid: null };
+  }
+  const ids = candidates.map(row => row.id);
+  db.transaction(() => {
+    db.prepare(UNLINK_RUN_DISPATCHES_SQL(ids)).run(...ids);
+    db.prepare(UNLINK_APPROVAL_DISPATCHES_SQL(ids)).run(...ids);
+    db.prepare(DELETE_TERMINAL_DISPATCHES_SQL(ids)).run(...ids);
+  })();
+  let farthest = candidates[0];
+  for (const row of candidates) {
+    if (row.scheduled_for > farthest.scheduled_for
+      || (row.scheduled_for === farthest.scheduled_for && row.rowid > farthest.rowid)) {
+      farthest = row;
+    }
+  }
+  return { pruned, cutoff, limit, afterScheduledFor: farthest.scheduled_for, afterRowid: farthest.rowid };
 }
