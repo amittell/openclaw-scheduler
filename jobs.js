@@ -13,6 +13,7 @@ import { persistTerminalEvidence, quarantineRunRecovery } from './runs.js';
 import { assertContainedPath, assertValidAgentId, assertValidSessionKey } from './identifiers.js';
 import { resolveDispatchStateDir } from './dispatch/paths.mjs';
 import { normalizeAgentSelection } from './agent-selection.js';
+import { DELIVERY_FROM_MAX_LENGTH } from './delivery-from.js';
 import {
   assertValidHandoffArtifact,
   getHandoffArtifact,
@@ -210,6 +211,31 @@ function assertSafeString(name, value, opts = {}) {
   }
   if (opts.maxLength && value.length > opts.maxLength) {
     throw new Error(`${name} exceeds max length of ${opts.maxLength}`);
+  }
+}
+
+// delivery_from is matched against single lines of the delivered text, so it
+// must itself be one printable line. null clears it.
+function assertDeliveryFrom(value) {
+  if (value == null) return;
+  if (typeof value !== 'string') {
+    throw new Error('delivery_from must be a string, or null to clear it');
+  }
+  if (/[\r\n\u2028\u2029]/.test(value)) {
+    throw new Error('delivery_from must be a single line (no line breaks)');
+  }
+  const hasControlChars = [...value].some((char) => {
+    const code = char.codePointAt(0);
+    return code <= 31 || (code >= 127 && code <= 159);
+  });
+  if (hasControlChars) {
+    throw new Error('delivery_from contains control characters');
+  }
+  if (value.trim().length === 0) {
+    throw new Error('delivery_from cannot be empty or only whitespace; use null to clear it');
+  }
+  if ([...value].length > DELIVERY_FROM_MAX_LENGTH) {
+    throw new Error(`delivery_from exceeds max length of ${DELIVERY_FROM_MAX_LENGTH} characters`);
   }
 }
 
@@ -511,6 +537,18 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
         { code: 'HANDOFF_V4_DELIVERY_SUMMARY_UNSUPPORTED' },
       );
     }
+    // delivery_from changes the delivered body and is outside the v4 bound
+    // field set, the same gap as delivery_summary above, so a v4 job cannot
+    // carry a marker. Clearing it (null) is allowed; the dispatcher also
+    // ignores the field for v4 jobs.
+    const settingDeliveryFrom = 'delivery_from' in normalized
+      || Number(currentJob?.handoff_version || 0) !== 4;
+    if (settingDeliveryFrom && merged.delivery_from != null) {
+      throw Object.assign(
+        new Error('delivery_from is not supported for handoff v4 jobs: the field is outside the v4 artifact binding contract'),
+        { code: 'HANDOFF_V4_DELIVERY_FROM_UNSUPPORTED' },
+      );
+    }
   } else if (
     normalized.handoff_artifact_digest != null
     || normalized.handoff_artifact_payload != null
@@ -598,6 +636,9 @@ export function validateJobSpec(opts, currentJob = null, mode = 'create') {
   assertEnum('overlap_policy', merged.overlap_policy || 'skip', VALID_OVERLAP_POLICIES);
   assertEnum('delivery_mode', merged.delivery_mode || 'announce', VALID_DELIVERY_MODES);
   assertEnum('delivery_summary', merged.delivery_summary || 'none', VALID_DELIVERY_SUMMARY);
+  if (mode === 'create' || 'delivery_from' in normalized) {
+    assertDeliveryFrom(merged.delivery_from);
+  }
 
   // INSERT-only: enforce delivery_to for all non-exempt jobs.
   // Exempt from this requirement:
@@ -1384,7 +1425,7 @@ export function createJob(opts) {
       payload_model, payload_model_fallback, payload_thinking, payload_timeout_seconds,
       execution_intent, execution_read_only, shell_env_policy,
       overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals, max_trigger_fanout,
-      delivery_mode, delivery_channel, delivery_to, delivery_summary,
+      delivery_mode, delivery_channel, delivery_to, delivery_summary, delivery_from,
       delete_after_run, next_run_at,
       parent_id, trigger_on, trigger_delay_s,
       max_retries, payload_scope, resource_pool,
@@ -1415,7 +1456,7 @@ export function createJob(opts) {
       child_credential_policy,
       handoff_version, handoff_artifact_digest, effective_task_hash
 ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?, ?,
@@ -1489,6 +1530,7 @@ export function createJob(opts) {
     Number(normalized.handoff_version) === 4
       ? 'none'
       : (normalized.delivery_summary || 'llm'),
+    normalized.delivery_from ?? null,
     normalized.delete_after_run ? 1 : 0,
     nextRun,
     normalized.parent_id || null,
@@ -1630,7 +1672,7 @@ export function updateJob(id, patch) {
     'execution_intent', 'execution_read_only', 'shell_env_policy',
     'overlap_policy', 'run_timeout_ms', 'max_queued_dispatches', 'max_pending_approvals', 'max_trigger_fanout',
     'delivery_mode', 'delivery_channel', 'delivery_to',
-    'delivery_summary',
+    'delivery_summary', 'delivery_from',
     'delete_after_run', 'next_run_at', 'last_run_at', 'last_status',
     'consecutive_errors', 'parent_id', 'trigger_on', 'trigger_delay_s',
     'max_retries', 'payload_scope', 'resource_pool', 'trigger_condition',
