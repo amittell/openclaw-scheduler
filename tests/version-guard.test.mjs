@@ -396,6 +396,10 @@ test('whitespace-only SCHEDULER_VERSION_GUARD hard-fails identically on cli and 
   );
   assert.equal(dispatchWhitespace.status, 1, 'dispatch: whitespace-only override must hard-fail');
   assert.match(dispatchWhitespace.stderr, /version mismatch/i);
+  // Pre-fix, the truthy whitespace value downgraded the guard to warn-only and
+  // enqueue continued to the (failing) Gateway. Proving the guard hard-exited
+  // BEFORE the Gateway call is what makes this a regression test.
+  assert.doesNotMatch(dispatchWhitespace.stderr, /gateway/i, 'guard must hard-exit before any Gateway call');
 });
 
 test('dispatch enqueue stamps the ledger row with the client version', t => {
