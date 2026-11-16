@@ -133,6 +133,12 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   }
 
   const effectiveHome = homeDir || env.HOME;
+  // CodeQL hardening: the provider segment is derived from the model id
+  // (caller-supplied). Only a safe token may appear in the key filename,
+  // so a crafted model id cannot traverse the secrets directory.
+  if (provider && !/^[a-zA-Z0-9._-]+$/.test(provider)) {
+    return { status: 'unknown', reason: 'provider not safe for key path' };
+  }
   const apiKeyPath = effectiveHome
     ? join(effectiveHome, '.openclaw', 'secrets', `${provider ?? 'gpufarm'}-api-key.txt`)
     : null;
@@ -148,7 +154,17 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
 
   // The provider baseUrl may already end in /v1 (OpenClaw convention) --
   // normalize so we never request /v1/v1/models.
-  const url = `${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`;
+  let url;
+  try {
+    url = new URL(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`);
+  } catch {
+    return { status: 'unknown', reason: 'unparseable provider base url' };
+  }
+  // CodeQL hardening: only probe http(s) endpoints; never chase a file://
+  // or other scheme out of the process.
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { status: 'unknown', reason: `unsupported url scheme: ${url.protocol}` };
+  }
   let res;
   try {
     res = await fetchImpl(url, {
@@ -169,13 +185,46 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   }
   const data = Array.isArray(body?.data) ? body.data : null;
   if (!data) return { status: 'unknown', reason: 'unexpected models list shape', data: body };
-  const ids = new Set(
-    data.map((entry) => (isRecord(entry) ? normalizeString(entry.id) : null)).filter(Boolean),
-  );
-  if (ids.has(modelId) || ids.has(bareId)) return { status: 'served', data: body };
+  // A non-empty list whose entries all lack a usable `id` is a malformed
+  // catalog, not proof of absence -- fall through tolerantly instead of
+  // treating an empty id set as a definitive model-absent.
+  const ids = [];
+  for (const entry of data) {
+    if (isRecord(entry)) {
+      const id = normalizeString(entry.id);
+      if (id) ids.push(id);
+    }
+  }
+  if (data.length > 0 && ids.length === 0) {
+    return { status: 'unknown', reason: 'malformed models list (no usable id fields)', data: body };
+  }
+  const idSet = new Set(ids);
+  if (idSet.has(modelId) || idSet.has(bareId)) return { status: 'served', data: body };
   return {
     status: 'not_served',
     reason: `model_not_found: ${modelId} not served by ${provider ?? 'unknown'}`,
     data: body,
   };
+}
+
+/**
+ * Choose which model the liveness pre-check should probe for an enqueue.
+ *
+ * Fresh: the resolved default/explicit model is applied to the new session,
+ * so probe it. Reuse: the continuation keeps the existing session's model
+ * unless an explicit --model overrides it, so probe THAT instead of the
+ * fresh-spawn default -- which would wrongly reject a healthy continuation
+ * when the configured default has been retired but the session runs a
+ * healthy explicit model.
+ *
+ * @param {object} p
+ * @param {boolean} p.isFresh
+ * @param {string|null} p.defaultModel - resolved default/explicit model
+ * @param {string|null} p.explicitModel - the --model flag value (or null)
+ * @param {string|null} p.labelModel - the label row's stored model (or null)
+ * @returns {string|null} the model to probe, or null to skip the probe
+ */
+export function selectProbeModel({ isFresh, defaultModel, explicitModel, labelModel } = {}) {
+  if (isFresh) return defaultModel || null;
+  return explicitModel || labelModel || null;
 }

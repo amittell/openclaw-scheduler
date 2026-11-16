@@ -15,9 +15,10 @@
  *   (C) return 'unknown' (tolerant fall-through) on a network error, so a
  *       flaky network never fails a dispatch.
  */
+import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { probeModelAvailability } from '../dispatch/default-model.mjs';
+import { probeModelAvailability, selectProbeModel } from '../dispatch/default-model.mjs';
 
 const MODEL = 'gpufarm/qwen3.8-27b';
 const OPENCLAW_CONFIG = {
@@ -35,7 +36,7 @@ function probeOpts(fetchImpl) {
     env: { HOME: '/nonexistent-home' },
     homeDir: '/nonexistent-home',
     exists: (p) => p.endsWith('gpufarm-api-key.txt'),
-    readFile: (p) => 'test-api-key',
+    readFile: (_p) => 'test-api-key',
     timeoutMs: 5000,
   };
 }
@@ -97,4 +98,53 @@ test('probe: unresolvable provider base url -> unknown (tolerant)', async () => 
   opts.openClawConfig = {};
   const result = await probeModelAvailability(MODEL, null, opts);
   assert.equal(result.status, 'unknown');
+});
+
+test('probe: non-empty list with no usable id fields -> unknown (malformed, not definitive absence)', async () => {
+  const fetchImpl = async () => jsonResponse([{ name: 'qwen3.8-27b' }]);
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: non-empty list of null entries -> unknown (malformed, not definitive absence)', async () => {
+  const fetchImpl = async () => jsonResponse([null]);
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: mixed list with at least one usable id -> real catalog, membership decides', async () => {
+  const fetchImpl = async () => jsonResponse([{ id: 'some-other-model' }, { name: 'odd' }]);
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'not_served');
+});
+
+test('probe: unsafe provider segment in model id -> unknown (no path traversal)', async () => {
+  // providerBase passed directly so base resolves; the unsafe provider
+  // segment (space) must trip the safety check before the key path is built.
+  const result = await probeModelAvailability('gp ufarm/x', 'http://gpufarm.lan/v1', probeOpts(async () => jsonResponse([])));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: non-http(s) base url scheme -> unknown (SSRF guard)', async () => {
+  const opts = probeOpts(async () => jsonResponse([]));
+  opts.openClawConfig = { models: { providers: { gpufarm: { baseUrl: 'file:///etc/passwd' } } } };
+  const result = await probeModelAvailability(MODEL, null, opts);
+  assert.equal(result.status, 'unknown');
+});
+
+test('selectProbeModel: fresh probes the resolved default/explicit model', () => {
+  assert.equal(selectProbeModel({ isFresh: true, defaultModel: 'prov/a', explicitModel: null, labelModel: 'prov/b' }), 'prov/a');
+  assert.equal(selectProbeModel({ isFresh: true, defaultModel: null, explicitModel: 'prov/c', labelModel: 'prov/b' }), null);
+});
+
+test('selectProbeModel: reuse without --model probes the existing session model, not the default', () => {
+  assert.equal(selectProbeModel({ isFresh: false, defaultModel: 'prov/retired', explicitModel: null, labelModel: 'prov/healthy' }), 'prov/healthy');
+});
+
+test('selectProbeModel: reuse with --model probes the explicit override', () => {
+  assert.equal(selectProbeModel({ isFresh: false, defaultModel: 'prov/retired', explicitModel: 'prov/override', labelModel: 'prov/healthy' }), 'prov/override');
+});
+
+test('selectProbeModel: reuse with no model anywhere skips the probe', () => {
+  assert.equal(selectProbeModel({ isFresh: false, defaultModel: null, explicitModel: null, labelModel: null }), null);
 });
