@@ -83,3 +83,99 @@ export function resolveDefaultDispatchModel({
     STATIC_DISPATCH_DEFAULT_MODEL
   );
 }
+
+/**
+ * Probe whether a model is actually served by its provider.
+ *
+ * Background: a dispatch pinned to a model the provider no longer serves
+ * (e.g. a renamed gpufarm catalog entry whose /v1/models list is empty)
+ * would spawn, run for minutes, and die with an aborted run the watcher
+ * classifies "interrupted" -- then auto-redispatch onto the same dead
+ * model, burning the retry budget. This probe lets the spawn path and the
+ * interrupted-redispatch path fail fast on a DEFINITIVE model-absent.
+ *
+ * Tolerant by design: network errors, missing config, missing API key,
+ * unknown provider, non-OK HTTP status, and unexpected response shapes all
+ * return { status: 'unknown' } so the caller falls through to normal
+ * behavior. Only a reachable endpoint answering with a parseable model
+ * list that omits the model (or an empty list) is 'not_served'.
+ *
+ * @param {string} model - model id, optionally provider-prefixed ("gpufarm/qwen3.8-27b")
+ * @param {string|null} providerBase - provider base URL; derived from the
+ *   OpenClaw config (models.providers.<provider>.baseUrl) when omitted
+ * @param {object} [opts]
+ * @returns {Promise<{status: 'served'|'not_served'|'unknown', reason: string, httpStatus?: number, data?: unknown}>}
+ */
+export async function probeModelAvailability(model, providerBase, opts = {}) {
+  const {
+    fetchImpl = fetch,
+    openClawConfig,
+    env = process.env,
+    homeDir,
+    exists = existsSync,
+    readFile = readFileSync,
+    timeoutMs = 5000,
+  } = opts;
+
+  const modelId = normalizeString(model);
+  if (!modelId) return { status: 'unknown', reason: 'no model to probe' };
+
+  const provider = modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : null;
+  const bareId = modelId.includes('/') ? modelId.slice(modelId.indexOf('/') + 1) : modelId;
+
+  let base = normalizeString(providerBase);
+  if (!base) {
+    const cfg = openClawConfig ?? readOpenClawConfig({ env, homeDir, exists, readFile });
+    const providers = isRecord(cfg?.models?.providers) ? cfg.models.providers : {};
+    const providerCfg = provider ? providers[provider] : null;
+    base = normalizeString(providerCfg?.baseUrl);
+    if (!base) return { status: 'unknown', reason: 'provider base url not resolvable' };
+  }
+
+  const effectiveHome = homeDir || env.HOME;
+  const apiKeyPath = effectiveHome
+    ? join(effectiveHome, '.openclaw', 'secrets', `${provider ?? 'gpufarm'}-api-key.txt`)
+    : null;
+  let apiKey = null;
+  if (apiKeyPath) {
+    try {
+      if (exists(apiKeyPath)) apiKey = normalizeString(readFile(apiKeyPath, 'utf8'));
+    } catch {
+      apiKey = null;
+    }
+  }
+  if (!apiKey) return { status: 'unknown', reason: 'no api key available' };
+
+  // The provider baseUrl may already end in /v1 (OpenClaw convention) --
+  // normalize so we never request /v1/v1/models.
+  const url = `${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`;
+  let res;
+  try {
+    res = await fetchImpl(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return { status: 'unknown', reason: `probe failed: ${err?.message || err}` };
+  }
+  if (!res.ok) {
+    return { status: 'unknown', reason: `probe http ${res.status}`, httpStatus: res.status };
+  }
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    return { status: 'unknown', reason: 'unparseable models list' };
+  }
+  const data = Array.isArray(body?.data) ? body.data : null;
+  if (!data) return { status: 'unknown', reason: 'unexpected models list shape', data: body };
+  const ids = new Set(
+    data.map((entry) => (isRecord(entry) ? normalizeString(entry.id) : null)).filter(Boolean),
+  );
+  if (ids.has(modelId) || ids.has(bareId)) return { status: 'served', data: body };
+  return {
+    status: 'not_served',
+    reason: `model_not_found: ${modelId} not served by ${provider ?? 'unknown'}`,
+    data: body,
+  };
+}

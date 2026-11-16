@@ -64,7 +64,7 @@ import {
   labelCompletionIdentity,
 } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
-import { resolveDefaultDispatchModel } from './default-model.mjs';
+import { resolveDefaultDispatchModel, probeModelAvailability } from './default-model.mjs';
 import {
   assertRouteMatchesSource,
   normalizeRoute,
@@ -2574,6 +2574,26 @@ async function cmdEnqueue(flags) {
   // Dynamic branding: resolve per-agent brand name
   const agentBrand = resolveAgentBrand(agent);
   const model       = flags.model            || DEFAULT_DISPATCH_MODEL;
+
+  // -- Model liveness pre-check ------------------------------------
+  // A dispatch pinned to a model the provider no longer serves (e.g. a
+  // renamed gpufarm catalog entry whose /v1/models list is empty) would
+  // spawn, run for minutes, and die with an aborted run the watcher
+  // classifies "interrupted" -- then auto-redispatch onto the same dead
+  // model. Probe before spawning and fail fast on a DEFINITIVE
+  // model-absent; network errors and missing config stay tolerant
+  // (status 'unknown' falls through to the normal spawn).
+  // Runs for BOTH the gateway and tool routes (before the tool-route
+  // early return below).
+  if (model) {
+    const modelProbe = await probeModelAvailability(model, null, {
+      env: process.env,
+      homeDir: HOME_DIR,
+    });
+    if (modelProbe.status === 'not_served') {
+      die(modelProbe.reason, 1);
+    }
+  }
 
   // -- Session key resolution ----------------------------------
   let sessionKey = Object.hasOwn(flags, 'session-key') ? flags['session-key'] : null;
