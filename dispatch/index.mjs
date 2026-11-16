@@ -64,7 +64,7 @@ import {
   labelCompletionIdentity,
 } from './hooks.mjs';
 import { resolveMessageInput } from './message-input.mjs';
-import { resolveDefaultDispatchModel } from './default-model.mjs';
+import { resolveDefaultDispatchModel, probeModelAvailability, selectProbeModel } from './default-model.mjs';
 import {
   assertRouteMatchesSource,
   normalizeRoute,
@@ -2605,6 +2605,36 @@ async function cmdEnqueue(flags) {
       sessionKey = assertSessionKeyForAgent(sessionKey, agent, '--session-key');
     } catch (error) {
       die(error.message, 2);
+    }
+  }
+
+  // -- Model liveness pre-check ------------------------------------
+  // Probe the model that will actually drive the session, not the
+  // fresh-spawn default. Fresh: the resolved default/explicit model is
+  // applied to the new session. Reuse: the continuation keeps the
+  // existing session's model unless an explicit --model overrides it
+  // (the tool route patches requestedModel; the gateway route patches
+  // only fresh sessions). A dispatch pinned to a model the provider no
+  // longer serves (e.g. a renamed gpufarm catalog entry whose /v1/models
+  // list is empty) would spawn, run for minutes, and die with an aborted
+  // run the watcher classifies "interrupted" -- then auto-redispatch onto
+  // the same dead model. Fail fast on a DEFINITIVE model-absent; network
+  // errors and missing config stay tolerant (status 'unknown' falls through
+  // to the normal spawn). Runs for BOTH the gateway and tool routes
+  // (before the tool-route early return below).
+  const probeModel = selectProbeModel({
+    isFresh,
+    defaultModel: model,
+    explicitModel: flags.model || null,
+    labelModel: getLabel(label)?.model || null,
+  });
+  if (probeModel) {
+    const modelProbe = await probeModelAvailability(probeModel, null, {
+      env: process.env,
+      homeDir: HOME_DIR,
+    });
+    if (modelProbe.status === 'not_served') {
+      die(modelProbe.reason, 1);
     }
   }
 
