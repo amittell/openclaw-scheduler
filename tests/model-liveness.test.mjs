@@ -148,3 +148,92 @@ test('selectProbeModel: reuse with --model probes the explicit override', () => 
 test('selectProbeModel: reuse with no model anywhere skips the probe', () => {
   assert.equal(selectProbeModel({ isFresh: false, defaultModel: null, explicitModel: null, labelModel: null }), null);
 });
+
+// ---------------------------------------------------------------------------
+// Wave-2 finding: a paginating provider yields a false `not_served`
+// (the probe must be tolerant -- in doubt -> unknown).
+// ---------------------------------------------------------------------------
+test('probe: paginated list (body.next non-null) -> unknown (catalog not provably complete)', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'some-other-model' }], next: 'cursor-abc' }) });
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: paginated list (has_more true) -> unknown', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'some-other-model' }], has_more: true }) });
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: paginated list (meta.next non-null) -> unknown', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'some-other-model' }], meta: { next: 'page-2' } }) });
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'unknown');
+});
+
+test('probe: last page (body.next null) is still definitive -> served', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'qwen3.8-27b' }], next: null }) });
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'served');
+});
+
+test('probe: last page (body.next null) omitting the model -> not_served (definitive)', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ data: [{ id: 'some-other-model' }], next: null }) });
+  const result = await probeModelAvailability(MODEL, null, probeOpts(fetchImpl));
+  assert.equal(result.status, 'not_served');
+});
+
+// ---------------------------------------------------------------------------
+// Wave-2 finding: the probe reads a hardcoded secrets filename rather than
+// resolving the config's apiKey reference.
+// ---------------------------------------------------------------------------
+test('probe: apiKey file ref resolved via secrets.providers path (not the conventional filename)', async () => {
+  const cfg = {
+    models: { providers: { gpufarm: { baseUrl: 'http://gpufarm.lan/v1', apiKey: { source: 'file', provider: 'gpufarm_bots', id: 'value' } } } },
+    secrets: { providers: { gpufarm_bots: { source: 'file', path: '~/custom/elsewhere.txt', mode: 'singleValue' } } },
+  };
+  const fetchImpl = async () => jsonResponse([{ id: 'qwen3.8-27b' }]);
+  const opts = probeOpts(fetchImpl);
+  opts.openClawConfig = cfg;
+  opts.exists = (p) => p.endsWith('elsewhere.txt'); // only the ref path exists
+  opts.readFile = (_p) => 'ref-key-value';
+  const result = await probeModelAvailability(MODEL, null, opts);
+  assert.equal(result.status, 'served');
+});
+
+test('probe: apiKey env ref resolved from env', async () => {
+  const cfg = {
+    models: { providers: { gpufarm: { baseUrl: 'http://gpufarm.lan/v1', apiKey: { source: 'env', id: 'GPUFARM_KEY' } } } },
+  };
+  const fetchImpl = async () => jsonResponse([{ id: 'qwen3.8-27b' }]);
+  const opts = probeOpts(fetchImpl);
+  opts.openClawConfig = cfg;
+  opts.env = { HOME: '/nonexistent-home', GPUFARM_KEY: 'env-key-value' };
+  opts.exists = () => false; // no conventional file
+  const result = await probeModelAvailability(MODEL, null, opts);
+  assert.equal(result.status, 'served');
+});
+
+test('probe: apiKey file ref with no secrets.providers entry falls back to the conventional path', async () => {
+  const cfg = {
+    models: { providers: { gpufarm: { baseUrl: 'http://gpufarm.lan/v1', apiKey: { source: 'file', provider: 'missing_alias', id: 'value' } } } },
+  };
+  const fetchImpl = async () => jsonResponse([{ id: 'qwen3.8-27b' }]);
+  const opts = probeOpts(fetchImpl); // exists() matches the conventional filename
+  opts.openClawConfig = cfg;
+  const result = await probeModelAvailability(MODEL, null, opts);
+  assert.equal(result.status, 'served');
+});
+
+test('probe: apiKey file ref to a missing file -> unknown (tolerant, no key)', async () => {
+  const cfg = {
+    models: { providers: { gpufarm: { baseUrl: 'http://gpufarm.lan/v1', apiKey: { source: 'file', provider: 'gpufarm_bots', id: 'value' } } } },
+    secrets: { providers: { gpufarm_bots: { source: 'file', path: '~/custom/elsewhere.txt', mode: 'singleValue' } } },
+  };
+  const fetchImpl = async () => jsonResponse([{ id: 'qwen3.8-27b' }]);
+  const opts = probeOpts(fetchImpl);
+  opts.openClawConfig = cfg;
+  opts.exists = () => false; // neither the ref path nor the conventional path exists
+  const result = await probeModelAvailability(MODEL, null, opts);
+  assert.equal(result.status, 'unknown');
+});

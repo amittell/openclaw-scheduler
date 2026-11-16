@@ -65,6 +65,56 @@ export function resolveOpenClawDispatchDefaultModel(config) {
   );
 }
 
+/**
+ * Resolve a `source:"file"` secret reference to its file contents.
+ *
+ * The reference names a secret provider alias (e.g. "gpufarm_bots"); the
+ * provider's configured `path` (under secrets.providers.<alias>) is resolved
+ * home-relative and read. Any missing piece (no alias, no path, no file,
+ * unreadable file) returns null so the caller degrades tolerantly.
+ *
+ * @param {object} ref - the {source, provider, id} secret reference
+ * @param {object} cfg - the parsed OpenClaw config
+ * @param {object} ctx - { env, homeDir, exists, readFile }
+ * @returns {string|null} the secret value, or null when unresolvable
+ */
+function resolveSecretRefFile(ref, cfg, { env, homeDir, exists, readFile }) {
+  if (ref.source !== 'file') return null;
+  const secretProviders = isRecord(cfg?.secrets?.providers) ? cfg.secrets.providers : {};
+  const providerDef = typeof ref.provider === 'string' ? secretProviders[ref.provider] : null;
+  const pathValue = normalizeString(providerDef?.path);
+  if (!pathValue) return null;
+  const filePath = resolveHomeRelativePath(pathValue, homeDir || env.HOME);
+  if (!filePath || !exists(filePath)) return null;
+  try {
+    return normalizeString(readFile(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a provider's API key from its config declaration.
+ *
+ * Honors a plain string key, an `env` reference, and a `file` reference
+ * (via secrets.providers.<alias>.path). Other sources (exec/store) and
+ * unresolvable references return null so the caller degrades tolerantly
+ * rather than assuming the conventional filename.
+ *
+ * @param {object|null} providerCfg - models.providers.<provider> config
+ * @param {object} cfg - the parsed OpenClaw config
+ * @param {object} ctx - { env, homeDir, exists, readFile }
+ * @returns {string|null} the API key, or null when unresolvable
+ */
+function resolveProviderApiKey(providerCfg, cfg, ctx) {
+  const ref = providerCfg?.apiKey;
+  if (typeof ref === 'string') return normalizeString(ref);
+  if (!isRecord(ref)) return null;
+  if (ref.source === 'env') return normalizeString(ctx.env[ref.id]);
+  if (ref.source === 'file') return resolveSecretRefFile(ref, cfg, ctx);
+  return null;
+}
+
 export function resolveDefaultDispatchModel({
   dispatchConfig = {},
   openClawConfig,
@@ -123,11 +173,12 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   const provider = modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : null;
   const bareId = modelId.includes('/') ? modelId.slice(modelId.indexOf('/') + 1) : modelId;
 
+  const cfg = openClawConfig ?? readOpenClawConfig({ env, homeDir, exists, readFile });
+  const providers = isRecord(cfg?.models?.providers) ? cfg.models.providers : {};
+  const providerCfg = provider ? providers[provider] : null;
+
   let base = normalizeString(providerBase);
   if (!base) {
-    const cfg = openClawConfig ?? readOpenClawConfig({ env, homeDir, exists, readFile });
-    const providers = isRecord(cfg?.models?.providers) ? cfg.models.providers : {};
-    const providerCfg = provider ? providers[provider] : null;
     base = normalizeString(providerCfg?.baseUrl);
     if (!base) return { status: 'unknown', reason: 'provider base url not resolvable' };
   }
@@ -139,15 +190,22 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   if (provider && !/^[a-zA-Z0-9._-]+$/.test(provider)) {
     return { status: 'unknown', reason: 'provider not safe for key path' };
   }
-  const apiKeyPath = effectiveHome
-    ? join(effectiveHome, '.openclaw', 'secrets', `${provider ?? 'gpufarm'}-api-key.txt`)
-    : null;
-  let apiKey = null;
-  if (apiKeyPath) {
-    try {
-      if (exists(apiKeyPath)) apiKey = normalizeString(readFile(apiKeyPath, 'utf8'));
-    } catch {
-      apiKey = null;
+  // Resolve the provider API key through the config's apiKey declaration
+  // (string, env ref, or file ref via secrets.providers.<alias>.path) so the
+  // probe protects deployments that store the key elsewhere, not just the
+  // conventional filename. Falls back to the conventional path when the
+  // config declares no resolvable reference.
+  let apiKey = resolveProviderApiKey(providerCfg, cfg, { env, homeDir, exists, readFile });
+  if (!apiKey) {
+    const apiKeyPath = effectiveHome
+      ? join(effectiveHome, '.openclaw', 'secrets', `${provider ?? 'gpufarm'}-api-key.txt`)
+      : null;
+    if (apiKeyPath) {
+      try {
+        if (exists(apiKeyPath)) apiKey = normalizeString(readFile(apiKeyPath, 'utf8'));
+      } catch {
+        apiKey = null;
+      }
     }
   }
   if (!apiKey) return { status: 'unknown', reason: 'no api key available' };
@@ -185,6 +243,22 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   }
   const data = Array.isArray(body?.data) ? body.data : null;
   if (!data) return { status: 'unknown', reason: 'unexpected models list shape', data: body };
+  // A paginating provider may return only page 1; a truncated catalog is not
+  // proof of absence, so fall through tolerantly instead of a false not_served.
+  // Only an explicit "more pages" signal (non-null next/cursor/pagination,
+  // has_more/hasMore true, or a meta.next/meta.cursor) marks the list as
+  // incomplete -- a null next (last page) keeps the catalog definitive.
+  const meta = isRecord(body?.meta) ? body.meta : null;
+  const looksIncomplete =
+    body.next != null ||
+    body.cursor != null ||
+    body.pagination != null ||
+    body.has_more === true ||
+    body.hasMore === true ||
+    (meta && (meta.next != null || meta.cursor != null));
+  if (looksIncomplete) {
+    return { status: 'unknown', reason: 'paginated models list (catalog not provably complete)', data: body };
+  }
   // A non-empty list whose entries all lack a usable `id` is a malformed
   // catalog, not proof of absence -- fall through tolerantly instead of
   // treating an empty id set as a definitive model-absent.
