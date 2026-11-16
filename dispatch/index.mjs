@@ -1836,7 +1836,11 @@ function buildDispatchTaskMessage({ label, message, deliverTo, deliverChannel, o
   parts.push(``);
   parts.push(`---`);
   parts.push(`DELIVERY RULE: Do NOT use the message tool, sessions_send, or any direct messaging to send updates or results to Telegram or any chat. Do NOT reference chat IDs, user IDs, or delivery targets in your work.`);
-  parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically.`);
+  parts.push(`Your ONLY output channel is the done signal above. The scheduler handles delivery automatically. The done call is what completes this task -- follow the completion protocol exactly:`);
+  parts.push(`1. The done CLI call is the FINAL action of this task: it must be the last tool call of your final turn.`);
+  parts.push(`2. Writing the final prose report is NOT completion. A turn that ends with prose and no done call is classified as interrupted and re-dispatched -- the run is wasted and the owner is alerted. A "result report to the parent" is not the deliverable; the done call is.`);
+  parts.push(`3. Call done only when ALL work is complete AND verified, with --summary (one line) and --checklist '{"work_complete":true}' (plus tests_passed/pushed where applicable).`);
+  parts.push(`4. If you are about to end your turn without having called done: STOP and call done first.`);
   if (origin) {
     parts.push(`Note: This job will be delivered to origin channel: ${origin}`);
   }
