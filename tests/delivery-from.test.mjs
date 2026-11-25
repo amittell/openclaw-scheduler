@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { closeDb, getDb, initDb, setDbPath } from '../db.js';
+import { approvalBindingHashForDb } from '../approval-binding.js';
 import migrateConsolidate from '../migrate-consolidate.js';
 import {
   canEnqueueDispatch, createJob, deleteJob, getDispatchBacklogCount, getJob,
@@ -204,6 +205,49 @@ test('without delivery_from the delivered body is byte-identical to the reply', 
     assert.deepEqual(warnings(logs), []);
   }
 });
+
+for (const [scenario, mode, reportTail, expectedRequests] of [
+  ['summarization is disabled', 'none', '', 0],
+  ['the selected report is below the summary threshold', 'llm', '', 0],
+  ['the summarizer fails', 'llm', '\n' + 'long report line\n'.repeat(35), 1],
+]) {
+  test(`a selected report retains the complete agent reply when ${scenario}`, async () => {
+    await memoryDb();
+    const report = REPORT + reportTail;
+    const reply = 'narration '.repeat(550) + '\n\n' + report;
+    const job = agentJob({ delivery_from: MARKER, delivery_summary: mode });
+    const writes = [];
+    const { run, deps, ctx } = finalizeFixture(job, {
+      storeRunArtifact: (kind, runId, text) => {
+        const path = join(tmpRoot, `${kind}-${runId}.txt`);
+        writeFileSync(path, text);
+        writes.push(path);
+        return path;
+      },
+    });
+    let requests = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      requests++;
+      throw new Error('summary unavailable');
+    };
+    try {
+      await finalizeDispatch(job, ctx, agentResult(reply), deps);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.equal(requests, expectedRequests);
+    assert.deepEqual(outboxBodies(run.id), [report]);
+    assert.equal(writes.length, 1);
+    const stored = getRun(run.id);
+    assert.equal(stored.summary, reply.slice(0, 5000));
+    const delivery = JSON.parse(stored.context_summary).agent_delivery;
+    assert.equal(delivery.summarized, false);
+    assert.equal(delivery.full_body.path, writes[0]);
+    assert.equal(delivery.full_body.bytes, Buffer.byteLength(reply, 'utf8'));
+    assert.equal(readFileSync(delivery.full_body.path, 'utf8'), reply);
+  });
+}
 
 test('marker absent: the full reply is delivered and one warning is logged', async () => {
   await memoryDb();
@@ -412,6 +456,29 @@ test('the consolidation migration is idempotent on a database that already has d
   assert.equal(getJob(job.id).delivery_from, MARKER, 'the stored marker survives the migration');
   assert.equal(schemaVersion(db), 31);
   assert.equal(migrateConsolidate(), false);
+});
+
+test('legacy approval bindings survive the unset marker migration and still bind marker changes', async () => {
+  let db = await openFile('existing-v31-approval-binding');
+  const parent = agentJob({ name: 'approval parent' });
+  const child = agentJob({
+    name: 'approval child', parent_id: parent.id, schedule_cron: null, trigger_on: 'success',
+  });
+  db.exec('ALTER TABLE jobs DROP COLUMN delivery_from');
+  const persistedJob = () => getJob(child.id);
+  const legacyHash = approvalBindingHashForDb(db, persistedJob());
+  db = await openFile('existing-v31-approval-binding');
+
+  assert.equal(approvalBindingHashForDb(db, persistedJob()), legacyHash);
+  updateJob(child.id, { delivery_from: MARKER });
+  const markedHash = approvalBindingHashForDb(db, persistedJob());
+  assert.notEqual(markedHash, legacyHash);
+  updateJob(child.id, { delivery_from: '## Other report' });
+  assert.notEqual(approvalBindingHashForDb(db, persistedJob()), markedHash);
+  updateJob(child.id, { delivery_from: null });
+  assert.equal(approvalBindingHashForDb(db, persistedJob()), legacyHash);
+  updateJob(parent.id, { delivery_from: MARKER });
+  assert.notEqual(approvalBindingHashForDb(db, persistedJob()), legacyHash);
 });
 
 // -- CLI -------------------------------------------------------------------
