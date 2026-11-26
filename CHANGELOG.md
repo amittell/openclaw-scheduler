@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Per-job `delivery_from` marker: deliver an agent's report without the
+  step narration ahead of it.** An isolated agent job's text is every reply
+  payload of the run joined with a blank line (the gateway's
+  `/v1/chat/completions` final text), so narration the model writes between
+  tool calls was delivered first: on 2026-11-13/14 the AILY daily status
+  delivery began with 177 characters ("Fetching git + GitHub state.", "All
+  data in. Updating checkpoint, then sending ...") before its
+  `**AILY daily status**` heading, even with a prompt line telling the model
+  not to narrate. The scheduler cannot tell a payload boundary from a
+  paragraph break, so the new optional job field names the report's first
+  line instead. When a line starts with the marker (after optional leading
+  whitespace), only the text from the last such line to the end is
+  delivered; a marker later in a line does not count. When no line matches,
+  the full text is delivered and one `delivery_from marker not found ...
+  delivering the full text` warning is logged, so a delivery is never dropped
+  or cut short because of the marker. An unset (`NULL`) field delivers
+  exactly what it did before. The marker is applied to announce and
+  announce-always deliveries before `delivery_summary`, so a summary is made
+  from the report only, and below the `Job soft-failed` / `Shell job failed`
+  headers, which are kept. Shell jobs apply it to their announced output.
+  Only the delivered body changes: `runs.summary`, the summarized-delivery
+  `agent-output` artifact, evidence hashes and child trigger conditions keep
+  the full text. `jobs add`, `jobs update` and `jobs validate` accept the
+  field (one line, 1 to 200 characters, no control characters; `null`
+  clears it), `jobs get` and `jobs list --json` show it, and `schema jobs`
+  describes it. Handoff v4 jobs reject it with
+  `HANDOFF_V4_DELIVERY_FROM_UNSUPPORTED` and the dispatcher ignores it for
+  them, because like `delivery_summary` it is outside the v4 artifact binding
+  contract. Existing installs get the nullable `jobs.delivery_from` column
+  from the consolidation migration on the next start; the schema version
+  stays 31, so an older release can still open the database.
+
 ## [0.6.12] -- 2026-11-13
 
 ### Fixed

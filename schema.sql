@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   delivery_channel TEXT,
   delivery_to     TEXT,
   delivery_summary TEXT DEFAULT 'none',               -- 'none' | 'llm' (v31: LLM summary of long delivery bodies; v32: 'llm' is the code default for non-v4 jobs at write time — the stored 'none' default covers pre-v32 rows and handoff v4 jobs, which always store 'none')
+  delivery_from   TEXT DEFAULT NULL,                  -- line prefix: deliver from the last line that starts with it (NULL = full text); schema version stays 31
   
   -- Metadata
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),

@@ -31,6 +31,8 @@ function stableJob(job) {
   const persisted = {};
   for (const key of Object.keys(job).sort()) {
     if (DYNAMIC_JOB_FIELDS.has(key)) continue;
+    // A migrated NULL marker has the same delivery contract as the legacy row.
+    if (key === 'delivery_from' && job[key] === null) continue;
     persisted[key] = job[key];
   }
   return canonicalize(persisted);
