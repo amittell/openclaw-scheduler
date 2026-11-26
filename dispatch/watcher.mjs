@@ -55,6 +55,7 @@ import {
   recordCompletionDeliveryDebt,
 } from './hooks.mjs';
 import { getDispatchLivenessPolicy } from './liveness.mjs';
+import { probeModelAvailability } from './default-model.mjs';
 import { resolveContainedFilePath, resolveLabelsPath } from './paths.mjs';
 import { assertRouteMatchesSource, effectiveDeliveryTarget, parseOriginRoute, parseSourceContext } from './source-context.mjs';
 import { callGatewayRpc } from './gateway-rpc.mjs';
@@ -1477,7 +1478,7 @@ function respawnInterrupted(label) {
   }
 }
 
-function emitInterruptedOutcome(label, summary, result = null) {
+async function emitInterruptedOutcome(label, summary, result = null) {
   process.stderr.write(`[watcher] [${label}] session auto-resolved as interrupted -- work may be incomplete\n`);
   const entry = getLabelEntry(label);
   const verify = runVerifyCmd(label, entry);
@@ -1547,6 +1548,29 @@ function emitInterruptedOutcome(label, summary, result = null) {
   // when no further redispatch will be scheduled; while a backoff or a
   // respawn failure is pending it stays non-terminal so the 5-min check-in
   // announcements stay accurate.
+  // -- Model liveness re-probe ------------------------------------
+  // The session died; before burning an interrupt-retry slot re-spawning
+  // onto the same model, verify the model is still served. A DEFINITIVE
+  // model-absent fails fast: the label goes terminal with the
+  // model_not_found error and the interruptRetryCount is NOT incremented
+  // (the retry budget is for transient interruptions, not a dead model).
+  // Network errors and missing config stay tolerant (status 'unknown'
+  // falls through to the normal redispatch flow).
+  const modelProbe = entry?.model
+    ? await probeModelAvailability(entry.model)
+    : { status: 'unknown' };
+  if (modelProbe.status === 'not_served') {
+    process.stderr.write(
+      `[watcher] [${label}] ${modelProbe.reason} -- not re-dispatching onto the dead model; marking terminal\n`
+    );
+    markLabelError(label, modelProbe.reason);
+    process.stdout.write(
+      `⚠️ dispatch [${label}] interrupted -- ${modelProbe.reason}\n` +
+      `Summary: ${modelProbe.reason}\n`
+    );
+    process.exit(exitZeroOnTerminal ? 0 : 1);
+  }
+
   const interruptDecision = getInterruptRedispatchDecision(label);
   if (interruptDecision) {
     const retryAfterMs = parseTimestampMs(entry?.watcherRetryAfter);
@@ -1766,7 +1790,7 @@ function handleOnce529(label, errorMsg) {
   process.exit(0);
 }
 
-function runOnceAndExit() {
+async function runOnceAndExit() {
   try {
     touchWatcherPing(label);
   } catch {
@@ -1827,7 +1851,7 @@ function runOnceAndExit() {
     }
 
     if (status.status === 'interrupted') {
-      emitInterruptedOutcome(label, status.summary, terminalResult);
+      await emitInterruptedOutcome(label, status.summary, terminalResult);
     }
 
     const summary = status.error || status.summary || `terminal failure (${status.status || 'unknown'})`;
@@ -1863,7 +1887,7 @@ function runOnceAndExit() {
 
     const turnAbortReason = getSessionTurnAbortReason(status);
     if (turnAbortReason) {
-      emitInterruptedOutcome(label, turnAbortReason, {
+      await emitInterruptedOutcome(label, turnAbortReason, {
         ...result,
         sessionKey: status.sessionKey,
         artifactEvidence: result?.artifactEvidence || getSessionArtifactEvidence(status),
@@ -1880,7 +1904,7 @@ function runOnceAndExit() {
         // Route to the interrupted (redispatchable) outcome instead of error.
         // emitInterruptedOutcome always exits (redispatch scheduled, budget
         // exhausted, or verify-cmd passed), so nothing below runs on this path.
-        emitInterruptedOutcome(label, stallReason, {
+        await emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
@@ -1903,7 +1927,7 @@ function runOnceAndExit() {
 }
 
 if (once) {
-  runOnceAndExit();
+  await runOnceAndExit();
 }
 
 // -- Start heartbeat -----------------------------------------------------
@@ -2221,7 +2245,7 @@ while (Date.now() < deadline) {
     // NOTE: Always resolve as 'interrupted', never 'done'. Only agent-side cmdDone may set status=done.
     if (status.status === 'interrupted') {
       const interruptedResult = dispatch('result', ['--label', label]);
-      emitInterruptedOutcome(label, status.summary, interruptedResult);
+      await emitInterruptedOutcome(label, status.summary, interruptedResult);
     }
 
     // Reset 529 retryCount on successful completion
@@ -2282,7 +2306,7 @@ while (Date.now() < deadline) {
 
     const turnAbortReason = getSessionTurnAbortReason(status);
     if (turnAbortReason) {
-      emitInterruptedOutcome(label, turnAbortReason, {
+      await emitInterruptedOutcome(label, turnAbortReason, {
         ...result,
         sessionKey: status.sessionKey,
         artifactEvidence: result?.artifactEvidence || getSessionArtifactEvidence(status),
@@ -2297,7 +2321,7 @@ while (Date.now() < deadline) {
       if (artifactEvidence?.found) {
         // Artifact-backed stall: route to the interrupted (redispatchable)
         // outcome instead of error. emitInterruptedOutcome always exits.
-        emitInterruptedOutcome(label, stallReason, {
+        await emitInterruptedOutcome(label, stallReason, {
           ...result,
           sessionKey: status.sessionKey,
           artifactEvidence,
@@ -2344,7 +2368,7 @@ if (finalStatus?.status === 'done') {
 // If status is interrupted (auto-resolved as incomplete), exit non-zero
 if (finalStatus?.status === 'interrupted') {
   process.stderr.write(`[watcher] [${label}] final status=interrupted -- session idle without completion\n`);
-  emitInterruptedOutcome(label, finalStatus?.summary, finalResult);
+  await emitInterruptedOutcome(label, finalStatus?.summary, finalResult);
 }
 
 // -- Token-based activity check before steering ----------------------------

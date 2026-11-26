@@ -205,6 +205,27 @@ is genuinely unavailable.
 
 *One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
 
+#### Model availability precheck
+
+For a scheduler running as an unprivileged Unix user, a host administrator can
+approve one provider and endpoint in
+`/etc/openclaw-scheduler-model-catalog.json` with `provider` and `baseUrl`
+fields. Use a root-owned regular file readable by the scheduler, with no
+group or other write access on the file or its parent directories. On macOS,
+the scheduler reads the canonical `/private/etc` path. Keep the approval
+file and its parent directories protected from writes via ACLs as well.
+
+Set the same `provider` and HTTP or HTTPS `baseUrl` in
+`~/.openclaw/scheduler/model-catalog-probe.json`, with an `apiKey` scoped
+to that catalog. Use mode `0600` for the scheduler user's file. The enqueue
+CLI and scheduled watcher require both files and an exact match of the
+normalized catalog endpoint, including scheme, host, port, and path.
+Keep the key out of job commands, environment variables, and labels.
+
+A complete catalog can confirm that a model is absent and stop dispatch
+before spawning. Missing or mismatched approval, other providers, redirects,
+network errors and incomplete catalogs leave normal dispatch available.
+
 ### `adopt` -- record a session the agent spawned
 
 ```bash
