@@ -875,9 +875,10 @@ How it behaves:
   <job>; delivering the full text`).
 - **Before summarization.** With `delivery_summary: "llm"`, the summary is
   made from the selected text only.
-- **Only the delivered body changes.** The run record keeps the full reply
-  (`runs.summary`, and the `agent-output` artifact when a long reply is
-  summarized), and child `trigger_condition` checks still see the full text.
+- **Only the delivered body changes.** Child `trigger_condition` checks
+  still see the full text. The run keeps its normal summary. The
+  `agent-output` artifact holds the original reply when summarization
+  replaces it or marker selection omits text outside the stored summary.
 - **Failure headers stay.** A soft-failed agent run is still posted under its
   `Job soft-failed` line, and a failed shell job under `Shell job failed`,
   with the selected text below it.

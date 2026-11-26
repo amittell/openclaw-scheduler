@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.13] -- 2026-11-25
 
 ### Added
 
@@ -26,9 +26,10 @@ All notable changes to this project will be documented in this file.
   announce-always deliveries before `delivery_summary`, so a summary is made
   from the report only, and below the `Job soft-failed` / `Shell job failed`
   headers, which are kept. Shell jobs apply it to their announced output.
-  Only the delivered body changes: `runs.summary`, the summarized-delivery
-  `agent-output` artifact, evidence hashes and child trigger conditions keep
-  the full text. `jobs add`, `jobs update` and `jobs validate` accept the
+  Evidence hashes and child trigger conditions use the full text. The run
+  keeps its normal summary and writes the original reply as an `agent-output`
+  artifact when summarization replaces it or marker selection omits text
+  outside the stored summary. `jobs add`, `jobs update` and `jobs validate` accept the
   field (one line, 1 to 200 characters, no control characters; `null`
   clears it), `jobs get` and `jobs list --json` show it, and `schema jobs`
   describes it. Handoff v4 jobs reject it with
@@ -37,6 +38,19 @@ All notable changes to this project will be documented in this file.
   contract. Existing installs get the nullable `jobs.delivery_from` column
   from the consolidation migration on the next start; the schema version
   stays 31, so an older release can still open the database.
+
+### Fixed
+
+- **Preserve approvals when upgrading existing jobs.** A migrated unset
+  marker keeps the original approval binding. Changing the marker
+  invalidates approval for the previous delivery rules. (#96)
+- **Finish dispatch with a verified `done` call.** Dispatch prompts make
+  `done` the final tool call. An interrupted worker whose report is complete
+  and verified records completion without redoing the work. (#98)
+
+### Changed
+
+- Removed the automatic repository mirror workflow and its manual shadow.
 
 ## [0.6.12] -- 2026-11-13
 
