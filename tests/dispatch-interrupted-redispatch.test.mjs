@@ -20,6 +20,7 @@ import Database from 'better-sqlite3';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
 const WATCHER_PATH = join(REPO_DIR, 'dispatch', 'watcher.mjs');
+const CATALOG_POLICY_FIXTURE = new URL('./fixtures/model-catalog-policy-preload.mjs', import.meta.url).href;
 const SCHEMA_PATH = join(REPO_DIR, 'schema.sql');
 
 /**
@@ -257,18 +258,19 @@ test('catalog absence ends interrupted work without advancing the retry', async 
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const { port } = server.address();
+    const policy = { provider: 'test', baseUrl: `http://127.0.0.1:${port}/v1` };
     const settingsDir = join(fix.root, '.openclaw', 'scheduler');
     mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(fix.root, 'model-catalog-policy-fixture.json'), JSON.stringify(policy), { mode: 0o600 });
     writeFileSync(join(settingsDir, 'model-catalog-probe.json'), JSON.stringify({
-      provider: 'test',
-      baseUrl: `http://127.0.0.1:${port}/v1`,
+      ...policy,
       apiKey: 'watcher-fixture-key',
     }), { mode: 0o600 });
     const env = watcherEnv(fix, { HOME: fix.root, stubPath, DISPATCH_INTERRUPT_RETRIES: '2' });
     const watchOnce = () => {
       writeFileSync(fix.labelsPath, JSON.stringify({ 'int-x': entry }));
       return new Promise(resolve => {
-        const args = [WATCHER_PATH, '--label', 'int-x', '--timeout', '3600', '--poll-interval', '20', '--once'];
+        const args = ['--import', CATALOG_POLICY_FIXTURE, WATCHER_PATH, '--label', 'int-x', '--timeout', '3600', '--poll-interval', '20', '--once'];
         execFile(process.execPath, args, { env, timeout: 15_000 }, (error, stdout, stderr) => {
           resolve({ status: error ? error.code : 0, stdout, stderr });
         });

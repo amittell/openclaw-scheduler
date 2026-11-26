@@ -18,7 +18,7 @@
 import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { probeModelAvailability, selectProbeModel } from '../dispatch/default-model.mjs';
+import { probeModelAvailability, readModelCatalogPolicy, selectProbeModel } from '../dispatch/default-model.mjs';
 
 const MODEL = 'gpufarm/qwen3.8-27b';
 const PROBE_SETTINGS = {
@@ -26,10 +26,99 @@ const PROBE_SETTINGS = {
   baseUrl: 'https://catalog.example.test/gateway/v1/',
   apiKey: 'catalog-fixture',
 };
+const PROBE_POLICY = { provider: PROBE_SETTINGS.provider, baseUrl: PROBE_SETTINGS.baseUrl };
 
-function probeOpts(fetchImpl, settings = {}) {
-  return { fetchImpl, settings: { ...PROBE_SETTINGS, ...settings } };
+function probeOpts(fetchImpl, settings = {}, policy = PROBE_POLICY) {
+  return { fetchImpl, settings: { ...PROBE_SETTINGS, ...settings }, readPolicy: () => policy };
 }
+
+function fakePolicyFilesystem({ directory = {}, file = {}, contents = JSON.stringify(PROBE_POLICY) } = {}) {
+  const calls = [];
+  return {
+    calls,
+    constants: { O_RDONLY: 0, O_NOFOLLOW: 4, O_NONBLOCK: 8 },
+    lstatSync(path) {
+      calls.push(['stat directory', path]);
+      return { isDirectory: () => true, uid: 0, mode: 0o755, ...directory };
+    },
+    openSync(path, flags) {
+      calls.push(['open', path, flags]);
+      return 42;
+    },
+    fstatSync(fd) {
+      calls.push(['stat file', fd]);
+      return { isFile: () => true, uid: 0, mode: 0o644, size: contents.length, ...file };
+    },
+    readFileSync(fd, encoding) {
+      calls.push(['read', fd, encoding]);
+      return contents;
+    },
+    closeSync(fd) {
+      calls.push(['close', fd]);
+    },
+  };
+}
+
+test('catalog policy verifies the macOS path and reads the protected descriptor', () => {
+  const filesystem = fakePolicyFilesystem();
+  assert.deepEqual(readModelCatalogPolicy({ filesystem, platform: 'darwin', uid: 501 }), PROBE_POLICY);
+  assert.deepEqual(filesystem.calls, [
+    ['stat directory', '/'],
+    ['stat directory', '/private'],
+    ['stat directory', '/private/etc'],
+    ['open', '/private/etc/openclaw-scheduler-model-catalog.json', 12],
+    ['stat file', 42],
+    ['read', 42, 'utf8'],
+    ['close', 42],
+  ]);
+});
+
+for (const [description, directory] of [
+  ['non-directory', { isDirectory: () => false }],
+  ['unprivileged owner', { uid: 1000 }],
+  ['group-writable directory', { mode: 0o775 }],
+]) {
+  test(`catalog policy rejects ${description} before opening the file`, () => {
+    const filesystem = fakePolicyFilesystem({ directory });
+    assert.equal(readModelCatalogPolicy({ filesystem, platform: 'linux', uid: 501 }), null);
+    assert.deepEqual(filesystem.calls, [['stat directory', '/']]);
+  });
+}
+
+for (const [description, file] of [
+  ['non-regular file', { isFile: () => false }],
+  ['unprivileged owner', { uid: 1000 }],
+  ['writable file', { mode: 0o646 }],
+  ['oversized file', { size: 4097 }],
+]) {
+  test(`catalog policy rejects ${description} and closes the descriptor without reading`, () => {
+    const filesystem = fakePolicyFilesystem({ file });
+    assert.equal(readModelCatalogPolicy({ filesystem, platform: 'linux', uid: 501 }), null);
+    assert.deepEqual(filesystem.calls.slice(-3), [
+      ['open', '/etc/openclaw-scheduler-model-catalog.json', 12],
+      ['stat file', 42],
+      ['close', 42],
+    ]);
+  });
+}
+
+test('catalog policy closes the descriptor if JSON is invalid', () => {
+  const filesystem = fakePolicyFilesystem({ contents: '{' });
+  assert.equal(readModelCatalogPolicy({ filesystem, platform: 'linux', uid: 501 }), null);
+  assert.deepEqual(filesystem.calls.at(-1), ['close', 42]);
+});
+
+test('catalog policy is unavailable on platforms without the POSIX trust checks', () => {
+  const filesystem = fakePolicyFilesystem();
+  assert.equal(readModelCatalogPolicy({ filesystem, platform: 'win32', uid: 501 }), null);
+  assert.deepEqual(filesystem.calls, []);
+});
+
+test('a privileged scheduler account cannot use the administrator file as an independent policy', () => {
+  const filesystem = fakePolicyFilesystem();
+  assert.equal(readModelCatalogPolicy({ filesystem, platform: 'linux', uid: 0 }), null);
+  assert.deepEqual(filesystem.calls, []);
+});
 
 function jsonResponse(list) {
   return {
@@ -181,6 +270,35 @@ test('probe: uses only the configured catalog endpoint and its credential', asyn
     authorization: 'Bearer catalog-fixture',
     redirect: 'error',
   }]);
+});
+
+for (const [description, policy] of [
+  ['missing policy', null],
+  ['different provider', { ...PROBE_POLICY, provider: 'another-provider' }],
+  ['different hostname', { ...PROBE_POLICY, baseUrl: 'https://elsewhere.example.test/gateway/v1' }],
+  ['different scheme', { ...PROBE_POLICY, baseUrl: 'http://catalog.example.test/gateway/v1' }],
+  ['different port', { ...PROBE_POLICY, baseUrl: 'https://catalog.example.test:8443/gateway/v1' }],
+  ['different path', { ...PROBE_POLICY, baseUrl: 'https://catalog.example.test/other/v1' }],
+]) {
+  test(`probe: ${description} leaves dispatch available without a request`, async () => {
+    let calls = 0;
+    const result = await probeModelAvailability(MODEL, probeOpts(async () => {
+      calls++;
+      return jsonResponse([]);
+    }, {}, policy));
+    assert.deepEqual(result, { status: 'unknown', reason: 'model catalog endpoint is not approved' });
+    assert.equal(calls, 0);
+  });
+}
+
+test('probe: accepts equivalent endpoint spelling and sends to the approved catalog', async () => {
+  const urls = [];
+  const result = await probeModelAvailability(MODEL, probeOpts(async url => {
+    urls.push(url.href);
+    return jsonResponse([{ id: MODEL }]);
+  }, { baseUrl: 'https://CATALOG.example.test:443/gateway' }));
+  assert.equal(result.status, 'served');
+  assert.deepEqual(urls, ['https://catalog.example.test/gateway/v1/models']);
 });
 
 for (const base of [

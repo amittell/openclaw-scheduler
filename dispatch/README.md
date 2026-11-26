@@ -207,17 +207,24 @@ is genuinely unavailable.
 
 #### Model availability precheck
 
-Operators can enable the precheck for one provider in
-`~/.openclaw/scheduler/model-catalog-probe.json`. Set `provider` to the
-OpenClaw provider ID, `baseUrl` to its HTTP or HTTPS API base, and
-`apiKey` to a credential scoped to that catalog. Restrict this file to
-the scheduler user (mode `0600` on Unix). Both the enqueue CLI and the
-scheduled watcher read the file from their home directory. Keep the key
-out of job commands, environment variables, and labels.
+For a scheduler running as an unprivileged Unix user, a host administrator can
+approve one provider and endpoint in
+`/etc/openclaw-scheduler-model-catalog.json` with `provider` and `baseUrl`
+fields. Use a root-owned regular file readable by the scheduler, with no
+group or other write access on the file or its parent directories. On macOS,
+the scheduler reads the canonical `/private/etc` path. Keep the approval
+file and its parent directories protected from writes via ACLs as well.
+
+Set the same `provider` and HTTP or HTTPS `baseUrl` in
+`~/.openclaw/scheduler/model-catalog-probe.json`, with an `apiKey` scoped
+to that catalog. Use mode `0600` for the scheduler user's file. The enqueue
+CLI and scheduled watcher require both files and an exact match of the
+normalized catalog endpoint, including scheme, host, port, and path.
+Keep the key out of job commands, environment variables, and labels.
 
 A complete catalog can confirm that a model is absent and stop dispatch
-before spawning. Missing settings, other providers, redirects, network
-errors and incomplete catalogs leave normal dispatch available.
+before spawning. Missing or mismatched approval, other providers, redirects,
+network errors and incomplete catalogs leave normal dispatch available.
 
 ### `adopt` -- record a session the agent spawned
 

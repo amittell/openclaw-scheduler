@@ -25,6 +25,7 @@ import { buildCompletionDeliveryScope } from '../dispatch/hooks.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(__dirname, '..');
 const INDEX_PATH = join(REPO_DIR, 'dispatch', 'index.mjs');
+const CATALOG_POLICY_FIXTURE = new URL('./fixtures/model-catalog-policy-preload.mjs', import.meta.url).href;
 
 const AGENT_SHELL = Object.freeze({ OPENCLAW_SHELL: 'exec' });
 const SUBAGENT_SHELL = Object.freeze({ OPENCLAW_SUBAGENT_EXEC: '1' });
@@ -324,15 +325,16 @@ test('enqueue checks the configured model catalog before preparing a spawn', asy
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const endpoint = server.address();
+    const policy = { provider: 'test', baseUrl: `http://127.0.0.1:${endpoint.port}/v1` };
     const settingsDir = join(fixture.root, '.openclaw', 'scheduler');
     mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(fixture.root, 'model-catalog-policy-fixture.json'), JSON.stringify(policy), { mode: 0o600 });
     writeFileSync(join(settingsDir, 'model-catalog-probe.json'), JSON.stringify({
-      provider: 'test',
-      baseUrl: `http://127.0.0.1:${endpoint.port}/v1`,
+      ...policy,
       apiKey: 'dispatch-fixture-key',
     }), { mode: 0o600 });
     const enqueue = (label) => new Promise(resolve => {
-      execFile(process.execPath, [INDEX_PATH, ...enqueueArgs(label, ['--model', 'test/model-a'])],
+      execFile(process.execPath, ['--import', CATALOG_POLICY_FIXTURE, INDEX_PATH, ...enqueueArgs(label, ['--model', 'test/model-a'])],
         dispatchOptions(fixture, AGENT_SHELL), (error, stdout, stderr) => {
           resolve({ status: error ? error.code : 0, stdout, stderr });
         });

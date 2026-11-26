@@ -1,6 +1,8 @@
-import { existsSync, readFileSync } from 'fs';
+import * as fs from 'node:fs';
 import { homedir } from 'os';
 import { join, resolve as pathResolve } from 'path';
+
+const { existsSync, readFileSync } = fs;
 
 // No static model fallback: OpenClaw's configured agent default is the only
 // safe fallback because the gateway's allowlist can change independently.
@@ -93,6 +95,46 @@ function readModelCatalogSettings() {
   }
 }
 
+// The scheduler account and its jobs can write to HOME. Keep egress approval
+// under an independent administrator-owned path on the same machine.
+export function readModelCatalogPolicy({
+  filesystem = fs, platform = process.platform, uid = process.geteuid?.(),
+} = {}) {
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = filesystem.constants;
+  if (platform === 'win32' || !Number.isInteger(uid) || uid <= 0 || !O_NOFOLLOW || !O_NONBLOCK) return null;
+  const directories = platform === 'darwin' ? ['/', '/private', '/private/etc'] : ['/', '/etc'];
+  const catalogPolicy = `${directories.at(-1)}/openclaw-scheduler-model-catalog.json`;
+  try {
+    for (const directory of directories) {
+      const stat = filesystem.lstatSync(directory);
+      if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return null;
+    }
+    const descriptor = filesystem.openSync(catalogPolicy, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    try {
+      const stat = filesystem.fstatSync(descriptor);
+      if (!stat.isFile() || stat.uid !== 0 || (stat.mode & 0o022) !== 0 || stat.size > 4096) return null;
+      return JSON.parse(filesystem.readFileSync(descriptor, 'utf8'));
+    } finally {
+      filesystem.closeSync(descriptor);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function modelCatalogEndpoint(base) {
+  let url;
+  try {
+    url = new URL(base);
+  } catch {
+    return null;
+  }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username || url.password || url.search || url.hash) return null;
+  url.pathname = `${url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`;
+  return url;
+}
+
 /**
  * Probe whether a model is actually served by its provider.
  *
@@ -114,7 +156,7 @@ function readModelCatalogSettings() {
  * @returns {Promise<{status: 'served'|'not_served'|'unknown', reason?: string, httpStatus?: number, data?: unknown}>}
  */
 export async function probeModelAvailability(model, {
-  fetchImpl = fetch, settings = readModelCatalogSettings(), timeoutMs = 5000,
+  fetchImpl = fetch, settings = readModelCatalogSettings(), readPolicy = readModelCatalogPolicy, timeoutMs = 5000,
 } = {}) {
   const modelId = normalizeString(model);
   const provider = normalizeString(settings?.provider);
@@ -129,23 +171,17 @@ export async function probeModelAvailability(model, {
   }
   const bareId = modelId.slice(separator + 1);
 
-  // Only the operator's catalog settings select the destination and credential.
-  // The model is compared to the catalog after fetching it.
-  let url;
-  try {
-    url = new URL(base);
-  } catch {
-    return { status: 'unknown', reason: 'unparseable provider base url' };
+  const requested = modelCatalogEndpoint(base);
+  if (!requested) return { status: 'unknown', reason: 'unsupported provider base url' };
+  const policy = readPolicy();
+  const approved = modelCatalogEndpoint(normalizeString(policy?.baseUrl));
+  if (!approved || normalizeString(policy?.provider) !== provider || approved.href !== requested.href) {
+    return { status: 'unknown', reason: 'model catalog endpoint is not approved' };
   }
-  if ((url.protocol !== 'http:' && url.protocol !== 'https:') ||
-      url.username || url.password || url.search || url.hash) {
-    return { status: 'unknown', reason: 'unsupported provider base url' };
-  }
-  url.pathname = `${url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`;
 
   let res;
   try {
-    res = await fetchImpl(url, {
+    res = await fetchImpl(approved, {
       headers: { Authorization: `Bearer ${apiKey}` },
       redirect: 'error',
       signal: AbortSignal.timeout(timeoutMs),
