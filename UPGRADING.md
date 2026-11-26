@@ -188,6 +188,14 @@ The first start also adds the index `idx_dispatch_queue_job_active`. A host
 where it was already created by hand with the same definition is left as is.
 The schema version stays 31.
 
+### Per-job delivery marker (`delivery_from`)
+
+The first start adds the nullable column `jobs.delivery_from`. Existing jobs
+read `NULL` and deliver exactly as before. The schema version stays 31, so a
+rollback to an older release still opens the database; that release ignores
+the column, so jobs that set a marker deliver their full text until the
+upgrade is applied again.
+
 ---
 
 ## Step 1: Pull or Install the Update

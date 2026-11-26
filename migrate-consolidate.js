@@ -186,7 +186,7 @@ export default function migrateConsolidate() {
       'approval_risk_level', 'approval_approver_scope', 'output_format',
       'verify_shell', 'verify_timeout_s', 'verify_on_failure',
       'handoff_version', 'handoff_artifact_digest', 'effective_task_hash',
-      'delivery_summary',
+      'delivery_summary', 'delivery_from',
     ])
     && hasColumns(runColumns, [
       'dispatch_queue_id', 'shell_exit_code', 'shell_signal', 'shell_timed_out',
@@ -826,6 +826,12 @@ export default function migrateConsolidate() {
     // v31: opt-in LLM summarization of delivery bodies
     `ALTER TABLE jobs ADD COLUMN delivery_summary TEXT DEFAULT 'none'`,
     `ALTER TABLE delivery_outbox ADD COLUMN summary_source TEXT DEFAULT NULL`,
+    // Per-job delivery marker. A v31 database without the column fails the
+    // no-op check above, so the next start runs this migration and adds it.
+    // No schema version bump: an older v31 release ignores the extra
+    // nullable column, so a rollback still opens the database; recording
+    // version 32 would make it refuse with SCHEMA_VERSION_UNSUPPORTED.
+    `ALTER TABLE jobs ADD COLUMN delivery_from TEXT DEFAULT NULL`,
   ];
 
   for (const sql of alters) {
