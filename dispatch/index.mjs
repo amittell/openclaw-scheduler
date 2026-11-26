@@ -2633,10 +2633,7 @@ async function cmdEnqueue(flags) {
     labelModel: getLabel(label)?.model || null,
   });
   if (probeModel) {
-    const modelProbe = await probeModelAvailability(probeModel, null, {
-      env: process.env,
-      homeDir: HOME_DIR,
-    });
+    const modelProbe = await probeModelAvailability(probeModel);
     if (modelProbe.status === 'not_served') {
       die(modelProbe.reason, 1);
     }

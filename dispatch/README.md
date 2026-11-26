@@ -205,6 +205,20 @@ is genuinely unavailable.
 
 *One prompt source is required: `--message`, `--message-file`, `--message-env`, `--message-stdin`, or piped stdin.
 
+#### Model availability precheck
+
+Operators can enable the precheck for one provider by setting
+`DISPATCH_MODEL_PROBE_PROVIDER` to its OpenClaw provider ID,
+`DISPATCH_MODEL_PROBE_BASE_URL` to its HTTP or HTTPS API base, and
+`DISPATCH_MODEL_PROBE_API_KEY` to a credential scoped to that catalog.
+Set these in the environment of the enqueue CLI and the watcher process
+to check both initial dispatch and interrupted redispatch. Keep the
+credential in the process environment rather than in job commands or labels.
+
+A complete catalog can confirm that a model is absent and stop dispatch
+before spawning. Missing settings, other providers, redirects, network
+errors and incomplete catalogs leave normal dispatch available.
+
 ### `adopt` -- record a session the agent spawned
 
 ```bash

@@ -1,8 +1,9 @@
 import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import {
   chmodSync,
   existsSync,
@@ -13,6 +14,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -139,11 +141,11 @@ function seedSession(fixture, sessionKey) {
   writeFileSync(sessionsPath, JSON.stringify(sessions));
 }
 
-function runDispatch(fixture, args, env = {}) {
+function dispatchOptions(fixture, env) {
   const base = { ...process.env };
   delete base.OPENCLAW_SHELL;
   delete base.OPENCLAW_SUBAGENT_EXEC;
-  return spawnSync(process.execPath, [INDEX_PATH, ...args], {
+  return {
     encoding: 'utf8',
     timeout: 45_000,
     env: {
@@ -159,7 +161,11 @@ function runDispatch(fixture, args, env = {}) {
       OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:9',
       ...env,
     },
-  });
+  };
+}
+
+function runDispatch(fixture, args, env = {}) {
+  return spawnSync(process.execPath, [INDEX_PATH, ...args], dispatchOptions(fixture, env));
 }
 
 function readLabels(fixture) {
@@ -304,6 +310,54 @@ function assertSessionsSendContract(params, mode) {
   assert.equal(params.timeoutSeconds, 0, 'fire-and-forget: dispatch delivers the completion');
   assert.notEqual(params.watch, true);
 }
+
+test('enqueue checks the configured model catalog before preparing a spawn', async () => {
+  const fixture = buildFixture();
+  const requests = [];
+  let modelIds = [];
+  const server = createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url, authorization: request.headers.authorization });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ data: modelIds.map(id => ({ id })) }));
+  });
+  try {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const endpoint = server.address();
+    const env = {
+      ...AGENT_SHELL,
+      DISPATCH_MODEL_PROBE_PROVIDER: 'test',
+      DISPATCH_MODEL_PROBE_BASE_URL: `http://127.0.0.1:${endpoint.port}/v1`,
+      DISPATCH_MODEL_PROBE_API_KEY: 'dispatch-fixture-key',
+    };
+    const enqueue = (label) => new Promise(resolve => {
+      execFile(process.execPath, [INDEX_PATH, ...enqueueArgs(label, ['--model', 'test/model-a'])],
+        dispatchOptions(fixture, env), (error, stdout, stderr) => {
+          resolve({ status: error ? error.code : 0, stdout, stderr });
+        });
+    });
+    const absent = await enqueue('model-catalog-absent');
+    assert.equal(absent.status, 1, absent.stderr || absent.stdout);
+    assert.match(absent.stderr, /model_not_found: test\/model-a not served by test/);
+    assert.deepEqual(readLabels(fixture), {});
+
+    modelIds = ['model-a'];
+    const present = await enqueue('model-catalog-present');
+    assert.equal(present.status, 0, present.stderr || present.stdout);
+    assert.equal(parseJson(present).status, 'awaiting-spawn');
+    assert.deepEqual(readCalls(fixture), []);
+    const expected = { method: 'GET', url: '/v1/models', authorization: 'Bearer dispatch-fixture-key' };
+    assert.deepEqual(requests, [expected, expected]);
+  } finally {
+    try {
+      if (server.listening) {
+        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      }
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
 
 test('enqueue from an agent exec shell prepares sessions_spawn and makes no Gateway calls', () => {
   const fixture = buildFixture();

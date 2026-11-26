@@ -65,56 +65,6 @@ export function resolveOpenClawDispatchDefaultModel(config) {
   );
 }
 
-/**
- * Resolve a `source:"file"` secret reference to its file contents.
- *
- * The reference names a secret provider alias (e.g. "gpufarm_bots"); the
- * provider's configured `path` (under secrets.providers.<alias>) is resolved
- * home-relative and read. Any missing piece (no alias, no path, no file,
- * unreadable file) returns null so the caller degrades tolerantly.
- *
- * @param {object} ref - the {source, provider, id} secret reference
- * @param {object} cfg - the parsed OpenClaw config
- * @param {object} ctx - { env, homeDir, exists, readFile }
- * @returns {string|null} the secret value, or null when unresolvable
- */
-function resolveSecretRefFile(ref, cfg, { env, homeDir, exists, readFile }) {
-  if (ref.source !== 'file') return null;
-  const secretProviders = isRecord(cfg?.secrets?.providers) ? cfg.secrets.providers : {};
-  const providerDef = typeof ref.provider === 'string' ? secretProviders[ref.provider] : null;
-  const pathValue = normalizeString(providerDef?.path);
-  if (!pathValue) return null;
-  const filePath = resolveHomeRelativePath(pathValue, homeDir || env.HOME);
-  if (!filePath || !exists(filePath)) return null;
-  try {
-    return normalizeString(readFile(filePath, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Resolve a provider's API key from its config declaration.
- *
- * Honors a plain string key, an `env` reference, and a `file` reference
- * (via secrets.providers.<alias>.path). Other sources (exec/store) and
- * unresolvable references return null so the caller degrades tolerantly
- * rather than assuming the conventional filename.
- *
- * @param {object|null} providerCfg - models.providers.<provider> config
- * @param {object} cfg - the parsed OpenClaw config
- * @param {object} ctx - { env, homeDir, exists, readFile }
- * @returns {string|null} the API key, or null when unresolvable
- */
-function resolveProviderApiKey(providerCfg, cfg, ctx) {
-  const ref = providerCfg?.apiKey;
-  if (typeof ref === 'string') return normalizeString(ref);
-  if (!isRecord(ref)) return null;
-  if (ref.source === 'env') return normalizeString(ctx.env[ref.id]);
-  if (ref.source === 'file') return resolveSecretRefFile(ref, cfg, ctx);
-  return null;
-}
-
 export function resolveDefaultDispatchModel({
   dispatchConfig = {},
   openClawConfig,
@@ -150,87 +100,49 @@ export function resolveDefaultDispatchModel({
  * behavior. Only a reachable endpoint answering with a parseable model
  * list that omits the model (or an empty list) is 'not_served'.
  *
- * @param {string} model - model id, optionally provider-prefixed ("gpufarm/qwen3.8-27b")
- * @param {string|null} providerBase - provider base URL; derived from the
- *   OpenClaw config (models.providers.<provider>.baseUrl) when omitted
+ * @param {string} model - provider-qualified model ID
  * @param {object} [opts]
- * @returns {Promise<{status: 'served'|'not_served'|'unknown', reason: string, httpStatus?: number, data?: unknown}>}
+ * @returns {Promise<{status: 'served'|'not_served'|'unknown', reason?: string, httpStatus?: number, data?: unknown}>}
  */
-export async function probeModelAvailability(model, providerBase, opts = {}) {
-  const {
-    fetchImpl = fetch,
-    openClawConfig,
-    env = process.env,
-    homeDir,
-    exists = existsSync,
-    readFile = readFileSync,
-    timeoutMs = 5000,
-  } = opts;
-
+export async function probeModelAvailability(model, {
+  fetchImpl = fetch, env = process.env, timeoutMs = 5000,
+} = {}) {
   const modelId = normalizeString(model);
-  if (!modelId) return { status: 'unknown', reason: 'no model to probe' };
-
-  const provider = modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : null;
-  const bareId = modelId.includes('/') ? modelId.slice(modelId.indexOf('/') + 1) : modelId;
-
-  const cfg = openClawConfig ?? readOpenClawConfig({ env, homeDir, exists, readFile });
-  const providers = isRecord(cfg?.models?.providers) ? cfg.models.providers : {};
-  const providerCfg = provider ? providers[provider] : null;
-
-  let base = normalizeString(providerBase);
-  if (!base) {
-    base = normalizeString(providerCfg?.baseUrl);
-    if (!base) return { status: 'unknown', reason: 'provider base url not resolvable' };
+  const provider = normalizeString(env.DISPATCH_MODEL_PROBE_PROVIDER);
+  const base = normalizeString(env.DISPATCH_MODEL_PROBE_BASE_URL);
+  const apiKey = normalizeString(env.DISPATCH_MODEL_PROBE_API_KEY);
+  if (!provider || !base || !apiKey) {
+    return { status: 'unknown', reason: 'model catalog probe is not configured' };
   }
-
-  const effectiveHome = homeDir || env.HOME;
-  // CodeQL hardening: the provider segment is derived from the model id
-  // (caller-supplied). Only a safe token may appear in the key filename,
-  // so a crafted model id cannot traverse the secrets directory.
-  if (provider && !/^[a-zA-Z0-9._-]+$/.test(provider)) {
-    return { status: 'unknown', reason: 'provider not safe for key path' };
+  const separator = modelId?.indexOf('/') ?? -1;
+  if (separator < 1 || modelId.slice(0, separator) !== provider || separator === modelId.length - 1) {
+    return { status: 'unknown', reason: 'model is outside the configured probe provider' };
   }
-  // Resolve the provider API key through the config's apiKey declaration
-  // (string, env ref, or file ref via secrets.providers.<alias>.path) so the
-  // probe protects deployments that store the key elsewhere, not just the
-  // conventional filename. Falls back to the conventional path when the
-  // config declares no resolvable reference.
-  let apiKey = resolveProviderApiKey(providerCfg, cfg, { env, homeDir, exists, readFile });
-  if (!apiKey) {
-    const apiKeyPath = effectiveHome
-      ? join(effectiveHome, '.openclaw', 'secrets', `${provider ?? 'gpufarm'}-api-key.txt`)
-      : null;
-    if (apiKeyPath) {
-      try {
-        if (exists(apiKeyPath)) apiKey = normalizeString(readFile(apiKeyPath, 'utf8'));
-      } catch {
-        apiKey = null;
-      }
-    }
-  }
-  if (!apiKey) return { status: 'unknown', reason: 'no api key available' };
+  const bareId = modelId.slice(separator + 1);
 
-  // The provider baseUrl may already end in /v1 (OpenClaw convention) --
-  // normalize so we never request /v1/v1/models.
+  // Only the operator's process environment selects the destination and credential.
+  // The model is compared to the catalog after fetching it.
   let url;
   try {
-    url = new URL(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`);
+    url = new URL(base);
   } catch {
     return { status: 'unknown', reason: 'unparseable provider base url' };
   }
-  // CodeQL hardening: only probe http(s) endpoints; never chase a file://
-  // or other scheme out of the process.
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return { status: 'unknown', reason: `unsupported url scheme: ${url.protocol}` };
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username || url.password || url.search || url.hash) {
+    return { status: 'unknown', reason: 'unsupported provider base url' };
   }
+  url.pathname = `${url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`;
+
   let res;
   try {
     res = await fetchImpl(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      redirect: 'error',
       signal: AbortSignal.timeout(timeoutMs),
     });
-  } catch (err) {
-    return { status: 'unknown', reason: `probe failed: ${err?.message || err}` };
+  } catch {
+    return { status: 'unknown', reason: 'model catalog request failed' };
   }
   if (!res.ok) {
     return { status: 'unknown', reason: `probe http ${res.status}`, httpStatus: res.status };
@@ -276,7 +188,7 @@ export async function probeModelAvailability(model, providerBase, opts = {}) {
   if (idSet.has(modelId) || idSet.has(bareId)) return { status: 'served', data: body };
   return {
     status: 'not_served',
-    reason: `model_not_found: ${modelId} not served by ${provider ?? 'unknown'}`,
+    reason: `model_not_found: ${modelId} not served by ${provider}`,
     data: body,
   };
 }

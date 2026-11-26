@@ -1557,10 +1557,7 @@ async function emitInterruptedOutcome(label, summary, result = null) {
   // Network errors and missing config stay tolerant (status 'unknown'
   // falls through to the normal redispatch flow).
   const modelProbe = entry?.model
-    ? await probeModelAvailability(entry.model, null, {
-        env: process.env,
-        homeDir: process.env.HOME || homedir(),
-      })
+    ? await probeModelAvailability(entry.model)
     : { status: 'unknown' };
   if (modelProbe.status === 'not_served') {
     process.stderr.write(
