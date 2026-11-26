@@ -69,6 +69,9 @@ If you add new features or fix bugs, add tests. The test count should only go up
 
 All PRs target `main`. There are no long-lived feature branches.
 
+GitHub Actions runs pull request and main-branch checks and publishes tagged
+releases. The repository no longer mirrors branches or tags automatically.
+
 ## Release Process
 
 1. On the release branch, update `package.json` and `package-lock.json` without
