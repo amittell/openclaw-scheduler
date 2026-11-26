@@ -324,15 +324,16 @@ test('enqueue checks the configured model catalog before preparing a spawn', asy
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const endpoint = server.address();
-    const env = {
-      ...AGENT_SHELL,
-      DISPATCH_MODEL_PROBE_PROVIDER: 'test',
-      DISPATCH_MODEL_PROBE_BASE_URL: `http://127.0.0.1:${endpoint.port}/v1`,
-      DISPATCH_MODEL_PROBE_API_KEY: 'dispatch-fixture-key',
-    };
+    const settingsDir = join(fixture.root, '.openclaw', 'scheduler');
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, 'model-catalog-probe.json'), JSON.stringify({
+      provider: 'test',
+      baseUrl: `http://127.0.0.1:${endpoint.port}/v1`,
+      apiKey: 'dispatch-fixture-key',
+    }), { mode: 0o600 });
     const enqueue = (label) => new Promise(resolve => {
       execFile(process.execPath, [INDEX_PATH, ...enqueueArgs(label, ['--model', 'test/model-a'])],
-        dispatchOptions(fixture, env), (error, stdout, stderr) => {
+        dispatchOptions(fixture, AGENT_SHELL), (error, stdout, stderr) => {
           resolve({ status: error ? error.code : 0, stdout, stderr });
         });
     });

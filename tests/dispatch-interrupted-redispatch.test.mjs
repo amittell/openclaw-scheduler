@@ -1,14 +1,17 @@
 import './isolate-environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -226,6 +229,76 @@ test('(2) tick after backoff: respawn via enqueue --mode reuse with continuation
     assert.equal(after.interruptRetryCount, 1, 'counter not double-incremented on the dispatch tick');
   } finally {
     rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('catalog absence ends interrupted work without advancing the retry', async () => {
+  const fix = makeFixture('catalog');
+  const requests = [];
+  let catalog = [];
+  const server = createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url, auth: request.headers.authorization });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ data: catalog }));
+  });
+  try {
+    const { stubPath, enqueueLog } = stubInterruptedIndex(fix);
+    const entry = {
+      sessionKey: 'agent:main:subagent:11111111-2222-4333-8444-555555555555',
+      status: 'interrupted',
+      agent: 'main',
+      mode: 'fresh',
+      spawnedAt: new Date().toISOString(),
+      timeoutSeconds: 7200,
+      model: 'test/model-a',
+      interruptRetryCount: 1,
+      watcherRetryAfter: new Date(Date.now() - 1000).toISOString(),
+    };
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const { port } = server.address();
+    const settingsDir = join(fix.root, '.openclaw', 'scheduler');
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, 'model-catalog-probe.json'), JSON.stringify({
+      provider: 'test',
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+      apiKey: 'watcher-fixture-key',
+    }), { mode: 0o600 });
+    const env = watcherEnv(fix, { HOME: fix.root, stubPath, DISPATCH_INTERRUPT_RETRIES: '2' });
+    const watchOnce = () => {
+      writeFileSync(fix.labelsPath, JSON.stringify({ 'int-x': entry }));
+      return new Promise(resolve => {
+        const args = [WATCHER_PATH, '--label', 'int-x', '--timeout', '3600', '--poll-interval', '20', '--once'];
+        execFile(process.execPath, args, { env, timeout: 15_000 }, (error, stdout, stderr) => {
+          resolve({ status: error ? error.code : 0, stdout, stderr });
+        });
+      });
+    };
+
+    const missing = await watchOnce();
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.match(missing.stdout, /model_not_found: test\/model-a not served by test/);
+    const terminal = readLabels(fix)['int-x'];
+    assert.equal(terminal.status, 'error');
+    assert.equal(terminal.interruptRetryCount, 1);
+    assert.equal(existsSync(enqueueLog), false);
+
+    catalog = [{ id: 'model-a' }];
+    const available = await watchOnce();
+    assert.equal(available.status, 0, available.stderr);
+    assert.match(available.stderr, /interrupted redispatch dispatched/);
+    assert.equal(JSON.parse(readFileSync(enqueueLog, 'utf8'))[0], 'enqueue');
+    assert.notEqual(readLabels(fix)['int-x'].status, 'error');
+    const expectedRequest = { method: 'GET', url: '/v1/models', auth: 'Bearer watcher-fixture-key' };
+    assert.deepEqual(requests, [expectedRequest, expectedRequest]);
+  } finally {
+    try {
+      if (server.listening) {
+        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      }
+    } finally {
+      rmSync(fix.root, { recursive: true, force: true });
+    }
   }
 });
 

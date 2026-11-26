@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'fs';
+import { homedir } from 'os';
 import { join, resolve as pathResolve } from 'path';
 
 // No static model fallback: OpenClaw's configured agent default is the only
@@ -84,6 +85,14 @@ export function resolveDefaultDispatchModel({
   );
 }
 
+function readModelCatalogSettings() {
+  try {
+    return JSON.parse(readFileSync(join(homedir(), '.openclaw', 'scheduler', 'model-catalog-probe.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Probe whether a model is actually served by its provider.
  *
@@ -105,12 +114,12 @@ export function resolveDefaultDispatchModel({
  * @returns {Promise<{status: 'served'|'not_served'|'unknown', reason?: string, httpStatus?: number, data?: unknown}>}
  */
 export async function probeModelAvailability(model, {
-  fetchImpl = fetch, env = process.env, timeoutMs = 5000,
+  fetchImpl = fetch, settings = readModelCatalogSettings(), timeoutMs = 5000,
 } = {}) {
   const modelId = normalizeString(model);
-  const provider = normalizeString(env.DISPATCH_MODEL_PROBE_PROVIDER);
-  const base = normalizeString(env.DISPATCH_MODEL_PROBE_BASE_URL);
-  const apiKey = normalizeString(env.DISPATCH_MODEL_PROBE_API_KEY);
+  const provider = normalizeString(settings?.provider);
+  const base = normalizeString(settings?.baseUrl);
+  const apiKey = normalizeString(settings?.apiKey);
   if (!provider || !base || !apiKey) {
     return { status: 'unknown', reason: 'model catalog probe is not configured' };
   }
@@ -120,7 +129,7 @@ export async function probeModelAvailability(model, {
   }
   const bareId = modelId.slice(separator + 1);
 
-  // Only the operator's process environment selects the destination and credential.
+  // Only the operator's catalog settings select the destination and credential.
   // The model is compared to the catalog after fetching it.
   let url;
   try {

@@ -207,13 +207,13 @@ is genuinely unavailable.
 
 #### Model availability precheck
 
-Operators can enable the precheck for one provider by setting
-`DISPATCH_MODEL_PROBE_PROVIDER` to its OpenClaw provider ID,
-`DISPATCH_MODEL_PROBE_BASE_URL` to its HTTP or HTTPS API base, and
-`DISPATCH_MODEL_PROBE_API_KEY` to a credential scoped to that catalog.
-Set these in the environment of the enqueue CLI and the watcher process
-to check both initial dispatch and interrupted redispatch. Keep the
-credential in the process environment rather than in job commands or labels.
+Operators can enable the precheck for one provider in
+`~/.openclaw/scheduler/model-catalog-probe.json`. Set `provider` to the
+OpenClaw provider ID, `baseUrl` to its HTTP or HTTPS API base, and
+`apiKey` to a credential scoped to that catalog. Restrict this file to
+the scheduler user (mode `0600` on Unix). Both the enqueue CLI and the
+scheduled watcher read the file from their home directory. Keep the key
+out of job commands, environment variables, and labels.
 
 A complete catalog can confirm that a model is absent and stop dispatch
 before spawning. Missing settings, other providers, redirects, network

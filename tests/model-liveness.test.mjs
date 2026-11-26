@@ -21,14 +21,14 @@ import assert from 'node:assert/strict';
 import { probeModelAvailability, selectProbeModel } from '../dispatch/default-model.mjs';
 
 const MODEL = 'gpufarm/qwen3.8-27b';
-const PROBE_ENV = {
-  DISPATCH_MODEL_PROBE_PROVIDER: 'gpufarm',
-  DISPATCH_MODEL_PROBE_BASE_URL: 'https://catalog.example.test/gateway/v1/',
-  DISPATCH_MODEL_PROBE_API_KEY: 'catalog-fixture',
+const PROBE_SETTINGS = {
+  provider: 'gpufarm',
+  baseUrl: 'https://catalog.example.test/gateway/v1/',
+  apiKey: 'catalog-fixture',
 };
 
 function probeOpts(fetchImpl, settings = {}) {
-  return { fetchImpl, env: { ...PROBE_ENV, ...settings } };
+  return { fetchImpl, settings: { ...PROBE_SETTINGS, ...settings } };
 }
 
 function jsonResponse(list) {
@@ -76,7 +76,7 @@ test('probe: non-OK HTTP status -> unknown (tolerant)', async () => {
   assert.equal(result.httpStatus, 502);
 });
 
-for (const name of Object.keys(PROBE_ENV)) {
+for (const name of Object.keys(PROBE_SETTINGS)) {
   test(`probe: missing ${name} leaves normal dispatch available`, async () => {
     let called = false;
     const opts = probeOpts(async () => {
@@ -195,7 +195,7 @@ for (const base of [
     const opts = probeOpts(async () => {
       called = true;
       return jsonResponse([]);
-    }, { DISPATCH_MODEL_PROBE_BASE_URL: base });
+    }, { baseUrl: base });
     assert.equal((await probeModelAvailability(MODEL, opts)).status, 'unknown');
     assert.equal(called, false);
   });
