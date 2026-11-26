@@ -214,6 +214,7 @@ test('(2) tick after backoff: respawn via enqueue --mode reuse with continuation
       'redispatch is the designed takeover and must pass --force-retry explicitly');
     assert.match(flag('--message'), /interrupted before completion/i, 'continuation prompt present');
     assert.match(flag('--message'), /do not redo completed steps/i, 'continuation prompt present');
+    assert.match(flag('--message'), /complete, verified report and no pending work, the correct continuation is to run the done call immediately/, 'continuation prompt includes the done-call hint');
     assert.equal(flag('--model'), 'gpufarm/qwen3.8-27b', 'original model preserved');
     assert.equal(flag('--thinking'), 'high', 'original thinking preserved');
     assert.equal(flag('--timeout'), '7200', 'original timeout preserved');
@@ -651,6 +652,7 @@ process.exit(0);
     assert.equal(flag('--label'), 'int-x');
     assert.equal(flag('--mode'), 'reuse', 'continues the same session');
     assert.match(flag('--message'), /interrupted before completion/i, 'continuation prompt present');
+    assert.match(flag('--message'), /complete, verified report and no pending work, the correct continuation is to run the done call immediately/, 'continuation prompt includes the done-call hint');
     assert.equal(flag('--deliver-to'), '484946046', 'delivery target preserved');
     const afterSecond = readLabels(fix)['int-x'];
     assert.equal(afterSecond.watcherRetryAfter, undefined, 'backoff window cleared after dispatch');

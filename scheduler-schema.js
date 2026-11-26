@@ -39,6 +39,7 @@ export const SCHEDULER_SCHEMAS = {
       // (summarization is outside the v4 artifact binding contract). The SQL
       // column default remains 'none' so pre-v32 rows keep their stored value.
       delivery_summary: { type: 'string', enum: ['none', 'llm'], default: 'llm', description: 'Summarize long announce delivery bodies via the gateway model (fail-open to raw). Write-time default is "llm" for non-handoff-v4 jobs that never set the field; an explicit "none" opts out. Handoff v4 jobs always store "none". The SQL column default remains "none" for pre-v32 rows.' },
+      delivery_from: { type: 'string', nullable: true, default: null, minLength: 1, maxLength: 200, description: 'Deliver only the text from the last line that starts with this marker (after optional leading whitespace) to the end; a marker later in a line does not count. Applied to announce deliveries before delivery_summary. When no line matches, the full text is delivered and a warning is logged. One line, no control characters; null clears it. The run record keeps the full text. Not supported for handoff v4 jobs.' },
       // REQUIRED on insert for non-exempt jobs. Exempt: job_type='watchdog', name starts with 'watchdog:',
       // session_target='main', or delivery_mode='none'. Set to the origin chat_id so results reach the right chat.
       delivery_to: { type: 'string', nullable: true, required: 'non-system jobs', description: 'Target chat/user id for delivery (e.g. telegram chat_id). Required on insert for non-system jobs.' },

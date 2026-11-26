@@ -82,6 +82,14 @@ export interface JobSpec {
    * outside the v4 artifact binding contract).
    */
   delivery_summary?: 'none' | 'llm';
+  /**
+   * Deliver only the text from the last line that starts with this marker
+   * (after optional leading whitespace) to the end. One line, 1-200
+   * characters, no control characters; null clears it. When no line matches,
+   * the full text is delivered. The run record keeps the full text. Not
+   * supported for handoff v4 jobs.
+   */
+  delivery_from?: string | null;
 
   // Workflow chaining
   parent_id?: string | null;

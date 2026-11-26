@@ -22,6 +22,7 @@ import {
   shouldSummarizeDelivery,
   summarizeDeliveryContent,
 } from './delivery-summary.js';
+import { applyDeliveryFrom } from './delivery-from.js';
 import { negotiateCredentialCapabilities } from './capability-negotiation.js';
 import { appendRuntimeEvent } from './runtime-events.js';
 import {
@@ -1114,114 +1115,99 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   }
 
   const fence = ctx.dispatcherFence || deps.dispatcherFence || null;
-  // v31/v32: LLM summarization of long delivery bodies (on by default for
-  // non-v4 jobs since v32; explicit delivery_summary='none' opts out). The
-  // summary is
-  // precomputed here (async, before the completion bookkeeping transaction)
-  // and carried through result.deliveryOverride so the durable outbox path
-  // posts the concise text. The full raw output stays in the run record
-  // (result.content / shell_stdout / summary), so nothing is lost. Fail-open:
-  // any LLM error or empty result keeps the raw content and records
-  // summarySource 'raw-fallback'. A body that already carries the soft-failure
-  // prefix keeps its failure context: the summary is posted under a status
-  // line instead of silently replacing the marker.
-  {
-    const rawBody = String(result.deliveryOverride ?? result.content ?? '');
-    // Skip the summary request entirely when no delivery will be posted: a
-    // successful shell/agent job in announce mode sets skipDelivery (only
-    // errors announce), so summarizing long output would burn a model request
-    // and up to the finalization delay without posting anything.
-    if (!result.skipDelivery && shouldSummarizeDelivery(job, rawBody)) {
-      const summary = await summarizeDeliveryContent({
-        rawContent: rawBody,
-        jobName: job.name,
-        status: result.status,
-        agentId: job.agent_id || 'main',
-      });
-      if (summary) {
-        // Before the summary replaces the delivery body, persist the full raw
-        // body as the run's complete output record. For isolated agent jobs the
-        // run record only stores result.summary (truncated to 5000 chars) plus
-        // byte counts/hashes -- there is no full-output column the way shell
-        // jobs have shell_stdout. Once the outbox receives only the summary,
-        // the raw body would be lost. We therefore offload the full raw body to
-        // a run artifact (the same storeRunArtifact mechanism the shell path
-        // uses for oversized stdout) and record its path + sha256 + bytes in
-        // context_summary so a complete persisted copy always exists.
-        let persistedFullBody = null;
-        try {
-          const fullBodyPath = deps.storeRunArtifact
-            ? (deps.storeRunArtifact('agent-output', ctx.run.id, rawBody) || null)
-            : null;
-          if (fullBodyPath) {
-            persistedFullBody = {
-              path: fullBodyPath,
-              sha256: `sha256:${createHash('sha256').update(rawBody, 'utf8').digest('hex')}`,
-              bytes: Buffer.byteLength(rawBody, 'utf8'),
-            };
-          }
-        } catch (persistErr) {
-          // Persisting the artifact is best-effort; the fail-open contract is
-          // about the delivery, not the record. Log and continue so the summary
-          // still posts. The full body remains in result.content until finishRun.
-          log('warn', `Could not persist full delivery body before summarizing ${job.name}`, {
-            runId: ctx.run.id,
-            error: String(persistErr.message || persistErr).slice(0, 300),
-          });
-        }
-        const agentDeliveryCtx = {
-          summarized: true,
-          raw_chars: rawBody.length,
-          raw_bytes: Buffer.byteLength(rawBody, 'utf8'),
-          full_body: persistedFullBody,
-          summary_chars: summary.length,
+  // delivery_from: when the delivered body comes from result.content (agent
+  // replies and every strategy that sets no deliveryOverride), deliver it from
+  // the job's marker line. This runs before summarization, so a summary sees
+  // only the report, and before enqueueCompletionDelivery adds the soft-failure
+  // header, so that header is kept. result.content and result.summary are not
+  // touched: the run record, trigger conditions, and the idempotency result
+  // hash keep the full text. Shell jobs apply the marker in executeShell,
+  // before their failure header is added to deliveryOverride.
+  const deliversContent = !result.skipDelivery
+    && result.deliveryOverride == null
+    && ['announce', 'announce-always'].includes(job.delivery_mode);
+  const deliveryText = deliversContent
+    ? applyDeliveryFrom(job, result.content, { log, runId: ctx.run.id })
+    : result.content;
+  const fullBody = String(result.deliveryOverride ?? result.content ?? '');
+  const rawBody = String(result.deliveryOverride ?? deliveryText ?? '');
+  // Do not run the summarizer for a completion that will not announce.
+  const shouldSummarize = !result.skipDelivery && shouldSummarizeDelivery(job, rawBody);
+  const summary = shouldSummarize
+    ? await summarizeDeliveryContent({
+      rawContent: rawBody,
+      jobName: job.name,
+      status: result.status,
+      agentId: job.agent_id || 'main',
+    })
+    : null;
+  // A shortened report may be the only full-size delivery copy. Keep the
+  // original whenever selection hides text that runs.summary did not keep,
+  // independently of the summarizer's outcome.
+  const selectionLosesOutput = deliversContent && rawBody !== fullBody
+    && finishFields.summary !== fullBody;
+  let persistedFullBody = null;
+  if (summary || selectionLosesOutput) {
+    try {
+      const path = deps.storeRunArtifact?.('agent-output', ctx.run.id, fullBody);
+      if (path) {
+        persistedFullBody = {
+          path,
+          sha256: `sha256:${createHash('sha256').update(fullBody, 'utf8').digest('hex')}`,
+          bytes: Buffer.byteLength(fullBody, 'utf8'),
         };
-        const existingDeliveryCtx = result.runFinishFields?.context_summary
-          && typeof result.runFinishFields.context_summary === 'object'
-          ? result.runFinishFields.context_summary
-          : {};
-        result.runFinishFields = {
-          ...result.runFinishFields,
-          context_summary: {
-            ...existingDeliveryCtx,
-            agent_delivery: agentDeliveryCtx,
-          },
-        };
-        // finishFields (the object actually written to the run record) was
-        // assembled before this summary block ran, so merge the agent_delivery
-        // context into it as well -- otherwise the persisted full-body record
-        // would be dropped when the run is finalized.
-        const existingFinishCtx = typeof finishFields.context_summary === 'string'
-          ? safeParse(finishFields.context_summary)
-          : finishFields.context_summary;
-        finishFields.context_summary = {
-          ...(existingFinishCtx && typeof existingFinishCtx === 'object' && !Array.isArray(existingFinishCtx)
-            ? existingFinishCtx
-            : {}),
-          agent_delivery: agentDeliveryCtx,
-        };
-        // A soft-failure body is posted under the "⚠️ Job soft-failed" marker
-        // (see enqueueCompletionDelivery). Summarizing would drop that failure
-        // context, so re-attach a one-line status prefix above the summary.
-        const failureContext = rawBody.startsWith('\u26a0\ufe0f Job soft-failed') || result.status === 'error';
-        result.deliveryOverride = failureContext
-          ? `\u26a0\ufe0f Job soft-failed: ${job.name} (Status: ${result.status})\n${summary}`
-          : summary;
-        result.summarySource = 'llm';
-        log('info', `Delivery body LLM-summarized for ${job.name}`, {
-          runId: ctx.run.id,
-          rawChars: rawBody.length,
-          summaryChars: summary.length,
-          preservedFailureContext: failureContext,
-          fullBodyPersisted: Boolean(persistedFullBody),
-        });
-      } else {
-        result.summarySource = 'raw-fallback';
-        log('debug', `Delivery summary unavailable; delivering raw for ${job.name}`, {
-          runId: ctx.run.id,
-        });
       }
+    } catch (persistErr) {
+      log('warn', `Could not persist full delivery body for ${job.name}`, {
+        runId: ctx.run.id,
+        error: String(persistErr.message || persistErr).slice(0, 300),
+      });
     }
+    const agentDeliveryCtx = {
+      summarized: Boolean(summary),
+      raw_chars: rawBody.length,
+      raw_bytes: Buffer.byteLength(rawBody, 'utf8'),
+      full_body: persistedFullBody,
+      ...(summary ? { summary_chars: summary.length } : {}),
+    };
+    const existingDeliveryCtx = result.runFinishFields?.context_summary
+      && typeof result.runFinishFields.context_summary === 'object'
+      ? result.runFinishFields.context_summary
+      : {};
+    result.runFinishFields = {
+      ...result.runFinishFields,
+      context_summary: { ...existingDeliveryCtx, agent_delivery: agentDeliveryCtx },
+    };
+    // finishFields was assembled before delivery selection and owns the write.
+    const existingFinishCtx = typeof finishFields.context_summary === 'string'
+      ? safeParse(finishFields.context_summary)
+      : finishFields.context_summary;
+    finishFields.context_summary = {
+      ...(existingFinishCtx && typeof existingFinishCtx === 'object' && !Array.isArray(existingFinishCtx)
+        ? existingFinishCtx
+        : {}),
+      agent_delivery: agentDeliveryCtx,
+    };
+  }
+  if (summary) {
+    // Preserve the status line that would otherwise be replaced by the summary.
+    const failureContext = rawBody.startsWith('\u26a0\ufe0f Job soft-failed') || result.status === 'error';
+    result.deliveryOverride = failureContext
+      ? `\u26a0\ufe0f Job soft-failed: ${job.name} (Status: ${result.status})\n${summary}`
+      : summary;
+    result.summarySource = 'llm';
+    log('info', `Delivery body LLM-summarized for ${job.name}`, {
+      runId: ctx.run.id,
+      rawChars: rawBody.length,
+      summaryChars: summary.length,
+      preservedFailureContext: failureContext,
+      fullBodyPersisted: Boolean(persistedFullBody),
+    });
+  } else if (shouldSummarize) {
+    result.summarySource = 'raw-fallback';
+    log('debug', `Delivery summary unavailable; delivering raw for ${job.name}`, {
+      runId: ctx.run.id,
+    });
   }
   // One conservative retry for transient LLM failures (5xx / gateway timeout /
   // aborted-class) on isolated agent-turn jobs. Retry bookkeeping and delivery
@@ -1265,7 +1251,7 @@ export async function finalizeDispatch(job, ctx, result, deps) {
   };
   const enqueueCompletionDelivery = (retryScheduled) => {
     if (result.skipDelivery) return null;
-    const deliveryContent = result.deliveryOverride ?? result.content;
+    const deliveryContent = result.deliveryOverride ?? deliveryText;
     const shouldAnnounce = ['announce', 'announce-always'].includes(job.delivery_mode)
       && deliveryContent?.trim();
     if (!shouldAnnounce) return null;
@@ -3032,13 +3018,15 @@ export async function executeShell(job, ctx, deps) {
       });
     }
   } else {
-    // Shell delivery logic: announce-always sends on all results, announce sends on error only
+    // Shell delivery logic: announce-always sends on all results, announce sends on error only.
+    // delivery_from selects the payload before the failure header is added.
     const announcePayload = shellResult.deliveryText.trim() ? shellResult.deliveryText : shellResult.errorMessage;
+    const deliveryFromOpts = { log, runId: ctx.run.id };
     if (job.delivery_mode === 'announce-always' && announcePayload) {
       const prefix = shellResult.status === 'ok' ? '' : `\u26a0\ufe0f Shell job failed: ${job.name}\n\n`;
-      result.deliveryOverride = `${prefix}${announcePayload}`;
+      result.deliveryOverride = `${prefix}${applyDeliveryFrom(job, announcePayload, deliveryFromOpts)}`;
     } else if (job.delivery_mode === 'announce' && shellResult.status !== 'ok' && announcePayload) {
-      result.deliveryOverride = announcePayload;
+      result.deliveryOverride = applyDeliveryFrom(job, announcePayload, deliveryFromOpts);
     } else {
       result.skipDelivery = true;
     }

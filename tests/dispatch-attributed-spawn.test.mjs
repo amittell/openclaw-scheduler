@@ -388,6 +388,30 @@ test('enqueue from an agent exec shell prepares sessions_spawn and makes no Gate
   }
 });
 
+test('task prompt carries the strengthened done-call completion protocol', () => {
+  const fixture = buildFixture();
+  try {
+    const label = 'done-signal-protocol';
+    const result = runDispatch(fixture, enqueueArgs(label), AGENT_SHELL);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const plan = parseJson(result);
+    assert.equal(plan.ok, true);
+    assert.equal(plan.status, 'awaiting-spawn');
+    const { task } = plan.spawn.params;
+    // Strengthened done-signal instructions (root cause of the 2026-11-16
+    // false interrupted cycle: a finished run ended on a prose report
+    // instead of the push-based done call).
+    assert.match(task, /DELIVERY RULE/);
+    assert.match(task, /done CLI call is the FINAL action of this task/);
+    assert.match(task, /last tool call of your final turn/);
+    assert.match(task, /prose and no done call is classified as interrupted/);
+    assert.match(task, /only when ALL work is complete AND verified/);
+    assert.match(task, /STOP and call done first/);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('a subagent exec shell also selects the tool route', () => {
   const fixture = buildFixture();
   try {

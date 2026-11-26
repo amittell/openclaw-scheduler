@@ -1422,7 +1422,8 @@ function respawnInterrupted(label) {
     const continuationMsg =
       `[Auto-redispatch after interrupted session] Your previous run on this session was interrupted before completion. ` +
       `It may have left partial artifacts on disk -- verify the existing state before redoing any work. ` +
-      `Continue from where the transcript left off; do not redo completed steps.`;
+      `Continue from where the transcript left off; do not redo completed steps. ` +
+      `If the transcript already ends with a complete, verified report and no pending work, the correct continuation is to run the done call immediately with the checklist -- do not redo completed steps.`;
 
     const enqueueArgs = [
       INDEX_PATH, 'enqueue',

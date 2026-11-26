@@ -1,6 +1,6 @@
 {
   "name": "openclaw-scheduler",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Durable continuity and governed-workflow sidecar for OpenClaw agents and shell jobs",
   "type": "module",
   "main": "./index.js",
@@ -95,6 +95,7 @@
     "cli.js",
     "db.js",
     "dispatch-queue.js",
+    "delivery-from.js",
     "delivery-outbox.js",
     "delivery-summary.js",
     "dispatcher-approvals.js",

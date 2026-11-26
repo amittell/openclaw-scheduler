@@ -838,6 +838,64 @@ openclaw-scheduler jobs update <id> '{"delivery_summary":"llm"}'
 
 ---
 
+## Delivering From a Marker Line (`delivery_from`)
+
+An agent job's reply is every message the model sent during the run, joined
+with a blank line. A model that narrates its steps between tool calls
+("Fetching git + GitHub state.") therefore posts that narration ahead of its
+report, and the scheduler cannot tell where one message ended and the next
+began. Set `delivery_from` to the text the report's first line starts with,
+and only the text from that line to the end is delivered.
+
+```bash
+openclaw-scheduler jobs add '{
+  "name": "Daily Status",
+  "schedule_cron": "0 8 * * *",
+  "session_target": "isolated",
+  "payload_kind": "agentTurn",
+  "payload_message": "Check the repositories and post the daily status report. Start the report with the line **Daily status**.",
+  "delivery_mode": "announce-always",
+  "delivery_channel": "telegram",
+  "delivery_to": "YOUR_CHAT_ID",
+  "delivery_from": "**Daily status**",
+  "run_timeout_ms": 600000,
+  "origin": "system"
+}'
+```
+
+How it behaves:
+
+- **Line starts only.** A line matches when it starts with the marker after
+  optional leading whitespace. The marker later in a line does not count.
+  When several lines match, the last one wins.
+- **From the marker to the end.** The delivered body begins with the marker
+  and runs unchanged to the end of the text.
+- **Never drops a delivery.** When no line matches, the full text is delivered
+  and the scheduler logs one warning (`delivery_from marker not found for
+  <job>; delivering the full text`).
+- **Before summarization.** With `delivery_summary: "llm"`, the summary is
+  made from the selected text only.
+- **Only the delivered body changes.** Child `trigger_condition` checks
+  still see the full text. The run keeps its normal summary. The
+  `agent-output` artifact holds the original reply when summarization
+  replaces it or marker selection omits text outside the stored summary.
+- **Failure headers stay.** A soft-failed agent run is still posted under its
+  `Job soft-failed` line, and a failed shell job under `Shell job failed`,
+  with the selected text below it.
+- **Shell jobs too.** For a shell job the marker is applied to the announced
+  output (the `stdout:` block and everything after it).
+- **Rules.** One line, 1 to 200 characters, no control characters. `null`
+  clears it, and an unset field delivers exactly what it did before. Handoff
+  v4 jobs cannot set it (`HANDOFF_V4_DELIVERY_FROM_UNSUPPORTED`): like
+  `delivery_summary`, it is outside the v4 artifact binding contract.
+
+```bash
+openclaw-scheduler jobs update <id> '{"delivery_from":"**Daily status**"}'
+openclaw-scheduler jobs update <id> '{"delivery_from":null}'
+```
+
+---
+
 ## Delivery Aliases
 
 Delivery aliases let you define named delivery targets (e.g., `@my_team`) instead of hard-coding channel/target pairs in every job.
@@ -1433,7 +1491,7 @@ payload_model, payload_model_fallback, payload_thinking, execution_intent, execu
 overlap_policy, run_timeout_ms, max_queued_dispatches, max_pending_approvals,
 max_trigger_fanout, output_store_limit_bytes, output_excerpt_limit_bytes,
 output_summary_limit_bytes, output_offload_threshold_bytes,
-max_retries, delivery_mode, delivery_channel, delivery_summary,
+max_retries, delivery_mode, delivery_channel, delivery_summary, delivery_from,
 delivery_to, delivery_guarantee, delete_after_run, ttl_hours,
 parent_id, trigger_on, trigger_delay_s, trigger_condition,
 resource_pool, auth_profile, auth_profile_fallback,
